@@ -134,8 +134,8 @@ pub trait Tx: Send {
     async fn entries_before(
         &mut self,
         conversation: ConversationId,
-        before: i64,
         from: i64,
+        before: i64,
         limit: u32,
     ) -> DomainResult<Vec<Entry>>;
 

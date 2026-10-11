@@ -31,7 +31,7 @@ where
         let end = member.visible_upper(found.last_seq) + 1;
         let before = before_seq.map_or(end, |seq| seq.min(end));
         let page = tx
-            .entries_before(conversation, before, member.visible_from_seq, limit)
+            .entries_before(conversation, member.visible_from_seq, before, limit)
             .await?;
         tx.rollback().await?;
         Ok(page)

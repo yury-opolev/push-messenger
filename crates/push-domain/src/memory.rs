@@ -335,8 +335,8 @@ impl Tx for InMemoryTx {
     async fn entries_before(
         &mut self,
         conversation: ConversationId,
-        before: i64,
         from: i64,
+        before: i64,
         limit: u32,
     ) -> DomainResult<Vec<Entry>> {
         if from >= before {
@@ -599,11 +599,11 @@ mod tests {
             Vec::<i64>::new()
         );
         assert_eq!(
-            seqs(&tx.entries_before(conversation, 5, 1, 2).await.unwrap()),
+            seqs(&tx.entries_before(conversation, 1, 5, 2).await.unwrap()),
             vec![3, 4]
         );
         assert_eq!(
-            seqs(&tx.entries_before(conversation, 3, 2, 10).await.unwrap()),
+            seqs(&tx.entries_before(conversation, 2, 3, 10).await.unwrap()),
             vec![2]
         );
         assert_eq!(
