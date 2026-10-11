@@ -154,3 +154,82 @@ async fn a_revoked_device_can_neither_sync_nor_ack() {
         Err(DomainError::UnknownDevice)
     );
 }
+
+#[tokio::test]
+async fn a_full_batch_reports_more_only_if_something_remains() {
+    let world = World::new();
+    let (alice, bob, carol) = (
+        world.person().await,
+        world.person().await,
+        world.person().await,
+    );
+    let chat = world.direct_chat(&alice, &bob).await;
+    for body in ["1", "2", "3", "4", "5"] {
+        world.send(&alice, chat, body).await;
+    }
+    let exact = world.svc.sync(bob.device, 5).await.unwrap();
+    assert_eq!(exact.entries.len(), 5);
+    assert!(!exact.more);
+
+    let other = world.direct_chat(&carol, &bob).await;
+    world.send(&carol, other, "extra").await;
+    let full = world.svc.sync(bob.device, 5).await.unwrap();
+    assert_eq!(full.entries.len(), 5);
+    assert!(full.more);
+}
+
+#[tokio::test]
+async fn a_zero_limit_is_treated_as_one() {
+    let world = World::new();
+    let (alice, bob) = (world.person().await, world.person().await);
+    let chat = world.direct_chat(&alice, &bob).await;
+    world.send(&alice, chat, "one").await;
+    world.send(&alice, chat, "two").await;
+
+    let batch = world.svc.sync(bob.device, 0).await.unwrap();
+    assert_eq!(seqs(&batch.entries), [1]);
+    assert!(batch.more);
+}
+
+#[tokio::test]
+async fn a_non_member_cannot_ack() {
+    let world = World::new();
+    let (alice, bob, carol) = (
+        world.person().await,
+        world.person().await,
+        world.person().await,
+    );
+    let chat = world.direct_chat(&alice, &bob).await;
+    world.send(&alice, chat, "one").await;
+
+    assert_eq!(
+        world.svc.ack(carol.device, chat, 1).await,
+        Err(DomainError::NotMember)
+    );
+}
+
+#[tokio::test]
+async fn a_negative_ack_is_rejected() {
+    let world = World::new();
+    let (alice, bob) = (world.person().await, world.person().await);
+    let chat = world.direct_chat(&alice, &bob).await;
+    world.send(&alice, chat, "one").await;
+
+    assert_eq!(
+        world.svc.ack(bob.device, chat, -1).await,
+        Err(DomainError::SeqOutOfRange)
+    );
+}
+
+#[tokio::test]
+async fn sync_without_ack_returns_the_same_entries() {
+    let world = World::new();
+    let (alice, bob) = (world.person().await, world.person().await);
+    let chat = world.direct_chat(&alice, &bob).await;
+    world.send(&alice, chat, "one").await;
+
+    let first = world.svc.sync(bob.device, 100).await.unwrap();
+    let second = world.svc.sync(bob.device, 100).await.unwrap();
+    assert_eq!(first, second);
+    assert_eq!(seqs(&second.entries), [1]);
+}

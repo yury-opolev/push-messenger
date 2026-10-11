@@ -25,6 +25,9 @@ where
 {
     /// Everything after the device's delivery positions, within each membership's
     /// visible range, up to `limit` entries.
+    ///
+    /// Sync does not advance anything: the position moves only when the device acks.
+    /// Calling sync again without acking returns the same entries.
     pub async fn sync(&self, device: DeviceId, limit: u32) -> DomainResult<SyncBatch> {
         let limit = limit.clamp(1, MAX_SYNC_BATCH) as usize;
         let mut tx = self.store.begin().await?;
@@ -76,6 +79,9 @@ where
         let member = require_member(&mut tx, conversation, user).await?;
         if seq < 0 || seq > member.visible_upper(found.last_seq) {
             return Err(DomainError::SeqOutOfRange);
+        }
+        if seq < member.visible_from_seq - 1 {
+            return Ok(false);
         }
         let moved = tx.raise_cursor(device, conversation, seq).await?;
         tx.commit().await?;
