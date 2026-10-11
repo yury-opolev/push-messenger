@@ -12,6 +12,7 @@ pub mod ids;
 pub mod memory;
 pub mod model;
 pub mod notify;
+mod read;
 mod send;
 mod service;
 pub mod store;
