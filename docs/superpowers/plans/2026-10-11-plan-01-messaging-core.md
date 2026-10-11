@@ -1308,6 +1308,11 @@ impl Tx for InMemoryTx {
         Ok(devices)
     }
 
+    async fn lock_contact_pair(&mut self, _a: UserId, _b: UserId) -> DomainResult<()> {
+        // Every in-memory transaction already holds the store-wide lock.
+        Ok(())
+    }
+
     async fn get_contact(
         &mut self,
         owner: UserId,
@@ -2099,6 +2104,7 @@ where
         if !tx.user_exists(a).await? || !tx.user_exists(b).await? {
             return Err(DomainError::UnknownUser);
         }
+        tx.lock_contact_pair(a, b).await?;
         Ok(tx)
     }
 }
@@ -2224,6 +2230,7 @@ where
         }
         let key = direct_key(me, peer);
         let mut tx = self.store.begin().await?;
+        tx.lock_contact_pair(me, peer).await?;
         if !are_contacts(&mut tx, me, peer).await? {
             return Err(DomainError::NotContact);
         }
