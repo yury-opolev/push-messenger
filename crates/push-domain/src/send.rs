@@ -42,6 +42,8 @@ where
         let conversation = require_conversation(&mut tx, command.conversation).await?;
         let seq = tx.next_seq(conversation.id).await?;
 
+        // A non-member reusing an existing `client_msg_id` gets `ClientIdConflict`; that is
+        // acceptable because ids are random and chosen by the client.
         // A retry of an entry that is already stored always gets its original receipt,
         // even if the sender has since lost the right to send. Checked under the
         // conversation lock taken by `next_seq`, so it cannot race a concurrent attempt.

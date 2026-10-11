@@ -1,6 +1,6 @@
 mod common;
 
-use common::World;
+use common::{World, bodies};
 use push_domain::{DomainError, ValidationError};
 
 #[tokio::test]
@@ -36,5 +36,54 @@ async fn a_direct_chat_with_yourself_is_invalid() {
     assert_eq!(
         world.svc.open_direct(alice.user, alice.user).await,
         Err(DomainError::Invalid(ValidationError::SelfTarget))
+    );
+}
+
+#[tokio::test]
+async fn every_device_of_both_users_starts_at_the_beginning() {
+    let world = World::new();
+    let (alice, bob) = (world.person().await, world.person().await);
+    let alice_phone = world.add_device(&alice).await;
+    let bob_old = world.add_device(&bob).await;
+    world.svc.revoke_device(bob_old).await.unwrap();
+    let chat = world.direct_chat(&alice, &bob).await;
+    world.send(&alice, chat, "hello").await;
+
+    for device in [alice_phone, bob.device] {
+        let batch = world.svc.sync(device, 100).await.unwrap();
+        assert_eq!(bodies(&batch.entries), ["hello"]);
+    }
+    assert_eq!(
+        world.svc.sync(bob_old, 100).await,
+        Err(DomainError::UnknownDevice)
+    );
+}
+
+#[tokio::test]
+async fn opening_again_adds_no_duplicate_members() {
+    let world = World::new();
+    let (alice, bob) = (world.person().await, world.person().await);
+    let chat = world.direct_chat(&alice, &bob).await;
+    world.svc.open_direct(alice.user, bob.user).await.unwrap();
+    world.svc.open_direct(bob.user, alice.user).await.unwrap();
+
+    let state = world
+        .svc
+        .conversation_state(alice.user, chat)
+        .await
+        .unwrap();
+    assert_eq!(state.members.len(), 2);
+}
+
+#[tokio::test]
+async fn opening_after_a_block_is_refused_even_if_the_chat_exists() {
+    let world = World::new();
+    let (alice, bob) = (world.person().await, world.person().await);
+    world.direct_chat(&alice, &bob).await;
+    world.svc.contact_block(bob.user, alice.user).await.unwrap();
+
+    assert_eq!(
+        world.svc.open_direct(alice.user, bob.user).await,
+        Err(DomainError::NotContact)
     );
 }

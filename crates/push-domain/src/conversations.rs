@@ -41,7 +41,8 @@ where
         };
         let id = conversation.id;
         if tx.insert_conversation(conversation).await? == InsertOutcome::Duplicate {
-            // Safety net: the pair lock already serialises callers, but if a concurrent request created it first, return that one.
+            // Safety net: the pair lock already serialises callers, but if a concurrent
+            // request created it first, return that one.
             tx.rollback().await?;
             let mut tx = self.store.begin().await?;
             let existing = tx.find_direct(key).await?.ok_or_else(|| {

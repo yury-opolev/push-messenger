@@ -112,6 +112,14 @@ async fn a_retry_after_being_blocked_still_returns_the_original() {
     world.svc.contact_block(bob.user, alice.user).await.unwrap();
 
     assert_eq!(world.svc.send_text(command).await, Ok(first));
+
+    world
+        .svc
+        .contact_unblock(bob.user, alice.user)
+        .await
+        .unwrap();
+    world.befriend(&alice, &bob).await;
+    assert_eq!(world.send(&alice, chat, "again").await.seq, 2);
 }
 
 #[tokio::test]
