@@ -4,12 +4,23 @@
 //! and read positions — independent of storage and transport. Storage is reached through
 //! the `Store` and `Tx` traits.
 
+pub mod clock;
 pub mod error;
 pub mod ids;
+pub mod model;
+pub mod notify;
+pub mod store;
 pub mod validation;
 
+pub use clock::{Clock, ManualClock, SystemClock};
 pub use error::{DomainError, DomainResult};
 pub use ids::{ClientMsgId, ConversationId, DeviceId, MessageId, UserId};
+pub use model::{
+    ContactState, ContentType, Conversation, ConversationKind, ConversationState, Entry, EntryKind,
+    Member, MemberState, Role, SendReceipt, direct_key,
+};
+pub use notify::{NoopNotifier, Notifier, RecordingNotifier};
+pub use store::{InsertOutcome, Store, Tx};
 pub use validation::{
     MAX_HISTORY_PAGE, MAX_SYNC_BATCH, MAX_TEXT_BYTES, ValidationError, validate_text,
 };
