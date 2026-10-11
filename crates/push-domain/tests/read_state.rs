@@ -134,3 +134,43 @@ async fn only_members_can_read_or_see_state() {
         Err(DomainError::NotMember)
     );
 }
+
+#[tokio::test]
+async fn a_negative_read_position_is_rejected() {
+    let world = World::new();
+    let (alice, bob) = (world.person().await, world.person().await);
+    let chat = world.direct_chat(&alice, &bob).await;
+    world.send(&alice, chat, "one").await;
+
+    assert_eq!(
+        world.svc.read_up_to(bob.user, chat, -1).await,
+        Err(DomainError::SeqOutOfRange)
+    );
+}
+
+#[tokio::test]
+async fn sending_never_lowers_the_senders_read_position() {
+    let world = World::new();
+    let (alice, bob) = (world.person().await, world.person().await);
+    let chat = world.direct_chat(&alice, &bob).await;
+    let alice_read = || async {
+        let state = world
+            .svc
+            .conversation_state(alice.user, chat)
+            .await
+            .unwrap();
+        member(&state, alice.user).read_seq
+    };
+    for body in ["one", "two", "three"] {
+        world.send(&bob, chat, body).await;
+    }
+
+    world.svc.read_up_to(alice.user, chat, 3).await.unwrap();
+    assert_eq!(alice_read().await, 3);
+    world.send(&alice, chat, "four").await;
+    assert_eq!(alice_read().await, 4);
+    for body in ["five", "six", "seven", "eight", "nine"] {
+        world.send(&bob, chat, body).await;
+    }
+    assert_eq!(alice_read().await, 4);
+}

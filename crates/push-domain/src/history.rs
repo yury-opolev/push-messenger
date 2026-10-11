@@ -15,7 +15,7 @@ where
     N: Notifier,
 {
     /// Up to `limit` entries before `before_seq` (or the newest ones), oldest first,
-    /// limited to what `user` may see.
+    /// limited to what `user` may see. `before_seq` is exclusive.
     pub async fn history(
         &self,
         user: UserId,
