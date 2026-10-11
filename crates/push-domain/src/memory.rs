@@ -114,6 +114,10 @@ impl Tx for InMemoryTx {
             .map(|row| row.user))
     }
 
+    async fn device_exists(&mut self, device: DeviceId) -> DomainResult<bool> {
+        Ok(self.work.devices.contains_key(&device))
+    }
+
     async fn devices_of_user(&mut self, user: UserId) -> DomainResult<Vec<DeviceId>> {
         let mut devices: Vec<DeviceId> = self
             .work

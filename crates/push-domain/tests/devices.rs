@@ -43,6 +43,28 @@ async fn identify_rejects_a_revoked_device() {
 }
 
 #[tokio::test]
+async fn a_device_id_of_another_user_cannot_be_registered() {
+    let world = World::new();
+    let alice = world.person().await;
+    let bob = world.person().await;
+    assert_eq!(
+        world.svc.register_device(alice.device, bob.user).await,
+        Err(DomainError::UnknownDevice)
+    );
+}
+
+#[tokio::test]
+async fn a_revoked_device_cannot_be_registered_again() {
+    let world = World::new();
+    let alice = world.person().await;
+    world.svc.revoke_device(alice.device).await.unwrap();
+    assert_eq!(
+        world.svc.register_device(alice.device, alice.user).await,
+        Err(DomainError::UnknownDevice)
+    );
+}
+
+#[tokio::test]
 async fn registering_the_same_user_and_device_twice_is_harmless() {
     let world = World::new();
     let alice = world.person().await;

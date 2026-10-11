@@ -45,6 +45,9 @@ where
         if !tx.user_exists(user).await? {
             return Err(DomainError::UnknownUser);
         }
+        if tx.device_exists(device).await? && tx.device_owner(device).await? != Some(user) {
+            return Err(DomainError::UnknownDevice);
+        }
         tx.insert_device(device, user).await?;
         for (conversation, member) in tx.memberships(user).await? {
             if member.is_current() {

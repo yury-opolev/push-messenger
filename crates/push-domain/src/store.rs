@@ -52,6 +52,8 @@ pub trait Tx: Send {
     async fn revoke_device(&mut self, device: DeviceId) -> DomainResult<()>;
     /// The owner of an active device; `None` if the device is unknown or revoked.
     async fn device_owner(&mut self, device: DeviceId) -> DomainResult<Option<UserId>>;
+    /// Whether a device row exists, active or revoked.
+    async fn device_exists(&mut self, device: DeviceId) -> DomainResult<bool>;
     /// The user's active devices.
     /// The order of the result is unspecified.
     async fn devices_of_user(&mut self, user: UserId) -> DomainResult<Vec<DeviceId>>;
