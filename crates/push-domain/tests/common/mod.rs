@@ -6,7 +6,10 @@
 use std::sync::Arc;
 
 use chrono::{TimeZone, Utc};
-use push_domain::{DeviceId, InMemoryStore, ManualClock, Messaging, RecordingNotifier, UserId};
+use push_domain::{
+    ClientMsgId, ConversationId, DeviceId, Entry, InMemoryStore, ManualClock, Messaging,
+    RecordingNotifier, SendReceipt, SendText, UserId,
+};
 
 pub type Svc = Messaging<InMemoryStore, Arc<ManualClock>, Arc<RecordingNotifier>>;
 
@@ -69,8 +72,44 @@ impl World {
     }
 
     /// Makes two people contacts and opens their direct conversation.
-    pub async fn direct_chat(&self, a: &Person, b: &Person) -> push_domain::ConversationId {
+    pub async fn direct_chat(&self, a: &Person, b: &Person) -> ConversationId {
         self.befriend(a, b).await;
         self.svc.open_direct(a.user, b.user).await.unwrap()
     }
+
+    /// Sends a text message and expects it to succeed.
+    pub async fn send(
+        &self,
+        from: &Person,
+        conversation: ConversationId,
+        body: &str,
+    ) -> SendReceipt {
+        self.svc
+            .send_text(text(from, conversation, body))
+            .await
+            .unwrap()
+    }
+}
+
+/// A send command with a fresh client message id.
+pub fn text(from: &Person, conversation: ConversationId, body: &str) -> SendText {
+    SendText {
+        sender: from.user,
+        device: from.device,
+        conversation,
+        client_msg_id: ClientMsgId::new(),
+        body: body.as_bytes().to_vec(),
+        client_ts: None,
+    }
+}
+
+pub fn bodies(entries: &[Entry]) -> Vec<String> {
+    entries
+        .iter()
+        .map(|entry| String::from_utf8(entry.body.clone().unwrap_or_default()).unwrap())
+        .collect()
+}
+
+pub fn seqs(entries: &[Entry]) -> Vec<i64> {
+    entries.iter().map(|entry| entry.seq).collect()
 }

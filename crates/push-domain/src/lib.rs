@@ -12,6 +12,7 @@ pub mod ids;
 pub mod memory;
 pub mod model;
 pub mod notify;
+mod send;
 mod service;
 pub mod store;
 pub mod validation;
@@ -25,6 +26,7 @@ pub use model::{
     Member, MemberState, Role, SendReceipt, direct_key,
 };
 pub use notify::{NoopNotifier, Notifier, RecordingNotifier};
+pub use send::SendText;
 pub use service::Messaging;
 pub use store::{InsertOutcome, Store, Tx};
 pub use validation::{

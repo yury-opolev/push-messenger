@@ -70,7 +70,6 @@ where
     }
 }
 
-#[allow(dead_code)] // Used from Task 8 on.
 pub(crate) async fn require_conversation<T: Tx>(
     tx: &mut T,
     id: ConversationId,

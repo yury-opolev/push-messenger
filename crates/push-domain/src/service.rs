@@ -12,7 +12,6 @@ use crate::store::{Store, Tx};
 pub struct Messaging<S, C, N> {
     pub(crate) store: S,
     pub(crate) clock: C,
-    #[allow(dead_code)]
     pub(crate) notifier: N,
 }
 
