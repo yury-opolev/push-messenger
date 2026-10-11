@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use crate::error::{DomainError, DomainResult};
-use crate::ids::{ClientMsgId, ConversationId, DeviceId, UserId};
+use crate::ids::{ClientMsgId, ConversationId, DeviceId, MessageId, UserId};
 use crate::model::{ContactState, Conversation, Entry, Member};
 use crate::store::{InsertOutcome, Store, Tx};
 
@@ -30,6 +30,7 @@ struct State {
     entries: BTreeMap<(ConversationId, i64), Entry>,
     client_ids: HashMap<(ConversationId, ClientMsgId), i64>,
     cursors: HashMap<(DeviceId, ConversationId), i64>,
+    message_ids: HashSet<MessageId>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -169,6 +170,11 @@ impl Tx for InMemoryTx {
         &mut self,
         conversation: Conversation,
     ) -> DomainResult<InsertOutcome> {
+        if self.work.conversations.contains_key(&conversation.id) {
+            return Err(DomainError::Store(
+                "primary key violation: conversation already exists".into(),
+            ));
+        }
         if let Some(key) = conversation.direct_key {
             if self.work.direct_index.contains_key(&key) {
                 return Ok(InsertOutcome::Duplicate);
@@ -281,6 +287,12 @@ impl Tx for InMemoryTx {
                 "primary key violation: an entry with this seq already exists".into(),
             ));
         }
+        if self.work.message_ids.contains(&entry.message_id) {
+            return Err(DomainError::Store(
+                "unique violation: message_id already exists".into(),
+            ));
+        }
+        self.work.message_ids.insert(entry.message_id);
         self.work.client_ids.insert(key, entry.seq);
         self.work
             .entries
@@ -420,8 +432,7 @@ impl Tx for InMemoryTx {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ids::MessageId;
-    use crate::model::{ContentType, ConversationKind, EntryKind};
+    use crate::model::{ContentType, ConversationKind, EntryKind, Role};
     use chrono::{TimeZone, Utc};
 
     fn conversation() -> Conversation {
@@ -668,6 +679,61 @@ mod tests {
             tx.create_cursor_if_absent(DeviceId::new(), id, 0).await,
             Err(DomainError::Store(_))
         ));
+        let member = Member {
+            conversation_id: id,
+            user_id: UserId::new(),
+            role: Role::Member,
+            visible_from_seq: 1,
+            left_at_seq: None,
+            read_seq: 0,
+        };
+        assert!(matches!(
+            tx.insert_member(member).await,
+            Err(DomainError::Store(_))
+        ));
+        assert!(matches!(
+            tx.raise_cursor(DeviceId::new(), id, 1).await,
+            Err(DomainError::Store(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_conversation_id_cannot_be_inserted_twice() {
+        let store = InMemoryStore::new();
+        let first = conversation();
+        let mut second = conversation();
+        second.id = first.id;
+        second.direct_key = Some([3; 32]);
+
+        let mut tx = store.begin().await.unwrap();
+        tx.insert_conversation(first).await.unwrap();
+        assert!(matches!(
+            tx.insert_conversation(second).await,
+            Err(DomainError::Store(_))
+        ));
+        assert_eq!(tx.find_direct([3; 32]).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_message_id_cannot_be_inserted_twice() {
+        let store = InMemoryStore::new();
+        let conversation = conversation();
+        let id = conversation.id;
+        let mut tx = store.begin().await.unwrap();
+        tx.insert_conversation(conversation).await.unwrap();
+        let first = entry(id, 1, ClientMsgId::new());
+        let mut second = entry(id, 2, ClientMsgId::new());
+        second.message_id = first.message_id;
+        tx.insert_entry(first).await.unwrap();
+
+        assert!(matches!(
+            tx.insert_entry(second).await,
+            Err(DomainError::Store(_))
+        ));
+        assert_eq!(
+            seqs(&tx.entries_after(id, 0, 5, 10).await.unwrap()),
+            vec![1]
+        );
     }
 
     #[tokio::test]
