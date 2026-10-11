@@ -349,6 +349,19 @@ honest statement is "Bob has read up to message N".
 - Positions only move forward: `GREATEST(current, new)`.
 - Delivery positions move only on `Ack` from that device — never on send.
 
+### 4.8 Sequence numbers and ordering
+
+- `seq` is per conversation and starts at 1. It comes from `conversation.last_seq`,
+  incremented inside the write transaction — not from a Postgres sequence, which is
+  shared and may skip values.
+- It is a signed 64-bit integer and never wraps. Protobuf encodes small values in 1–3
+  bytes. The Node binding exposes it as `BigInt`.
+- There is one ordered log per conversation and no priorities. Edits and deletes take
+  the next `seq` like anything else. They need no priority: a message is always
+  delivered in its current state, so a recipient who has not received the original yet
+  gets the edited or deleted version directly, and a deleted body is never sent after
+  the delete.
+
 ## 5. Accounts, devices and contacts
 
 ### 5.1 Credentials
