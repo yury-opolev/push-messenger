@@ -75,11 +75,14 @@ where
         tx.commit().await
     }
 
-    /// Removes a block. The users are then strangers again.
+    /// Removes a block. A request the block had hidden becomes an ordinary pending request.
     pub async fn contact_unblock(&self, me: UserId, peer: UserId) -> DomainResult<()> {
         let mut tx = self.begin_pair(me, peer).await?;
         if tx.get_contact(me, peer).await? == Some(ContactState::Blocked) {
             tx.delete_contact(me, peer).await?;
+            if tx.get_contact(peer, me).await? == Some(ContactState::RequestedOut) {
+                tx.put_contact(me, peer, ContactState::RequestedIn).await?;
+            }
         }
         tx.commit().await
     }

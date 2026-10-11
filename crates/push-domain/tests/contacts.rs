@@ -172,3 +172,150 @@ async fn requesting_an_unknown_user_fails() {
         Err(DomainError::UnknownUser)
     );
 }
+
+#[tokio::test]
+async fn a_hidden_request_arrives_when_the_block_is_lifted() {
+    let world = World::new();
+    let (alice, bob) = (world.person().await, world.person().await);
+    world.svc.contact_block(alice.user, bob.user).await.unwrap();
+    world
+        .svc
+        .contact_request(bob.user, alice.user)
+        .await
+        .unwrap();
+    world
+        .svc
+        .contact_unblock(alice.user, bob.user)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        world.svc.contact_state(alice.user, bob.user).await,
+        Ok(Some(ContactState::RequestedIn))
+    );
+    assert_eq!(
+        world.svc.contact_state(bob.user, alice.user).await,
+        Ok(Some(ContactState::RequestedOut))
+    );
+    world
+        .svc
+        .contact_accept(alice.user, bob.user)
+        .await
+        .unwrap();
+    for (me, peer) in [(alice.user, bob.user), (bob.user, alice.user)] {
+        assert_eq!(
+            world.svc.contact_state(me, peer).await,
+            Ok(Some(ContactState::Accepted))
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_sender_cannot_decline_their_own_request() {
+    let world = World::new();
+    let (alice, bob) = (world.person().await, world.person().await);
+    world
+        .svc
+        .contact_request(alice.user, bob.user)
+        .await
+        .unwrap();
+    assert_eq!(
+        world.svc.contact_decline(alice.user, bob.user).await,
+        Err(DomainError::NoPendingRequest)
+    );
+}
+
+#[tokio::test]
+async fn blocking_cancels_a_pending_request_in_either_direction() {
+    let world = World::new();
+    let (alice, bob) = (world.person().await, world.person().await);
+    world
+        .svc
+        .contact_request(alice.user, bob.user)
+        .await
+        .unwrap();
+    world.svc.contact_block(bob.user, alice.user).await.unwrap();
+    assert_eq!(
+        world.svc.contact_state(alice.user, bob.user).await,
+        Ok(None)
+    );
+
+    let (carol, dave) = (world.person().await, world.person().await);
+    world
+        .svc
+        .contact_request(carol.user, dave.user)
+        .await
+        .unwrap();
+    world
+        .svc
+        .contact_block(carol.user, dave.user)
+        .await
+        .unwrap();
+    assert_eq!(
+        world.svc.contact_state(dave.user, carol.user).await,
+        Ok(None)
+    );
+}
+
+#[tokio::test]
+async fn a_repeated_request_changes_nothing() {
+    let world = World::new();
+    let (alice, bob) = (world.person().await, world.person().await);
+    for _ in 0..2 {
+        assert_eq!(
+            world.svc.contact_request(alice.user, bob.user).await,
+            Ok(ContactState::RequestedOut)
+        );
+    }
+    assert_eq!(
+        world.svc.contact_state(bob.user, alice.user).await,
+        Ok(Some(ContactState::RequestedIn))
+    );
+}
+
+#[tokio::test]
+async fn a_request_to_an_accepted_contact_stays_accepted() {
+    let world = World::new();
+    let (alice, bob) = (world.person().await, world.person().await);
+    world.befriend(&alice, &bob).await;
+    assert_eq!(
+        world.svc.contact_request(alice.user, bob.user).await,
+        Ok(ContactState::Accepted)
+    );
+    assert_eq!(
+        world.svc.contact_state(bob.user, alice.user).await,
+        Ok(Some(ContactState::Accepted))
+    );
+}
+
+#[tokio::test]
+async fn contact_operations_reject_self_and_unknown_users() {
+    let world = World::new();
+    let alice = world.person().await;
+    let selfish = Err(DomainError::Invalid(ValidationError::SelfTarget));
+    assert_eq!(
+        world.svc.contact_accept(alice.user, alice.user).await,
+        selfish
+    );
+    assert_eq!(
+        world.svc.contact_decline(alice.user, alice.user).await,
+        selfish
+    );
+    assert_eq!(
+        world.svc.contact_block(alice.user, alice.user).await,
+        selfish
+    );
+    let stranger = UserId::new();
+    assert_eq!(
+        world.svc.contact_accept(alice.user, stranger).await,
+        Err(DomainError::UnknownUser)
+    );
+    assert_eq!(
+        world.svc.contact_decline(alice.user, stranger).await,
+        Err(DomainError::UnknownUser)
+    );
+    assert_eq!(
+        world.svc.contact_block(alice.user, stranger).await,
+        Err(DomainError::UnknownUser)
+    );
+}
