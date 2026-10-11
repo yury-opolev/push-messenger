@@ -10,6 +10,7 @@
 //!   (on Postgres: `ON CONFLICT DO NOTHING`, never a caught unique violation);
 //! - report deadlocks and serialisation failures as [`DomainError::Conflict`], which
 //!   callers may retry;
+//! - enforce the schema's foreign and primary keys, failing with `DomainError::Store`;
 //! - roll back a transaction that is dropped without [`Tx::commit`].
 //!
 //! [`DomainError::Conflict`]: crate::error::DomainError::Conflict
@@ -52,6 +53,7 @@ pub trait Tx: Send {
     /// The owner of an active device; `None` if the device is unknown or revoked.
     async fn device_owner(&mut self, device: DeviceId) -> DomainResult<Option<UserId>>;
     /// The user's active devices.
+    /// The order of the result is unspecified.
     async fn devices_of_user(&mut self, user: UserId) -> DomainResult<Vec<DeviceId>>;
 
     // --- Contacts: one row per direction -----------------------------------------------
@@ -86,16 +88,19 @@ pub trait Tx: Send {
     /// Locks the conversation, increments `last_seq` and returns the new value.
     /// Fails with `ConversationNotFound` if the conversation does not exist.
     async fn next_seq(&mut self, id: ConversationId) -> DomainResult<i64>;
+    /// Inserts the member, replacing an existing row for the same conversation and user.
     async fn insert_member(&mut self, member: Member) -> DomainResult<()>;
     async fn get_member(
         &mut self,
         conversation: ConversationId,
         user: UserId,
     ) -> DomainResult<Option<Member>>;
+    /// The order of the result is unspecified.
     async fn members(&mut self, conversation: ConversationId) -> DomainResult<Vec<Member>>;
     /// Every conversation the user is, or was, a member of.
     /// A device registered concurrently with a membership change may lack a delivery
     /// position; callers treat a missing position as `visible_from_seq - 1`.
+    /// The order of the result is unspecified.
     async fn memberships(&mut self, user: UserId) -> DomainResult<Vec<(Conversation, Member)>>;
     /// Moves `read_seq` forward to `seq`. Returns whether it moved.
     /// Fails with `NotMember` if the member does not exist.

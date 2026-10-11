@@ -15,6 +15,10 @@ use crate::ids::{ClientMsgId, ConversationId, DeviceId, UserId};
 use crate::model::{ContactState, Conversation, Entry, Member};
 use crate::store::{InsertOutcome, Store, Tx};
 
+fn missing(what: &str) -> DomainError {
+    DomainError::Store(format!("foreign key violation: {what} does not exist"))
+}
+
 #[derive(Debug, Clone, Default)]
 struct State {
     users: HashSet<UserId>,
@@ -84,6 +88,9 @@ impl Tx for InMemoryTx {
     }
 
     async fn insert_device(&mut self, device: DeviceId, user: UserId) -> DomainResult<()> {
+        if !self.work.users.contains(&user) {
+            return Err(missing("user"));
+        }
         self.work.devices.entry(device).or_insert(DeviceRow {
             user,
             revoked: false,
@@ -138,6 +145,9 @@ impl Tx for InMemoryTx {
         peer: UserId,
         state: ContactState,
     ) -> DomainResult<()> {
+        if !self.work.users.contains(&owner) || !self.work.users.contains(&peer) {
+            return Err(missing("user"));
+        }
         self.work.contacts.insert((owner, peer), state);
         Ok(())
     }
@@ -182,6 +192,16 @@ impl Tx for InMemoryTx {
     }
 
     async fn insert_member(&mut self, member: Member) -> DomainResult<()> {
+        if !self
+            .work
+            .conversations
+            .contains_key(&member.conversation_id)
+        {
+            return Err(missing("conversation"));
+        }
+        if !self.work.users.contains(&member.user_id) {
+            return Err(missing("user"));
+        }
         self.work
             .members
             .insert((member.conversation_id, member.user_id), member);
@@ -241,9 +261,21 @@ impl Tx for InMemoryTx {
     }
 
     async fn insert_entry(&mut self, entry: Entry) -> DomainResult<InsertOutcome> {
+        if !self.work.conversations.contains_key(&entry.conversation_id) {
+            return Err(missing("conversation"));
+        }
         let key = (entry.conversation_id, entry.client_msg_id);
         if self.work.client_ids.contains_key(&key) {
             return Ok(InsertOutcome::Duplicate);
+        }
+        if self
+            .work
+            .entries
+            .contains_key(&(entry.conversation_id, entry.seq))
+        {
+            return Err(DomainError::Store(
+                "primary key violation: an entry with this seq already exists".into(),
+            ));
         }
         self.work.client_ids.insert(key, entry.seq);
         self.work
@@ -320,6 +352,12 @@ impl Tx for InMemoryTx {
         conversation: ConversationId,
         seq: i64,
     ) -> DomainResult<()> {
+        if !self.work.devices.contains_key(&device) {
+            return Err(missing("device"));
+        }
+        if !self.work.conversations.contains_key(&conversation) {
+            return Err(missing("conversation"));
+        }
         self.work
             .cursors
             .entry((device, conversation))
@@ -333,6 +371,12 @@ impl Tx for InMemoryTx {
         conversation: ConversationId,
         seq: i64,
     ) -> DomainResult<bool> {
+        if !self.work.devices.contains_key(&device) {
+            return Err(missing("device"));
+        }
+        if !self.work.conversations.contains_key(&conversation) {
+            return Err(missing("conversation"));
+        }
         match self.work.cursors.get_mut(&(device, conversation)) {
             Some(position) if seq > *position => {
                 *position = seq;
@@ -446,6 +490,7 @@ mod tests {
         first.direct_key = Some([7; 32]);
         let mut second = conversation();
         second.direct_key = Some([7; 32]);
+        let second_id = second.id;
 
         let mut tx = store.begin().await.unwrap();
         assert_eq!(
@@ -457,15 +502,19 @@ mod tests {
             InsertOutcome::Duplicate
         );
         assert_eq!(tx.find_direct([7; 32]).await.unwrap(), Some(first.id));
+        assert_eq!(tx.get_conversation(second_id).await.unwrap(), None);
     }
 
     #[tokio::test]
     async fn a_reused_client_msg_id_is_a_duplicate() {
         let store = InMemoryStore::new();
-        let conversation = ConversationId::new();
         let client_msg_id = ClientMsgId::new();
+        let conversation = conversation();
+        let id = conversation.id;
 
         let mut tx = store.begin().await.unwrap();
+        tx.insert_conversation(conversation).await.unwrap();
+        let conversation = id;
         assert_eq!(
             tx.insert_entry(entry(conversation, 1, client_msg_id))
                 .await
@@ -489,8 +538,11 @@ mod tests {
     #[tokio::test]
     async fn entry_ranges_respect_their_bounds() {
         let store = InMemoryStore::new();
-        let conversation = ConversationId::new();
+        let conversation = conversation();
+        let id = conversation.id;
         let mut tx = store.begin().await.unwrap();
+        tx.insert_conversation(conversation).await.unwrap();
+        let conversation = id;
         for seq in 1..=5 {
             tx.insert_entry(entry(conversation, seq, ClientMsgId::new()))
                 .await
@@ -526,8 +578,14 @@ mod tests {
     #[tokio::test]
     async fn positions_only_move_forward() {
         let store = InMemoryStore::new();
-        let (device, conversation) = (DeviceId::new(), ConversationId::new());
+        let (user, device) = (UserId::new(), DeviceId::new());
+        let conversation = conversation();
+        let id = conversation.id;
         let mut tx = store.begin().await.unwrap();
+        tx.insert_user(user).await.unwrap();
+        tx.insert_device(device, user).await.unwrap();
+        tx.insert_conversation(conversation).await.unwrap();
+        let conversation = id;
 
         tx.create_cursor_if_absent(device, conversation, 3)
             .await
@@ -548,6 +606,7 @@ mod tests {
         let user = UserId::new();
         let (kept, revoked) = (DeviceId::new(), DeviceId::new());
         let mut tx = store.begin().await.unwrap();
+        tx.insert_user(user).await.unwrap();
         tx.insert_device(kept, user).await.unwrap();
         tx.insert_device(revoked, user).await.unwrap();
         tx.revoke_device(revoked).await.unwrap();
@@ -555,5 +614,81 @@ mod tests {
         assert_eq!(tx.device_owner(kept).await.unwrap(), Some(user));
         assert_eq!(tx.device_owner(revoked).await.unwrap(), None);
         assert_eq!(tx.devices_of_user(user).await.unwrap(), vec![kept]);
+    }
+
+    #[tokio::test]
+    async fn rows_referring_to_missing_parents_are_rejected() {
+        let store = InMemoryStore::new();
+        let mut tx = store.begin().await.unwrap();
+        let conversation = conversation();
+        let id = conversation.id;
+        tx.insert_conversation(conversation).await.unwrap();
+
+        assert!(matches!(
+            tx.insert_entry(entry(ConversationId::new(), 1, ClientMsgId::new()))
+                .await,
+            Err(DomainError::Store(_))
+        ));
+        assert!(matches!(
+            tx.insert_device(DeviceId::new(), UserId::new()).await,
+            Err(DomainError::Store(_))
+        ));
+        assert!(matches!(
+            tx.put_contact(UserId::new(), UserId::new(), ContactState::RequestedOut)
+                .await,
+            Err(DomainError::Store(_))
+        ));
+        assert!(matches!(
+            tx.create_cursor_if_absent(DeviceId::new(), id, 0).await,
+            Err(DomainError::Store(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_entry_cannot_overwrite_an_existing_seq() {
+        let store = InMemoryStore::new();
+        let conversation = conversation();
+        let id = conversation.id;
+        let mut tx = store.begin().await.unwrap();
+        tx.insert_conversation(conversation).await.unwrap();
+        tx.insert_entry(entry(id, 1, ClientMsgId::new()))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            tx.insert_entry(entry(id, 1, ClientMsgId::new())).await,
+            Err(DomainError::Store(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn raising_an_absent_position_creates_it() {
+        let store = InMemoryStore::new();
+        let (user, device) = (UserId::new(), DeviceId::new());
+        let conversation = conversation();
+        let id = conversation.id;
+        let mut tx = store.begin().await.unwrap();
+        tx.insert_user(user).await.unwrap();
+        tx.insert_device(device, user).await.unwrap();
+        tx.insert_conversation(conversation).await.unwrap();
+
+        assert!(tx.raise_cursor(device, id, 4).await.unwrap());
+        assert_eq!(tx.get_cursor(device, id).await.unwrap(), Some(4));
+    }
+
+    #[tokio::test]
+    async fn operations_on_missing_rows_fail_as_documented() {
+        let store = InMemoryStore::new();
+        let mut tx = store.begin().await.unwrap();
+        assert_eq!(
+            tx.next_seq(ConversationId::new()).await,
+            Err(DomainError::ConversationNotFound)
+        );
+        assert_eq!(
+            tx.raise_read_seq(ConversationId::new(), UserId::new(), 1)
+                .await,
+            Err(DomainError::NotMember)
+        );
+        assert_eq!(tx.revoke_device(DeviceId::new()).await, Ok(()));
     }
 }
