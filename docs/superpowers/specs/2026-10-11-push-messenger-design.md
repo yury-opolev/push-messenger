@@ -255,13 +255,16 @@ Each **member** records how far they have read (`conversation_member.read_seq`).
 5. message-svc, in **one transaction**:
    1. `UPDATE conversation SET last_seq = last_seq + 1 … RETURNING last_seq` — locks
       the conversation.
-   2. Checks that the sender is a current member and, for direct conversations, that
+   2. Looks up `client_msg_id` in the conversation. If it is already stored, this is a
+      retry: **roll back** (which restores `last_seq`), check the stored row has the same
+      `sender_id`, and return its original receipt. This comes before the permission
+      checks, so a retry whose first attempt succeeded is never reported as failed —
+      even if the sender has since been blocked or removed.
+   3. Checks that the sender is a current member and, for direct conversations, that
       both contact rows are `accepted`.
-   3. `INSERT INTO message … ON CONFLICT (conversation_id, client_msg_id) DO NOTHING
-      RETURNING …`.
-   4. If nothing was inserted, this is a retry: **roll back** (which restores
-      `last_seq`), load the original row, check it has the same `sender_id`, and return
-      it. Otherwise continue.
+   4. `INSERT INTO message … ON CONFLICT (conversation_id, client_msg_id) DO NOTHING
+      RETURNING …`. If nothing was inserted (a backstop for step 2), roll back and return
+      the original as in step 2.
    5. Advances the sender's `read_seq` to the new seq (sending a message marks the
       conversation read for its sender). Delivery positions are **not** touched.
    6. Commits.
