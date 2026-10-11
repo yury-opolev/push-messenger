@@ -61,7 +61,7 @@ async fn a_before_seq_beyond_the_end_returns_the_newest_page() {
 #[tokio::test]
 async fn a_before_seq_at_or_below_one_returns_nothing() {
     let (world, bob, chat) = chat_with_five_messages().await;
-    for before in [0, -3] {
+    for before in [1, 0, -3] {
         let page = world
             .svc
             .history(bob.user, chat, Some(before), 10)

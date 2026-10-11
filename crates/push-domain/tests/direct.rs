@@ -47,6 +47,11 @@ async fn every_device_of_both_users_starts_at_the_beginning() {
     let bob_old = world.add_device(&bob).await;
     world.svc.revoke_device(bob_old).await.unwrap();
     let chat = world.direct_chat(&alice, &bob).await;
+
+    for device in [alice.device, alice_phone, bob.device] {
+        assert_eq!(world.position(device, chat).await, Some(0));
+    }
+    assert_eq!(world.position(bob_old, chat).await, None);
     world.send(&alice, chat, "hello").await;
 
     for device in [alice_phone, bob.device] {
@@ -64,8 +69,10 @@ async fn opening_again_adds_no_duplicate_members() {
     let world = World::new();
     let (alice, bob) = (world.person().await, world.person().await);
     let chat = world.direct_chat(&alice, &bob).await;
-    world.svc.open_direct(alice.user, bob.user).await.unwrap();
-    world.svc.open_direct(bob.user, alice.user).await.unwrap();
+    let again = world.svc.open_direct(alice.user, bob.user).await.unwrap();
+    let from_bob = world.svc.open_direct(bob.user, alice.user).await.unwrap();
+    assert_eq!(again, chat);
+    assert_eq!(from_bob, chat);
 
     let state = world
         .svc

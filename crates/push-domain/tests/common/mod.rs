@@ -8,7 +8,7 @@ use std::sync::Arc;
 use chrono::{TimeZone, Utc};
 use push_domain::{
     ClientMsgId, ConversationId, DeviceId, Entry, InMemoryStore, ManualClock, Messaging,
-    RecordingNotifier, SendReceipt, SendText, UserId,
+    RecordingNotifier, SendReceipt, SendText, Store, Tx, UserId,
 };
 
 pub type Svc = Messaging<InMemoryStore, Arc<ManualClock>, Arc<RecordingNotifier>>;
@@ -22,6 +22,7 @@ pub struct Person {
 
 pub struct World {
     pub svc: Svc,
+    pub store: InMemoryStore,
     pub clock: Arc<ManualClock>,
     pub notifier: Arc<RecordingNotifier>,
 }
@@ -32,16 +33,39 @@ impl World {
             Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap(),
         ));
         let notifier = Arc::new(RecordingNotifier::default());
-        let svc = Messaging::new(
-            InMemoryStore::new(),
-            Arc::clone(&clock),
-            Arc::clone(&notifier),
-        );
+        let store = InMemoryStore::new();
+        let svc = Messaging::new(store.clone(), Arc::clone(&clock), Arc::clone(&notifier));
         Self {
             svc,
+            store,
             clock,
             notifier,
         }
+    }
+
+    /// The delivery position of a device, read straight from the store.
+    pub async fn position(&self, device: DeviceId, conversation: ConversationId) -> Option<i64> {
+        let mut tx = self.store.begin().await.unwrap();
+        let position = tx.get_cursor(device, conversation).await.unwrap();
+        tx.rollback().await.unwrap();
+        position
+    }
+
+    /// Replaces a member row directly in the store, to set up visibility ranges that the
+    /// Plan 1 API cannot create yet.
+    pub async fn set_visibility(
+        &self,
+        conversation: ConversationId,
+        user: UserId,
+        visible_from_seq: i64,
+        left_at_seq: Option<i64>,
+    ) {
+        let mut tx = self.store.begin().await.unwrap();
+        let mut member = tx.get_member(conversation, user).await.unwrap().unwrap();
+        member.visible_from_seq = visible_from_seq;
+        member.left_at_seq = left_at_seq;
+        tx.insert_member(member).await.unwrap();
+        tx.commit().await.unwrap();
     }
 
     /// Registers a verified user with one device.
