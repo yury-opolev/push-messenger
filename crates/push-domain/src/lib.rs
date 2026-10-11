@@ -6,6 +6,7 @@
 
 pub mod clock;
 mod contacts;
+mod conversations;
 pub mod error;
 pub mod ids;
 pub mod memory;

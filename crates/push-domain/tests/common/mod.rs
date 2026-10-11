@@ -67,4 +67,10 @@ impl World {
         self.svc.contact_request(a.user, b.user).await.unwrap();
         self.svc.contact_accept(b.user, a.user).await.unwrap();
     }
+
+    /// Makes two people contacts and opens their direct conversation.
+    pub async fn direct_chat(&self, a: &Person, b: &Person) -> push_domain::ConversationId {
+        self.befriend(a, b).await;
+        self.svc.open_direct(a.user, b.user).await.unwrap()
+    }
 }

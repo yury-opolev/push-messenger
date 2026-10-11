@@ -111,7 +111,6 @@ where
 }
 
 /// Whether both directions are `Accepted`.
-#[allow(dead_code)] // Used by open_direct in Task 7.
 pub(crate) async fn are_contacts<T: Tx>(tx: &mut T, a: UserId, b: UserId) -> DomainResult<bool> {
     Ok(tx.get_contact(a, b).await? == Some(ContactState::Accepted)
         && tx.get_contact(b, a).await? == Some(ContactState::Accepted))

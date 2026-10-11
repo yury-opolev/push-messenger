@@ -11,8 +11,6 @@ use crate::store::{Store, Tx};
 #[derive(Debug)]
 pub struct Messaging<S, C, N> {
     pub(crate) store: S,
-    // Not read until the contact and send operations land.
-    #[allow(dead_code)]
     pub(crate) clock: C,
     #[allow(dead_code)]
     pub(crate) notifier: N,
