@@ -285,10 +285,13 @@ conversation lock and then hits the conflict, so retries are race-free.
    "I have everything up to `seq`".
 5. message-svc sets `delivered_seq = GREATEST(delivered_seq, seq)`.
 
-**First sync for a device in a conversation.** If a device has no cursor for a
-conversation, one is created at `last_seq` — the device starts up to date and loads older
-messages through `FetchHistory`. When a member is added, cursors for that member's
-devices start at `visible_from_seq - 1`.
+**Where a device starts.** Delivery positions are created eagerly, never on first sync:
+- when a device is registered, it gets a position at each of its user's conversations'
+  current `last_seq`, so it starts up to date and loads older messages through
+  `FetchHistory`;
+- when a conversation is created or a member is added, every device of each new member
+  gets a position at `visible_from_seq - 1`, so it receives everything from the start of
+  its visibility.
 
 ### 4.4 Delivery states
 
