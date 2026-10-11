@@ -13,6 +13,19 @@
 //! - enforce the schema's foreign and primary keys, failing with `DomainError::Store`;
 //! - roll back a transaction that is dropped without [`Tx::commit`].
 //!
+//! # Locking
+//!
+//! A send takes the conversation lock through [`Tx::next_seq`] and reads contacts WITHOUT
+//! the pair lock. A send that read `Accepted` before a concurrent block commits is ordered
+//! before the block; that is accepted. `open_direct` takes the pair lock and never locks an
+//! existing conversation, so the lock order cannot form a cycle.
+//!
+//! # Delivery positions
+//!
+//! A device may lack a delivery position for a conversation (for example one joined after
+//! the device registered). Readers fall back to `visible_from_seq - 1`, so sync iterates
+//! memberships rather than joining only on existing positions.
+//!
 //! [`DomainError::Conflict`]: crate::error::DomainError::Conflict
 
 use async_trait::async_trait;
@@ -46,7 +59,9 @@ pub trait Tx: Send {
     /// Records a verified user. Idempotent.
     async fn insert_user(&mut self, user: UserId) -> DomainResult<()>;
     async fn user_exists(&mut self, user: UserId) -> DomainResult<bool>;
-    /// Records a device. Idempotent.
+    /// Records a device if absent. If a device with this id already exists (any owner,
+    /// active or revoked) it does nothing; callers check ownership first with
+    /// `device_exists` / `device_owner`.
     async fn insert_device(&mut self, device: DeviceId, user: UserId) -> DomainResult<()>;
     /// Marks a device revoked. A no-op for an unknown device.
     async fn revoke_device(&mut self, device: DeviceId) -> DomainResult<()>;
@@ -70,18 +85,21 @@ pub trait Tx: Send {
         owner: UserId,
         peer: UserId,
     ) -> DomainResult<Option<ContactState>>;
+    /// Inserts or replaces the contact row.
     async fn put_contact(
         &mut self,
         owner: UserId,
         peer: UserId,
         state: ContactState,
     ) -> DomainResult<()>;
+    /// A no-op if the row is absent.
     async fn delete_contact(&mut self, owner: UserId, peer: UserId) -> DomainResult<()>;
 
     // --- Conversations and members -----------------------------------------------------
 
     async fn find_direct(&mut self, key: [u8; 32]) -> DomainResult<Option<ConversationId>>;
-    /// `Duplicate` if a direct conversation with the same key already exists.
+    /// A conversation with an existing id fails with `DomainError::Store`; a direct key
+    /// that already exists returns `Duplicate`.
     async fn insert_conversation(
         &mut self,
         conversation: Conversation,
@@ -102,6 +120,8 @@ pub trait Tx: Send {
     /// Every conversation the user is, or was, a member of.
     /// A device registered concurrently with a membership change may lack a delivery
     /// position; callers treat a missing position as `visible_from_seq - 1`.
+    /// Each returned `Conversation` (including `last_seq`) must be read in the same
+    /// statement as its `Member` row, so `last_seq` is consistent with the membership.
     /// The order of the result is unspecified.
     async fn memberships(&mut self, user: UserId) -> DomainResult<Vec<(Conversation, Member)>>;
     /// Moves `read_seq` forward to `seq`. Returns whether it moved.
@@ -146,13 +166,15 @@ pub trait Tx: Send {
         device: DeviceId,
         conversation: ConversationId,
     ) -> DomainResult<Option<i64>>;
+    /// Creates the position if absent. Accepts revoked devices: their positions still
+    /// count for `delivered_seq`.
     async fn create_cursor_if_absent(
         &mut self,
         device: DeviceId,
         conversation: ConversationId,
         seq: i64,
     ) -> DomainResult<()>;
-    /// Moves the position forward to `seq`, creating it if absent.
+    /// Moves the position forward to `seq`, creating it if absent. Accepts revoked devices.
     /// Returns whether it moved; creating it counts as moving.
     async fn raise_cursor(
         &mut self,
