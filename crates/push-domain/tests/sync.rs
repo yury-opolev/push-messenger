@@ -233,3 +233,20 @@ async fn sync_without_ack_returns_the_same_entries() {
     assert_eq!(first, second);
     assert_eq!(seqs(&second.entries), [1]);
 }
+
+#[tokio::test]
+async fn a_new_device_gets_nothing_from_a_conversation_already_left() {
+    let world = World::new();
+    let (alice, bob) = (world.person().await, world.person().await);
+    let chat = world.direct_chat(&alice, &bob).await;
+    for body in ["one", "two", "three"] {
+        world.send(&alice, chat, body).await;
+    }
+    world.set_visibility(chat, bob.user, 1, Some(2)).await;
+
+    let new_device = world.add_device(&bob).await;
+    let batch = world.svc.sync(new_device, 100).await.unwrap();
+    assert!(batch.entries.is_empty());
+    let history = world.svc.history(bob.user, chat, None, 10).await.unwrap();
+    assert_eq!(seqs(&history), [1, 2]);
+}

@@ -38,8 +38,8 @@ where
 
     /// Records a newly registered device. Idempotent.
     ///
-    /// The device starts up to date in every current conversation of its user; older
-    /// messages are loaded through history.
+    /// The device starts up to date in every conversation of its user, including ones the
+    /// user has left (up to where they left); older messages are loaded through history.
     pub async fn register_device(&self, device: DeviceId, user: UserId) -> DomainResult<()> {
         let mut tx = self.store.begin().await?;
         if !tx.user_exists(user).await? {
@@ -50,10 +50,9 @@ where
         }
         tx.insert_device(device, user).await?;
         for (conversation, member) in tx.memberships(user).await? {
-            if member.is_current() {
-                tx.create_cursor_if_absent(device, conversation.id, conversation.last_seq)
-                    .await?;
-            }
+            let position = member.visible_upper(conversation.last_seq);
+            tx.create_cursor_if_absent(device, conversation.id, position)
+                .await?;
         }
         tx.commit().await
     }
