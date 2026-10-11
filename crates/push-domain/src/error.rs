@@ -22,6 +22,8 @@ pub enum DomainError {
     ClientIdConflict,
     #[error("the sequence number is outside the conversation")]
     SeqOutOfRange,
+    #[error("a concurrent change conflicted; retry the operation")]
+    Conflict,
     #[error("storage error: {0}")]
     Store(String),
 }
