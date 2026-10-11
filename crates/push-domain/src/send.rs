@@ -30,7 +30,8 @@ where
     N: Notifier,
 {
     /// Appends a text message. A retry with the same `client_msg_id` returns the original
-    /// receipt and stores nothing new.
+    /// receipt, stores nothing new and notifies nobody — even if the sender has since lost
+    /// the right to send.
     pub async fn send_text(&self, command: SendText) -> DomainResult<SendReceipt> {
         validate_text(&command.body)?;
 
@@ -40,6 +41,17 @@ where
         }
         let conversation = require_conversation(&mut tx, command.conversation).await?;
         let seq = tx.next_seq(conversation.id).await?;
+
+        // A retry of an entry that is already stored always gets its original receipt,
+        // even if the sender has since lost the right to send. Checked under the
+        // conversation lock taken by `next_seq`, so it cannot race a concurrent attempt.
+        if let Some(original) = tx
+            .entry_by_client_id(conversation.id, command.client_msg_id)
+            .await?
+        {
+            tx.rollback().await?;
+            return receipt_for(&original, command.sender);
+        }
 
         let members = tx.members(conversation.id).await?;
         if !members
@@ -79,7 +91,8 @@ where
         let receipt = SendReceipt::from(&entry);
 
         if tx.insert_entry(entry).await? == InsertOutcome::Duplicate {
-            // Rolling back returns `seq` to the counter, keeping the log gapless.
+            // Backstop: the lookup above normally catches retries. Rolling back returns
+            // `seq` to the counter, keeping the log gapless.
             tx.rollback().await?;
             return self
                 .replay_send(command.conversation, command.client_msg_id, command.sender)
@@ -113,9 +126,14 @@ where
                 DomainError::Store("duplicate entry disappeared after a conflict".into())
             })?;
         tx.rollback().await?;
-        if original.sender_id != sender {
-            return Err(DomainError::ClientIdConflict);
-        }
-        Ok(SendReceipt::from(&original))
+        receipt_for(&original, sender)
     }
+}
+
+/// The receipt of a stored entry, if it belongs to `sender`.
+fn receipt_for(original: &Entry, sender: UserId) -> DomainResult<SendReceipt> {
+    if original.sender_id != sender {
+        return Err(DomainError::ClientIdConflict);
+    }
+    Ok(SendReceipt::from(original))
 }

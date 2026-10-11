@@ -91,6 +91,40 @@ async fn a_blocked_contact_cannot_send() {
         world.svc.send_text(text(&alice, chat, "hi")).await,
         Err(DomainError::NotContact)
     );
+
+    world
+        .svc
+        .contact_unblock(bob.user, alice.user)
+        .await
+        .unwrap();
+    world.befriend(&alice, &bob).await;
+    assert_eq!(world.send(&alice, chat, "after").await.seq, 1);
+}
+
+#[tokio::test]
+async fn a_retry_after_being_blocked_still_returns_the_original() {
+    let world = World::new();
+    let (alice, bob) = (world.person().await, world.person().await);
+    let chat = world.direct_chat(&alice, &bob).await;
+
+    let command = text(&alice, chat, "hello");
+    let first = world.svc.send_text(command.clone()).await.unwrap();
+    world.svc.contact_block(bob.user, alice.user).await.unwrap();
+
+    assert_eq!(world.svc.send_text(command).await, Ok(first));
+}
+
+#[tokio::test]
+async fn a_retry_is_not_notified_again() {
+    let world = World::new();
+    let (alice, bob) = (world.person().await, world.person().await);
+    let chat = world.direct_chat(&alice, &bob).await;
+    let command = text(&alice, chat, "hello");
+    world.svc.send_text(command.clone()).await.unwrap();
+    world.notifier.take();
+
+    world.svc.send_text(command).await.unwrap();
+    assert!(world.notifier.take().is_empty());
 }
 
 #[tokio::test]
