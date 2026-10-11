@@ -5,6 +5,7 @@
 //! the `Store` and `Tx` traits.
 
 pub mod clock;
+mod contacts;
 pub mod error;
 pub mod ids;
 pub mod memory;

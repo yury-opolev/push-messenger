@@ -61,4 +61,10 @@ impl World {
         self.svc.register_device(device, person.user).await.unwrap();
         device
     }
+
+    /// Makes two people accepted contacts.
+    pub async fn befriend(&self, a: &Person, b: &Person) {
+        self.svc.contact_request(a.user, b.user).await.unwrap();
+        self.svc.contact_accept(b.user, a.user).await.unwrap();
+    }
 }
