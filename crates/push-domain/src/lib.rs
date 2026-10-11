@@ -8,6 +8,7 @@ pub mod clock;
 mod contacts;
 mod conversations;
 pub mod error;
+mod history;
 pub mod ids;
 pub mod memory;
 pub mod model;
