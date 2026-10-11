@@ -1,0 +1,37 @@
+# Rust
+/target
+**/*.rs.bk
+*.pdb
+
+# Node / SDK bindings
+node_modules/
+dist/
+*.node
+*.tsbuildinfo
+
+# Generated FFI artifacts
+/sdk/bindings/c/include/*.h
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+kubeconfig
+*.kubeconfig
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Brainstorming visual companion sessions
+.superpowers/
+
+# Local data
+*.sqlite
+*.sqlite3
+*.db
+/data
