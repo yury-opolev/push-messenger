@@ -15,6 +15,7 @@ pub mod notify;
 mod send;
 mod service;
 pub mod store;
+mod sync;
 pub mod validation;
 
 pub use clock::{Clock, ManualClock, SystemClock};
@@ -29,6 +30,7 @@ pub use notify::{NoopNotifier, Notifier, RecordingNotifier};
 pub use send::SendText;
 pub use service::Messaging;
 pub use store::{InsertOutcome, Store, Tx};
+pub use sync::SyncBatch;
 pub use validation::{
     MAX_HISTORY_PAGE, MAX_SYNC_BATCH, MAX_TEXT_BYTES, ValidationError, validate_text,
 };

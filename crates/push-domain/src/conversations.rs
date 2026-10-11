@@ -79,7 +79,6 @@ pub(crate) async fn require_conversation<T: Tx>(
         .ok_or(DomainError::ConversationNotFound)
 }
 
-#[allow(dead_code)] // Used from Task 9 on.
 pub(crate) async fn require_member<T: Tx>(
     tx: &mut T,
     conversation: ConversationId,
