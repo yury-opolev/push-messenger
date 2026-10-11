@@ -152,7 +152,7 @@ conversation (
 conversation_member (
   conversation_id  uuid not null references conversation,
   user_id          uuid not null references known_user,
-  role             smallint not null,      -- owner | member (admin reserved)
+  role             smallint not null,      -- admin | member
   visible_from_seq bigint not null,        -- first seq this member may see
   left_at_seq      bigint,                 -- last seq visible after leaving
   read_seq         bigint not null default 0,
@@ -444,11 +444,12 @@ Access-token claims: `sub`, `device_id`, `email_verified`, `exp`, `iat`, `jti`, 
 ## 6. Groups (up to 100 members)
 
 - `CreateGroup{title, member_ids[]}` — every member must be an accepted contact of the
-  creator. The creator becomes owner.
-- `AddMembers`, `RemoveMember`, `LeaveGroup`, `RenameGroup` — two roles: the **owner**
-  renames the group and adds or removes members; **members** chat and can leave.
-- If the owner leaves, ownership passes to the member with the earliest `joined` entry,
-  recorded as a system entry. A group with no members left is closed.
+  creator. The creator becomes an admin.
+- Two roles. **Admins** (one or more) rename the group, add and remove members, and
+  promote members to admin or demote admins to member. **Members** chat and can leave.
+- A group always has at least one admin. If the last admin leaves or is demoted, the
+  member with the earliest `joined` entry becomes admin, recorded as a system entry. A
+  group with no members left is closed.
 - Every membership change is a **system entry** in the log, written under the same
   conversation lock as messages. Sends and membership changes are therefore strictly
   ordered: a removed member never receives anything after the removal entry.
@@ -456,7 +457,7 @@ Access-token claims: `sub`, `device_id`, `email_verified`, `exp`, `iat`, `jti`, 
   member who leaves keeps history up to `left_at_seq`. Rejoining sets a new
   `visible_from_seq` and clears `left_at_seq`.
 - The 100-member limit is checked under the conversation lock.
-- Adding a member requires them to be an accepted contact of the owner.
+- Adding a member requires them to be an accepted contact of the admin adding them.
 - Group receipts are aggregated (§4.5). Per-member read lists are out of scope for v1.
 
 ## 7. Wire protocol
@@ -492,6 +493,7 @@ Request frames carry a client-chosen `request_id`, echoed in the response:
 | RedeemInvite / RevokeInvite | `code` |
 | CreateGroup | `title, member_ids[]` |
 | AddMembers / RemoveMember / LeaveGroup / RenameGroup | `conversation_id`, plus `user_ids[]` / `user_id` / — / `title` |
+| SetRole | `conversation_id, user_id, role` |
 
 ### 7.2 Server → client
 
