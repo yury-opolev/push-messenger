@@ -152,7 +152,7 @@ conversation (
 conversation_member (
   conversation_id  uuid not null references conversation,
   user_id          uuid not null references known_user,
-  role             smallint not null,      -- owner | admin | member
+  role             smallint not null,      -- owner | member (admin reserved)
   visible_from_seq bigint not null,        -- first seq this member may see
   left_at_seq      bigint,                 -- last seq visible after leaving
   read_seq         bigint not null default 0,
@@ -445,8 +445,10 @@ Access-token claims: `sub`, `device_id`, `email_verified`, `exp`, `iat`, `jti`, 
 
 - `CreateGroup{title, member_ids[]}` — every member must be an accepted contact of the
   creator. The creator becomes owner.
-- `AddMembers`, `RemoveMember`, `LeaveGroup`, `RenameGroup` — owners and admins manage
-  membership; anyone can leave.
+- `AddMembers`, `RemoveMember`, `LeaveGroup`, `RenameGroup` — two roles: the **owner**
+  renames the group and adds or removes members; **members** chat and can leave.
+- If the owner leaves, ownership passes to the member with the earliest `joined` entry,
+  recorded as a system entry. A group with no members left is closed.
 - Every membership change is a **system entry** in the log, written under the same
   conversation lock as messages. Sends and membership changes are therefore strictly
   ordered: a removed member never receives anything after the removal entry.
@@ -454,7 +456,7 @@ Access-token claims: `sub`, `device_id`, `email_verified`, `exp`, `iat`, `jti`, 
   member who leaves keeps history up to `left_at_seq`. Rejoining sets a new
   `visible_from_seq` and clears `left_at_seq`.
 - The 100-member limit is checked under the conversation lock.
-- Adding a member requires them to be an accepted contact of the person adding them.
+- Adding a member requires them to be an accepted contact of the owner.
 - Group receipts are aggregated (§4.5). Per-member read lists are out of scope for v1.
 
 ## 7. Wire protocol
