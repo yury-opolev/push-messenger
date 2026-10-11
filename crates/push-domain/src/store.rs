@@ -158,4 +158,11 @@ pub trait Tx: Send {
         conversation: ConversationId,
         seq: i64,
     ) -> DomainResult<bool>;
+    /// The furthest delivery position across all of the user's devices, including revoked
+    /// ones: a delivery that happened stays delivered. 0 if the user has no position.
+    async fn delivered_seq(
+        &mut self,
+        conversation: ConversationId,
+        user: UserId,
+    ) -> DomainResult<i64>;
 }

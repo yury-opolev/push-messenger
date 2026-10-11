@@ -95,6 +95,26 @@ async fn delivered_is_the_furthest_position_across_a_users_devices() {
 }
 
 #[tokio::test]
+async fn delivered_survives_revoking_the_device_that_received_it() {
+    let world = World::new();
+    let (alice, bob) = (world.person().await, world.person().await);
+    let chat = world.direct_chat(&alice, &bob).await;
+    let tablet = world.add_device(&bob).await;
+    for body in ["one", "two", "three"] {
+        world.send(&alice, chat, body).await;
+    }
+
+    world.svc.ack(tablet, chat, 3).await.unwrap();
+    world.svc.revoke_device(tablet).await.unwrap();
+    let state = world
+        .svc
+        .conversation_state(alice.user, chat)
+        .await
+        .unwrap();
+    assert_eq!(member(&state, bob.user).delivered_seq, 3);
+}
+
+#[tokio::test]
 async fn only_members_can_read_or_see_state() {
     let world = World::new();
     let (alice, bob, carol) = (

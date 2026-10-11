@@ -389,6 +389,28 @@ impl Tx for InMemoryTx {
             }
         }
     }
+
+    async fn delivered_seq(
+        &mut self,
+        conversation: ConversationId,
+        user: UserId,
+    ) -> DomainResult<i64> {
+        Ok(self
+            .work
+            .cursors
+            .iter()
+            .filter(|((device, cursor_conversation), _)| {
+                *cursor_conversation == conversation
+                    && self
+                        .work
+                        .devices
+                        .get(device)
+                        .is_some_and(|row| row.user == user)
+            })
+            .map(|(_, position)| *position)
+            .max()
+            .unwrap_or(0))
+    }
 }
 
 #[cfg(test)]

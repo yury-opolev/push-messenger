@@ -44,12 +44,7 @@ where
 
         let mut members = Vec::new();
         for member in tx.members(conversation).await? {
-            let mut delivered_seq = 0;
-            for device in tx.devices_of_user(member.user_id).await? {
-                if let Some(position) = tx.get_cursor(device, conversation).await? {
-                    delivered_seq = delivered_seq.max(position);
-                }
-            }
+            let delivered_seq = tx.delivered_seq(conversation, member.user_id).await?;
             members.push(MemberState {
                 user_id: member.user_id,
                 delivered_seq,
