@@ -1,8 +1,71 @@
 mod common;
 
 use chrono::{TimeZone, Utc};
-use common::{World, text};
-use push_domain::{ConversationId, DomainError, SendText, ValidationError};
+use common::{Person, World, text};
+use push_domain::{
+    ConversationId, DeviceId, DomainError, InMemoryStore, ManualClock, Messaging, Notifier,
+    SendText, Store, Tx, UserId, ValidationError,
+};
+use std::sync::Arc;
+
+/// Proves a notification happens after commit: it begins its own transaction (which would
+/// wait forever on the in-memory store's lock if the sender's were still open) and checks
+/// the new message is already visible.
+struct CommitProbe {
+    store: InMemoryStore,
+    observed: std::sync::Mutex<Vec<i64>>,
+}
+
+#[async_trait::async_trait]
+impl Notifier for CommitProbe {
+    async fn notify_users(&self, users: &[UserId]) {
+        let mut tx = tokio::time::timeout(std::time::Duration::from_secs(2), self.store.begin())
+            .await
+            .expect("notified while the sending transaction was still open")
+            .unwrap();
+        // The conversation's last_seq as seen by an independent transaction.
+        let memberships = tx.memberships(users[0]).await.unwrap();
+        let mut observed = self.observed.lock().unwrap();
+        observed.extend(
+            memberships
+                .iter()
+                .map(|(conversation, _)| conversation.last_seq),
+        );
+    }
+}
+
+async fn register(svc: &Messaging<InMemoryStore, Arc<ManualClock>, Arc<CommitProbe>>) -> Person {
+    let person = Person {
+        user: UserId::new(),
+        device: DeviceId::new(),
+    };
+    svc.register_user(person.user).await.unwrap();
+    svc.register_device(person.device, person.user)
+        .await
+        .unwrap();
+    person
+}
+
+#[tokio::test]
+async fn members_are_notified_only_after_the_send_commits() {
+    let store = InMemoryStore::new();
+    let probe = Arc::new(CommitProbe {
+        store: store.clone(),
+        observed: std::sync::Mutex::new(Vec::new()),
+    });
+    let clock = Arc::new(ManualClock::new(
+        Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap(),
+    ));
+    let svc = Messaging::new(store, clock, Arc::clone(&probe));
+    let alice = register(&svc).await;
+    let bob = register(&svc).await;
+    svc.contact_request(alice.user, bob.user).await.unwrap();
+    svc.contact_accept(bob.user, alice.user).await.unwrap();
+    let chat = svc.open_direct(alice.user, bob.user).await.unwrap();
+
+    svc.send_text(text(&alice, chat, "hi")).await.unwrap();
+    assert_eq!(*probe.observed.lock().unwrap(), [1]);
+}
 
 #[tokio::test]
 async fn messages_get_consecutive_seq_numbers_starting_at_one() {
