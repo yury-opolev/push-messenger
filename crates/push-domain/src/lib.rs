@@ -7,6 +7,7 @@
 pub mod clock;
 pub mod error;
 pub mod ids;
+pub mod memory;
 pub mod model;
 pub mod notify;
 pub mod store;
@@ -15,6 +16,7 @@ pub mod validation;
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use error::{DomainError, DomainResult};
 pub use ids::{ClientMsgId, ConversationId, DeviceId, MessageId, UserId};
+pub use memory::InMemoryStore;
 pub use model::{
     ContactState, ContentType, Conversation, ConversationKind, ConversationState, Entry, EntryKind,
     Member, MemberState, Role, SendReceipt, direct_key,
