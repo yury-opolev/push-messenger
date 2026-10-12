@@ -32,6 +32,35 @@ pub struct EditText {
     pub client_ts: Option<DateTime<Utc>>,
 }
 
+/// Erases a message. `sender` and `device` come from the verified token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteMessage {
+    pub sender: UserId,
+    pub device: DeviceId,
+    pub conversation: ConversationId,
+    /// The delete's own idempotency key, reused on every retry.
+    pub client_msg_id: ClientMsgId,
+    pub target: MessageRef,
+}
+
+/// An edit or a delete, after input validation.
+struct Change {
+    sender: UserId,
+    device: DeviceId,
+    conversation: ConversationId,
+    client_msg_id: ClientMsgId,
+    target: MessageRef,
+    action: Action,
+}
+
+enum Action {
+    Edit {
+        body: Vec<u8>,
+        client_ts: Option<DateTime<Utc>>,
+    },
+    Delete,
+}
+
 impl<S, C, N> Messaging<S, C, N>
 where
     S: Store,
@@ -46,13 +75,55 @@ where
     /// receipt, before any permission or window check.
     pub async fn edit_text(&self, command: EditText) -> DomainResult<SendReceipt> {
         validate_text(&command.body)?;
+        self.change_message(Change {
+            sender: command.sender,
+            device: command.device,
+            conversation: command.conversation,
+            client_msg_id: command.client_msg_id,
+            target: command.target,
+            action: Action::Edit {
+                body: command.body,
+                client_ts: command.client_ts,
+            },
+        })
+        .await
+    }
+
+    /// Erases one of the sender's own messages (spec §4.6).
+    ///
+    /// The delete is a log entry of its own. In the same transaction the message row is
+    /// marked deleted and its text, and the text of every edit entry targeting it, is
+    /// erased. A retry with the same `client_msg_id` returns the original receipt; a new
+    /// delete of a deleted message fails with `AlreadyDeleted`.
+    pub async fn delete_message(&self, command: DeleteMessage) -> DomainResult<SendReceipt> {
+        self.change_message(Change {
+            sender: command.sender,
+            device: command.device,
+            conversation: command.conversation,
+            client_msg_id: command.client_msg_id,
+            target: command.target,
+            action: Action::Delete,
+        })
+        .await
+    }
+
+    async fn change_message(&self, change: Change) -> DomainResult<SendReceipt> {
+        let (kind, window, body, client_ts) = match change.action {
+            Action::Edit { body, client_ts } => (
+                EntryKind::Edit,
+                self.policy.edit_window,
+                Some(body),
+                client_ts,
+            ),
+            Action::Delete => (EntryKind::Delete, self.policy.delete_window, None, None),
+        };
         let prepared = self
             .prepare_append(
-                command.sender,
-                command.device,
-                command.conversation,
-                command.client_msg_id,
-                EntryKind::Edit,
+                change.sender,
+                change.device,
+                change.conversation,
+                change.client_msg_id,
+                kind,
             )
             .await?;
         let Append {
@@ -66,8 +137,8 @@ where
             Prepared::Retry(receipt) => return Ok(receipt),
             Prepared::Ready(append) => append,
         };
-        let mut target = resolve_target(&mut tx, &member, command.target).await?;
-        check_change(&target, command.sender, now, self.policy.edit_window)?;
+        let mut target = resolve_target(&mut tx, &member, change.target).await?;
+        check_change(&target, change.sender, now, window)?;
 
         // Erase older edits first, so the only edit text left is the one inserted below.
         tx.erase_edit_bodies(conversation.id, target.seq).await?;
@@ -75,14 +146,14 @@ where
             conversation_id: conversation.id,
             seq,
             message_id: MessageId::new(),
-            client_msg_id: command.client_msg_id,
-            kind: EntryKind::Edit,
+            client_msg_id: change.client_msg_id,
+            kind,
             target_seq: Some(target.seq),
-            sender_id: command.sender,
-            sender_device_id: Some(command.device),
+            sender_id: change.sender,
+            sender_device_id: Some(change.device),
             content_type: ContentType::Text,
-            body: Some(command.body.clone()),
-            client_ts: command.client_ts,
+            body: body.clone(),
+            client_ts,
             server_ts: now,
             edited_at: None,
             edit_seq: None,
@@ -92,17 +163,18 @@ where
         if tx.insert_entry(entry).await? == InsertOutcome::Duplicate {
             tx.rollback().await?;
             return self
-                .replay_append(
-                    conversation.id,
-                    command.client_msg_id,
-                    command.sender,
-                    EntryKind::Edit,
-                )
+                .replay_append(conversation.id, change.client_msg_id, change.sender, kind)
                 .await;
         }
-        target.body = Some(command.body);
-        target.edited_at = Some(now);
-        target.edit_seq = Some(seq);
+
+        // An edit stores the new text; a delete stores none.
+        target.body = body;
+        if kind == EntryKind::Edit {
+            target.edited_at = Some(now);
+            target.edit_seq = Some(seq);
+        } else {
+            target.deleted_at = Some(now);
+        }
         tx.update_entry(target).await?;
         tx.commit().await?;
 

@@ -7,9 +7,9 @@ use std::sync::Arc;
 
 use chrono::{TimeZone, Utc};
 use push_domain::{
-    ClientMsgId, Conversation, ConversationId, DeviceId, EditText, Entry, Event, InMemoryStore,
-    ManualClock, MessageRef, Messaging, Policy, RecordingNotifier, SendReceipt, SendText, Store,
-    Tx, UserId,
+    ClientMsgId, Conversation, ConversationId, DeleteMessage, DeviceId, EditText, Entry, Event,
+    InMemoryStore, ManualClock, MessageRef, Messaging, Policy, RecordingNotifier, SendReceipt,
+    SendText, Store, Tx, UserId,
 };
 
 pub type Svc = Messaging<InMemoryStore, Arc<ManualClock>, Arc<RecordingNotifier>>;
@@ -149,6 +149,17 @@ impl World {
             ))
             .await
             .unwrap()
+    }
+}
+
+/// A delete command with a fresh client message id.
+pub fn delete(from: &Person, conversation: ConversationId, target: MessageRef) -> DeleteMessage {
+    DeleteMessage {
+        sender: from.user,
+        device: from.device,
+        conversation,
+        client_msg_id: ClientMsgId::new(),
+        target,
     }
 }
 

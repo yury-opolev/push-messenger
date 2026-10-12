@@ -4,7 +4,7 @@ use chrono::TimeDelta;
 use common::{Person, World, bodies, edit, entries_for, seqs, text};
 use push_domain::{
     ClientMsgId, Clock, ConversationId, DomainError, EditText, Entry, EntryKind, MessageId,
-    MessageRef, Policy, SendReceipt, ValidationError,
+    MessageRef, Policy, SendReceipt, SendText, ValidationError,
 };
 
 /// Alice and bob in a direct chat, with one message "hello" from alice at seq 1.
@@ -259,4 +259,65 @@ async fn an_edit_moves_the_conversations_updated_at() {
 
     world.edit(&alice, chat, &hello, "v1").await;
     assert_eq!(world.conversation(chat).await.updated_at, world.clock.now());
+}
+
+#[tokio::test]
+async fn an_edit_leaves_the_senders_read_position_unchanged() {
+    let (world, alice, bob, chat, hello) = chat_with_one_message().await;
+    world.send(&bob, chat, "reply").await;
+    let read_seq_of_alice = || async {
+        let state = world
+            .svc
+            .conversation_state(alice.user, chat)
+            .await
+            .unwrap();
+        state
+            .members
+            .iter()
+            .find(|member| member.user_id == alice.user)
+            .unwrap()
+            .read_seq
+    };
+    let before = read_seq_of_alice().await;
+
+    world.edit(&alice, chat, &hello, "v1").await;
+    assert_eq!(read_seq_of_alice().await, before);
+}
+
+#[tokio::test]
+async fn a_text_send_cannot_reuse_the_client_msg_id_of_an_edit() {
+    let (world, alice, _bob, chat, hello) = chat_with_one_message().await;
+    let command = edit(&alice, chat, by_id(&hello), "v1");
+    let reused = command.client_msg_id;
+    world.svc.edit_text(command).await.unwrap();
+
+    let clash = SendText {
+        client_msg_id: reused,
+        ..text(&alice, chat, "again")
+    };
+    assert_eq!(
+        world.svc.send_text(clash).await,
+        Err(DomainError::ClientIdConflict)
+    );
+}
+
+#[tokio::test]
+async fn refused_edits_leave_no_gap_in_seq() {
+    let (world, alice, _bob, chat, hello) = chat_with_one_message().await;
+    assert_eq!(
+        world
+            .svc
+            .edit_text(edit(&alice, chat, MessageRef::Id(MessageId::new()), "x"))
+            .await,
+        Err(DomainError::TargetNotFound)
+    );
+    world.clock.advance(TimeDelta::hours(49));
+    assert_eq!(
+        world
+            .svc
+            .edit_text(edit(&alice, chat, by_id(&hello), "x"))
+            .await,
+        Err(DomainError::WindowExpired)
+    );
+    assert_eq!(world.send(&alice, chat, "next").await.seq, 2);
 }

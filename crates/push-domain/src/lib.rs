@@ -22,7 +22,7 @@ mod sync;
 pub mod validation;
 
 pub use clock::{Clock, ManualClock, SystemClock};
-pub use edit::{EditText, MessageRef};
+pub use edit::{DeleteMessage, EditText, MessageRef};
 pub use error::{DomainError, DomainResult};
 pub use ids::{ClientMsgId, ConversationId, DeviceId, MessageId, UserId};
 pub use memory::InMemoryStore;
