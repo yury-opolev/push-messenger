@@ -10,10 +10,12 @@ repository.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+chrono.workspace = true
 prost.workspace = true
 push-domain.workspace = true
 push-proto.workspace = true
 redis.workspace = true
+tonic.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 

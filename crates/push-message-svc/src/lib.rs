@@ -4,6 +4,9 @@
 //! and, after every commit, rings the affected users' Redis channels so their gateways
 //! sync them.
 
+mod convert;
+mod grpc;
 mod notify;
 
+pub use grpc::{DevSetupApi, MessagingApi};
 pub use notify::RedisNotifier;

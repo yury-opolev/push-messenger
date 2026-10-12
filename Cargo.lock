@@ -1912,6 +1912,7 @@ name = "push-message-svc"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "chrono",
  "prost 0.14.4",
  "push-domain",
  "push-proto",
@@ -1919,6 +1920,7 @@ dependencies = [
  "testcontainers-modules",
  "tokio",
  "tokio-stream",
+ "tonic 0.14.5",
  "tracing",
  "uuid",
 ]
