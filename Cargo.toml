@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/push-domain", "crates/push-testkit"]
+members = ["crates/push-domain", "crates/push-store", "crates/push-testkit"]
 
 [workspace.package]
 version = "0.1.0"
@@ -14,10 +14,21 @@ async-trait = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 libtest-mimic = "0.8"
 push-domain = { path = "crates/push-domain" }
+push-testkit = { path = "crates/push-testkit" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sqlx = { version = "0.8", default-features = false, features = [
+    "chrono",
+    "macros",
+    "migrate",
+    "postgres",
+    "runtime-tokio",
+    "uuid",
+] }
+testcontainers-modules = { version = "0.13", features = ["postgres"] }
 thiserror = "2"
 tokio = { version = "1", features = ["sync"] }
+tracing = "0.1"
 uuid = { version = "1", features = ["serde", "v4", "v7"] }
 
 [workspace.lints.rust]

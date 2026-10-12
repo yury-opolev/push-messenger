@@ -1,0 +1,391 @@
+//! [`PgStore`] and its transactions.
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use push_domain::{
+    ClientMsgId, ContactState, Conversation, ConversationId, ConversationOverview, DeviceId,
+    DomainResult, Entry, GroupPositions, InsertOutcome, InviteRecord, Member, MessageId, Store, Tx,
+    UserId,
+};
+use sqlx::postgres::PgPool;
+use sqlx::{PgConnection, Postgres, Transaction};
+use uuid::Uuid;
+
+use crate::error::store_error;
+
+/// The push-domain [`Store`] on PostgreSQL.
+#[derive(Debug, Clone)]
+pub struct PgStore {
+    pool: PgPool,
+}
+
+impl PgStore {
+    /// A store over `pool`, whose database holds the migrated `messaging` schema (see
+    /// [`PgStore::migrate`]).
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+
+    /// Applies the migrations the database does not have yet.
+    pub async fn migrate(&self) -> Result<(), sqlx::migrate::MigrateError> {
+        crate::MIGRATOR.run(&self.pool).await
+    }
+}
+
+/// A READ COMMITTED transaction. Dropping it without [`Tx::commit`] rolls it back.
+#[derive(Debug)]
+pub struct PgTx {
+    tx: Transaction<'static, Postgres>,
+}
+
+impl PgTx {
+    fn conn(&mut self) -> &mut PgConnection {
+        &mut self.tx
+    }
+}
+
+#[async_trait]
+impl Store for PgStore {
+    type Tx = PgTx;
+
+    async fn begin(&self) -> DomainResult<PgTx> {
+        let tx = self
+            .pool
+            .begin_with("BEGIN ISOLATION LEVEL READ COMMITTED")
+            .await
+            .map_err(store_error)?;
+        Ok(PgTx { tx })
+    }
+}
+
+#[async_trait]
+impl Tx for PgTx {
+    async fn commit(self) -> DomainResult<()> {
+        self.tx.commit().await.map_err(store_error)
+    }
+
+    async fn rollback(self) -> DomainResult<()> {
+        self.tx.rollback().await.map_err(store_error)
+    }
+
+    async fn insert_user(&mut self, user: UserId) -> DomainResult<()> {
+        sqlx::query(
+            "INSERT INTO messaging.known_user (user_id) VALUES ($1) ON CONFLICT DO NOTHING",
+        )
+        .bind(user.0)
+        .execute(self.conn())
+        .await
+        .map_err(store_error)?;
+        Ok(())
+    }
+
+    async fn user_exists(&mut self, user: UserId) -> DomainResult<bool> {
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM messaging.known_user WHERE user_id = $1)")
+            .bind(user.0)
+            .fetch_one(self.conn())
+            .await
+            .map_err(store_error)
+    }
+
+    async fn insert_device(&mut self, device: DeviceId, user: UserId) -> DomainResult<bool> {
+        // A concurrent insert of the same id makes this wait for its outcome, so the check
+        // below sees whichever row won.
+        sqlx::query(
+            "INSERT INTO messaging.member_device (device_id, user_id) VALUES ($1, $2) \
+             ON CONFLICT (device_id) DO NOTHING",
+        )
+        .bind(device.0)
+        .bind(user.0)
+        .execute(self.conn())
+        .await
+        .map_err(store_error)?;
+        sqlx::query_scalar(
+            "SELECT user_id = $2 AND revoked_at IS NULL \
+             FROM messaging.member_device WHERE device_id = $1",
+        )
+        .bind(device.0)
+        .bind(user.0)
+        .fetch_one(self.conn())
+        .await
+        .map_err(store_error)
+    }
+
+    async fn revoke_device(&mut self, device: DeviceId) -> DomainResult<()> {
+        sqlx::query(
+            "UPDATE messaging.member_device SET revoked_at = coalesce(revoked_at, now()) \
+             WHERE device_id = $1",
+        )
+        .bind(device.0)
+        .execute(self.conn())
+        .await
+        .map_err(store_error)?;
+        Ok(())
+    }
+
+    async fn device_owner(&mut self, device: DeviceId) -> DomainResult<Option<UserId>> {
+        let owner: Option<Uuid> = sqlx::query_scalar(
+            "SELECT user_id FROM messaging.member_device \
+             WHERE device_id = $1 AND revoked_at IS NULL",
+        )
+        .bind(device.0)
+        .fetch_optional(self.conn())
+        .await
+        .map_err(store_error)?;
+        Ok(owner.map(UserId))
+    }
+
+    async fn devices_of_user(&mut self, user: UserId) -> DomainResult<Vec<DeviceId>> {
+        let devices: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT device_id FROM messaging.member_device \
+             WHERE user_id = $1 AND revoked_at IS NULL",
+        )
+        .bind(user.0)
+        .fetch_all(self.conn())
+        .await
+        .map_err(store_error)?;
+        Ok(devices.into_iter().map(DeviceId).collect())
+    }
+
+    async fn lock_contact_pair(&mut self, _a: UserId, _b: UserId) -> DomainResult<()> {
+        unimplemented!("plan 3B task 2")
+    }
+
+    async fn get_contact(
+        &mut self,
+        _owner: UserId,
+        _peer: UserId,
+    ) -> DomainResult<Option<ContactState>> {
+        unimplemented!("plan 3B task 2")
+    }
+
+    async fn put_contact(
+        &mut self,
+        _owner: UserId,
+        _peer: UserId,
+        _state: ContactState,
+    ) -> DomainResult<()> {
+        unimplemented!("plan 3B task 2")
+    }
+
+    async fn delete_contact(&mut self, _owner: UserId, _peer: UserId) -> DomainResult<()> {
+        unimplemented!("plan 3B task 2")
+    }
+
+    async fn contacts_of(&mut self, _owner: UserId) -> DomainResult<Vec<(UserId, ContactState)>> {
+        unimplemented!("plan 3B task 2")
+    }
+
+    async fn insert_invite(&mut self, _invite: InviteRecord) -> DomainResult<InsertOutcome> {
+        unimplemented!("plan 3B task 2")
+    }
+
+    async fn lock_invite(&mut self, _code: &str) -> DomainResult<Option<InviteRecord>> {
+        unimplemented!("plan 3B task 2")
+    }
+
+    async fn update_invite(&mut self, _invite: InviteRecord) -> DomainResult<()> {
+        unimplemented!("plan 3B task 2")
+    }
+
+    async fn find_direct(&mut self, _key: [u8; 32]) -> DomainResult<Option<ConversationId>> {
+        unimplemented!("plan 3B task 3")
+    }
+
+    async fn insert_conversation(
+        &mut self,
+        _conversation: Conversation,
+    ) -> DomainResult<InsertOutcome> {
+        unimplemented!("plan 3B task 3")
+    }
+
+    async fn get_conversation(
+        &mut self,
+        _id: ConversationId,
+    ) -> DomainResult<Option<Conversation>> {
+        unimplemented!("plan 3B task 3")
+    }
+
+    async fn next_seq(&mut self, _id: ConversationId, _at: DateTime<Utc>) -> DomainResult<i64> {
+        unimplemented!("plan 3B task 3")
+    }
+
+    async fn set_title(&mut self, _id: ConversationId, _title: String) -> DomainResult<()> {
+        unimplemented!("plan 3B task 3")
+    }
+
+    async fn insert_member(&mut self, _member: Member) -> DomainResult<()> {
+        unimplemented!("plan 3B task 3")
+    }
+
+    async fn get_member(
+        &mut self,
+        _conversation: ConversationId,
+        _user: UserId,
+    ) -> DomainResult<Option<Member>> {
+        unimplemented!("plan 3B task 3")
+    }
+
+    async fn members(&mut self, _conversation: ConversationId) -> DomainResult<Vec<Member>> {
+        unimplemented!("plan 3B task 3")
+    }
+
+    async fn memberships(&mut self, _user: UserId) -> DomainResult<Vec<(Conversation, Member)>> {
+        unimplemented!("plan 3B task 3")
+    }
+
+    async fn raise_read_seq(
+        &mut self,
+        _conversation: ConversationId,
+        _user: UserId,
+        _seq: i64,
+    ) -> DomainResult<bool> {
+        unimplemented!("plan 3B task 3")
+    }
+
+    async fn lock_conversation_positions(
+        &mut self,
+        _conversation: ConversationId,
+    ) -> DomainResult<()> {
+        unimplemented!("plan 3B task 3")
+    }
+
+    async fn insert_entry(&mut self, _entry: Entry) -> DomainResult<InsertOutcome> {
+        unimplemented!("plan 3B task 4")
+    }
+
+    async fn entry_by_client_id(
+        &mut self,
+        _conversation: ConversationId,
+        _client_msg_id: ClientMsgId,
+    ) -> DomainResult<Option<Entry>> {
+        unimplemented!("plan 3B task 4")
+    }
+
+    async fn entry_by_message_id(
+        &mut self,
+        _conversation: ConversationId,
+        _message_id: MessageId,
+    ) -> DomainResult<Option<Entry>> {
+        unimplemented!("plan 3B task 4")
+    }
+
+    async fn update_entry(&mut self, _entry: Entry) -> DomainResult<()> {
+        unimplemented!("plan 3B task 4")
+    }
+
+    async fn erase_edit_bodies(
+        &mut self,
+        _conversation: ConversationId,
+        _target_seq: i64,
+    ) -> DomainResult<()> {
+        unimplemented!("plan 3B task 4")
+    }
+
+    async fn entries_after(
+        &mut self,
+        _conversation: ConversationId,
+        _after: i64,
+        _up_to: i64,
+        _targets_from: i64,
+        _limit: u32,
+    ) -> DomainResult<Vec<Entry>> {
+        unimplemented!("plan 3B task 4")
+    }
+
+    async fn count_incoming_messages(
+        &mut self,
+        _conversation: ConversationId,
+        _user: UserId,
+        _after: i64,
+        _up_to: i64,
+        _cap: u32,
+    ) -> DomainResult<u32> {
+        unimplemented!("plan 3B task 4")
+    }
+
+    async fn first_live_message(
+        &mut self,
+        _conversation: ConversationId,
+        _after: i64,
+        _up_to: i64,
+        _not_from: Option<UserId>,
+    ) -> DomainResult<Option<i64>> {
+        unimplemented!("plan 3B task 4")
+    }
+
+    async fn messages_before(
+        &mut self,
+        _conversation: ConversationId,
+        _from: i64,
+        _before: i64,
+        _limit: u32,
+    ) -> DomainResult<Vec<Entry>> {
+        unimplemented!("plan 3B task 4")
+    }
+
+    async fn get_cursor(
+        &mut self,
+        _device: DeviceId,
+        _conversation: ConversationId,
+    ) -> DomainResult<Option<i64>> {
+        unimplemented!("plan 3B task 5")
+    }
+
+    async fn create_cursor_if_absent(
+        &mut self,
+        _device: DeviceId,
+        _conversation: ConversationId,
+        _seq: i64,
+    ) -> DomainResult<()> {
+        unimplemented!("plan 3B task 5")
+    }
+
+    async fn raise_cursor(
+        &mut self,
+        _device: DeviceId,
+        _conversation: ConversationId,
+        _seq: i64,
+    ) -> DomainResult<bool> {
+        unimplemented!("plan 3B task 5")
+    }
+
+    async fn delivered_seq(
+        &mut self,
+        _conversation: ConversationId,
+        _user: UserId,
+    ) -> DomainResult<i64> {
+        unimplemented!("plan 3B task 5")
+    }
+
+    async fn member_positions(
+        &mut self,
+        _conversation: ConversationId,
+    ) -> DomainResult<Vec<(Member, i64)>> {
+        unimplemented!("plan 3B task 5")
+    }
+
+    async fn sync_positions(
+        &mut self,
+        _user: UserId,
+        _device: DeviceId,
+    ) -> DomainResult<Vec<(Conversation, Member, i64)>> {
+        unimplemented!("plan 3B task 5")
+    }
+
+    async fn group_positions(
+        &mut self,
+        _conversation: ConversationId,
+        _last_seq: i64,
+    ) -> DomainResult<Option<GroupPositions>> {
+        unimplemented!("plan 3B task 5")
+    }
+
+    async fn conversation_overviews(
+        &mut self,
+        _user: UserId,
+        _changed_since: Option<DateTime<Utc>>,
+        _unread_cap: u32,
+    ) -> DomainResult<Vec<ConversationOverview>> {
+        unimplemented!("plan 3B task 6")
+    }
+}
