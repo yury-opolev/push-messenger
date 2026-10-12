@@ -180,8 +180,8 @@ pub trait Tx: Send {
     /// other's old position). It does not lock the conversation row: acks and reads do not
     /// wait for appends to commit. Appends take it after `next_seq`, never before.
     /// Postgres: a transaction-scoped advisory lock (`pg_advisory_xact_lock`) on a
-    /// namespaced (tagged) hash of the conversation id, so it cannot share a key with the
-    /// contact-pair lock.
+    /// namespaced (tagged) hash of the conversation id, so sharing a key with another kind
+    /// of lock, such as a contact pair's, is unlikely and would only add waiting.
     async fn lock_conversation_positions(
         &mut self,
         conversation: ConversationId,
@@ -189,7 +189,10 @@ pub trait Tx: Send {
 
     // --- The log -----------------------------------------------------------------------
 
-    /// `Duplicate` if the conversation already has an entry with this `client_msg_id`.
+    /// `Duplicate`, writing nothing, if the conversation already has an entry with this
+    /// `client_msg_id`. Otherwise fails with `DomainError::Store` if an entry with this
+    /// `message_id` exists (in any conversation) or the conversation already has an entry
+    /// at this `seq`.
     async fn insert_entry(&mut self, entry: Entry) -> DomainResult<InsertOutcome>;
     async fn entry_by_client_id(
         &mut self,
@@ -239,7 +242,7 @@ pub trait Tx: Send {
     ) -> DomainResult<u32>;
     /// The lowest `seq` with `after < seq <= up_to` of a message (`kind = Message`) that is
     /// not deleted and, if `not_from` is given, was sent by someone else. `None` if there is
-    /// none. On Postgres one range scan of the primary key: `… ORDER BY seq LIMIT 1`.
+    /// none. On Postgres one range scan of the `message_live` partial index: `… ORDER BY seq LIMIT 1`.
     async fn first_live_message(
         &mut self,
         conversation: ConversationId,
@@ -260,6 +263,8 @@ pub trait Tx: Send {
 
     // --- Delivery positions ------------------------------------------------------------
 
+    /// The device's delivery position in the conversation; `None` if it has none there.
+    /// Revoked devices keep their positions.
     async fn get_cursor(
         &mut self,
         device: DeviceId,

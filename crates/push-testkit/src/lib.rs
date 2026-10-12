@@ -17,6 +17,7 @@ use std::sync::Arc;
 use libtest_mimic::{Arguments, Conclusion, Trial};
 use push_domain::Store;
 
+mod concurrency;
 mod contract;
 mod scenarios;
 mod world;
@@ -75,6 +76,12 @@ pub fn cases<B: Backend>() -> Vec<Case<B>> {
     let mut cases = contract::cases();
     cases.extend(scenarios::cases());
     cases
+}
+
+/// The cases that run operations at the same time. They need a store whose transactions
+/// run concurrently; the in-memory store cannot run them.
+pub fn concurrency_cases<B: Backend>() -> Vec<Case<B>> {
+    concurrency::cases()
 }
 
 /// Runs `cases` as the tests of this binary and exits. Each case gets a backend from

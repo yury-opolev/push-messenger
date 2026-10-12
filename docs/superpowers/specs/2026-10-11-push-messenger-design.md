@@ -194,6 +194,29 @@ outbox ( event_id uuid primary key, kind text not null,
          payload jsonb not null, created_at timestamptz not null default now() )
 ```
 
+Implementation notes (push-store, migration `0001_messaging.sql`):
+
+- Enumerations are `smallint` with `CHECK` constraints: contact state 1–4 in the order
+  listed, conversation kind 1 direct / 2 group, role 1 admin / 2 member, message kind 1–4
+  and content type 1–2 as above. Invite codes are checked against the Crockford alphabet,
+  and `uses` never exceeds `max_uses`.
+- Extra indexes: `member_device (user_id)`; history pages use a partial index on
+  `message (conversation_id, seq) where kind in (1, 4)`; unread counts and receipt
+  positions use a partial index on live messages
+  (`where kind = 1 and deleted_at is null`, including `sender_id`).
+- Group-wide receipt positions, conversation listings, sync positions and conversation
+  state each take one statement, however many members or conversations there are. The
+  per-member logic lives in the SQL functions `messaging.delivered_seq`,
+  `messaging.effective_position` and `messaging.group_positions`.
+- Transactions run at READ COMMITTED. `next_seq` is
+  `UPDATE conversation SET last_seq = last_seq + 1, updated_at = greatest(updated_at, $at)
+  … RETURNING last_seq`, whose row lock serialises appends. Contact pairs and a group's
+  receipt positions are serialised with `pg_advisory_xact_lock` on a 64-bit FNV-1a hash of
+  a per-kind tag and the ids; invites with `SELECT … FOR UPDATE`. Serialization failures
+  and deadlocks are reported as a retryable conflict.
+- The `outbox` table above is **not** part of the messaging migration yet: the plan that
+  first needs it (worker/auth) adds it.
+
 ### 3.3 worker schema
 
 ```sql

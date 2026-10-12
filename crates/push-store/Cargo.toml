@@ -1,0 +1,28 @@
+[package]
+name = "push-store"
+description = "PostgreSQL storage for push-messenger: migrations and the push-domain Store."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+chrono.workspace = true
+push-domain.workspace = true
+sqlx.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+push-testkit.workspace = true
+testcontainers-modules.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+
+[[test]]
+name = "postgres"
+harness = false
+
+[lints]
+workspace = true
