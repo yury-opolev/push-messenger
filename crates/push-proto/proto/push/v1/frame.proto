@@ -1,0 +1,149 @@
+// The client wire protocol (spec §7). Every WebSocket binary message is one `Frame`.
+//
+// Conventions:
+// - Identifiers (users, devices, conversations, messages, client message ids) are UUIDs
+//   as 16 bytes, big-endian, as `uuid::Uuid::as_bytes` gives them.
+// - Times are microseconds since the Unix epoch, UTC: the precision PostgreSQL stores.
+// - `seq` is a signed 64-bit integer, per conversation, starting at 1.
+//
+// Field numbers set aside for features the spec reserves (§7) are `reserved` below:
+// ephemeral and urgent messages, media attachments, and private reads. A later plan
+// removes the `reserved` line when it adds the field, keeping the number.
+
+syntax = "proto3";
+
+package push.v1;
+
+message Frame {
+  oneof body {
+    // Client to server.
+    Identify identify = 1;
+    Send send = 2;
+    Ack ack = 3;
+    Ping ping = 4;
+
+    // Server to client.
+    Ready ready = 32;
+    SendAck send_ack = 33;
+    Deliver deliver = 34;
+    Error error = 35;
+    Pong pong = 36;
+  }
+  // 5-31: the other client frames of spec §7.1 (ReAuth, Edit, Delete, ReadUpTo and the
+  // request frames); 37-63: the other server frames of §7.2. Assigned as they are added.
+}
+
+// Must be the first frame, within 5 seconds of connecting.
+message Identify {
+  // The access token (a JWT, Plan 5). Not checked yet.
+  string token = 1;
+  // DEV ONLY: accepted only by a gateway started with PUSH_DEV_AUTH=1, which trusts
+  // these ids without any proof. Removed when real tokens arrive (Plan 8); when
+  // removing them, reserve their field numbers (14, 15) and names.
+  bytes dev_user_id = 14;
+  bytes dev_device_id = 15;
+  // private_reads: the device does not reveal reads to others.
+  reserved 16;
+  reserved "private_reads";
+}
+
+message Ready {
+  bytes user_id = 1;
+  bytes device_id = 2;
+  // How often the client should send Ping.
+  uint32 heartbeat_ms = 3;
+}
+
+enum ContentType {
+  CONTENT_TYPE_UNSPECIFIED = 0;
+  CONTENT_TYPE_TEXT = 1;
+  CONTENT_TYPE_SYSTEM_EVENT = 2;
+}
+
+enum EntryKind {
+  ENTRY_KIND_UNSPECIFIED = 0;
+  ENTRY_KIND_MESSAGE = 1;
+  ENTRY_KIND_EDIT = 2;
+  ENTRY_KIND_DELETE = 3;
+  ENTRY_KIND_SYSTEM = 4;
+}
+
+message Send {
+  // UUIDv7 chosen by the client before the first attempt, reused on every retry.
+  bytes client_msg_id = 1;
+  bytes conversation_id = 2;
+  ContentType content_type = 3;
+  bytes body = 4;
+  optional int64 client_ts = 5;
+  // 16 ephemeral, 17 urgent, 18 attachments (media).
+  reserved 16, 17, 18;
+  reserved "ephemeral", "urgent", "attachments";
+}
+
+// The entry is durably stored. Also the answer to Edit and Delete (later plans).
+message SendAck {
+  bytes client_msg_id = 1;
+  bytes message_id = 2;
+  int64 seq = 3;
+  int64 server_ts = 4;
+}
+
+// One log entry, in its current state.
+message Deliver {
+  bytes conversation_id = 1;
+  int64 seq = 2;
+  bytes message_id = 3;
+  bytes client_msg_id = 4;
+  EntryKind kind = 5;
+  // Edit and delete entries: the seq of the message they change (as the log stores it).
+  optional int64 target_seq = 6;
+  bytes sender_id = 7;
+  ContentType content_type = 8;
+  // Absent once the message is deleted, and on edit and delete entries superseded later.
+  optional bytes body = 9;
+  optional int64 client_ts = 10;
+  int64 server_ts = 11;
+  optional int64 edited_at = 12;
+  optional int64 edit_seq = 13;
+  bool deleted = 14;
+  // 16 ephemeral, 17 urgent, 18 attachments (media).
+  reserved 16, 17, 18;
+  reserved "ephemeral", "urgent", "attachments";
+}
+
+// "I have everything up to seq in this conversation."
+message Ack {
+  bytes conversation_id = 1;
+  int64 seq = 2;
+}
+
+message Ping {}
+
+message Pong {}
+
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED = 0;
+  // The frame could not be decoded, or is not allowed now.
+  ERROR_CODE_BAD_FRAME = 1;
+  // A field is invalid: an id that is not 16 bytes, an empty or too large body.
+  ERROR_CODE_INVALID = 2;
+  ERROR_CODE_UNKNOWN_DEVICE = 3;
+  ERROR_CODE_CONVERSATION_NOT_FOUND = 4;
+  ERROR_CODE_NOT_MEMBER = 5;
+  ERROR_CODE_NOT_CONTACT = 6;
+  ERROR_CODE_CLIENT_ID_CONFLICT = 7;
+  ERROR_CODE_SEQ_OUT_OF_RANGE = 8;
+  // A concurrent change or a server problem; retry with backoff.
+  ERROR_CODE_UNAVAILABLE = 9;
+  // Any other rejection; `message` says which.
+  ERROR_CODE_REJECTED = 10;
+}
+
+message Error {
+  ErrorCode code = 1;
+  string message = 2;
+  // Whether the same frame may succeed if sent again unchanged.
+  bool retryable = 3;
+  // Set when the error answers a Send.
+  optional bytes client_msg_id = 4;
+}

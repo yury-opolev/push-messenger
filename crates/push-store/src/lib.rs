@@ -6,17 +6,55 @@
 //! where the domain needs it by row locks (`next_seq`, `lock_invite`) and by
 //! transaction-scoped advisory locks (contact pairs, conversation positions).
 //!
-//! Errors: serialization failures and deadlocks become the retryable
+//! Errors: serialization failures, deadlocks and lock timeouts become the retryable
 //! `DomainError::Conflict`; every other database error, constraint violations included,
 //! becomes `DomainError::Store`. Both are logged with `tracing` first.
+//!
+//! A service connects with [`PgStore::connect`], which sets the lock, statement and
+//! idle-in-transaction timeouts of [`StoreOptions`] on every connection. Each service has
+//! a database of its own (message-svc: `push_messaging`), so sqlx's migrations table
+//! never mixes two services' migrations.
 
 mod codes;
 mod error;
 mod locks;
+mod options;
 mod rows;
 mod store;
 
+pub use options::StoreOptions;
 pub use store::{PgStore, PgTx};
 
 /// The migrations of the `messaging` schema, embedded at build time.
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
+
+/// Checks that `url` parses as a PostgreSQL connection URL, without connecting. The error
+/// never contains the URL, which carries the password.
+pub fn check_database_url(url: &str) -> Result<(), String> {
+    // sqlx parses any scheme as PostgreSQL options, so the scheme is checked here.
+    if !(url.starts_with("postgres://") || url.starts_with("postgresql://")) {
+        return Err("not a valid PostgreSQL connection URL".to_owned());
+    }
+    url.parse::<sqlx::postgres::PgConnectOptions>()
+        .map(drop)
+        .map_err(|_| "not a valid PostgreSQL connection URL".to_owned())
+}
+
+/// Applies the migrations the database at `url` does not have yet, on a connection of its
+/// own: a migration must not inherit the pool's statement and lock timeouts, which are
+/// sized for requests. Run it as the owner of the database.
+///
+/// This is the entry point services use: at start-up they call
+/// `push_store::migrate_database(url)` on a dedicated connection, not `PgStore::migrate`
+/// on the request pool.
+pub async fn migrate_database(url: &str) -> Result<(), sqlx::migrate::MigrateError> {
+    // A one-connection pool without the session settings of `PgStore::connect`.
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(std::time::Duration::from_secs(5))
+        .connect(url)
+        .await?;
+    let result = MIGRATOR.run(&pool).await;
+    pool.close().await;
+    result
+}

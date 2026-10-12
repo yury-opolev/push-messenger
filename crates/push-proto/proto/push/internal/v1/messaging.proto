@@ -1,0 +1,149 @@
+// The internal API of message-svc, called by the gateway (spec §2). Never exposed outside
+// the cluster. Callers pass the user and device the gateway verified; message-svc trusts
+// them.
+//
+// Errors are gRPC statuses whose `details` hold an encoded `push.v1.Error`, which the
+// gateway forwards to the client.
+
+syntax = "proto3";
+
+package push.internal.v1;
+
+import "push/v1/frame.proto";
+
+service Messaging {
+  // Confirms that the device is active and belongs to the user.
+  rpc Identify(IdentifyRequest) returns (IdentifyResponse);
+  // Appends a text message; answers after commit.
+  rpc Send(SendRequest) returns (push.v1.SendAck);
+  // Entries after the device's delivery positions, oldest first per conversation.
+  rpc Sync(SyncRequest) returns (SyncResponse);
+  // Records that the device holds everything up to a seq.
+  rpc Ack(AckRequest) returns (AckResponse);
+}
+
+// DEV ONLY: setup calls for local clusters and the smoke test, registered only by a
+// message-svc started with PUSH_DEV_SETUP=1. Plans 5-7 replace them with auth-svc events
+// and the real contact and conversation requests.
+service DevSetup {
+  rpc RegisterUser(RegisterUserRequest) returns (RegisterUserResponse);
+  rpc RegisterDevice(RegisterDeviceRequest) returns (RegisterDeviceResponse);
+  // Makes two users accepted contacts: a request from `user_id`, accepted by `peer_id`.
+  rpc MakeContacts(MakeContactsRequest) returns (MakeContactsResponse);
+  rpc OpenDirect(OpenDirectRequest) returns (OpenDirectResponse);
+}
+
+message IdentifyRequest {
+  bytes user_id = 1;
+  bytes device_id = 2;
+}
+
+message IdentifyResponse {}
+
+message SendRequest {
+  bytes user_id = 1;
+  bytes device_id = 2;
+  push.v1.Send send = 3;
+}
+
+message SyncRequest {
+  bytes device_id = 1;
+  // At most this many entries; 0 means the server's maximum.
+  uint32 limit = 2;
+}
+
+message SyncResponse {
+  repeated push.v1.Deliver entries = 1;
+  // More entries are waiting beyond this batch.
+  bool more = 2;
+}
+
+message AckRequest {
+  bytes device_id = 1;
+  push.v1.Ack ack = 2;
+}
+
+message AckResponse {
+  // Whether the device's position moved.
+  bool moved = 1;
+}
+
+// Published on the Redis channel `notify:{user_id}` after a commit (spec §4.3). Never
+// carries message bodies: a lost notification only delays the client.
+message Notification {
+  oneof kind {
+    // New log entries exist for the user; their devices should sync.
+    EntriesAvailable entries_available = 1;
+    ReceiptChanged receipt_changed = 2;
+    ContactChanged contact_changed = 3;
+    ReadPositionChanged read_position_changed = 4;
+  }
+}
+
+message EntriesAvailable {}
+
+message ReceiptChanged {
+  bytes conversation_id = 1;
+  oneof positions {
+    DirectReceipt direct = 2;
+    GroupReceipt group = 3;
+  }
+}
+
+message DirectReceipt {
+  bytes user_id = 1;
+  int64 delivered_seq = 2;
+  int64 read_seq = 3;
+}
+
+message GroupReceipt {
+  int64 all_delivered_seq = 1;
+  int64 all_read_seq = 2;
+}
+
+enum ContactState {
+  CONTACT_STATE_NONE = 0;
+  CONTACT_STATE_REQUESTED_OUT = 1;
+  CONTACT_STATE_REQUESTED_IN = 2;
+  CONTACT_STATE_ACCEPTED = 3;
+  CONTACT_STATE_BLOCKED = 4;
+}
+
+message ContactChanged {
+  bytes peer_id = 1;
+  ContactState state = 2;
+}
+
+message ReadPositionChanged {
+  bytes conversation_id = 1;
+  int64 read_seq = 2;
+}
+
+message RegisterUserRequest {
+  bytes user_id = 1;
+}
+
+message RegisterUserResponse {}
+
+message RegisterDeviceRequest {
+  bytes user_id = 1;
+  bytes device_id = 2;
+}
+
+message RegisterDeviceResponse {}
+
+message MakeContactsRequest {
+  bytes user_id = 1;
+  bytes peer_id = 2;
+}
+
+message MakeContactsResponse {}
+
+message OpenDirectRequest {
+  bytes user_id = 1;
+  bytes peer_id = 2;
+}
+
+message OpenDirectResponse {
+  bytes conversation_id = 1;
+}

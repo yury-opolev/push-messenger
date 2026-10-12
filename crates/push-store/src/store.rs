@@ -7,13 +7,14 @@ use push_domain::{
     DomainError, DomainResult, Entry, EntryKind, GroupPositions, InsertOutcome, InviteRecord,
     Member, MessageId, Store, Tx, UserId,
 };
-use sqlx::postgres::{PgPool, PgRow};
-use sqlx::{PgConnection, Postgres, Row, Transaction};
+use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
+use sqlx::{Executor, PgConnection, Postgres, Row, Transaction};
 use uuid::Uuid;
 
 use crate::codes::{decode, encode};
 use crate::error::store_error;
 use crate::locks;
+use crate::options::StoreOptions;
 use crate::rows::{self, conversation_columns, entry_columns, member_columns};
 
 /// The push-domain [`Store`] on PostgreSQL.
@@ -29,9 +30,51 @@ impl PgStore {
         Self { pool }
     }
 
-    /// Applies the migrations the database does not have yet.
+    /// Connects a pool to `url` as `options` say. Every connection the pool opens first
+    /// sets the lock, statement and idle-in-transaction timeouts. Fails if the options do
+    /// not pass [`StoreOptions::validate`] or the first connection cannot be made.
+    pub async fn connect(url: &str, options: &StoreOptions) -> Result<Self, sqlx::Error> {
+        options
+            .validate()
+            .map_err(|message| sqlx::Error::Configuration(message.into()))?;
+        let settings = options.session_settings();
+        let pool = PgPoolOptions::new()
+            .max_connections(options.max_connections)
+            .acquire_timeout(options.acquire_timeout)
+            .after_connect(move |connection, _| {
+                let settings = settings.clone();
+                Box::pin(async move {
+                    connection.execute(settings.as_str()).await?;
+                    Ok(())
+                })
+            })
+            .connect(url)
+            .await?;
+        Ok(Self::new(pool))
+    }
+
+    /// Applies the migrations the database does not have yet on this pool, whose statement
+    /// and lock timeouts are sized for requests. Services do not use it: at start-up they
+    /// call `push_store::migrate_database(url)` on a dedicated connection. Run it as the
+    /// owner of the database: since PostgreSQL 15 other users cannot create objects in it.
     pub async fn migrate(&self) -> Result<(), sqlx::migrate::MigrateError> {
         crate::MIGRATOR.run(&self.pool).await
+    }
+
+    /// Checks that the database answers, for readiness probes.
+    pub async fn ping(&self) -> Result<(), sqlx::Error> {
+        sqlx::query("SELECT 1").execute(&self.pool).await?;
+        Ok(())
+    }
+
+    /// The pool the store runs on.
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
+    /// Closes every connection and waits until they are closed. Later calls fail.
+    pub async fn close(&self) {
+        self.pool.close().await;
     }
 }
 

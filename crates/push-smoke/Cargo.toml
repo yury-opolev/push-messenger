@@ -1,0 +1,29 @@
+[package]
+name = "push-smoke"
+description = "End-to-end smoke test of a running push-messenger deployment."
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+futures-util.workspace = true
+push-proto.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "time"] }
+tokio-tungstenite.workspace = true
+tonic.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["io-util"] }
+push-gateway.workspace = true
+push-message-svc.workspace = true
+push-store.workspace = true
+testcontainers-modules.workspace = true
+tokio-util.workspace = true
+
+[lints]
+workspace = true

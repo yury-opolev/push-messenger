@@ -2,8 +2,9 @@
 
 use push_domain::DomainError;
 
-/// SQLSTATE codes a caller may retry: `serialization_failure` and `deadlock_detected`.
-const RETRYABLE: [&str; 2] = ["40001", "40P01"];
+/// SQLSTATE codes a caller may retry: `serialization_failure`, `deadlock_detected` and
+/// `lock_not_available` (a `lock_timeout` expired).
+const RETRYABLE: [&str; 3] = ["40001", "40P01", "55P03"];
 
 /// Whether an error with this SQLSTATE goes away when the transaction is retried.
 fn is_retryable(code: Option<&str>) -> bool {
@@ -31,9 +32,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_serialization_failures_and_deadlocks_are_retryable() {
+    fn only_serialization_failures_deadlocks_and_lock_timeouts_are_retryable() {
         assert!(is_retryable(Some("40001")));
         assert!(is_retryable(Some("40P01")));
+        assert!(is_retryable(Some("55P03")));
+        assert!(
+            !is_retryable(Some("57014")),
+            "query_canceled: a statement timeout"
+        );
         assert!(!is_retryable(Some("23505")), "unique_violation");
         assert!(!is_retryable(Some("23503")), "foreign_key_violation");
         assert!(!is_retryable(Some("23514")), "check_violation");
