@@ -30,7 +30,7 @@ gateway:
   replicas: 1
   # Client ping interval announced in Ready, in milliseconds.
   heartbeatMs: 30000
-  # Longer than the gateway's own 10 s drain.
+  # 5 s preStop sleep + the gateway's own 10 s drain + margin.
   terminationGracePeriodSeconds: 30
   resources:
     requests:
@@ -42,6 +42,7 @@ gateway:
 
 messageSvc:
   replicas: 1
+  terminationGracePeriodSeconds: 30
   dbMaxConnections: 10
   resources:
     requests:

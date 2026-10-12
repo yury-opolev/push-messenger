@@ -1,0 +1,78 @@
+{{- $name := include "push.name" (dict "root" . "component" "message-svc") -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "push.labels" (dict "root" . "component" "message-svc") | nindent 4 }}
+spec:
+  selector:
+    {{- include "push.selector" (dict "root" . "component" "message-svc") | nindent 4 }}
+  ports:
+    - name: grpc
+      port: 50051
+      targetPort: grpc
+      appProtocol: grpc
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "push.labels" (dict "root" . "component" "message-svc") | nindent 4 }}
+spec:
+  replicas: {{ .Values.messageSvc.replicas }}
+  selector:
+    matchLabels:
+      {{- include "push.selector" (dict "root" . "component" "message-svc") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "push.labels" (dict "root" . "component" "message-svc") | nindent 8 }}
+      {{- with .Values.buildId }}
+      annotations:
+        push-messenger/build-id: {{ . | quote }}
+      {{- end }}
+    spec:
+      automountServiceAccountToken: false
+      # Set explicitly (the Kubernetes default is also 30 s) so a graceful stop is a
+      # deliberate budget, not an accident.
+      terminationGracePeriodSeconds: {{ .Values.messageSvc.terminationGracePeriodSeconds }}
+      containers:
+        - name: message-svc
+          image: {{ include "push.image" .Values.images.messageSvc }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          {{- include "push.containerSecurity" . | nindent 10 }}
+          env:
+            - name: PUSH_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "push.secretName" . }}
+                  key: database-url
+            - name: PUSH_REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "push.secretName" . }}
+                  key: redis-url
+            - name: PUSH_DB_MAX_CONNECTIONS
+              value: {{ .Values.messageSvc.dbMaxConnections | quote }}
+            - name: PUSH_DEV_SETUP
+              value: {{ include "push.devFlag" . | quote }}
+          ports:
+            - name: grpc
+              containerPort: 50051
+            - name: health
+              containerPort: 8081
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.messageSvc.resources | nindent 12 }}

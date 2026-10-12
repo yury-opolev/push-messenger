@@ -1,0 +1,18 @@
+push-messenger {{ .Chart.AppVersion }} is installed as release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+
+WebSocket endpoint: ws://{{ .Values.ingress.host }}/v1/socket (through the ingress controller).
+
+To remove it, delete the namespace too:
+  helm uninstall {{ .Release.Name }} --namespace {{ .Release.Namespace }}
+  kubectl delete namespace {{ .Release.Namespace }}
+`helm uninstall` alone keeps the PostgreSQL volume (data-{{ .Release.Name }}-postgres-0)
+but deletes the Secret, so a later install generates a new password that the old
+database does not accept.
+{{- if include "push.devMode" . }}
+
+DEV MODE IS ON: the gateway accepts identities without a token and message-svc serves the
+DevSetup API. This is for a local cluster only.
+
+Run the end-to-end smoke test:
+  helm test {{ .Release.Name }} --namespace {{ .Release.Namespace }} --logs
+{{- end }}

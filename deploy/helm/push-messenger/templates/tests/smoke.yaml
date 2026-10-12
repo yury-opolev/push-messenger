@@ -1,0 +1,36 @@
+{{- if include "push.devMode" . -}}
+# `helm test <release>` runs the end-to-end smoke test inside the cluster: the dev setup
+# calls go straight to message-svc, the WebSockets through the ingress controller with
+# the ingress host as the Host header, as a client's would.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ include "push.name" (dict "root" . "component" "smoke") }}
+  labels:
+    {{- include "push.labels" (dict "root" . "component" "smoke") | nindent 4 }}
+  annotations:
+    helm.sh/hook: test
+    helm.sh/hook-delete-policy: before-hook-creation
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  containers:
+    - name: smoke
+      image: {{ include "push.image" .Values.images.smoke }}
+      imagePullPolicy: {{ .Values.images.pullPolicy }}
+      {{- include "push.containerSecurity" . | nindent 6 }}
+      args:
+        - --setup
+        - {{ printf "http://%s:50051" (include "push.name" (dict "root" . "component" "message-svc")) | quote }}
+        - --socket
+        - {{ .Values.smoke.socketUrl | quote }}
+        - --host
+        - {{ .Values.ingress.host | quote }}
+      resources:
+        requests:
+          cpu: 10m
+          memory: 16Mi
+        limits:
+          cpu: 200m
+          memory: 64Mi
+{{- end }}
