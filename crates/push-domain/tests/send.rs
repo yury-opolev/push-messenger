@@ -243,6 +243,7 @@ async fn a_send_tells_every_member_to_sync_and_a_failed_one_tells_nobody() {
     let _ = world.svc.send_text(text(&alice, chat, "")).await;
     assert!(world.notifier.take().is_empty());
 }
+
 #[tokio::test]
 async fn the_server_timestamp_comes_from_the_clock() {
     let world = World::new();
