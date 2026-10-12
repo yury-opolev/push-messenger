@@ -12,8 +12,8 @@
 
 ## Before you start
 
-- **Plan 3A must be merged first.** This plan builds on `push-testkit` and the `Tx` contract
-  as Plan 3A left them.
+- **Plan 3A is merged** (PR #4). This plan builds on `push-testkit` and the `Tx` contract
+  as Plan 3A left them on `main`.
 - Work from the repository root: `C:\Users\yurio\Documents\github\push-messenger`. Every
   command below starts there.
 - Create the branch from an up-to-date `main`:
@@ -49,8 +49,8 @@ $env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Env
   exit code; piping it into `Select-String` or `Out-Null` hides the diff and the failure.
   If it reports a diff, run `cargo fmt --all` and check again. The code in this plan is
   already formatted, so a diff usually means a copying mistake.
-- Baseline (after Plan 3A): `cargo test --workspace` passes 271 tests (`push-domain` 22
-  unit, `push-testkit` `in_memory` 249).
+- Baseline (after Plan 3A): `cargo test --workspace` passes 272 tests (`push-domain` 22
+  unit, `push-testkit` `in_memory` 250, of which 51 are contract cases).
 - **Testing rule:** the contract cases and scenarios already exist (Plan 3A). Each task
   first switches on the cases for the methods it implements and runs them to watch them
   fail (`not implemented: plan 3B task N`), then implements the methods. New helpers
@@ -66,7 +66,8 @@ cargo +1.85 build --workspace --all-targets --locked
 
   The last one is what the `msrv` CI job needs. Never add `#[allow(dead_code)]` or other
   `allow`s; the tasks introduce each helper with its first user.
-- **Scope rule:** no domain changes (Plan 3A made them), no connection settings, pool
+- **Scope rule:** no domain changes (Plan 3A made them; Tasks 3–6 only correct doc
+  comments in `push-domain/src/store.rs` and `push-testkit`), no connection settings, pool
   sizing or TLS for production (Plan 4 wires the service), no `docker compose` file (tests
   start their own container).
 
@@ -117,8 +118,9 @@ These were settled while writing the plan. Do not reopen them during execution.
 6. **Advisory lock keys** are the 64-bit FNV-1a hash of a tag (`contact-pair`,
    `conversation-positions`) followed by the 16-byte ids (a pair ordered lower first), read
    as a signed `bigint`. FNV-1a is fixed by its definition, so every replica computes the
-   same key. Two subjects sharing a key only wait for each other; correctness never
-   depends on keys being distinct.
+   same key. The tag namespaces each kind of lock, so a key shared across kinds is as
+   unlikely as any other 64-bit collision. Two subjects sharing a key, of one kind or of
+   two, only wait for each other; correctness never depends on keys being distinct.
 7. **The test harness.** `tests/postgres.rs` (`harness = false`) starts one container on
    the first case that needs it (`OnceLock`, through the main runtime's handle), so
    `--list` or a filter matching nothing starts no container; it removes the container
@@ -137,8 +139,10 @@ These were settled while writing the plan. Do not reopen them during execution.
    ordered; concurrent retries of one `client_msg_id` store one entry; concurrent
    `open_direct` calls create one conversation; a concurrent accept never undoes a block;
    concurrent redeems never exceed `max_uses`; concurrent acks by different members still
-   produce the group receipt; a deadlock is reported as a retryable `Conflict`. Each was
-   checked to fail when the lock it relies on is removed (Task 7, Step 4).
+   produce the group receipt; concurrent registrations of one device id by two users give
+   it exactly one owner, and the loser gets `UnknownDevice` and no delivery positions; a
+   deadlock is reported as a retryable `Conflict`. Each was checked to fail when the lock
+   or check it relies on is removed (Task 7, Step 4).
 10. **CI** needs no new job: `cargo test --workspace --locked` in both jobs runs the Postgres
     tests with the runner's Docker. Each job pulls `postgres:17-alpine` first (a registry
     failure then shows as such) and gets a 30-minute timeout.
@@ -163,11 +167,13 @@ crates/push-store/            NEW
 │   └── store.rs              PgStore, PgTx, impl Store, impl Tx
 └── tests/
     └── postgres.rs           harness = false: the suite on testcontainers
+crates/push-domain/src/store.rs   doc comments only (Tasks 3–5)
 crates/push-testkit/
 ├── Cargo.toml                tokio "macros"
 └── src/
     ├── lib.rs                + concurrency_cases()
-    └── concurrency.rs        NEW: the concurrency scenarios
+    ├── concurrency.rs        NEW: the concurrency scenarios
+    └── scenarios/send.rs     doc comment only (Task 6)
 ```
 
 ---
@@ -1087,7 +1093,7 @@ cargo fmt --all -- --check
 cargo +1.85 build --workspace --all-targets --locked
 ```
 
-Expected: 281 tests pass (`push-domain` 22, `push-store` 2 unit and 8 `postgres`, `push-testkit` 249 `in_memory`), no warnings, no diff, the 1.85 build succeeds.
+Expected: 282 tests pass (`push-domain` 22, `push-store` 2 unit and 8 `postgres`, `push-testkit` 250 `in_memory`), no warnings, no diff, the 1.85 build succeeds.
 
 ```powershell
 git add Cargo.toml Cargo.lock crates/push-store
@@ -1230,9 +1236,10 @@ Create `crates/push-store/src/locks.rs`:
 //!
 //! A key is the 64-bit FNV-1a hash of a fixed tag followed by the 16-byte ids it covers.
 //! FNV-1a is fixed by its definition, so every replica and every release computes the same
-//! key. Two different subjects can share a key; that only makes two unrelated operations
-//! wait for each other, never lets two operations on one subject run together. The tags
-//! keep the kinds of lock apart.
+//! key. The tag namespaces each kind of lock, so a key shared by two kinds is as unlikely
+//! as any other 64-bit collision. Any shared key, within a kind or across kinds, only
+//! makes two unrelated operations wait for each other; it never lets two operations on one
+//! subject run together.
 
 use push_domain::UserId;
 use uuid::Uuid;
@@ -1483,7 +1490,7 @@ cargo fmt --all -- --check
 cargo +1.85 build --workspace --all-targets --locked
 ```
 
-Expected: 291 tests pass (`push-domain` 22, `push-store` 6 unit and 14 `postgres`, `in_memory` 249), no warnings, no diff, the 1.85 build succeeds.
+Expected: 292 tests pass (`push-domain` 22, `push-store` 6 unit and 14 `postgres`, `in_memory` 250), no warnings, no diff, the 1.85 build succeeds.
 
 ```powershell
 git add Cargo.lock crates/push-store
@@ -1497,6 +1504,7 @@ git commit -m "feat(store): contacts and invites on Postgres"
 **Files:**
 - Modify: `crates/push-store/src/rows.rs`, `locks.rs`, `store.rs`
 - Modify: `crates/push-store/tests/postgres.rs`
+- Modify: `crates/push-domain/src/store.rs` (a doc comment)
 
 - [ ] **Step 1: Switch on the conversations cases and watch them fail**
 
@@ -1522,7 +1530,9 @@ Expected: the 13 `contract::conversations::…` cases fail with `not implemented
 In `crates/push-store/src/locks.rs`, replace `use push_domain::UserId;` with `use push_domain::{ConversationId, UserId};`, add after the function `contact_pair`:
 
 ```rust
-/// The lock serialising changes to a conversation's delivery and read positions.
+/// The lock serialising changes to a conversation's delivery and read positions. Its tag
+/// namespaces it: sharing a key with another kind of lock is unlikely and only adds
+/// waiting.
 pub(crate) fn conversation_positions(conversation: ConversationId) -> i64 {
     fnv1a(b"conversation-positions", &[conversation.0])
 }
@@ -1539,6 +1549,21 @@ and add this test at the end of its `tests` module:
             fnv1a(b"contact-pair", &[id])
         );
     }
+```
+
+In `crates/push-domain/src/store.rs`, the doc comment of `lock_conversation_positions`
+overstates what the tag gives. Replace its last two lines:
+
+```rust
+    /// namespaced (tagged) hash of the conversation id, so it cannot share a key with the
+    /// contact-pair lock.
+```
+
+with:
+
+```rust
+    /// namespaced (tagged) hash of the conversation id, so sharing a key with another kind
+    /// of lock, such as a contact pair's, is unlikely and would only add waiting.
 ```
 
 - [ ] **Step 3: Read conversations and members from rows**
@@ -1879,10 +1904,10 @@ cargo fmt --all -- --check
 cargo +1.85 build --workspace --all-targets --locked
 ```
 
-Expected: 305 tests pass (`push-domain` 22, `push-store` 7 unit and 27 `postgres`, `in_memory` 249), no warnings, no diff, the 1.85 build succeeds.
+Expected: 306 tests pass (`push-domain` 22, `push-store` 7 unit and 27 `postgres`, `in_memory` 250), no warnings, no diff, the 1.85 build succeeds.
 
 ```powershell
-git add crates/push-store
+git add crates/push-store crates/push-domain
 git commit -m "feat(store): conversations and members on Postgres"
 ```
 
@@ -1893,6 +1918,7 @@ git commit -m "feat(store): conversations and members on Postgres"
 **Files:**
 - Modify: `crates/push-store/src/rows.rs`, `store.rs`
 - Modify: `crates/push-store/tests/postgres.rs`
+- Modify: `crates/push-domain/src/store.rs` (a doc comment)
 
 - [ ] **Step 1: Switch on the entries cases and watch them fail**
 
@@ -2279,7 +2305,25 @@ and replace the stubs of `insert_entry`, `entry_by_client_id`, `entry_by_message
 
 `count_incoming_messages` counts inside a `LIMIT`ed subquery, so it stops at the cap; `first_live_message` and `messages_before` are single range scans of the primary key and the history index.
 
-- [ ] **Step 4: Run the gates and commit**
+- [ ] **Step 4: Document the errors of `insert_entry`**
+
+The contract says when `insert_entry` returns `Duplicate` but not when it fails. In
+`crates/push-domain/src/store.rs`, replace the doc comment of `insert_entry`:
+
+```rust
+    /// `Duplicate` if the conversation already has an entry with this `client_msg_id`.
+```
+
+with:
+
+```rust
+    /// `Duplicate`, writing nothing, if the conversation already has an entry with this
+    /// `client_msg_id`. Otherwise fails with `DomainError::Store` if an entry with this
+    /// `message_id` exists (in any conversation) or the conversation already has an entry
+    /// at this `seq`.
+```
+
+- [ ] **Step 5: Run the gates and commit**
 
 ```powershell
 cargo test --workspace
@@ -2288,10 +2332,10 @@ cargo fmt --all -- --check
 cargo +1.85 build --workspace --all-targets --locked
 ```
 
-Expected: 319 tests pass (`push-domain` 22, `push-store` 7 unit and 41 `postgres`, `in_memory` 249), no warnings, no diff, the 1.85 build succeeds.
+Expected: 320 tests pass (`push-domain` 22, `push-store` 7 unit and 41 `postgres`, `in_memory` 250), no warnings, no diff, the 1.85 build succeeds.
 
 ```powershell
-git add crates/push-store
+git add crates/push-store crates/push-domain
 git commit -m "feat(store): the message log on Postgres"
 ```
 
@@ -2302,6 +2346,7 @@ git commit -m "feat(store): the message log on Postgres"
 **Files:**
 - Modify: `crates/push-store/src/store.rs`
 - Modify: `crates/push-store/tests/postgres.rs`
+- Modify: `crates/push-domain/src/store.rs` (a doc comment)
 
 - [ ] **Step 1: Switch on the positions cases and watch them fail**
 
@@ -2322,7 +2367,7 @@ In `crates/push-store/tests/postgres.rs`, replace the `READY` list with:
 cargo test -p push-store --test postgres
 ```
 
-Expected: the 8 `contract::positions::…` cases fail with `not implemented: plan 3B task 5`.
+Expected: the 9 `contract::positions::…` cases fail with `not implemented: plan 3B task 5`.
 
 - [ ] **Step 2: Implement the methods**
 
@@ -2491,7 +2536,27 @@ and replace the stubs of `get_cursor`, `create_cursor_if_absent`, `raise_cursor`
 
 `raise_cursor` is one upsert that updates only upwards: `rows_affected` is 1 when the position was created or moved. `sync_positions` starts from the memberships and left-joins the device's positions, so a missing position counts as the floor. `group_positions` is the SQL function of the migration: one statement however many members the group has.
 
-- [ ] **Step 3: Run the gates and commit**
+- [ ] **Step 3: Document `get_cursor`**
+
+In `crates/push-domain/src/store.rs`, replace
+
+```rust
+    // --- Delivery positions ------------------------------------------------------------
+
+    async fn get_cursor(
+```
+
+with:
+
+```rust
+    // --- Delivery positions ------------------------------------------------------------
+
+    /// The device's delivery position in the conversation; `None` if it has none there.
+    /// Revoked devices keep their positions.
+    async fn get_cursor(
+```
+
+- [ ] **Step 4: Run the gates and commit**
 
 ```powershell
 cargo test --workspace
@@ -2500,10 +2565,10 @@ cargo fmt --all -- --check
 cargo +1.85 build --workspace --all-targets --locked
 ```
 
-Expected: 327 tests pass (`push-domain` 22, `push-store` 7 unit and 49 `postgres`, `in_memory` 249), no warnings, no diff, the 1.85 build succeeds.
+Expected: 329 tests pass (`push-domain` 22, `push-store` 7 unit and 50 `postgres`, `in_memory` 250), no warnings, no diff, the 1.85 build succeeds.
 
 ```powershell
-git add crates/push-store
+git add crates/push-store crates/push-domain
 git commit -m "feat(store): delivery positions and group positions on Postgres"
 ```
 
@@ -2514,6 +2579,7 @@ git commit -m "feat(store): delivery positions and group positions on Postgres"
 **Files:**
 - Modify: `crates/push-store/src/store.rs`
 - Modify: `crates/push-store/tests/postgres.rs`
+- Modify: `crates/push-testkit/src/scenarios/send.rs` (a doc comment)
 
 - [ ] **Step 1: Run every case and watch the rest fail**
 
@@ -2527,7 +2593,7 @@ In `crates/push-store/tests/postgres.rs`, replace everything from the comment `/
 cargo test -p push-store --test postgres
 ```
 
-Expected: 249 cases run and 14 fail with `not implemented: plan 3B task 6`: `contract::overviews::overviews_hold_what_a_listing_needs_for_every_membership`, the 11 `listings::…` scenarios, `groups::messages_from_before_joining_are_neither_unread_nor_changed_for_the_new_member` and `membership::a_former_member_lists_the_group_as_it_was_when_they_left`. The other 235 pass: every domain operation except listing already works on Postgres.
+Expected: 250 cases run and 14 fail with `not implemented: plan 3B task 6`: `contract::overviews::overviews_hold_what_a_listing_needs_for_every_membership`, the 11 `listings::…` scenarios, `groups::messages_from_before_joining_are_neither_unread_nor_changed_for_the_new_member` and `membership::a_former_member_lists_the_group_as_it_was_when_they_left`. The other 236 pass: every domain operation except listing already works on Postgres.
 
 - [ ] **Step 2: Implement the overviews**
 
@@ -2668,7 +2734,24 @@ fn overview(row: &PgRow) -> Result<ConversationOverview, sqlx::Error> {
 
 One statement for every membership of the user: the members and admins are aggregated in sorted arrays, the direct peer and its delivery position come from a `LATERAL` subquery that only direct conversations run, the unread count stops at the cap inside a `LIMIT`ed subquery, the group positions come from `messaging.group_positions` only for groups, and a former member's departure time is a primary-key lookup of the entry at `left_at_seq`.
 
-- [ ] **Step 3: Run the gates and commit**
+- [ ] **Step 3: Say what the commit probe proves on Postgres**
+
+`send::events_are_published_only_after_the_send_commits` now runs on Postgres too, where
+`begin` never waits for the sender. In `crates/push-testkit/src/scenarios/send.rs`,
+replace the last line of the doc comment of `CommitProbe`:
+
+```rust
+/// the new message is already visible.
+```
+
+with:
+
+```rust
+/// the new message is already visible. On Postgres an early publish is caught because an
+/// independent READ COMMITTED transaction would still see `last_seq == 0`.
+```
+
+- [ ] **Step 4: Run the gates and commit**
 
 ```powershell
 cargo test --workspace
@@ -2677,10 +2760,10 @@ cargo fmt --all -- --check
 cargo +1.85 build --workspace --all-targets --locked
 ```
 
-Expected: 527 tests pass (`push-domain` 22, `push-store` 7 unit and 249 `postgres`, `in_memory` 249), no warnings, no diff, the 1.85 build succeeds. The `postgres` target takes about 10 seconds.
+Expected: 529 tests pass (`push-domain` 22, `push-store` 7 unit and 250 `postgres`, `in_memory` 250), no warnings, no diff, the 1.85 build succeeds. The `postgres` target takes about 10 seconds.
 
 ```powershell
-git add crates/push-store
+git add crates/push-store crates/push-testkit
 git commit -m "feat(store): conversation overviews; run the whole suite on Postgres"
 ```
 
@@ -2696,7 +2779,8 @@ git commit -m "feat(store): conversation overviews; run the whole suite on Postg
 The in-memory store serialises every transaction, so these scenarios mean something only
 on Postgres (decision 9). They are written against the public API and pass as soon as
 they run, because Plan 3A and Tasks 1–6 put the locks in place; Step 4 removes each lock
-in turn to watch the scenario that depends on it fail.
+(and the owner re-check of `insert_device`) in turn to watch the scenario that depends on
+it fail.
 
 - [ ] **Step 1: Write the scenarios**
 
@@ -2712,7 +2796,7 @@ use std::sync::Arc;
 
 use chrono::TimeDelta;
 use push_domain::{
-    ContactState, DomainError, Event, ReceiptUpdate, SendReceipt, Store, Tx, UserId,
+    ContactState, DeviceId, DomainError, Event, ReceiptUpdate, SendReceipt, Store, Tx, UserId,
 };
 use tokio::task::JoinSet;
 
@@ -2920,6 +3004,46 @@ async fn concurrent_acks_by_different_members_produce_the_group_receipt<B: Backe
     }
 }
 
+async fn concurrent_registrations_of_one_device_give_it_one_owner<B: Backend>(backend: &B) {
+    let world = Arc::new(World::new(backend).await);
+    let (alice, bob, carol) = (
+        world.person().await,
+        world.person().await,
+        world.person().await,
+    );
+    let users = [alice.user, bob.user];
+    let chats = [
+        world.direct_chat(&alice, &carol).await,
+        world.direct_chat(&bob, &carol).await,
+    ];
+
+    for _ in 0..10 {
+        let device = DeviceId::new();
+        let registrations = users
+            .into_iter()
+            .map(|user| {
+                let world = Arc::clone(&world);
+                async move { world.svc.register_device(device, user).await }
+            })
+            .collect();
+        let results = all(registrations).await;
+
+        let winner = results
+            .iter()
+            .position(Result::is_ok)
+            .expect("one registration succeeds");
+        let loser = 1 - winner;
+        assert_eq!(results[loser], Err(DomainError::UnknownDevice));
+        assert_eq!(world.svc.identify(device, users[winner]).await, Ok(()));
+        assert_eq!(
+            world.svc.identify(device, users[loser]).await,
+            Err(DomainError::UnknownDevice)
+        );
+        assert!(world.position(device, chats[winner]).await.is_some());
+        assert_eq!(world.position(device, chats[loser]).await, None);
+    }
+}
+
 async fn a_deadlock_is_reported_as_a_retryable_conflict<B: Backend>(backend: &B) {
     let store = backend.store().await;
     let [a, b, c, d] = [(); 4].map(|()| UserId::new());
@@ -2961,6 +3085,7 @@ pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
         a_concurrent_accept_never_undoes_a_block,
         concurrent_redeems_never_exceed_the_use_limit,
         concurrent_acks_by_different_members_produce_the_group_receipt,
+        concurrent_registrations_of_one_device_give_it_one_owner,
         a_deadlock_is_reported_as_a_retryable_conflict,
     ]
     .into_iter()
@@ -2999,7 +3124,7 @@ In `crates/push-store/tests/postgres.rs`, replace `let conclusion = push_testkit
 cargo test -p push-store --test postgres -- concurrency::
 ```
 
-Expected: 7 cases, all `ok`.
+Expected: 8 cases, all `ok`.
 
 - [ ] **Step 3: Check that they do not flake**
 
@@ -3007,7 +3132,7 @@ Expected: 7 cases, all `ok`.
 foreach ($run in 1..5) { cargo test -p push-store --test postgres -- concurrency:: }
 ```
 
-Expected: five runs, each `7 passed`.
+Expected: five runs, each `8 passed`.
 
 - [ ] **Step 4: Watch each scenario catch the bug it is for**
 
@@ -3018,6 +3143,33 @@ Make each of these changes in `crates/push-store/src/store.rs` on its own, run `
 | In `lock_conversation_positions`, bind `locks::conversation_positions(ConversationId(Uuid::new_v4()))` instead of `locks::conversation_positions(conversation)` | `concurrent_acks_by_different_members_produce_the_group_receipt` |
 | In `lock_contact_pair`, bind `locks::contact_pair(UserId::new(), UserId::new())` instead of `locks::contact_pair(a, b)` | `a_concurrent_accept_never_undoes_a_block`, `a_deadlock_is_reported_as_a_retryable_conflict` |
 | In `lock_invite`, delete ` FOR UPDATE` from the query | `concurrent_redeems_never_exceed_the_use_limit` |
+| In `insert_device`, replace the second statement (the `SELECT user_id = $2 …` re-check) with `Ok(true)` | `concurrent_registrations_of_one_device_give_it_one_owner` |
+| Replace the whole body of `insert_device` with the single statement below, which re-checks inside the insert's own statement | `concurrent_registrations_of_one_device_give_it_one_owner` |
+
+```rust
+    async fn insert_device(&mut self, device: DeviceId, user: UserId) -> DomainResult<bool> {
+        sqlx::query_scalar(
+            "WITH inserted AS ( \
+                INSERT INTO messaging.member_device (device_id, user_id) VALUES ($1, $2) \
+                ON CONFLICT (device_id) DO NOTHING RETURNING user_id \
+             ) \
+             SELECT coalesce((SELECT true FROM inserted), \
+                (SELECT user_id = $2 AND revoked_at IS NULL \
+                 FROM messaging.member_device WHERE device_id = $1))",
+        )
+        .bind(device.0)
+        .bind(user.0)
+        .fetch_one(self.conn())
+        .await
+        .map_err(store_error)
+    }
+```
+
+The single statement passes every contract case and scenario, but under READ COMMITTED its
+snapshot is taken before the concurrent registration commits: the loser's `ON CONFLICT`
+waits and does nothing, its re-check sees no row, and the registration fails with
+`Store("… unexpected null …")` instead of `UnknownDevice`. That is why `insert_device`
+re-checks in a second statement, which sees the winner's committed row.
 
 Finish with `git diff --stat crates/push-store` printing nothing.
 
@@ -3030,7 +3182,7 @@ cargo fmt --all -- --check
 cargo +1.85 build --workspace --all-targets --locked
 ```
 
-Expected: 534 tests pass (`push-domain` 22, `push-store` 7 unit and 256 `postgres`, `in_memory` 249), no warnings, no diff, the 1.85 build succeeds.
+Expected: 537 tests pass (`push-domain` 22, `push-store` 7 unit and 258 `postgres`, `in_memory` 250), no warnings, no diff, the 1.85 build succeeds.
 
 ```powershell
 git add Cargo.lock crates/push-testkit crates/push-store
@@ -3126,8 +3278,8 @@ Implementation notes (push-store, migration `0001_messaging.sql`):
   `UPDATE conversation SET last_seq = last_seq + 1, updated_at = greatest(updated_at, $at)
   … RETURNING last_seq`, whose row lock serialises appends. Contact pairs and a group's
   receipt positions are serialised with `pg_advisory_xact_lock` on a 64-bit FNV-1a hash of
-  the ids; invites with `SELECT … FOR UPDATE`. Serialization failures and deadlocks are
-  reported as a retryable conflict.
+  a per-kind tag and the ids; invites with `SELECT … FOR UPDATE`. Serialization failures
+  and deadlocks are reported as a retryable conflict.
 ```
 
 - [ ] **Step 4: Mark plan 3B in review**
@@ -3143,7 +3295,7 @@ cargo test --workspace --locked
 cargo +1.85 test --workspace --locked
 ```
 
-Expected: no formatting diff, no warnings, 534 tests pass on both toolchains.
+Expected: no formatting diff, no warnings, 537 tests pass on both toolchains.
 
 - [ ] **Step 6: Commit and push**
 
@@ -3156,7 +3308,7 @@ git push -u origin feature/plan-03b-postgres-store
 - [ ] **Step 7: Open the pull request and wait for CI**
 
 ```powershell
-gh pr create --base main --title "Plan 3B: Postgres store" --body "Implements docs/superpowers/plans/2026-10-12-plan-03b-postgres-store.md: push-store with the messaging schema as an embedded sqlx migration, every Tx method on PostgreSQL (runtime-checked queries, READ COMMITTED, row and advisory locks, ON CONFLICT DO NOTHING for duplicates, 40001/40P01 mapped to Conflict), set-based statements for group positions, listings, sync and conversation state, the whole push-testkit suite on testcontainers (postgres:17-alpine, one database per case) and seven concurrency scenarios."
+gh pr create --base main --title "Plan 3B: Postgres store" --body "Implements docs/superpowers/plans/2026-10-12-plan-03b-postgres-store.md: push-store with the messaging schema as an embedded sqlx migration, every Tx method on PostgreSQL (runtime-checked queries, READ COMMITTED, row and advisory locks, ON CONFLICT DO NOTHING for duplicates, 40001/40P01 mapped to Conflict), set-based statements for group positions, listings, sync and conversation state, the whole push-testkit suite on testcontainers (postgres:17-alpine, one database per case) and eight concurrency scenarios."
 gh pr checks --watch
 ```
 
@@ -3176,6 +3328,7 @@ Expected: the `ci` workflow succeeds (`rust` and `msrv` jobs, each running the P
 | §4.6 edit and delete erasure (`erase_edit_bodies`, `update_entry`) | 4 |
 | §4.7 `seq` gapless; positions only move forward | 3, 5, 7 |
 | §5.5 contacts serialised per pair; invites with `FOR UPDATE` and a use limit that holds under concurrency | 2, 7 |
+| Plan 3A `insert_device` contract: two concurrent registrations of one device id cannot both succeed for different users | 1, 7 |
 | §12 integration layer on real Postgres via testcontainers; adverse test 2 (two identical sends at once: one row, no gap) | 1–7 |
 | Plan 3 decisions: crate, sqlx runtime queries, embedded migrations, error mapping, `ON CONFLICT DO NOTHING`, `next_seq` statement, pair and positions advisory locks, `lock_invite` `FOR UPDATE`, conformance on both stores, concurrency tests, CI | 1–8 |
 
