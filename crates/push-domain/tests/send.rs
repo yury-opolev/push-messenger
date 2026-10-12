@@ -1,14 +1,14 @@
 mod common;
 
 use chrono::{TimeZone, Utc};
-use common::{Person, World, text};
+use common::{Person, World, entries_for, text};
 use push_domain::{
-    ConversationId, DeviceId, DomainError, InMemoryStore, ManualClock, Messaging, Notifier,
+    ConversationId, DeviceId, DomainError, Event, InMemoryStore, ManualClock, Messaging, Notifier,
     SendText, Store, Tx, UserId, ValidationError,
 };
 use std::sync::Arc;
 
-/// Proves a notification happens after commit: it begins its own transaction (which would
+/// Proves events are published after commit: it begins its own transaction (which would
 /// wait forever on the in-memory store's lock if the sender's were still open) and checks
 /// the new message is already visible.
 struct CommitProbe {
@@ -18,10 +18,13 @@ struct CommitProbe {
 
 #[async_trait::async_trait]
 impl Notifier for CommitProbe {
-    async fn notify_users(&self, users: &[UserId]) {
+    async fn publish(&self, events: &[Event]) {
+        let Some(Event::EntriesAvailable { users }) = events.first() else {
+            return;
+        };
         let mut tx = tokio::time::timeout(std::time::Duration::from_secs(2), self.store.begin())
             .await
-            .expect("notified while the sending transaction was still open")
+            .expect("published while the sending transaction was still open")
             .unwrap();
         // The conversation's last_seq as seen by an independent transaction.
         let memberships = tx.memberships(users[0]).await.unwrap();
@@ -47,7 +50,7 @@ async fn register(svc: &Messaging<InMemoryStore, Arc<ManualClock>, Arc<CommitPro
 }
 
 #[tokio::test]
-async fn members_are_notified_only_after_the_send_commits() {
+async fn events_are_published_only_after_the_send_commits() {
     let store = InMemoryStore::new();
     let probe = Arc::new(CommitProbe {
         store: store.clone(),
@@ -186,7 +189,7 @@ async fn a_retry_after_being_blocked_still_returns_the_original() {
 }
 
 #[tokio::test]
-async fn a_retry_is_not_notified_again() {
+async fn a_retry_publishes_nothing() {
     let world = World::new();
     let (alice, bob) = (world.person().await, world.person().await);
     let chat = world.direct_chat(&alice, &bob).await;
@@ -228,25 +231,18 @@ async fn sending_to_an_unknown_conversation_fails() {
 }
 
 #[tokio::test]
-async fn members_are_notified_only_after_a_successful_send() {
+async fn a_send_tells_every_member_to_sync_and_a_failed_one_tells_nobody() {
     let world = World::new();
     let (alice, bob) = (world.person().await, world.person().await);
     let chat = world.direct_chat(&alice, &bob).await;
     world.notifier.take();
 
     world.send(&alice, chat, "hi").await;
-    let calls = world.notifier.take();
-    assert_eq!(calls.len(), 1);
-    let mut notified = calls[0].clone();
-    notified.sort();
-    let mut expected = vec![alice.user, bob.user];
-    expected.sort();
-    assert_eq!(notified, expected);
+    assert_eq!(world.notifier.take(), [entries_for(&[&alice, &bob])]);
 
     let _ = world.svc.send_text(text(&alice, chat, "")).await;
     assert!(world.notifier.take().is_empty());
 }
-
 #[tokio::test]
 async fn the_server_timestamp_comes_from_the_clock() {
     let world = World::new();

@@ -6,8 +6,8 @@ use crate::conversations::require_conversation;
 use crate::error::{DomainError, DomainResult};
 use crate::ids::{ClientMsgId, ConversationId, DeviceId, MessageId, UserId};
 use crate::model::{ContentType, ConversationKind, Entry, EntryKind, SendReceipt};
-use crate::notify::Notifier;
-use crate::service::{Messaging, require_device};
+use crate::notify::{Event, Notifier};
+use crate::service::{Messaging, current_member_ids, require_device};
 use crate::store::{InsertOutcome, Store, Tx};
 use crate::validation::validate_text;
 
@@ -30,7 +30,7 @@ where
     N: Notifier,
 {
     /// Appends a text message. A retry with the same `client_msg_id` returns the original
-    /// receipt, stores nothing new and notifies nobody — even if the sender has since lost
+    /// receipt, stores nothing new and publishes nothing — even if the sender has since lost
     /// the right to send.
     pub async fn send_text(&self, command: SendText) -> DomainResult<SendReceipt> {
         validate_text(&command.body)?;
@@ -104,12 +104,10 @@ where
             .await?;
         tx.commit().await?;
 
-        let recipients: Vec<UserId> = members
-            .iter()
-            .filter(|member| member.is_current())
-            .map(|member| member.user_id)
-            .collect();
-        self.notifier.notify_users(&recipients).await;
+        self.publish(vec![Event::EntriesAvailable {
+            users: current_member_ids(&members),
+        }])
+        .await;
         Ok(receipt)
     }
 

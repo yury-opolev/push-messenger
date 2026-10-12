@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use chrono::{TimeZone, Utc};
 use push_domain::{
-    ClientMsgId, ConversationId, DeviceId, Entry, InMemoryStore, ManualClock, Messaging,
+    ClientMsgId, ConversationId, DeviceId, Entry, Event, InMemoryStore, ManualClock, Messaging,
     RecordingNotifier, SendReceipt, SendText, Store, Tx, UserId,
 };
 
@@ -136,4 +136,11 @@ pub fn bodies(entries: &[Entry]) -> Vec<String> {
 
 pub fn seqs(entries: &[Entry]) -> Vec<i64> {
     entries.iter().map(|entry| entry.seq).collect()
+}
+
+/// The event that tells these people to sync.
+pub fn entries_for(people: &[&Person]) -> Event {
+    let mut users: Vec<UserId> = people.iter().map(|person| person.user).collect();
+    users.sort();
+    Event::EntriesAvailable { users }
 }

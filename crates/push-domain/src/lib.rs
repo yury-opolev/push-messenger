@@ -28,7 +28,7 @@ pub use model::{
     ContactState, ContentType, Conversation, ConversationKind, ConversationState, Entry, EntryKind,
     Member, MemberState, Role, SendReceipt, direct_key,
 };
-pub use notify::{NoopNotifier, Notifier, RecordingNotifier};
+pub use notify::{Event, NoopNotifier, Notifier, ReceiptUpdate, RecordingNotifier};
 pub use send::SendText;
 pub use service::Messaging;
 pub use store::{InsertOutcome, Store, Tx};
