@@ -38,7 +38,8 @@ message Identify {
   // The access token (a JWT, Plan 5). Not checked yet.
   string token = 1;
   // DEV ONLY: accepted only by a gateway started with PUSH_DEV_AUTH=1, which trusts
-  // these ids without any proof. Removed when real tokens arrive (Plan 8).
+  // these ids without any proof. Removed when real tokens arrive (Plan 8); when
+  // removing them, reserve their field numbers (14, 15) and names.
   bytes dev_user_id = 14;
   bytes dev_device_id = 15;
   // private_reads: the device does not reveal reads to others.

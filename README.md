@@ -8,11 +8,14 @@ We build the server side and an SDK; third parties build the user interfaces.
 
 ## Build and test
 
-The Postgres tests of `push-store` start a `postgres:17-alpine` container through
-Docker, so Docker must be running (the first run pulls the image):
+The integration tests start `postgres:17-alpine` and `redis:7-alpine` containers through
+Docker, so Docker must be running (the first run pulls the images):
 
     docker version
     cargo test --workspace
+
+Building needs neither a database nor a system `protoc` (`push-proto` uses a vendored
+one).
 
 ## License
 

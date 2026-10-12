@@ -581,7 +581,7 @@ Request frames carry a client-chosen `request_id`, echoed in the response:
 | Frame | Fields |
 |---|---|
 | Ready | `user_id, device_id, heartbeat_ms` |
-| Deliver | `conversation_id, seq, message_id, client_msg_id, kind, target_message_id, sender_id, content_type, body, client_ts, server_ts, edited_at, edit_seq, deleted` |
+| Deliver | `conversation_id, seq, message_id, client_msg_id, kind, target_seq, sender_id, content_type, body, client_ts, server_ts, edited_at, edit_seq, deleted` — `target_seq` is set on edit and delete entries: the `seq` of the message they change, as the log stores it |
 | SendAck | `client_msg_id, message_id, seq, server_ts` (also for Edit and Delete) |
 | Receipt | direct: `conversation_id, user_id, delivered_seq, read_seq`; group: `conversation_id, all_delivered_seq, all_read_seq` |
 | ReadPosition | `conversation_id, read_seq` — the user's own read position moved |
@@ -624,6 +624,39 @@ Request frames carry a client-chosen `request_id`, echoed in the response:
 | Azure Load Balancer idle timeout | 4 min | 30 min, with TCP reset |
 | nginx `proxy_read_timeout` / `proxy_send_timeout` | 60 s | 120 s |
 | Client ping interval | — | 30 s |
+
+### 7.6 Encoding and the internal API
+
+Implementation notes (push-proto, Plan 4A):
+
+- `crates/push-proto/proto/push/v1/frame.proto` holds the client frames,
+  `push/internal/v1/messaging.proto` the gateway's gRPC calls to message-svc. Rust code is
+  generated at build time with a vendored `protoc`, so building needs no system protoc.
+- Identifiers are 16-byte UUIDs; times are microseconds since the Unix epoch, UTC.
+- Frame field numbers: client frames 1–31, server frames 32–63. Reserved field numbers:
+  `ephemeral` 16, `urgent` 17 and media `attachments` 18 on `Send` and `Deliver`;
+  `private_reads` 16 on `Identify`.
+- A failed gRPC call carries the client's `Error` frame, encoded, in the status details;
+  the gateway forwards it, adding the `client_msg_id` of the `Send` it answers. Storage
+  failures and conflicts are `retryable`.
+- message-svc publishes a small `Notification` (entries available, receipt, contact
+  change, read position; never a body) on `notify:{user_id}` after every commit. The
+  gateway subscribes to the channels of the users it holds and syncs their devices; it
+  does not send an entry twice on one connection, so repeated syncs without acks are
+  harmless.
+- **DEV ONLY identity, until real tokens (Plans 5 and 8).** A gateway started with
+  `PUSH_DEV_AUTH=1` accepts `Identify{dev_user_id, dev_device_id}` without a token;
+  otherwise `Identify` closes with 4001. message-svc started with `PUSH_DEV_SETUP=1`
+  serves the `DevSetup` gRPC service (register users and devices, make contacts, open a
+  direct conversation). Both variables accept only `1` or `0`, and both services log a
+  warning at start-up when enabled. When the dev fields are removed (Plan 8), their field
+  numbers (14, 15) and names are reserved.
+- **Start-up and runtime behaviour (message-svc).** It fails at start-up, without
+  retrying, on an invalid database or Redis URL and on `PUSH_DB_MAX_CONNECTIONS=0`; error
+  messages never echo URLs. Store timeouts must be between 1 ms and `i32::MAX` ms.
+  Start-up connect retries (every 2 s) and Redis subscription commands are interruptible
+  by shutdown; Redis subscription commands are bounded at 5 s. Services migrate with
+  `push_store::migrate_database` on a dedicated connection, not the request pool.
 
 ## 8. SDK
 
@@ -726,7 +759,8 @@ push-messenger/
 │   ├── push-message-svc  binary
 │   ├── push-auth         binary
 │   ├── push-worker       binary
-│   └── push-sdk          client core
+│   ├── push-sdk          client core
+│   └── push-smoke        end-to-end smoke test of a running deployment (not published)
 ├── bindings/
 │   ├── node/             napi-rs
 │   └── c/                cbindgen
