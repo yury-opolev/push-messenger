@@ -242,7 +242,7 @@ pub trait Tx: Send {
     ) -> DomainResult<u32>;
     /// The lowest `seq` with `after < seq <= up_to` of a message (`kind = Message`) that is
     /// not deleted and, if `not_from` is given, was sent by someone else. `None` if there is
-    /// none. On Postgres one range scan of the primary key: `… ORDER BY seq LIMIT 1`.
+    /// none. On Postgres one range scan of the `message_live` partial index: `… ORDER BY seq LIMIT 1`.
     async fn first_live_message(
         &mut self,
         conversation: ConversationId,

@@ -194,6 +194,15 @@ outbox ( event_id uuid primary key, kind text not null,
          payload jsonb not null, created_at timestamptz not null default now() )
 ```
 
+**Implementation status.** `push-store` implements this schema as the migration
+`crates/push-store/migrations/0001_messaging.sql`, with these additions: `smallint`
+enums with `CHECK`s, `direct_key` of exactly 32 bytes and only on direct conversations,
+checks on invite codes and uses, an index on `member_device (user_id)`, partial indexes on
+`message` (edit targets, history kinds, live messages) and three SQL functions
+(`messaging.delivered_seq`, `messaging.effective_position`, `messaging.group_positions`).
+The `outbox` table above is **not** part of the messaging migration yet: the plan that
+first needs it (worker/auth) adds it.
+
 ### 3.3 worker schema
 
 ```sql
