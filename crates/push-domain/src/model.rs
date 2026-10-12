@@ -120,7 +120,8 @@ impl From<&Entry> for SendReceipt {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemberState {
     pub user_id: UserId,
-    /// Furthest delivery position across the member's active devices.
+    /// Furthest delivery position across all of the member's devices. Positions of revoked
+    /// devices count: a delivery that happened stays delivered.
     pub delivered_seq: i64,
     pub read_seq: i64,
 }

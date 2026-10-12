@@ -245,6 +245,7 @@ async fn a_new_device_gets_nothing_from_a_conversation_already_left() {
     world.set_visibility(chat, bob.user, 1, Some(2)).await;
 
     let new_device = world.add_device(&bob).await;
+    assert_eq!(world.position(new_device, chat).await, Some(2));
     let batch = world.svc.sync(new_device, 100).await.unwrap();
     assert!(batch.entries.is_empty());
     let history = world.svc.history(bob.user, chat, None, 10).await.unwrap();

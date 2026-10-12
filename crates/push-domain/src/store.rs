@@ -22,9 +22,11 @@
 //!
 //! # Delivery positions
 //!
-//! A device may lack a delivery position for a conversation (for example one joined after
-//! the device registered). Readers fall back to `visible_from_seq - 1`, so sync iterates
-//! memberships rather than joining only on existing positions.
+//! Positions are created eagerly, so a device normally has one for every membership of its
+//! user. One can still be missing: a device registered concurrently with a membership
+//! change reads the memberships before the new member row commits. Readers fall back to
+//! `visible_from_seq - 1`, so sync iterates memberships rather than joining only on
+//! existing positions.
 //!
 //! [`DomainError::Conflict`]: crate::error::DomainError::Conflict
 
