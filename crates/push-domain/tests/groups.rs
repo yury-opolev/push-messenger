@@ -2,7 +2,7 @@ mod common;
 
 use common::{World, entries_for, seqs, system_events, text};
 use push_domain::{
-    Clock, ContentType, ConversationId, DomainError, EntryKind, MAX_GROUP_MEMBERS, Role,
+    Clock, ContentType, ConversationId, DomainError, EntryKind, MAX_GROUP_MEMBERS, Positions, Role,
     SystemEvent, UserId, ValidationError,
 };
 
@@ -352,4 +352,163 @@ async fn a_device_registered_later_starts_at_the_end_of_the_group() {
             .entries
             .is_empty()
     );
+}
+
+#[tokio::test]
+async fn adding_members_does_not_lower_all_read() {
+    let world = World::new();
+    let (alice, bob, dave) = (
+        world.person().await,
+        world.person().await,
+        world.person().await,
+    );
+    let group = world.group(&alice, &[&bob]).await;
+    world.send(&alice, group, "one").await;
+    world.send(&alice, group, "two").await;
+    world.svc.read_up_to(bob.user, group, 2).await.unwrap();
+    let before = world
+        .svc
+        .conversation_state(alice.user, group)
+        .await
+        .unwrap();
+    assert_eq!(
+        before.positions,
+        Positions::Group {
+            all_delivered_seq: 2,
+            all_read_seq: 2,
+        }
+    );
+
+    world.befriend(&alice, &dave).await;
+    world
+        .svc
+        .add_members(alice.user, group, &[dave.user])
+        .await
+        .unwrap();
+    let after = world
+        .svc
+        .conversation_state(alice.user, group)
+        .await
+        .unwrap();
+    assert_eq!(after.positions, before.positions);
+}
+
+#[tokio::test]
+async fn a_full_group_rejection_consumes_no_seq() {
+    let world = World::new();
+    let alice = world.person().await;
+    let mut friends = Vec::new();
+    for _ in 0..MAX_GROUP_MEMBERS {
+        let friend = world.person().await;
+        world.befriend(&alice, &friend).await;
+        friends.push(friend.user);
+    }
+    let (last, first) = friends.split_last().unwrap();
+    let group = world
+        .svc
+        .create_group(alice.user, "Almost full", &first[1..])
+        .await
+        .unwrap();
+    let last_seq = world.conversation(group).await.last_seq;
+
+    assert_eq!(
+        world
+            .svc
+            .add_members(alice.user, group, &[first[0], *last])
+            .await,
+        Err(DomainError::GroupFull)
+    );
+    assert_eq!(world.conversation(group).await.last_seq, last_seq);
+}
+
+#[tokio::test]
+async fn duplicate_ids_in_add_are_added_once() {
+    let world = World::new();
+    let (alice, bob, dave) = (
+        world.person().await,
+        world.person().await,
+        world.person().await,
+    );
+    let group = world.group(&alice, &[&bob]).await;
+    world.befriend(&alice, &dave).await;
+
+    world
+        .svc
+        .add_members(alice.user, group, &[dave.user, dave.user])
+        .await
+        .unwrap();
+    assert_eq!(world.conversation(group).await.last_seq, 2);
+    let batch = world.svc.sync(dave.device, 100).await.unwrap();
+    assert_eq!(
+        system_events(&batch.entries),
+        [Some(SystemEvent::MembersAdded {
+            actor: alice.user,
+            users: vec![dave.user],
+        })]
+    );
+}
+
+#[tokio::test]
+async fn read_up_to_below_the_floor_changes_nothing() {
+    let world = World::new();
+    let (alice, bob, dave) = (
+        world.person().await,
+        world.person().await,
+        world.person().await,
+    );
+    let group = world.group(&alice, &[&bob]).await;
+    world.send(&alice, group, "one").await;
+    world.send(&alice, group, "two").await;
+    world.befriend(&alice, &dave).await;
+    world
+        .svc
+        .add_members(alice.user, group, &[dave.user])
+        .await
+        .unwrap();
+    assert_eq!(world.member(group, &dave).await.unwrap().read_seq, 3);
+    world.notifier.take();
+
+    assert_eq!(world.svc.read_up_to(dave.user, group, 1).await, Ok(false));
+    assert!(world.notifier.take().is_empty());
+    assert_eq!(world.member(group, &dave).await.unwrap().read_seq, 3);
+}
+
+#[tokio::test]
+async fn a_removed_member_can_rejoin_and_sees_only_new_history() {
+    let world = World::new();
+    let (alice, bob, dave) = (
+        world.person().await,
+        world.person().await,
+        world.person().await,
+    );
+    let group = world.group(&alice, &[&bob, &dave]).await;
+    world.send(&alice, group, "one").await;
+    world.svc.read_up_to(dave.user, group, 2).await.unwrap();
+    world
+        .svc
+        .remove_member(alice.user, group, dave.user)
+        .await
+        .unwrap();
+    world.send(&alice, group, "while away").await;
+    world
+        .svc
+        .add_members(alice.user, group, &[dave.user])
+        .await
+        .unwrap();
+    world.send(&alice, group, "back").await;
+
+    let batch = world.svc.sync(dave.device, 100).await.unwrap();
+    assert_eq!(seqs(&batch.entries), [5, 6]);
+    assert_eq!(
+        system_events(&batch.entries[..1]),
+        [Some(SystemEvent::MembersAdded {
+            actor: alice.user,
+            users: vec![dave.user],
+        })]
+    );
+    let history = world.svc.history(dave.user, group, None, 10).await.unwrap();
+    assert_eq!(seqs(&history.entries), [5, 6]);
+    let row = world.member(group, &dave).await.unwrap();
+    assert_eq!((row.visible_from_seq, row.left_at_seq), (5, None));
+    assert!(row.read_seq >= 2);
 }

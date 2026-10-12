@@ -100,6 +100,10 @@ where
     ///
     /// A direct conversation with someone `user` has blocked is left out: blocking hides it
     /// from the blocker (spec §5.5). The blocked user still sees it.
+    ///
+    /// A group `user` has left is listed as they last saw it: up to the entry at which they
+    /// left, with its time as `updated_at`, and without members or admins. Its title and
+    /// group-wide positions are current, the positions capped at where they left.
     pub async fn list_conversations(
         &self,
         user: UserId,
@@ -126,10 +130,10 @@ where
                 .count_incoming_messages(conversation.id, user, unread_after, last_seq, MAX_UNREAD)
                 .await?;
             let receipts = receipts(&mut tx, &conversation, &member, &members).await?;
-            summaries.push(ConversationSummary {
+            let mut summary = ConversationSummary {
                 conversation_id: conversation.id,
                 kind: conversation.kind,
-                title: conversation.title,
+                title: conversation.title.clone(),
                 last_seq,
                 read_seq: member.read_seq,
                 unread,
@@ -137,11 +141,35 @@ where
                 updated_at: conversation.updated_at,
                 members: current_member_ids(&members),
                 admins: current_admin_ids(&members),
-            });
+            };
+            if let Some(left_at_seq) = member.left_at_seq {
+                summary.updated_at = left_at_time(&mut tx, &conversation, left_at_seq).await?;
+                if changed_since.is_some_and(|since| summary.updated_at <= since) {
+                    continue;
+                }
+                summary.members.clear();
+                summary.admins.clear();
+            }
+            summaries.push(summary);
         }
         tx.rollback().await?;
         Ok(summaries)
     }
+}
+
+/// When a former member's view of a conversation last changed: the time of the entry at
+/// which they left, or the conversation's creation if that entry does not exist.
+async fn left_at_time<T: Tx>(
+    tx: &mut T,
+    conversation: &Conversation,
+    left_at_seq: i64,
+) -> DomainResult<DateTime<Utc>> {
+    let entries = tx
+        .entries_after(conversation.id, left_at_seq - 1, left_at_seq, 0, 1)
+        .await?;
+    Ok(entries
+        .first()
+        .map_or(conversation.created_at, |entry| entry.server_ts))
 }
 
 /// How far the others got, as `member` may see it: the other member's positions in a

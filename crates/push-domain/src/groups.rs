@@ -13,7 +13,7 @@ use crate::read::{GroupPositions, group_positions, group_receipt};
 use crate::service::{Messaging, current_member_ids};
 use crate::store::{Store, Tx};
 use crate::system::SystemEvent;
-use crate::validation::{MAX_GROUP_MEMBERS, validate_title};
+use crate::validation::{MAX_GROUP_MEMBERS, ValidationError, validate_title};
 
 impl<S, C, N> Messaging<S, C, N>
 where
@@ -136,6 +136,70 @@ where
         Ok(())
     }
 
+    /// Removes a current member from a group. A `MemberRemoved` entry records it, and it is
+    /// the last entry the removed user can see. Removing a former member again changes
+    /// nothing; a user who was never a member is `NotMember`. Admins leave rather than
+    /// remove themselves.
+    pub async fn remove_member(
+        &self,
+        admin: UserId,
+        conversation: ConversationId,
+        user: UserId,
+    ) -> DomainResult<()> {
+        if admin == user {
+            return Err(ValidationError::SelfTarget.into());
+        }
+        let mut change = self.begin_change(conversation).await?;
+        change.require_admin(admin)?;
+        let mut removed = change.member(user).cloned().ok_or(DomainError::NotMember)?;
+        if !removed.is_current() {
+            return change.cancel().await;
+        }
+        let event = SystemEvent::MemberRemoved { actor: admin, user };
+        removed.left_at_seq = Some(change.append(&event).await?);
+        change.put_member(removed).await?;
+        let events = change.finish(Some(user)).await?;
+        self.publish(events).await;
+        Ok(())
+    }
+
+    /// `user` leaves a group. A `MemberLeft` entry records it, and it is the last entry they
+    /// can see. Leaving again changes nothing.
+    ///
+    /// A group always has an admin: if none remains, the current member who joined first
+    /// (lowest `visible_from_seq`, then lowest user id) becomes one, recorded by an
+    /// `AdminPromoted` entry. When the last member leaves, the group is closed: nothing can
+    /// be appended to it any more, because every append needs a current member.
+    pub async fn leave_group(
+        &self,
+        user: UserId,
+        conversation: ConversationId,
+    ) -> DomainResult<()> {
+        let mut change = self.begin_change(conversation).await?;
+        let mut leaver = change.member(user).cloned().ok_or(DomainError::NotMember)?;
+        if !leaver.is_current() {
+            return change.cancel().await;
+        }
+        leaver.left_at_seq = Some(
+            change
+                .append(&SystemEvent::MemberLeft { actor: user })
+                .await?,
+        );
+        change.put_member(leaver).await?;
+        if let Some(mut heir) = change.heir() {
+            let promoted = SystemEvent::AdminPromoted {
+                actor: user,
+                user: heir.user_id,
+            };
+            change.append(&promoted).await?;
+            heir.role = Role::Admin;
+            change.put_member(heir).await?;
+        }
+        let events = change.finish(Some(user)).await?;
+        self.publish(events).await;
+        Ok(())
+    }
+
     /// Locks a group for a membership or settings change and takes the next `seq`.
     async fn begin_change(&self, conversation: ConversationId) -> DomainResult<GroupChange<S::Tx>> {
         let mut tx = self.store.begin().await?;
@@ -198,6 +262,30 @@ impl<T: Tx> GroupChange<T> {
             .iter()
             .filter(|member| member.is_current())
             .count()
+    }
+
+    /// The member to promote when no current admin is left: the current member who joined
+    /// first, then the lowest user id. `None` while an admin remains or nobody does.
+    fn heir(&self) -> Option<Member> {
+        let current = self.members.iter().filter(|member| member.is_current());
+        if current.clone().any(|member| member.role == Role::Admin) {
+            return None;
+        }
+        current
+            .min_by_key(|member| (member.visible_from_seq, member.user_id))
+            .cloned()
+    }
+
+    /// Stores a changed member row and keeps this change's view of the members up to date.
+    async fn put_member(&mut self, member: Member) -> DomainResult<()> {
+        if let Some(row) = self
+            .members
+            .iter_mut()
+            .find(|row| row.user_id == member.user_id)
+        {
+            *row = member.clone();
+        }
+        self.tx.insert_member(member).await
     }
 
     /// Appends a system entry recording `event` and returns its `seq`.

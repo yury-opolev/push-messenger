@@ -32,6 +32,9 @@ where
         if seq < 0 || seq > member.visible_upper(found.last_seq) {
             return Err(DomainError::SeqOutOfRange);
         }
+        if seq < member.visible_from_seq - 1 {
+            return Ok(false);
+        }
         let group_before = group_positions(&mut tx, &found, found.last_seq).await?;
         let moved = tx.raise_read_seq(conversation, user, seq).await?;
         // Messages below the member's floor were never visible to them, so they are never
@@ -55,7 +58,8 @@ where
         Ok(moved)
     }
 
-    /// Positions in a conversation, as seen by `user`: both members' positions in a direct conversation, only the group-wide positions in a group.
+    /// Positions in a conversation, as seen by `user`: both members' positions in a direct
+    /// conversation, only the group-wide positions in a group.
     pub async fn conversation_state(
         &self,
         user: UserId,
