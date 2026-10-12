@@ -1,0 +1,28 @@
+{{- if .Values.ingress.enabled -}}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "push.name" (dict "root" . "component" "gateway") }}
+  labels:
+    {{- include "push.labels" (dict "root" . "component" "gateway") | nindent 4 }}
+  annotations:
+    # ingress-nginx passes the WebSocket upgrade through by itself; what it needs is
+    # longer timeouts than its 60 s default, so idle sockets between client pings
+    # survive (spec §7.5).
+    nginx.ingress.kubernetes.io/proxy-read-timeout: {{ .Values.ingress.timeoutSeconds | quote }}
+    nginx.ingress.kubernetes.io/proxy-send-timeout: {{ .Values.ingress.timeoutSeconds | quote }}
+    nginx.ingress.kubernetes.io/proxy-http-version: "1.1"
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  rules:
+    - host: {{ .Values.ingress.host }}
+      http:
+        paths:
+          - path: /v1/socket
+            pathType: Exact
+            backend:
+              service:
+                name: {{ include "push.name" (dict "root" . "component" "gateway") }}
+                port:
+                  name: http
+{{- end }}

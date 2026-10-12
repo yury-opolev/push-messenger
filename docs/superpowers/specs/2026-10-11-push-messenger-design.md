@@ -788,6 +788,29 @@ push-messenger/
 - Images go to GHCR and are deployed with Helm.
 - Region, VM size and domain are confirmed with the owner before any cloud spend.
 
+Implementation notes (local minikube, Plan 4B):
+
+- One Helm chart, `deploy/helm/push-messenger`: the gateway and message-svc
+  (Deployments), PostgreSQL 17 (StatefulSet with a volume, database `push_messaging`
+  owned by the user message-svc migrates as) and Redis 7 (AUTH on, no persistence), and an
+  Ingress for `/v1/socket` with ingress-nginx's read and send timeouts at 120 s. Database
+  and Redis passwords are generated on install and kept in one Secret; the services read
+  their connection URLs from it. Probes: `/healthz` and `/readyz` on port 8081 of each
+  service.
+- Images (`deploy/docker/Dockerfile`, one target per binary from one shared build stage)
+  run as a non-root user on distroless, with a read-only root filesystem.
+- Shutdown: the gateway has a `lifecycle.preStop.sleep.seconds: 5` (ingress-nginx stops
+  routing to it before SIGTERM) and both Deployments set `terminationGracePeriodSeconds: 30`.
+- Hardening: Redis runs non-root (uid 999) with a read-only root filesystem; the data pods
+  use `automountServiceAccountToken: false` and the `RuntimeDefault` seccomp profile.
+- The chart Secret carries `helm.sh/resource-policy: keep`, so `helm uninstall` keeps the
+  Secret and the PVC and the passwords keep matching the database. `down` wipes the
+  Secret, PVC, PVs and the hostpath directory.
+- `deploy/minikube/up.ps1` (and `up.sh`) wait for ingress-nginx, retry `helm upgrade
+  --install` up to 5 times, and bring it up on minikube; `helm test` runs `push-smoke`
+  inside the cluster through the ingress controller. The Azure plan replaces the in-chart
+  secrets with Key Vault and adds TLS, and may replace the in-chart PostgreSQL and Redis.
+
 ## 12. Testing
 
 | Layer | Scope |

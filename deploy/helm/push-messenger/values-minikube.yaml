@@ -1,0 +1,9 @@
+# Local minikube only (deploy/minikube/up.ps1). Turns on the DEV ONLY identity and setup
+# API that the smoke test needs.
+
+devMode:
+  enabled: true
+  acknowledge: insecure-local-only
+
+ingress:
+  host: push.local

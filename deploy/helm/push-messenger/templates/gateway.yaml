@@ -1,0 +1,81 @@
+{{- $name := include "push.name" (dict "root" . "component" "gateway") -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "push.labels" (dict "root" . "component" "gateway") | nindent 4 }}
+spec:
+  selector:
+    {{- include "push.selector" (dict "root" . "component" "gateway") | nindent 4 }}
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "push.labels" (dict "root" . "component" "gateway") | nindent 4 }}
+spec:
+  replicas: {{ .Values.gateway.replicas }}
+  selector:
+    matchLabels:
+      {{- include "push.selector" (dict "root" . "component" "gateway") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "push.labels" (dict "root" . "component" "gateway") | nindent 8 }}
+      {{- with .Values.buildId }}
+      annotations:
+        push-messenger/build-id: {{ . | quote }}
+      {{- end }}
+    spec:
+      automountServiceAccountToken: false
+      # Shutdown budget: the 5 s preStop sleep, then SIGTERM, on which the gateway closes
+      # every connection with 4005 and waits up to 10 s, plus margin. The sleep gives
+      # Kubernetes time to take the pod out of the Service and Ingress endpoints before
+      # the gateway closes its listener. The image has no shell, so it uses the native
+      # sleep action (Kubernetes 1.30+; minikube runs 1.31) instead of `exec: sleep`.
+      terminationGracePeriodSeconds: {{ .Values.gateway.terminationGracePeriodSeconds }}
+      containers:
+        - name: gateway
+          image: {{ include "push.image" .Values.images.gateway }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          {{- include "push.containerSecurity" . | nindent 10 }}
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: 5
+          env:
+            - name: PUSH_MESSAGE_SVC_URL
+              value: {{ printf "http://%s:50051" (include "push.name" (dict "root" . "component" "message-svc")) | quote }}
+            - name: PUSH_REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "push.secretName" . }}
+                  key: redis-url
+            - name: PUSH_HEARTBEAT_MS
+              value: {{ .Values.gateway.heartbeatMs | quote }}
+            - name: PUSH_DEV_AUTH
+              value: {{ include "push.devFlag" . | quote }}
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: health
+              containerPort: 8081
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.gateway.resources | nindent 12 }}
