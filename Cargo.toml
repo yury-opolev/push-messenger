@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/push-domain",
+    "crates/push-message-svc",
     "crates/push-proto",
     "crates/push-store",
     "crates/push-testkit",
@@ -22,7 +23,12 @@ prost = "0.14"
 protoc-bin-vendored = "3"
 push-domain = { path = "crates/push-domain" }
 push-proto = { path = "crates/push-proto" }
+push-store = { path = "crates/push-store" }
 push-testkit = { path = "crates/push-testkit" }
+redis = { version = "1", default-features = false, features = [
+    "connection-manager",
+    "tokio-comp",
+] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sqlx = { version = "0.8", default-features = false, features = [
@@ -33,9 +39,10 @@ sqlx = { version = "0.8", default-features = false, features = [
     "runtime-tokio",
     "uuid",
 ] }
-testcontainers-modules = { version = "0.13", features = ["postgres"] }
+testcontainers-modules = { version = "0.13", features = ["postgres", "redis"] }
 thiserror = "2"
 tokio = { version = "1", features = ["sync"] }
+tokio-stream = "0.1"
 tonic = "0.14"
 tonic-prost = "0.14"
 tonic-prost-build = "0.14"
