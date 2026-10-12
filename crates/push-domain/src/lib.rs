@@ -28,8 +28,8 @@ pub use history::HistoryPage;
 pub use ids::{ClientMsgId, ConversationId, DeviceId, MessageId, UserId};
 pub use memory::InMemoryStore;
 pub use model::{
-    ContactState, ContentType, Conversation, ConversationKind, ConversationState, Entry, EntryKind,
-    Member, MemberState, Role, SendReceipt, direct_key,
+    ContactState, ContentType, Conversation, ConversationKind, ConversationState,
+    ConversationSummary, Entry, EntryKind, Member, MemberState, Role, SendReceipt, direct_key,
 };
 pub use notify::{Event, NoopNotifier, Notifier, ReceiptUpdate, RecordingNotifier};
 pub use send::SendText;
@@ -37,5 +37,5 @@ pub use service::{Messaging, Policy};
 pub use store::{InsertOutcome, Store, Tx};
 pub use sync::SyncBatch;
 pub use validation::{
-    MAX_HISTORY_PAGE, MAX_SYNC_BATCH, MAX_TEXT_BYTES, ValidationError, validate_text,
+    MAX_HISTORY_PAGE, MAX_SYNC_BATCH, MAX_TEXT_BYTES, MAX_UNREAD, ValidationError, validate_text,
 };

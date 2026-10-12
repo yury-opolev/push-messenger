@@ -128,6 +128,34 @@ pub struct MemberState {
     pub read_seq: i64,
 }
 
+/// One conversation in a user's conversation list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversationSummary {
+    pub conversation_id: ConversationId,
+    pub kind: ConversationKind,
+    pub title: Option<String>,
+    /// The highest `seq` the user may see: the conversation's `last_seq`, or where the
+    /// user left it.
+    pub last_seq: i64,
+    /// The user's own read position.
+    pub read_seq: i64,
+    /// Live messages from others after `read_seq` within the visible range, at most
+    /// `MAX_UNREAD`.
+    pub unread: u32,
+    /// Direct conversations: the other member's delivered position, the furthest across
+    /// their devices, and never below `peer_read_seq`. Zero for other conversations; Plan
+    /// 2B replaces or extends these fields with group aggregates.
+    pub peer_delivered_seq: i64,
+    /// Direct conversations: the other member's read position. Zero for other
+    /// conversations.
+    pub peer_read_seq: i64,
+    /// When the conversation was created or last had an entry appended. Acks and reads do
+    /// not move it.
+    pub updated_at: DateTime<Utc>,
+    /// Current members, sorted.
+    pub members: Vec<UserId>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConversationState {
     pub conversation_id: ConversationId,

@@ -6,6 +6,8 @@ pub const MAX_TEXT_BYTES: usize = 64 * 1024;
 pub const MAX_HISTORY_PAGE: u32 = 100;
 /// Largest batch returned by one sync.
 pub const MAX_SYNC_BATCH: u32 = 500;
+/// Unread counts stop here; clients show "99+".
+pub const MAX_UNREAD: u32 = 100;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ValidationError {
