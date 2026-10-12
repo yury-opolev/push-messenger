@@ -66,6 +66,20 @@ async fn next_seq_moves_updated_at_and_a_rollback_restores_it<B: Backend>(backen
     assert_eq!((stored.last_seq, stored.updated_at), (1, first));
 }
 
+async fn next_seq_never_moves_updated_at_back<B: Backend>(backend: &B) {
+    let conversation = conversation();
+    let id = conversation.id;
+    let store = store_with(backend, conversation).await;
+    let later = start() + TimeDelta::hours(1);
+
+    let mut tx = store.begin().await.unwrap();
+    tx.next_seq(id, later).await.unwrap();
+    tx.next_seq(id, start()).await.unwrap();
+
+    let stored = tx.get_conversation(id).await.unwrap().unwrap();
+    assert_eq!((stored.last_seq, stored.updated_at), (2, later));
+}
+
 async fn a_second_direct_conversation_for_the_same_pair_is_a_duplicate<B: Backend>(backend: &B) {
     let store = backend.store().await;
     let mut first = conversation();
@@ -133,6 +147,9 @@ async fn operations_on_missing_rows_fail_as_documented<B: Backend>(backend: &B) 
         tx.next_seq(ConversationId::new(), start()).await,
         Err(DomainError::ConversationNotFound)
     );
+    tx.rollback().await.unwrap();
+
+    let mut tx = store.begin().await.unwrap();
     assert_eq!(
         tx.raise_read_seq(ConversationId::new(), UserId::new(), 1)
             .await,
@@ -242,6 +259,7 @@ pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
         a_conversation_is_read_back_as_stored,
         next_seq_counts_from_one_and_a_rollback_gives_the_number_back,
         next_seq_moves_updated_at_and_a_rollback_restores_it,
+        next_seq_never_moves_updated_at_back,
         a_second_direct_conversation_for_the_same_pair_is_a_duplicate,
         a_conversation_id_cannot_be_inserted_twice,
         set_title_changes_only_the_title,

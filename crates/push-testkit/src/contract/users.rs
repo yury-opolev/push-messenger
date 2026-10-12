@@ -35,17 +35,18 @@ async fn inserting_a_known_device_id_changes_nothing<B: Backend>(backend: &B) {
     let store = backend.store().await;
     let (user, other) = (UserId::new(), UserId::new());
     add_users(&store, &[user, other]).await;
-    let device = DeviceId::new();
+    let (device, revoked) = (DeviceId::new(), DeviceId::new());
     let mut tx = store.begin().await.unwrap();
-    tx.insert_device(device, user).await.unwrap();
-    tx.insert_device(device, other).await.unwrap();
+    assert_eq!(tx.insert_device(device, user).await, Ok(true));
+    assert_eq!(tx.insert_device(device, user).await, Ok(true));
+    assert_eq!(tx.insert_device(device, other).await, Ok(false));
+    assert_eq!(tx.insert_device(revoked, user).await, Ok(true));
+    tx.revoke_device(revoked).await.unwrap();
+    assert_eq!(tx.insert_device(revoked, user).await, Ok(false));
 
     assert_eq!(tx.device_owner(device).await.unwrap(), Some(user));
+    assert_eq!(tx.device_owner(revoked).await.unwrap(), None);
     assert!(tx.devices_of_user(other).await.unwrap().is_empty());
-    assert!(tx.device_exists(device).await.unwrap());
-    tx.revoke_device(device).await.unwrap();
-    assert!(tx.device_exists(device).await.unwrap());
-    assert!(!tx.device_exists(DeviceId::new()).await.unwrap());
 }
 
 async fn a_device_of_an_unknown_user_is_refused<B: Backend>(backend: &B) {

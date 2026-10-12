@@ -90,15 +90,21 @@ impl Tx for InMemoryTx {
         Ok(self.work.users.contains(&user))
     }
 
-    async fn insert_device(&mut self, device: DeviceId, user: UserId) -> DomainResult<()> {
+    async fn insert_device(&mut self, device: DeviceId, user: UserId) -> DomainResult<bool> {
+        if let Some(row) = self.work.devices.get(&device) {
+            return Ok(row.user == user && !row.revoked);
+        }
         if !self.work.users.contains(&user) {
             return Err(missing("user"));
         }
-        self.work.devices.entry(device).or_insert(DeviceRow {
-            user,
-            revoked: false,
-        });
-        Ok(())
+        self.work.devices.insert(
+            device,
+            DeviceRow {
+                user,
+                revoked: false,
+            },
+        );
+        Ok(true)
     }
 
     async fn revoke_device(&mut self, device: DeviceId) -> DomainResult<()> {
@@ -115,10 +121,6 @@ impl Tx for InMemoryTx {
             .get(&device)
             .filter(|row| !row.revoked)
             .map(|row| row.user))
-    }
-
-    async fn device_exists(&mut self, device: DeviceId) -> DomainResult<bool> {
-        Ok(self.work.devices.contains_key(&device))
     }
 
     async fn devices_of_user(&mut self, user: UserId) -> DomainResult<Vec<DeviceId>> {
@@ -236,7 +238,7 @@ impl Tx for InMemoryTx {
             .get_mut(&id)
             .ok_or(DomainError::ConversationNotFound)?;
         conversation.last_seq += 1;
-        conversation.updated_at = at;
+        conversation.updated_at = conversation.updated_at.max(at);
         Ok(conversation.last_seq)
     }
 

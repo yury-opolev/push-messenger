@@ -68,16 +68,17 @@ pub trait Tx: Send {
     /// Records a verified user. Idempotent.
     async fn insert_user(&mut self, user: UserId) -> DomainResult<()>;
     async fn user_exists(&mut self, user: UserId) -> DomainResult<bool>;
-    /// Records a device if absent. If a device with this id already exists (any owner,
-    /// active or revoked) it does nothing; callers check ownership first with
-    /// `device_exists` / `device_owner`.
-    async fn insert_device(&mut self, device: DeviceId, user: UserId) -> DomainResult<()>;
+    /// Records an active device of `user` unless a device with this id exists (any owner,
+    /// active or revoked), and returns whether the device is now an active device of
+    /// `user`. Postgres checks after `INSERT … ON CONFLICT DO NOTHING`, which waits for a
+    /// concurrent insert of the same id, so two registrations cannot both see `true` for
+    /// different users. Fails with `DomainError::Store` if the device is new and the user
+    /// is not known.
+    async fn insert_device(&mut self, device: DeviceId, user: UserId) -> DomainResult<bool>;
     /// Marks a device revoked. A no-op for an unknown device.
     async fn revoke_device(&mut self, device: DeviceId) -> DomainResult<()>;
     /// The owner of an active device; `None` if the device is unknown or revoked.
     async fn device_owner(&mut self, device: DeviceId) -> DomainResult<Option<UserId>>;
-    /// Whether a device row exists, active or revoked.
-    async fn device_exists(&mut self, device: DeviceId) -> DomainResult<bool>;
     /// The user's active devices.
     /// The order of the result is unspecified.
     async fn devices_of_user(&mut self, user: UserId) -> DomainResult<Vec<DeviceId>>;
@@ -133,8 +134,9 @@ pub trait Tx: Send {
         conversation: Conversation,
     ) -> DomainResult<InsertOutcome>;
     async fn get_conversation(&mut self, id: ConversationId) -> DomainResult<Option<Conversation>>;
-    /// Locks the conversation, increments `last_seq`, sets `updated_at` to `at` and
-    /// returns the new `last_seq`. Both changes are undone if the transaction rolls back.
+    /// Locks the conversation, increments `last_seq`, moves `updated_at` forward to `at`
+    /// (never back: `GREATEST` on Postgres) and returns the new `last_seq`. Both changes are
+    /// undone if the transaction rolls back.
     /// Fails with `ConversationNotFound` if the conversation does not exist.
     /// The conversation row lock is held until the transaction commits or rolls back.
     async fn next_seq(&mut self, id: ConversationId, at: DateTime<Utc>) -> DomainResult<i64>;

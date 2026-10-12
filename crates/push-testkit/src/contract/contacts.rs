@@ -70,6 +70,14 @@ async fn a_contact_with_an_unknown_user_is_refused<B: Backend>(backend: &B) {
             .await,
         Err(DomainError::Store(_))
     ));
+    tx.rollback().await.unwrap();
+
+    let mut tx = store.begin().await.unwrap();
+    assert!(matches!(
+        tx.put_contact(UserId::new(), alice, ContactState::RequestedOut)
+            .await,
+        Err(DomainError::Store(_))
+    ));
 }
 
 async fn an_invite_code_is_stored_once<B: Backend>(backend: &B) {
