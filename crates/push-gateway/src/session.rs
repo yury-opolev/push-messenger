@@ -162,8 +162,8 @@ fn reply_error(code: ErrorCode, message: &str) -> Step {
 
 #[cfg(test)]
 mod tests {
-    use push_proto::encode_frame;
     use push_proto::v1::{Identify, Ping};
+    use push_proto::{MAX_FRAME_BYTES, encode_frame};
 
     use super::*;
 
@@ -259,6 +259,40 @@ mod tests {
             session.on_binary(&bytes),
             Step::Close(4001, "invalid dev identity")
         );
+    }
+
+    #[test]
+    fn while_identifying_any_other_frame_or_a_second_identify_closes_with_4001() {
+        let ping = encode_frame(Body::Ping(Ping {}));
+        let second = identify(Uuid::now_v7(), Uuid::now_v7());
+        for bytes in [ping.as_slice(), second.as_slice()] {
+            let mut session = Session::new(true);
+            let (user, device) = (Uuid::now_v7(), Uuid::now_v7());
+            assert_eq!(
+                session.on_binary(&identify(user, device)),
+                Step::Identify { user, device }
+            );
+            assert_eq!(
+                session.on_binary(bytes),
+                Step::Close(4001, "the first frame must be Identify")
+            );
+            assert_eq!(session.device(), None);
+        }
+    }
+
+    #[test]
+    fn an_oversized_frame_closes_before_identify_and_errors_once_ready() {
+        let oversized = vec![0u8; MAX_FRAME_BYTES + 1];
+        assert_eq!(
+            Session::new(true).on_binary(&oversized),
+            Step::Close(4001, "the first frame must be Identify")
+        );
+        let (mut session, _) = ready_session();
+        assert_eq!(
+            session.on_binary(&oversized),
+            Step::Reply(error_frame(ErrorCode::BadFrame, "the frame is too large"))
+        );
+        assert!(session.device().is_some());
     }
 
     #[test]

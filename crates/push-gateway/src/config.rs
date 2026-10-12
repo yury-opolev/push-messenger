@@ -150,6 +150,13 @@ mod tests {
     }
 
     #[test]
+    fn debug_output_redacts_the_redis_url() {
+        let output = format!("{:?}", config(&REQUIRED).unwrap());
+        assert!(!output.contains("secret"), "{output}");
+        assert!(output.contains("<redacted>"), "{output}");
+    }
+
+    #[test]
     fn the_urls_are_required() {
         assert_eq!(
             config(&REQUIRED[1..]),
