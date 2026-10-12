@@ -654,9 +654,11 @@ Implementation notes (push-proto, Plan 4A):
 - **Start-up and runtime behaviour (message-svc).** It fails at start-up, without
   retrying, on an invalid database or Redis URL and on `PUSH_DB_MAX_CONNECTIONS=0`; error
   messages never echo URLs. Store timeouts must be between 1 ms and `i32::MAX` ms.
-  Start-up connect retries (every 2 s) and Redis subscription commands are interruptible
-  by shutdown; Redis subscription commands are bounded at 5 s. Services migrate with
-  `push_store::migrate_database` on a dedicated connection, not the request pool.
+  Start-up connect retries (every 2 s) are interruptible by shutdown. Services migrate
+  with `push_store::migrate_database` on a dedicated connection, not the request pool.
+- **Start-up and runtime behaviour (gateway).** The Redis hub reconnects every 1 s and
+  rings every local session after re-subscribing; its subscription commands are bounded
+  at 5 s and interruptible by shutdown.
 
 ## 8. SDK
 
