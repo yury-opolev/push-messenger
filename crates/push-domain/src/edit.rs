@@ -5,6 +5,7 @@ use crate::error::{DomainError, DomainResult};
 use crate::ids::{ClientMsgId, ConversationId, DeviceId, MessageId, UserId};
 use crate::model::{ContentType, Entry, EntryKind, Member, SendReceipt};
 use crate::notify::{Event, Notifier};
+use crate::read::group_receipt;
 use crate::send::{Append, Prepared};
 use crate::service::{Messaging, current_member_ids};
 use crate::store::{InsertOutcome, Store, Tx};
@@ -94,7 +95,8 @@ where
     /// The delete is a log entry of its own. In the same transaction the message row is
     /// marked deleted and its text, and the text of every edit entry targeting it, is
     /// erased. A retry with the same `client_msg_id` returns the original receipt; a new
-    /// delete of a deleted message fails with `AlreadyDeleted`.
+    /// delete of a deleted message fails with `AlreadyDeleted`. If the deleted message held
+    /// a group's group-wide positions back, its members get the new ones.
     pub async fn delete_message(&self, command: DeleteMessage) -> DomainResult<SendReceipt> {
         self.change_message(Change {
             sender: command.sender,
@@ -133,9 +135,10 @@ where
             member,
             seq,
             now,
+            group_before,
         } = match prepared {
             Prepared::Retry(receipt) => return Ok(receipt),
-            Prepared::Ready(append) => append,
+            Prepared::Ready(append) => *append,
         };
         let mut target = resolve_target(&mut tx, &member, change.target).await?;
         check_change(&target, change.sender, now, window)?;
@@ -176,12 +179,14 @@ where
             target.deleted_at = Some(now);
         }
         tx.update_entry(target).await?;
+        let group = group_receipt(&mut tx, &conversation, seq, group_before).await?;
         tx.commit().await?;
 
-        self.publish(vec![Event::EntriesAvailable {
+        let mut events = vec![Event::EntriesAvailable {
             users: current_member_ids(&members),
-        }])
-        .await;
+        }];
+        events.extend(group);
+        self.publish(events).await;
         Ok(receipt)
     }
 }

@@ -5,9 +5,11 @@ use crate::contacts::are_contacts;
 use crate::error::{DomainError, DomainResult};
 use crate::ids::{ConversationId, UserId};
 use crate::model::{
-    ContactState, Conversation, ConversationKind, ConversationSummary, Member, Role, direct_key,
+    ContactState, Conversation, ConversationKind, ConversationSummary, Member, Receipts, Role,
+    direct_key,
 };
 use crate::notify::Notifier;
+use crate::read::group_positions_for;
 use crate::service::{Messaging, current_member_ids};
 use crate::store::{InsertOutcome, Store, Tx};
 use crate::validation::{MAX_UNREAD, ValidationError};
@@ -87,7 +89,7 @@ where
     /// sorted by id. With `changed_since`, only those whose `updated_at` is later.
     ///
     /// `changed_since` reflects content changes only: a conversation created or an entry
-    /// appended. Receipt positions (`peer_delivered_seq`, `peer_read_seq`) do not move
+    /// appended. Receipt positions (`receipts`) do not move
     /// `updated_at`, so the busy conversation row is not written on every ack and read. A
     /// reconnecting client refreshes its ticks with one listing without `changed_since`.
     ///
@@ -98,6 +100,11 @@ where
     ///
     /// A direct conversation with someone `user` has blocked is left out: blocking hides it
     /// from the blocker (spec §5.5). The blocked user still sees it.
+    ///
+    /// A group `user` has left is listed as they last saw it: up to the entry at which they
+    /// left, with its time as `updated_at`, and without members or admins. Its title and
+    /// group-wide positions are current, the positions capped at where they left. Once no
+    /// current members remain, the group-wide positions are reported as 0.
     pub async fn list_conversations(
         &self,
         user: UserId,
@@ -123,43 +130,86 @@ where
             let unread = tx
                 .count_incoming_messages(conversation.id, user, unread_after, last_seq, MAX_UNREAD)
                 .await?;
-            let (peer_delivered_seq, peer_read_seq) =
-                peer_positions(&mut tx, &conversation, user, &members).await?;
-            summaries.push(ConversationSummary {
+            let receipts = receipts(&mut tx, &conversation, &member, &members).await?;
+            let mut summary = ConversationSummary {
                 conversation_id: conversation.id,
                 kind: conversation.kind,
-                title: conversation.title,
+                title: conversation.title.clone(),
                 last_seq,
                 read_seq: member.read_seq,
                 unread,
-                peer_delivered_seq,
-                peer_read_seq,
+                receipts,
                 updated_at: conversation.updated_at,
                 members: current_member_ids(&members),
-            });
+                admins: current_admin_ids(&members),
+            };
+            if let Some(left_at_seq) = member.left_at_seq {
+                summary.updated_at = left_at_time(&mut tx, &conversation, left_at_seq).await?;
+                if changed_since.is_some_and(|since| summary.updated_at <= since) {
+                    continue;
+                }
+                summary.members.clear();
+                summary.admins.clear();
+            }
+            summaries.push(summary);
         }
         tx.rollback().await?;
         Ok(summaries)
     }
 }
 
-/// How far the other member of a direct conversation got, as `(delivered, read)`, with
-/// delivered at least read. `(0, 0)` for other conversations: Plan 2B adds group
-/// aggregates.
-async fn peer_positions<T: Tx>(
+/// When a former member's view of a conversation last changed: the time of the entry at
+/// which they left, or the conversation's creation if that entry does not exist.
+async fn left_at_time<T: Tx>(
     tx: &mut T,
     conversation: &Conversation,
-    user: UserId,
+    left_at_seq: i64,
+) -> DomainResult<DateTime<Utc>> {
+    let entries = tx
+        .entries_after(conversation.id, left_at_seq - 1, left_at_seq, 0, 1)
+        .await?;
+    Ok(entries
+        .first()
+        .map_or(conversation.created_at, |entry| entry.server_ts))
+}
+
+/// How far the others got, as `member` may see it: the other member's positions in a
+/// direct conversation, with delivered at least read; the group-wide positions in a group.
+async fn receipts<T: Tx>(
+    tx: &mut T,
+    conversation: &Conversation,
+    member: &Member,
     members: &[Member],
-) -> DomainResult<(i64, i64)> {
-    if conversation.kind != ConversationKind::Direct {
-        return Ok((0, 0));
+) -> DomainResult<Receipts> {
+    if conversation.kind == ConversationKind::Group {
+        let group = group_positions_for(tx, conversation, member).await?;
+        return Ok(Receipts::Group {
+            all_delivered_seq: group.delivered,
+            all_read_seq: group.read,
+        });
     }
-    let Some(peer) = members.iter().find(|member| member.user_id != user) else {
-        return Ok((0, 0));
+    let Some(peer) = members.iter().find(|other| other.user_id != member.user_id) else {
+        return Ok(Receipts::Direct {
+            peer_delivered_seq: 0,
+            peer_read_seq: 0,
+        });
     };
     let delivered_seq = tx.delivered_seq(conversation.id, peer.user_id).await?;
-    Ok((delivered_seq.max(peer.read_seq), peer.read_seq))
+    Ok(Receipts::Direct {
+        peer_delivered_seq: delivered_seq.max(peer.read_seq),
+        peer_read_seq: peer.read_seq,
+    })
+}
+
+/// The ids of the current admins, sorted.
+fn current_admin_ids(members: &[Member]) -> Vec<UserId> {
+    let mut admins: Vec<UserId> = members
+        .iter()
+        .filter(|member| member.is_current() && member.role == Role::Admin)
+        .map(|member| member.user_id)
+        .collect();
+    admins.sort();
+    admins
 }
 
 /// Whether `user` has blocked any other member.

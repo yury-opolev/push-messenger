@@ -30,6 +30,18 @@ pub enum DomainError {
     AlreadyDeleted,
     #[error("the time allowed for this change has passed")]
     WindowExpired,
+    /// The invite does not exist, was revoked, has expired or is used up. One error for
+    /// all of these, so redeeming is not an oracle.
+    #[error("invite not found")]
+    InviteNotFound,
+    #[error("a group has at most 100 members")]
+    GroupFull,
+    #[error("this is not a group")]
+    NotAGroup,
+    #[error("only an admin of this group can do that")]
+    NotAdmin,
+    #[error("a group must keep at least one admin")]
+    LastAdmin,
     #[error("a concurrent change conflicted; retry the operation")]
     Conflict,
     #[error("storage error: {0}")]

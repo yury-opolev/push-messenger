@@ -9,7 +9,7 @@ use crate::model::{
     ContentType, Conversation, ConversationKind, Entry, EntryKind, Member, SendReceipt,
 };
 use crate::notify::{Event, Notifier};
-use crate::read::direct_receipt;
+use crate::read::{GroupPositions, direct_receipt, group_positions, group_receipt};
 use crate::service::{Messaging, current_member_ids, require_device};
 use crate::store::{InsertOutcome, Store, Tx};
 use crate::validation::validate_text;
@@ -36,12 +36,14 @@ pub(crate) struct Append<T> {
     pub(crate) member: Member,
     pub(crate) seq: i64,
     pub(crate) now: DateTime<Utc>,
+    /// A group's group-wide positions before this entry; `None` for a direct conversation.
+    pub(crate) group_before: Option<GroupPositions>,
 }
 
 pub(crate) enum Prepared<T> {
     /// The `client_msg_id` is already stored: this is its original receipt.
     Retry(SendReceipt),
-    Ready(Append<T>),
+    Ready(Box<Append<T>>),
 }
 
 impl<S, C, N> Messaging<S, C, N>
@@ -56,8 +58,10 @@ where
     ///
     /// Advances the sender's read position to what the sending device has already received
     /// (its delivery position): replying marks as read everything the user could have seen,
-    /// never messages their device has not received yet. If that passes over a message from
-    /// the other member of a direct conversation, they get a read receipt.
+    /// never messages their device has not received yet. When it moves, the sender's
+    /// devices learn the new position, and if it passes over a message from the other
+    /// member of a direct conversation, they get a read receipt. A group's members get its
+    /// group-wide positions if they moved.
     pub async fn send_text(&self, command: SendText) -> DomainResult<SendReceipt> {
         validate_text(&command.body)?;
         let prepared = self
@@ -76,9 +80,10 @@ where
             member,
             seq,
             now,
+            group_before,
         } = match prepared {
             Prepared::Retry(receipt) => return Ok(receipt),
-            Prepared::Ready(append) => append,
+            Prepared::Ready(append) => *append,
         };
 
         let entry = Entry {
@@ -117,22 +122,32 @@ where
             .get_cursor(command.device, conversation.id)
             .await?
             .unwrap_or(0);
-        tx.raise_read_seq(conversation.id, command.sender, device_position)
+        let read_moved = tx
+            .raise_read_seq(conversation.id, command.sender, device_position)
             .await?;
         let read_receipt = direct_receipt(
             &mut tx,
             &conversation,
             command.sender,
-            member.read_seq,
+            member.read_seq.max(member.visible_from_seq - 1),
             device_position,
         )
         .await?;
+        let group = group_receipt(&mut tx, &conversation, seq, group_before).await?;
         tx.commit().await?;
 
         let mut events = vec![Event::EntriesAvailable {
             users: current_member_ids(&members),
         }];
+        if read_moved {
+            events.push(Event::ReadPositionChanged {
+                user: command.sender,
+                conversation: conversation.id,
+                read_seq: device_position,
+            });
+        }
         events.extend(read_receipt);
+        events.extend(group);
         self.publish(events).await;
         Ok(receipt)
     }
@@ -182,14 +197,16 @@ where
                 }
             }
         }
-        Ok(Prepared::Ready(Append {
+        let group_before = group_positions(&mut tx, &conversation, seq - 1).await?;
+        Ok(Prepared::Ready(Box::new(Append {
             tx,
             conversation,
             members,
             member,
             seq,
             now,
-        }))
+            group_before,
+        })))
     }
 
     /// The receipt of an already stored entry, if it is the same sender's entry of the

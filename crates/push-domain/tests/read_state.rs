@@ -1,11 +1,13 @@
 mod common;
 
 use common::World;
-use push_domain::{ConversationState, DomainError, MemberState, UserId};
+use push_domain::{ConversationState, DomainError, MemberState, Positions, UserId};
 
 fn member(state: &ConversationState, user: UserId) -> &MemberState {
-    state
-        .members
+    let Positions::Members(members) = &state.positions else {
+        panic!("a direct conversation lists its members' positions");
+    };
+    members
         .iter()
         .find(|member| member.user_id == user)
         .expect("member present")
@@ -206,4 +208,29 @@ async fn sending_never_lowers_the_senders_read_position() {
         world.send(&bob, chat, body).await;
     }
     assert_eq!(alice_read().await, 3);
+}
+
+#[tokio::test]
+async fn a_groups_state_holds_only_group_wide_positions() {
+    let world = World::new();
+    let (alice, bob, carol) = (
+        world.person().await,
+        world.person().await,
+        world.person().await,
+    );
+    let group = world.group(&alice, &[&bob, &carol]).await;
+    world.send(&alice, group, "one").await;
+    world.svc.ack(bob.device, group, 2).await.unwrap();
+    world.svc.ack(carol.device, group, 2).await.unwrap();
+    world.svc.read_up_to(carol.user, group, 2).await.unwrap();
+
+    let state = world.svc.conversation_state(bob.user, group).await.unwrap();
+    assert_eq!(state.last_seq, 2);
+    assert_eq!(
+        state.positions,
+        Positions::Group {
+            all_delivered_seq: 2,
+            all_read_seq: 1,
+        }
+    );
 }

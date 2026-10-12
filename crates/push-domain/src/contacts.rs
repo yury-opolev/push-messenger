@@ -1,7 +1,7 @@
 use crate::clock::Clock;
 use crate::error::{DomainError, DomainResult};
 use crate::ids::UserId;
-use crate::model::ContactState;
+use crate::model::{ContactState, ContactSummary};
 use crate::notify::{Event, Notifier};
 use crate::service::Messaging;
 use crate::store::{Store, Tx};
@@ -125,11 +125,15 @@ where
 
     /// Every relationship `user` has, as they see it, sorted by peer. Includes the users
     /// they have blocked; never shows that someone blocked them.
-    pub async fn list_contacts(&self, user: UserId) -> DomainResult<Vec<(UserId, ContactState)>> {
+    pub async fn list_contacts(&self, user: UserId) -> DomainResult<Vec<ContactSummary>> {
         let mut tx = self.store.begin().await?;
-        let mut contacts = tx.contacts_of(user).await?;
+        let rows = tx.contacts_of(user).await?;
         tx.rollback().await?;
-        contacts.sort_by_key(|(peer, _)| *peer);
+        let mut contacts: Vec<ContactSummary> = rows
+            .into_iter()
+            .map(|(user_id, state)| ContactSummary { user_id, state })
+            .collect();
+        contacts.sort_by_key(|contact| contact.user_id);
         Ok(contacts)
     }
 
@@ -154,7 +158,7 @@ pub(crate) async fn are_contacts<T: Tx>(tx: &mut T, a: UserId, b: UserId) -> Dom
 }
 
 /// Writes `owner`'s view of `peer`; `None` removes it. Returns whether it changed.
-async fn set_contact<T: Tx>(
+pub(crate) async fn set_contact<T: Tx>(
     tx: &mut T,
     owner: UserId,
     peer: UserId,
@@ -170,6 +174,6 @@ async fn set_contact<T: Tx>(
     Ok(true)
 }
 
-fn contact_changed(user: UserId, peer: UserId, state: Option<ContactState>) -> Event {
+pub(crate) fn contact_changed(user: UserId, peer: UserId, state: Option<ContactState>) -> Event {
     Event::ContactChanged { user, peer, state }
 }

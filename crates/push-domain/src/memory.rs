@@ -13,7 +13,7 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use crate::error::{DomainError, DomainResult};
 use crate::ids::{ClientMsgId, ConversationId, DeviceId, MessageId, UserId};
-use crate::model::{ContactState, Conversation, Entry, EntryKind, Member};
+use crate::model::{ContactState, Conversation, Entry, EntryKind, InviteRecord, Member};
 use crate::store::{InsertOutcome, Store, Tx};
 
 fn missing(what: &str) -> DomainError {
@@ -25,6 +25,7 @@ struct State {
     users: HashSet<UserId>,
     devices: HashMap<DeviceId, DeviceRow>,
     contacts: HashMap<(UserId, UserId), ContactState>,
+    invites: HashMap<String, InviteRecord>,
     conversations: HashMap<ConversationId, Conversation>,
     direct_index: HashMap<[u8; 32], ConversationId>,
     members: BTreeMap<(ConversationId, UserId), Member>,
@@ -173,6 +174,32 @@ impl Tx for InMemoryTx {
             .collect())
     }
 
+    async fn insert_invite(&mut self, invite: InviteRecord) -> DomainResult<InsertOutcome> {
+        if !self.work.users.contains(&invite.user_id) {
+            return Err(missing("user"));
+        }
+        if self.work.invites.contains_key(&invite.code) {
+            return Ok(InsertOutcome::Duplicate);
+        }
+        self.work.invites.insert(invite.code.clone(), invite);
+        Ok(InsertOutcome::Inserted)
+    }
+
+    async fn lock_invite(&mut self, code: &str) -> DomainResult<Option<InviteRecord>> {
+        // Every in-memory transaction already holds the store-wide lock.
+        Ok(self.work.invites.get(code).cloned())
+    }
+
+    async fn update_invite(&mut self, invite: InviteRecord) -> DomainResult<()> {
+        let stored =
+            self.work.invites.get_mut(&invite.code).ok_or_else(|| {
+                DomainError::Store("update of an invite that does not exist".into())
+            })?;
+        stored.uses = invite.uses;
+        stored.revoked_at = invite.revoked_at;
+        Ok(())
+    }
+
     async fn find_direct(&mut self, key: [u8; 32]) -> DomainResult<Option<ConversationId>> {
         Ok(self.work.direct_index.get(&key).copied())
     }
@@ -211,6 +238,16 @@ impl Tx for InMemoryTx {
         conversation.last_seq += 1;
         conversation.updated_at = at;
         Ok(conversation.last_seq)
+    }
+
+    async fn set_title(&mut self, id: ConversationId, title: String) -> DomainResult<()> {
+        let conversation = self
+            .work
+            .conversations
+            .get_mut(&id)
+            .ok_or(DomainError::ConversationNotFound)?;
+        conversation.title = Some(title);
+        Ok(())
     }
 
     async fn insert_member(&mut self, member: Member) -> DomainResult<()> {
@@ -419,6 +456,29 @@ impl Tx for InMemoryTx {
         Ok(count as u32)
     }
 
+    async fn first_live_message(
+        &mut self,
+        conversation: ConversationId,
+        after: i64,
+        up_to: i64,
+        not_from: Option<UserId>,
+    ) -> DomainResult<Option<i64>> {
+        if after >= up_to {
+            return Ok(None);
+        }
+        Ok(self
+            .work
+            .entries
+            .range((conversation, after + 1)..=(conversation, up_to))
+            .map(|(_, entry)| entry)
+            .find(|entry| {
+                entry.kind == EntryKind::Message
+                    && entry.deleted_at.is_none()
+                    && not_from.is_none_or(|user| entry.sender_id != user)
+            })
+            .map(|entry| entry.seq))
+    }
+
     async fn messages_before(
         &mut self,
         conversation: ConversationId,
@@ -563,6 +623,67 @@ mod tests {
 
     fn seqs(entries: &[Entry]) -> Vec<i64> {
         entries.iter().map(|entry| entry.seq).collect()
+    }
+
+    fn invite(code: &str, user: UserId) -> InviteRecord {
+        InviteRecord {
+            code: code.into(),
+            user_id: user,
+            expires_at: start() + TimeDelta::days(1),
+            max_uses: 1,
+            uses: 0,
+            revoked_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_invite_code_is_stored_once() {
+        let store = InMemoryStore::new();
+        let (first, second) = (UserId::new(), UserId::new());
+        let mut tx = store.begin().await.unwrap();
+        tx.insert_user(first).await.unwrap();
+        tx.insert_user(second).await.unwrap();
+
+        assert_eq!(
+            tx.insert_invite(invite("ABCDEFGHJK", first)).await,
+            Ok(InsertOutcome::Inserted)
+        );
+        assert_eq!(
+            tx.insert_invite(invite("ABCDEFGHJK", second)).await,
+            Ok(InsertOutcome::Duplicate)
+        );
+        assert_eq!(
+            tx.lock_invite("ABCDEFGHJK").await,
+            Ok(Some(invite("ABCDEFGHJK", first)))
+        );
+        assert_eq!(tx.lock_invite("0000000000").await, Ok(None));
+        assert!(matches!(
+            tx.insert_invite(invite("0000000000", UserId::new())).await,
+            Err(DomainError::Store(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn update_invite_changes_only_uses_and_revocation() {
+        let store = InMemoryStore::new();
+        let user = UserId::new();
+        let mut tx = store.begin().await.unwrap();
+        tx.insert_user(user).await.unwrap();
+        tx.insert_invite(invite("ABCDEFGHJK", user)).await.unwrap();
+
+        let mut changed = invite("ABCDEFGHJK", UserId::new());
+        changed.uses = 1;
+        changed.revoked_at = Some(start());
+        changed.max_uses = 9;
+        tx.update_invite(changed).await.unwrap();
+
+        let stored = tx.lock_invite("ABCDEFGHJK").await.unwrap().unwrap();
+        assert_eq!((stored.uses, stored.revoked_at), (1, Some(start())));
+        assert_eq!((stored.user_id, stored.max_uses), (user, 1));
+        assert!(matches!(
+            tx.update_invite(invite("0000000000", user)).await,
+            Err(DomainError::Store(_))
+        ));
     }
 
     #[tokio::test]
@@ -1110,6 +1231,64 @@ mod tests {
         assert_eq!(
             seqs(&tx.entries_after(id, 3, 6, 2, 2).await.unwrap()),
             vec![5, 6]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_first_live_message_skips_changes_deleted_messages_and_the_excluded_sender() {
+        let store = InMemoryStore::new();
+        let conversation = conversation();
+        let id = conversation.id;
+        let me = UserId::new();
+        let mut tx = store.begin().await.unwrap();
+        tx.insert_conversation(conversation).await.unwrap();
+        let entries = [
+            entry(id, 1, ClientMsgId::new()),
+            Entry {
+                sender_id: me,
+                ..entry(id, 2, ClientMsgId::new())
+            },
+            Entry {
+                deleted_at: Some(start()),
+                ..entry(id, 3, ClientMsgId::new())
+            },
+            Entry {
+                kind: EntryKind::Edit,
+                ..entry(id, 4, ClientMsgId::new())
+            },
+            entry(id, 5, ClientMsgId::new()),
+        ];
+        for entry in entries {
+            tx.insert_entry(entry).await.unwrap();
+        }
+
+        assert_eq!(tx.first_live_message(id, 0, 5, Some(me)).await, Ok(Some(1)));
+        assert_eq!(tx.first_live_message(id, 1, 5, Some(me)).await, Ok(Some(5)));
+        assert_eq!(tx.first_live_message(id, 1, 5, None).await, Ok(Some(2)));
+        assert_eq!(tx.first_live_message(id, 2, 4, None).await, Ok(None));
+        assert_eq!(tx.first_live_message(id, 5, 5, None).await, Ok(None));
+    }
+
+    #[tokio::test]
+    async fn set_title_changes_only_the_title() {
+        let store = InMemoryStore::new();
+        let original = conversation();
+        let id = original.id;
+        let mut tx = store.begin().await.unwrap();
+        tx.insert_conversation(original.clone()).await.unwrap();
+
+        tx.set_title(id, "Trip".into()).await.unwrap();
+        let stored = tx.get_conversation(id).await.unwrap().unwrap();
+        assert_eq!(
+            stored,
+            Conversation {
+                title: Some("Trip".into()),
+                ..original
+            }
+        );
+        assert_eq!(
+            tx.set_title(ConversationId::new(), "Trip".into()).await,
+            Err(DomainError::ConversationNotFound)
         );
     }
 }

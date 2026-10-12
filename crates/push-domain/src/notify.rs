@@ -37,12 +37,19 @@ pub enum Event {
         peer: UserId,
         state: Option<ContactState>,
     },
+    /// `user`'s own read position moved, by reading or by sending; their other devices
+    /// update their unread counts. Published to `user` only.
+    ReadPositionChanged {
+        user: UserId,
+        conversation: ConversationId,
+        read_seq: i64,
+    },
 }
 
 /// The positions a receipt reports.
 ///
-/// Group conversations will report aggregates in a variant of their own, so match this
-/// enum with a wildcard arm.
+/// Match this enum with a wildcard arm: later versions may report positions of other
+/// kinds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ReceiptUpdate {
@@ -52,6 +59,16 @@ pub enum ReceiptUpdate {
         user_id: UserId,
         delivered_seq: i64,
         read_seq: i64,
+    },
+    /// A group: every live message up to `all_read_seq` has been read, and every one up to
+    /// `all_delivered_seq` delivered, by every current member other than its sender. Never
+    /// per-member positions. `all_delivered_seq` is never below `all_read_seq`.
+    ///
+    /// The transport sends at most one of these per second per conversation, keeping the
+    /// latest (spec §4.5); the domain publishes one for every change.
+    Group {
+        all_delivered_seq: i64,
+        all_read_seq: i64,
     },
 }
 

@@ -1,7 +1,7 @@
 mod common;
 
 use common::{World, bodies};
-use push_domain::{DomainError, ValidationError};
+use push_domain::{DomainError, Positions, ValidationError};
 
 #[tokio::test]
 async fn a_direct_chat_requires_accepted_contacts() {
@@ -79,7 +79,7 @@ async fn opening_again_adds_no_duplicate_members() {
         .conversation_state(alice.user, chat)
         .await
         .unwrap();
-    assert_eq!(state.members.len(), 2);
+    assert!(matches!(state.positions, Positions::Members(members) if members.len() == 2));
 }
 
 #[tokio::test]

@@ -1,14 +1,18 @@
 //! Strongly typed identifiers. All are UUIDs; new ones are v7 (time-ordered), which keeps
-//! database indexes compact.
+//! database indexes compact. They serialise as plain UUID strings.
 
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 macro_rules! id_type {
     ($(#[$doc:meta])* $name:ident) => {
         $(#[$doc])*
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+        #[derive(
+            Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
+        )]
+        #[serde(transparent)]
         pub struct $name(pub Uuid);
 
         impl $name {
