@@ -189,7 +189,10 @@ pub trait Tx: Send {
 
     // --- The log -----------------------------------------------------------------------
 
-    /// `Duplicate` if the conversation already has an entry with this `client_msg_id`.
+    /// `Duplicate`, writing nothing, if the conversation already has an entry with this
+    /// `client_msg_id`. Otherwise fails with `DomainError::Store` if an entry with this
+    /// `message_id` exists (in any conversation) or the conversation already has an entry
+    /// at this `seq`.
     async fn insert_entry(&mut self, entry: Entry) -> DomainResult<InsertOutcome>;
     async fn entry_by_client_id(
         &mut self,

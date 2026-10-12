@@ -4,8 +4,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use push_domain::{
     ClientMsgId, ContactState, Conversation, ConversationId, ConversationOverview, DeviceId,
-    DomainError, DomainResult, Entry, GroupPositions, InsertOutcome, InviteRecord, Member,
-    MessageId, Store, Tx, UserId,
+    DomainError, DomainResult, Entry, EntryKind, GroupPositions, InsertOutcome, InviteRecord,
+    Member, MessageId, Store, Tx, UserId,
 };
 use sqlx::postgres::{PgPool, PgRow};
 use sqlx::{PgConnection, Postgres, Transaction};
@@ -14,7 +14,7 @@ use uuid::Uuid;
 use crate::codes::{decode, encode};
 use crate::error::store_error;
 use crate::locks;
-use crate::rows::{self, conversation_columns, member_columns};
+use crate::rows::{self, conversation_columns, entry_columns, member_columns};
 
 /// The push-domain [`Store`] on PostgreSQL.
 #[derive(Debug, Clone)]
@@ -495,78 +495,226 @@ impl Tx for PgTx {
         Ok(())
     }
 
-    async fn insert_entry(&mut self, _entry: Entry) -> DomainResult<InsertOutcome> {
-        unimplemented!("plan 3B task 4")
+    async fn insert_entry(&mut self, entry: Entry) -> DomainResult<InsertOutcome> {
+        // Only a client_msg_id conflict is a duplicate: a seq or message id that exists
+        // still fails with a unique violation.
+        let inserted = sqlx::query(
+            "INSERT INTO messaging.message \
+             (conversation_id, seq, message_id, client_msg_id, kind, target_seq, sender_id, \
+              sender_device_id, content_type, body, client_ts, server_ts, edited_at, edit_seq, \
+              deleted_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) \
+             ON CONFLICT (conversation_id, client_msg_id) DO NOTHING",
+        )
+        .bind(entry.conversation_id.0)
+        .bind(entry.seq)
+        .bind(entry.message_id.0)
+        .bind(entry.client_msg_id.0)
+        .bind(encode(entry.kind))
+        .bind(entry.target_seq)
+        .bind(entry.sender_id.0)
+        .bind(entry.sender_device_id.map(|device| device.0))
+        .bind(encode(entry.content_type))
+        .bind(entry.body)
+        .bind(entry.client_ts)
+        .bind(entry.server_ts)
+        .bind(entry.edited_at)
+        .bind(entry.edit_seq)
+        .bind(entry.deleted_at)
+        .execute(self.conn())
+        .await
+        .map_err(store_error)?
+        .rows_affected();
+        Ok(if inserted == 1 {
+            InsertOutcome::Inserted
+        } else {
+            InsertOutcome::Duplicate
+        })
     }
 
     async fn entry_by_client_id(
         &mut self,
-        _conversation: ConversationId,
-        _client_msg_id: ClientMsgId,
+        conversation: ConversationId,
+        client_msg_id: ClientMsgId,
     ) -> DomainResult<Option<Entry>> {
-        unimplemented!("plan 3B task 4")
+        let row = sqlx::query(concat!(
+            "SELECT ",
+            entry_columns!(),
+            " FROM messaging.message e WHERE e.conversation_id = $1 AND e.client_msg_id = $2"
+        ))
+        .bind(conversation.0)
+        .bind(client_msg_id.0)
+        .fetch_optional(self.conn())
+        .await
+        .map_err(store_error)?;
+        row.map(|row| rows::entry(&row).map_err(store_error))
+            .transpose()
     }
 
     async fn entry_by_message_id(
         &mut self,
-        _conversation: ConversationId,
-        _message_id: MessageId,
+        conversation: ConversationId,
+        message_id: MessageId,
     ) -> DomainResult<Option<Entry>> {
-        unimplemented!("plan 3B task 4")
+        let row = sqlx::query(concat!(
+            "SELECT ",
+            entry_columns!(),
+            " FROM messaging.message e WHERE e.conversation_id = $1 AND e.message_id = $2"
+        ))
+        .bind(conversation.0)
+        .bind(message_id.0)
+        .fetch_optional(self.conn())
+        .await
+        .map_err(store_error)?;
+        row.map(|row| rows::entry(&row).map_err(store_error))
+            .transpose()
     }
 
-    async fn update_entry(&mut self, _entry: Entry) -> DomainResult<()> {
-        unimplemented!("plan 3B task 4")
+    async fn update_entry(&mut self, entry: Entry) -> DomainResult<()> {
+        let updated = sqlx::query(
+            "UPDATE messaging.message \
+             SET body = $3, edited_at = $4, edit_seq = $5, deleted_at = $6 \
+             WHERE conversation_id = $1 AND seq = $2",
+        )
+        .bind(entry.conversation_id.0)
+        .bind(entry.seq)
+        .bind(entry.body)
+        .bind(entry.edited_at)
+        .bind(entry.edit_seq)
+        .bind(entry.deleted_at)
+        .execute(self.conn())
+        .await
+        .map_err(store_error)?
+        .rows_affected();
+        if updated == 0 {
+            return Err(DomainError::Store(
+                "update of an entry that does not exist".into(),
+            ));
+        }
+        Ok(())
     }
 
     async fn erase_edit_bodies(
         &mut self,
-        _conversation: ConversationId,
-        _target_seq: i64,
+        conversation: ConversationId,
+        target_seq: i64,
     ) -> DomainResult<()> {
-        unimplemented!("plan 3B task 4")
+        sqlx::query(
+            "UPDATE messaging.message SET body = NULL \
+             WHERE conversation_id = $1 AND target_seq = $2 AND kind = $3 \
+             AND body IS NOT NULL",
+        )
+        .bind(conversation.0)
+        .bind(target_seq)
+        .bind(encode(EntryKind::Edit))
+        .execute(self.conn())
+        .await
+        .map_err(store_error)?;
+        Ok(())
     }
 
     async fn entries_after(
         &mut self,
-        _conversation: ConversationId,
-        _after: i64,
-        _up_to: i64,
-        _targets_from: i64,
-        _limit: u32,
+        conversation: ConversationId,
+        after: i64,
+        up_to: i64,
+        targets_from: i64,
+        limit: u32,
     ) -> DomainResult<Vec<Entry>> {
-        unimplemented!("plan 3B task 4")
+        let rows = sqlx::query(concat!(
+            "SELECT ",
+            entry_columns!(),
+            " FROM messaging.message e \
+             WHERE e.conversation_id = $1 AND e.seq > $2 AND e.seq <= $3 \
+             AND (e.target_seq IS NULL OR e.target_seq >= $4) \
+             ORDER BY e.seq LIMIT $5"
+        ))
+        .bind(conversation.0)
+        .bind(after)
+        .bind(up_to)
+        .bind(targets_from)
+        .bind(i64::from(limit))
+        .fetch_all(self.conn())
+        .await
+        .map_err(store_error)?;
+        read_all(rows, rows::entry)
     }
 
     async fn count_incoming_messages(
         &mut self,
-        _conversation: ConversationId,
-        _user: UserId,
-        _after: i64,
-        _up_to: i64,
-        _cap: u32,
+        conversation: ConversationId,
+        user: UserId,
+        after: i64,
+        up_to: i64,
+        cap: u32,
     ) -> DomainResult<u32> {
-        unimplemented!("plan 3B task 4")
+        let count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM ( \
+                SELECT 1 FROM messaging.message \
+                WHERE conversation_id = $1 AND seq > $2 AND seq <= $3 \
+                AND kind = 1 AND deleted_at IS NULL AND sender_id <> $4 \
+                LIMIT $5 \
+             ) incoming",
+        )
+        .bind(conversation.0)
+        .bind(after)
+        .bind(up_to)
+        .bind(user.0)
+        .bind(i64::from(cap))
+        .fetch_one(self.conn())
+        .await
+        .map_err(store_error)?;
+        u32::try_from(count).map_err(|_| DomainError::Store(format!("count {count} overflows")))
     }
 
     async fn first_live_message(
         &mut self,
-        _conversation: ConversationId,
-        _after: i64,
-        _up_to: i64,
-        _not_from: Option<UserId>,
+        conversation: ConversationId,
+        after: i64,
+        up_to: i64,
+        not_from: Option<UserId>,
     ) -> DomainResult<Option<i64>> {
-        unimplemented!("plan 3B task 4")
+        sqlx::query_scalar(
+            "SELECT seq FROM messaging.message \
+             WHERE conversation_id = $1 AND seq > $2 AND seq <= $3 \
+             AND kind = 1 AND deleted_at IS NULL \
+             AND ($4::uuid IS NULL OR sender_id <> $4) \
+             ORDER BY seq LIMIT 1",
+        )
+        .bind(conversation.0)
+        .bind(after)
+        .bind(up_to)
+        .bind(not_from.map(|user| user.0))
+        .fetch_optional(self.conn())
+        .await
+        .map_err(store_error)
     }
 
     async fn messages_before(
         &mut self,
-        _conversation: ConversationId,
-        _from: i64,
-        _before: i64,
-        _limit: u32,
+        conversation: ConversationId,
+        from: i64,
+        before: i64,
+        limit: u32,
     ) -> DomainResult<Vec<Entry>> {
-        unimplemented!("plan 3B task 4")
+        let rows = sqlx::query(concat!(
+            "SELECT * FROM ( \
+                SELECT ",
+            entry_columns!(),
+            " FROM messaging.message e \
+                WHERE e.conversation_id = $1 AND e.seq >= $2 AND e.seq < $3 \
+                AND e.kind IN (1, 4) \
+                ORDER BY e.seq DESC LIMIT $4 \
+             ) page ORDER BY seq"
+        ))
+        .bind(conversation.0)
+        .bind(from)
+        .bind(before)
+        .bind(i64::from(limit))
+        .fetch_all(self.conn())
+        .await
+        .map_err(store_error)?;
+        read_all(rows, rows::entry)
     }
 
     async fn get_cursor(

@@ -134,6 +134,7 @@ fn main() {
         "contract::users::",
         "contract::contacts::",
         "contract::conversations::",
+        "contract::entries::",
     ];
     let cases = push_testkit::cases()
         .into_iter()

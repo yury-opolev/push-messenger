@@ -1,6 +1,9 @@
 //! Reading domain records from result rows.
 
-use push_domain::{Conversation, ConversationId, InviteRecord, Member, UserId};
+use push_domain::{
+    ClientMsgId, Conversation, ConversationId, DeviceId, Entry, InviteRecord, Member, MessageId,
+    UserId,
+};
 use sqlx::Row;
 use sqlx::postgres::PgRow;
 
@@ -22,6 +25,16 @@ macro_rules! member_columns {
     };
 }
 pub(crate) use member_columns;
+
+/// The columns [`entry`] reads, from a table aliased `e`.
+macro_rules! entry_columns {
+    () => {
+        "e.conversation_id, e.seq, e.message_id, e.client_msg_id, e.kind, e.target_seq, \
+         e.sender_id, e.sender_device_id, e.content_type, e.body, e.client_ts, e.server_ts, \
+         e.edited_at, e.edit_seq, e.deleted_at"
+    };
+}
+pub(crate) use entry_columns;
 
 fn decode_error(message: String) -> sqlx::Error {
     sqlx::Error::Decode(message.into())
@@ -55,6 +68,27 @@ pub(crate) fn member(row: &PgRow) -> Result<Member, sqlx::Error> {
         visible_from_seq: row.try_get("visible_from_seq")?,
         left_at_seq: row.try_get("left_at_seq")?,
         read_seq: row.try_get("read_seq")?,
+    })
+}
+
+pub(crate) fn entry(row: &PgRow) -> Result<Entry, sqlx::Error> {
+    let sender_device_id: Option<uuid::Uuid> = row.try_get("sender_device_id")?;
+    Ok(Entry {
+        conversation_id: ConversationId(row.try_get("conversation_id")?),
+        seq: row.try_get("seq")?,
+        message_id: MessageId(row.try_get("message_id")?),
+        client_msg_id: ClientMsgId(row.try_get("client_msg_id")?),
+        kind: decode(row.try_get("kind")?)?,
+        target_seq: row.try_get("target_seq")?,
+        sender_id: UserId(row.try_get("sender_id")?),
+        sender_device_id: sender_device_id.map(DeviceId),
+        content_type: decode(row.try_get("content_type")?)?,
+        body: row.try_get("body")?,
+        client_ts: row.try_get("client_ts")?,
+        server_ts: row.try_get("server_ts")?,
+        edited_at: row.try_get("edited_at")?,
+        edit_seq: row.try_get("edit_seq")?,
+        deleted_at: row.try_get("deleted_at")?,
     })
 }
 
