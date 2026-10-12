@@ -123,7 +123,8 @@ impl From<&Entry> for SendReceipt {
 pub struct MemberState {
     pub user_id: UserId,
     /// Furthest delivery position across all of the member's devices. Positions of revoked
-    /// devices count: a delivery that happened stays delivered.
+    /// devices count: a delivery that happened stays delivered. Reported as at least
+    /// `read_seq`, since reading implies delivery.
     pub delivered_seq: i64,
     pub read_seq: i64,
 }

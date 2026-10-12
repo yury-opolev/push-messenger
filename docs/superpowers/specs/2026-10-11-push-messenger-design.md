@@ -266,8 +266,10 @@ Each **member** records how far they have read (`conversation_member.read_seq`).
    4. `INSERT INTO message … ON CONFLICT (conversation_id, client_msg_id) DO NOTHING
       RETURNING …`. If nothing was inserted (a backstop for step 2), roll back and return
       the original as in step 2.
-   5. Advances the sender's `read_seq` to the new seq (sending a message marks the
-      conversation read for its sender). Delivery positions are **not** touched.
+   5. Advances the sender's read position to what the sending device has already received
+      (its delivery position): replying marks as read everything the user could have seen,
+      never messages their device has not received yet. Delivery positions are **not**
+      touched.
    6. Commits.
 6. Only **after commit** does message-svc reply with
    `{client_msg_id, message_id, seq, server_ts}`. The gateway sends `SendAck`, and the
@@ -317,8 +319,8 @@ honest statement is "Bob has read up to message N".
   (`all_delivered_seq`, `all_read_seq`, taken over all current members), only when it
   changes, at most once per second per conversation.
 - Position changes that pass only over edits, deletes or system entries send no receipt.
-- Sending marks the conversation read for the sender, so a reply can also produce a read
-  receipt for the other member of a direct chat.
+- Sending advances the sender's read position to what the sending device has received, so
+  a reply can also produce a read receipt for the other member of a direct chat.
 - A read implies delivery: a receipt never reports `delivered_seq` below `read_seq`.
 - After connecting, the client calls `ListConversations{changed_since}` to get the current
   positions and unread counts for conversations whose content changed. `changed_since`

@@ -44,11 +44,12 @@ async fn reading_beyond_the_last_message_is_rejected() {
 }
 
 #[tokio::test]
-async fn sending_marks_the_conversation_read_for_the_sender() {
+async fn sending_marks_received_messages_read() {
     let world = World::new();
     let (alice, bob) = (world.person().await, world.person().await);
     let chat = world.direct_chat(&alice, &bob).await;
     world.send(&bob, chat, "one").await;
+    world.svc.ack(alice.device, chat, 1).await.unwrap();
     world.send(&alice, chat, "two").await;
 
     let state = world
@@ -57,8 +58,21 @@ async fn sending_marks_the_conversation_read_for_the_sender() {
         .await
         .unwrap();
     assert_eq!(state.last_seq, 2);
-    assert_eq!(member(&state, alice.user).read_seq, 2);
-    assert_eq!(member(&state, bob.user).read_seq, 1);
+    assert_eq!(member(&state, alice.user).read_seq, 1);
+    assert_eq!(member(&state, bob.user).read_seq, 0);
+}
+
+#[tokio::test]
+async fn sending_does_not_mark_unreceived_messages_read() {
+    let world = World::new();
+    let (alice, bob) = (world.person().await, world.person().await);
+    let chat = world.direct_chat(&alice, &bob).await;
+    world.send(&bob, chat, "one").await;
+    world.send(&alice, chat, "two").await;
+
+    let state = world.svc.conversation_state(bob.user, chat).await.unwrap();
+    assert_eq!(member(&state, alice.user).read_seq, 0);
+    assert_eq!(member(&state, alice.user).delivered_seq, 0);
 }
 
 #[tokio::test]
@@ -92,6 +106,25 @@ async fn delivered_is_the_furthest_position_across_a_users_devices() {
         .await
         .unwrap();
     assert_eq!(member(&state, bob.user).delivered_seq, 3);
+}
+
+#[tokio::test]
+async fn read_implies_delivered_in_conversation_state() {
+    let world = World::new();
+    let (alice, bob) = (world.person().await, world.person().await);
+    let chat = world.direct_chat(&alice, &bob).await;
+    for body in ["one", "two"] {
+        world.send(&alice, chat, body).await;
+    }
+
+    world.svc.read_up_to(bob.user, chat, 2).await.unwrap();
+    let state = world
+        .svc
+        .conversation_state(alice.user, chat)
+        .await
+        .unwrap();
+    assert_eq!(member(&state, bob.user).delivered_seq, 2);
+    assert_eq!(member(&state, bob.user).read_seq, 2);
 }
 
 #[tokio::test]
@@ -168,9 +201,9 @@ async fn sending_never_lowers_the_senders_read_position() {
     world.svc.read_up_to(alice.user, chat, 3).await.unwrap();
     assert_eq!(alice_read().await, 3);
     world.send(&alice, chat, "four").await;
-    assert_eq!(alice_read().await, 4);
+    assert_eq!(alice_read().await, 3);
     for body in ["five", "six", "seven", "eight", "nine"] {
         world.send(&bob, chat, body).await;
     }
-    assert_eq!(alice_read().await, 4);
+    assert_eq!(alice_read().await, 3);
 }

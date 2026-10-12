@@ -54,8 +54,10 @@ where
     /// receipt, stores nothing new and publishes nothing — even if the sender has since lost
     /// the right to send.
     ///
-    /// Sending marks the conversation read for the sender; if that passes over a message
-    /// from the other member of a direct conversation, they get a read receipt.
+    /// Advances the sender's read position to what the sending device has already received
+    /// (its delivery position): replying marks as read everything the user could have seen,
+    /// never messages their device has not received yet. If that passes over a message from
+    /// the other member of a direct conversation, they get a read receipt.
     pub async fn send_text(&self, command: SendText) -> DomainResult<SendReceipt> {
         validate_text(&command.body)?;
         let prepared = self
@@ -111,10 +113,20 @@ where
                 )
                 .await;
         }
-        tx.raise_read_seq(conversation.id, command.sender, seq)
+        let device_position = tx
+            .get_cursor(command.device, conversation.id)
+            .await?
+            .unwrap_or(0);
+        tx.raise_read_seq(conversation.id, command.sender, device_position)
             .await?;
-        let read_receipt =
-            direct_receipt(&mut tx, &conversation, command.sender, member.read_seq, seq).await?;
+        let read_receipt = direct_receipt(
+            &mut tx,
+            &conversation,
+            command.sender,
+            member.read_seq,
+            device_position,
+        )
+        .await?;
         tx.commit().await?;
 
         let mut events = vec![Event::EntriesAvailable {

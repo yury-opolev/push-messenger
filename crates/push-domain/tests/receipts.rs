@@ -110,11 +110,12 @@ async fn reading_past_an_edit_sends_nothing() {
 }
 
 #[tokio::test]
-async fn replying_reports_that_the_peers_messages_were_read_and_so_delivered() {
+async fn replying_reports_that_the_peers_received_messages_were_read_and_so_delivered() {
     let world = World::new();
     let (alice, bob) = (world.person().await, world.person().await);
     let chat = world.direct_chat(&alice, &bob).await;
     world.send(&bob, chat, "hi").await;
+    world.svc.ack(alice.device, chat, 1).await.unwrap();
     world.notifier.take();
 
     world.send(&alice, chat, "hello").await;
@@ -122,7 +123,19 @@ async fn replying_reports_that_the_peers_messages_were_read_and_so_delivered() {
         world.notifier.take(),
         [
             entries_for(&[&alice, &bob]),
-            receipt(chat, &bob, &alice, 2, 2)
+            receipt(chat, &bob, &alice, 1, 1)
         ]
     );
+}
+
+#[tokio::test]
+async fn replying_without_having_received_the_peers_message_sends_no_read_receipt() {
+    let world = World::new();
+    let (alice, bob) = (world.person().await, world.person().await);
+    let chat = world.direct_chat(&alice, &bob).await;
+    world.send(&bob, chat, "hi").await;
+    world.notifier.take();
+
+    world.send(&alice, chat, "hello").await;
+    assert_eq!(world.notifier.take(), [entries_for(&[&alice, &bob])]);
 }

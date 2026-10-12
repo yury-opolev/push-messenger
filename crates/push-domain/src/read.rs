@@ -49,7 +49,7 @@ where
             let delivered_seq = tx.delivered_seq(conversation, member.user_id).await?;
             members.push(MemberState {
                 user_id: member.user_id,
-                delivered_seq,
+                delivered_seq: delivered_seq.max(member.read_seq),
                 read_seq: member.read_seq,
             });
         }

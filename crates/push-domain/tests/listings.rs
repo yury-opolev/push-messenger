@@ -78,7 +78,7 @@ async fn unread_counts_messages_from_others_after_the_read_position() {
     assert_eq!(summary(&world, &bob, chat).await.unread, 1);
 
     let alices = summary(&world, &alice, chat).await;
-    assert_eq!((alices.read_seq, alices.unread), (3, 0));
+    assert_eq!((alices.read_seq, alices.unread), (0, 0));
 }
 
 #[tokio::test]
