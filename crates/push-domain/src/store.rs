@@ -20,6 +20,9 @@
 //! before the block; that is accepted. `open_direct` takes the pair lock and never locks an
 //! existing conversation, so the lock order cannot form a cycle.
 //!
+//! Redeeming an invite locks the invite row ([`Tx::lock_invite`]) first and the contact
+//! pair second. No operation takes them in the other order.
+//!
 //! # Delivery positions
 //!
 //! Positions are created eagerly, so a device normally has one for every membership of its
@@ -35,7 +38,7 @@ use chrono::{DateTime, Utc};
 
 use crate::error::DomainResult;
 use crate::ids::{ClientMsgId, ConversationId, DeviceId, MessageId, UserId};
-use crate::model::{ContactState, Conversation, Entry, Member};
+use crate::model::{ContactState, Conversation, Entry, InviteRecord, Member};
 
 /// Result of an insert guarded by a uniqueness rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,6 +104,21 @@ pub trait Tx: Send {
     /// Every row owned by `owner`, as `(peer, state)`. Empty for an unknown user.
     /// The order of the result is unspecified.
     async fn contacts_of(&mut self, owner: UserId) -> DomainResult<Vec<(UserId, ContactState)>>;
+
+    // --- Invites -----------------------------------------------------------------------
+
+    /// Stores a new invite. Returns `Duplicate`, writing nothing, if an invite with the same
+    /// code exists (Postgres: `ON CONFLICT (code) DO NOTHING`). Fails with
+    /// `DomainError::Store` if the creator is not a known user.
+    async fn insert_invite(&mut self, invite: InviteRecord) -> DomainResult<InsertOutcome>;
+    /// The invite with this code, or `None`. Locks the invite row until the transaction
+    /// ends (`SELECT … FOR UPDATE`), so redeems and revokes of one invite are serialised and
+    /// its use count cannot be exceeded.
+    async fn lock_invite(&mut self, code: &str) -> DomainResult<Option<InviteRecord>>;
+    /// Overwrites `uses` and `revoked_at` of the stored invite with the same code. Every
+    /// other field of `invite` is ignored. Fails with `DomainError::Store` if there is no
+    /// such invite.
+    async fn update_invite(&mut self, invite: InviteRecord) -> DomainResult<()>;
 
     // --- Conversations and members -----------------------------------------------------
 

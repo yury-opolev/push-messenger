@@ -21,6 +21,48 @@ pub struct ContactSummary {
     pub state: ContactState,
 }
 
+/// A stored invite (spec §5.5). Redeeming it makes the redeemer an accepted contact of
+/// its creator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InviteRecord {
+    pub code: String,
+    /// The creator.
+    pub user_id: UserId,
+    pub expires_at: DateTime<Utc>,
+    pub max_uses: u32,
+    pub uses: u32,
+    pub revoked_at: Option<DateTime<Utc>>,
+}
+
+impl InviteRecord {
+    /// Whether the invite can be redeemed at `now`: not revoked, not expired and not used
+    /// up.
+    pub fn is_usable(&self, now: DateTime<Utc>) -> bool {
+        self.revoked_at.is_none() && now < self.expires_at && self.uses < self.max_uses
+    }
+}
+
+/// What the creator of an invite learns about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Invite {
+    /// Ten characters of Crockford base32, shown as a link or QR code.
+    pub code: String,
+    pub expires_at: DateTime<Utc>,
+    pub max_uses: u32,
+    pub uses: u32,
+}
+
+impl From<&InviteRecord> for Invite {
+    fn from(record: &InviteRecord) -> Self {
+        Self {
+            code: record.code.clone(),
+            expires_at: record.expires_at,
+            max_uses: record.max_uses,
+            uses: record.uses,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConversationKind {
     Direct,

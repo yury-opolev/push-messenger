@@ -13,7 +13,7 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use crate::error::{DomainError, DomainResult};
 use crate::ids::{ClientMsgId, ConversationId, DeviceId, MessageId, UserId};
-use crate::model::{ContactState, Conversation, Entry, EntryKind, Member};
+use crate::model::{ContactState, Conversation, Entry, EntryKind, InviteRecord, Member};
 use crate::store::{InsertOutcome, Store, Tx};
 
 fn missing(what: &str) -> DomainError {
@@ -25,6 +25,7 @@ struct State {
     users: HashSet<UserId>,
     devices: HashMap<DeviceId, DeviceRow>,
     contacts: HashMap<(UserId, UserId), ContactState>,
+    invites: HashMap<String, InviteRecord>,
     conversations: HashMap<ConversationId, Conversation>,
     direct_index: HashMap<[u8; 32], ConversationId>,
     members: BTreeMap<(ConversationId, UserId), Member>,
@@ -171,6 +172,32 @@ impl Tx for InMemoryTx {
             .filter(|((row_owner, _), _)| *row_owner == owner)
             .map(|((_, peer), state)| (*peer, *state))
             .collect())
+    }
+
+    async fn insert_invite(&mut self, invite: InviteRecord) -> DomainResult<InsertOutcome> {
+        if !self.work.users.contains(&invite.user_id) {
+            return Err(missing("user"));
+        }
+        if self.work.invites.contains_key(&invite.code) {
+            return Ok(InsertOutcome::Duplicate);
+        }
+        self.work.invites.insert(invite.code.clone(), invite);
+        Ok(InsertOutcome::Inserted)
+    }
+
+    async fn lock_invite(&mut self, code: &str) -> DomainResult<Option<InviteRecord>> {
+        // Every in-memory transaction already holds the store-wide lock.
+        Ok(self.work.invites.get(code).cloned())
+    }
+
+    async fn update_invite(&mut self, invite: InviteRecord) -> DomainResult<()> {
+        let stored =
+            self.work.invites.get_mut(&invite.code).ok_or_else(|| {
+                DomainError::Store("update of an invite that does not exist".into())
+            })?;
+        stored.uses = invite.uses;
+        stored.revoked_at = invite.revoked_at;
+        Ok(())
     }
 
     async fn find_direct(&mut self, key: [u8; 32]) -> DomainResult<Option<ConversationId>> {
@@ -563,6 +590,67 @@ mod tests {
 
     fn seqs(entries: &[Entry]) -> Vec<i64> {
         entries.iter().map(|entry| entry.seq).collect()
+    }
+
+    fn invite(code: &str, user: UserId) -> InviteRecord {
+        InviteRecord {
+            code: code.into(),
+            user_id: user,
+            expires_at: start() + TimeDelta::days(1),
+            max_uses: 1,
+            uses: 0,
+            revoked_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_invite_code_is_stored_once() {
+        let store = InMemoryStore::new();
+        let (first, second) = (UserId::new(), UserId::new());
+        let mut tx = store.begin().await.unwrap();
+        tx.insert_user(first).await.unwrap();
+        tx.insert_user(second).await.unwrap();
+
+        assert_eq!(
+            tx.insert_invite(invite("ABCDEFGHJK", first)).await,
+            Ok(InsertOutcome::Inserted)
+        );
+        assert_eq!(
+            tx.insert_invite(invite("ABCDEFGHJK", second)).await,
+            Ok(InsertOutcome::Duplicate)
+        );
+        assert_eq!(
+            tx.lock_invite("ABCDEFGHJK").await,
+            Ok(Some(invite("ABCDEFGHJK", first)))
+        );
+        assert_eq!(tx.lock_invite("0000000000").await, Ok(None));
+        assert!(matches!(
+            tx.insert_invite(invite("0000000000", UserId::new())).await,
+            Err(DomainError::Store(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn update_invite_changes_only_uses_and_revocation() {
+        let store = InMemoryStore::new();
+        let user = UserId::new();
+        let mut tx = store.begin().await.unwrap();
+        tx.insert_user(user).await.unwrap();
+        tx.insert_invite(invite("ABCDEFGHJK", user)).await.unwrap();
+
+        let mut changed = invite("ABCDEFGHJK", UserId::new());
+        changed.uses = 1;
+        changed.revoked_at = Some(start());
+        changed.max_uses = 9;
+        tx.update_invite(changed).await.unwrap();
+
+        let stored = tx.lock_invite("ABCDEFGHJK").await.unwrap().unwrap();
+        assert_eq!((stored.uses, stored.revoked_at), (1, Some(start())));
+        assert_eq!((stored.user_id, stored.max_uses), (user, 1));
+        assert!(matches!(
+            tx.update_invite(invite("0000000000", user)).await,
+            Err(DomainError::Store(_))
+        ));
     }
 
     #[tokio::test]

@@ -11,6 +11,7 @@ mod edit;
 pub mod error;
 mod history;
 pub mod ids;
+mod invites;
 pub mod memory;
 pub mod model;
 pub mod notify;
@@ -29,7 +30,8 @@ pub use ids::{ClientMsgId, ConversationId, DeviceId, MessageId, UserId};
 pub use memory::InMemoryStore;
 pub use model::{
     ContactState, ContactSummary, ContentType, Conversation, ConversationKind, ConversationState,
-    ConversationSummary, Entry, EntryKind, Member, MemberState, Role, SendReceipt, direct_key,
+    ConversationSummary, Entry, EntryKind, Invite, InviteRecord, Member, MemberState, Role,
+    SendReceipt, direct_key,
 };
 pub use notify::{Event, NoopNotifier, Notifier, ReceiptUpdate, RecordingNotifier};
 pub use send::SendText;
@@ -37,5 +39,6 @@ pub use service::{Messaging, Policy};
 pub use store::{InsertOutcome, Store, Tx};
 pub use sync::SyncBatch;
 pub use validation::{
-    MAX_HISTORY_PAGE, MAX_SYNC_BATCH, MAX_TEXT_BYTES, MAX_UNREAD, ValidationError, validate_text,
+    MAX_HISTORY_PAGE, MAX_INVITE_LIFETIME_SECS, MAX_INVITE_USES, MAX_SYNC_BATCH, MAX_TEXT_BYTES,
+    MAX_UNREAD, MIN_INVITE_LIFETIME_SECS, ValidationError, validate_invite, validate_text,
 };
