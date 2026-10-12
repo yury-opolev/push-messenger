@@ -25,6 +25,8 @@ use uuid::Uuid;
 
 /// How long a joining session waits for its user's subscription to become active.
 const SUBSCRIBE_WAIT: Duration = Duration::from_secs(2);
+/// How long a subscribe or unsubscribe may take before the connection is given up on.
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long to wait before reconnecting to Redis.
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 
@@ -177,6 +179,24 @@ impl Drop for Membership {
     }
 }
 
+/// Runs a Redis command with a time limit. `None` when `shutdown` came first; otherwise
+/// whether the command succeeded, a timeout counting as a failure.
+async fn bounded(
+    shutdown: &CancellationToken,
+    command: impl Future<Output = redis::RedisResult<()>>,
+) -> Option<bool> {
+    tokio::select! {
+        () = shutdown.cancelled() => None,
+        result = tokio::time::timeout(COMMAND_TIMEOUT, command) => match result {
+            Ok(result) => Some(result.is_ok()),
+            Err(_) => {
+                tracing::warn!("Redis did not answer a subscription command in time");
+                Some(false)
+            }
+        },
+    }
+}
+
 /// The subscriber task: keeps one Redis pub/sub connection, follows the hub's subscribe
 /// and unsubscribe commands, and dispatches what arrives. Reconnects after a break,
 /// subscribes again to every user with a session and rings them all. Connecting is
@@ -198,9 +218,13 @@ async fn subscribe(
                 let (mut sink, mut messages) = pubsub.split();
                 let mut resubscribed = true;
                 for user in hub.users() {
-                    if sink.subscribe(notify_channel(user)).await.is_err() {
-                        resubscribed = false;
-                        break;
+                    match bounded(&shutdown, sink.subscribe(notify_channel(user))).await {
+                        None => return,
+                        Some(true) => {}
+                        Some(false) => {
+                            resubscribed = false;
+                            break;
+                        }
                     }
                 }
                 if resubscribed {
@@ -211,18 +235,30 @@ async fn subscribe(
                         tokio::select! {
                             () = shutdown.cancelled() => return,
                             command = commands.recv() => {
-                                let result = match command {
+                                let succeeded = match command {
                                     None => return,
                                     Some(Command::Subscribe(user, done)) => {
-                                        let result = sink.subscribe(notify_channel(user)).await;
+                                        let Some(succeeded) =
+                                            bounded(&shutdown, sink.subscribe(notify_channel(user))).await
+                                        else {
+                                            return;
+                                        };
+                                        // Sent even when the subscribe failed: the reconnect path
+                                        // subscribes every user again and calls `ring_all`, so the
+                                        // joining session does not need to wait any longer.
                                         let _ = done.send(());
-                                        result
+                                        succeeded
                                     }
                                     Some(Command::Unsubscribe(user)) => {
-                                        sink.unsubscribe(notify_channel(user)).await
+                                        let Some(succeeded) =
+                                            bounded(&shutdown, sink.unsubscribe(notify_channel(user))).await
+                                        else {
+                                            return;
+                                        };
+                                        succeeded
                                     }
                                 };
-                                if result.is_err() {
+                                if !succeeded {
                                     break;
                                 }
                             }
