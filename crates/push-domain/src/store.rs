@@ -210,6 +210,16 @@ pub trait Tx: Send {
         up_to: i64,
         cap: u32,
     ) -> DomainResult<u32>;
+    /// The lowest `seq` with `after < seq <= up_to` of a message (`kind = Message`) that is
+    /// not deleted and, if `not_from` is given, was sent by someone else. `None` if there is
+    /// none. On Postgres one range scan of the primary key: `… ORDER BY seq LIMIT 1`.
+    async fn first_live_message(
+        &mut self,
+        conversation: ConversationId,
+        after: i64,
+        up_to: i64,
+        not_from: Option<UserId>,
+    ) -> DomainResult<Option<i64>>;
     /// The newest `limit` entries of kind `Message` or `System` with `from <= seq < before`,
     /// returned oldest first. Edit and delete entries are skipped and do not count towards
     /// `limit`.

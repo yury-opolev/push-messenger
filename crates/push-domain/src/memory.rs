@@ -446,6 +446,29 @@ impl Tx for InMemoryTx {
         Ok(count as u32)
     }
 
+    async fn first_live_message(
+        &mut self,
+        conversation: ConversationId,
+        after: i64,
+        up_to: i64,
+        not_from: Option<UserId>,
+    ) -> DomainResult<Option<i64>> {
+        if after >= up_to {
+            return Ok(None);
+        }
+        Ok(self
+            .work
+            .entries
+            .range((conversation, after + 1)..=(conversation, up_to))
+            .map(|(_, entry)| entry)
+            .find(|entry| {
+                entry.kind == EntryKind::Message
+                    && entry.deleted_at.is_none()
+                    && not_from.is_none_or(|user| entry.sender_id != user)
+            })
+            .map(|entry| entry.seq))
+    }
+
     async fn messages_before(
         &mut self,
         conversation: ConversationId,
@@ -1199,5 +1222,40 @@ mod tests {
             seqs(&tx.entries_after(id, 3, 6, 2, 2).await.unwrap()),
             vec![5, 6]
         );
+    }
+
+    #[tokio::test]
+    async fn the_first_live_message_skips_changes_deleted_messages_and_the_excluded_sender() {
+        let store = InMemoryStore::new();
+        let conversation = conversation();
+        let id = conversation.id;
+        let me = UserId::new();
+        let mut tx = store.begin().await.unwrap();
+        tx.insert_conversation(conversation).await.unwrap();
+        let entries = [
+            entry(id, 1, ClientMsgId::new()),
+            Entry {
+                sender_id: me,
+                ..entry(id, 2, ClientMsgId::new())
+            },
+            Entry {
+                deleted_at: Some(start()),
+                ..entry(id, 3, ClientMsgId::new())
+            },
+            Entry {
+                kind: EntryKind::Edit,
+                ..entry(id, 4, ClientMsgId::new())
+            },
+            entry(id, 5, ClientMsgId::new()),
+        ];
+        for entry in entries {
+            tx.insert_entry(entry).await.unwrap();
+        }
+
+        assert_eq!(tx.first_live_message(id, 0, 5, Some(me)).await, Ok(Some(1)));
+        assert_eq!(tx.first_live_message(id, 1, 5, Some(me)).await, Ok(Some(5)));
+        assert_eq!(tx.first_live_message(id, 1, 5, None).await, Ok(Some(2)));
+        assert_eq!(tx.first_live_message(id, 2, 4, None).await, Ok(None));
+        assert_eq!(tx.first_live_message(id, 5, 5, None).await, Ok(None));
     }
 }
