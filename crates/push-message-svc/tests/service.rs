@@ -123,7 +123,7 @@ async fn shutdown_is_honoured_while_the_database_is_unreachable() {
         .unwrap();
     assert!(result.is_ok(), "{result:?}");
     assert!(
-        started.elapsed() < Duration::from_secs(5),
+        started.elapsed() < Duration::from_secs(1),
         "shutdown took {:?}",
         started.elapsed()
     );

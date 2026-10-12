@@ -31,6 +31,10 @@ pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
 /// Checks that `url` parses as a PostgreSQL connection URL, without connecting. The error
 /// never contains the URL, which carries the password.
 pub fn check_database_url(url: &str) -> Result<(), String> {
+    // sqlx parses any scheme as PostgreSQL options, so the scheme is checked here.
+    if !(url.starts_with("postgres://") || url.starts_with("postgresql://")) {
+        return Err("not a valid PostgreSQL connection URL".to_owned());
+    }
     url.parse::<sqlx::postgres::PgConnectOptions>()
         .map(drop)
         .map_err(|_| "not a valid PostgreSQL connection URL".to_owned())

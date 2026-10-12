@@ -154,14 +154,20 @@ mod tests {
     }
 
     const REQUIRED: [(&str, &str); 2] = [
-        ("PUSH_DATABASE_URL", "postgres://push@db/push_messaging"),
+        (
+            "PUSH_DATABASE_URL",
+            "postgres://push:dbsecret@db/push_messaging",
+        ),
         ("PUSH_REDIS_URL", "redis://:secret@redis:6379"),
     ];
 
     #[test]
     fn defaults_apply_when_only_the_urls_are_set() {
         let config = config(&REQUIRED).unwrap();
-        assert_eq!(config.database_url, "postgres://push@db/push_messaging");
+        assert_eq!(
+            config.database_url,
+            "postgres://push:dbsecret@db/push_messaging"
+        );
         assert_eq!(config.redis_url, "redis://:secret@redis:6379");
         assert_eq!(config.grpc_addr, "0.0.0.0:50051".parse().unwrap());
         assert_eq!(config.health_addr, "0.0.0.0:8081".parse().unwrap());
@@ -227,6 +233,9 @@ mod tests {
             config(&variables).unwrap_err().to_string()
         };
         let message = bad("PUSH_DATABASE_URL", "postgres://push:hunter2@db:notaport/x");
+        assert!(message.contains("PUSH_DATABASE_URL"), "{message}");
+        assert!(!message.contains("hunter2"), "{message}");
+        let message = bad("PUSH_DATABASE_URL", "mysql://push:hunter2@db/x");
         assert!(message.contains("PUSH_DATABASE_URL"), "{message}");
         assert!(!message.contains("hunter2"), "{message}");
         let message = bad("PUSH_REDIS_URL", "http://:hunter2@redis:6379");
