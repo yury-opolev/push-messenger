@@ -3,7 +3,8 @@ use crate::conversations::{require_conversation, require_member};
 use crate::error::{DomainError, DomainResult};
 use crate::ids::{ConversationId, UserId};
 use crate::model::{
-    Conversation, ConversationKind, ConversationState, Member, MemberState, Positions,
+    Conversation, ConversationKind, ConversationState, GroupPositions, Member, MemberState,
+    Positions,
 };
 use crate::notify::{Event, Notifier, ReceiptUpdate};
 use crate::service::{Messaging, current_member_ids};
@@ -145,22 +146,9 @@ pub(crate) async fn direct_receipt<T: Tx>(
     }))
 }
 
-/// Group-wide positions (spec §4.5): every live message up to `read` has been read, and
-/// every one up to `delivered` delivered, by every current member other than its sender.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct GroupPositions {
-    pub(crate) delivered: i64,
-    pub(crate) read: i64,
-}
-
-/// The group-wide positions of `conversation` with its log ending at `last_seq`, the
-/// minimum over its current members of their effective positions. `None` for a direct
-/// conversation or a group without members.
-///
-/// A member's effective position skips their own messages, edits, deletes and system
-/// entries: it lies just before the first live message from someone else after their
-/// position, within their visible range, or at the end of that range if there is none.
-/// The delivered position is at least the read one, since reading implies delivery.
+/// The group-wide positions of `conversation` with its log ending at `last_seq` (see
+/// [`Tx::group_positions`]). `None` for a direct conversation or a group without current
+/// members.
 pub(crate) async fn group_positions<T: Tx>(
     tx: &mut T,
     conversation: &Conversation,
@@ -169,29 +157,7 @@ pub(crate) async fn group_positions<T: Tx>(
     if conversation.kind != ConversationKind::Group {
         return Ok(None);
     }
-    let mut all: Option<GroupPositions> = None;
-    for member in tx.members(conversation.id).await? {
-        if !member.is_current() {
-            continue;
-        }
-        let read = effective_position(tx, &member, last_seq, member.read_seq).await?;
-        let delivered_seq = tx.delivered_seq(conversation.id, member.user_id).await?;
-        let delivered = if delivered_seq > member.read_seq {
-            effective_position(tx, &member, last_seq, delivered_seq)
-                .await?
-                .max(read)
-        } else {
-            read
-        };
-        all = Some(match all {
-            None => GroupPositions { delivered, read },
-            Some(other) => GroupPositions {
-                delivered: other.delivered.min(delivered),
-                read: other.read.min(read),
-            },
-        });
-    }
-    Ok(all)
+    tx.group_positions(conversation.id, last_seq).await
 }
 
 /// The group-wide positions before a change to `conversation`, with its log ending at
@@ -228,24 +194,6 @@ pub(crate) async fn group_positions_for<T: Tx>(
             read: all.read.min(upper),
         },
     ))
-}
-
-/// How far `member`, at `position`, has effectively got: see [`group_positions`].
-async fn effective_position<T: Tx>(
-    tx: &mut T,
-    member: &Member,
-    last_seq: i64,
-    position: i64,
-) -> DomainResult<i64> {
-    let upper = member.visible_upper(last_seq);
-    let from = position.max(member.visible_from_seq - 1);
-    if from >= upper {
-        return Ok(upper);
-    }
-    let first = tx
-        .first_live_message(member.conversation_id, from, upper, Some(member.user_id))
-        .await?;
-    Ok(first.map_or(upper, |seq| seq - 1))
 }
 
 /// The receipt for a group's current members after a change, if its group-wide positions

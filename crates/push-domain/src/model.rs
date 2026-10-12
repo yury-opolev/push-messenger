@@ -223,6 +223,15 @@ pub enum Receipts {
     },
 }
 
+/// Group-wide positions (spec §4.5): every live message up to `read` has been read, and
+/// every one up to `delivered` delivered, by every current member other than its sender.
+/// `delivered` is never below `read`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GroupPositions {
+    pub delivered: i64,
+    pub read: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConversationState {
     pub conversation_id: ConversationId,

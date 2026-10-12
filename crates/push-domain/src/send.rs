@@ -6,10 +6,11 @@ use crate::conversations::require_conversation;
 use crate::error::{DomainError, DomainResult};
 use crate::ids::{ClientMsgId, ConversationId, DeviceId, MessageId, UserId};
 use crate::model::{
-    ContentType, Conversation, ConversationKind, Entry, EntryKind, Member, SendReceipt,
+    ContentType, Conversation, ConversationKind, Entry, EntryKind, GroupPositions, Member,
+    SendReceipt,
 };
 use crate::notify::{Event, Notifier};
-use crate::read::{GroupPositions, direct_receipt, group_positions_before, group_receipt};
+use crate::read::{direct_receipt, group_positions_before, group_receipt};
 use crate::service::{Messaging, current_member_ids, require_device};
 use crate::store::{InsertOutcome, Store, Tx};
 use crate::validation::validate_text;

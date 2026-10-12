@@ -1,6 +1,9 @@
-use push_domain::{ConversationId, DeviceId, DomainError, Store, Tx, UserId};
+use push_domain::{
+    ClientMsgId, Conversation, ConversationId, ConversationKind, DeviceId, DomainError, Entry,
+    EntryKind, GroupPositions, Member, Store, Tx, UserId,
+};
 
-use super::{add_users, conversation, store_with};
+use super::{add_users, conversation, entry, member, start, store_with};
 use crate::{Backend, Case, case_list};
 
 async fn positions_only_move_forward<B: Backend>(backend: &B) {
@@ -92,11 +95,124 @@ async fn a_position_needs_a_known_device_and_conversation<B: Backend>(backend: &
     }
 }
 
+/// A group log with seven entries and five members:
+///
+/// | seq | entry |
+/// |---|---|
+/// | 1 | system entry by alice |
+/// | 2 | message from alice |
+/// | 3 | message from bob |
+/// | 4 | message from carol, deleted |
+/// | 5 | edit by alice of seq 2 |
+/// | 6 | message from alice |
+/// | 7 | message from bob |
+///
+/// alice has read 2 and her device has 7; bob has read 0, his revoked phone has 6 and his
+/// laptop 1; carol has read 5 and has no device; dave left at 3; erin joined at 6 and her
+/// device still has 3 from an earlier membership.
+async fn group_positions_are_minimums_of_effective_positions_over_current_members<B: Backend>(
+    backend: &B,
+) {
+    let group = Conversation {
+        kind: ConversationKind::Group,
+        ..conversation()
+    };
+    let id = group.id;
+    let store = store_with(backend, group).await;
+    let [alice, bob, carol, dave, erin] = [(); 5].map(|()| UserId::new());
+    add_users(&store, &[alice, bob, carol, dave, erin]).await;
+    let mut tx = store.begin().await.unwrap();
+    let senders = [alice, alice, bob, carol, alice, alice, bob];
+    for (seq, sender) in (1..).zip(senders) {
+        let mut entry = Entry {
+            sender_id: sender,
+            ..entry(id, seq, ClientMsgId::new())
+        };
+        match seq {
+            1 => entry.kind = EntryKind::System,
+            4 => entry.deleted_at = Some(start()),
+            5 => {
+                entry.kind = EntryKind::Edit;
+                entry.target_seq = Some(2);
+            }
+            _ => {}
+        }
+        tx.insert_entry(entry).await.unwrap();
+    }
+    let rows = [
+        (alice, 1, None, 2),
+        (bob, 1, None, 0),
+        (carol, 1, None, 5),
+        (dave, 1, Some(3), 0),
+        (erin, 6, None, 0),
+    ];
+    for (user, visible_from_seq, left_at_seq, read_seq) in rows {
+        tx.insert_member(Member {
+            visible_from_seq,
+            left_at_seq,
+            read_seq,
+            ..member(id, user)
+        })
+        .await
+        .unwrap();
+    }
+    let devices = [(alice, 7), (bob, 6), (bob, 1), (erin, 3)];
+    let mut ids = Vec::new();
+    for (user, position) in devices {
+        let device = DeviceId::new();
+        tx.insert_device(device, user).await.unwrap();
+        tx.raise_cursor(device, id, position).await.unwrap();
+        ids.push(device);
+    }
+    tx.revoke_device(ids[1]).await.unwrap();
+    tx.commit().await.unwrap();
+
+    let mut tx = store.begin().await.unwrap();
+    assert_eq!(
+        tx.group_positions(id, 7).await,
+        Ok(Some(GroupPositions {
+            delivered: 5,
+            read: 1
+        }))
+    );
+    assert_eq!(
+        tx.group_positions(id, 4).await,
+        Ok(Some(GroupPositions {
+            delivered: 4,
+            read: 1
+        })),
+        "positions are capped at the end of the log"
+    );
+}
+
+async fn a_group_without_current_members_has_no_positions<B: Backend>(backend: &B) {
+    let group = Conversation {
+        kind: ConversationKind::Group,
+        ..conversation()
+    };
+    let id = group.id;
+    let store = store_with(backend, group).await;
+    let alice = UserId::new();
+    add_users(&store, &[alice]).await;
+    let mut tx = store.begin().await.unwrap();
+    assert_eq!(tx.group_positions(id, 0).await, Ok(None));
+
+    tx.insert_member(Member {
+        left_at_seq: Some(0),
+        ..member(id, alice)
+    })
+    .await
+    .unwrap();
+    assert_eq!(tx.group_positions(id, 0).await, Ok(None));
+}
+
 pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
     case_list![
         positions_only_move_forward,
         raising_an_absent_position_creates_it,
         delivered_is_the_furthest_position_of_any_device_of_the_user,
         a_position_needs_a_known_device_and_conversation,
+        group_positions_are_minimums_of_effective_positions_over_current_members,
+        a_group_without_current_members_has_no_positions,
     ]
 }

@@ -13,7 +13,9 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use crate::error::{DomainError, DomainResult};
 use crate::ids::{ClientMsgId, ConversationId, DeviceId, MessageId, UserId};
-use crate::model::{ContactState, Conversation, Entry, EntryKind, InviteRecord, Member};
+use crate::model::{
+    ContactState, Conversation, Entry, EntryKind, GroupPositions, InviteRecord, Member,
+};
 use crate::store::{InsertOutcome, Store, Tx};
 
 fn missing(what: &str) -> DomainError {
@@ -33,6 +35,52 @@ struct State {
     client_ids: HashMap<(ConversationId, ClientMsgId), i64>,
     cursors: HashMap<(DeviceId, ConversationId), i64>,
     message_ids: HashMap<MessageId, (ConversationId, i64)>,
+}
+
+impl State {
+    fn first_live_message(
+        &self,
+        conversation: ConversationId,
+        after: i64,
+        up_to: i64,
+        not_from: Option<UserId>,
+    ) -> Option<i64> {
+        if after >= up_to {
+            return None;
+        }
+        self.entries
+            .range((conversation, after + 1)..=(conversation, up_to))
+            .map(|(_, entry)| entry)
+            .find(|entry| {
+                entry.kind == EntryKind::Message
+                    && entry.deleted_at.is_none()
+                    && not_from.is_none_or(|user| entry.sender_id != user)
+            })
+            .map(|entry| entry.seq)
+    }
+
+    fn delivered_seq(&self, conversation: ConversationId, user: UserId) -> i64 {
+        self.cursors
+            .iter()
+            .filter(|((device, cursor_conversation), _)| {
+                *cursor_conversation == conversation
+                    && self.devices.get(device).is_some_and(|row| row.user == user)
+            })
+            .map(|(_, position)| *position)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// See [`Tx::group_positions`].
+    fn effective_position(&self, member: &Member, last_seq: i64, position: i64) -> i64 {
+        let upper = member.visible_upper(last_seq);
+        let from = position.max(member.visible_from_seq - 1);
+        if from >= upper {
+            return upper;
+        }
+        self.first_live_message(member.conversation_id, from, upper, Some(member.user_id))
+            .map_or(upper, |seq| seq - 1)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -473,20 +521,9 @@ impl Tx for InMemoryTx {
         up_to: i64,
         not_from: Option<UserId>,
     ) -> DomainResult<Option<i64>> {
-        if after >= up_to {
-            return Ok(None);
-        }
         Ok(self
             .work
-            .entries
-            .range((conversation, after + 1)..=(conversation, up_to))
-            .map(|(_, entry)| entry)
-            .find(|entry| {
-                entry.kind == EntryKind::Message
-                    && entry.deleted_at.is_none()
-                    && not_from.is_none_or(|user| entry.sender_id != user)
-            })
-            .map(|entry| entry.seq))
+            .first_live_message(conversation, after, up_to, not_from))
     }
 
     async fn messages_before(
@@ -570,20 +607,33 @@ impl Tx for InMemoryTx {
         conversation: ConversationId,
         user: UserId,
     ) -> DomainResult<i64> {
-        Ok(self
-            .work
-            .cursors
-            .iter()
-            .filter(|((device, cursor_conversation), _)| {
-                *cursor_conversation == conversation
-                    && self
-                        .work
-                        .devices
-                        .get(device)
-                        .is_some_and(|row| row.user == user)
+        Ok(self.work.delivered_seq(conversation, user))
+    }
+
+    async fn group_positions(
+        &mut self,
+        conversation: ConversationId,
+        last_seq: i64,
+    ) -> DomainResult<Option<GroupPositions>> {
+        let state = &self.work;
+        Ok(state
+            .members
+            .values()
+            .filter(|member| member.conversation_id == conversation && member.is_current())
+            .map(|member| {
+                let delivered_seq = state.delivered_seq(conversation, member.user_id);
+                GroupPositions {
+                    delivered: state.effective_position(
+                        member,
+                        last_seq,
+                        delivered_seq.max(member.read_seq),
+                    ),
+                    read: state.effective_position(member, last_seq, member.read_seq),
+                }
             })
-            .map(|(_, position)| *position)
-            .max()
-            .unwrap_or(0))
+            .reduce(|all, one| GroupPositions {
+                delivered: all.delivered.min(one.delivered),
+                read: all.read.min(one.read),
+            }))
     }
 }

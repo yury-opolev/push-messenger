@@ -7,9 +7,11 @@ use crate::contacts::are_contacts;
 use crate::conversations::require_conversation;
 use crate::error::{DomainError, DomainResult};
 use crate::ids::{ClientMsgId, ConversationId, MessageId, UserId};
-use crate::model::{ContentType, Conversation, ConversationKind, Entry, EntryKind, Member, Role};
+use crate::model::{
+    ContentType, Conversation, ConversationKind, Entry, EntryKind, GroupPositions, Member, Role,
+};
 use crate::notify::{Event, Notifier};
-use crate::read::{GroupPositions, group_positions_before, group_receipt};
+use crate::read::{group_positions_before, group_receipt};
 use crate::service::{Messaging, current_member_ids};
 use crate::store::{Store, Tx};
 use crate::system::SystemEvent;

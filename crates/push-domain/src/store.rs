@@ -45,7 +45,7 @@ use chrono::{DateTime, Utc};
 
 use crate::error::DomainResult;
 use crate::ids::{ClientMsgId, ConversationId, DeviceId, MessageId, UserId};
-use crate::model::{ContactState, Conversation, Entry, InviteRecord, Member};
+use crate::model::{ContactState, Conversation, Entry, GroupPositions, InviteRecord, Member};
 
 /// Result of an insert guarded by a uniqueness rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -284,4 +284,23 @@ pub trait Tx: Send {
         conversation: ConversationId,
         user: UserId,
     ) -> DomainResult<i64>;
+
+    /// The group-wide positions of `conversation` with its log ending at `last_seq`: the
+    /// minimums over its current members of their effective positions. `None` if it has
+    /// no current members.
+    ///
+    /// A member's effective position from a raw position `p` skips their own messages,
+    /// edits, deletes, system entries and deleted messages: with
+    /// `from = max(p, visible_from_seq - 1)`, it is `last_seq` if `from >= last_seq`,
+    /// otherwise the `seq` before the first live message from someone else with
+    /// `from < seq <= last_seq` (see `first_live_message`), or `last_seq` if there is none.
+    /// Their effective read position starts from `read_seq`; their effective delivered
+    /// position from `max(delivered_seq, read_seq)`, so it is never below the read one.
+    ///
+    /// Postgres computes it in one statement, however many members the group has.
+    async fn group_positions(
+        &mut self,
+        conversation: ConversationId,
+        last_seq: i64,
+    ) -> DomainResult<Option<GroupPositions>>;
 }
