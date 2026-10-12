@@ -146,7 +146,8 @@ conversation (
   title           text,                    -- group only
   created_by      uuid not null,
   last_seq        bigint not null default 0,   -- the single-writer counter
-  created_at      timestamptz not null default now()
+  created_at      timestamptz not null default now(),
+  updated_at      timestamptz not null default now()   -- creation or last append
 )
 
 conversation_member (
@@ -316,8 +317,19 @@ honest statement is "Bob has read up to message N".
   (`all_delivered_seq`, `all_read_seq`, taken over all current members), only when it
   changes, at most once per second per conversation.
 - Position changes that pass only over edits, deletes or system entries send no receipt.
-- After connecting, the client calls `ListConversations{changed_since}` to get the
-  current positions and unread counts for conversations that changed.
+- Sending marks the conversation read for the sender, so a reply can also produce a read
+  receipt for the other member of a direct chat.
+- A read implies delivery: a receipt never reports `delivered_seq` below `read_seq`.
+- After connecting, the client calls `ListConversations{changed_since}` to get the current
+  positions and unread counts for conversations whose content changed. `changed_since`
+  reflects content changes only: a conversation created or an entry appended. Receipt
+  positions are not tracked by `updated_at`, so the busy conversation row is not written
+  on every ack and read. A direct conversation's summary carries the other member's
+  `peer_delivered_seq` and `peer_read_seq`, so a reconnecting client refreshes its ticks
+  with one `ListConversations` without `changed_since`.
+- Block and unblock do not move `updated_at` either. After a `ContactChanged` event, the
+  client also lists without `changed_since` to refresh hidden and unhidden chats. Clients
+  pass `changed_since` as the previous listing time minus a safety window.
 
 ### 4.6 Edits and deletes
 
@@ -329,8 +341,10 @@ honest statement is "Bob has read up to message N".
   - **Delete:** `deleted_at`, and `body` set to null on the original **and every edit
     entry** targeting it. Deletion is real erasure, not hiding.
 - Checks, made under the conversation lock:
-  - the target is a normal message (`kind = 1`) and not already deleted (deleting
-    twice returns the first result);
+  - the target is a normal message (`kind = 1`) and not already deleted (a retry of the
+    same delete, with the same `client_msg_id`, returns its original result; a new
+    delete of an already-deleted message fails with `AlreadyDeleted`, and so does an
+    edit of one);
   - the caller is the original sender (any of their devices);
   - `now() - target.server_ts` is within the window. Edits and deletes are allowed for
     48 hours by default; both limits are server settings.
@@ -427,7 +441,10 @@ Access-token claims: `sub`, `device_id`, `email_verified`, `exp`, `iat`, `jti`, 
   to 20 per hour per user. Email lookup is not offered.
 - **Contact request.** `ContactRequest{user_id}` creates `requested_out` /
   `requested_in` rows. The other user can `Accept`, `Decline` or `Block`. If both send a
-  request to each other, it becomes accepted.
+  request to each other, it becomes accepted. A decline is announced only to the user
+  who declined; to the requester it looks the same as a block. There is no "remove
+  contact" operation in v1, so an accepted contact can end only through a block; a
+  remove/unfriend operation is a candidate for a later version.
 - **Invite link / QR code.** `CreateInvite{expires_in, max_uses}` returns a short code,
   shown as a link or QR code. `RedeemInvite{code}` makes both users accepted contacts
   immediately: sharing the link is the consent. Codes expire, have a use limit and can be
