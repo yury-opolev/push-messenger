@@ -149,6 +149,86 @@ mod tests {
     }
 
     #[test]
+    fn every_variant_has_a_pinned_encoding() {
+        let (a, b, c) = (user(1), user(2), user(3));
+        let cases = [
+            (
+                SystemEvent::Created {
+                    actor: a,
+                    title: "T".into(),
+                    users: vec![b, c],
+                },
+                concat!(
+                    r#"{"v":1,"type":"created","actor":"00000000-0000-0000-0000-000000000001","#,
+                    r#""title":"T","users":["00000000-0000-0000-0000-000000000002","#,
+                    r#""00000000-0000-0000-0000-000000000003"]}"#
+                ),
+            ),
+            (
+                SystemEvent::MembersAdded {
+                    actor: a,
+                    users: vec![b],
+                },
+                concat!(
+                    r#"{"v":1,"type":"members_added","actor":"00000000-0000-0000-0000-000000000001","#,
+                    r#""users":["00000000-0000-0000-0000-000000000002"]}"#
+                ),
+            ),
+            (
+                SystemEvent::MemberRemoved { actor: a, user: b },
+                concat!(
+                    r#"{"v":1,"type":"member_removed","actor":"00000000-0000-0000-0000-000000000001","#,
+                    r#""user":"00000000-0000-0000-0000-000000000002"}"#
+                ),
+            ),
+            (
+                SystemEvent::MemberLeft { actor: a },
+                r#"{"v":1,"type":"member_left","actor":"00000000-0000-0000-0000-000000000001"}"#,
+            ),
+            (
+                SystemEvent::Renamed {
+                    actor: a,
+                    title: "T".into(),
+                },
+                concat!(
+                    r#"{"v":1,"type":"renamed","actor":"00000000-0000-0000-0000-000000000001","#,
+                    r#""title":"T"}"#
+                ),
+            ),
+            (
+                SystemEvent::RoleChanged {
+                    actor: a,
+                    user: b,
+                    role: Role::Member,
+                },
+                concat!(
+                    r#"{"v":1,"type":"role_changed","actor":"00000000-0000-0000-0000-000000000001","#,
+                    r#""user":"00000000-0000-0000-0000-000000000002","role":"member"}"#
+                ),
+            ),
+            (
+                SystemEvent::AdminPromoted { actor: a, user: b },
+                concat!(
+                    r#"{"v":1,"type":"admin_promoted","actor":"00000000-0000-0000-0000-000000000001","#,
+                    r#""user":"00000000-0000-0000-0000-000000000002"}"#
+                ),
+            ),
+        ];
+        for (event, expected) in cases {
+            assert_eq!(String::from_utf8(event.encode()).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn unknown_fields_are_ignored() {
+        let body = r#"{"v":1,"type":"member_left","actor":"00000000-0000-0000-0000-000000000001","extra":1}"#;
+        assert_eq!(
+            SystemEvent::decode(body.as_bytes()),
+            Some(SystemEvent::MemberLeft { actor: user(1) })
+        );
+    }
+
+    #[test]
     fn other_versions_types_and_bodies_are_not_decoded() {
         let actor = r#""actor":"00000000-0000-0000-0000-000000000001""#;
         for body in [

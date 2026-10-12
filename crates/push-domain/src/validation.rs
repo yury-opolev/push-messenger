@@ -16,6 +16,10 @@ pub const MAX_INVITE_USES: u32 = 100;
 pub const MIN_INVITE_LIFETIME_SECS: i64 = 60;
 /// Longest invite lifetime, in seconds: 30 days.
 pub const MAX_INVITE_LIFETIME_SECS: i64 = 30 * 24 * 60 * 60;
+/// Longest group title, in characters, after trimming.
+pub const MAX_TITLE_CHARS: usize = 100;
+/// Most members a group can have, admins included.
+pub const MAX_GROUP_MEMBERS: usize = 100;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ValidationError {
@@ -31,6 +35,10 @@ pub enum ValidationError {
     InviteUses { actual: u32, limit: u32 },
     #[error("an invite lasts {min} to {max} seconds, not {actual}")]
     InviteLifetime { actual: i64, min: i64, max: i64 },
+    #[error("a group title cannot be empty")]
+    EmptyTitle,
+    #[error("a group title is {actual} characters; the limit is {limit}")]
+    TitleTooLong { actual: usize, limit: usize },
 }
 
 /// Checks a text message body.
@@ -69,6 +77,23 @@ pub fn validate_invite(expires_in: TimeDelta, max_uses: u32) -> Result<(), Valid
         });
     }
     Ok(())
+}
+
+/// Checks a group title and returns it without leading and trailing whitespace. It must
+/// keep 1 to `MAX_TITLE_CHARS` characters.
+pub fn validate_title(title: &str) -> Result<String, ValidationError> {
+    let title = title.trim();
+    let chars = title.chars().count();
+    if chars == 0 {
+        return Err(ValidationError::EmptyTitle);
+    }
+    if chars > MAX_TITLE_CHARS {
+        return Err(ValidationError::TitleTooLong {
+            actual: chars,
+            limit: MAX_TITLE_CHARS,
+        });
+    }
+    Ok(title.to_string())
 }
 
 #[cfg(test)]
@@ -136,5 +161,24 @@ mod tests {
                 })
             );
         }
+    }
+
+    #[test]
+    fn a_title_is_trimmed_and_may_have_exactly_the_limit() {
+        assert_eq!(validate_title("  Trip  "), Ok("Trip".to_string()));
+        let longest = "é".repeat(MAX_TITLE_CHARS);
+        assert_eq!(validate_title(&longest), Ok(longest.clone()));
+    }
+
+    #[test]
+    fn rejects_empty_and_long_titles() {
+        assert_eq!(validate_title(" \t "), Err(ValidationError::EmptyTitle));
+        assert_eq!(
+            validate_title(&"a".repeat(MAX_TITLE_CHARS + 1)),
+            Err(ValidationError::TitleTooLong {
+                actual: MAX_TITLE_CHARS + 1,
+                limit: MAX_TITLE_CHARS,
+            })
+        );
     }
 }

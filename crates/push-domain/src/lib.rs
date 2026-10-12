@@ -9,6 +9,7 @@ mod contacts;
 mod conversations;
 mod edit;
 pub mod error;
+mod groups;
 mod history;
 pub mod ids;
 mod invites;
@@ -41,6 +42,7 @@ pub use store::{InsertOutcome, Store, Tx};
 pub use sync::SyncBatch;
 pub use system::{SYSTEM_EVENT_VERSION, SystemEvent};
 pub use validation::{
-    MAX_HISTORY_PAGE, MAX_INVITE_LIFETIME_SECS, MAX_INVITE_USES, MAX_SYNC_BATCH, MAX_TEXT_BYTES,
-    MAX_UNREAD, MIN_INVITE_LIFETIME_SECS, ValidationError, validate_invite, validate_text,
+    MAX_GROUP_MEMBERS, MAX_HISTORY_PAGE, MAX_INVITE_LIFETIME_SECS, MAX_INVITE_USES, MAX_SYNC_BATCH,
+    MAX_TEXT_BYTES, MAX_TITLE_CHARS, MAX_UNREAD, MIN_INVITE_LIFETIME_SECS, ValidationError,
+    validate_invite, validate_text, validate_title,
 };

@@ -8,8 +8,8 @@ use std::sync::Arc;
 use chrono::{TimeZone, Utc};
 use push_domain::{
     ClientMsgId, Conversation, ConversationId, DeleteMessage, DeviceId, EditText, Entry, Event,
-    InMemoryStore, ManualClock, MessageRef, Messaging, Policy, RecordingNotifier, SendReceipt,
-    SendText, Store, Tx, UserId,
+    InMemoryStore, ManualClock, Member, MessageRef, Messaging, Policy, RecordingNotifier,
+    SendReceipt, SendText, Store, SystemEvent, Tx, UserId,
 };
 
 pub type Svc = Messaging<InMemoryStore, Arc<ManualClock>, Arc<RecordingNotifier>>;
@@ -69,6 +69,14 @@ impl World {
         conversation
     }
 
+    /// A member row, read straight from the store.
+    pub async fn member(&self, conversation: ConversationId, person: &Person) -> Option<Member> {
+        let mut tx = self.store.begin().await.unwrap();
+        let member = tx.get_member(conversation, person.user).await.unwrap();
+        tx.rollback().await.unwrap();
+        member
+    }
+
     /// Replaces a member row directly in the store, to set up visibility ranges that the
     /// Plan 1 API cannot create yet.
     pub async fn set_visibility(
@@ -117,6 +125,18 @@ impl World {
     pub async fn direct_chat(&self, a: &Person, b: &Person) -> ConversationId {
         self.befriend(a, b).await;
         self.svc.open_direct(a.user, b.user).await.unwrap()
+    }
+
+    /// Makes `admin` a contact of every other member and creates a group titled "Group".
+    pub async fn group(&self, admin: &Person, members: &[&Person]) -> ConversationId {
+        for member in members {
+            self.befriend(admin, member).await;
+        }
+        let ids: Vec<UserId> = members.iter().map(|member| member.user).collect();
+        self.svc
+            .create_group(admin.user, "Group", &ids)
+            .await
+            .unwrap()
     }
 
     /// Sends a text message and expects it to succeed.
@@ -202,6 +222,14 @@ pub fn bodies(entries: &[Entry]) -> Vec<String> {
 
 pub fn seqs(entries: &[Entry]) -> Vec<i64> {
     entries.iter().map(|entry| entry.seq).collect()
+}
+
+/// The system events recorded by these entries; `None` for other entries.
+pub fn system_events(entries: &[Entry]) -> Vec<Option<SystemEvent>> {
+    entries
+        .iter()
+        .map(|entry| SystemEvent::decode(entry.body.as_deref().unwrap_or_default()))
+        .collect()
 }
 
 /// The event that tells these people to sync.

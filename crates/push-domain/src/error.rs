@@ -34,6 +34,8 @@ pub enum DomainError {
     /// all of these, so redeeming is not an oracle.
     #[error("invite not found")]
     InviteNotFound,
+    #[error("a group has at most 100 members")]
+    GroupFull,
     #[error("a concurrent change conflicted; retry the operation")]
     Conflict,
     #[error("storage error: {0}")]
