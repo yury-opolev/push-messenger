@@ -695,6 +695,8 @@ push-messenger/
 ├── crates/
 │   ├── push-proto        protobuf types, validation rules, shared limits
 │   ├── push-domain       messaging logic over repository traits; no I/O
+│   ├── push-testkit      the domain's behaviour suite and storage contract, run
+│   │                     against every store (not published)
 │   ├── push-store        Postgres implementations (sqlx) and migrations
 │   ├── push-email        email traits; Resend and log implementations
 │   ├── push-gateway      binary
@@ -731,8 +733,8 @@ push-messenger/
 
 | Layer | Scope |
 |---|---|
-| Unit | `push-domain` with in-memory repositories: seq allocation, retry replay, positions, receipts, edit/delete rules, contacts, group membership, validation |
-| Integration | Real Postgres and Redis via testcontainers: transaction order, gapless `seq` under concurrent retries, outbox relay, `SKIP LOCKED` |
+| Unit | `push-domain` with in-memory repositories: seq allocation, retry replay, positions, receipts, edit/delete rules, contacts, group membership, validation. The scenarios and the storage contract live in `push-testkit` and are written once: every store runs all of them |
+| Integration | Real Postgres and Redis via testcontainers: the whole `push-testkit` suite against Postgres, transaction order, gapless `seq` under concurrent retries, outbox relay, `SKIP LOCKED` |
 | Protocol | Raw-frame harness: malformed frames, out-of-order acks, replayed `client_msg_id`, unverified email, revoked device, non-contact send |
 | End-to-end | SDK clients through the full stack: register, verify, connect via invite, chat, receipts, edit, delete, group of 100, new device loading history |
 | Load | 10,000 concurrent sockets: memory per connection, latency, recovery from a reconnect storm, 100-member group throughput |
