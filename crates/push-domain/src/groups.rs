@@ -4,11 +4,13 @@ use chrono::{DateTime, Utc};
 
 use crate::clock::Clock;
 use crate::contacts::are_contacts;
+use crate::conversations::require_conversation;
 use crate::error::{DomainError, DomainResult};
 use crate::ids::{ClientMsgId, ConversationId, MessageId, UserId};
 use crate::model::{ContentType, Conversation, ConversationKind, Entry, EntryKind, Member, Role};
 use crate::notify::{Event, Notifier};
-use crate::service::Messaging;
+use crate::read::{GroupPositions, group_positions, group_receipt};
+use crate::service::{Messaging, current_member_ids};
 use crate::store::{Store, Tx};
 use crate::system::SystemEvent;
 use crate::validation::{MAX_GROUP_MEMBERS, validate_title};
@@ -86,6 +88,151 @@ where
         users.sort();
         self.publish(vec![Event::EntriesAvailable { users }]).await;
         Ok(id)
+    }
+
+    /// Adds accepted contacts of `admin` to a group as members. Users who are already
+    /// current members are skipped, so adding twice changes nothing; former members
+    /// rejoin. A group has at most `MAX_GROUP_MEMBERS` current members.
+    ///
+    /// A `MembersAdded` entry records the change. The added members see the log from that
+    /// entry on, with nothing before it unread, and every active device of theirs starts
+    /// just before it.
+    pub async fn add_members(
+        &self,
+        admin: UserId,
+        conversation: ConversationId,
+        users: &[UserId],
+    ) -> DomainResult<()> {
+        let mut change = self.begin_change(conversation).await?;
+        change.require_admin(admin)?;
+        let mut added: Vec<UserId> = users
+            .iter()
+            .copied()
+            .filter(|user| !change.is_current(*user))
+            .collect();
+        added.sort();
+        added.dedup();
+        if added.is_empty() {
+            return change.cancel().await;
+        }
+        if change.current_count() + added.len() > MAX_GROUP_MEMBERS {
+            return Err(DomainError::GroupFull);
+        }
+        for user in &added {
+            if !are_contacts(&mut change.tx, admin, *user).await? {
+                return Err(DomainError::NotContact);
+            }
+        }
+        let event = SystemEvent::MembersAdded {
+            actor: admin,
+            users: added.clone(),
+        };
+        let seq = change.append(&event).await?;
+        for user in added {
+            join(&mut change.tx, conversation, user, Role::Member, seq).await?;
+        }
+        let events = change.finish(None).await?;
+        self.publish(events).await;
+        Ok(())
+    }
+
+    /// Locks a group for a membership or settings change and takes the next `seq`.
+    async fn begin_change(&self, conversation: ConversationId) -> DomainResult<GroupChange<S::Tx>> {
+        let mut tx = self.store.begin().await?;
+        let conversation = require_conversation(&mut tx, conversation).await?;
+        if conversation.kind != ConversationKind::Group {
+            return Err(DomainError::NotAGroup);
+        }
+        let now = self.clock.now();
+        let seq = tx.next_seq(conversation.id, now).await?;
+        let members = tx.members(conversation.id).await?;
+        let before = group_positions(&mut tx, &conversation, seq - 1).await?;
+        Ok(GroupChange {
+            tx,
+            conversation,
+            members,
+            next_seq: Some(seq),
+            last_seq: seq - 1,
+            now,
+            before,
+        })
+    }
+}
+
+/// An open transaction holding a group's lock, for one membership or settings change.
+/// Dropping it without `finish` rolls back, which also gives back the `seq` it took.
+struct GroupChange<T> {
+    tx: T,
+    conversation: Conversation,
+    /// Every member row as it was when the lock was taken, current and former.
+    members: Vec<Member>,
+    /// The `seq` taken by `begin_change` and not used yet.
+    next_seq: Option<i64>,
+    /// The highest `seq` written so far.
+    last_seq: i64,
+    now: DateTime<Utc>,
+    /// The group-wide positions before the change.
+    before: Option<GroupPositions>,
+}
+
+impl<T: Tx> GroupChange<T> {
+    /// `NotMember` unless `actor` is a current member, `NotAdmin` unless also an admin.
+    fn require_admin(&self, actor: UserId) -> DomainResult<()> {
+        match self.member(actor) {
+            Some(member) if member.is_current() && member.role == Role::Admin => Ok(()),
+            Some(member) if member.is_current() => Err(DomainError::NotAdmin),
+            _ => Err(DomainError::NotMember),
+        }
+    }
+
+    fn is_current(&self, user: UserId) -> bool {
+        self.member(user).is_some_and(Member::is_current)
+    }
+
+    fn member(&self, user: UserId) -> Option<&Member> {
+        self.members.iter().find(|member| member.user_id == user)
+    }
+
+    fn current_count(&self) -> usize {
+        self.members
+            .iter()
+            .filter(|member| member.is_current())
+            .count()
+    }
+
+    /// Appends a system entry recording `event` and returns its `seq`.
+    async fn append(&mut self, event: &SystemEvent) -> DomainResult<i64> {
+        let seq = match self.next_seq.take() {
+            Some(seq) => seq,
+            None => self.tx.next_seq(self.conversation.id, self.now).await?,
+        };
+        self.tx
+            .insert_entry(system_entry(self.conversation.id, seq, event, self.now))
+            .await?;
+        self.last_seq = seq;
+        Ok(seq)
+    }
+
+    /// Nothing to change: rolls back.
+    async fn cancel(self) -> DomainResult<()> {
+        self.tx.rollback().await
+    }
+
+    /// Commits, and returns the events to publish: new entries for the current members and
+    /// `also_tell` (a member who just left and may see their own departure), and the new
+    /// group-wide positions if they moved.
+    async fn finish(mut self, also_tell: Option<UserId>) -> DomainResult<Vec<Event>> {
+        let group =
+            group_receipt(&mut self.tx, &self.conversation, self.last_seq, self.before).await?;
+        let members = self.tx.members(self.conversation.id).await?;
+        self.tx.commit().await?;
+
+        let mut users = current_member_ids(&members);
+        users.extend(also_tell);
+        users.sort();
+        let mut events = vec![Event::EntriesAvailable { users }];
+        events.extend(group);
+        Ok(events)
     }
 }
 

@@ -55,7 +55,7 @@ where
         Ok(moved)
     }
 
-    /// Delivery and read positions of every member, as seen by `user`.
+    /// Positions in a conversation, as seen by `user`: both members' positions in a direct conversation, only the group-wide positions in a group.
     pub async fn conversation_state(
         &self,
         user: UserId,

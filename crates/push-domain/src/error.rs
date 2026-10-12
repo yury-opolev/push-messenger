@@ -36,6 +36,10 @@ pub enum DomainError {
     InviteNotFound,
     #[error("a group has at most 100 members")]
     GroupFull,
+    #[error("this is not a group")]
+    NotAGroup,
+    #[error("only an admin of this group can do that")]
+    NotAdmin,
     #[error("a concurrent change conflicted; retry the operation")]
     Conflict,
     #[error("storage error: {0}")]
