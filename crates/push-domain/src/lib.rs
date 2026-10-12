@@ -7,6 +7,7 @@
 pub mod clock;
 mod contacts;
 mod conversations;
+mod edit;
 pub mod error;
 mod history;
 pub mod ids;
@@ -21,6 +22,7 @@ mod sync;
 pub mod validation;
 
 pub use clock::{Clock, ManualClock, SystemClock};
+pub use edit::{EditText, MessageRef};
 pub use error::{DomainError, DomainResult};
 pub use ids::{ClientMsgId, ConversationId, DeviceId, MessageId, UserId};
 pub use memory::InMemoryStore;
@@ -30,7 +32,7 @@ pub use model::{
 };
 pub use notify::{Event, NoopNotifier, Notifier, ReceiptUpdate, RecordingNotifier};
 pub use send::SendText;
-pub use service::Messaging;
+pub use service::{Messaging, Policy};
 pub use store::{InsertOutcome, Store, Tx};
 pub use sync::SyncBatch;
 pub use validation::{

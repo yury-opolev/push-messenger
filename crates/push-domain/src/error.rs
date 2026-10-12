@@ -18,10 +18,18 @@ pub enum DomainError {
     NoPendingRequest,
     #[error("the contact is blocked")]
     Blocked,
-    #[error("this client message id was already used by another sender")]
+    #[error("this client message id was already used for a different entry")]
     ClientIdConflict,
     #[error("the sequence number is outside the conversation")]
     SeqOutOfRange,
+    #[error("the target message does not exist in this conversation")]
+    TargetNotFound,
+    #[error("only the sender of a message can change it")]
+    NotSender,
+    #[error("the message is already deleted")]
+    AlreadyDeleted,
+    #[error("the time allowed for this change has passed")]
+    WindowExpired,
     #[error("a concurrent change conflicted; retry the operation")]
     Conflict,
     #[error("storage error: {0}")]

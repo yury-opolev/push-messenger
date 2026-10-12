@@ -7,8 +7,9 @@ use std::sync::Arc;
 
 use chrono::{TimeZone, Utc};
 use push_domain::{
-    ClientMsgId, Conversation, ConversationId, DeviceId, Entry, Event, InMemoryStore, ManualClock,
-    Messaging, RecordingNotifier, SendReceipt, SendText, Store, Tx, UserId,
+    ClientMsgId, Conversation, ConversationId, DeviceId, EditText, Entry, Event, InMemoryStore,
+    ManualClock, MessageRef, Messaging, Policy, RecordingNotifier, SendReceipt, SendText, Store,
+    Tx, UserId,
 };
 
 pub type Svc = Messaging<InMemoryStore, Arc<ManualClock>, Arc<RecordingNotifier>>;
@@ -29,12 +30,21 @@ pub struct World {
 
 impl World {
     pub fn new() -> Self {
+        Self::with_policy(Policy::default())
+    }
+
+    pub fn with_policy(policy: Policy) -> Self {
         let clock = Arc::new(ManualClock::new(
             Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap(),
         ));
         let notifier = Arc::new(RecordingNotifier::default());
         let store = InMemoryStore::new();
-        let svc = Messaging::new(store.clone(), Arc::clone(&clock), Arc::clone(&notifier));
+        let svc = Messaging::with_policy(
+            store.clone(),
+            Arc::clone(&clock),
+            Arc::clone(&notifier),
+            policy,
+        );
         Self {
             svc,
             store,
@@ -120,6 +130,43 @@ impl World {
             .send_text(text(from, conversation, body))
             .await
             .unwrap()
+    }
+
+    /// Edits a message by its server id and expects it to succeed.
+    pub async fn edit(
+        &self,
+        from: &Person,
+        conversation: ConversationId,
+        target: &SendReceipt,
+        body: &str,
+    ) -> SendReceipt {
+        self.svc
+            .edit_text(edit(
+                from,
+                conversation,
+                MessageRef::Id(target.message_id),
+                body,
+            ))
+            .await
+            .unwrap()
+    }
+}
+
+/// An edit command with a fresh client message id.
+pub fn edit(
+    from: &Person,
+    conversation: ConversationId,
+    target: MessageRef,
+    body: &str,
+) -> EditText {
+    EditText {
+        sender: from.user,
+        device: from.device,
+        conversation,
+        client_msg_id: ClientMsgId::new(),
+        target,
+        body: body.as_bytes().to_vec(),
+        client_ts: None,
     }
 }
 
