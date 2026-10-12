@@ -180,8 +180,8 @@ pub trait Tx: Send {
     /// other's old position). It does not lock the conversation row: acks and reads do not
     /// wait for appends to commit. Appends take it after `next_seq`, never before.
     /// Postgres: a transaction-scoped advisory lock (`pg_advisory_xact_lock`) on a
-    /// namespaced (tagged) hash of the conversation id, so it cannot share a key with the
-    /// contact-pair lock.
+    /// namespaced (tagged) hash of the conversation id, so sharing a key with another kind
+    /// of lock, such as a contact pair's, is unlikely and would only add waiting.
     async fn lock_conversation_positions(
         &mut self,
         conversation: ConversationId,

@@ -7,7 +7,7 @@
 //! makes two unrelated operations wait for each other; it never lets two operations on one
 //! subject run together.
 
-use push_domain::UserId;
+use push_domain::{ConversationId, UserId};
 use uuid::Uuid;
 
 const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
@@ -30,6 +30,13 @@ pub(crate) fn contact_pair(a: UserId, b: UserId) -> i64 {
     fnv1a(b"contact-pair", &[low.0, high.0])
 }
 
+/// The lock serialising changes to a conversation's delivery and read positions. Its tag
+/// namespaces it: sharing a key with another kind of lock is unlikely and only adds
+/// waiting.
+pub(crate) fn conversation_positions(conversation: ConversationId) -> i64 {
+    fnv1a(b"conversation-positions", &[conversation.0])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -46,5 +53,14 @@ mod tests {
         let (a, b) = (UserId::new(), UserId::new());
         assert_eq!(contact_pair(a, b), contact_pair(b, a));
         assert_ne!(contact_pair(a, b), contact_pair(a, UserId::new()));
+    }
+
+    #[test]
+    fn the_kinds_of_lock_use_different_keys() {
+        let id = Uuid::now_v7();
+        assert_ne!(
+            conversation_positions(ConversationId(id)),
+            fnv1a(b"contact-pair", &[id])
+        );
     }
 }

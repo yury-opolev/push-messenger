@@ -7,14 +7,14 @@ use push_domain::{
     DomainError, DomainResult, Entry, GroupPositions, InsertOutcome, InviteRecord, Member,
     MessageId, Store, Tx, UserId,
 };
-use sqlx::postgres::PgPool;
+use sqlx::postgres::{PgPool, PgRow};
 use sqlx::{PgConnection, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::codes::{decode, encode};
 use crate::error::store_error;
 use crate::locks;
-use crate::rows;
+use crate::rows::{self, conversation_columns, member_columns};
 
 /// The push-domain [`Store`] on PostgreSQL.
 #[derive(Debug, Clone)]
@@ -64,6 +64,16 @@ impl Store for PgStore {
 /// A count the domain keeps as `u32`, as the `integer` the schema stores.
 fn to_integer(value: u32, what: &str) -> DomainResult<i32> {
     i32::try_from(value).map_err(|_| DomainError::Store(format!("{what} {value} is too large")))
+}
+
+/// Reads every row with `read`, failing like a query.
+fn read_all<T>(
+    rows: Vec<PgRow>,
+    read: fn(&PgRow) -> Result<T, sqlx::Error>,
+) -> DomainResult<Vec<T>> {
+    rows.iter()
+        .map(|row| read(row).map_err(store_error))
+        .collect()
 }
 
 #[async_trait]
@@ -277,66 +287,212 @@ impl Tx for PgTx {
         Ok(())
     }
 
-    async fn find_direct(&mut self, _key: [u8; 32]) -> DomainResult<Option<ConversationId>> {
-        unimplemented!("plan 3B task 3")
+    async fn find_direct(&mut self, key: [u8; 32]) -> DomainResult<Option<ConversationId>> {
+        let id: Option<Uuid> = sqlx::query_scalar(
+            "SELECT conversation_id FROM messaging.conversation WHERE direct_key = $1",
+        )
+        .bind(&key[..])
+        .fetch_optional(self.conn())
+        .await
+        .map_err(store_error)?;
+        Ok(id.map(ConversationId))
     }
 
     async fn insert_conversation(
         &mut self,
-        _conversation: Conversation,
+        conversation: Conversation,
     ) -> DomainResult<InsertOutcome> {
-        unimplemented!("plan 3B task 3")
+        // Only a direct key conflict is a duplicate: a conversation id that exists still
+        // fails with a primary key violation.
+        let inserted = sqlx::query(
+            "INSERT INTO messaging.conversation \
+             (conversation_id, kind, direct_key, title, created_by, last_seq, created_at, \
+              updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT (direct_key) DO NOTHING",
+        )
+        .bind(conversation.id.0)
+        .bind(encode(conversation.kind))
+        .bind(conversation.direct_key.map(|key| key.to_vec()))
+        .bind(&conversation.title)
+        .bind(conversation.created_by.0)
+        .bind(conversation.last_seq)
+        .bind(conversation.created_at)
+        .bind(conversation.updated_at)
+        .execute(self.conn())
+        .await
+        .map_err(store_error)?
+        .rows_affected();
+        Ok(if inserted == 1 {
+            InsertOutcome::Inserted
+        } else {
+            InsertOutcome::Duplicate
+        })
     }
 
-    async fn get_conversation(
-        &mut self,
-        _id: ConversationId,
-    ) -> DomainResult<Option<Conversation>> {
-        unimplemented!("plan 3B task 3")
+    async fn get_conversation(&mut self, id: ConversationId) -> DomainResult<Option<Conversation>> {
+        let row = sqlx::query(concat!(
+            "SELECT ",
+            conversation_columns!(),
+            " FROM messaging.conversation c WHERE c.conversation_id = $1"
+        ))
+        .bind(id.0)
+        .fetch_optional(self.conn())
+        .await
+        .map_err(store_error)?;
+        row.map(|row| rows::conversation(&row).map_err(store_error))
+            .transpose()
     }
 
-    async fn next_seq(&mut self, _id: ConversationId, _at: DateTime<Utc>) -> DomainResult<i64> {
-        unimplemented!("plan 3B task 3")
+    async fn next_seq(&mut self, id: ConversationId, at: DateTime<Utc>) -> DomainResult<i64> {
+        // The row lock this takes is held until the transaction ends: one appender at a
+        // time per conversation.
+        let seq: Option<i64> = sqlx::query_scalar(
+            "UPDATE messaging.conversation \
+             SET last_seq = last_seq + 1, updated_at = greatest(updated_at, $2) \
+             WHERE conversation_id = $1 RETURNING last_seq",
+        )
+        .bind(id.0)
+        .bind(at)
+        .fetch_optional(self.conn())
+        .await
+        .map_err(store_error)?;
+        seq.ok_or(DomainError::ConversationNotFound)
     }
 
-    async fn set_title(&mut self, _id: ConversationId, _title: String) -> DomainResult<()> {
-        unimplemented!("plan 3B task 3")
+    async fn set_title(&mut self, id: ConversationId, title: String) -> DomainResult<()> {
+        let updated =
+            sqlx::query("UPDATE messaging.conversation SET title = $2 WHERE conversation_id = $1")
+                .bind(id.0)
+                .bind(title)
+                .execute(self.conn())
+                .await
+                .map_err(store_error)?
+                .rows_affected();
+        if updated == 0 {
+            return Err(DomainError::ConversationNotFound);
+        }
+        Ok(())
     }
 
-    async fn insert_member(&mut self, _member: Member) -> DomainResult<()> {
-        unimplemented!("plan 3B task 3")
+    async fn insert_member(&mut self, member: Member) -> DomainResult<()> {
+        sqlx::query(
+            "INSERT INTO messaging.conversation_member \
+             (conversation_id, user_id, role, visible_from_seq, left_at_seq, read_seq) \
+             VALUES ($1, $2, $3, $4, $5, $6) \
+             ON CONFLICT (conversation_id, user_id) DO UPDATE SET \
+             role = excluded.role, visible_from_seq = excluded.visible_from_seq, \
+             left_at_seq = excluded.left_at_seq, read_seq = excluded.read_seq",
+        )
+        .bind(member.conversation_id.0)
+        .bind(member.user_id.0)
+        .bind(encode(member.role))
+        .bind(member.visible_from_seq)
+        .bind(member.left_at_seq)
+        .bind(member.read_seq)
+        .execute(self.conn())
+        .await
+        .map_err(store_error)?;
+        Ok(())
     }
 
     async fn get_member(
         &mut self,
-        _conversation: ConversationId,
-        _user: UserId,
+        conversation: ConversationId,
+        user: UserId,
     ) -> DomainResult<Option<Member>> {
-        unimplemented!("plan 3B task 3")
+        let row = sqlx::query(concat!(
+            "SELECT ",
+            member_columns!(),
+            " FROM messaging.conversation_member m \
+             WHERE m.conversation_id = $1 AND m.user_id = $2"
+        ))
+        .bind(conversation.0)
+        .bind(user.0)
+        .fetch_optional(self.conn())
+        .await
+        .map_err(store_error)?;
+        row.map(|row| rows::member(&row).map_err(store_error))
+            .transpose()
     }
 
-    async fn members(&mut self, _conversation: ConversationId) -> DomainResult<Vec<Member>> {
-        unimplemented!("plan 3B task 3")
+    async fn members(&mut self, conversation: ConversationId) -> DomainResult<Vec<Member>> {
+        let rows = sqlx::query(concat!(
+            "SELECT ",
+            member_columns!(),
+            " FROM messaging.conversation_member m WHERE m.conversation_id = $1"
+        ))
+        .bind(conversation.0)
+        .fetch_all(self.conn())
+        .await
+        .map_err(store_error)?;
+        read_all(rows, rows::member)
     }
 
-    async fn memberships(&mut self, _user: UserId) -> DomainResult<Vec<(Conversation, Member)>> {
-        unimplemented!("plan 3B task 3")
+    async fn memberships(&mut self, user: UserId) -> DomainResult<Vec<(Conversation, Member)>> {
+        let rows = sqlx::query(concat!(
+            "SELECT ",
+            conversation_columns!(),
+            ", ",
+            member_columns!(),
+            " FROM messaging.conversation_member m \
+             JOIN messaging.conversation c ON c.conversation_id = m.conversation_id \
+             WHERE m.user_id = $1"
+        ))
+        .bind(user.0)
+        .fetch_all(self.conn())
+        .await
+        .map_err(store_error)?;
+        read_all(rows, |row| {
+            Ok((rows::conversation(row)?, rows::member(row)?))
+        })
     }
 
     async fn raise_read_seq(
         &mut self,
-        _conversation: ConversationId,
-        _user: UserId,
-        _seq: i64,
+        conversation: ConversationId,
+        user: UserId,
+        seq: i64,
     ) -> DomainResult<bool> {
-        unimplemented!("plan 3B task 3")
+        let moved = sqlx::query(
+            "UPDATE messaging.conversation_member SET read_seq = $3 \
+             WHERE conversation_id = $1 AND user_id = $2 AND read_seq < $3",
+        )
+        .bind(conversation.0)
+        .bind(user.0)
+        .bind(seq)
+        .execute(self.conn())
+        .await
+        .map_err(store_error)?
+        .rows_affected();
+        if moved == 1 {
+            return Ok(true);
+        }
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM messaging.conversation_member \
+             WHERE conversation_id = $1 AND user_id = $2)",
+        )
+        .bind(conversation.0)
+        .bind(user.0)
+        .fetch_one(self.conn())
+        .await
+        .map_err(store_error)?;
+        if exists {
+            Ok(false)
+        } else {
+            Err(DomainError::NotMember)
+        }
     }
 
     async fn lock_conversation_positions(
         &mut self,
-        _conversation: ConversationId,
+        conversation: ConversationId,
     ) -> DomainResult<()> {
-        unimplemented!("plan 3B task 3")
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(locks::conversation_positions(conversation))
+            .execute(self.conn())
+            .await
+            .map_err(store_error)?;
+        Ok(())
     }
 
     async fn insert_entry(&mut self, _entry: Entry) -> DomainResult<InsertOutcome> {
