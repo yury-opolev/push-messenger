@@ -30,6 +30,7 @@ where
             return Ok(existing);
         }
 
+        let now = self.clock.now();
         let conversation = Conversation {
             id: ConversationId::new(),
             kind: ConversationKind::Direct,
@@ -37,7 +38,8 @@ where
             title: None,
             created_by: me,
             last_seq: 0,
-            created_at: self.clock.now(),
+            created_at: now,
+            updated_at: now,
         };
         let id = conversation.id;
         if tx.insert_conversation(conversation).await? == InsertOutcome::Duplicate {

@@ -1,10 +1,10 @@
 mod common;
 
-use chrono::{TimeZone, Utc};
+use chrono::{TimeDelta, TimeZone, Utc};
 use common::{Person, World, entries_for, text};
 use push_domain::{
-    ConversationId, DeviceId, DomainError, Event, InMemoryStore, ManualClock, Messaging, Notifier,
-    SendText, Store, Tx, UserId, ValidationError,
+    Clock, ConversationId, DeviceId, DomainError, Event, InMemoryStore, ManualClock, Messaging,
+    Notifier, SendText, Store, Tx, UserId, ValidationError,
 };
 use std::sync::Arc;
 
@@ -253,4 +253,20 @@ async fn the_server_timestamp_comes_from_the_clock() {
     world.clock.set(at);
 
     assert_eq!(world.send(&alice, chat, "hi").await.server_ts, at);
+}
+
+#[tokio::test]
+async fn opening_and_sending_set_the_conversations_updated_at() {
+    let world = World::new();
+    let (alice, bob) = (world.person().await, world.person().await);
+    let opened_at = world.clock.now();
+    let chat = world.direct_chat(&alice, &bob).await;
+    assert_eq!(world.conversation(chat).await.updated_at, opened_at);
+
+    world.clock.advance(TimeDelta::minutes(5));
+    world.send(&alice, chat, "hi").await;
+    assert_eq!(
+        world.conversation(chat).await.updated_at,
+        opened_at + TimeDelta::minutes(5)
+    );
 }

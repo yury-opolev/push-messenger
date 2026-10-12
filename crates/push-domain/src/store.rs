@@ -31,6 +31,7 @@
 //! [`DomainError::Conflict`]: crate::error::DomainError::Conflict
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 
 use crate::error::DomainResult;
 use crate::ids::{ClientMsgId, ConversationId, DeviceId, UserId};
@@ -107,9 +108,10 @@ pub trait Tx: Send {
         conversation: Conversation,
     ) -> DomainResult<InsertOutcome>;
     async fn get_conversation(&mut self, id: ConversationId) -> DomainResult<Option<Conversation>>;
-    /// Locks the conversation, increments `last_seq` and returns the new value.
+    /// Locks the conversation, increments `last_seq`, sets `updated_at` to `at` and
+    /// returns the new `last_seq`. Both changes are undone if the transaction rolls back.
     /// Fails with `ConversationNotFound` if the conversation does not exist.
-    async fn next_seq(&mut self, id: ConversationId) -> DomainResult<i64>;
+    async fn next_seq(&mut self, id: ConversationId, at: DateTime<Utc>) -> DomainResult<i64>;
     /// Inserts the member, replacing an existing row for the same conversation and user.
     async fn insert_member(&mut self, member: Member) -> DomainResult<()>;
     async fn get_member(

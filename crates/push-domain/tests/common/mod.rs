@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use chrono::{TimeZone, Utc};
 use push_domain::{
-    ClientMsgId, ConversationId, DeviceId, Entry, Event, InMemoryStore, ManualClock, Messaging,
-    RecordingNotifier, SendReceipt, SendText, Store, Tx, UserId,
+    ClientMsgId, Conversation, ConversationId, DeviceId, Entry, Event, InMemoryStore, ManualClock,
+    Messaging, RecordingNotifier, SendReceipt, SendText, Store, Tx, UserId,
 };
 
 pub type Svc = Messaging<InMemoryStore, Arc<ManualClock>, Arc<RecordingNotifier>>;
@@ -49,6 +49,14 @@ impl World {
         let position = tx.get_cursor(device, conversation).await.unwrap();
         tx.rollback().await.unwrap();
         position
+    }
+
+    /// A conversation row, read straight from the store.
+    pub async fn conversation(&self, id: ConversationId) -> Conversation {
+        let mut tx = self.store.begin().await.unwrap();
+        let conversation = tx.get_conversation(id).await.unwrap().unwrap();
+        tx.rollback().await.unwrap();
+        conversation
     }
 
     /// Replaces a member row directly in the store, to set up visibility ranges that the

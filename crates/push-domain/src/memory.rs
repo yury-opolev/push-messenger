@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use crate::error::{DomainError, DomainResult};
@@ -191,13 +192,14 @@ impl Tx for InMemoryTx {
         Ok(self.work.conversations.get(&id).cloned())
     }
 
-    async fn next_seq(&mut self, id: ConversationId) -> DomainResult<i64> {
+    async fn next_seq(&mut self, id: ConversationId, at: DateTime<Utc>) -> DomainResult<i64> {
         let conversation = self
             .work
             .conversations
             .get_mut(&id)
             .ok_or(DomainError::ConversationNotFound)?;
         conversation.last_seq += 1;
+        conversation.updated_at = at;
         Ok(conversation.last_seq)
     }
 
@@ -433,7 +435,11 @@ impl Tx for InMemoryTx {
 mod tests {
     use super::*;
     use crate::model::{ContentType, ConversationKind, EntryKind, Role};
-    use chrono::{TimeZone, Utc};
+    use chrono::{TimeDelta, TimeZone};
+
+    fn start() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap()
+    }
 
     fn conversation() -> Conversation {
         Conversation {
@@ -443,7 +449,8 @@ mod tests {
             title: None,
             created_by: UserId::new(),
             last_seq: 0,
-            created_at: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+            created_at: start(),
+            updated_at: start(),
         }
     }
 
@@ -460,7 +467,7 @@ mod tests {
             content_type: ContentType::Text,
             body: Some(b"hi".to_vec()),
             client_ts: None,
-            server_ts: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+            server_ts: start(),
             edited_at: None,
             edit_seq: None,
             deleted_at: None,
@@ -509,15 +516,36 @@ mod tests {
 
         let mut tx = store.begin().await.unwrap();
         tx.insert_conversation(conversation).await.unwrap();
-        assert_eq!(tx.next_seq(id).await.unwrap(), 1);
+        assert_eq!(tx.next_seq(id, start()).await.unwrap(), 1);
         tx.commit().await.unwrap();
 
         let mut tx = store.begin().await.unwrap();
-        assert_eq!(tx.next_seq(id).await.unwrap(), 2);
+        assert_eq!(tx.next_seq(id, start()).await.unwrap(), 2);
         tx.rollback().await.unwrap();
 
         let mut tx = store.begin().await.unwrap();
-        assert_eq!(tx.next_seq(id).await.unwrap(), 2);
+        assert_eq!(tx.next_seq(id, start()).await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn next_seq_moves_updated_at_and_a_rollback_restores_it() {
+        let store = InMemoryStore::new();
+        let conversation = conversation();
+        let id = conversation.id;
+        let (first, second) = (start() + TimeDelta::hours(1), start() + TimeDelta::hours(2));
+
+        let mut tx = store.begin().await.unwrap();
+        tx.insert_conversation(conversation).await.unwrap();
+        tx.next_seq(id, first).await.unwrap();
+        tx.commit().await.unwrap();
+
+        let mut tx = store.begin().await.unwrap();
+        tx.next_seq(id, second).await.unwrap();
+        tx.rollback().await.unwrap();
+
+        let mut tx = store.begin().await.unwrap();
+        let stored = tx.get_conversation(id).await.unwrap().unwrap();
+        assert_eq!(stored.updated_at, first);
     }
 
     #[tokio::test]
@@ -773,7 +801,7 @@ mod tests {
         let store = InMemoryStore::new();
         let mut tx = store.begin().await.unwrap();
         assert_eq!(
-            tx.next_seq(ConversationId::new()).await,
+            tx.next_seq(ConversationId::new(), start()).await,
             Err(DomainError::ConversationNotFound)
         );
         assert_eq!(

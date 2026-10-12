@@ -40,7 +40,8 @@ where
             return Err(DomainError::UnknownDevice);
         }
         let conversation = require_conversation(&mut tx, command.conversation).await?;
-        let seq = tx.next_seq(conversation.id).await?;
+        let now = self.clock.now();
+        let seq = tx.next_seq(conversation.id, now).await?;
 
         // A non-member reusing an existing `client_msg_id` gets `ClientIdConflict`; that is
         // acceptable because ids are random and chosen by the client.
@@ -85,7 +86,7 @@ where
             content_type: ContentType::Text,
             body: Some(command.body),
             client_ts: command.client_ts,
-            server_ts: self.clock.now(),
+            server_ts: now,
             edited_at: None,
             edit_seq: None,
             deleted_at: None,

@@ -50,6 +50,8 @@ pub struct Conversation {
     /// Highest `seq` written; the single-writer counter.
     pub last_seq: i64,
     pub created_at: DateTime<Utc>,
+    /// When the conversation was created or last had an entry appended.
+    pub updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
