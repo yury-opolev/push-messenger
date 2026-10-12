@@ -4,6 +4,7 @@ use crate::error::{DomainError, DomainResult};
 use crate::ids::{ConversationId, DeviceId};
 use crate::model::Entry;
 use crate::notify::Notifier;
+use crate::read::direct_receipt;
 use crate::service::{Messaging, require_device};
 use crate::store::{Store, Tx};
 use crate::validation::MAX_SYNC_BATCH;
@@ -25,6 +26,10 @@ where
 {
     /// Everything after the device's delivery positions, within each membership's
     /// visible range, up to `limit` entries.
+    ///
+    /// Edits and deletes of messages below the member's visible range are never delivered
+    /// (spec §4.6). If such entries end a conversation, the device's position stays before
+    /// them until it acks a later entry; nothing is lost, as they are never delivered.
     ///
     /// Sync does not advance anything: the position moves only when the device acks.
     /// Calling sync again without acking returns the same entries.
@@ -49,15 +54,21 @@ where
                 continue;
             }
             let room = limit - entries.len();
-            if room == 0 {
+            // One entry beyond the room tells whether more is waiting.
+            let mut page = tx
+                .entries_after(
+                    conversation.id,
+                    position,
+                    upper,
+                    member.visible_from_seq,
+                    room as u32 + 1,
+                )
+                .await?;
+            if page.len() > room {
+                page.truncate(room);
+                entries.extend(page);
                 more = true;
                 break;
-            }
-            let page = tx
-                .entries_after(conversation.id, position, upper, room as u32)
-                .await?;
-            if page.last().map_or(position, |entry| entry.seq) < upper {
-                more = true;
             }
             entries.extend(page);
         }
@@ -66,7 +77,8 @@ where
     }
 
     /// Records that the device holds everything up to `seq`. Returns whether the
-    /// position moved; it never moves backwards.
+    /// position moved; it never moves backwards. If the user's delivered position moved
+    /// over a message from the other member of a direct conversation, they get a receipt.
     pub async fn ack(
         &self,
         device: DeviceId,
@@ -83,8 +95,22 @@ where
         if seq < member.visible_from_seq - 1 {
             return Ok(false);
         }
+        // Count only from the member's floor; matters once group joins exist (Plan 2B).
+        let delivered_before = tx
+            .delivered_seq(conversation, user)
+            .await?
+            .max(member.visible_from_seq - 1);
         let moved = tx.raise_cursor(device, conversation, seq).await?;
+        let receipt = direct_receipt(
+            &mut tx,
+            &found,
+            user,
+            delivered_before,
+            delivered_before.max(seq),
+        )
+        .await?;
         tx.commit().await?;
+        self.publish(receipt.into_iter().collect()).await;
         Ok(moved)
     }
 }

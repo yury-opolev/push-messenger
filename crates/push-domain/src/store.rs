@@ -22,16 +22,19 @@
 //!
 //! # Delivery positions
 //!
-//! A device may lack a delivery position for a conversation (for example one joined after
-//! the device registered). Readers fall back to `visible_from_seq - 1`, so sync iterates
-//! memberships rather than joining only on existing positions.
+//! Positions are created eagerly, so a device normally has one for every membership of its
+//! user. One can still be missing: a device registered concurrently with a membership
+//! change reads the memberships before the new member row commits. Readers fall back to
+//! `visible_from_seq - 1`, so sync iterates memberships rather than joining only on
+//! existing positions.
 //!
 //! [`DomainError::Conflict`]: crate::error::DomainError::Conflict
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 
 use crate::error::DomainResult;
-use crate::ids::{ClientMsgId, ConversationId, DeviceId, UserId};
+use crate::ids::{ClientMsgId, ConversationId, DeviceId, MessageId, UserId};
 use crate::model::{ContactState, Conversation, Entry, Member};
 
 /// Result of an insert guarded by a uniqueness rule.
@@ -95,6 +98,10 @@ pub trait Tx: Send {
     /// A no-op if the row is absent.
     async fn delete_contact(&mut self, owner: UserId, peer: UserId) -> DomainResult<()>;
 
+    /// Every row owned by `owner`, as `(peer, state)`. Empty for an unknown user.
+    /// The order of the result is unspecified.
+    async fn contacts_of(&mut self, owner: UserId) -> DomainResult<Vec<(UserId, ContactState)>>;
+
     // --- Conversations and members -----------------------------------------------------
 
     async fn find_direct(&mut self, key: [u8; 32]) -> DomainResult<Option<ConversationId>>;
@@ -105,9 +112,11 @@ pub trait Tx: Send {
         conversation: Conversation,
     ) -> DomainResult<InsertOutcome>;
     async fn get_conversation(&mut self, id: ConversationId) -> DomainResult<Option<Conversation>>;
-    /// Locks the conversation, increments `last_seq` and returns the new value.
+    /// Locks the conversation, increments `last_seq`, sets `updated_at` to `at` and
+    /// returns the new `last_seq`. Both changes are undone if the transaction rolls back.
     /// Fails with `ConversationNotFound` if the conversation does not exist.
-    async fn next_seq(&mut self, id: ConversationId) -> DomainResult<i64>;
+    /// The conversation row lock is held until the transaction commits or rolls back.
+    async fn next_seq(&mut self, id: ConversationId, at: DateTime<Utc>) -> DomainResult<i64>;
     /// Inserts the member, replacing an existing row for the same conversation and user.
     async fn insert_member(&mut self, member: Member) -> DomainResult<()>;
     async fn get_member(
@@ -142,16 +151,51 @@ pub trait Tx: Send {
         conversation: ConversationId,
         client_msg_id: ClientMsgId,
     ) -> DomainResult<Option<Entry>>;
-    /// Entries with `after < seq <= up_to`, oldest first, at most `limit`.
+    /// The entry with this `message_id`; `None` if there is none or it belongs to another
+    /// conversation.
+    async fn entry_by_message_id(
+        &mut self,
+        conversation: ConversationId,
+        message_id: MessageId,
+    ) -> DomainResult<Option<Entry>>;
+    /// Overwrites the mutable fields of the stored entry at `(conversation_id, seq)`:
+    /// `body`, `edited_at`, `edit_seq` and `deleted_at`. Every other field of `entry` is
+    /// ignored. Fails with `DomainError::Store` if no such entry exists.
+    async fn update_entry(&mut self, entry: Entry) -> DomainResult<()>;
+    /// Sets `body` to null on every `Edit` entry whose `target_seq` is `target_seq`.
+    /// A no-op if there are none. Postgres serves it from the index on
+    /// `(conversation_id, target_seq)`.
+    async fn erase_edit_bodies(
+        &mut self,
+        conversation: ConversationId,
+        target_seq: i64,
+    ) -> DomainResult<()>;
+    /// Entries with `after < seq <= up_to`, oldest first, at most `limit`. Entries with a
+    /// `target_seq` below `targets_from` (edits and deletes of messages outside the
+    /// reader's visible range) are skipped and do not count towards `limit`.
     async fn entries_after(
         &mut self,
         conversation: ConversationId,
         after: i64,
         up_to: i64,
+        targets_from: i64,
         limit: u32,
     ) -> DomainResult<Vec<Entry>>;
-    /// The newest `limit` entries with `from <= seq < before`, returned oldest first.
-    async fn entries_before(
+    /// Counts entries with `after < seq <= up_to` that are messages (`kind = Message`), not
+    /// deleted, and sent by someone other than `user`. Stops counting at `cap`, so the
+    /// result is at most `cap`.
+    async fn count_incoming_messages(
+        &mut self,
+        conversation: ConversationId,
+        user: UserId,
+        after: i64,
+        up_to: i64,
+        cap: u32,
+    ) -> DomainResult<u32>;
+    /// The newest `limit` entries of kind `Message` or `System` with `from <= seq < before`,
+    /// returned oldest first. Edit and delete entries are skipped and do not count towards
+    /// `limit`.
+    async fn messages_before(
         &mut self,
         conversation: ConversationId,
         from: i64,

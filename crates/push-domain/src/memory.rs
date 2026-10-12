@@ -8,11 +8,12 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use crate::error::{DomainError, DomainResult};
 use crate::ids::{ClientMsgId, ConversationId, DeviceId, MessageId, UserId};
-use crate::model::{ContactState, Conversation, Entry, Member};
+use crate::model::{ContactState, Conversation, Entry, EntryKind, Member};
 use crate::store::{InsertOutcome, Store, Tx};
 
 fn missing(what: &str) -> DomainError {
@@ -30,7 +31,7 @@ struct State {
     entries: BTreeMap<(ConversationId, i64), Entry>,
     client_ids: HashMap<(ConversationId, ClientMsgId), i64>,
     cursors: HashMap<(DeviceId, ConversationId), i64>,
-    message_ids: HashSet<MessageId>,
+    message_ids: HashMap<MessageId, (ConversationId, i64)>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -162,6 +163,16 @@ impl Tx for InMemoryTx {
         Ok(())
     }
 
+    async fn contacts_of(&mut self, owner: UserId) -> DomainResult<Vec<(UserId, ContactState)>> {
+        Ok(self
+            .work
+            .contacts
+            .iter()
+            .filter(|((row_owner, _), _)| *row_owner == owner)
+            .map(|((_, peer), state)| (*peer, *state))
+            .collect())
+    }
+
     async fn find_direct(&mut self, key: [u8; 32]) -> DomainResult<Option<ConversationId>> {
         Ok(self.work.direct_index.get(&key).copied())
     }
@@ -191,13 +202,14 @@ impl Tx for InMemoryTx {
         Ok(self.work.conversations.get(&id).cloned())
     }
 
-    async fn next_seq(&mut self, id: ConversationId) -> DomainResult<i64> {
+    async fn next_seq(&mut self, id: ConversationId, at: DateTime<Utc>) -> DomainResult<i64> {
         let conversation = self
             .work
             .conversations
             .get_mut(&id)
             .ok_or(DomainError::ConversationNotFound)?;
         conversation.last_seq += 1;
+        conversation.updated_at = at;
         Ok(conversation.last_seq)
     }
 
@@ -287,12 +299,14 @@ impl Tx for InMemoryTx {
                 "primary key violation: an entry with this seq already exists".into(),
             ));
         }
-        if self.work.message_ids.contains(&entry.message_id) {
+        if self.work.message_ids.contains_key(&entry.message_id) {
             return Err(DomainError::Store(
                 "unique violation: message_id already exists".into(),
             ));
         }
-        self.work.message_ids.insert(entry.message_id);
+        self.work
+            .message_ids
+            .insert(entry.message_id, (entry.conversation_id, entry.seq));
         self.work.client_ids.insert(key, entry.seq);
         self.work
             .entries
@@ -313,11 +327,56 @@ impl Tx for InMemoryTx {
             .cloned())
     }
 
+    async fn entry_by_message_id(
+        &mut self,
+        conversation: ConversationId,
+        message_id: MessageId,
+    ) -> DomainResult<Option<Entry>> {
+        Ok(self
+            .work
+            .message_ids
+            .get(&message_id)
+            .filter(|(owner, _)| *owner == conversation)
+            .and_then(|key| self.work.entries.get(key))
+            .cloned())
+    }
+
+    async fn update_entry(&mut self, entry: Entry) -> DomainResult<()> {
+        let stored = self
+            .work
+            .entries
+            .get_mut(&(entry.conversation_id, entry.seq))
+            .ok_or_else(|| DomainError::Store("update of an entry that does not exist".into()))?;
+        stored.body = entry.body;
+        stored.edited_at = entry.edited_at;
+        stored.edit_seq = entry.edit_seq;
+        stored.deleted_at = entry.deleted_at;
+        Ok(())
+    }
+
+    async fn erase_edit_bodies(
+        &mut self,
+        conversation: ConversationId,
+        target_seq: i64,
+    ) -> DomainResult<()> {
+        for entry in self
+            .work
+            .entries
+            .range_mut((conversation, i64::MIN)..=(conversation, i64::MAX))
+            .map(|(_, entry)| entry)
+            .filter(|entry| entry.kind == EntryKind::Edit && entry.target_seq == Some(target_seq))
+        {
+            entry.body = None;
+        }
+        Ok(())
+    }
+
     async fn entries_after(
         &mut self,
         conversation: ConversationId,
         after: i64,
         up_to: i64,
+        targets_from: i64,
         limit: u32,
     ) -> DomainResult<Vec<Entry>> {
         if after >= up_to {
@@ -327,12 +386,40 @@ impl Tx for InMemoryTx {
             .work
             .entries
             .range((conversation, after + 1)..=(conversation, up_to))
+            .map(|(_, entry)| entry)
+            .filter(|entry| entry.target_seq.is_none_or(|target| target >= targets_from))
             .take(limit as usize)
-            .map(|(_, entry)| entry.clone())
+            .cloned()
             .collect())
     }
 
-    async fn entries_before(
+    async fn count_incoming_messages(
+        &mut self,
+        conversation: ConversationId,
+        user: UserId,
+        after: i64,
+        up_to: i64,
+        cap: u32,
+    ) -> DomainResult<u32> {
+        if after >= up_to {
+            return Ok(0);
+        }
+        let count = self
+            .work
+            .entries
+            .range((conversation, after + 1)..=(conversation, up_to))
+            .map(|(_, entry)| entry)
+            .filter(|entry| {
+                entry.kind == EntryKind::Message
+                    && entry.deleted_at.is_none()
+                    && entry.sender_id != user
+            })
+            .take(cap as usize)
+            .count();
+        Ok(count as u32)
+    }
+
+    async fn messages_before(
         &mut self,
         conversation: ConversationId,
         from: i64,
@@ -347,8 +434,10 @@ impl Tx for InMemoryTx {
             .entries
             .range((conversation, from)..(conversation, before))
             .rev()
+            .map(|(_, entry)| entry)
+            .filter(|entry| matches!(entry.kind, EntryKind::Message | EntryKind::System))
             .take(limit as usize)
-            .map(|(_, entry)| entry.clone())
+            .cloned()
             .collect();
         page.reverse();
         Ok(page)
@@ -432,8 +521,12 @@ impl Tx for InMemoryTx {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{ContentType, ConversationKind, EntryKind, Role};
-    use chrono::{TimeZone, Utc};
+    use crate::model::{ContentType, ConversationKind, Role};
+    use chrono::{TimeDelta, TimeZone};
+
+    fn start() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap()
+    }
 
     fn conversation() -> Conversation {
         Conversation {
@@ -443,7 +536,8 @@ mod tests {
             title: None,
             created_by: UserId::new(),
             last_seq: 0,
-            created_at: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+            created_at: start(),
+            updated_at: start(),
         }
     }
 
@@ -460,7 +554,7 @@ mod tests {
             content_type: ContentType::Text,
             body: Some(b"hi".to_vec()),
             client_ts: None,
-            server_ts: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+            server_ts: start(),
             edited_at: None,
             edit_seq: None,
             deleted_at: None,
@@ -509,15 +603,36 @@ mod tests {
 
         let mut tx = store.begin().await.unwrap();
         tx.insert_conversation(conversation).await.unwrap();
-        assert_eq!(tx.next_seq(id).await.unwrap(), 1);
+        assert_eq!(tx.next_seq(id, start()).await.unwrap(), 1);
         tx.commit().await.unwrap();
 
         let mut tx = store.begin().await.unwrap();
-        assert_eq!(tx.next_seq(id).await.unwrap(), 2);
+        assert_eq!(tx.next_seq(id, start()).await.unwrap(), 2);
         tx.rollback().await.unwrap();
 
         let mut tx = store.begin().await.unwrap();
-        assert_eq!(tx.next_seq(id).await.unwrap(), 2);
+        assert_eq!(tx.next_seq(id, start()).await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn next_seq_moves_updated_at_and_a_rollback_restores_it() {
+        let store = InMemoryStore::new();
+        let conversation = conversation();
+        let id = conversation.id;
+        let (first, second) = (start() + TimeDelta::hours(1), start() + TimeDelta::hours(2));
+
+        let mut tx = store.begin().await.unwrap();
+        tx.insert_conversation(conversation).await.unwrap();
+        tx.next_seq(id, first).await.unwrap();
+        tx.commit().await.unwrap();
+
+        let mut tx = store.begin().await.unwrap();
+        tx.next_seq(id, second).await.unwrap();
+        tx.rollback().await.unwrap();
+
+        let mut tx = store.begin().await.unwrap();
+        let stored = tx.get_conversation(id).await.unwrap().unwrap();
+        assert_eq!(stored.updated_at, first);
     }
 
     #[tokio::test]
@@ -587,28 +702,95 @@ mod tests {
         }
 
         assert_eq!(
-            seqs(&tx.entries_after(conversation, 1, 4, 10).await.unwrap()),
+            seqs(&tx.entries_after(conversation, 1, 4, 0, 10).await.unwrap()),
             vec![2, 3, 4]
         );
         assert_eq!(
-            seqs(&tx.entries_after(conversation, 1, 5, 2).await.unwrap()),
+            seqs(&tx.entries_after(conversation, 1, 5, 0, 2).await.unwrap()),
             vec![2, 3]
         );
         assert_eq!(
-            seqs(&tx.entries_after(conversation, 5, 5, 10).await.unwrap()),
+            seqs(&tx.entries_after(conversation, 5, 5, 0, 10).await.unwrap()),
             Vec::<i64>::new()
         );
         assert_eq!(
-            seqs(&tx.entries_before(conversation, 1, 5, 2).await.unwrap()),
+            seqs(&tx.messages_before(conversation, 1, 5, 2).await.unwrap()),
             vec![3, 4]
         );
         assert_eq!(
-            seqs(&tx.entries_before(conversation, 2, 3, 10).await.unwrap()),
+            seqs(&tx.messages_before(conversation, 2, 3, 10).await.unwrap()),
             vec![2]
         );
         assert_eq!(
-            seqs(&tx.entries_before(conversation, 1, 1, 10).await.unwrap()),
+            seqs(&tx.messages_before(conversation, 1, 1, 10).await.unwrap()),
             Vec::<i64>::new()
+        );
+    }
+
+    #[tokio::test]
+    async fn only_live_messages_from_others_are_counted_up_to_the_cap() {
+        let store = InMemoryStore::new();
+        let conversation = conversation();
+        let id = conversation.id;
+        let me = UserId::new();
+        let mut tx = store.begin().await.unwrap();
+        tx.insert_conversation(conversation).await.unwrap();
+        let mut entries = vec![
+            entry(id, 1, ClientMsgId::new()),
+            Entry {
+                sender_id: me,
+                ..entry(id, 2, ClientMsgId::new())
+            },
+            Entry {
+                deleted_at: Some(start()),
+                ..entry(id, 3, ClientMsgId::new())
+            },
+            Entry {
+                kind: EntryKind::Edit,
+                ..entry(id, 4, ClientMsgId::new())
+            },
+        ];
+        entries.extend((5..=7).map(|seq| entry(id, seq, ClientMsgId::new())));
+        for entry in entries {
+            tx.insert_entry(entry).await.unwrap();
+        }
+
+        assert_eq!(tx.count_incoming_messages(id, me, 0, 7, 100).await, Ok(4));
+        assert_eq!(tx.count_incoming_messages(id, me, 1, 4, 100).await, Ok(0));
+        assert_eq!(tx.count_incoming_messages(id, me, 0, 7, 2).await, Ok(2));
+        assert_eq!(tx.count_incoming_messages(id, me, 7, 7, 100).await, Ok(0));
+    }
+
+    #[tokio::test]
+    async fn messages_before_skips_edits_and_deletes() {
+        let store = InMemoryStore::new();
+        let conversation = conversation();
+        let id = conversation.id;
+        let mut tx = store.begin().await.unwrap();
+        tx.insert_conversation(conversation).await.unwrap();
+        let kinds = [
+            EntryKind::Message,
+            EntryKind::Edit,
+            EntryKind::System,
+            EntryKind::Delete,
+            EntryKind::Message,
+        ];
+        for (seq, kind) in (1..).zip(kinds) {
+            tx.insert_entry(Entry {
+                kind,
+                ..entry(id, seq, ClientMsgId::new())
+            })
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(
+            seqs(&tx.messages_before(id, 1, 6, 2).await.unwrap()),
+            vec![3, 5]
+        );
+        assert_eq!(
+            seqs(&tx.messages_before(id, 1, 6, 10).await.unwrap()),
+            vec![1, 3, 5]
         );
     }
 
@@ -731,7 +913,7 @@ mod tests {
             Err(DomainError::Store(_))
         ));
         assert_eq!(
-            seqs(&tx.entries_after(id, 0, 5, 10).await.unwrap()),
+            seqs(&tx.entries_after(id, 0, 5, 0, 10).await.unwrap()),
             vec![1]
         );
     }
@@ -773,7 +955,7 @@ mod tests {
         let store = InMemoryStore::new();
         let mut tx = store.begin().await.unwrap();
         assert_eq!(
-            tx.next_seq(ConversationId::new()).await,
+            tx.next_seq(ConversationId::new(), start()).await,
             Err(DomainError::ConversationNotFound)
         );
         assert_eq!(
@@ -782,5 +964,152 @@ mod tests {
             Err(DomainError::NotMember)
         );
         assert_eq!(tx.revoke_device(DeviceId::new()).await, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn an_entry_is_found_by_message_id_only_in_its_own_conversation() {
+        let store = InMemoryStore::new();
+        let (home, elsewhere) = (conversation(), conversation());
+        let (home_id, elsewhere_id) = (home.id, elsewhere.id);
+        let mut tx = store.begin().await.unwrap();
+        tx.insert_conversation(home).await.unwrap();
+        tx.insert_conversation(elsewhere).await.unwrap();
+        let stored = entry(home_id, 1, ClientMsgId::new());
+        tx.insert_entry(stored.clone()).await.unwrap();
+
+        assert_eq!(
+            tx.entry_by_message_id(home_id, stored.message_id)
+                .await
+                .unwrap(),
+            Some(stored.clone())
+        );
+        assert_eq!(
+            tx.entry_by_message_id(elsewhere_id, stored.message_id)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            tx.entry_by_message_id(home_id, MessageId::new())
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn update_entry_changes_only_the_mutable_fields() {
+        let store = InMemoryStore::new();
+        let conversation = conversation();
+        let id = conversation.id;
+        let mut tx = store.begin().await.unwrap();
+        tx.insert_conversation(conversation).await.unwrap();
+        let original = entry(id, 1, ClientMsgId::new());
+        tx.insert_entry(original.clone()).await.unwrap();
+
+        let mut changed = original.clone();
+        changed.body = None;
+        changed.edited_at = Some(start() + TimeDelta::hours(1));
+        changed.edit_seq = Some(4);
+        changed.deleted_at = Some(start() + TimeDelta::hours(2));
+        changed.sender_id = UserId::new();
+        changed.kind = EntryKind::Edit;
+        tx.update_entry(changed.clone()).await.unwrap();
+
+        let stored = tx
+            .entry_by_message_id(id, original.message_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.body, None);
+        assert_eq!(stored.edited_at, changed.edited_at);
+        assert_eq!(stored.edit_seq, Some(4));
+        assert_eq!(stored.deleted_at, changed.deleted_at);
+        assert_eq!(stored.sender_id, original.sender_id);
+        assert_eq!(stored.kind, EntryKind::Message);
+    }
+
+    #[tokio::test]
+    async fn updating_a_missing_entry_fails() {
+        let store = InMemoryStore::new();
+        let conversation = conversation();
+        let id = conversation.id;
+        let mut tx = store.begin().await.unwrap();
+        tx.insert_conversation(conversation).await.unwrap();
+
+        assert!(matches!(
+            tx.update_entry(entry(id, 1, ClientMsgId::new())).await,
+            Err(DomainError::Store(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn erasing_edit_bodies_touches_only_edits_of_that_target() {
+        let store = InMemoryStore::new();
+        let conversation = conversation();
+        let id = conversation.id;
+        let mut tx = store.begin().await.unwrap();
+        tx.insert_conversation(conversation).await.unwrap();
+        let edit = |seq, target| Entry {
+            kind: EntryKind::Edit,
+            target_seq: Some(target),
+            ..entry(id, seq, ClientMsgId::new())
+        };
+        tx.insert_entry(entry(id, 1, ClientMsgId::new()))
+            .await
+            .unwrap();
+        tx.insert_entry(entry(id, 2, ClientMsgId::new()))
+            .await
+            .unwrap();
+        tx.insert_entry(edit(3, 1)).await.unwrap();
+        tx.insert_entry(edit(4, 2)).await.unwrap();
+        tx.insert_entry(edit(5, 1)).await.unwrap();
+
+        tx.erase_edit_bodies(id, 1).await.unwrap();
+        let bodies: Vec<bool> = tx
+            .entries_after(id, 0, 5, 0, 10)
+            .await
+            .unwrap()
+            .iter()
+            .map(|entry| entry.body.is_some())
+            .collect();
+        assert_eq!(bodies, [true, true, false, true, false]);
+    }
+
+    #[tokio::test]
+    async fn entries_after_skips_changes_to_messages_below_targets_from() {
+        let store = InMemoryStore::new();
+        let conversation = conversation();
+        let id = conversation.id;
+        let mut tx = store.begin().await.unwrap();
+        tx.insert_conversation(conversation).await.unwrap();
+        for seq in 1..=3 {
+            tx.insert_entry(entry(id, seq, ClientMsgId::new()))
+                .await
+                .unwrap();
+        }
+        for (seq, target) in [(4, 1), (5, 3), (6, 2)] {
+            tx.insert_entry(Entry {
+                kind: EntryKind::Edit,
+                target_seq: Some(target),
+                ..entry(id, seq, ClientMsgId::new())
+            })
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(
+            seqs(&tx.entries_after(id, 2, 6, 3, 10).await.unwrap()),
+            vec![3, 5]
+        );
+        assert_eq!(
+            seqs(&tx.entries_after(id, 0, 6, 2, 3).await.unwrap()),
+            vec![1, 2, 3],
+            "the limit counts only returned entries"
+        );
+        assert_eq!(
+            seqs(&tx.entries_after(id, 3, 6, 2, 2).await.unwrap()),
+            vec![5, 6]
+        );
     }
 }

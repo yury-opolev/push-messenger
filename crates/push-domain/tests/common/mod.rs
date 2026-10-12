@@ -7,8 +7,9 @@ use std::sync::Arc;
 
 use chrono::{TimeZone, Utc};
 use push_domain::{
-    ClientMsgId, ConversationId, DeviceId, Entry, InMemoryStore, ManualClock, Messaging,
-    RecordingNotifier, SendReceipt, SendText, Store, Tx, UserId,
+    ClientMsgId, Conversation, ConversationId, DeleteMessage, DeviceId, EditText, Entry, Event,
+    InMemoryStore, ManualClock, MessageRef, Messaging, Policy, RecordingNotifier, SendReceipt,
+    SendText, Store, Tx, UserId,
 };
 
 pub type Svc = Messaging<InMemoryStore, Arc<ManualClock>, Arc<RecordingNotifier>>;
@@ -29,12 +30,21 @@ pub struct World {
 
 impl World {
     pub fn new() -> Self {
+        Self::with_policy(Policy::default())
+    }
+
+    pub fn with_policy(policy: Policy) -> Self {
         let clock = Arc::new(ManualClock::new(
             Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap(),
         ));
         let notifier = Arc::new(RecordingNotifier::default());
         let store = InMemoryStore::new();
-        let svc = Messaging::new(store.clone(), Arc::clone(&clock), Arc::clone(&notifier));
+        let svc = Messaging::with_policy(
+            store.clone(),
+            Arc::clone(&clock),
+            Arc::clone(&notifier),
+            policy,
+        );
         Self {
             svc,
             store,
@@ -49,6 +59,14 @@ impl World {
         let position = tx.get_cursor(device, conversation).await.unwrap();
         tx.rollback().await.unwrap();
         position
+    }
+
+    /// A conversation row, read straight from the store.
+    pub async fn conversation(&self, id: ConversationId) -> Conversation {
+        let mut tx = self.store.begin().await.unwrap();
+        let conversation = tx.get_conversation(id).await.unwrap().unwrap();
+        tx.rollback().await.unwrap();
+        conversation
     }
 
     /// Replaces a member row directly in the store, to set up visibility ranges that the
@@ -113,6 +131,54 @@ impl World {
             .await
             .unwrap()
     }
+
+    /// Edits a message by its server id and expects it to succeed.
+    pub async fn edit(
+        &self,
+        from: &Person,
+        conversation: ConversationId,
+        target: &SendReceipt,
+        body: &str,
+    ) -> SendReceipt {
+        self.svc
+            .edit_text(edit(
+                from,
+                conversation,
+                MessageRef::Id(target.message_id),
+                body,
+            ))
+            .await
+            .unwrap()
+    }
+}
+
+/// A delete command with a fresh client message id.
+pub fn delete(from: &Person, conversation: ConversationId, target: MessageRef) -> DeleteMessage {
+    DeleteMessage {
+        sender: from.user,
+        device: from.device,
+        conversation,
+        client_msg_id: ClientMsgId::new(),
+        target,
+    }
+}
+
+/// An edit command with a fresh client message id.
+pub fn edit(
+    from: &Person,
+    conversation: ConversationId,
+    target: MessageRef,
+    body: &str,
+) -> EditText {
+    EditText {
+        sender: from.user,
+        device: from.device,
+        conversation,
+        client_msg_id: ClientMsgId::new(),
+        target,
+        body: body.as_bytes().to_vec(),
+        client_ts: None,
+    }
 }
 
 /// A send command with a fresh client message id.
@@ -136,4 +202,11 @@ pub fn bodies(entries: &[Entry]) -> Vec<String> {
 
 pub fn seqs(entries: &[Entry]) -> Vec<i64> {
     entries.iter().map(|entry| entry.seq).collect()
+}
+
+/// The event that tells these people to sync.
+pub fn entries_for(people: &[&Person]) -> Event {
+    let mut users: Vec<UserId> = people.iter().map(|person| person.user).collect();
+    users.sort();
+    Event::EntriesAvailable { users }
 }

@@ -1,54 +1,102 @@
-//! The doorbell. After a commit, the service tells the transport layer which users have
-//! something new. It carries no message content, and losing a notification only delays
-//! delivery: the next sync reads the log.
+//! Events for the transport layer.
+//!
+//! After a commit, the service publishes typed events: which users have new log entries,
+//! whose delivery or read position moved, and whose contacts changed. Events are best
+//! effort and ephemeral. They carry no message bodies, and losing one only delays a
+//! client, because everything they announce is durable and can be read back:
+//!
+//! - new entries through `sync`;
+//! - contact changes through `list_contacts`;
+//! - receipt positions through `list_conversations` called without `changed_since`.
+//!   `changed_since` reflects content changes only (a conversation created or an entry
+//!   appended). Receipt positions do not move `updated_at`, so the busy conversation row
+//!   is not written on every ack and read. A reconnecting client refreshes its ticks with
+//!   one listing without `changed_since`.
 
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
-use crate::ids::UserId;
+use crate::ids::{ConversationId, UserId};
+use crate::model::ContactState;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Event {
+    /// New log entries exist for these users; their devices should sync.
+    EntriesAvailable { users: Vec<UserId> },
+    /// Delivery or read positions changed in a conversation; push a receipt to `to`.
+    Receipt {
+        conversation: ConversationId,
+        to: Vec<UserId>,
+        receipt: ReceiptUpdate,
+    },
+    /// A contact relationship changed as seen by `user`. `None` means no relationship.
+    ContactChanged {
+        user: UserId,
+        peer: UserId,
+        state: Option<ContactState>,
+    },
+}
+
+/// The positions a receipt reports.
+///
+/// Group conversations will report aggregates in a variant of their own, so match this
+/// enum with a wildcard arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ReceiptUpdate {
+    /// A direct conversation: the positions of the member whose position moved.
+    /// `delivered_seq` is never below `read_seq`: a message read is a message delivered.
+    Direct {
+        user_id: UserId,
+        delivered_seq: i64,
+        read_seq: i64,
+    },
+}
 
 #[async_trait]
 pub trait Notifier: Send + Sync {
-    /// Best effort; must not fail the operation that triggered it.
-    async fn notify_users(&self, users: &[UserId]);
+    /// Called only after the triggering transaction committed. Best effort: it must not
+    /// fail the operation that triggered it.
+    async fn publish(&self, events: &[Event]);
 }
 
-/// Discards notifications.
+/// Discards events.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoopNotifier;
 
 #[async_trait]
 impl Notifier for NoopNotifier {
-    async fn notify_users(&self, _users: &[UserId]) {}
+    async fn publish(&self, _events: &[Event]) {}
 }
 
-/// Records notifications. For tests.
+/// Records events. For tests.
 #[derive(Debug, Default)]
 pub struct RecordingNotifier {
-    calls: Mutex<Vec<Vec<UserId>>>,
+    events: Mutex<Vec<Event>>,
 }
 
 impl RecordingNotifier {
-    /// Returns and clears the notifications recorded so far, one list per call.
-    pub fn take(&self) -> Vec<Vec<UserId>> {
-        std::mem::take(&mut *self.calls.lock().expect("notifier lock poisoned"))
+    /// Returns and clears every event published so far, in publication order.
+    pub fn take(&self) -> Vec<Event> {
+        std::mem::take(&mut *self.events.lock().expect("notifier lock poisoned"))
     }
 }
 
 #[async_trait]
 impl Notifier for RecordingNotifier {
-    async fn notify_users(&self, users: &[UserId]) {
-        self.calls
+    async fn publish(&self, events: &[Event]) {
+        self.events
             .lock()
             .expect("notifier lock poisoned")
-            .push(users.to_vec());
+            .extend_from_slice(events);
     }
 }
 
 #[async_trait]
 impl<T: Notifier + ?Sized> Notifier for Arc<T> {
-    async fn notify_users(&self, users: &[UserId]) {
-        (**self).notify_users(users).await;
+    async fn publish(&self, events: &[Event]) {
+        (**self).publish(events).await;
     }
 }

@@ -1,8 +1,30 @@
+use chrono::TimeDelta;
+
 use crate::clock::Clock;
 use crate::error::{DomainError, DomainResult};
 use crate::ids::{DeviceId, UserId};
-use crate::notify::Notifier;
+use crate::model::Member;
+use crate::notify::{Event, Notifier};
 use crate::store::{Store, Tx};
+
+/// Server settings for changing messages after they are sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Policy {
+    /// How long after sending its sender may edit a message.
+    pub edit_window: TimeDelta,
+    /// How long after sending its sender may delete a message.
+    pub delete_window: TimeDelta,
+}
+
+impl Default for Policy {
+    /// 48 hours for both.
+    fn default() -> Self {
+        Self {
+            edit_window: TimeDelta::hours(48),
+            delete_window: TimeDelta::hours(48),
+        }
+    }
+}
 
 /// The messaging service. Every operation runs in one storage transaction.
 ///
@@ -13,6 +35,7 @@ pub struct Messaging<S, C, N> {
     pub(crate) store: S,
     pub(crate) clock: C,
     pub(crate) notifier: N,
+    pub(crate) policy: Policy,
 }
 
 impl<S, C, N> Messaging<S, C, N>
@@ -21,11 +44,17 @@ where
     C: Clock,
     N: Notifier,
 {
+    /// A service with the default [`Policy`].
     pub fn new(store: S, clock: C, notifier: N) -> Self {
+        Self::with_policy(store, clock, notifier, Policy::default())
+    }
+
+    pub fn with_policy(store: S, clock: C, notifier: N, policy: Policy) -> Self {
         Self {
             store,
             clock,
             notifier,
+            policy,
         }
     }
 
@@ -63,6 +92,13 @@ where
         tx.commit().await
     }
 
+    /// Publishes events after a commit. Publishes nothing when there is nothing to say.
+    pub(crate) async fn publish(&self, events: Vec<Event>) {
+        if !events.is_empty() {
+            self.notifier.publish(&events).await;
+        }
+    }
+
     /// Confirms that a connecting device is active and belongs to the user in its token.
     pub async fn identify(&self, device: DeviceId, user: UserId) -> DomainResult<()> {
         let mut tx = self.store.begin().await?;
@@ -81,4 +117,15 @@ pub(crate) async fn require_device<T: Tx>(tx: &mut T, device: DeviceId) -> Domai
     tx.device_owner(device)
         .await?
         .ok_or(DomainError::UnknownDevice)
+}
+
+/// The ids of the current members, sorted so events are deterministic.
+pub(crate) fn current_member_ids(members: &[Member]) -> Vec<UserId> {
+    let mut users: Vec<UserId> = members
+        .iter()
+        .filter(|member| member.is_current())
+        .map(|member| member.user_id)
+        .collect();
+    users.sort();
+    users
 }

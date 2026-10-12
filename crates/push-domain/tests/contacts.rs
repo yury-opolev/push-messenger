@@ -1,7 +1,15 @@
 mod common;
 
-use common::World;
-use push_domain::{ContactState, DomainError, UserId, ValidationError};
+use common::{Person, World};
+use push_domain::{ContactState, DomainError, Event, UserId, ValidationError};
+
+fn changed(user: &Person, peer: &Person, state: Option<ContactState>) -> Event {
+    Event::ContactChanged {
+        user: user.user,
+        peer: peer.user,
+        state,
+    }
+}
 
 #[tokio::test]
 async fn request_then_accept_makes_both_sides_accepted() {
@@ -317,5 +325,189 @@ async fn contact_operations_reject_self_and_unknown_users() {
     assert_eq!(
         world.svc.contact_block(alice.user, stranger).await,
         Err(DomainError::UnknownUser)
+    );
+}
+
+#[tokio::test]
+async fn a_request_and_its_acceptance_are_announced_to_both_users() {
+    let world = World::new();
+    let (alice, bob) = (world.person().await, world.person().await);
+
+    world
+        .svc
+        .contact_request(alice.user, bob.user)
+        .await
+        .unwrap();
+    assert_eq!(
+        world.notifier.take(),
+        [
+            changed(&alice, &bob, Some(ContactState::RequestedOut)),
+            changed(&bob, &alice, Some(ContactState::RequestedIn)),
+        ]
+    );
+
+    world
+        .svc
+        .contact_accept(bob.user, alice.user)
+        .await
+        .unwrap();
+    assert_eq!(
+        world.notifier.take(),
+        [
+            changed(&bob, &alice, Some(ContactState::Accepted)),
+            changed(&alice, &bob, Some(ContactState::Accepted)),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn crossing_requests_announce_acceptance_to_both_users() {
+    let world = World::new();
+    let (alice, bob) = (world.person().await, world.person().await);
+    world
+        .svc
+        .contact_request(alice.user, bob.user)
+        .await
+        .unwrap();
+    world.notifier.take();
+
+    world
+        .svc
+        .contact_request(bob.user, alice.user)
+        .await
+        .unwrap();
+    assert_eq!(
+        world.notifier.take(),
+        [
+            changed(&bob, &alice, Some(ContactState::Accepted)),
+            changed(&alice, &bob, Some(ContactState::Accepted)),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_request_that_changes_nothing_publishes_nothing() {
+    let world = World::new();
+    let (alice, bob) = (world.person().await, world.person().await);
+    world
+        .svc
+        .contact_request(alice.user, bob.user)
+        .await
+        .unwrap();
+    world.notifier.take();
+
+    world
+        .svc
+        .contact_request(alice.user, bob.user)
+        .await
+        .unwrap();
+    assert!(world.notifier.take().is_empty());
+}
+
+#[tokio::test]
+async fn a_decline_is_announced_only_to_the_user_who_declined() {
+    let world = World::new();
+    let (alice, bob) = (world.person().await, world.person().await);
+    world
+        .svc
+        .contact_request(alice.user, bob.user)
+        .await
+        .unwrap();
+    world.notifier.take();
+
+    world
+        .svc
+        .contact_decline(bob.user, alice.user)
+        .await
+        .unwrap();
+    assert_eq!(world.notifier.take(), [changed(&bob, &alice, None)]);
+}
+
+#[tokio::test]
+async fn a_block_is_announced_only_to_the_blocker() {
+    let world = World::new();
+    let (alice, bob) = (world.person().await, world.person().await);
+    world.befriend(&alice, &bob).await;
+    world.notifier.take();
+
+    world.svc.contact_block(alice.user, bob.user).await.unwrap();
+    assert_eq!(
+        world.notifier.take(),
+        [changed(&alice, &bob, Some(ContactState::Blocked))]
+    );
+}
+
+#[tokio::test]
+async fn a_request_hidden_by_a_block_is_announced_only_when_the_block_is_lifted() {
+    let world = World::new();
+    let (alice, bob) = (world.person().await, world.person().await);
+    world.svc.contact_block(alice.user, bob.user).await.unwrap();
+    world.notifier.take();
+
+    world
+        .svc
+        .contact_request(bob.user, alice.user)
+        .await
+        .unwrap();
+    assert_eq!(
+        world.notifier.take(),
+        [changed(&bob, &alice, Some(ContactState::RequestedOut))]
+    );
+
+    world
+        .svc
+        .contact_unblock(alice.user, bob.user)
+        .await
+        .unwrap();
+    assert_eq!(
+        world.notifier.take(),
+        [changed(&alice, &bob, Some(ContactState::RequestedIn))]
+    );
+}
+
+#[tokio::test]
+async fn unblocking_someone_who_is_not_blocked_publishes_nothing() {
+    let world = World::new();
+    let (alice, bob) = (world.person().await, world.person().await);
+    world
+        .svc
+        .contact_unblock(alice.user, bob.user)
+        .await
+        .unwrap();
+    assert!(world.notifier.take().is_empty());
+}
+
+#[tokio::test]
+async fn contacts_are_listed_from_the_owners_side_only() {
+    let world = World::new();
+    let (alice, bob, carol, dave) = (
+        world.person().await,
+        world.person().await,
+        world.person().await,
+        world.person().await,
+    );
+    world.befriend(&alice, &bob).await;
+    world
+        .svc
+        .contact_request(alice.user, carol.user)
+        .await
+        .unwrap();
+    world
+        .svc
+        .contact_block(alice.user, dave.user)
+        .await
+        .unwrap();
+
+    let mut expected = vec![
+        (bob.user, ContactState::Accepted),
+        (carol.user, ContactState::RequestedOut),
+        (dave.user, ContactState::Blocked),
+    ];
+    expected.sort_by_key(|(peer, _)| *peer);
+    assert_eq!(world.svc.list_contacts(alice.user).await, Ok(expected));
+    assert_eq!(world.svc.list_contacts(dave.user).await, Ok(vec![]));
+    assert_eq!(
+        world.svc.list_contacts(carol.user).await,
+        Ok(vec![(alice.user, ContactState::RequestedIn)])
     );
 }
