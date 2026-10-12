@@ -68,6 +68,7 @@ at start-up.
 | `PUSH_HEALTH_ADDR` | address of `/healthz` and `/readyz` | `0.0.0.0:8081` |
 | `PUSH_HEARTBEAT_MS` | client ping interval announced in `Ready`, 1000 to 600000 | `30000` |
 | `PUSH_DEV_AUTH` | `1` accepts DEV ONLY identities without a token | off |
+
 ## License
 
 MIT

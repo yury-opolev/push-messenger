@@ -2,13 +2,12 @@ push-messenger {{ .Chart.AppVersion }} is installed as release "{{ .Release.Name
 
 WebSocket endpoint: ws://{{ .Values.ingress.host }}/v1/socket (through the ingress controller).
 
-To remove it, delete the namespace too:
-  helm uninstall {{ .Release.Name }} --namespace {{ .Release.Namespace }}
-  kubectl delete namespace {{ .Release.Namespace }}
-`helm uninstall` alone keeps the PostgreSQL volume (data-{{ .Release.Name }}-postgres-0)
-and the Secret ({{ include "push.secretName" . }}, helm.sh/resource-policy: keep), so a later
-install reuses the password the database was initialised with. Deleting the namespace
-removes the volume and the Secret together.
+`helm uninstall` keeps the PostgreSQL volume (data-{{ .Release.Name }}-postgres-0) and the
+Secret ({{ include "push.secretName" . }}, helm.sh/resource-policy: keep), so a later install
+reuses the password the database was initialised with.
+To wipe everything on minikube, use deploy/minikube/down.ps1 (or down.sh): it also removes
+the released volumes and the provisioner's data directory, which deleting the namespace
+alone can leave behind.
 {{- if include "push.devMode" . }}
 
 DEV MODE IS ON: the gateway accepts identities without a token and message-svc serves the

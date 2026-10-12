@@ -1779,7 +1779,5 @@ the controller merges after the final review and its own minikube run.
   a plain role that owns `push_messaging`.
 - **gRPC load balancing across message-svc replicas:** HTTP/2 keeps one connection per
   gateway, so the ClusterIP Service pins each gateway to one replica (see Plan 4A).
-- **Keeping the database password across `helm uninstall`**: today NOTES.txt and the
-  README tell you to delete the namespace too; an annotated, kept Secret is an option.
 - **NetworkPolicies** (only the gateway may call message-svc; only the services may reach
   the stores), Postgres backups, resource tuning from the load test.

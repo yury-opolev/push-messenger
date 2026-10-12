@@ -787,6 +787,7 @@ push-messenger/
   `terminationGracePeriodSeconds` longer than that.
 - Images go to GHCR and are deployed with Helm.
 - Region, VM size and domain are confirmed with the owner before any cloud spend.
+
 Implementation notes (local minikube, Plan 4B):
 
 - One Helm chart, `deploy/helm/push-messenger`: the gateway and message-svc
