@@ -30,9 +30,26 @@ spec:
       labels:
         {{- include "push.labels" (dict "root" . "component" "redis") | nindent 8 }}
     spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: redis
           image: {{ .Values.redis.image }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            # Persistence is off; /data is the image's working directory.
+            - name: data
+              mountPath: /data
           args: ["--requirepass", "$(REDIS_PASSWORD)", "--save", "", "--appendonly", "no"]
           env:
             - name: REDIS_PASSWORD
@@ -54,3 +71,6 @@ spec:
             periodSeconds: 10
           resources:
             {{- toYaml .Values.redis.resources | nindent 12 }}
+      volumes:
+        - name: data
+          emptyDir: {}

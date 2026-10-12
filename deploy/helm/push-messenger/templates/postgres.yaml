@@ -30,6 +30,10 @@ spec:
       labels:
         {{- include "push.labels" (dict "root" . "component" "postgres") | nindent 8 }}
     spec:
+      automountServiceAccountToken: false
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: postgres
           image: {{ .Values.postgres.image }}
