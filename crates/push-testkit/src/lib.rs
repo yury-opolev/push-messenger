@@ -17,6 +17,7 @@ use std::sync::Arc;
 use libtest_mimic::{Arguments, Conclusion, Trial};
 use push_domain::Store;
 
+mod contract;
 mod scenarios;
 mod world;
 
@@ -69,9 +70,11 @@ macro_rules! case_list {
 }
 pub(crate) use case_list;
 
-/// Every case that any store must pass.
+/// Every case that any store must pass: the `Tx` contract, then the domain scenarios.
 pub fn cases<B: Backend>() -> Vec<Case<B>> {
-    scenarios::cases()
+    let mut cases = contract::cases();
+    cases.extend(scenarios::cases());
+    cases
 }
 
 /// Runs `cases` as the tests of this binary and exits. Each case gets a backend from

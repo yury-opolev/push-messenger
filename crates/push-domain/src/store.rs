@@ -11,6 +11,9 @@
 //! - report deadlocks and serialisation failures as [`DomainError::Conflict`], which
 //!   callers may retry;
 //! - enforce the schema's foreign and primary keys, failing with `DomainError::Store`;
+//! - after any method fails, expect the caller to roll back: the transaction may be
+//!   unusable (on Postgres every later statement fails), so no caller continues after an
+//!   error;
 //! - roll back a transaction that is dropped without [`Tx::commit`].
 //!
 //! # Locking
