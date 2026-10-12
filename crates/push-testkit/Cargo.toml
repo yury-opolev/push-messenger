@@ -13,7 +13,7 @@ async-trait.workspace = true
 chrono.workspace = true
 libtest-mimic.workspace = true
 push-domain.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "time"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 
 [[test]]
 name = "in_memory"

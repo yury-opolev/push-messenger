@@ -1,0 +1,305 @@
+//! Scenarios that run operations at the same time. They need a store whose transactions
+//! really run concurrently: the in-memory store serialises every transaction, and its
+//! store-wide lock would deadlock the scenarios that hold two transactions open. Only
+//! `push-store` runs them.
+
+use std::sync::Arc;
+
+use chrono::TimeDelta;
+use push_domain::{
+    ContactState, DeviceId, DomainError, Event, ReceiptUpdate, SendReceipt, Store, Tx, UserId,
+};
+use tokio::task::JoinSet;
+
+use crate::{Backend, Case, World, case_list, seqs, text};
+
+/// Runs every future at the same time, each on its own task, and returns their results
+/// in the order given.
+async fn all<T: Send + 'static>(futures: Vec<impl Future<Output = T> + Send + 'static>) -> Vec<T> {
+    let mut set = JoinSet::new();
+    for (index, future) in futures.into_iter().enumerate() {
+        set.spawn(async move { (index, future.await) });
+    }
+    let mut results: Vec<(usize, T)> = set.join_all().await;
+    results.sort_by_key(|(index, _)| *index);
+    results.into_iter().map(|(_, result)| result).collect()
+}
+
+async fn concurrent_sends_stay_gapless_and_ordered<B: Backend>(backend: &B) {
+    let world = Arc::new(World::new(backend).await);
+    let (alice, bob) = (world.person().await, world.person().await);
+    let chat = world.direct_chat(&alice, &bob).await;
+
+    let sends = (0..20)
+        .map(|index| {
+            let world = Arc::clone(&world);
+            let from = if index % 2 == 0 { alice } else { bob };
+            async move {
+                world
+                    .svc
+                    .send_text(text(&from, chat, &index.to_string()))
+                    .await
+            }
+        })
+        .collect();
+    let receipts: Vec<SendReceipt> = all(sends).await.into_iter().map(Result::unwrap).collect();
+
+    let mut stored: Vec<i64> = receipts.iter().map(|receipt| receipt.seq).collect();
+    stored.sort();
+    assert_eq!(stored, (1..=20).collect::<Vec<_>>());
+    let synced = world.svc.sync(bob.device, 100).await.unwrap().entries;
+    assert_eq!(seqs(&synced), (1..=20).collect::<Vec<_>>());
+    for entry in synced {
+        let receipt = receipts
+            .iter()
+            .find(|receipt| receipt.message_id == entry.message_id)
+            .unwrap();
+        assert_eq!(receipt.seq, entry.seq);
+    }
+}
+
+async fn concurrent_retries_store_one_entry<B: Backend>(backend: &B) {
+    let world = Arc::new(World::new(backend).await);
+    let (alice, bob) = (world.person().await, world.person().await);
+    let chat = world.direct_chat(&alice, &bob).await;
+    let command = text(&alice, chat, "once");
+
+    let retries = (0..8)
+        .map(|_| {
+            let (world, command) = (Arc::clone(&world), command.clone());
+            async move { world.svc.send_text(command).await }
+        })
+        .collect();
+    let receipts = all(retries).await;
+
+    let first = receipts[0].clone().unwrap();
+    assert!(receipts.iter().all(|receipt| *receipt == Ok(first.clone())));
+    assert_eq!(first.seq, 1);
+    let synced = world.svc.sync(bob.device, 100).await.unwrap().entries;
+    assert_eq!(seqs(&synced), [1]);
+    assert_eq!(world.send(&bob, chat, "next").await.seq, 2);
+}
+
+async fn concurrent_open_direct_calls_create_one_conversation<B: Backend>(backend: &B) {
+    let world = Arc::new(World::new(backend).await);
+    let (alice, bob) = (world.person().await, world.person().await);
+    world.befriend(&alice, &bob).await;
+
+    let opens = (0..8)
+        .map(|index| {
+            let world = Arc::clone(&world);
+            let (me, peer) = if index % 2 == 0 {
+                (alice.user, bob.user)
+            } else {
+                (bob.user, alice.user)
+            };
+            async move { world.svc.open_direct(me, peer).await }
+        })
+        .collect();
+    let ids = all(opens).await;
+
+    let first = ids[0].clone().unwrap();
+    assert!(ids.iter().all(|id| *id == Ok(first)));
+    let listed = world
+        .svc
+        .list_conversations(alice.user, None)
+        .await
+        .unwrap();
+    assert_eq!(listed.len(), 1);
+}
+
+async fn a_concurrent_accept_never_undoes_a_block<B: Backend>(backend: &B) {
+    let world = Arc::new(World::new(backend).await);
+    for _ in 0..10 {
+        let (alice, bob) = (world.person().await, world.person().await);
+        world
+            .svc
+            .contact_request(alice.user, bob.user)
+            .await
+            .unwrap();
+
+        let accept = {
+            let world = Arc::clone(&world);
+            async move { world.svc.contact_accept(bob.user, alice.user).await }
+        };
+        let block = {
+            let world = Arc::clone(&world);
+            async move { world.svc.contact_block(alice.user, bob.user).await }
+        };
+        let (accepted, blocked) = tokio::join!(tokio::spawn(accept), tokio::spawn(block));
+        assert!(matches!(
+            accepted.unwrap(),
+            Ok(()) | Err(DomainError::NoPendingRequest)
+        ));
+        blocked.unwrap().unwrap();
+
+        assert_eq!(
+            world.svc.contact_state(alice.user, bob.user).await,
+            Ok(Some(ContactState::Blocked))
+        );
+        assert_eq!(
+            world.svc.contact_state(bob.user, alice.user).await,
+            Ok(None)
+        );
+    }
+}
+
+async fn concurrent_redeems_never_exceed_the_use_limit<B: Backend>(backend: &B) {
+    let world = Arc::new(World::new(backend).await);
+    let creator = world.person().await;
+    let invite = world
+        .svc
+        .create_invite(creator.user, TimeDelta::days(1), 3)
+        .await
+        .unwrap();
+    let mut redeemers = Vec::new();
+    for _ in 0..8 {
+        redeemers.push(world.person().await);
+    }
+
+    let redeems = redeemers
+        .iter()
+        .map(|redeemer| {
+            let (world, code, user) = (Arc::clone(&world), invite.code.clone(), redeemer.user);
+            async move { world.svc.redeem_invite(user, &code).await }
+        })
+        .collect();
+    let results = all(redeems).await;
+
+    let redeemed = results.iter().filter(|result| result.is_ok()).count();
+    assert_eq!(redeemed, 3);
+    assert!(
+        results
+            .iter()
+            .all(|result| matches!(result, Ok(_) | Err(DomainError::InviteNotFound)))
+    );
+    let contacts = world.svc.list_contacts(creator.user).await.unwrap();
+    assert_eq!(contacts.len(), 3);
+}
+
+async fn concurrent_acks_by_different_members_produce_the_group_receipt<B: Backend>(backend: &B) {
+    let world = Arc::new(World::new(backend).await);
+    let (alice, bob, carol) = (
+        world.person().await,
+        world.person().await,
+        world.person().await,
+    );
+    let group = world.group(&alice, &[&bob, &carol]).await;
+
+    for _ in 0..10 {
+        let seq = world.send(&alice, group, "news").await.seq;
+        world.notifier.take();
+
+        let acks = [bob, carol]
+            .into_iter()
+            .map(|member| {
+                let world = Arc::clone(&world);
+                async move { world.svc.ack(member.device, group, seq).await }
+            })
+            .collect();
+        assert!(all(acks).await.into_iter().all(|moved| moved == Ok(true)));
+
+        let delivered = world.notifier.take().into_iter().any(|event| {
+            matches!(
+                event,
+                Event::Receipt {
+                    receipt: ReceiptUpdate::Group {
+                        all_delivered_seq,
+                        ..
+                    },
+                    ..
+                } if all_delivered_seq == seq
+            )
+        });
+        assert!(delivered, "no group receipt reached seq {seq}");
+    }
+}
+
+async fn concurrent_registrations_of_one_device_give_it_one_owner<B: Backend>(backend: &B) {
+    let world = Arc::new(World::new(backend).await);
+    let (alice, bob, carol) = (
+        world.person().await,
+        world.person().await,
+        world.person().await,
+    );
+    let users = [alice.user, bob.user];
+    let chats = [
+        world.direct_chat(&alice, &carol).await,
+        world.direct_chat(&bob, &carol).await,
+    ];
+
+    for _ in 0..10 {
+        let device = DeviceId::new();
+        let registrations = users
+            .into_iter()
+            .map(|user| {
+                let world = Arc::clone(&world);
+                async move { world.svc.register_device(device, user).await }
+            })
+            .collect();
+        let results = all(registrations).await;
+
+        let winner = results
+            .iter()
+            .position(Result::is_ok)
+            .expect("one registration succeeds");
+        let loser = 1 - winner;
+        assert_eq!(results[loser], Err(DomainError::UnknownDevice));
+        assert_eq!(world.svc.identify(device, users[winner]).await, Ok(()));
+        assert_eq!(
+            world.svc.identify(device, users[loser]).await,
+            Err(DomainError::UnknownDevice)
+        );
+        assert!(world.position(device, chats[winner]).await.is_some());
+        assert_eq!(world.position(device, chats[loser]).await, None);
+    }
+}
+
+async fn a_deadlock_is_reported_as_a_retryable_conflict<B: Backend>(backend: &B) {
+    let store = backend.store().await;
+    let [a, b, c, d] = [(); 4].map(|()| UserId::new());
+    let mut first = store.begin().await.unwrap();
+    let mut second = store.begin().await.unwrap();
+    first.lock_contact_pair(a, b).await.unwrap();
+    second.lock_contact_pair(c, d).await.unwrap();
+
+    // Each waits for the other's lock. The database aborts one of them, which gives its
+    // locks back when it rolls back, so the other then gets its lock.
+    let take = |mut tx: <B::Store as Store>::Tx, x: UserId, y: UserId| async move {
+        match tx.lock_contact_pair(x, y).await {
+            Ok(()) => Ok(tx),
+            Err(error) => {
+                tx.rollback().await.unwrap();
+                Err(error)
+            }
+        }
+    };
+    let (first, second) = tokio::join!(take(first, c, d), take(second, a, b));
+
+    let errors: Vec<DomainError> = [&first, &second]
+        .into_iter()
+        .filter_map(|result| result.as_ref().err().cloned())
+        .collect();
+    assert_eq!(errors, [DomainError::Conflict]);
+    assert!(errors[0].is_retryable());
+    for tx in [first, second].into_iter().flatten() {
+        tx.rollback().await.unwrap();
+    }
+}
+
+/// The scenarios that need a store with concurrent transactions.
+pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
+    case_list![
+        concurrent_sends_stay_gapless_and_ordered,
+        concurrent_retries_store_one_entry,
+        concurrent_open_direct_calls_create_one_conversation,
+        a_concurrent_accept_never_undoes_a_block,
+        concurrent_redeems_never_exceed_the_use_limit,
+        concurrent_acks_by_different_members_produce_the_group_receipt,
+        concurrent_registrations_of_one_device_give_it_one_owner,
+        a_deadlock_is_reported_as_a_retryable_conflict,
+    ]
+    .into_iter()
+    .map(|case| case.within("concurrency"))
+    .collect()
+}

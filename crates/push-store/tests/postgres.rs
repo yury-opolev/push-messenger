@@ -128,7 +128,9 @@ fn main() {
             .clone(),
         databases: Arc::default(),
     };
-    let conclusion = push_testkit::run(backend, push_testkit::cases());
+    let mut cases = push_testkit::cases();
+    cases.extend(push_testkit::concurrency_cases());
+    let conclusion = push_testkit::run(backend, cases);
 
     let started = Arc::into_inner(server).and_then(OnceLock::into_inner);
     if let Some(server) = started {
