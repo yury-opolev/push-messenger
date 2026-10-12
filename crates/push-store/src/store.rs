@@ -858,10 +858,108 @@ impl Tx for PgTx {
 
     async fn conversation_overviews(
         &mut self,
-        _user: UserId,
-        _changed_since: Option<DateTime<Utc>>,
-        _unread_cap: u32,
+        user: UserId,
+        changed_since: Option<DateTime<Utc>>,
+        unread_cap: u32,
     ) -> DomainResult<Vec<ConversationOverview>> {
-        unimplemented!("plan 3B task 6")
+        let rows = sqlx::query(concat!(
+            "SELECT ",
+            conversation_columns!(),
+            ", ",
+            member_columns!(),
+            ", others.members, others.admins, \
+             peer.user_id AS peer_user_id, peer.role AS peer_role, \
+             peer.visible_from_seq AS peer_visible_from_seq, \
+             peer.left_at_seq AS peer_left_at_seq, peer.read_seq AS peer_read_seq, \
+             peer.delivered_seq AS peer_delivered_seq, \
+             unread.count AS unread, \
+             gp.delivered AS group_delivered, gp.read AS group_read, \
+             left_entry.server_ts AS left_at \
+             FROM messaging.conversation_member m \
+             JOIN messaging.conversation c ON c.conversation_id = m.conversation_id \
+             CROSS JOIN LATERAL ( \
+                SELECT \
+                    coalesce(array_agg(o.user_id ORDER BY o.user_id) \
+                        FILTER (WHERE o.left_at_seq IS NULL), '{}') AS members, \
+                    coalesce(array_agg(o.user_id ORDER BY o.user_id) \
+                        FILTER (WHERE o.left_at_seq IS NULL AND o.role = 1), '{}') AS admins \
+                FROM messaging.conversation_member o \
+                WHERE o.conversation_id = m.conversation_id \
+             ) others \
+             LEFT JOIN LATERAL ( \
+                SELECT p.user_id, p.role, p.visible_from_seq, p.left_at_seq, p.read_seq, \
+                    messaging.delivered_seq(p.conversation_id, p.user_id) AS delivered_seq \
+                FROM messaging.conversation_member p \
+                WHERE c.kind = 1 AND p.conversation_id = m.conversation_id \
+                    AND p.user_id <> m.user_id \
+                LIMIT 1 \
+             ) peer ON true \
+             CROSS JOIN LATERAL ( \
+                SELECT count(*) AS count FROM ( \
+                    SELECT 1 FROM messaging.message e \
+                    WHERE e.conversation_id = m.conversation_id \
+                        AND e.seq > greatest(m.read_seq, m.visible_from_seq - 1) \
+                        AND e.seq <= coalesce(m.left_at_seq, c.last_seq) \
+                        AND e.kind = 1 AND e.deleted_at IS NULL AND e.sender_id <> m.user_id \
+                    LIMIT $3 \
+                ) incoming \
+             ) unread \
+             LEFT JOIN LATERAL ( \
+                SELECT g.delivered, g.read \
+                FROM messaging.group_positions(c.conversation_id, c.last_seq) g \
+                WHERE c.kind = 2 \
+             ) gp ON true \
+             LEFT JOIN messaging.message left_entry \
+                ON left_entry.conversation_id = m.conversation_id \
+                AND left_entry.seq = m.left_at_seq \
+             WHERE m.user_id = $1 AND ($2::timestamptz IS NULL OR c.updated_at > $2)"
+        ))
+        .bind(user.0)
+        .bind(changed_since)
+        .bind(i64::from(unread_cap))
+        .fetch_all(self.conn())
+        .await
+        .map_err(store_error)?;
+        read_all(rows, overview)
     }
+}
+
+/// One row of the `conversation_overviews` query.
+fn overview(row: &PgRow) -> Result<ConversationOverview, sqlx::Error> {
+    let conversation = rows::conversation(row)?;
+    let users = |column: &str| -> Result<Vec<UserId>, sqlx::Error> {
+        let ids: Vec<Uuid> = row.try_get(column)?;
+        Ok(ids.into_iter().map(UserId).collect())
+    };
+    let peer_user_id: Option<Uuid> = row.try_get("peer_user_id")?;
+    let peer = match peer_user_id {
+        Some(peer_user_id) => Some((
+            Member {
+                conversation_id: conversation.id,
+                user_id: UserId(peer_user_id),
+                role: decode(row.try_get("peer_role")?)?,
+                visible_from_seq: row.try_get("peer_visible_from_seq")?,
+                left_at_seq: row.try_get("peer_left_at_seq")?,
+                read_seq: row.try_get("peer_read_seq")?,
+            },
+            row.try_get("peer_delivered_seq")?,
+        )),
+        None => None,
+    };
+    let delivered: Option<i64> = row.try_get("group_delivered")?;
+    let read: Option<i64> = row.try_get("group_read")?;
+    let unread: i64 = row.try_get("unread")?;
+    Ok(ConversationOverview {
+        member: rows::member(row)?,
+        members: users("members")?,
+        admins: users("admins")?,
+        peer,
+        unread: u32::try_from(unread)
+            .map_err(|_| sqlx::Error::Decode(format!("unread count {unread}").into()))?,
+        group: delivered
+            .zip(read)
+            .map(|(delivered, read)| GroupPositions { delivered, read }),
+        left_at: row.try_get("left_at")?,
+        conversation,
+    })
 }

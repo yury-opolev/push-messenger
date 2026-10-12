@@ -8,7 +8,8 @@ use std::sync::Arc;
 
 /// Proves events are published after commit: it begins its own transaction (which would
 /// wait forever on the in-memory store's lock if the sender's were still open) and checks
-/// the new message is already visible.
+/// the new message is already visible. On Postgres an early publish is caught because an
+/// independent READ COMMITTED transaction would still see `last_seq == 0`.
 struct CommitProbe<S> {
     store: S,
     observed: std::sync::Mutex<Vec<i64>>,

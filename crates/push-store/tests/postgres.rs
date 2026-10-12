@@ -128,20 +128,7 @@ fn main() {
             .clone(),
         databases: Arc::default(),
     };
-    // The parts of the suite the store implements so far; task 6 runs all of it.
-    const READY: &[&str] = &[
-        "contract::transactions::",
-        "contract::users::",
-        "contract::contacts::",
-        "contract::conversations::",
-        "contract::entries::",
-        "contract::positions::",
-    ];
-    let cases = push_testkit::cases()
-        .into_iter()
-        .filter(|case| READY.iter().any(|prefix| case.name.starts_with(prefix)))
-        .collect();
-    let conclusion = push_testkit::run(backend, cases);
+    let conclusion = push_testkit::run(backend, push_testkit::cases());
 
     let started = Arc::into_inner(server).and_then(OnceLock::into_inner);
     if let Some(server) = started {
