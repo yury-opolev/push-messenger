@@ -103,7 +103,8 @@ where
     ///
     /// A group `user` has left is listed as they last saw it: up to the entry at which they
     /// left, with its time as `updated_at`, and without members or admins. Its title and
-    /// group-wide positions are current, the positions capped at where they left.
+    /// group-wide positions are current, the positions capped at where they left. Once no
+    /// current members remain, the group-wide positions are reported as 0.
     pub async fn list_conversations(
         &self,
         user: UserId,

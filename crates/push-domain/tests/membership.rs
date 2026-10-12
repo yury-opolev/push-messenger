@@ -163,11 +163,11 @@ async fn a_member_leaves_and_leaving_twice_changes_nothing() {
 #[tokio::test]
 async fn when_the_last_admin_leaves_the_longest_standing_member_is_promoted() {
     let world = World::new();
-    let (alice, bob, dave) = (
-        world.person().await,
-        world.person().await,
-        world.person().await,
-    );
+    let alice = world.person().await;
+    // Dave is created first, so he has the lower user id but joins later than bob.
+    let dave = world.person().await;
+    let bob = world.person().await;
+    assert!(dave.user < bob.user);
     let group = world.group(&alice, &[&bob]).await;
     world.befriend(&alice, &dave).await;
     world
@@ -205,6 +205,30 @@ async fn among_members_who_joined_together_the_lowest_user_id_is_promoted() {
     world.svc.leave_group(alice.user, group).await.unwrap();
     let heir = if bob.user < carol.user { &bob } else { &carol };
     assert_eq!(world.member(group, heir).await.unwrap().role, Role::Admin);
+}
+
+#[tokio::test]
+async fn leaving_a_direct_conversation_is_refused() {
+    let world = World::new();
+    let (alice, bob) = (world.person().await, world.person().await);
+    let direct = world.direct_chat(&alice, &bob).await;
+
+    assert_eq!(
+        world.svc.leave_group(alice.user, direct).await,
+        Err(DomainError::NotAGroup)
+    );
+}
+
+#[tokio::test]
+async fn removing_from_a_direct_conversation_is_refused() {
+    let world = World::new();
+    let (alice, bob) = (world.person().await, world.person().await);
+    let direct = world.direct_chat(&alice, &bob).await;
+
+    assert_eq!(
+        world.svc.remove_member(alice.user, direct, bob.user).await,
+        Err(DomainError::NotAGroup)
+    );
 }
 
 #[tokio::test]
