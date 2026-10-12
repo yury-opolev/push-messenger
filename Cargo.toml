@@ -1,6 +1,11 @@
 [workspace]
 resolver = "3"
-members = ["crates/push-domain", "crates/push-store", "crates/push-testkit"]
+members = [
+    "crates/push-domain",
+    "crates/push-proto",
+    "crates/push-store",
+    "crates/push-testkit",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -13,7 +18,10 @@ repository = "https://github.com/yury-opolev/push-messenger"
 async-trait = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 libtest-mimic = "0.8"
+prost = "0.14"
+protoc-bin-vendored = "3"
 push-domain = { path = "crates/push-domain" }
+push-proto = { path = "crates/push-proto" }
 push-testkit = { path = "crates/push-testkit" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -28,6 +36,9 @@ sqlx = { version = "0.8", default-features = false, features = [
 testcontainers-modules = { version = "0.13", features = ["postgres"] }
 thiserror = "2"
 tokio = { version = "1", features = ["sync"] }
+tonic = "0.14"
+tonic-prost = "0.14"
+tonic-prost-build = "0.14"
 tracing = "0.1"
 uuid = { version = "1", features = ["serde", "v4", "v7"] }
 
