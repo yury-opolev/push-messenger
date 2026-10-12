@@ -13,7 +13,7 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use crate::error::{DomainError, DomainResult};
 use crate::ids::{ClientMsgId, ConversationId, DeviceId, MessageId, UserId};
-use crate::model::{ContactState, Conversation, Entry, Member};
+use crate::model::{ContactState, Conversation, Entry, EntryKind, Member};
 use crate::store::{InsertOutcome, Store, Tx};
 
 fn missing(what: &str) -> DomainError {
@@ -31,7 +31,7 @@ struct State {
     entries: BTreeMap<(ConversationId, i64), Entry>,
     client_ids: HashMap<(ConversationId, ClientMsgId), i64>,
     cursors: HashMap<(DeviceId, ConversationId), i64>,
-    message_ids: HashSet<MessageId>,
+    message_ids: HashMap<MessageId, (ConversationId, i64)>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -289,12 +289,14 @@ impl Tx for InMemoryTx {
                 "primary key violation: an entry with this seq already exists".into(),
             ));
         }
-        if self.work.message_ids.contains(&entry.message_id) {
+        if self.work.message_ids.contains_key(&entry.message_id) {
             return Err(DomainError::Store(
                 "unique violation: message_id already exists".into(),
             ));
         }
-        self.work.message_ids.insert(entry.message_id);
+        self.work
+            .message_ids
+            .insert(entry.message_id, (entry.conversation_id, entry.seq));
         self.work.client_ids.insert(key, entry.seq);
         self.work
             .entries
@@ -313,6 +315,50 @@ impl Tx for InMemoryTx {
             .get(&(conversation, client_msg_id))
             .and_then(|seq| self.work.entries.get(&(conversation, *seq)))
             .cloned())
+    }
+
+    async fn entry_by_message_id(
+        &mut self,
+        conversation: ConversationId,
+        message_id: MessageId,
+    ) -> DomainResult<Option<Entry>> {
+        Ok(self
+            .work
+            .message_ids
+            .get(&message_id)
+            .filter(|(owner, _)| *owner == conversation)
+            .and_then(|key| self.work.entries.get(key))
+            .cloned())
+    }
+
+    async fn update_entry(&mut self, entry: Entry) -> DomainResult<()> {
+        let stored = self
+            .work
+            .entries
+            .get_mut(&(entry.conversation_id, entry.seq))
+            .ok_or_else(|| DomainError::Store("update of an entry that does not exist".into()))?;
+        stored.body = entry.body;
+        stored.edited_at = entry.edited_at;
+        stored.edit_seq = entry.edit_seq;
+        stored.deleted_at = entry.deleted_at;
+        Ok(())
+    }
+
+    async fn erase_edit_bodies(
+        &mut self,
+        conversation: ConversationId,
+        target_seq: i64,
+    ) -> DomainResult<()> {
+        for entry in self
+            .work
+            .entries
+            .range_mut((conversation, i64::MIN)..=(conversation, i64::MAX))
+            .map(|(_, entry)| entry)
+            .filter(|entry| entry.kind == EntryKind::Edit && entry.target_seq == Some(target_seq))
+        {
+            entry.body = None;
+        }
+        Ok(())
     }
 
     async fn entries_after(
@@ -434,7 +480,7 @@ impl Tx for InMemoryTx {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{ContentType, ConversationKind, EntryKind, Role};
+    use crate::model::{ContentType, ConversationKind, Role};
     use chrono::{TimeDelta, TimeZone};
 
     fn start() -> DateTime<Utc> {
@@ -810,5 +856,115 @@ mod tests {
             Err(DomainError::NotMember)
         );
         assert_eq!(tx.revoke_device(DeviceId::new()).await, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn an_entry_is_found_by_message_id_only_in_its_own_conversation() {
+        let store = InMemoryStore::new();
+        let (home, elsewhere) = (conversation(), conversation());
+        let (home_id, elsewhere_id) = (home.id, elsewhere.id);
+        let mut tx = store.begin().await.unwrap();
+        tx.insert_conversation(home).await.unwrap();
+        tx.insert_conversation(elsewhere).await.unwrap();
+        let stored = entry(home_id, 1, ClientMsgId::new());
+        tx.insert_entry(stored.clone()).await.unwrap();
+
+        assert_eq!(
+            tx.entry_by_message_id(home_id, stored.message_id)
+                .await
+                .unwrap(),
+            Some(stored.clone())
+        );
+        assert_eq!(
+            tx.entry_by_message_id(elsewhere_id, stored.message_id)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            tx.entry_by_message_id(home_id, MessageId::new())
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn update_entry_changes_only_the_mutable_fields() {
+        let store = InMemoryStore::new();
+        let conversation = conversation();
+        let id = conversation.id;
+        let mut tx = store.begin().await.unwrap();
+        tx.insert_conversation(conversation).await.unwrap();
+        let original = entry(id, 1, ClientMsgId::new());
+        tx.insert_entry(original.clone()).await.unwrap();
+
+        let mut changed = original.clone();
+        changed.body = None;
+        changed.edited_at = Some(start() + TimeDelta::hours(1));
+        changed.edit_seq = Some(4);
+        changed.deleted_at = Some(start() + TimeDelta::hours(2));
+        changed.sender_id = UserId::new();
+        changed.kind = EntryKind::Edit;
+        tx.update_entry(changed.clone()).await.unwrap();
+
+        let stored = tx
+            .entry_by_message_id(id, original.message_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.body, None);
+        assert_eq!(stored.edited_at, changed.edited_at);
+        assert_eq!(stored.edit_seq, Some(4));
+        assert_eq!(stored.deleted_at, changed.deleted_at);
+        assert_eq!(stored.sender_id, original.sender_id);
+        assert_eq!(stored.kind, EntryKind::Message);
+    }
+
+    #[tokio::test]
+    async fn updating_a_missing_entry_fails() {
+        let store = InMemoryStore::new();
+        let conversation = conversation();
+        let id = conversation.id;
+        let mut tx = store.begin().await.unwrap();
+        tx.insert_conversation(conversation).await.unwrap();
+
+        assert!(matches!(
+            tx.update_entry(entry(id, 1, ClientMsgId::new())).await,
+            Err(DomainError::Store(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn erasing_edit_bodies_touches_only_edits_of_that_target() {
+        let store = InMemoryStore::new();
+        let conversation = conversation();
+        let id = conversation.id;
+        let mut tx = store.begin().await.unwrap();
+        tx.insert_conversation(conversation).await.unwrap();
+        let edit = |seq, target| Entry {
+            kind: EntryKind::Edit,
+            target_seq: Some(target),
+            ..entry(id, seq, ClientMsgId::new())
+        };
+        tx.insert_entry(entry(id, 1, ClientMsgId::new()))
+            .await
+            .unwrap();
+        tx.insert_entry(entry(id, 2, ClientMsgId::new()))
+            .await
+            .unwrap();
+        tx.insert_entry(edit(3, 1)).await.unwrap();
+        tx.insert_entry(edit(4, 2)).await.unwrap();
+        tx.insert_entry(edit(5, 1)).await.unwrap();
+
+        tx.erase_edit_bodies(id, 1).await.unwrap();
+        let bodies: Vec<bool> = tx
+            .entries_after(id, 0, 5, 10)
+            .await
+            .unwrap()
+            .iter()
+            .map(|entry| entry.body.is_some())
+            .collect();
+        assert_eq!(bodies, [true, true, false, true, false]);
     }
 }

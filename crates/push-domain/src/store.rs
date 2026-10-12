@@ -34,7 +34,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
 use crate::error::DomainResult;
-use crate::ids::{ClientMsgId, ConversationId, DeviceId, UserId};
+use crate::ids::{ClientMsgId, ConversationId, DeviceId, MessageId, UserId};
 use crate::model::{ContactState, Conversation, Entry, Member};
 
 /// Result of an insert guarded by a uniqueness rule.
@@ -111,6 +111,7 @@ pub trait Tx: Send {
     /// Locks the conversation, increments `last_seq`, sets `updated_at` to `at` and
     /// returns the new `last_seq`. Both changes are undone if the transaction rolls back.
     /// Fails with `ConversationNotFound` if the conversation does not exist.
+    /// The conversation row lock is held until the transaction commits or rolls back.
     async fn next_seq(&mut self, id: ConversationId, at: DateTime<Utc>) -> DomainResult<i64>;
     /// Inserts the member, replacing an existing row for the same conversation and user.
     async fn insert_member(&mut self, member: Member) -> DomainResult<()>;
@@ -146,6 +147,25 @@ pub trait Tx: Send {
         conversation: ConversationId,
         client_msg_id: ClientMsgId,
     ) -> DomainResult<Option<Entry>>;
+    /// The entry with this `message_id`; `None` if there is none or it belongs to another
+    /// conversation.
+    async fn entry_by_message_id(
+        &mut self,
+        conversation: ConversationId,
+        message_id: MessageId,
+    ) -> DomainResult<Option<Entry>>;
+    /// Overwrites the mutable fields of the stored entry at `(conversation_id, seq)`:
+    /// `body`, `edited_at`, `edit_seq` and `deleted_at`. Every other field of `entry` is
+    /// ignored. Fails with `DomainError::Store` if no such entry exists.
+    async fn update_entry(&mut self, entry: Entry) -> DomainResult<()>;
+    /// Sets `body` to null on every `Edit` entry whose `target_seq` is `target_seq`.
+    /// A no-op if there are none. Postgres serves it from the index on
+    /// `(conversation_id, target_seq)`.
+    async fn erase_edit_bodies(
+        &mut self,
+        conversation: ConversationId,
+        target_seq: i64,
+    ) -> DomainResult<()>;
     /// Entries with `after < seq <= up_to`, oldest first, at most `limit`.
     async fn entries_after(
         &mut self,
