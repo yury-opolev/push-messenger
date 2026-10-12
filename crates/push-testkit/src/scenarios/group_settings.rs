@@ -1,12 +1,12 @@
-mod common;
-
+use crate::{Backend, Case, Person, World, case_list, entries_for, seqs, system_events};
 use chrono::TimeDelta;
-use common::{Person, World, entries_for, seqs, system_events};
 use push_domain::{Clock, ConversationId, DomainError, Role, SystemEvent, ValidationError};
 
 /// A group of alice (admin), bob and carol; `seq` 1 is its `Created` entry.
-async fn trio() -> (World, Person, Person, Person, ConversationId) {
-    let world = World::new();
+async fn trio<B: Backend>(
+    backend: &B,
+) -> (World<B::Store>, Person, Person, Person, ConversationId) {
+    let world = World::new(backend).await;
     let (alice, bob, carol) = (
         world.person().await,
         world.person().await,
@@ -17,9 +17,8 @@ async fn trio() -> (World, Person, Person, Person, ConversationId) {
     (world, alice, bob, carol, group)
 }
 
-#[tokio::test]
-async fn an_admin_renames_the_group() {
-    let (world, alice, bob, carol, group) = trio().await;
+async fn an_admin_renames_the_group<B: Backend>(backend: &B) {
+    let (world, alice, bob, carol, group) = trio(backend).await;
     world.clock.advance(TimeDelta::minutes(1));
 
     world
@@ -44,9 +43,10 @@ async fn an_admin_renames_the_group() {
     );
 }
 
-#[tokio::test]
-async fn renaming_to_the_same_title_changes_nothing_and_members_cannot_rename() {
-    let (world, alice, bob, _carol, group) = trio().await;
+async fn renaming_to_the_same_title_changes_nothing_and_members_cannot_rename<B: Backend>(
+    backend: &B,
+) {
+    let (world, alice, bob, _carol, group) = trio(backend).await;
 
     assert_eq!(
         world.svc.rename_group(alice.user, group, "Group").await,
@@ -64,9 +64,8 @@ async fn renaming_to_the_same_title_changes_nothing_and_members_cannot_rename() 
     );
 }
 
-#[tokio::test]
-async fn a_promoted_member_can_act_as_admin_and_demote_others() {
-    let (world, alice, bob, carol, group) = trio().await;
+async fn a_promoted_member_can_act_as_admin_and_demote_others<B: Backend>(backend: &B) {
+    let (world, alice, bob, carol, group) = trio(backend).await;
 
     world
         .svc
@@ -104,9 +103,8 @@ async fn a_promoted_member_can_act_as_admin_and_demote_others() {
     );
 }
 
-#[tokio::test]
-async fn the_last_admin_cannot_be_demoted() {
-    let (world, alice, bob, _carol, group) = trio().await;
+async fn the_last_admin_cannot_be_demoted<B: Backend>(backend: &B) {
+    let (world, alice, bob, _carol, group) = trio(backend).await;
 
     assert_eq!(
         world
@@ -126,9 +124,8 @@ async fn the_last_admin_cannot_be_demoted() {
     assert_eq!(world.conversation(group).await.last_seq, 1);
 }
 
-#[tokio::test]
-async fn only_current_members_get_a_role() {
-    let (world, alice, bob, _carol, group) = trio().await;
+async fn only_current_members_get_a_role<B: Backend>(backend: &B) {
+    let (world, alice, bob, _carol, group) = trio(backend).await;
     world.svc.leave_group(bob.user, group).await.unwrap();
 
     assert_eq!(
@@ -140,9 +137,8 @@ async fn only_current_members_get_a_role() {
     );
 }
 
-#[tokio::test]
-async fn no_one_is_promoted_when_an_admin_leaves_and_another_remains() {
-    let (world, alice, bob, carol, group) = trio().await;
+async fn no_one_is_promoted_when_an_admin_leaves_and_another_remains<B: Backend>(backend: &B) {
+    let (world, alice, bob, carol, group) = trio(backend).await;
     world
         .svc
         .set_role(alice.user, group, bob.user, Role::Admin)
@@ -165,9 +161,8 @@ async fn no_one_is_promoted_when_an_admin_leaves_and_another_remains() {
     );
 }
 
-#[tokio::test]
-async fn an_admin_can_demote_themselves_when_another_admin_remains() {
-    let (world, alice, bob, _carol, group) = trio().await;
+async fn an_admin_can_demote_themselves_when_another_admin_remains<B: Backend>(backend: &B) {
+    let (world, alice, bob, _carol, group) = trio(backend).await;
     world
         .svc
         .set_role(alice.user, group, bob.user, Role::Admin)
@@ -186,4 +181,16 @@ async fn an_admin_can_demote_themselves_when_another_admin_remains() {
         Role::Member
     );
     assert_eq!(world.member(group, &bob).await.unwrap().role, Role::Admin);
+}
+
+pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
+    case_list![
+        an_admin_renames_the_group,
+        renaming_to_the_same_title_changes_nothing_and_members_cannot_rename,
+        a_promoted_member_can_act_as_admin_and_demote_others,
+        the_last_admin_cannot_be_demoted,
+        only_current_members_get_a_role,
+        no_one_is_promoted_when_an_admin_leaves_and_another_remains,
+        an_admin_can_demote_themselves_when_another_admin_remains,
+    ]
 }

@@ -1,10 +1,10 @@
-mod common;
-
-use common::{Person, World, bodies, delete, seqs};
+use crate::{Backend, Case, Person, World, bodies, case_list, delete, seqs};
 use push_domain::{ConversationId, DomainError, MAX_HISTORY_PAGE, MessageRef};
 
-async fn chat_with_five_messages() -> (World, Person, Person, ConversationId) {
-    let world = World::new();
+async fn chat_with_five_messages<B: Backend>(
+    backend: &B,
+) -> (World<B::Store>, Person, Person, ConversationId) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let chat = world.direct_chat(&alice, &bob).await;
     for body in ["1", "2", "3", "4", "5"] {
@@ -13,17 +13,15 @@ async fn chat_with_five_messages() -> (World, Person, Person, ConversationId) {
     (world, alice, bob, chat)
 }
 
-#[tokio::test]
-async fn the_first_page_is_the_newest_messages_oldest_first() {
-    let (world, _alice, bob, chat) = chat_with_five_messages().await;
+async fn the_first_page_is_the_newest_messages_oldest_first<B: Backend>(backend: &B) {
+    let (world, _alice, bob, chat) = chat_with_five_messages(backend).await;
     let page = world.svc.history(bob.user, chat, None, 2).await.unwrap();
     assert_eq!(seqs(&page.entries), [4, 5]);
     assert!(page.has_more);
 }
 
-#[tokio::test]
-async fn pages_go_backwards_from_before_seq() {
-    let (world, _alice, bob, chat) = chat_with_five_messages().await;
+async fn pages_go_backwards_from_before_seq<B: Backend>(backend: &B) {
+    let (world, _alice, bob, chat) = chat_with_five_messages(backend).await;
     let history = |before| world.svc.history(bob.user, chat, Some(before), 2);
 
     let page = history(4).await.unwrap();
@@ -35,24 +33,21 @@ async fn pages_go_backwards_from_before_seq() {
     assert!(history(1).await.unwrap().entries.is_empty());
 }
 
-#[tokio::test]
-async fn a_page_that_reaches_the_start_has_no_more() {
-    let (world, _alice, bob, chat) = chat_with_five_messages().await;
+async fn a_page_that_reaches_the_start_has_no_more<B: Backend>(backend: &B) {
+    let (world, _alice, bob, chat) = chat_with_five_messages(backend).await;
     let page = world.svc.history(bob.user, chat, Some(3), 2).await.unwrap();
     assert_eq!(seqs(&page.entries), [1, 2]);
     assert!(!page.has_more);
 }
 
-#[tokio::test]
-async fn the_page_size_is_at_least_one() {
-    let (world, _alice, bob, chat) = chat_with_five_messages().await;
+async fn the_page_size_is_at_least_one<B: Backend>(backend: &B) {
+    let (world, _alice, bob, chat) = chat_with_five_messages(backend).await;
     let page = world.svc.history(bob.user, chat, None, 0).await.unwrap();
     assert_eq!(seqs(&page.entries), [5]);
 }
 
-#[tokio::test]
-async fn only_members_can_read_history() {
-    let (world, _alice, _bob, chat) = chat_with_five_messages().await;
+async fn only_members_can_read_history<B: Backend>(backend: &B) {
+    let (world, _alice, _bob, chat) = chat_with_five_messages(backend).await;
     let carol = world.person().await;
     assert_eq!(
         world.svc.history(carol.user, chat, None, 10).await,
@@ -60,9 +55,8 @@ async fn only_members_can_read_history() {
     );
 }
 
-#[tokio::test]
-async fn a_before_seq_beyond_the_end_returns_the_newest_page() {
-    let (world, _alice, bob, chat) = chat_with_five_messages().await;
+async fn a_before_seq_beyond_the_end_returns_the_newest_page<B: Backend>(backend: &B) {
+    let (world, _alice, bob, chat) = chat_with_five_messages(backend).await;
     let page = world
         .svc
         .history(bob.user, chat, Some(99), 2)
@@ -71,9 +65,8 @@ async fn a_before_seq_beyond_the_end_returns_the_newest_page() {
     assert_eq!(seqs(&page.entries), [4, 5]);
 }
 
-#[tokio::test]
-async fn a_before_seq_at_or_below_one_returns_nothing() {
-    let (world, _alice, bob, chat) = chat_with_five_messages().await;
+async fn a_before_seq_at_or_below_one_returns_nothing<B: Backend>(backend: &B) {
+    let (world, _alice, bob, chat) = chat_with_five_messages(backend).await;
     for before in [1, 0, -3] {
         let page = world
             .svc
@@ -85,9 +78,8 @@ async fn a_before_seq_at_or_below_one_returns_nothing() {
     }
 }
 
-#[tokio::test]
-async fn the_page_size_is_capped() {
-    let world = World::new();
+async fn the_page_size_is_capped<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let chat = world.direct_chat(&alice, &bob).await;
     for _ in 0..=MAX_HISTORY_PAGE {
@@ -99,9 +91,8 @@ async fn the_page_size_is_capped() {
     assert!(page.has_more);
 }
 
-#[tokio::test]
-async fn history_holds_messages_in_their_current_state_and_no_changes() {
-    let world = World::new();
+async fn history_holds_messages_in_their_current_state_and_no_changes<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let chat = world.direct_chat(&alice, &bob).await;
     let first = world.send(&alice, chat, "one").await;
@@ -120,9 +111,8 @@ async fn history_holds_messages_in_their_current_state_and_no_changes() {
     assert!(page.entries[1].body.is_none());
 }
 
-#[tokio::test]
-async fn only_edits_below_the_page_mean_no_more() {
-    let world = World::new();
+async fn only_edits_below_the_page_mean_no_more<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let chat = world.direct_chat(&alice, &bob).await;
     let first = world.send(&alice, chat, "one").await;
@@ -139,9 +129,8 @@ async fn only_edits_below_the_page_mean_no_more() {
     assert!(!page.has_more);
 }
 
-#[tokio::test]
-async fn edits_do_not_take_room_in_a_page() {
-    let world = World::new();
+async fn edits_do_not_take_room_in_a_page<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let chat = world.direct_chat(&alice, &bob).await;
     let first = world.send(&alice, chat, "one").await;
@@ -153,4 +142,20 @@ async fn edits_do_not_take_room_in_a_page() {
     let page = world.svc.history(bob.user, chat, None, 2).await.unwrap();
     assert_eq!(seqs(&page.entries), [first.seq, second.seq]);
     assert!(!page.has_more);
+}
+
+pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
+    case_list![
+        the_first_page_is_the_newest_messages_oldest_first,
+        pages_go_backwards_from_before_seq,
+        a_page_that_reaches_the_start_has_no_more,
+        the_page_size_is_at_least_one,
+        only_members_can_read_history,
+        a_before_seq_beyond_the_end_returns_the_newest_page,
+        a_before_seq_at_or_below_one_returns_nothing,
+        the_page_size_is_capped,
+        history_holds_messages_in_their_current_state_and_no_changes,
+        only_edits_below_the_page_mean_no_more,
+        edits_do_not_take_room_in_a_page,
+    ]
 }

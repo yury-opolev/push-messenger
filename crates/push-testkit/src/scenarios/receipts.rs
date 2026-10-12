@@ -1,6 +1,4 @@
-mod common;
-
-use common::{Person, World, delete, entries_for};
+use crate::{Backend, Case, Person, World, case_list, delete, entries_for};
 use push_domain::{ConversationId, Event, MessageRef, ReceiptUpdate};
 
 fn receipt(
@@ -29,9 +27,8 @@ fn read_moved(person: &Person, conversation: ConversationId, read_seq: i64) -> E
     }
 }
 
-#[tokio::test]
-async fn an_ack_over_a_message_from_the_peer_sends_a_delivery_receipt() {
-    let world = World::new();
+async fn an_ack_over_a_message_from_the_peer_sends_a_delivery_receipt<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let chat = world.direct_chat(&alice, &bob).await;
     world.send(&alice, chat, "one").await;
@@ -41,9 +38,10 @@ async fn an_ack_over_a_message_from_the_peer_sends_a_delivery_receipt() {
     assert_eq!(world.notifier.take(), [receipt(chat, &alice, &bob, 1, 0)]);
 }
 
-#[tokio::test]
-async fn an_ack_that_does_not_move_the_users_delivered_position_sends_nothing() {
-    let world = World::new();
+async fn an_ack_that_does_not_move_the_users_delivered_position_sends_nothing<B: Backend>(
+    backend: &B,
+) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let chat = world.direct_chat(&alice, &bob).await;
     let tablet = world.add_device(&bob).await;
@@ -55,9 +53,8 @@ async fn an_ack_that_does_not_move_the_users_delivered_position_sends_nothing() 
     assert!(world.notifier.take().is_empty());
 }
 
-#[tokio::test]
-async fn an_ack_over_only_ones_own_messages_sends_nothing() {
-    let world = World::new();
+async fn an_ack_over_only_ones_own_messages_sends_nothing<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let chat = world.direct_chat(&alice, &bob).await;
     world.send(&alice, chat, "one").await;
@@ -67,9 +64,8 @@ async fn an_ack_over_only_ones_own_messages_sends_nothing() {
     assert!(world.notifier.take().is_empty());
 }
 
-#[tokio::test]
-async fn an_ack_over_only_changes_or_deleted_messages_sends_nothing() {
-    let world = World::new();
+async fn an_ack_over_only_changes_or_deleted_messages_sends_nothing<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let chat = world.direct_chat(&alice, &bob).await;
     let hello = world.send(&alice, chat, "hello").await;
@@ -87,9 +83,8 @@ async fn an_ack_over_only_changes_or_deleted_messages_sends_nothing() {
     assert!(world.notifier.take().is_empty());
 }
 
-#[tokio::test]
-async fn reading_a_message_from_the_peer_sends_a_read_receipt_once() {
-    let world = World::new();
+async fn reading_a_message_from_the_peer_sends_a_read_receipt_once<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let chat = world.direct_chat(&alice, &bob).await;
     world.send(&alice, chat, "one").await;
@@ -106,9 +101,8 @@ async fn reading_a_message_from_the_peer_sends_a_read_receipt_once() {
     assert!(world.notifier.take().is_empty());
 }
 
-#[tokio::test]
-async fn reading_past_an_edit_tells_only_the_readers_devices() {
-    let world = World::new();
+async fn reading_past_an_edit_tells_only_the_readers_devices<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let chat = world.direct_chat(&alice, &bob).await;
     let hello = world.send(&alice, chat, "hello").await;
@@ -120,9 +114,12 @@ async fn reading_past_an_edit_tells_only_the_readers_devices() {
     assert_eq!(world.notifier.take(), [read_moved(&bob, chat, 2)]);
 }
 
-#[tokio::test]
-async fn replying_reports_that_the_peers_received_messages_were_read_and_so_delivered() {
-    let world = World::new();
+async fn replying_reports_that_the_peers_received_messages_were_read_and_so_delivered<
+    B: Backend,
+>(
+    backend: &B,
+) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let chat = world.direct_chat(&alice, &bob).await;
     world.send(&bob, chat, "hi").await;
@@ -140,9 +137,10 @@ async fn replying_reports_that_the_peers_received_messages_were_read_and_so_deli
     );
 }
 
-#[tokio::test]
-async fn replying_without_having_received_the_peers_message_sends_no_read_receipt() {
-    let world = World::new();
+async fn replying_without_having_received_the_peers_message_sends_no_read_receipt<B: Backend>(
+    backend: &B,
+) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let chat = world.direct_chat(&alice, &bob).await;
     world.send(&bob, chat, "hi").await;
@@ -152,9 +150,8 @@ async fn replying_without_having_received_the_peers_message_sends_no_read_receip
     assert_eq!(world.notifier.take(), [entries_for(&[&alice, &bob])]);
 }
 
-#[tokio::test]
-async fn reading_never_reports_messages_below_the_readers_floor() {
-    let world = World::new();
+async fn reading_never_reports_messages_below_the_readers_floor<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let chat = world.direct_chat(&alice, &bob).await;
     world.send(&alice, chat, "one").await;
@@ -167,9 +164,8 @@ async fn reading_never_reports_messages_below_the_readers_floor() {
     assert_eq!(world.notifier.take(), [read_moved(&bob, chat, 3)]);
 }
 
-#[tokio::test]
-async fn replying_never_reports_messages_below_the_senders_floor() {
-    let world = World::new();
+async fn replying_never_reports_messages_below_the_senders_floor<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let chat = world.direct_chat(&alice, &bob).await;
     world.send(&alice, chat, "one").await;
@@ -184,4 +180,19 @@ async fn replying_never_reports_messages_below_the_senders_floor() {
         world.notifier.take(),
         [entries_for(&[&alice, &bob]), read_moved(&bob, chat, 3)]
     );
+}
+
+pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
+    case_list![
+        an_ack_over_a_message_from_the_peer_sends_a_delivery_receipt,
+        an_ack_that_does_not_move_the_users_delivered_position_sends_nothing,
+        an_ack_over_only_ones_own_messages_sends_nothing,
+        an_ack_over_only_changes_or_deleted_messages_sends_nothing,
+        reading_a_message_from_the_peer_sends_a_read_receipt_once,
+        reading_past_an_edit_tells_only_the_readers_devices,
+        replying_reports_that_the_peers_received_messages_were_read_and_so_delivered,
+        replying_without_having_received_the_peers_message_sends_no_read_receipt,
+        reading_never_reports_messages_below_the_readers_floor,
+        replying_never_reports_messages_below_the_senders_floor,
+    ]
 }

@@ -1,10 +1,8 @@
-mod common;
-
+use crate::{Backend, Case, Person, World, case_list};
 use chrono::TimeDelta;
-use common::{Person, World};
 use push_domain::{
-    Clock, ContactState, DomainError, Event, MAX_INVITE_LIFETIME_SECS, MAX_INVITE_USES, UserId,
-    ValidationError,
+    Clock, ContactState, DomainError, Event, MAX_INVITE_LIFETIME_SECS, MAX_INVITE_USES, Store,
+    UserId, ValidationError,
 };
 
 fn day() -> TimeDelta {
@@ -20,7 +18,7 @@ fn accepted(user: &Person, peer: &Person) -> Event {
 }
 
 /// A new invite from `person`, valid for a day.
-async fn invite(world: &World, person: &Person, max_uses: u32) -> String {
+async fn invite<S: Store>(world: &World<S>, person: &Person, max_uses: u32) -> String {
     world
         .svc
         .create_invite(person.user, day(), max_uses)
@@ -29,9 +27,8 @@ async fn invite(world: &World, person: &Person, max_uses: u32) -> String {
         .code
 }
 
-#[tokio::test]
-async fn an_invite_has_a_ten_character_code_and_its_limits() {
-    let world = World::new();
+async fn an_invite_has_a_ten_character_code_and_its_limits<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let alice = world.person().await;
 
     let invite = world.svc.create_invite(alice.user, day(), 3).await.unwrap();
@@ -42,9 +39,8 @@ async fn an_invite_has_a_ten_character_code_and_its_limits() {
     assert_ne!(other.code, invite.code);
 }
 
-#[tokio::test]
-async fn invites_outside_the_limits_are_refused() {
-    let world = World::new();
+async fn invites_outside_the_limits_are_refused<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let alice = world.person().await;
 
     assert_eq!(
@@ -64,18 +60,16 @@ async fn invites_outside_the_limits_are_refused() {
     ));
 }
 
-#[tokio::test]
-async fn an_unknown_user_cannot_create_an_invite() {
-    let world = World::new();
+async fn an_unknown_user_cannot_create_an_invite<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     assert_eq!(
         world.svc.create_invite(UserId::new(), day(), 1).await,
         Err(DomainError::UnknownUser)
     );
 }
 
-#[tokio::test]
-async fn only_the_creator_can_revoke_and_revoking_twice_is_harmless() {
-    let world = World::new();
+async fn only_the_creator_can_revoke_and_revoking_twice_is_harmless<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let invite = world.svc.create_invite(alice.user, day(), 1).await.unwrap();
 
@@ -97,9 +91,8 @@ async fn only_the_creator_can_revoke_and_revoking_twice_is_harmless() {
     );
 }
 
-#[tokio::test]
-async fn redeeming_makes_both_users_contacts_and_tells_both() {
-    let world = World::new();
+async fn redeeming_makes_both_users_contacts_and_tells_both<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let code = invite(&world, &alice, 1).await;
     world.notifier.take();
@@ -115,9 +108,8 @@ async fn redeeming_makes_both_users_contacts_and_tells_both() {
     assert!(world.svc.open_direct(bob.user, alice.user).await.is_ok());
 }
 
-#[tokio::test]
-async fn a_typed_code_may_use_lower_case_dashes_and_look_alikes() {
-    let world = World::new();
+async fn a_typed_code_may_use_lower_case_dashes_and_look_alikes<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let code = invite(&world, &alice, 1).await;
     let typed = format!("{}-{}", &code[..5], &code[5..])
@@ -131,9 +123,8 @@ async fn a_typed_code_may_use_lower_case_dashes_and_look_alikes() {
     );
 }
 
-#[tokio::test]
-async fn an_invite_can_be_used_only_max_uses_times() {
-    let world = World::new();
+async fn an_invite_can_be_used_only_max_uses_times<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob, carol, dave) = (
         world.person().await,
         world.person().await,
@@ -156,9 +147,8 @@ async fn an_invite_can_be_used_only_max_uses_times() {
     );
 }
 
-#[tokio::test]
-async fn an_invite_expires_at_its_expiry_time() {
-    let world = World::new();
+async fn an_invite_expires_at_its_expiry_time<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let code = invite(&world, &alice, 1).await;
 
@@ -169,9 +159,8 @@ async fn an_invite_expires_at_its_expiry_time() {
     );
 }
 
-#[tokio::test]
-async fn a_revoked_or_unknown_invite_is_not_found() {
-    let world = World::new();
+async fn a_revoked_or_unknown_invite_is_not_found<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let code = invite(&world, &alice, 1).await;
     world.svc.revoke_invite(alice.user, &code).await.unwrap();
@@ -184,9 +173,8 @@ async fn a_revoked_or_unknown_invite_is_not_found() {
     }
 }
 
-#[tokio::test]
-async fn redeeming_your_own_invite_is_invalid() {
-    let world = World::new();
+async fn redeeming_your_own_invite_is_invalid<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let alice = world.person().await;
     let code = invite(&world, &alice, 1).await;
 
@@ -196,9 +184,10 @@ async fn redeeming_your_own_invite_is_invalid() {
     );
 }
 
-#[tokio::test]
-async fn a_block_by_the_creator_looks_like_an_unknown_invite_and_uses_nothing() {
-    let world = World::new();
+async fn a_block_by_the_creator_looks_like_an_unknown_invite_and_uses_nothing<B: Backend>(
+    backend: &B,
+) {
+    let world = World::new(backend).await;
     let (alice, bob, carol) = (
         world.person().await,
         world.person().await,
@@ -219,9 +208,8 @@ async fn a_block_by_the_creator_looks_like_an_unknown_invite_and_uses_nothing() 
     );
 }
 
-#[tokio::test]
-async fn a_redeemer_who_blocked_the_creator_is_told_so() {
-    let world = World::new();
+async fn a_redeemer_who_blocked_the_creator_is_told_so<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let code = invite(&world, &alice, 1).await;
     world.svc.contact_block(bob.user, alice.user).await.unwrap();
@@ -232,9 +220,8 @@ async fn a_redeemer_who_blocked_the_creator_is_told_so() {
     );
 }
 
-#[tokio::test]
-async fn existing_contacts_redeem_without_using_the_invite() {
-    let world = World::new();
+async fn existing_contacts_redeem_without_using_the_invite<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob, carol) = (
         world.person().await,
         world.person().await,
@@ -255,9 +242,8 @@ async fn existing_contacts_redeem_without_using_the_invite() {
     );
 }
 
-#[tokio::test]
-async fn redeeming_replaces_a_pending_request() {
-    let world = World::new();
+async fn redeeming_replaces_a_pending_request<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     world
         .svc
@@ -278,4 +264,23 @@ async fn redeeming_replaces_a_pending_request() {
             Ok(Some(ContactState::Accepted))
         );
     }
+}
+
+pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
+    case_list![
+        an_invite_has_a_ten_character_code_and_its_limits,
+        invites_outside_the_limits_are_refused,
+        an_unknown_user_cannot_create_an_invite,
+        only_the_creator_can_revoke_and_revoking_twice_is_harmless,
+        redeeming_makes_both_users_contacts_and_tells_both,
+        a_typed_code_may_use_lower_case_dashes_and_look_alikes,
+        an_invite_can_be_used_only_max_uses_times,
+        an_invite_expires_at_its_expiry_time,
+        a_revoked_or_unknown_invite_is_not_found,
+        redeeming_your_own_invite_is_invalid,
+        a_block_by_the_creator_looks_like_an_unknown_invite_and_uses_nothing,
+        a_redeemer_who_blocked_the_creator_is_told_so,
+        existing_contacts_redeem_without_using_the_invite,
+        redeeming_replaces_a_pending_request,
+    ]
 }

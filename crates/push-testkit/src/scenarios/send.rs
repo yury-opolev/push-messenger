@@ -1,23 +1,21 @@
-mod common;
-
+use crate::{Backend, Case, Person, World, case_list, entries_for, text};
 use chrono::{TimeDelta, TimeZone, Utc};
-use common::{Person, World, entries_for, text};
 use push_domain::{
-    Clock, ConversationId, DeviceId, DomainError, Event, InMemoryStore, ManualClock, Messaging,
-    Notifier, SendText, Store, Tx, UserId, ValidationError,
+    Clock, ConversationId, DeviceId, DomainError, Event, ManualClock, Messaging, Notifier,
+    SendText, Store, Tx, UserId, ValidationError,
 };
 use std::sync::Arc;
 
 /// Proves events are published after commit: it begins its own transaction (which would
 /// wait forever on the in-memory store's lock if the sender's were still open) and checks
 /// the new message is already visible.
-struct CommitProbe {
-    store: InMemoryStore,
+struct CommitProbe<S> {
+    store: S,
     observed: std::sync::Mutex<Vec<i64>>,
 }
 
 #[async_trait::async_trait]
-impl Notifier for CommitProbe {
+impl<S: Store> Notifier for CommitProbe<S> {
     async fn publish(&self, events: &[Event]) {
         let Some(Event::EntriesAvailable { users }) = events.first() else {
             return;
@@ -37,7 +35,7 @@ impl Notifier for CommitProbe {
     }
 }
 
-async fn register(svc: &Messaging<InMemoryStore, Arc<ManualClock>, Arc<CommitProbe>>) -> Person {
+async fn register<S: Store>(svc: &Messaging<S, Arc<ManualClock>, Arc<CommitProbe<S>>>) -> Person {
     let person = Person {
         user: UserId::new(),
         device: DeviceId::new(),
@@ -49,9 +47,8 @@ async fn register(svc: &Messaging<InMemoryStore, Arc<ManualClock>, Arc<CommitPro
     person
 }
 
-#[tokio::test]
-async fn events_are_published_only_after_the_send_commits() {
-    let store = InMemoryStore::new();
+async fn events_are_published_only_after_the_send_commits<B: Backend>(backend: &B) {
+    let store = backend.store().await;
     let probe = Arc::new(CommitProbe {
         store: store.clone(),
         observed: std::sync::Mutex::new(Vec::new()),
@@ -70,9 +67,8 @@ async fn events_are_published_only_after_the_send_commits() {
     assert_eq!(*probe.observed.lock().unwrap(), [1]);
 }
 
-#[tokio::test]
-async fn messages_get_consecutive_seq_numbers_starting_at_one() {
-    let world = World::new();
+async fn messages_get_consecutive_seq_numbers_starting_at_one<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let chat = world.direct_chat(&alice, &bob).await;
 
@@ -82,9 +78,8 @@ async fn messages_get_consecutive_seq_numbers_starting_at_one() {
     assert_eq!([first.seq, second.seq, third.seq], [1, 2, 3]);
 }
 
-#[tokio::test]
-async fn a_retry_returns_the_original_and_leaves_no_gap() {
-    let world = World::new();
+async fn a_retry_returns_the_original_and_leaves_no_gap<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let chat = world.direct_chat(&alice, &bob).await;
 
@@ -96,9 +91,8 @@ async fn a_retry_returns_the_original_and_leaves_no_gap() {
     assert_eq!(world.send(&bob, chat, "hi").await.seq, 2);
 }
 
-#[tokio::test]
-async fn another_sender_cannot_reuse_a_client_msg_id() {
-    let world = World::new();
+async fn another_sender_cannot_reuse_a_client_msg_id<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let chat = world.direct_chat(&alice, &bob).await;
 
@@ -115,9 +109,8 @@ async fn another_sender_cannot_reuse_a_client_msg_id() {
     );
 }
 
-#[tokio::test]
-async fn an_invalid_message_is_rejected_and_uses_no_seq() {
-    let world = World::new();
+async fn an_invalid_message_is_rejected_and_uses_no_seq<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let chat = world.direct_chat(&alice, &bob).await;
 
@@ -128,9 +121,8 @@ async fn an_invalid_message_is_rejected_and_uses_no_seq() {
     assert_eq!(world.send(&alice, chat, "ok").await.seq, 1);
 }
 
-#[tokio::test]
-async fn only_members_can_send() {
-    let world = World::new();
+async fn only_members_can_send<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob, carol) = (
         world.person().await,
         world.person().await,
@@ -146,9 +138,8 @@ async fn only_members_can_send() {
     assert_eq!(world.send(&alice, chat, "still gapless").await.seq, 1);
 }
 
-#[tokio::test]
-async fn a_blocked_contact_cannot_send() {
-    let world = World::new();
+async fn a_blocked_contact_cannot_send<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let chat = world.direct_chat(&alice, &bob).await;
     world.svc.contact_block(bob.user, alice.user).await.unwrap();
@@ -167,9 +158,8 @@ async fn a_blocked_contact_cannot_send() {
     assert_eq!(world.send(&alice, chat, "after").await.seq, 1);
 }
 
-#[tokio::test]
-async fn a_retry_after_being_blocked_still_returns_the_original() {
-    let world = World::new();
+async fn a_retry_after_being_blocked_still_returns_the_original<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let chat = world.direct_chat(&alice, &bob).await;
 
@@ -188,9 +178,8 @@ async fn a_retry_after_being_blocked_still_returns_the_original() {
     assert_eq!(world.send(&alice, chat, "again").await.seq, 2);
 }
 
-#[tokio::test]
-async fn a_retry_publishes_nothing() {
-    let world = World::new();
+async fn a_retry_publishes_nothing<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let chat = world.direct_chat(&alice, &bob).await;
     let command = text(&alice, chat, "hello");
@@ -201,9 +190,8 @@ async fn a_retry_publishes_nothing() {
     assert!(world.notifier.take().is_empty());
 }
 
-#[tokio::test]
-async fn the_device_must_belong_to_the_sender() {
-    let world = World::new();
+async fn the_device_must_belong_to_the_sender<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let chat = world.direct_chat(&alice, &bob).await;
 
@@ -217,9 +205,8 @@ async fn the_device_must_belong_to_the_sender() {
     );
 }
 
-#[tokio::test]
-async fn sending_to_an_unknown_conversation_fails() {
-    let world = World::new();
+async fn sending_to_an_unknown_conversation_fails<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let alice = world.person().await;
     assert_eq!(
         world
@@ -230,9 +217,8 @@ async fn sending_to_an_unknown_conversation_fails() {
     );
 }
 
-#[tokio::test]
-async fn a_send_tells_every_member_to_sync_and_a_failed_one_tells_nobody() {
-    let world = World::new();
+async fn a_send_tells_every_member_to_sync_and_a_failed_one_tells_nobody<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let chat = world.direct_chat(&alice, &bob).await;
     world.notifier.take();
@@ -244,9 +230,8 @@ async fn a_send_tells_every_member_to_sync_and_a_failed_one_tells_nobody() {
     assert!(world.notifier.take().is_empty());
 }
 
-#[tokio::test]
-async fn the_server_timestamp_comes_from_the_clock() {
-    let world = World::new();
+async fn the_server_timestamp_comes_from_the_clock<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let chat = world.direct_chat(&alice, &bob).await;
     let at = Utc.with_ymd_and_hms(2026, 3, 4, 5, 6, 7).unwrap();
@@ -255,9 +240,8 @@ async fn the_server_timestamp_comes_from_the_clock() {
     assert_eq!(world.send(&alice, chat, "hi").await.server_ts, at);
 }
 
-#[tokio::test]
-async fn opening_and_sending_set_the_conversations_updated_at() {
-    let world = World::new();
+async fn opening_and_sending_set_the_conversations_updated_at<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let opened_at = world.clock.now();
     let chat = world.direct_chat(&alice, &bob).await;
@@ -269,4 +253,23 @@ async fn opening_and_sending_set_the_conversations_updated_at() {
         world.conversation(chat).await.updated_at,
         opened_at + TimeDelta::minutes(5)
     );
+}
+
+pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
+    case_list![
+        events_are_published_only_after_the_send_commits,
+        messages_get_consecutive_seq_numbers_starting_at_one,
+        a_retry_returns_the_original_and_leaves_no_gap,
+        another_sender_cannot_reuse_a_client_msg_id,
+        an_invalid_message_is_rejected_and_uses_no_seq,
+        only_members_can_send,
+        a_blocked_contact_cannot_send,
+        a_retry_after_being_blocked_still_returns_the_original,
+        a_retry_publishes_nothing,
+        the_device_must_belong_to_the_sender,
+        sending_to_an_unknown_conversation_fails,
+        a_send_tells_every_member_to_sync_and_a_failed_one_tells_nobody,
+        the_server_timestamp_comes_from_the_clock,
+        opening_and_sending_set_the_conversations_updated_at,
+    ]
 }

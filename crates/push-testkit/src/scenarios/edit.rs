@@ -1,15 +1,15 @@
-mod common;
-
+use crate::{Backend, Case, Person, World, bodies, case_list, edit, entries_for, seqs, text};
 use chrono::TimeDelta;
-use common::{Person, World, bodies, edit, entries_for, seqs, text};
 use push_domain::{
     ClientMsgId, Clock, ConversationId, DomainError, EditText, Entry, EntryKind, MessageId,
-    MessageRef, Policy, Positions, SendReceipt, SendText, ValidationError,
+    MessageRef, Policy, Positions, SendReceipt, SendText, Store, ValidationError,
 };
 
 /// Alice and bob in a direct chat, with one message "hello" from alice at seq 1.
-async fn chat_with_one_message() -> (World, Person, Person, ConversationId, SendReceipt) {
-    let world = World::new();
+async fn chat_with_one_message<B: Backend>(
+    backend: &B,
+) -> (World<B::Store>, Person, Person, ConversationId, SendReceipt) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let chat = world.direct_chat(&alice, &bob).await;
     let hello = world.send(&alice, chat, "hello").await;
@@ -20,13 +20,12 @@ fn by_id(target: &SendReceipt) -> MessageRef {
     MessageRef::Id(target.message_id)
 }
 
-async fn synced(world: &World, person: &Person) -> Vec<Entry> {
+async fn synced<S: Store>(world: &World<S>, person: &Person) -> Vec<Entry> {
     world.svc.sync(person.device, 100).await.unwrap().entries
 }
 
-#[tokio::test]
-async fn an_edit_is_an_entry_of_its_own_and_updates_the_message() {
-    let (world, alice, bob, chat, hello) = chat_with_one_message().await;
+async fn an_edit_is_an_entry_of_its_own_and_updates_the_message<B: Backend>(backend: &B) {
+    let (world, alice, bob, chat, hello) = chat_with_one_message(backend).await;
     world.clock.advance(TimeDelta::minutes(1));
 
     let receipt = world.edit(&alice, chat, &hello, "hello again").await;
@@ -44,9 +43,8 @@ async fn an_edit_is_an_entry_of_its_own_and_updates_the_message() {
     assert_eq!(change.message_id, receipt.message_id);
 }
 
-#[tokio::test]
-async fn only_the_latest_edit_keeps_its_text() {
-    let (world, alice, bob, chat, hello) = chat_with_one_message().await;
+async fn only_the_latest_edit_keeps_its_text<B: Backend>(backend: &B) {
+    let (world, alice, bob, chat, hello) = chat_with_one_message(backend).await;
     world.edit(&alice, chat, &hello, "v1").await;
     world.edit(&alice, chat, &hello, "v2").await;
 
@@ -60,9 +58,8 @@ async fn only_the_latest_edit_keeps_its_text() {
     assert_eq!(entries[0].edit_seq, Some(3));
 }
 
-#[tokio::test]
-async fn a_message_can_be_targeted_by_its_client_msg_id() {
-    let world = World::new();
+async fn a_message_can_be_targeted_by_its_client_msg_id<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let chat = world.direct_chat(&alice, &bob).await;
     let command = text(&alice, chat, "hello");
@@ -77,9 +74,8 @@ async fn a_message_can_be_targeted_by_its_client_msg_id() {
     assert_eq!(bodies(&synced(&world, &bob).await)[0], "fixed");
 }
 
-#[tokio::test]
-async fn an_edit_retry_returns_the_original_and_changes_nothing() {
-    let (world, alice, _bob, chat, hello) = chat_with_one_message().await;
+async fn an_edit_retry_returns_the_original_and_changes_nothing<B: Backend>(backend: &B) {
+    let (world, alice, _bob, chat, hello) = chat_with_one_message(backend).await;
     let command = edit(&alice, chat, by_id(&hello), "v1");
     let first = world.svc.edit_text(command.clone()).await.unwrap();
     world.notifier.take();
@@ -90,9 +86,8 @@ async fn an_edit_retry_returns_the_original_and_changes_nothing() {
     assert_eq!(world.send(&alice, chat, "next").await.seq, 3);
 }
 
-#[tokio::test]
-async fn an_edit_retry_succeeds_even_after_the_window_has_passed() {
-    let (world, alice, _bob, chat, hello) = chat_with_one_message().await;
+async fn an_edit_retry_succeeds_even_after_the_window_has_passed<B: Backend>(backend: &B) {
+    let (world, alice, _bob, chat, hello) = chat_with_one_message(backend).await;
     let command = edit(&alice, chat, by_id(&hello), "v1");
     let first = world.svc.edit_text(command.clone()).await.unwrap();
     world.clock.advance(TimeDelta::days(3));
@@ -100,9 +95,8 @@ async fn an_edit_retry_succeeds_even_after_the_window_has_passed() {
     assert_eq!(world.svc.edit_text(command).await, Ok(first));
 }
 
-#[tokio::test]
-async fn only_the_sender_can_edit() {
-    let (world, _alice, bob, chat, hello) = chat_with_one_message().await;
+async fn only_the_sender_can_edit<B: Backend>(backend: &B) {
+    let (world, _alice, bob, chat, hello) = chat_with_one_message(backend).await;
     assert_eq!(
         world
             .svc
@@ -113,9 +107,8 @@ async fn only_the_sender_can_edit() {
     assert_eq!(world.send(&bob, chat, "gapless").await.seq, 2);
 }
 
-#[tokio::test]
-async fn the_sender_may_edit_from_another_device() {
-    let (world, alice, bob, chat, hello) = chat_with_one_message().await;
+async fn the_sender_may_edit_from_another_device<B: Backend>(backend: &B) {
+    let (world, alice, bob, chat, hello) = chat_with_one_message(backend).await;
     let laptop = world.add_device(&alice).await;
     let command = EditText {
         device: laptop,
@@ -126,9 +119,8 @@ async fn the_sender_may_edit_from_another_device() {
     assert_eq!(bodies(&synced(&world, &bob).await)[0], "from the laptop");
 }
 
-#[tokio::test]
-async fn the_target_must_be_a_message_of_this_conversation() {
-    let (world, alice, _bob, chat, hello) = chat_with_one_message().await;
+async fn the_target_must_be_a_message_of_this_conversation<B: Backend>(backend: &B) {
+    let (world, alice, _bob, chat, hello) = chat_with_one_message(backend).await;
     let carol = world.person().await;
     let other_chat = world.direct_chat(&alice, &carol).await;
     let elsewhere = world.send(&alice, other_chat, "elsewhere").await;
@@ -147,9 +139,8 @@ async fn the_target_must_be_a_message_of_this_conversation() {
     }
 }
 
-#[tokio::test]
-async fn a_target_outside_the_callers_visible_range_is_not_found() {
-    let (world, alice, _bob, chat, hello) = chat_with_one_message().await;
+async fn a_target_outside_the_callers_visible_range_is_not_found<B: Backend>(backend: &B) {
+    let (world, alice, _bob, chat, hello) = chat_with_one_message(backend).await;
     world.set_visibility(chat, alice.user, 2, None).await;
 
     assert_eq!(
@@ -161,9 +152,8 @@ async fn a_target_outside_the_callers_visible_range_is_not_found() {
     );
 }
 
-#[tokio::test]
-async fn an_edit_is_allowed_until_the_window_closes() {
-    let (world, alice, _bob, chat, hello) = chat_with_one_message().await;
+async fn an_edit_is_allowed_until_the_window_closes<B: Backend>(backend: &B) {
+    let (world, alice, _bob, chat, hello) = chat_with_one_message(backend).await;
     world.clock.advance(TimeDelta::hours(48));
     world.edit(&alice, chat, &hello, "just in time").await;
 
@@ -177,12 +167,15 @@ async fn an_edit_is_allowed_until_the_window_closes() {
     );
 }
 
-#[tokio::test]
-async fn the_edit_window_comes_from_the_policy() {
-    let world = World::with_policy(Policy {
-        edit_window: TimeDelta::minutes(1),
-        ..Policy::default()
-    });
+async fn the_edit_window_comes_from_the_policy<B: Backend>(backend: &B) {
+    let world = World::with_policy(
+        backend,
+        Policy {
+            edit_window: TimeDelta::minutes(1),
+            ..Policy::default()
+        },
+    )
+    .await;
     let (alice, bob) = (world.person().await, world.person().await);
     let chat = world.direct_chat(&alice, &bob).await;
     let hello = world.send(&alice, chat, "hello").await;
@@ -197,9 +190,8 @@ async fn the_edit_window_comes_from_the_policy() {
     );
 }
 
-#[tokio::test]
-async fn an_invalid_edit_is_rejected_and_uses_no_seq() {
-    let (world, alice, _bob, chat, hello) = chat_with_one_message().await;
+async fn an_invalid_edit_is_rejected_and_uses_no_seq<B: Backend>(backend: &B) {
+    let (world, alice, _bob, chat, hello) = chat_with_one_message(backend).await;
     assert_eq!(
         world
             .svc
@@ -210,9 +202,8 @@ async fn an_invalid_edit_is_rejected_and_uses_no_seq() {
     assert_eq!(world.send(&alice, chat, "next").await.seq, 2);
 }
 
-#[tokio::test]
-async fn a_blocked_sender_cannot_edit() {
-    let (world, alice, bob, chat, hello) = chat_with_one_message().await;
+async fn a_blocked_sender_cannot_edit<B: Backend>(backend: &B) {
+    let (world, alice, bob, chat, hello) = chat_with_one_message(backend).await;
     world.svc.contact_block(bob.user, alice.user).await.unwrap();
 
     assert_eq!(
@@ -224,9 +215,8 @@ async fn a_blocked_sender_cannot_edit() {
     );
 }
 
-#[tokio::test]
-async fn a_client_msg_id_cannot_be_reused_for_another_kind_of_entry() {
-    let world = World::new();
+async fn a_client_msg_id_cannot_be_reused_for_another_kind_of_entry<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let chat = world.direct_chat(&alice, &bob).await;
     let command = text(&alice, chat, "hello");
@@ -243,27 +233,24 @@ async fn a_client_msg_id_cannot_be_reused_for_another_kind_of_entry() {
     );
 }
 
-#[tokio::test]
-async fn an_edit_tells_every_member_to_sync() {
-    let (world, alice, bob, chat, hello) = chat_with_one_message().await;
+async fn an_edit_tells_every_member_to_sync<B: Backend>(backend: &B) {
+    let (world, alice, bob, chat, hello) = chat_with_one_message(backend).await;
     world.notifier.take();
 
     world.edit(&alice, chat, &hello, "v1").await;
     assert_eq!(world.notifier.take(), [entries_for(&[&alice, &bob])]);
 }
 
-#[tokio::test]
-async fn an_edit_moves_the_conversations_updated_at() {
-    let (world, alice, _bob, chat, hello) = chat_with_one_message().await;
+async fn an_edit_moves_the_conversations_updated_at<B: Backend>(backend: &B) {
+    let (world, alice, _bob, chat, hello) = chat_with_one_message(backend).await;
     world.clock.advance(TimeDelta::minutes(3));
 
     world.edit(&alice, chat, &hello, "v1").await;
     assert_eq!(world.conversation(chat).await.updated_at, world.clock.now());
 }
 
-#[tokio::test]
-async fn an_edit_leaves_the_senders_read_position_unchanged() {
-    let (world, alice, bob, chat, hello) = chat_with_one_message().await;
+async fn an_edit_leaves_the_senders_read_position_unchanged<B: Backend>(backend: &B) {
+    let (world, alice, bob, chat, hello) = chat_with_one_message(backend).await;
     world.send(&bob, chat, "reply").await;
     let read_seq_of_alice = || async {
         let state = world
@@ -286,9 +273,8 @@ async fn an_edit_leaves_the_senders_read_position_unchanged() {
     assert_eq!(read_seq_of_alice().await, before);
 }
 
-#[tokio::test]
-async fn a_text_send_cannot_reuse_the_client_msg_id_of_an_edit() {
-    let (world, alice, _bob, chat, hello) = chat_with_one_message().await;
+async fn a_text_send_cannot_reuse_the_client_msg_id_of_an_edit<B: Backend>(backend: &B) {
+    let (world, alice, _bob, chat, hello) = chat_with_one_message(backend).await;
     let command = edit(&alice, chat, by_id(&hello), "v1");
     let reused = command.client_msg_id;
     world.svc.edit_text(command).await.unwrap();
@@ -303,9 +289,8 @@ async fn a_text_send_cannot_reuse_the_client_msg_id_of_an_edit() {
     );
 }
 
-#[tokio::test]
-async fn refused_edits_leave_no_gap_in_seq() {
-    let (world, alice, _bob, chat, hello) = chat_with_one_message().await;
+async fn refused_edits_leave_no_gap_in_seq<B: Backend>(backend: &B) {
+    let (world, alice, _bob, chat, hello) = chat_with_one_message(backend).await;
     assert_eq!(
         world
             .svc
@@ -322,4 +307,28 @@ async fn refused_edits_leave_no_gap_in_seq() {
         Err(DomainError::WindowExpired)
     );
     assert_eq!(world.send(&alice, chat, "next").await.seq, 2);
+}
+
+pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
+    case_list![
+        an_edit_is_an_entry_of_its_own_and_updates_the_message,
+        only_the_latest_edit_keeps_its_text,
+        a_message_can_be_targeted_by_its_client_msg_id,
+        an_edit_retry_returns_the_original_and_changes_nothing,
+        an_edit_retry_succeeds_even_after_the_window_has_passed,
+        only_the_sender_can_edit,
+        the_sender_may_edit_from_another_device,
+        the_target_must_be_a_message_of_this_conversation,
+        a_target_outside_the_callers_visible_range_is_not_found,
+        an_edit_is_allowed_until_the_window_closes,
+        the_edit_window_comes_from_the_policy,
+        an_invalid_edit_is_rejected_and_uses_no_seq,
+        a_blocked_sender_cannot_edit,
+        a_client_msg_id_cannot_be_reused_for_another_kind_of_entry,
+        an_edit_tells_every_member_to_sync,
+        an_edit_moves_the_conversations_updated_at,
+        an_edit_leaves_the_senders_read_position_unchanged,
+        a_text_send_cannot_reuse_the_client_msg_id_of_an_edit,
+        refused_edits_leave_no_gap_in_seq,
+    ]
 }

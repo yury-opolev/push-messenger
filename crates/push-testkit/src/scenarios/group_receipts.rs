@@ -1,6 +1,4 @@
-mod common;
-
-use common::{Person, World, delete, entries_for};
+use crate::{Backend, Case, Person, World, case_list, delete, entries_for};
 use push_domain::{ConversationId, Event, MessageRef, ReceiptUpdate};
 
 fn group_receipt(
@@ -30,8 +28,10 @@ fn read_moved(person: &Person, conversation: ConversationId, read_seq: i64) -> E
 }
 
 /// A group of alice (admin), bob and carol; `seq` 1 is its `Created` entry.
-async fn trio() -> (World, Person, Person, Person, ConversationId) {
-    let world = World::new();
+async fn trio<B: Backend>(
+    backend: &B,
+) -> (World<B::Store>, Person, Person, Person, ConversationId) {
+    let world = World::new(backend).await;
     let (alice, bob, carol) = (
         world.person().await,
         world.person().await,
@@ -42,9 +42,8 @@ async fn trio() -> (World, Person, Person, Person, ConversationId) {
     (world, alice, bob, carol, group)
 }
 
-#[tokio::test]
-async fn a_group_receipt_waits_for_every_other_member() {
-    let (world, alice, bob, carol, group) = trio().await;
+async fn a_group_receipt_waits_for_every_other_member<B: Backend>(backend: &B) {
+    let (world, alice, bob, carol, group) = trio(backend).await;
     world.send(&alice, group, "hi").await;
     world.notifier.take();
     let everyone = [&alice, &bob, &carol];
@@ -69,9 +68,8 @@ async fn a_group_receipt_waits_for_every_other_member() {
     );
 }
 
-#[tokio::test]
-async fn ones_own_messages_never_hold_the_group_back() {
-    let (world, alice, bob, carol, group) = trio().await;
+async fn ones_own_messages_never_hold_the_group_back<B: Backend>(backend: &B) {
+    let (world, alice, bob, carol, group) = trio(backend).await;
     world.send(&alice, group, "one").await;
     world.send(&bob, group, "two").await;
     world.svc.read_up_to(carol.user, group, 3).await.unwrap();
@@ -88,9 +86,8 @@ async fn ones_own_messages_never_hold_the_group_back() {
     );
 }
 
-#[tokio::test]
-async fn replying_in_a_group_can_complete_a_read() {
-    let (world, alice, bob, carol, group) = trio().await;
+async fn replying_in_a_group_can_complete_a_read<B: Backend>(backend: &B) {
+    let (world, alice, bob, carol, group) = trio(backend).await;
     world.send(&alice, group, "one").await;
     world.svc.ack(bob.device, group, 2).await.unwrap();
     world.svc.read_up_to(bob.user, group, 2).await.unwrap();
@@ -109,9 +106,8 @@ async fn replying_in_a_group_can_complete_a_read() {
     );
 }
 
-#[tokio::test]
-async fn edits_send_no_group_receipt() {
-    let (world, alice, bob, carol, group) = trio().await;
+async fn edits_send_no_group_receipt<B: Backend>(backend: &B) {
+    let (world, alice, bob, carol, group) = trio(backend).await;
     let hello = world.send(&alice, group, "hello").await;
     world.svc.read_up_to(bob.user, group, 2).await.unwrap();
     world.svc.read_up_to(carol.user, group, 2).await.unwrap();
@@ -124,9 +120,8 @@ async fn edits_send_no_group_receipt() {
     );
 }
 
-#[tokio::test]
-async fn deleting_the_message_someone_had_not_read_can_complete_a_read() {
-    let (world, alice, bob, carol, group) = trio().await;
+async fn deleting_the_message_someone_had_not_read_can_complete_a_read<B: Backend>(backend: &B) {
+    let (world, alice, bob, carol, group) = trio(backend).await;
     let unread = world.send(&alice, group, "one").await;
     world.send(&carol, group, "two").await;
     world.svc.read_up_to(alice.user, group, 3).await.unwrap();
@@ -146,4 +141,14 @@ async fn deleting_the_message_someone_had_not_read_can_complete_a_read() {
             group_receipt(group, &everyone, 4, 4)
         ]
     );
+}
+
+pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
+    case_list![
+        a_group_receipt_waits_for_every_other_member,
+        ones_own_messages_never_hold_the_group_back,
+        replying_in_a_group_can_complete_a_read,
+        edits_send_no_group_receipt,
+        deleting_the_message_someone_had_not_read_can_complete_a_read,
+    ]
 }

@@ -1,14 +1,14 @@
-mod common;
-
+use crate::{Backend, Case, Person, World, case_list, delete, edit, entries_for, seqs};
 use chrono::TimeDelta;
-use common::{Person, World, delete, edit, entries_for, seqs};
 use push_domain::{
-    Clock, ConversationId, DomainError, Entry, EntryKind, MessageRef, Policy, SendReceipt,
+    Clock, ConversationId, DomainError, Entry, EntryKind, MessageRef, Policy, SendReceipt, Store,
 };
 
 /// Alice and bob in a direct chat, with one message "hello" from alice at seq 1.
-async fn chat_with_one_message() -> (World, Person, Person, ConversationId, SendReceipt) {
-    let world = World::new();
+async fn chat_with_one_message<B: Backend>(
+    backend: &B,
+) -> (World<B::Store>, Person, Person, ConversationId, SendReceipt) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let chat = world.direct_chat(&alice, &bob).await;
     let hello = world.send(&alice, chat, "hello").await;
@@ -19,13 +19,12 @@ fn by_id(target: &SendReceipt) -> MessageRef {
     MessageRef::Id(target.message_id)
 }
 
-async fn synced(world: &World, person: &Person) -> Vec<Entry> {
+async fn synced<S: Store>(world: &World<S>, person: &Person) -> Vec<Entry> {
     world.svc.sync(person.device, 100).await.unwrap().entries
 }
 
-#[tokio::test]
-async fn a_delete_erases_the_message_and_every_edit_of_it() {
-    let (world, alice, bob, chat, hello) = chat_with_one_message().await;
+async fn a_delete_erases_the_message_and_every_edit_of_it<B: Backend>(backend: &B) {
+    let (world, alice, bob, chat, hello) = chat_with_one_message(backend).await;
     world.edit(&alice, chat, &hello, "v1").await;
     world.edit(&alice, chat, &hello, "v2").await;
     world.clock.advance(TimeDelta::minutes(1));
@@ -45,9 +44,8 @@ async fn a_delete_erases_the_message_and_every_edit_of_it() {
     assert_eq!(entries[3].target_seq, Some(1));
 }
 
-#[tokio::test]
-async fn a_delete_retry_returns_the_original_and_changes_nothing() {
-    let (world, alice, _bob, chat, hello) = chat_with_one_message().await;
+async fn a_delete_retry_returns_the_original_and_changes_nothing<B: Backend>(backend: &B) {
+    let (world, alice, _bob, chat, hello) = chat_with_one_message(backend).await;
     let command = delete(&alice, chat, by_id(&hello));
     let first = world.svc.delete_message(command.clone()).await.unwrap();
     world.notifier.take();
@@ -57,9 +55,8 @@ async fn a_delete_retry_returns_the_original_and_changes_nothing() {
     assert_eq!(world.send(&alice, chat, "next").await.seq, 3);
 }
 
-#[tokio::test]
-async fn a_second_delete_of_the_same_message_is_refused() {
-    let (world, alice, _bob, chat, hello) = chat_with_one_message().await;
+async fn a_second_delete_of_the_same_message_is_refused<B: Backend>(backend: &B) {
+    let (world, alice, _bob, chat, hello) = chat_with_one_message(backend).await;
     world
         .svc
         .delete_message(delete(&alice, chat, by_id(&hello)))
@@ -75,9 +72,8 @@ async fn a_second_delete_of_the_same_message_is_refused() {
     );
 }
 
-#[tokio::test]
-async fn a_deleted_message_cannot_be_edited() {
-    let (world, alice, _bob, chat, hello) = chat_with_one_message().await;
+async fn a_deleted_message_cannot_be_edited<B: Backend>(backend: &B) {
+    let (world, alice, _bob, chat, hello) = chat_with_one_message(backend).await;
     world
         .svc
         .delete_message(delete(&alice, chat, by_id(&hello)))
@@ -93,9 +89,8 @@ async fn a_deleted_message_cannot_be_edited() {
     );
 }
 
-#[tokio::test]
-async fn only_the_sender_can_delete() {
-    let (world, _alice, bob, chat, hello) = chat_with_one_message().await;
+async fn only_the_sender_can_delete<B: Backend>(backend: &B) {
+    let (world, _alice, bob, chat, hello) = chat_with_one_message(backend).await;
     assert_eq!(
         world
             .svc
@@ -105,9 +100,8 @@ async fn only_the_sender_can_delete() {
     );
 }
 
-#[tokio::test]
-async fn a_delete_is_allowed_until_the_window_closes() {
-    let (world, alice, _bob, chat, hello) = chat_with_one_message().await;
+async fn a_delete_is_allowed_until_the_window_closes<B: Backend>(backend: &B) {
+    let (world, alice, _bob, chat, hello) = chat_with_one_message(backend).await;
     let second = world.send(&alice, chat, "second").await;
     world.clock.advance(TimeDelta::hours(48));
     world
@@ -126,12 +120,15 @@ async fn a_delete_is_allowed_until_the_window_closes() {
     );
 }
 
-#[tokio::test]
-async fn the_delete_window_is_separate_from_the_edit_window() {
-    let world = World::with_policy(Policy {
-        edit_window: TimeDelta::minutes(1),
-        ..Policy::default()
-    });
+async fn the_delete_window_is_separate_from_the_edit_window<B: Backend>(backend: &B) {
+    let world = World::with_policy(
+        backend,
+        Policy {
+            edit_window: TimeDelta::minutes(1),
+            ..Policy::default()
+        },
+    )
+    .await;
     let (alice, bob) = (world.person().await, world.person().await);
     let chat = world.direct_chat(&alice, &bob).await;
     let hello = world.send(&alice, chat, "hello").await;
@@ -153,9 +150,8 @@ async fn the_delete_window_is_separate_from_the_edit_window() {
     );
 }
 
-#[tokio::test]
-async fn a_delete_tells_every_member_to_sync() {
-    let (world, alice, bob, chat, hello) = chat_with_one_message().await;
+async fn a_delete_tells_every_member_to_sync<B: Backend>(backend: &B) {
+    let (world, alice, bob, chat, hello) = chat_with_one_message(backend).await;
     world.notifier.take();
 
     world
@@ -164,4 +160,17 @@ async fn a_delete_tells_every_member_to_sync() {
         .await
         .unwrap();
     assert_eq!(world.notifier.take(), [entries_for(&[&alice, &bob])]);
+}
+
+pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
+    case_list![
+        a_delete_erases_the_message_and_every_edit_of_it,
+        a_delete_retry_returns_the_original_and_changes_nothing,
+        a_second_delete_of_the_same_message_is_refused,
+        a_deleted_message_cannot_be_edited,
+        only_the_sender_can_delete,
+        a_delete_is_allowed_until_the_window_closes,
+        the_delete_window_is_separate_from_the_edit_window,
+        a_delete_tells_every_member_to_sync,
+    ]
 }

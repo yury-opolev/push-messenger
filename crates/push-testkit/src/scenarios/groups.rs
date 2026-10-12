@@ -1,14 +1,11 @@
-mod common;
-
-use common::{World, entries_for, seqs, system_events, text};
+use crate::{Backend, Case, World, case_list, entries_for, seqs, system_events, text};
 use push_domain::{
     Clock, ContentType, ConversationId, DomainError, EntryKind, MAX_GROUP_MEMBERS, Positions, Role,
     SystemEvent, UserId, ValidationError,
 };
 
-#[tokio::test]
-async fn a_new_group_starts_with_a_created_entry_seen_by_every_member() {
-    let world = World::new();
+async fn a_new_group_starts_with_a_created_entry_seen_by_every_member<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob, carol) = (
         world.person().await,
         world.person().await,
@@ -52,9 +49,10 @@ async fn a_new_group_starts_with_a_created_entry_seen_by_every_member() {
     assert_eq!((stored.last_seq, stored.updated_at), (1, world.clock.now()));
 }
 
-#[tokio::test]
-async fn the_creator_is_the_admin_and_everyone_sees_the_group_from_its_start() {
-    let world = World::new();
+async fn the_creator_is_the_admin_and_everyone_sees_the_group_from_its_start<B: Backend>(
+    backend: &B,
+) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let tablet = world.add_device(&bob).await;
     let group = world.group(&alice, &[&bob]).await;
@@ -73,9 +71,8 @@ async fn the_creator_is_the_admin_and_everyone_sees_the_group_from_its_start() {
     }
 }
 
-#[tokio::test]
-async fn duplicates_and_the_creator_in_the_member_list_are_ignored() {
-    let world = World::new();
+async fn duplicates_and_the_creator_in_the_member_list_are_ignored<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     world.befriend(&alice, &bob).await;
 
@@ -96,9 +93,8 @@ async fn duplicates_and_the_creator_in_the_member_list_are_ignored() {
     assert!(world.member(group, &bob).await.is_some());
 }
 
-#[tokio::test]
-async fn a_group_title_must_not_be_blank() {
-    let world = World::new();
+async fn a_group_title_must_not_be_blank<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let alice = world.person().await;
     assert_eq!(
         world.svc.create_group(alice.user, "   ", &[]).await,
@@ -106,9 +102,8 @@ async fn a_group_title_must_not_be_blank() {
     );
 }
 
-#[tokio::test]
-async fn every_member_must_be_an_accepted_contact_of_the_creator() {
-    let world = World::new();
+async fn every_member_must_be_an_accepted_contact_of_the_creator<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob, carol) = (
         world.person().await,
         world.person().await,
@@ -139,9 +134,8 @@ async fn every_member_must_be_an_accepted_contact_of_the_creator() {
     );
 }
 
-#[tokio::test]
-async fn a_group_holds_at_most_a_hundred_members() {
-    let world = World::new();
+async fn a_group_holds_at_most_a_hundred_members<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let alice = world.person().await;
     let mut friends = Vec::new();
     for _ in 1..MAX_GROUP_MEMBERS {
@@ -167,9 +161,8 @@ async fn a_group_holds_at_most_a_hundred_members() {
     );
 }
 
-#[tokio::test]
-async fn members_chat_without_being_contacts_and_blocks_do_not_matter() {
-    let world = World::new();
+async fn members_chat_without_being_contacts_and_blocks_do_not_matter<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob, carol, dave) = (
         world.person().await,
         world.person().await,
@@ -189,9 +182,8 @@ async fn members_chat_without_being_contacts_and_blocks_do_not_matter() {
     assert_eq!(history, Err(DomainError::NotMember));
 }
 
-#[tokio::test]
-async fn an_admin_adds_a_contact_who_sees_the_group_from_the_added_entry() {
-    let world = World::new();
+async fn an_admin_adds_a_contact_who_sees_the_group_from_the_added_entry<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob, dave) = (
         world.person().await,
         world.person().await,
@@ -227,9 +219,12 @@ async fn an_admin_adds_a_contact_who_sees_the_group_from_the_added_entry() {
     assert_eq!(world.position(dave.device, group).await, Some(2));
 }
 
-#[tokio::test]
-async fn messages_from_before_joining_are_neither_unread_nor_changed_for_the_new_member() {
-    let world = World::new();
+async fn messages_from_before_joining_are_neither_unread_nor_changed_for_the_new_member<
+    B: Backend,
+>(
+    backend: &B,
+) {
+    let world = World::new(backend).await;
     let (alice, bob, dave) = (
         world.person().await,
         world.person().await,
@@ -252,9 +247,8 @@ async fn messages_from_before_joining_are_neither_unread_nor_changed_for_the_new
     assert_eq!(seqs(&batch.entries), [3, 5]);
 }
 
-#[tokio::test]
-async fn only_a_current_admin_of_a_group_can_add() {
-    let world = World::new();
+async fn only_a_current_admin_of_a_group_can_add<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob, carol) = (
         world.person().await,
         world.person().await,
@@ -277,9 +271,10 @@ async fn only_a_current_admin_of_a_group_can_add() {
     );
 }
 
-#[tokio::test]
-async fn added_users_must_be_contacts_of_the_admin_and_current_members_are_skipped() {
-    let world = World::new();
+async fn added_users_must_be_contacts_of_the_admin_and_current_members_are_skipped<B: Backend>(
+    backend: &B,
+) {
+    let world = World::new(backend).await;
     let (alice, bob, erin) = (
         world.person().await,
         world.person().await,
@@ -303,9 +298,8 @@ async fn added_users_must_be_contacts_of_the_admin_and_current_members_are_skipp
     assert_eq!(world.conversation(group).await.last_seq, 1);
 }
 
-#[tokio::test]
-async fn adding_respects_the_hundred_member_cap() {
-    let world = World::new();
+async fn adding_respects_the_hundred_member_cap<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let alice = world.person().await;
     let mut friends = Vec::new();
     for _ in 0..MAX_GROUP_MEMBERS {
@@ -333,9 +327,8 @@ async fn adding_respects_the_hundred_member_cap() {
     );
 }
 
-#[tokio::test]
-async fn a_device_registered_later_starts_at_the_end_of_the_group() {
-    let world = World::new();
+async fn a_device_registered_later_starts_at_the_end_of_the_group<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let group = world.group(&alice, &[&bob]).await;
     world.send(&alice, group, "one").await;
@@ -354,9 +347,8 @@ async fn a_device_registered_later_starts_at_the_end_of_the_group() {
     );
 }
 
-#[tokio::test]
-async fn adding_members_does_not_lower_all_read() {
-    let world = World::new();
+async fn adding_members_does_not_lower_all_read<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob, dave) = (
         world.person().await,
         world.person().await,
@@ -393,9 +385,8 @@ async fn adding_members_does_not_lower_all_read() {
     assert_eq!(after.positions, before.positions);
 }
 
-#[tokio::test]
-async fn a_full_group_rejection_consumes_no_seq() {
-    let world = World::new();
+async fn a_full_group_rejection_consumes_no_seq<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let alice = world.person().await;
     let mut friends = Vec::new();
     for _ in 0..MAX_GROUP_MEMBERS {
@@ -421,9 +412,8 @@ async fn a_full_group_rejection_consumes_no_seq() {
     assert_eq!(world.conversation(group).await.last_seq, last_seq);
 }
 
-#[tokio::test]
-async fn duplicate_ids_in_add_are_added_once() {
-    let world = World::new();
+async fn duplicate_ids_in_add_are_added_once<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob, dave) = (
         world.person().await,
         world.person().await,
@@ -448,9 +438,8 @@ async fn duplicate_ids_in_add_are_added_once() {
     );
 }
 
-#[tokio::test]
-async fn read_up_to_below_the_floor_changes_nothing() {
-    let world = World::new();
+async fn read_up_to_below_the_floor_changes_nothing<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob, dave) = (
         world.person().await,
         world.person().await,
@@ -473,9 +462,8 @@ async fn read_up_to_below_the_floor_changes_nothing() {
     assert_eq!(world.member(group, &dave).await.unwrap().read_seq, 3);
 }
 
-#[tokio::test]
-async fn a_removed_member_can_rejoin_and_sees_only_new_history() {
-    let world = World::new();
+async fn a_removed_member_can_rejoin_and_sees_only_new_history<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob, dave) = (
         world.person().await,
         world.person().await,
@@ -511,4 +499,27 @@ async fn a_removed_member_can_rejoin_and_sees_only_new_history() {
     let row = world.member(group, &dave).await.unwrap();
     assert_eq!((row.visible_from_seq, row.left_at_seq), (5, None));
     assert!(row.read_seq >= 2);
+}
+
+pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
+    case_list![
+        a_new_group_starts_with_a_created_entry_seen_by_every_member,
+        the_creator_is_the_admin_and_everyone_sees_the_group_from_its_start,
+        duplicates_and_the_creator_in_the_member_list_are_ignored,
+        a_group_title_must_not_be_blank,
+        every_member_must_be_an_accepted_contact_of_the_creator,
+        a_group_holds_at_most_a_hundred_members,
+        members_chat_without_being_contacts_and_blocks_do_not_matter,
+        an_admin_adds_a_contact_who_sees_the_group_from_the_added_entry,
+        messages_from_before_joining_are_neither_unread_nor_changed_for_the_new_member,
+        only_a_current_admin_of_a_group_can_add,
+        added_users_must_be_contacts_of_the_admin_and_current_members_are_skipped,
+        adding_respects_the_hundred_member_cap,
+        a_device_registered_later_starts_at_the_end_of_the_group,
+        adding_members_does_not_lower_all_read,
+        a_full_group_rejection_consumes_no_seq,
+        duplicate_ids_in_add_are_added_once,
+        read_up_to_below_the_floor_changes_nothing,
+        a_removed_member_can_rejoin_and_sees_only_new_history,
+    ]
 }
