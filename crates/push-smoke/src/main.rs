@@ -1,6 +1,10 @@
 use std::process::ExitCode;
+use std::time::Duration;
 
 use push_smoke::{Target, run};
+
+/// The whole run, so that a hung deployment fails a helm test instead of hanging it.
+const TOTAL_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -11,10 +15,14 @@ async fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    match run(&target).await {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
+    match tokio::time::timeout(TOTAL_TIMEOUT, run(&target)).await {
+        Ok(Ok(())) => ExitCode::SUCCESS,
+        Ok(Err(error)) => {
             eprintln!("smoke: FAIL: {error:#}");
+            ExitCode::FAILURE
+        }
+        Err(_) => {
+            eprintln!("smoke: FAIL: not finished within {TOTAL_TIMEOUT:?}");
             ExitCode::FAILURE
         }
     }

@@ -18,6 +18,7 @@ tonic.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["io-util"] }
 push-gateway.workspace = true
 push-message-svc.workspace = true
 push-store.workspace = true

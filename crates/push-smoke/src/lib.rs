@@ -31,6 +31,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
+use tonic::transport::Endpoint;
 use uuid::Uuid;
 
 /// How long each step may take.
@@ -38,6 +39,9 @@ const STEP_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long to keep trying to connect: an ingress may answer 503 for a few seconds after
 /// its backends become ready.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How long a closing handshake may take; the test has passed by then.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -102,9 +106,14 @@ struct Client {
 /// complete within 10 s.
 pub async fn run(target: &Target) -> anyhow::Result<()> {
     let started = Instant::now();
-    let mut setup = DevSetupClient::connect(target.setup_url.clone())
+    let channel = Endpoint::from_shared(target.setup_url.clone())
+        .with_context(|| format!("message-svc URL {}", target.setup_url))?
+        .connect_timeout(STEP_TIMEOUT)
+        .timeout(STEP_TIMEOUT)
+        .connect()
         .await
         .with_context(|| format!("connect to message-svc at {}", target.setup_url))?;
+    let mut setup = DevSetupClient::new(channel);
     let alice = Client::register("alice", &mut setup).await?;
     let bob = Client::register("bob", &mut setup).await?;
     setup
@@ -198,7 +207,7 @@ pub async fn run(target: &Target) -> anyhow::Result<()> {
     step("bob acked; the gateway answered the following Ping");
 
     for socket in [&mut alice_socket, &mut bob_socket] {
-        let _ = socket.close(None).await;
+        let _ = tokio::time::timeout(CLOSE_TIMEOUT, socket.close(None)).await;
     }
     step(&format!("PASS in {} ms", started.elapsed().as_millis()));
     Ok(())
