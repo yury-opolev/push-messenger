@@ -263,6 +263,8 @@ pub trait Tx: Send {
 
     // --- Delivery positions ------------------------------------------------------------
 
+    /// The device's delivery position in the conversation; `None` if it has none there.
+    /// Revoked devices keep their positions.
     async fn get_cursor(
         &mut self,
         device: DeviceId,

@@ -8,7 +8,7 @@ use push_domain::{
     Member, MessageId, Store, Tx, UserId,
 };
 use sqlx::postgres::{PgPool, PgRow};
-use sqlx::{PgConnection, Postgres, Transaction};
+use sqlx::{PgConnection, Postgres, Row, Transaction};
 use uuid::Uuid;
 
 use crate::codes::{decode, encode};
@@ -719,59 +719,141 @@ impl Tx for PgTx {
 
     async fn get_cursor(
         &mut self,
-        _device: DeviceId,
-        _conversation: ConversationId,
+        device: DeviceId,
+        conversation: ConversationId,
     ) -> DomainResult<Option<i64>> {
-        unimplemented!("plan 3B task 5")
+        sqlx::query_scalar(
+            "SELECT delivered_seq FROM messaging.device_cursor \
+             WHERE device_id = $1 AND conversation_id = $2",
+        )
+        .bind(device.0)
+        .bind(conversation.0)
+        .fetch_optional(self.conn())
+        .await
+        .map_err(store_error)
     }
 
     async fn create_cursor_if_absent(
         &mut self,
-        _device: DeviceId,
-        _conversation: ConversationId,
-        _seq: i64,
+        device: DeviceId,
+        conversation: ConversationId,
+        seq: i64,
     ) -> DomainResult<()> {
-        unimplemented!("plan 3B task 5")
+        sqlx::query(
+            "INSERT INTO messaging.device_cursor (device_id, conversation_id, delivered_seq) \
+             VALUES ($1, $2, $3) ON CONFLICT (device_id, conversation_id) DO NOTHING",
+        )
+        .bind(device.0)
+        .bind(conversation.0)
+        .bind(seq)
+        .execute(self.conn())
+        .await
+        .map_err(store_error)?;
+        Ok(())
     }
 
     async fn raise_cursor(
         &mut self,
-        _device: DeviceId,
-        _conversation: ConversationId,
-        _seq: i64,
+        device: DeviceId,
+        conversation: ConversationId,
+        seq: i64,
     ) -> DomainResult<bool> {
-        unimplemented!("plan 3B task 5")
+        let moved = sqlx::query(
+            "INSERT INTO messaging.device_cursor (device_id, conversation_id, delivered_seq) \
+             VALUES ($1, $2, $3) \
+             ON CONFLICT (device_id, conversation_id) \
+             DO UPDATE SET delivered_seq = excluded.delivered_seq \
+             WHERE device_cursor.delivered_seq < excluded.delivered_seq",
+        )
+        .bind(device.0)
+        .bind(conversation.0)
+        .bind(seq)
+        .execute(self.conn())
+        .await
+        .map_err(store_error)?
+        .rows_affected();
+        Ok(moved == 1)
     }
 
     async fn delivered_seq(
         &mut self,
-        _conversation: ConversationId,
-        _user: UserId,
+        conversation: ConversationId,
+        user: UserId,
     ) -> DomainResult<i64> {
-        unimplemented!("plan 3B task 5")
+        sqlx::query_scalar("SELECT messaging.delivered_seq($1, $2)")
+            .bind(conversation.0)
+            .bind(user.0)
+            .fetch_one(self.conn())
+            .await
+            .map_err(store_error)
     }
 
     async fn member_positions(
         &mut self,
-        _conversation: ConversationId,
+        conversation: ConversationId,
     ) -> DomainResult<Vec<(Member, i64)>> {
-        unimplemented!("plan 3B task 5")
+        let rows = sqlx::query(concat!(
+            "SELECT ",
+            member_columns!(),
+            ", messaging.delivered_seq(m.conversation_id, m.user_id) AS delivered_seq \
+             FROM messaging.conversation_member m WHERE m.conversation_id = $1"
+        ))
+        .bind(conversation.0)
+        .fetch_all(self.conn())
+        .await
+        .map_err(store_error)?;
+        read_all(rows, |row| {
+            Ok((rows::member(row)?, row.try_get("delivered_seq")?))
+        })
     }
 
     async fn sync_positions(
         &mut self,
-        _user: UserId,
-        _device: DeviceId,
+        user: UserId,
+        device: DeviceId,
     ) -> DomainResult<Vec<(Conversation, Member, i64)>> {
-        unimplemented!("plan 3B task 5")
+        let rows = sqlx::query(concat!(
+            "SELECT ",
+            conversation_columns!(),
+            ", ",
+            member_columns!(),
+            ", position.seq AS position \
+             FROM messaging.conversation_member m \
+             JOIN messaging.conversation c ON c.conversation_id = m.conversation_id \
+             LEFT JOIN messaging.device_cursor d \
+                ON d.device_id = $2 AND d.conversation_id = m.conversation_id \
+             CROSS JOIN LATERAL ( \
+                SELECT greatest(coalesce(d.delivered_seq, 0), m.visible_from_seq - 1) AS seq \
+             ) position \
+             WHERE m.user_id = $1 AND position.seq < coalesce(m.left_at_seq, c.last_seq)"
+        ))
+        .bind(user.0)
+        .bind(device.0)
+        .fetch_all(self.conn())
+        .await
+        .map_err(store_error)?;
+        read_all(rows, |row| {
+            Ok((
+                rows::conversation(row)?,
+                rows::member(row)?,
+                row.try_get("position")?,
+            ))
+        })
     }
 
     async fn group_positions(
         &mut self,
-        _conversation: ConversationId,
-        _last_seq: i64,
+        conversation: ConversationId,
+        last_seq: i64,
     ) -> DomainResult<Option<GroupPositions>> {
-        unimplemented!("plan 3B task 5")
+        let positions: Option<(i64, i64)> =
+            sqlx::query_as("SELECT delivered, read FROM messaging.group_positions($1, $2)")
+                .bind(conversation.0)
+                .bind(last_seq)
+                .fetch_optional(self.conn())
+                .await
+                .map_err(store_error)?;
+        Ok(positions.map(|(delivered, read)| GroupPositions { delivered, read }))
     }
 
     async fn conversation_overviews(
