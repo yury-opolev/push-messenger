@@ -129,6 +129,63 @@ async fn member_positions_pair_every_member_with_their_furthest_delivery<B: Back
     assert_eq!(tx.member_positions(ConversationId::new()).await, Ok(vec![]));
 }
 
+/// Six conversations of alice: the last `seq`, her member row (visible from, left at), her
+/// phone's position if it has one, and the position sync should start from, if anything is
+/// left to receive. Her laptop has everything; it does not count.
+async fn sync_positions_list_memberships_with_something_left_to_receive<B: Backend>(backend: &B) {
+    let store = backend.store().await;
+    let (alice, bob) = (UserId::new(), UserId::new());
+    add_users(&store, &[alice, bob]).await;
+    let (phone, laptop) = (DeviceId::new(), DeviceId::new());
+    type Row = (i64, i64, Option<i64>, Option<i64>, Option<i64>);
+    let rows: [Row; 6] = [
+        (5, 1, None, Some(2), Some(2)),    // behind
+        (4, 3, None, None, Some(2)),       // no position: starts at the floor
+        (5, 1, None, Some(5), None),       // up to date
+        (6, 1, Some(3), Some(3), None),    // left, has everything up to leaving
+        (6, 1, Some(4), Some(1), Some(1)), // left, behind
+        (4, 4, None, Some(1), Some(3)),    // position below the floor
+    ];
+    let mut tx = store.begin().await.unwrap();
+    tx.insert_device(phone, alice).await.unwrap();
+    tx.insert_device(laptop, alice).await.unwrap();
+    let mut expected = Vec::new();
+    for (last_seq, visible_from_seq, left_at_seq, position, starts_at) in rows {
+        let conversation = conversation();
+        let id = conversation.id;
+        tx.insert_conversation(conversation.clone()).await.unwrap();
+        for _ in 0..last_seq {
+            tx.next_seq(id, start()).await.unwrap();
+        }
+        let row = Member {
+            visible_from_seq,
+            left_at_seq,
+            ..member(id, alice)
+        };
+        tx.insert_member(row.clone()).await.unwrap();
+        tx.insert_member(member(id, bob)).await.unwrap();
+        if let Some(position) = position {
+            tx.raise_cursor(phone, id, position).await.unwrap();
+        }
+        tx.raise_cursor(laptop, id, last_seq).await.unwrap();
+        if let Some(starts_at) = starts_at {
+            let stored = Conversation {
+                last_seq,
+                ..conversation
+            };
+            expected.push((stored, row, starts_at));
+        }
+    }
+    tx.commit().await.unwrap();
+
+    let mut tx = store.begin().await.unwrap();
+    let mut positions = tx.sync_positions(alice, phone).await.unwrap();
+    positions.sort_by_key(|(conversation, _, _)| conversation.id);
+    expected.sort_by_key(|(conversation, _, _)| conversation.id);
+    assert_eq!(positions, expected);
+    assert_eq!(tx.sync_positions(alice, laptop).await, Ok(vec![]));
+}
+
 /// A group log with seven entries and five members:
 ///
 /// | seq | entry |
@@ -246,6 +303,7 @@ pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
         raising_an_absent_position_creates_it,
         delivered_is_the_furthest_position_of_any_device_of_the_user,
         member_positions_pair_every_member_with_their_furthest_delivery,
+        sync_positions_list_memberships_with_something_left_to_receive,
         a_position_needs_a_known_device_and_conversation,
         group_positions_are_minimums_of_effective_positions_over_current_members,
         a_group_without_current_members_has_no_positions,

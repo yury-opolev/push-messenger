@@ -35,8 +35,8 @@
 //! Positions are created eagerly, so a device normally has one for every membership of its
 //! user. One can still be missing: a device registered concurrently with a membership
 //! change reads the memberships before the new member row commits. Readers fall back to
-//! `visible_from_seq - 1`, so sync iterates memberships rather than joining only on
-//! existing positions.
+//! `visible_from_seq - 1`, so [`Tx::sync_positions`] starts from the memberships and
+//! joins the positions to them, never the other way round.
 //!
 //! [`DomainError::Conflict`]: crate::error::DomainError::Conflict
 
@@ -291,6 +291,18 @@ pub trait Tx: Send {
         &mut self,
         conversation: ConversationId,
     ) -> DomainResult<Vec<(Member, i64)>>;
+
+    /// The memberships of `user` in which `device` has entries left to receive, each with
+    /// the position to sync from: the device's delivery position raised to the member's
+    /// floor (`visible_from_seq - 1`), also when the device has no position. Only rows
+    /// with that position below `member.visible_upper(conversation.last_seq)` are
+    /// returned. As in `memberships`, each conversation is read in the same statement as
+    /// its member row. The order of the result is unspecified.
+    async fn sync_positions(
+        &mut self,
+        user: UserId,
+        device: DeviceId,
+    ) -> DomainResult<Vec<(Conversation, Member, i64)>>;
 
     /// The group-wide positions of `conversation` with its log ending at `last_seq`: the
     /// minimums over its current members of their effective positions. `None` if it has

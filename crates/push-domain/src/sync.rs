@@ -37,22 +37,13 @@ where
         let limit = limit.clamp(1, MAX_SYNC_BATCH) as usize;
         let mut tx = self.store.begin().await?;
         let user = require_device(&mut tx, device).await?;
-        let mut memberships = tx.memberships(user).await?;
-        memberships.sort_by_key(|(conversation, _)| conversation.id);
+        let mut pending = tx.sync_positions(user, device).await?;
+        pending.sort_by_key(|(conversation, _, _)| conversation.id);
 
         let mut entries = Vec::new();
         let mut more = false;
-        for (conversation, member) in memberships {
-            let floor = member.visible_from_seq - 1;
-            let position = tx
-                .get_cursor(device, conversation.id)
-                .await?
-                .unwrap_or(floor)
-                .max(floor);
+        for (conversation, member, position) in pending {
             let upper = member.visible_upper(conversation.last_seq);
-            if position >= upper {
-                continue;
-            }
             let room = limit - entries.len();
             // One entry beyond the room tells whether more is waiting.
             let mut page = tx

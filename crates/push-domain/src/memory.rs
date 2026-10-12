@@ -626,6 +626,29 @@ impl Tx for InMemoryTx {
             .collect())
     }
 
+    async fn sync_positions(
+        &mut self,
+        user: UserId,
+        device: DeviceId,
+    ) -> DomainResult<Vec<(Conversation, Member, i64)>> {
+        let state = &self.work;
+        Ok(state
+            .members
+            .values()
+            .filter(|member| member.user_id == user)
+            .filter_map(|member| {
+                let conversation = state.conversations.get(&member.conversation_id)?;
+                let floor = member.visible_from_seq - 1;
+                let position = state
+                    .cursors
+                    .get(&(device, conversation.id))
+                    .map_or(floor, |position| (*position).max(floor));
+                (position < member.visible_upper(conversation.last_seq))
+                    .then(|| (conversation.clone(), member.clone(), position))
+            })
+            .collect())
+    }
+
     async fn group_positions(
         &mut self,
         conversation: ConversationId,
