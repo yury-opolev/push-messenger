@@ -35,3 +35,27 @@ jobs:
       - run: docker pull postgres:17-alpine
       - run: docker pull redis:7-alpine
       - run: cargo test --workspace --locked
+
+  # The container images build (nothing is pushed). Deploying them is verified on
+  # minikube before merge: deploy/minikube/up.ps1 -Smoke.
+  images:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the images
+        run: |
+          for target in message-svc gateway smoke; do
+            docker build -f deploy/docker/Dockerfile --target "$target" \
+              -t "push-messenger/$target:ci" .
+          done
+
+  chart:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.3
+      - run: pwsh deploy/helm/test-chart.ps1
