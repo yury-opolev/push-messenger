@@ -129,7 +129,11 @@ fn main() {
         databases: Arc::default(),
     };
     // The parts of the suite the store implements so far; task 6 runs all of it.
-    const READY: &[&str] = &["contract::transactions::", "contract::users::"];
+    const READY: &[&str] = &[
+        "contract::transactions::",
+        "contract::users::",
+        "contract::contacts::",
+    ];
     let cases = push_testkit::cases()
         .into_iter()
         .filter(|case| READY.iter().any(|prefix| case.name.starts_with(prefix)))

@@ -10,7 +10,10 @@
 //! `DomainError::Conflict`; every other database error, constraint violations included,
 //! becomes `DomainError::Store`. Both are logged with `tracing` first.
 
+mod codes;
 mod error;
+mod locks;
+mod rows;
 mod store;
 
 pub use store::{PgStore, PgTx};

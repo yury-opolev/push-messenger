@@ -4,14 +4,17 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use push_domain::{
     ClientMsgId, ContactState, Conversation, ConversationId, ConversationOverview, DeviceId,
-    DomainResult, Entry, GroupPositions, InsertOutcome, InviteRecord, Member, MessageId, Store, Tx,
-    UserId,
+    DomainError, DomainResult, Entry, GroupPositions, InsertOutcome, InviteRecord, Member,
+    MessageId, Store, Tx, UserId,
 };
 use sqlx::postgres::PgPool;
 use sqlx::{PgConnection, Postgres, Transaction};
 use uuid::Uuid;
 
+use crate::codes::{decode, encode};
 use crate::error::store_error;
+use crate::locks;
+use crate::rows;
 
 /// The push-domain [`Store`] on PostgreSQL.
 #[derive(Debug, Clone)]
@@ -56,6 +59,11 @@ impl Store for PgStore {
             .map_err(store_error)?;
         Ok(PgTx { tx })
     }
+}
+
+/// A count the domain keeps as `u32`, as the `integer` the schema stores.
+fn to_integer(value: u32, what: &str) -> DomainResult<i32> {
+    i32::try_from(value).map_err(|_| DomainError::Store(format!("{what} {value} is too large")))
 }
 
 #[async_trait]
@@ -146,45 +154,127 @@ impl Tx for PgTx {
         Ok(devices.into_iter().map(DeviceId).collect())
     }
 
-    async fn lock_contact_pair(&mut self, _a: UserId, _b: UserId) -> DomainResult<()> {
-        unimplemented!("plan 3B task 2")
+    async fn lock_contact_pair(&mut self, a: UserId, b: UserId) -> DomainResult<()> {
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(locks::contact_pair(a, b))
+            .execute(self.conn())
+            .await
+            .map_err(store_error)?;
+        Ok(())
     }
 
     async fn get_contact(
         &mut self,
-        _owner: UserId,
-        _peer: UserId,
+        owner: UserId,
+        peer: UserId,
     ) -> DomainResult<Option<ContactState>> {
-        unimplemented!("plan 3B task 2")
+        let state: Option<i16> = sqlx::query_scalar(
+            "SELECT state FROM messaging.contact WHERE owner_id = $1 AND peer_id = $2",
+        )
+        .bind(owner.0)
+        .bind(peer.0)
+        .fetch_optional(self.conn())
+        .await
+        .map_err(store_error)?;
+        state
+            .map(|state| decode(state).map_err(store_error))
+            .transpose()
     }
 
     async fn put_contact(
         &mut self,
-        _owner: UserId,
-        _peer: UserId,
-        _state: ContactState,
+        owner: UserId,
+        peer: UserId,
+        state: ContactState,
     ) -> DomainResult<()> {
-        unimplemented!("plan 3B task 2")
+        sqlx::query(
+            "INSERT INTO messaging.contact (owner_id, peer_id, state) VALUES ($1, $2, $3) \
+             ON CONFLICT (owner_id, peer_id) \
+             DO UPDATE SET state = excluded.state, updated_at = now()",
+        )
+        .bind(owner.0)
+        .bind(peer.0)
+        .bind(encode(state))
+        .execute(self.conn())
+        .await
+        .map_err(store_error)?;
+        Ok(())
     }
 
-    async fn delete_contact(&mut self, _owner: UserId, _peer: UserId) -> DomainResult<()> {
-        unimplemented!("plan 3B task 2")
+    async fn delete_contact(&mut self, owner: UserId, peer: UserId) -> DomainResult<()> {
+        sqlx::query("DELETE FROM messaging.contact WHERE owner_id = $1 AND peer_id = $2")
+            .bind(owner.0)
+            .bind(peer.0)
+            .execute(self.conn())
+            .await
+            .map_err(store_error)?;
+        Ok(())
     }
 
-    async fn contacts_of(&mut self, _owner: UserId) -> DomainResult<Vec<(UserId, ContactState)>> {
-        unimplemented!("plan 3B task 2")
+    async fn contacts_of(&mut self, owner: UserId) -> DomainResult<Vec<(UserId, ContactState)>> {
+        let rows: Vec<(Uuid, i16)> =
+            sqlx::query_as("SELECT peer_id, state FROM messaging.contact WHERE owner_id = $1")
+                .bind(owner.0)
+                .fetch_all(self.conn())
+                .await
+                .map_err(store_error)?;
+        rows.into_iter()
+            .map(|(peer, state)| Ok((UserId(peer), decode(state).map_err(store_error)?)))
+            .collect()
     }
 
-    async fn insert_invite(&mut self, _invite: InviteRecord) -> DomainResult<InsertOutcome> {
-        unimplemented!("plan 3B task 2")
+    async fn insert_invite(&mut self, invite: InviteRecord) -> DomainResult<InsertOutcome> {
+        let inserted = sqlx::query(
+            "INSERT INTO messaging.invite \
+             (code, user_id, expires_at, max_uses, uses, revoked_at) \
+             VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (code) DO NOTHING",
+        )
+        .bind(&invite.code)
+        .bind(invite.user_id.0)
+        .bind(invite.expires_at)
+        .bind(to_integer(invite.max_uses, "max_uses")?)
+        .bind(to_integer(invite.uses, "uses")?)
+        .bind(invite.revoked_at)
+        .execute(self.conn())
+        .await
+        .map_err(store_error)?
+        .rows_affected();
+        Ok(if inserted == 1 {
+            InsertOutcome::Inserted
+        } else {
+            InsertOutcome::Duplicate
+        })
     }
 
-    async fn lock_invite(&mut self, _code: &str) -> DomainResult<Option<InviteRecord>> {
-        unimplemented!("plan 3B task 2")
+    async fn lock_invite(&mut self, code: &str) -> DomainResult<Option<InviteRecord>> {
+        let row = sqlx::query(
+            "SELECT code, user_id, expires_at, max_uses, uses, revoked_at \
+             FROM messaging.invite WHERE code = $1 FOR UPDATE",
+        )
+        .bind(code)
+        .fetch_optional(self.conn())
+        .await
+        .map_err(store_error)?;
+        row.map(|row| rows::invite(&row).map_err(store_error))
+            .transpose()
     }
 
-    async fn update_invite(&mut self, _invite: InviteRecord) -> DomainResult<()> {
-        unimplemented!("plan 3B task 2")
+    async fn update_invite(&mut self, invite: InviteRecord) -> DomainResult<()> {
+        let updated =
+            sqlx::query("UPDATE messaging.invite SET uses = $2, revoked_at = $3 WHERE code = $1")
+                .bind(&invite.code)
+                .bind(to_integer(invite.uses, "uses")?)
+                .bind(invite.revoked_at)
+                .execute(self.conn())
+                .await
+                .map_err(store_error)?
+                .rows_affected();
+        if updated == 0 {
+            return Err(DomainError::Store(
+                "update of an invite that does not exist".into(),
+            ));
+        }
+        Ok(())
     }
 
     async fn find_direct(&mut self, _key: [u8; 32]) -> DomainResult<Option<ConversationId>> {
