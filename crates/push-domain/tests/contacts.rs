@@ -476,3 +476,38 @@ async fn unblocking_someone_who_is_not_blocked_publishes_nothing() {
         .unwrap();
     assert!(world.notifier.take().is_empty());
 }
+
+#[tokio::test]
+async fn contacts_are_listed_from_the_owners_side_only() {
+    let world = World::new();
+    let (alice, bob, carol, dave) = (
+        world.person().await,
+        world.person().await,
+        world.person().await,
+        world.person().await,
+    );
+    world.befriend(&alice, &bob).await;
+    world
+        .svc
+        .contact_request(alice.user, carol.user)
+        .await
+        .unwrap();
+    world
+        .svc
+        .contact_block(alice.user, dave.user)
+        .await
+        .unwrap();
+
+    let mut expected = vec![
+        (bob.user, ContactState::Accepted),
+        (carol.user, ContactState::RequestedOut),
+        (dave.user, ContactState::Blocked),
+    ];
+    expected.sort_by_key(|(peer, _)| *peer);
+    assert_eq!(world.svc.list_contacts(alice.user).await, Ok(expected));
+    assert_eq!(world.svc.list_contacts(dave.user).await, Ok(vec![]));
+    assert_eq!(
+        world.svc.list_contacts(carol.user).await,
+        Ok(vec![(alice.user, ContactState::RequestedIn)])
+    );
+}

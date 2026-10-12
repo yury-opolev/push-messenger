@@ -98,6 +98,10 @@ pub trait Tx: Send {
     /// A no-op if the row is absent.
     async fn delete_contact(&mut self, owner: UserId, peer: UserId) -> DomainResult<()>;
 
+    /// Every row owned by `owner`, as `(peer, state)`. Empty for an unknown user.
+    /// The order of the result is unspecified.
+    async fn contacts_of(&mut self, owner: UserId) -> DomainResult<Vec<(UserId, ContactState)>>;
+
     // --- Conversations and members -----------------------------------------------------
 
     async fn find_direct(&mut self, key: [u8; 32]) -> DomainResult<Option<ConversationId>>;

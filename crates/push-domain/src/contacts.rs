@@ -123,6 +123,16 @@ where
         Ok(state)
     }
 
+    /// Every relationship `user` has, as they see it, sorted by peer. Includes the users
+    /// they have blocked; never shows that someone blocked them.
+    pub async fn list_contacts(&self, user: UserId) -> DomainResult<Vec<(UserId, ContactState)>> {
+        let mut tx = self.store.begin().await?;
+        let mut contacts = tx.contacts_of(user).await?;
+        tx.rollback().await?;
+        contacts.sort_by_key(|(peer, _)| *peer);
+        Ok(contacts)
+    }
+
     /// Begins a transaction for an operation between two distinct, known users.
     async fn begin_pair(&self, a: UserId, b: UserId) -> DomainResult<S::Tx> {
         if a == b {

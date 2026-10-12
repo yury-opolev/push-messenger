@@ -163,6 +163,16 @@ impl Tx for InMemoryTx {
         Ok(())
     }
 
+    async fn contacts_of(&mut self, owner: UserId) -> DomainResult<Vec<(UserId, ContactState)>> {
+        Ok(self
+            .work
+            .contacts
+            .iter()
+            .filter(|((row_owner, _), _)| *row_owner == owner)
+            .map(|((_, peer), state)| (*peer, *state))
+            .collect())
+    }
+
     async fn find_direct(&mut self, key: [u8; 32]) -> DomainResult<Option<ConversationId>> {
         Ok(self.work.direct_index.get(&key).copied())
     }
