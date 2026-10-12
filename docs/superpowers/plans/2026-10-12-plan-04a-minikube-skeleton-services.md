@@ -85,6 +85,8 @@ cargo +1.85 build --workspace --all-targets --locked
   subscription is re-established.
 - **Delivery positions move only on `Ack`** (the domain guarantees it; the gateway never
   acks on the client's behalf).
+- **A device's backlog never stalls:** an ack that moves the position syncs again while
+  the last sync left entries behind, and a failed sync is retried with backoff.
 - **The DEV ONLY identity is off unless explicitly enabled:** `PUSH_DEV_AUTH` and
   `PUSH_DEV_SETUP` accept exactly `1` (on) or `0`/empty/unset (off) and refuse anything
   else; without dev auth, `Identify` closes the connection with 4001.
@@ -139,7 +141,9 @@ These were settled while writing the plan. Do not reopen them during execution.
    It serves `/healthz` (always 200) and `/readyz` (200 once the database is migrated and
    answers `SELECT 1`; 503 before, and after shutdown begins) on a separate port (8081),
    retries Postgres and Redis every 2 s until they answer (pods may start before them),
-   runs the migrations on start (it connects as the owner of `push_messaging`), stops on
+   runs the migrations on start on a connection of its own (`push_store::migrate_database`,
+   without the pool's request-sized statement and lock timeouts; it connects as the owner
+   of `push_messaging`), stops on
    SIGTERM or Ctrl-C (finishing calls in progress, then closing the pool), and logs JSON
    through `tracing-subscriber` (`RUST_LOG`, default `info`). Configuration is
    environment variables (`Config::from_env`; the table is in `config.rs`).
@@ -151,10 +155,17 @@ These were settled while writing the plan. Do not reopen them during execution.
    what each frame means: `Identify` first within 5 s or close 4001; bad frames after
    `Ready` get an `Error` frame and keep the connection; `Ping` gets `Pong`. A session
    remembers the highest `seq` it sent per conversation, so a sync that repeats unacked
-   entries sends nothing twice; it re-syncs while `more` is set only if the last batch
-   brought something new. On shutdown the HTTP server stops accepting, every session
-   closes with 4005, and `serve` waits up to 10 s for them (`TaskTracker`). Readiness is
-   "subscribed to Redis".
+   entries sends nothing twice. A backlog larger than one sync batch (500) keeps flowing:
+   the session remembers that the last sync reported `more`, and an `Ack` that moved the
+   position syncs again (an ack rings nobody, so nothing else would). A failed sync is
+   retried from the connection's loop after 1 s, doubling to 30 s, reset by a successful
+   sync (`RetryDelay`), so a session that connects while message-svc restarts still gets
+   its entries. On shutdown the HTTP server stops accepting, every session closes with
+   4005, and `serve` waits up to 10 s for them (`TaskTracker`). `/readyz` is 200 until
+   shutdown and does **not** depend on Redis: without Redis devices still get their
+   entries (after `Ready`, after acks, on retries), only later, while unready gateways
+   would refuse every client; the subscriber reconnects by itself, so liveness does not
+   depend on it either.
 9. **DEV ONLY identity safety (binaries).** `PUSH_DEV_AUTH` / `PUSH_DEV_SETUP` are parsed
    strictly: `1` on; unset, empty or `0` off; anything else (`true`, `yes`, ` 1`) is a
    start-up error. When on, each service logs a `WARN` at start-up saying that anyone who
@@ -202,7 +213,7 @@ crates/push-gateway/               NEW
 ├── Cargo.toml
 ├── src/lib.rs
 ├── src/config.rs                  Config from environment variables
-├── src/session.rs                 the per-connection state machine
+├── src/session.rs                 the per-connection state machine; sync retry delays
 ├── src/hub.rs                     sessions by user; the Redis subscriber
 ├── src/server.rs                  serve, connections, health, logging, signals
 ├── src/main.rs
@@ -248,7 +259,7 @@ Create `crates/push-store/tests/connect.rs` (a normal test harness, so it needs 
 use std::time::Duration;
 
 use push_domain::{DomainError, Store, Tx, UserId};
-use push_store::{MIGRATOR, PgStore, StoreOptions};
+use push_store::{MIGRATOR, PgStore, StoreOptions, migrate_database};
 use sqlx::{Connection, PgConnection};
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
@@ -327,11 +338,12 @@ async fn a_lock_timeout_is_a_retryable_conflict() {
 #[tokio::test]
 async fn running_the_migrations_again_changes_nothing() {
     let (_container, url) = postgres().await;
+    migrate_database(&url).await.expect("first run");
+    migrate_database(&url).await.expect("second run");
     let store = PgStore::connect(&url, &StoreOptions::default())
         .await
         .expect("connect");
-    store.migrate().await.expect("first run");
-    store.migrate().await.expect("second run");
+    store.migrate().await.expect("third run, through the pool");
     let applied: i64 = sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations")
         .fetch_one(store.pool())
         .await
@@ -554,9 +566,11 @@ with
 A statement timeout (`57014`) stays a `Store` error: retrying the same slow statement
 would only time out again.
 
-- [ ] **Step 7: Export the options and document the wiring**
+- [ ] **Step 7: Export the options, migrate on a connection of its own, document**
 
-Replace `crates/push-store/src/lib.rs` with:
+Replace `crates/push-store/src/lib.rs` with (`migrate_database` uses a one-connection
+pool without the session settings; a borrowed `PgConnection` would make the future
+unusable in `tokio::spawn`, which message-svc's tests need):
 
 ```rust
 //! PostgreSQL storage for push-messenger: the migrations of the `messaging` schema
@@ -588,6 +602,20 @@ pub use store::{PgStore, PgTx};
 
 /// The migrations of the `messaging` schema, embedded at build time.
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
+
+/// Applies the migrations the database at `url` does not have yet, on a connection of its
+/// own: a migration must not inherit the pool's statement and lock timeouts, which are
+/// sized for requests. Run it as the owner of the database.
+pub async fn migrate_database(url: &str) -> Result<(), sqlx::migrate::MigrateError> {
+    // A one-connection pool without the session settings of `PgStore::connect`.
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(url)
+        .await?;
+    let result = MIGRATOR.run(&pool).await;
+    pool.close().await;
+    result
+}
 ```
 
 - [ ] **Step 8: Run the store's tests**
@@ -3155,7 +3183,7 @@ use axum::routing::get;
 use push_domain::{Messaging, SystemClock};
 use push_proto::internal::v1::dev_setup_server::DevSetupServer;
 use push_proto::internal::v1::messaging_server::MessagingServer;
-use push_store::PgStore;
+use push_store::{PgStore, migrate_database};
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tokio_util::sync::CancellationToken;
@@ -3197,8 +3225,10 @@ pub async fn serve(
         );
     }
     let Some(store) = retry("postgres", &shutdown, || async {
+        // Migrations run on a connection of their own, without the pool's request-sized
+        // statement and lock timeouts.
+        migrate_database(&config.database_url).await?;
         let store = PgStore::connect(&config.database_url, &config.store).await?;
-        store.migrate().await?;
         anyhow::Ok(store)
     })
     .await
@@ -4597,10 +4627,10 @@ git commit -m "feat(push-gateway): hub of sessions rung through Redis"
 
 ---
 
-### Task 8: gateway — WebSockets, health and shutdown
+### Task 8: gateway — WebSockets, delivery, health and shutdown
 
 **Files:**
-- Modify: `Cargo.toml`, `crates/push-gateway/Cargo.toml`, `src/lib.rs`
+- Modify: `Cargo.toml`, `crates/push-gateway/Cargo.toml`, `src/lib.rs`, `src/session.rs`
 - Create: `crates/push-gateway/src/server.rs`, `src/main.rs`, `tests/gateway.rs`
 
 - [ ] **Step 1: Dependencies**
@@ -4728,21 +4758,24 @@ Create `crates/push-gateway/tests/gateway.rs`:
 //! store) and a real Redis (Docker must be running).
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use push_domain::{InMemoryStore, Messaging, SystemClock};
+use push_domain::{InMemoryStore, MAX_SYNC_BATCH, Messaging, SystemClock};
 use push_gateway::{Config, serve};
 use push_message_svc::{DevSetupApi, MessagingApi, RedisNotifier};
 use push_proto::internal::v1::dev_setup_client::DevSetupClient;
 use push_proto::internal::v1::dev_setup_server::DevSetupServer;
-use push_proto::internal::v1::messaging_server::MessagingServer;
+use push_proto::internal::v1::messaging_client::MessagingClient;
+use push_proto::internal::v1::messaging_server::{self, MessagingServer};
 use push_proto::internal::v1::{
-    MakeContactsRequest, OpenDirectRequest, RegisterDeviceRequest, RegisterUserRequest,
+    AckRequest, AckResponse, IdentifyRequest, IdentifyResponse, MakeContactsRequest,
+    OpenDirectRequest, RegisterDeviceRequest, RegisterUserRequest, SendRequest, SyncRequest,
+    SyncResponse,
 };
 use push_proto::v1::frame::Body;
-use push_proto::v1::{Ack, ContentType, Identify, Ping, Pong, Send};
+use push_proto::v1::{Ack, ContentType, Identify, Ping, Pong, Send, SendAck};
 use push_proto::{decode_frame, encode_frame, id_bytes};
 use testcontainers_modules::redis::Redis;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
@@ -4753,9 +4786,49 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use tokio_util::sync::CancellationToken;
+use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+type Api = MessagingApi<InMemoryStore, SystemClock, RedisNotifier>;
+
+/// message-svc's `Messaging` service, whose first `sync_failures` syncs fail as if the
+/// service were restarting.
+struct FlakySync {
+    api: Api,
+    sync_failures: Mutex<u32>,
+}
+
+#[tonic::async_trait]
+impl messaging_server::Messaging for FlakySync {
+    async fn identify(
+        &self,
+        request: Request<IdentifyRequest>,
+    ) -> Result<Response<IdentifyResponse>, Status> {
+        self.api.identify(request).await
+    }
+
+    async fn send(&self, request: Request<SendRequest>) -> Result<Response<SendAck>, Status> {
+        self.api.send(request).await
+    }
+
+    async fn sync(&self, request: Request<SyncRequest>) -> Result<Response<SyncResponse>, Status> {
+        let failing = {
+            let mut left = self.sync_failures.lock().unwrap();
+            let failing = *left > 0;
+            *left = left.saturating_sub(1);
+            failing
+        };
+        if failing {
+            return Err(Status::unavailable("message-svc is restarting"));
+        }
+        self.api.sync(request).await
+    }
+
+    async fn ack(&self, request: Request<AckRequest>) -> Result<Response<AckResponse>, Status> {
+        self.api.ack(request).await
+    }
+}
 
 struct Stack {
     _redis: ContainerAsync<Redis>,
@@ -4767,6 +4840,11 @@ struct Stack {
 
 /// Redis, message-svc's API on the in-memory store, and the gateway, on free ports.
 async fn stack(dev_auth: bool) -> Stack {
+    stack_with(dev_auth, 0).await
+}
+
+/// As [`stack`], with message-svc failing its first `sync_failures` syncs.
+async fn stack_with(dev_auth: bool, sync_failures: u32) -> Stack {
     let redis = Redis::default()
         .with_tag("7-alpine")
         .start()
@@ -4787,9 +4865,10 @@ async fn stack(dev_auth: bool) -> Stack {
     let message_svc = format!("http://{}", grpc.local_addr().unwrap());
     tokio::spawn(
         tonic::transport::Server::builder()
-            .add_service(MessagingServer::new(MessagingApi::new(Arc::clone(
-                &messaging,
-            ))))
+            .add_service(MessagingServer::new(FlakySync {
+                api: MessagingApi::new(Arc::clone(&messaging)),
+                sync_failures: Mutex::new(sync_failures),
+            }))
             .add_service(DevSetupServer::new(DevSetupApi::new(messaging)))
             .serve_with_incoming(TcpListenerStream::new(grpc)),
     );
@@ -5012,7 +5091,103 @@ async fn shutdown_closes_connections_with_4005() {
         .unwrap()
         .expect("a clean stop");
 }
+
+/// Alice and Bob, one device each, as contacts with a direct conversation; and `count`
+/// messages from Alice in it, sent through message-svc before anyone connects.
+async fn chat_with_backlog(stack: &Stack, count: u32) -> ((Uuid, Uuid), (Uuid, Uuid), Vec<u8>) {
+    let (alice, alice_device) = person(stack).await;
+    let (bob, bob_device) = person(stack).await;
+    let mut setup = DevSetupClient::connect(stack.message_svc.clone())
+        .await
+        .unwrap();
+    setup
+        .make_contacts(MakeContactsRequest {
+            user_id: id_bytes(alice),
+            peer_id: id_bytes(bob),
+        })
+        .await
+        .unwrap();
+    let conversation = setup
+        .open_direct(OpenDirectRequest {
+            user_id: id_bytes(alice),
+            peer_id: id_bytes(bob),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .conversation_id;
+    let mut messaging = MessagingClient::connect(stack.message_svc.clone())
+        .await
+        .unwrap();
+    for n in 0..count {
+        messaging
+            .send(SendRequest {
+                user_id: id_bytes(alice),
+                device_id: id_bytes(alice_device),
+                send: Some(Send {
+                    client_msg_id: id_bytes(Uuid::now_v7()),
+                    conversation_id: conversation.clone(),
+                    content_type: ContentType::Text.into(),
+                    body: format!("message {n}").into_bytes(),
+                    client_ts: None,
+                }),
+            })
+            .await
+            .unwrap();
+    }
+    ((alice, alice_device), (bob, bob_device), conversation)
+}
+
+#[tokio::test]
+async fn a_backlog_larger_than_one_sync_batch_is_delivered_as_the_device_acks() {
+    let stack = stack(true).await;
+    let backlog = MAX_SYNC_BATCH + 1;
+    let (_alice, (bob, bob_device), conversation) = chat_with_backlog(&stack, backlog).await;
+
+    let mut socket = connect(&stack).await;
+    send(&mut socket, identify(bob, bob_device)).await;
+    assert!(matches!(next(&mut socket).await, Body::Ready(_)));
+    for expected in 1..=i64::from(MAX_SYNC_BATCH) {
+        let Body::Deliver(entry) = next(&mut socket).await else {
+            panic!("expected Deliver {expected}");
+        };
+        assert_eq!(entry.seq, expected);
+    }
+
+    // Nothing rings Bob's channel again: only his ack can bring the rest.
+    send(
+        &mut socket,
+        Body::Ack(Ack {
+            conversation_id: conversation,
+            seq: i64::from(MAX_SYNC_BATCH),
+        }),
+    )
+    .await;
+    let Body::Deliver(entry) = next(&mut socket).await else {
+        panic!("expected the last Deliver");
+    };
+    assert_eq!(entry.seq, i64::from(backlog));
+}
+
+#[tokio::test]
+async fn a_failed_sync_is_retried() {
+    let stack = stack_with(true, 1).await;
+    let (_alice, (bob, bob_device), _conversation) = chat_with_backlog(&stack, 1).await;
+
+    let mut socket = connect(&stack).await;
+    send(&mut socket, identify(bob, bob_device)).await;
+    assert!(matches!(next(&mut socket).await, Body::Ready(_)));
+    // The sync after Ready fails; nothing rings Bob's channel, so only a retry delivers.
+    let Body::Deliver(entry) = next(&mut socket).await else {
+        panic!("expected Deliver");
+    };
+    assert_eq!(entry.seq, 1);
+}
 ```
+
+The last two tests guard delivery that no Redis ring triggers: a backlog of
+`MAX_SYNC_BATCH + 1` messages must flow on as Bob acks, and a sync that fails once (the
+`FlakySync` wrapper around message-svc's API) must be retried.
 
 ```powershell
 cargo test -p push-gateway --test gateway
@@ -5020,9 +5195,403 @@ cargo test -p push-gateway --test gateway
 
 Expected: compile errors — `push_gateway::serve` does not exist.
 
-- [ ] **Step 3: The server**
+- [ ] **Step 3: Teach the session when to sync again**
 
-Create `crates/push-gateway/src/server.rs`:
+Replace `crates/push-gateway/src/session.rs` with the version below. Against Task 6 it
+adds `more_waiting` with `synced` and `sync_after_ack`, the `RetryDelay` backoff, and
+their two tests:
+
+```rust
+//! The protocol state of one WebSocket connection, without any I/O: which frames are
+//! allowed when, what each one asks the gateway to do, which entries the client has
+//! already been sent, and when to sync again.
+
+use std::collections::HashMap;
+use std::time::Duration;
+
+use push_proto::close;
+use push_proto::v1::frame::Body;
+use push_proto::v1::{Ack, Deliver, Error, ErrorCode, Pong, Ready, Send};
+use push_proto::{FrameError, decode_frame, id, id_bytes};
+use uuid::Uuid;
+
+/// What the gateway must do for a frame the client sent.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Step {
+    /// Send this frame to the client.
+    Reply(Body),
+    /// Ask message-svc whether `device` is an active device of `user`, then call
+    /// [`Session::identified`] or close with [`close::INVALID_IDENTITY`].
+    Identify { user: Uuid, device: Uuid },
+    /// Forward a send to message-svc; answer with its `SendAck` or an error.
+    Send(Send),
+    /// Forward an ack to message-svc; answer only if it fails. If it moved the position,
+    /// ask [`Session::sync_after_ack`] whether to sync again.
+    Ack(Ack),
+    /// Close the connection with this code and reason.
+    Close(u16, &'static str),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum State {
+    /// Connected; the first frame must be `Identify`.
+    New,
+    /// `Identify` is being checked.
+    Identifying,
+    Ready {
+        device: Uuid,
+    },
+}
+
+#[derive(Debug)]
+pub struct Session {
+    dev_auth: bool,
+    state: State,
+    /// The highest `seq` sent to the client per conversation, so a sync that repeats
+    /// entries the client has not acked yet does not send them twice.
+    sent: HashMap<Vec<u8>, i64>,
+    /// The last sync left entries behind (`more`). They come only after an ack, which
+    /// rings nobody, so the session must sync again itself.
+    more_waiting: bool,
+}
+
+impl Session {
+    /// A new connection. `dev_auth` is whether DEV ONLY identities are accepted.
+    pub fn new(dev_auth: bool) -> Self {
+        Self {
+            dev_auth,
+            state: State::New,
+            sent: HashMap::new(),
+            more_waiting: false,
+        }
+    }
+
+    /// The connected device, once identified.
+    pub fn device(&self) -> Option<Uuid> {
+        match self.state {
+            State::Ready { device } => Some(device),
+            State::New | State::Identifying => None,
+        }
+    }
+
+    /// What to do with a binary message from the client.
+    pub fn on_binary(&mut self, bytes: &[u8]) -> Step {
+        let body = match (decode_frame(bytes), self.state) {
+            (Ok(body), _) => body,
+            (Err(_), State::New | State::Identifying) => {
+                return Step::Close(close::INVALID_IDENTITY, "the first frame must be Identify");
+            }
+            (Err(FrameError::TooLarge { .. }), State::Ready { .. }) => {
+                return reply_error(ErrorCode::BadFrame, "the frame is too large");
+            }
+            (Err(_), State::Ready { .. }) => {
+                return reply_error(ErrorCode::BadFrame, "the frame could not be decoded");
+            }
+        };
+        match (body, self.state) {
+            (Body::Identify(identify), State::New) => {
+                if !self.dev_auth {
+                    return Step::Close(
+                        close::INVALID_IDENTITY,
+                        "token sign-in is not available yet",
+                    );
+                }
+                match (id(&identify.dev_user_id), id(&identify.dev_device_id)) {
+                    (Ok(user), Ok(device)) => {
+                        self.state = State::Identifying;
+                        Step::Identify { user, device }
+                    }
+                    _ => Step::Close(close::INVALID_IDENTITY, "invalid dev identity"),
+                }
+            }
+            (_, State::New | State::Identifying) => {
+                Step::Close(close::INVALID_IDENTITY, "the first frame must be Identify")
+            }
+            (Body::Identify(_), State::Ready { .. }) => {
+                reply_error(ErrorCode::BadFrame, "already identified")
+            }
+            (Body::Send(send), State::Ready { .. }) => Step::Send(send),
+            (Body::Ack(ack), State::Ready { .. }) => Step::Ack(ack),
+            (Body::Ping(_), State::Ready { .. }) => Step::Reply(Body::Pong(Pong {})),
+            (_, State::Ready { .. }) => reply_error(ErrorCode::BadFrame, "not a client frame"),
+        }
+    }
+
+    /// What to do with a text message: the protocol is binary only.
+    pub fn on_text(&mut self) -> Step {
+        match self.state {
+            State::Ready { .. } => reply_error(ErrorCode::BadFrame, "frames must be binary"),
+            State::New | State::Identifying => {
+                Step::Close(close::INVALID_IDENTITY, "the first frame must be Identify")
+            }
+        }
+    }
+
+    /// message-svc confirmed the identity: the `Ready` frame to send.
+    pub fn identified(&mut self, user: Uuid, device: Uuid, heartbeat: Duration) -> Body {
+        self.state = State::Ready { device };
+        Body::Ready(Ready {
+            user_id: id_bytes(user),
+            device_id: id_bytes(device),
+            heartbeat_ms: u32::try_from(heartbeat.as_millis()).unwrap_or(u32::MAX),
+        })
+    }
+
+    /// The entries of a sync the client has not been sent on this connection yet,
+    /// remembering them as sent.
+    pub fn fresh(&mut self, entries: Vec<Deliver>) -> Vec<Deliver> {
+        entries
+            .into_iter()
+            .filter(|entry| {
+                let sent = self.sent.entry(entry.conversation_id.clone()).or_insert(0);
+                if entry.seq > *sent {
+                    *sent = entry.seq;
+                    true
+                } else {
+                    false
+                }
+            })
+            .collect()
+    }
+
+    /// Records whether the last sync left entries behind.
+    pub fn synced(&mut self, more: bool) {
+        self.more_waiting = more;
+    }
+
+    /// Whether to sync again after an ack: only if the ack `moved` the device's position
+    /// and the last sync left entries behind. Then the next sync returns them.
+    pub fn sync_after_ack(&self, moved: bool) -> bool {
+        moved && self.more_waiting
+    }
+}
+
+/// When to retry a failed sync: after 1 s, doubling up to 30 s, and from 1 s again once a
+/// sync succeeds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetryDelay {
+    next: Duration,
+}
+
+impl RetryDelay {
+    pub const FIRST: Duration = Duration::from_secs(1);
+    pub const MAX: Duration = Duration::from_secs(30);
+
+    /// A sync failed: how long to wait before the next attempt.
+    pub fn failed(&mut self) -> Duration {
+        let delay = self.next;
+        self.next = (self.next * 2).min(Self::MAX);
+        delay
+    }
+
+    /// A sync succeeded.
+    pub fn succeeded(&mut self) {
+        self.next = Self::FIRST;
+    }
+}
+
+impl Default for RetryDelay {
+    fn default() -> Self {
+        Self { next: Self::FIRST }
+    }
+}
+
+/// An `Error` frame for the client.
+pub(crate) fn error_frame(code: ErrorCode, message: &str) -> Body {
+    Body::Error(Error {
+        code: code.into(),
+        message: message.to_owned(),
+        retryable: false,
+        client_msg_id: None,
+    })
+}
+
+fn reply_error(code: ErrorCode, message: &str) -> Step {
+    Step::Reply(error_frame(code, message))
+}
+
+#[cfg(test)]
+mod tests {
+    use push_proto::encode_frame;
+    use push_proto::v1::{Identify, Ping};
+
+    use super::*;
+
+    fn identify(user: Uuid, device: Uuid) -> Vec<u8> {
+        encode_frame(Body::Identify(Identify {
+            token: String::new(),
+            dev_user_id: id_bytes(user),
+            dev_device_id: id_bytes(device),
+        }))
+    }
+
+    fn ready_session() -> (Session, Uuid) {
+        let mut session = Session::new(true);
+        let (user, device) = (Uuid::now_v7(), Uuid::now_v7());
+        assert_eq!(
+            session.on_binary(&identify(user, device)),
+            Step::Identify { user, device }
+        );
+        session.identified(user, device, Duration::from_secs(30));
+        (session, device)
+    }
+
+    fn error_code(step: Step) -> ErrorCode {
+        match step {
+            Step::Reply(Body::Error(error)) => error.code(),
+            other => panic!("expected an error frame, got {other:?}"),
+        }
+    }
+
+    fn entry(conversation: &[u8], seq: i64) -> Deliver {
+        Deliver {
+            conversation_id: conversation.to_vec(),
+            seq,
+            ..Deliver::default()
+        }
+    }
+
+    #[test]
+    fn a_dev_identity_is_checked_then_ready() {
+        let mut session = Session::new(true);
+        let (user, device) = (Uuid::now_v7(), Uuid::now_v7());
+        assert_eq!(
+            session.on_binary(&identify(user, device)),
+            Step::Identify { user, device }
+        );
+        assert_eq!(session.device(), None);
+        let ready = session.identified(user, device, Duration::from_secs(30));
+        assert_eq!(
+            ready,
+            Body::Ready(Ready {
+                user_id: id_bytes(user),
+                device_id: id_bytes(device),
+                heartbeat_ms: 30_000,
+            })
+        );
+        assert_eq!(session.device(), Some(device));
+    }
+
+    #[test]
+    fn without_dev_auth_identify_closes_with_4001() {
+        let mut session = Session::new(false);
+        assert_eq!(
+            session.on_binary(&identify(Uuid::now_v7(), Uuid::now_v7())),
+            Step::Close(4001, "token sign-in is not available yet")
+        );
+    }
+
+    #[test]
+    fn anything_but_identify_first_closes_with_4001() {
+        let ping = encode_frame(Body::Ping(Ping {}));
+        for bytes in [ping.as_slice(), &[0xff, 0xff], &[]] {
+            let mut session = Session::new(true);
+            assert_eq!(
+                session.on_binary(bytes),
+                Step::Close(4001, "the first frame must be Identify")
+            );
+        }
+        assert_eq!(
+            Session::new(true).on_text(),
+            Step::Close(4001, "the first frame must be Identify")
+        );
+    }
+
+    #[test]
+    fn a_dev_identity_with_malformed_ids_closes_with_4001() {
+        let mut session = Session::new(true);
+        let bytes = encode_frame(Body::Identify(Identify {
+            token: String::new(),
+            dev_user_id: vec![1, 2, 3],
+            dev_device_id: id_bytes(Uuid::now_v7()),
+        }));
+        assert_eq!(
+            session.on_binary(&bytes),
+            Step::Close(4001, "invalid dev identity")
+        );
+    }
+
+    #[test]
+    fn once_ready_frames_become_steps() {
+        let (mut session, _) = ready_session();
+        assert_eq!(
+            session.on_binary(&encode_frame(Body::Ping(Ping {}))),
+            Step::Reply(Body::Pong(Pong {}))
+        );
+        let send = Send {
+            client_msg_id: id_bytes(Uuid::now_v7()),
+            ..Send::default()
+        };
+        assert_eq!(
+            session.on_binary(&encode_frame(Body::Send(send.clone()))),
+            Step::Send(send)
+        );
+        let ack = Ack {
+            conversation_id: id_bytes(Uuid::now_v7()),
+            seq: 3,
+        };
+        assert_eq!(
+            session.on_binary(&encode_frame(Body::Ack(ack.clone()))),
+            Step::Ack(ack)
+        );
+    }
+
+    #[test]
+    fn once_ready_bad_frames_get_errors_but_keep_the_connection() {
+        let (mut session, _) = ready_session();
+        let again = identify(Uuid::now_v7(), Uuid::now_v7());
+        assert_eq!(error_code(session.on_binary(&again)), ErrorCode::BadFrame);
+        assert_eq!(
+            error_code(session.on_binary(&[0xff, 0xff])),
+            ErrorCode::BadFrame
+        );
+        let pong = encode_frame(Body::Pong(Pong {}));
+        assert_eq!(error_code(session.on_binary(&pong)), ErrorCode::BadFrame);
+        assert_eq!(error_code(session.on_text()), ErrorCode::BadFrame);
+        assert!(session.device().is_some());
+    }
+
+    #[test]
+    fn entries_already_sent_are_not_sent_again() {
+        let (mut session, _) = ready_session();
+        let (a, b) = (id_bytes(Uuid::now_v7()), id_bytes(Uuid::now_v7()));
+        assert_eq!(
+            session.fresh(vec![entry(&a, 1), entry(&a, 2), entry(&b, 1)]),
+            vec![entry(&a, 1), entry(&a, 2), entry(&b, 1)]
+        );
+        assert_eq!(
+            session.fresh(vec![entry(&a, 1), entry(&a, 2), entry(&a, 3), entry(&b, 1)]),
+            vec![entry(&a, 3)]
+        );
+    }
+
+    #[test]
+    fn an_ack_syncs_again_only_if_it_moved_and_entries_were_left() {
+        let (mut session, _) = ready_session();
+        assert!(!session.sync_after_ack(true), "nothing was left behind");
+        session.synced(true);
+        assert!(session.sync_after_ack(true));
+        assert!(!session.sync_after_ack(false), "the position did not move");
+        session.synced(false);
+        assert!(!session.sync_after_ack(true));
+    }
+
+    #[test]
+    fn failed_syncs_back_off_from_1_s_to_30_s_and_reset_on_success() {
+        let mut delay = RetryDelay::default();
+        let delays: Vec<u64> = (0..7).map(|_| delay.failed().as_secs()).collect();
+        assert_eq!(delays, [1, 2, 4, 8, 16, 30, 30]);
+        delay.succeeded();
+        assert_eq!(delay.failed(), Duration::from_secs(1));
+    }
+}
+```
+
+- [ ] **Step 4: The server**
+
+Create `crates/push-gateway/src/server.rs`. Every sync goes through `Connected::deliver`,
+which records `more` in the session and, on failure, schedules a retry that the
+connection's `select!` loop waits for:
 
 ```rust
 //! Running the gateway: the WebSocket endpoint, one task per connection, the health
@@ -5043,6 +5612,7 @@ use push_proto::v1::ErrorCode;
 use push_proto::v1::frame::Body;
 use push_proto::{MAX_FRAME_BYTES, close, encode_frame, error_from_status, id_bytes};
 use tokio::net::TcpListener;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tonic::transport::{Channel, Endpoint};
@@ -5050,7 +5620,7 @@ use uuid::Uuid;
 
 use crate::config::Config;
 use crate::hub::Hub;
-use crate::session::{Session, Step, error_frame};
+use crate::session::{RetryDelay, Session, Step, error_frame};
 
 /// The first frame must be `Identify`, within this time (spec §7.1).
 const IDENTIFY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -5105,7 +5675,7 @@ pub async fn serve(
     };
 
     let health_server = tokio::spawn(
-        axum::serve(health, health_router(hub, shutdown.clone()))
+        axum::serve(health, health_router(shutdown.clone()))
             .with_graceful_shutdown(shutdown.clone().cancelled_owned())
             .into_future(),
     );
@@ -5131,7 +5701,11 @@ pub async fn serve(
     Ok(())
 }
 
-fn health_router(hub: Hub, shutdown: CancellationToken) -> Router {
+/// `/healthz` always answers; `/readyz` answers until shutdown begins. Readiness does not
+/// depend on Redis: without it devices still get their entries, only later (after
+/// `Ready`, after acks and on retries), while an unready gateway would refuse every
+/// client. The subscriber reconnects by itself, so liveness does not depend on it either.
+fn health_router(shutdown: CancellationToken) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route(
@@ -5139,10 +5713,8 @@ fn health_router(hub: Hub, shutdown: CancellationToken) -> Router {
             get(move || async move {
                 if shutdown.is_cancelled() {
                     (StatusCode::SERVICE_UNAVAILABLE, "shutting down")
-                } else if hub.is_connected() {
-                    (StatusCode::OK, "ready")
                 } else {
-                    (StatusCode::SERVICE_UNAVAILABLE, "redis unreachable")
+                    (StatusCode::OK, "ready")
                 }
             }),
         )
@@ -5164,39 +5736,54 @@ async fn connection(mut socket: WebSocket, app: App) {
     };
     let mut membership = app.hub.join(user).await;
     let ready = session.identified(user, device, app.config.heartbeat);
-    let mut messaging = app.messaging.clone();
-    if send(&mut socket, ready).await.is_err()
-        || deliver(&mut socket, &mut session, &mut messaging, device)
-            .await
-            .is_err()
-    {
+    let mut connected = Connected {
+        socket,
+        session,
+        messaging: app.messaging.clone(),
+        user,
+        device,
+        retry: RetryDelay::default(),
+        retry_at: None,
+    };
+    if send(&mut connected.socket, ready).await.is_err() || connected.deliver().await.is_err() {
         return;
     }
     loop {
+        let retry_at = connected.retry_at;
         tokio::select! {
             () = app.shutdown.cancelled() => {
-                close_with(&mut socket, close::SHUTTING_DOWN, "server shutting down").await;
+                close_with(&mut connected.socket, close::SHUTTING_DOWN, "server shutting down").await;
                 return;
             }
             () = membership.rung() => {
-                if deliver(&mut socket, &mut session, &mut messaging, device).await.is_err() {
+                if connected.deliver().await.is_err() {
                     return;
                 }
             }
-            message = socket.recv() => {
+            // The precondition disables the branch; the far-away instant is never awaited.
+            () = tokio::time::sleep_until(retry_at.unwrap_or_else(far_future)), if retry_at.is_some() => {
+                if connected.deliver().await.is_err() {
+                    return;
+                }
+            }
+            message = connected.socket.recv() => {
                 let step = match message {
-                    Some(Ok(Message::Binary(bytes))) => session.on_binary(&bytes),
-                    Some(Ok(Message::Text(_))) => session.on_text(),
+                    Some(Ok(Message::Binary(bytes))) => connected.session.on_binary(&bytes),
+                    Some(Ok(Message::Text(_))) => connected.session.on_text(),
                     // WebSocket pings are answered by the library.
                     Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
                     Some(Ok(Message::Close(_)) | Err(_)) | None => return,
                 };
-                if run(step, &mut socket, &mut messaging, user, device).await.is_err() {
+                if connected.run(step).await.is_err() {
                     return;
                 }
             }
         }
     }
+}
+
+fn far_future() -> Instant {
+    Instant::now() + Duration::from_secs(24 * 60 * 60)
 }
 
 /// Waits for the first frame and checks the identity with message-svc. `None` once the
@@ -5269,85 +5856,104 @@ async fn identify(
     }
 }
 
-/// Does what the session asked for a client frame.
-async fn run(
-    step: Step,
-    socket: &mut WebSocket,
-    messaging: &mut MessagingClient<Channel>,
+/// An identified connection.
+struct Connected {
+    socket: WebSocket,
+    session: Session,
+    messaging: MessagingClient<Channel>,
     user: Uuid,
     device: Uuid,
-) -> Result<(), Closed> {
-    match step {
-        Step::Reply(body) => send(socket, body).await,
-        Step::Send(frame) => {
-            let client_msg_id = frame.client_msg_id.clone();
-            let request = SendRequest {
-                user_id: id_bytes(user),
-                device_id: id_bytes(device),
-                send: Some(frame),
-            };
-            let body = match messaging.send(request).await {
-                Ok(ack) => Body::SendAck(ack.into_inner()),
-                Err(status) => {
-                    let mut error = error_from_status(&status);
-                    error.client_msg_id = Some(client_msg_id);
-                    Body::Error(error)
-                }
-            };
-            send(socket, body).await
-        }
-        Step::Ack(ack) => {
-            let request = AckRequest {
-                device_id: id_bytes(device),
-                ack: Some(ack),
-            };
-            match messaging.ack(request).await {
-                Ok(_) => Ok(()),
-                Err(status) => send(socket, Body::Error(error_from_status(&status))).await,
-            }
-        }
-        Step::Close(code, reason) => {
-            close_with(socket, code, reason).await;
-            Err(Closed)
-        }
-        Step::Identify { .. } => {
-            send(
-                socket,
-                error_frame(ErrorCode::BadFrame, "already identified"),
-            )
-            .await
-        }
-    }
+    retry: RetryDelay,
+    /// When to retry a failed sync; `None` while the last sync succeeded.
+    retry_at: Option<Instant>,
 }
 
-/// Pushes every entry the device has not been sent yet. A failed sync is logged and
-/// left to the next ring.
-async fn deliver(
-    socket: &mut WebSocket,
-    session: &mut Session,
-    messaging: &mut MessagingClient<Channel>,
-    device: Uuid,
-) -> Result<(), Closed> {
-    loop {
-        let request = SyncRequest {
-            device_id: id_bytes(device),
-            limit: 0,
-        };
-        let batch = match messaging.sync(request).await {
-            Ok(batch) => batch.into_inner(),
-            Err(status) => {
-                tracing::warn!(code = ?status.code(), message = status.message(), "sync failed");
+impl Connected {
+    /// Does what the session asked for a client frame.
+    async fn run(&mut self, step: Step) -> Result<(), Closed> {
+        match step {
+            Step::Reply(body) => send(&mut self.socket, body).await,
+            Step::Send(frame) => {
+                let client_msg_id = frame.client_msg_id.clone();
+                let request = SendRequest {
+                    user_id: id_bytes(self.user),
+                    device_id: id_bytes(self.device),
+                    send: Some(frame),
+                };
+                let body = match self.messaging.send(request).await {
+                    Ok(ack) => Body::SendAck(ack.into_inner()),
+                    Err(status) => {
+                        let mut error = error_from_status(&status);
+                        error.client_msg_id = Some(client_msg_id);
+                        Body::Error(error)
+                    }
+                };
+                send(&mut self.socket, body).await
+            }
+            Step::Ack(ack) => {
+                let request = AckRequest {
+                    device_id: id_bytes(self.device),
+                    ack: Some(ack),
+                };
+                match self.messaging.ack(request).await {
+                    // An ack rings nobody: if the last sync left entries behind, this is
+                    // the moment to fetch them.
+                    Ok(response) if self.session.sync_after_ack(response.get_ref().moved) => {
+                        self.deliver().await
+                    }
+                    Ok(_) => Ok(()),
+                    Err(status) => {
+                        let error = Body::Error(error_from_status(&status));
+                        send(&mut self.socket, error).await
+                    }
+                }
+            }
+            Step::Close(code, reason) => {
+                close_with(&mut self.socket, code, reason).await;
+                Err(Closed)
+            }
+            Step::Identify { .. } => {
+                let error = error_frame(ErrorCode::BadFrame, "already identified");
+                send(&mut self.socket, error).await
+            }
+        }
+    }
+
+    /// Pushes every entry the device has not been sent yet. A failed sync is retried
+    /// after [`RetryDelay`], from the connection's loop.
+    async fn deliver(&mut self) -> Result<(), Closed> {
+        loop {
+            let request = SyncRequest {
+                device_id: id_bytes(self.device),
+                limit: 0,
+            };
+            let batch = match self.messaging.sync(request).await {
+                Ok(batch) => batch.into_inner(),
+                Err(status) => {
+                    let delay = self.retry.failed();
+                    self.retry_at = Some(Instant::now() + delay);
+                    tracing::warn!(
+                        code = ?status.code(),
+                        message = status.message(),
+                        retry_in = ?delay,
+                        "sync failed"
+                    );
+                    return Ok(());
+                }
+            };
+            self.retry.succeeded();
+            self.retry_at = None;
+            self.session.synced(batch.more);
+            let fresh = self.session.fresh(batch.entries);
+            let progressed = !fresh.is_empty();
+            for entry in fresh {
+                send(&mut self.socket, Body::Deliver(entry)).await?;
+            }
+            // Without acks a repeated sync returns the same batch: stop here. The ack that
+            // moves the position syncs again (`Session::sync_after_ack`).
+            if !(batch.more && progressed) {
                 return Ok(());
             }
-        };
-        let fresh = session.fresh(batch.entries);
-        let progressed = !fresh.is_empty();
-        for entry in fresh {
-            send(socket, Body::Deliver(entry)).await?;
-        }
-        // Without acks a repeated sync returns the same batch: stop instead of looping.
-        if !(batch.more && progressed) {
-            return Ok(());
         }
     }
 }
@@ -5446,19 +6052,22 @@ mod session;
 pub use config::{Config, ConfigError};
 pub use hub::{Hub, Membership};
 pub use server::{init_logging, serve, terminated};
-pub use session::{Session, Step};
+pub use session::{RetryDelay, Session, Step};
 ```
 
-- [ ] **Step 4: Run the tests**
+- [ ] **Step 5: Run the tests**
 
 ```powershell
 cargo test -p push-gateway
 ```
 
-Expected: unit tests 16, `gateway` 5 (about 6 s: one test waits out the 5 s `Identify`
-deadline), `hub` 2.
+Expected: unit tests 18 (2 new `session`), `gateway` 7 (about 6 s: one test waits out
+the 5 s `Identify` deadline), `hub` 2. The two delivery tests fail without their fixes:
+with the `Ok(response) if self.session.sync_after_ack(…)` arm removed, the backlog test
+waits in vain for seq 501; with the retry branch of the `select!` disabled, the retry
+test waits in vain for its `Deliver`.
 
-- [ ] **Step 5: Run the gates**
+- [ ] **Step 6: Run the gates**
 
 ```powershell
 cargo test --workspace --locked
@@ -5467,9 +6076,9 @@ cargo fmt --all -- --check
 cargo +1.85 build --workspace --all-targets --locked
 ```
 
-Expected: 596 tests pass.
+Expected: 600 tests pass.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```powershell
 git add Cargo.toml Cargo.lock crates/push-gateway
@@ -6114,7 +6723,7 @@ cargo fmt --all -- --check
 cargo +1.85 build --workspace --all-targets --locked
 ```
 
-Expected: 600 tests pass.
+Expected: 604 tests pass.
 
 - [ ] **Step 6: Commit**
 
@@ -6266,7 +6875,7 @@ cargo test --workspace --locked
 cargo +1.85 test --workspace --locked
 ```
 
-Expected: no formatting diff, no warnings, 600 tests pass on both toolchains.
+Expected: no formatting diff, no warnings, 604 tests pass on both toolchains.
 
 - [ ] **Step 6: Commit and push**
 
@@ -6279,7 +6888,7 @@ git push -u origin feature/plan-04a-skeleton-services
 - [ ] **Step 7: Open the pull request and wait for CI**
 
 ```powershell
-gh pr create --base main --title "Plan 4A: walking skeleton services" --body "Implements docs/superpowers/plans/2026-10-12-plan-04a-minikube-skeleton-services.md: push-proto (client frames and the internal gRPC API, vendored protoc), PgStore::connect with lock/statement/idle-in-transaction timeouts (55P03 -> Conflict), ping and close; push-message-svc (Messaging and DEV ONLY DevSetup over tonic, Redis notifications, health, migrations, graceful shutdown); push-gateway (axum WebSockets, session state machine, Redis hub, 4001/4005 close codes, DEV ONLY identity behind PUSH_DEV_AUTH=1); push-smoke with a whole-stack test on Postgres and Redis containers. 600 tests. Minikube comes with Plan 4B."
+gh pr create --base main --title "Plan 4A: walking skeleton services" --body "Implements docs/superpowers/plans/2026-10-12-plan-04a-minikube-skeleton-services.md: push-proto (client frames and the internal gRPC API, vendored protoc), PgStore::connect with lock/statement/idle-in-transaction timeouts (55P03 -> Conflict), ping and close; push-message-svc (Messaging and DEV ONLY DevSetup over tonic, Redis notifications, health, migrations, graceful shutdown); push-gateway (axum WebSockets, session state machine, Redis hub, 4001/4005 close codes, DEV ONLY identity behind PUSH_DEV_AUTH=1); push-smoke with a whole-stack test on Postgres and Redis containers. 604 tests. Minikube comes with Plan 4B."
 gh pr checks --watch
 ```
 
@@ -6296,6 +6905,7 @@ merges after the final review.
 | §2 Postgres is the truth, Redis a doorbell: re-sync after Ready and on re-subscription; never a body on Redis | 3, 7, 8 |
 | §4.2 SendAck only after commit; retries return the original receipt (domain, unchanged) | 4, 8, 9 |
 | §4.3 delivering: notify → Sync per connected device, serialised per device → Deliver → Ack | 4, 7, 8, 9 |
+| §4.3 batches: a backlog beyond one batch flows on as the device acks; a failed sync is retried with backoff | 8 |
 | §7 wire protocol as protobuf in `push-proto`, the single contract; reserved numbers for ephemeral, urgent, private reads, media | 2, 10 |
 | §7.2 `Deliver` with `target_seq` (the flagged mismatch) | 2, 4, 10 |
 | §7.3 Identify first within 5 s; Ready with `heartbeat_ms`; Ping/Pong | 6, 8 |
@@ -6317,6 +6927,9 @@ merges after the final review.
 - **Gateway robustness** (Plan 8): `kick:{device_id}` and takeover (4003), rate limits
   (4004), the 5-minute sweep, a server-side idle timeout, batched draining in a `preStop`
   hook, metrics.
+- **gRPC load balancing across message-svc replicas** (Plan 7 or 8): HTTP/2 keeps one
+  long-lived connection per gateway, so a ClusterIP Service pins each gateway to one
+  replica; needs client-side balancing over a headless Service, or a mesh.
 - **message-svc** (Plan 7): retrying `Conflict` inside the service, gRPC health checking,
   connection pool sizing per replica, TLS between services if they ever leave the
   cluster.

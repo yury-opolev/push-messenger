@@ -53,7 +53,7 @@ helm version
 - **Do not pipe `cargo fmt`**; run `cargo fmt --all -- --check` on its own.
 - If PowerShell refuses to run the `.ps1` scripts (execution policy), run them as
   `pwsh -NoProfile -File deploy/minikube/up.ps1 -Smoke` instead.
-- Baseline (after Plan 4A): `cargo test --workspace` passes 600 tests. This plan adds no
+- Baseline (after Plan 4A): `cargo test --workspace` passes 604 tests. This plan adds no
   Rust tests; its checks are `deploy/helm/test-chart.ps1` (12 checks) and the smoke test
   on minikube.
 - **Every task ends green:**
@@ -130,13 +130,21 @@ These were settled while writing the plan. Do not reopen them during execution.
    prints the smoke output. For debugging from the host, Task 4 also runs the binary
    through two port-forwards.
 7. **Bring-up:** `up.ps1` (the owner's platform) and `up.sh` (Linux, macOS, CI) do the
-   same: start or reuse the profile (`push`, 4 CPUs, 6 GB, docker driver), enable the
-   ingress addon and wait for its controller, build, `helm upgrade --install … --wait`,
-   print how to reach the gateway, and with `-Smoke` / `--smoke` run `helm test`.
-   `down.ps1` / `down.sh` uninstall the release and delete the namespace (and its
-   volume); `-Delete` / `--delete` delete the profile.
-8. **CI** builds the three images (no push) and runs `test-chart.ps1` (Helm is installed
-   by `azure/setup-helm`, `pwsh` is on the runner). It runs no cluster: the minikube smoke
+   same: start the profile (`push`, 4 CPUs, 6 GB, docker driver) unless its node, kubelet
+   and API server already all run — `minikube start` is idempotent, but on a running
+   profile it restarts every container in the cluster (seen in verification: every pod's
+   restart count went up on each run) — enable the ingress addon, wait for its controller
+   *and* for its admission-webhook jobs (`ingress-nginx-admission-create` / `-patch`) to
+   complete, since installing an Ingress before them fails; build; `helm upgrade
+   --install … --wait`; print how to reach the gateway; and with `-Smoke` / `--smoke` run
+   `helm test`. Every native call is checked: `up.ps1` throws on any non-zero
+   `$LASTEXITCODE` (minikube, kubectl, docker, helm, including `docker-env`); `up.sh` runs
+   with `set -euo pipefail` and builds in a subshell, **not** inside a command
+   substitution, where bash disables `errexit` and a failed build would deploy stale
+   `:dev` images. `down.ps1` / `down.sh` uninstall the release and delete the namespace
+   (and its volume); `-Delete` / `--delete` delete the profile.
+8. **CI** builds the three images (no push) and runs `test-chart.ps1` (Helm 3.16.3,
+   pinned through `azure/setup-helm`; `pwsh` is on the runner). It runs no cluster: the minikube smoke
    test is the merge gate, run by the implementer and recorded in the pull request
    (owner requirement). A kind or minikube job in CI is deferred.
 
@@ -291,7 +299,7 @@ git add .dockerignore deploy/docker
 git commit -m "build: container images for message-svc, the gateway and the smoke test"
 ```
 
-Expected: 600 tests pass, no warnings, no diff.
+Expected: 604 tests pass, no warnings, no diff.
 
 ---
 
@@ -1023,6 +1031,13 @@ Create `deploy/helm/push-messenger/templates/NOTES.txt`:
 push-messenger {{ .Chart.AppVersion }} is installed as release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
 
 WebSocket endpoint: ws://{{ .Values.ingress.host }}/v1/socket (through the ingress controller).
+
+To remove it, delete the namespace too:
+  helm uninstall {{ .Release.Name }} --namespace {{ .Release.Namespace }}
+  kubectl delete namespace {{ .Release.Namespace }}
+`helm uninstall` alone keeps the PostgreSQL volume (data-{{ .Release.Name }}-postgres-0)
+but deletes the Secret, so a later install generates a new password that the old
+database does not accept.
 {{- if include "push.devMode" . }}
 
 DEV MODE IS ON: the gateway accepts identities without a token and message-svc serves the
@@ -1140,8 +1155,10 @@ function Invoke-Step([string] $What, [scriptblock] $Command) {
     }
 }
 
-$hostState = minikube status -p $Cluster --format '{{.Host}}' 2>$null
-if ($hostState -ne 'Running') {
+# `minikube start` is idempotent, but on a running profile it restarts every container in
+# the cluster; skip it only when the node, kubelet and API server all run.
+$state = minikube status -p $Cluster --format '{{.Host}}/{{.Kubelet}}/{{.APIServer}}' 2>$null
+if ($state -ne 'Running/Running/Running') {
     Invoke-Step "start minikube profile '$Cluster'" {
         minikube start -p $Cluster --driver=docker --cpus=$Cpus --memory=$Memory
     }
@@ -1149,6 +1166,12 @@ if ($hostState -ne 'Running') {
 Invoke-Step 'enable the ingress addon' { minikube -p $Cluster addons enable ingress }
 Invoke-Step 'wait for ingress-nginx' {
     kubectl --context $Cluster -n ingress-nginx rollout status deployment/ingress-nginx-controller --timeout=300s
+}
+# The admission webhook validates Ingress objects; installing before its certificate
+# jobs finish fails the install.
+Invoke-Step 'wait for the ingress-nginx admission webhook' {
+    kubectl --context $Cluster -n ingress-nginx wait --for=condition=complete `
+        job/ingress-nginx-admission-create job/ingress-nginx-admission-patch --timeout=300s
 }
 
 # Build into the cluster's own Docker daemon, so the pods find the images without a
@@ -1159,7 +1182,11 @@ foreach ($name in $dockerVariables) {
     $saved[$name] = [Environment]::GetEnvironmentVariable($name)
 }
 try {
-    minikube -p $Cluster docker-env --shell powershell | Out-String | Invoke-Expression
+    $dockerEnv = minikube -p $Cluster docker-env --shell powershell
+    if ($LASTEXITCODE -ne 0) {
+        throw "minikube docker-env failed (exit code $LASTEXITCODE)"
+    }
+    $dockerEnv | Out-String | Invoke-Expression
     if (-not $SkipBuild) {
         foreach ($target in 'message-svc', 'gateway', 'smoke') {
             Invoke-Step "build push-messenger/${target}:dev" {
@@ -1283,7 +1310,10 @@ release=push
 
 step() { printf '==> %s\n' "$*"; }
 
-if [[ "$(minikube status -p "$cluster" --format '{{.Host}}' 2>/dev/null || true)" != "Running" ]]; then
+# `minikube start` is idempotent, but on a running profile it restarts every container in
+# the cluster; skip it only when the node, kubelet and API server all run.
+state="$(minikube status -p "$cluster" --format '{{.Host}}/{{.Kubelet}}/{{.APIServer}}' 2>/dev/null || true)"
+if [[ "$state" != "Running/Running/Running" ]]; then
   step "start minikube profile '$cluster'"
   minikube start -p "$cluster" --driver=docker --cpus="$cpus" --memory="$memory"
 fi
@@ -1291,21 +1321,38 @@ step 'enable the ingress addon'
 minikube -p "$cluster" addons enable ingress
 step 'wait for ingress-nginx'
 kubectl --context "$cluster" -n ingress-nginx rollout status deployment/ingress-nginx-controller --timeout=300s
+# The admission webhook validates Ingress objects; installing before its certificate
+# jobs finish fails the install.
+step 'wait for the ingress-nginx admission webhook'
+kubectl --context "$cluster" -n ingress-nginx wait --for=condition=complete \
+  job/ingress-nginx-admission-create job/ingress-nginx-admission-patch --timeout=300s
 
-# Build into the cluster's own Docker daemon, in a subshell so the DOCKER_* variables do
-# not leak; the image ids name the build, so only rebuilt images roll the pods.
-build_id="$(
-  eval "$(minikube -p "$cluster" docker-env --shell bash)"
-  if [[ "$skip_build" == false ]]; then
+# Point docker at the cluster's own Docker daemon. Called in subshells only, so the
+# DOCKER_* variables do not leak into this script.
+use_cluster_docker() {
+  local env
+  env="$(minikube -p "$cluster" docker-env --shell bash)" || return 1
+  eval "$env"
+}
+
+# Builds run in a subshell, not a command substitution: errexit stays on there, so a
+# failed build stops the script before anything is deployed.
+if [[ "$skip_build" == false ]]; then
+  (
+    use_cluster_docker
     for target in message-svc gateway smoke; do
-      step "build push-messenger/$target:dev" >&2
-      docker build -f "$root/deploy/docker/Dockerfile" --target "$target" -t "push-messenger/$target:dev" "$root" >&2
+      step "build push-messenger/$target:dev"
+      docker build -f "$root/deploy/docker/Dockerfile" --target "$target" -t "push-messenger/$target:dev" "$root"
     done
-  fi
-  docker image inspect --format '{{.Id}}' \
-    push-messenger/message-svc:dev push-messenger/gateway:dev push-messenger/smoke:dev \
-    | cut -c8-19 | paste -sd- -
-)"
+  )
+fi
+# The image ids name the build: a rebuilt image rolls the pods, an unchanged one does not.
+if ! ids="$(use_cluster_docker && docker image inspect --format '{{.Id}}' \
+  push-messenger/message-svc:dev push-messenger/gateway:dev push-messenger/smoke:dev)"; then
+  echo 'the images are not in the cluster yet; run without --skip-build' >&2
+  exit 1
+fi
+build_id="$(printf '%s\n' "$ids" | cut -c8-19 | paste -sd- -)"
 
 step "install release '$release' in namespace '$namespace'"
 helm upgrade --install "$release" "$chart" \
@@ -1372,9 +1419,11 @@ deploy/minikube/up.ps1 -Smoke
 This starts the minikube profile `push` (about 1–2 minutes the first time; a warning
 "Failing to connect to https://registry.k8s.io/ from inside the minikube container" can
 appear and is harmless if the ingress controller rolls out), enables the ingress addon,
-builds the three images inside the node (about 3 minutes the first time: `Finished
-release profile … in 3m 06s` here), installs the chart and runs the smoke test. The whole
-first run took about 5 minutes here. Expected ending (ids and times differ):
+waits for its controller and admission jobs (`job.batch/ingress-nginx-admission-create
+condition met`, the same for `-patch`), builds the three images inside the node (about
+3 minutes the first time: `Finished release profile … in 2m 39s` here), installs the
+chart and runs the smoke test. The whole first run took about 5 minutes here. Expected
+ending (ids and times differ):
 
 ```
 ==> install release 'push' in namespace 'push'
@@ -1396,13 +1445,13 @@ TEST SUITE:     push-smoke
 Phase:          Succeeded
 …
 POD LOGS: push-smoke
-smoke: set up alice=01a1313a-95f0-7770-9a6c-9d2ad0603899 bob=01a1313a-9608-7274-a9c7-07dc39ea2f82 as contacts with a direct conversation
+smoke: set up alice=01a1315e-fc37-70a1-b677-f6fbaee00264 bob=01a1315e-fc45-7685-b3ce-2f636a8bcfe8 as contacts with a direct conversation
 smoke: bob connected (Ready, heartbeat 30000 ms)
 smoke: alice connected (Ready, heartbeat 30000 ms)
 smoke: alice got SendAck seq=1 after 7 ms
-smoke: bob got Deliver seq=1 after 37 ms
+smoke: bob got Deliver seq=1 after 41 ms
 smoke: bob acked; the gateway answered the following Ping
-smoke: PASS in 174 ms
+smoke: PASS in 206 ms
 ```
 
 If the smoke test fails, read `kubectl --context push -n push logs deploy/push-gateway`
@@ -1432,9 +1481,20 @@ deploy/minikube/up.ps1 -SkipBuild -Smoke
 kubectl --context push -n push get pods
 ```
 
-Expected: `REVISION: 2`, the smoke test passes again, and the gateway and message-svc
-pods keep their names and ages: unchanged images do not roll the pods, and the generated
-passwords are kept.
+Expected: no `start minikube profile` step (the profile runs), `REVISION: 2`, the smoke
+test passes again, and the gateway and message-svc pods keep their names, ages and
+restart counts: unchanged images do not roll the pods, the running cluster is not
+restarted, and the generated passwords are kept.
+
+Then check the start path from a stopped profile:
+
+```powershell
+minikube stop -p push
+deploy/minikube/up.ps1 -SkipBuild -Smoke
+```
+
+Expected: `==> start minikube profile 'push'` runs, the admission jobs are still
+complete, and the smoke test passes.
 
 ```powershell
 kubectl --context push -n push delete pod -l app.kubernetes.io/name=gateway
@@ -1472,7 +1532,7 @@ debugging from the host; both port-forwards are stopped afterwards.
 & 'C:\Program Files\Git\bin\bash.exe' deploy/minikube/up.sh --cluster push --skip-build --smoke
 ```
 
-Expected: `REVISION: 3` and the smoke test passes. Skip this step if Git Bash is not
+Expected: `REVISION: 4` and the smoke test passes. Skip this step if Git Bash is not
 installed; CI does not run it.
 
 - [ ] **Step 8: Tear down**
@@ -1571,6 +1631,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.3
       - run: pwsh deploy/helm/test-chart.ps1
 ```
 
@@ -1601,8 +1663,11 @@ starts (or reuses) the minikube profile `push`, enables its ingress addon, build
 images into the cluster, installs the chart (`deploy/helm/push-messenger`) with
 `values-minikube.yaml`, and runs the end-to-end smoke test: two users chat through the
 ingress. `deploy/minikube/up.sh --smoke` does the same on Linux and macOS;
-`deploy/minikube/down.ps1` removes it again (`-Delete` deletes the profile). Every pull
-request is verified this way before it is merged.
+`deploy/minikube/down.ps1` removes it again, namespace and database volume included
+(`-Delete` deletes the profile). Removing the release with `helm uninstall` alone keeps
+the PostgreSQL volume but not the Secret, so a later install generates a password the
+old database rejects: delete the namespace as well. Every pull request is verified this
+way before it is merged.
 
 The minikube values switch on a DEV ONLY identity: the gateway accepts any user and
 device id without a token. The chart refuses that mode unless the values also say
@@ -1652,7 +1717,7 @@ pwsh -NoProfile -File deploy/helm/test-chart.ps1
 deploy/minikube/up.ps1 -Smoke
 ```
 
-Expected: no diff, no warnings, 600 tests on both toolchains, `all chart checks passed`,
+Expected: no diff, no warnings, 604 tests on both toolchains, `all chart checks passed`,
 and the smoke test `PASS`. Copy the seven `smoke:` lines for the pull request. Then tear
 down: `deploy/minikube/down.ps1` (keep the profile for later plans) or
 `deploy/minikube/down.ps1 -Delete`.
@@ -1709,5 +1774,12 @@ the controller merges after the final review and its own minikube run.
 - **Gateway draining in batches in a `preStop` hook** and a `PodDisruptionBudget`
   (Plan 8); horizontal scaling and anti-affinity.
 - **auth-svc and the worker in the chart** (Plans 5 and 6), each with its own database.
+- **The Postgres role is a superuser on minikube** (`POSTGRES_USER` of the official
+  image). Fix before Azure: a superuser only for bootstrap, and message-svc connecting as
+  a plain role that owns `push_messaging`.
+- **gRPC load balancing across message-svc replicas:** HTTP/2 keeps one connection per
+  gateway, so the ClusterIP Service pins each gateway to one replica (see Plan 4A).
+- **Keeping the database password across `helm uninstall`**: today NOTES.txt and the
+  README tell you to delete the namespace too; an annotated, kept Secret is an option.
 - **NetworkPolicies** (only the gateway may call message-svc; only the services may reach
   the stores), Postgres backups, resource tuning from the load test.
