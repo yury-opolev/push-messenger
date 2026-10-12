@@ -1938,8 +1938,15 @@ dependencies = [
 name = "push-gateway"
 version = "0.1.0"
 dependencies = [
+ "prost 0.14.4",
  "push-proto",
+ "redis",
+ "testcontainers-modules",
  "thiserror",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tracing",
  "uuid",
 ]
 

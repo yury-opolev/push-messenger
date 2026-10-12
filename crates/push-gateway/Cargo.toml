@@ -9,9 +9,19 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+prost.workspace = true
 push-proto.workspace = true
+redis.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+tokio-stream.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+testcontainers-modules.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true
