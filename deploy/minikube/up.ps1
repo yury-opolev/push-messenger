@@ -59,10 +59,18 @@ Invoke-Step 'wait for ingress-nginx' {
     kubectl --context $Cluster -n ingress-nginx rollout status deployment/ingress-nginx-controller --timeout=300s
 }
 # The admission webhook validates Ingress objects; installing before its certificate
-# jobs finish fails the install.
-Invoke-Step 'wait for the ingress-nginx admission webhook' {
-    kubectl --context $Cluster -n ingress-nginx wait --for=condition=complete `
-        job/ingress-nginx-admission-create job/ingress-nginx-admission-patch --timeout=300s
+# jobs finish fails the install. The jobs may already be cleaned up; then there is
+# nothing to wait for.
+Write-Host '==> wait for the ingress-nginx admission jobs' -ForegroundColor Cyan
+$jobs = kubectl --context $Cluster -n ingress-nginx get job -o name
+if ($LASTEXITCODE -ne 0) {
+    throw "listing the ingress-nginx jobs failed (exit code $LASTEXITCODE)"
+}
+if ($jobs) {
+    kubectl --context $Cluster -n ingress-nginx wait --for=condition=complete job --all --timeout=300s
+    if ($LASTEXITCODE -ne 0) {
+        throw "the ingress-nginx admission jobs did not complete (exit code $LASTEXITCODE)"
+    }
 }
 
 # Build into the cluster's own Docker daemon, so the pods find the images without a
@@ -98,12 +106,25 @@ try {
     }
 }
 
-Invoke-Step "install release '$release' in namespace '$namespace'" {
+# Right after a cluster start the controller can be ready before its admission webhook
+# answers; the install is then refused. Retry only when it fails.
+$installed = $false
+for ($attempt = 1; $attempt -le 5 -and -not $installed; $attempt++) {
+    Write-Host "==> install release '$release' in namespace '$namespace' (attempt $attempt of 5)" -ForegroundColor Cyan
     helm upgrade --install $release $chart `
         --kube-context $Cluster --namespace $namespace --create-namespace `
         -f (Join-Path $chart 'values-minikube.yaml') `
         --set "buildId=$buildId" `
         --wait --timeout 10m
+    if ($LASTEXITCODE -eq 0) {
+        $installed = $true
+    } elseif ($attempt -lt 5) {
+        Write-Host "helm upgrade failed (exit code $LASTEXITCODE); retrying in 10 s" -ForegroundColor Yellow
+        Start-Sleep -Seconds 10
+    }
+}
+if (-not $installed) {
+    throw "install release '$release' failed after 5 attempts"
 }
 
 Write-Host ''

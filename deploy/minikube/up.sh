@@ -40,10 +40,13 @@ minikube -p "$cluster" addons enable ingress
 step 'wait for ingress-nginx'
 kubectl --context "$cluster" -n ingress-nginx rollout status deployment/ingress-nginx-controller --timeout=300s
 # The admission webhook validates Ingress objects; installing before its certificate
-# jobs finish fails the install.
-step 'wait for the ingress-nginx admission webhook'
-kubectl --context "$cluster" -n ingress-nginx wait --for=condition=complete \
-  job/ingress-nginx-admission-create job/ingress-nginx-admission-patch --timeout=300s
+# jobs finish fails the install. The jobs may already be cleaned up; then there is
+# nothing to wait for.
+step 'wait for the ingress-nginx admission jobs'
+jobs="$(kubectl --context "$cluster" -n ingress-nginx get job -o name)"
+if [[ -n "$jobs" ]]; then
+  kubectl --context "$cluster" -n ingress-nginx wait --for=condition=complete job --all --timeout=300s
+fi
 
 # Point docker at the cluster's own Docker daemon. Called in subshells only, so the
 # DOCKER_* variables do not leak into this script.
@@ -72,12 +75,28 @@ if ! ids="$(use_cluster_docker && docker image inspect --format '{{.Id}}' \
 fi
 build_id="$(printf '%s\n' "$ids" | cut -c8-19 | paste -sd- -)"
 
-step "install release '$release' in namespace '$namespace'"
-helm upgrade --install "$release" "$chart" \
-  --kube-context "$cluster" --namespace "$namespace" --create-namespace \
-  -f "$chart/values-minikube.yaml" \
-  --set "buildId=$build_id" \
-  --wait --timeout 10m
+# Right after a cluster start the controller can be ready before its admission webhook
+# answers; the install is then refused. Retry only when it fails.
+installed=false
+for attempt in 1 2 3 4 5; do
+  step "install release '$release' in namespace '$namespace' (attempt $attempt of 5)"
+  if helm upgrade --install "$release" "$chart" \
+    --kube-context "$cluster" --namespace "$namespace" --create-namespace \
+    -f "$chart/values-minikube.yaml" \
+    --set "buildId=$build_id" \
+    --wait --timeout 10m; then
+    installed=true
+    break
+  fi
+  if [[ "$attempt" -lt 5 ]]; then
+    echo 'helm upgrade failed; retrying in 10 s' >&2
+    sleep 10
+  fi
+done
+if [[ "$installed" == false ]]; then
+  echo "install release '$release' failed after 5 attempts" >&2
+  exit 1
+fi
 
 echo
 echo "push-messenger is up: minikube profile '$cluster', namespace '$namespace'."
