@@ -108,7 +108,11 @@ where
     Fut: Future<Output = Result<T, E>>,
 {
     loop {
-        match connect().await {
+        let attempt = tokio::select! {
+            () = shutdown.cancelled() => return None,
+            attempt = connect() => attempt,
+        };
+        match attempt {
             Ok(value) => {
                 tracing::info!(dependency = what, "connected");
                 return Some(value);

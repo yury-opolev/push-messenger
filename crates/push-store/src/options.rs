@@ -39,6 +39,9 @@ impl StoreOptions {
     /// "disabled" and rejects values above `i32::MAX`; a timeout must never silently turn
     /// off. The error names the offending setting.
     pub fn validate(&self) -> Result<(), String> {
+        if self.max_connections == 0 {
+            return Err("max_connections is 0; it must be at least 1".to_owned());
+        }
         for (name, value) in [
             ("lock_timeout", self.lock_timeout),
             ("statement_timeout", self.statement_timeout),
@@ -149,6 +152,15 @@ mod tests {
             ..StoreOptions::default()
         };
         assert_eq!(at_limit.validate(), Ok(()));
+    }
+
+    #[test]
+    fn zero_max_connections_is_refused_by_name() {
+        let options = StoreOptions {
+            max_connections: 0,
+            ..StoreOptions::default()
+        };
+        assert!(options.validate().unwrap_err().contains("max_connections"));
     }
 
     #[test]

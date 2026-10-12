@@ -53,8 +53,10 @@ impl PgStore {
         Ok(Self::new(pool))
     }
 
-    /// Applies the migrations the database does not have yet. Run it as the owner of the
-    /// database: since PostgreSQL 15 other users cannot create objects in it.
+    /// Applies the migrations the database does not have yet on this pool, whose statement
+    /// and lock timeouts are sized for requests. Services do not use it: at start-up they
+    /// call `push_store::migrate_database(url)` on a dedicated connection. Run it as the
+    /// owner of the database: since PostgreSQL 15 other users cannot create objects in it.
     pub async fn migrate(&self) -> Result<(), sqlx::migrate::MigrateError> {
         crate::MIGRATOR.run(&self.pool).await
     }

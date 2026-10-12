@@ -2,7 +2,7 @@
 
 use std::net::SocketAddr;
 
-use push_store::StoreOptions;
+use push_store::{StoreOptions, check_database_url};
 
 /// How the service runs. Read from the environment by [`Config::from_env`]:
 ///
@@ -12,9 +12,9 @@ use push_store::StoreOptions;
 /// | `PUSH_REDIS_URL` | Redis URL, `redis://:password@host:6379` | required |
 /// | `PUSH_GRPC_ADDR` | address of the gRPC API | `0.0.0.0:50051` |
 /// | `PUSH_HEALTH_ADDR` | address of `/healthz` and `/readyz` | `0.0.0.0:8081` |
-/// | `PUSH_DB_MAX_CONNECTIONS` | pool size | `10` |
+/// | `PUSH_DB_MAX_CONNECTIONS` | pool size, at least 1 | `10` |
 /// | `PUSH_DEV_SETUP` | `1` registers the DEV ONLY `DevSetup` service | off |
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Config {
     pub database_url: String,
     pub redis_url: String,
@@ -22,6 +22,20 @@ pub struct Config {
     pub health_addr: SocketAddr,
     pub store: StoreOptions,
     pub dev_setup: bool,
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Config")
+            .field("database_url", &"<redacted>")
+            .field("redis_url", &"<redacted>")
+            .field("grpc_addr", &self.grpc_addr)
+            .field("health_addr", &self.health_addr)
+            .field("store", &self.store)
+            .field("dev_setup", &self.dev_setup)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -53,14 +67,38 @@ impl Config {
             max_connections: parsed(&lookup, "PUSH_DB_MAX_CONNECTIONS", 10)?,
             ..StoreOptions::default()
         };
+        store.validate().map_err(|reason| ConfigError::Invalid {
+            name: "PUSH_DB_MAX_CONNECTIONS",
+            value: store.max_connections.to_string(),
+            reason,
+        })?;
+        let database_url = required("PUSH_DATABASE_URL")?;
+        check_database_url(&database_url)
+            .map_err(|reason| redacted("PUSH_DATABASE_URL", reason))?;
+        let redis_url = required("PUSH_REDIS_URL")?;
+        redis::Client::open(redis_url.as_str()).map_err(|_| {
+            redacted(
+                "PUSH_REDIS_URL",
+                "not a valid Redis URL, expected redis://[:password@]host:6379".to_owned(),
+            )
+        })?;
         Ok(Self {
-            database_url: required("PUSH_DATABASE_URL")?,
-            redis_url: required("PUSH_REDIS_URL")?,
+            database_url,
+            redis_url,
             grpc_addr: parsed(&lookup, "PUSH_GRPC_ADDR", ([0, 0, 0, 0], 50051).into())?,
             health_addr: parsed(&lookup, "PUSH_HEALTH_ADDR", ([0, 0, 0, 0], 8081).into())?,
             store,
             dev_setup: dev_flag(&lookup, "PUSH_DEV_SETUP")?,
         })
+    }
+}
+
+/// An invalid URL variable; the value is never shown because it carries a password.
+fn redacted(name: &'static str, reason: String) -> ConfigError {
+    ConfigError::Invalid {
+        name,
+        value: "<redacted>".to_owned(),
+        reason,
     }
 }
 
@@ -178,6 +216,32 @@ mod tests {
                 "{value:?}"
             );
         }
+    }
+
+    #[test]
+    fn unusable_values_fail_start_up_without_echoing_the_urls() {
+        let bad = |name: &str, value: &str| {
+            let mut variables = REQUIRED.to_vec();
+            variables.retain(|(key, _)| *key != name);
+            variables.push((name, value));
+            config(&variables).unwrap_err().to_string()
+        };
+        let message = bad("PUSH_DATABASE_URL", "postgres://push:hunter2@db:notaport/x");
+        assert!(message.contains("PUSH_DATABASE_URL"), "{message}");
+        assert!(!message.contains("hunter2"), "{message}");
+        let message = bad("PUSH_REDIS_URL", "http://:hunter2@redis:6379");
+        assert!(message.contains("PUSH_REDIS_URL"), "{message}");
+        assert!(!message.contains("hunter2"), "{message}");
+        let message = bad("PUSH_DB_MAX_CONNECTIONS", "0");
+        assert!(message.contains("PUSH_DB_MAX_CONNECTIONS"), "{message}");
+    }
+
+    #[test]
+    fn debug_output_hides_the_urls() {
+        let config = config(&REQUIRED).unwrap();
+        let shown = format!("{config:?}");
+        assert!(!shown.contains("secret"), "{shown}");
+        assert!(shown.contains("<redacted>"), "{shown}");
     }
 
     #[test]

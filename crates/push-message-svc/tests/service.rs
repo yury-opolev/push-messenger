@@ -39,6 +39,7 @@ struct Running {
 
 /// Starts Postgres, Redis and the service on free local ports.
 async fn start(dev_setup: bool) -> Running {
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
     let postgres = Postgres::default()
         .with_tag("17-alpine")
         .start()
@@ -83,13 +84,49 @@ async fn start(dev_setup: bool) -> Running {
         shutdown,
         server,
     };
-    for _ in 0..120 {
-        if get(running.health, "/readyz").await.0 == 200 {
+    for _ in 0..240 {
+        if running.server.is_finished() {
+            let outcome = running.server.await;
+            panic!("the service stopped before it became ready: {outcome:?}");
+        }
+        let probe = tokio::time::timeout(Duration::from_secs(2), get(running.health, "/readyz"));
+        if matches!(probe.await, Ok((200, _))) {
             return running;
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
-    panic!("the service did not become ready within 30 s");
+    panic!("the service did not become ready within 60 s");
+}
+
+#[tokio::test]
+async fn shutdown_is_honoured_while_the_database_is_unreachable() {
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+    let grpc = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let health = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let config = Config {
+        database_url: "postgres://postgres:postgres@127.0.0.1:1/postgres".to_owned(),
+        redis_url: "redis://127.0.0.1:1".to_owned(),
+        grpc_addr: grpc.local_addr().unwrap(),
+        health_addr: health.local_addr().unwrap(),
+        store: StoreOptions::default(),
+        dev_setup: false,
+    };
+    let shutdown = CancellationToken::new();
+    let server = tokio::spawn(serve(config, grpc, health, shutdown.clone()));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let started = std::time::Instant::now();
+    shutdown.cancel();
+    let result = tokio::time::timeout(Duration::from_secs(10), server)
+        .await
+        .expect("serve did not stop")
+        .unwrap();
+    assert!(result.is_ok(), "{result:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "shutdown took {:?}",
+        started.elapsed()
+    );
 }
 
 /// A minimal HTTP/1.1 GET: the status code and the body.

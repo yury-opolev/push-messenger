@@ -28,6 +28,14 @@ pub use store::{PgStore, PgTx};
 /// The migrations of the `messaging` schema, embedded at build time.
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
 
+/// Checks that `url` parses as a PostgreSQL connection URL, without connecting. The error
+/// never contains the URL, which carries the password.
+pub fn check_database_url(url: &str) -> Result<(), String> {
+    url.parse::<sqlx::postgres::PgConnectOptions>()
+        .map(drop)
+        .map_err(|_| "not a valid PostgreSQL connection URL".to_owned())
+}
+
 /// Applies the migrations the database at `url` does not have yet, on a connection of its
 /// own: a migration must not inherit the pool's statement and lock timeouts, which are
 /// sized for requests. Run it as the owner of the database.
@@ -39,6 +47,7 @@ pub async fn migrate_database(url: &str) -> Result<(), sqlx::migrate::MigrateErr
     // A one-connection pool without the session settings of `PgStore::connect`.
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)
+        .acquire_timeout(std::time::Duration::from_secs(5))
         .connect(url)
         .await?;
     let result = MIGRATOR.run(&pool).await;
