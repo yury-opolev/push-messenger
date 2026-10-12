@@ -45,7 +45,9 @@ use chrono::{DateTime, Utc};
 
 use crate::error::DomainResult;
 use crate::ids::{ClientMsgId, ConversationId, DeviceId, MessageId, UserId};
-use crate::model::{ContactState, Conversation, Entry, GroupPositions, InviteRecord, Member};
+use crate::model::{
+    ContactState, Conversation, ConversationOverview, Entry, GroupPositions, InviteRecord, Member,
+};
 
 /// Result of an insert guarded by a uniqueness rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -322,4 +324,16 @@ pub trait Tx: Send {
         conversation: ConversationId,
         last_seq: i64,
     ) -> DomainResult<Option<GroupPositions>>;
+
+    /// An overview of each conversation `user` is, or was, a member of whose `updated_at`
+    /// is later than `changed_since` (every one without it). Unread counts stop at
+    /// `unread_cap`. Each conversation is read in the same statement as the user's member
+    /// row, as in `memberships`. One statement on Postgres, however many conversations
+    /// there are. The order of the result is unspecified.
+    async fn conversation_overviews(
+        &mut self,
+        user: UserId,
+        changed_since: Option<DateTime<Utc>>,
+        unread_cap: u32,
+    ) -> DomainResult<Vec<ConversationOverview>>;
 }

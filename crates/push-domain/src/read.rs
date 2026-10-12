@@ -71,7 +71,8 @@ where
         let caller = require_member(&mut tx, conversation, user).await?;
 
         let positions = if found.kind == ConversationKind::Group {
-            let group = group_positions_for(&mut tx, &found, &caller).await?;
+            let all = group_positions(&mut tx, &found, found.last_seq).await?;
+            let group = visible_group_positions(all, &found, &caller);
             Positions::Group {
                 all_delivered_seq: group.delivered,
                 all_read_seq: group.read,
@@ -176,16 +177,15 @@ pub(crate) async fn group_positions_before<T: Tx>(
     group_positions(tx, conversation, last_seq).await
 }
 
-/// The group-wide positions of a group as `member` may see them: never above the end of
-/// their visible range, and zero for a group without members.
-pub(crate) async fn group_positions_for<T: Tx>(
-    tx: &mut T,
+/// A group's group-wide positions `all` as `member` may see them: never above the end of
+/// their visible range, and zero for a group without current members.
+pub(crate) fn visible_group_positions(
+    all: Option<GroupPositions>,
     conversation: &Conversation,
     member: &Member,
-) -> DomainResult<GroupPositions> {
+) -> GroupPositions {
     let upper = member.visible_upper(conversation.last_seq);
-    let all = group_positions(tx, conversation, conversation.last_seq).await?;
-    Ok(all.map_or(
+    all.map_or(
         GroupPositions {
             delivered: 0,
             read: 0,
@@ -194,7 +194,7 @@ pub(crate) async fn group_positions_for<T: Tx>(
             delivered: all.delivered.min(upper),
             read: all.read.min(upper),
         },
-    ))
+    )
 }
 
 /// The receipt for a group's current members after a change, if its group-wide positions

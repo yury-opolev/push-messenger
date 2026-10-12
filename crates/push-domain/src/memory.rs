@@ -14,7 +14,8 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 use crate::error::{DomainError, DomainResult};
 use crate::ids::{ClientMsgId, ConversationId, DeviceId, MessageId, UserId};
 use crate::model::{
-    ContactState, Conversation, Entry, EntryKind, GroupPositions, InviteRecord, Member,
+    ContactState, Conversation, ConversationKind, ConversationOverview, Entry, EntryKind,
+    GroupPositions, InviteRecord, Member, Role,
 };
 use crate::store::{InsertOutcome, Store, Tx};
 
@@ -69,6 +70,100 @@ impl State {
             .map(|(_, position)| *position)
             .max()
             .unwrap_or(0)
+    }
+
+    fn count_incoming_messages(
+        &self,
+        conversation: ConversationId,
+        user: UserId,
+        after: i64,
+        up_to: i64,
+        cap: u32,
+    ) -> u32 {
+        if after >= up_to {
+            return 0;
+        }
+        self.entries
+            .range((conversation, after + 1)..=(conversation, up_to))
+            .map(|(_, entry)| entry)
+            .filter(|entry| {
+                entry.kind == EntryKind::Message
+                    && entry.deleted_at.is_none()
+                    && entry.sender_id != user
+            })
+            .take(cap as usize)
+            .count() as u32
+    }
+
+    fn group_positions(
+        &self,
+        conversation: ConversationId,
+        last_seq: i64,
+    ) -> Option<GroupPositions> {
+        self.members
+            .values()
+            .filter(|member| member.conversation_id == conversation && member.is_current())
+            .map(|member| {
+                let delivered_seq = self.delivered_seq(conversation, member.user_id);
+                GroupPositions {
+                    delivered: self.effective_position(
+                        member,
+                        last_seq,
+                        delivered_seq.max(member.read_seq),
+                    ),
+                    read: self.effective_position(member, last_seq, member.read_seq),
+                }
+            })
+            .reduce(|all, one| GroupPositions {
+                delivered: all.delivered.min(one.delivered),
+                read: all.read.min(one.read),
+            })
+    }
+
+    /// See [`Tx::conversation_overviews`].
+    fn overview(
+        &self,
+        conversation: &Conversation,
+        member: &Member,
+        unread_cap: u32,
+    ) -> ConversationOverview {
+        let id = conversation.id;
+        let rows: Vec<&Member> = self
+            .members
+            .values()
+            .filter(|row| row.conversation_id == id)
+            .collect();
+        let current = |admins_only: bool| -> Vec<UserId> {
+            rows.iter()
+                .filter(|row| row.is_current() && (!admins_only || row.role == Role::Admin))
+                .map(|row| row.user_id)
+                .collect()
+        };
+        let peer = (conversation.kind == ConversationKind::Direct)
+            .then(|| rows.iter().find(|row| row.user_id != member.user_id))
+            .flatten()
+            .map(|peer| ((*peer).clone(), self.delivered_seq(id, peer.user_id)));
+        let left_at = member
+            .left_at_seq
+            .and_then(|seq| self.entries.get(&(id, seq)).map(|entry| entry.server_ts));
+        ConversationOverview {
+            conversation: conversation.clone(),
+            member: member.clone(),
+            members: current(false),
+            admins: current(true),
+            peer,
+            unread: self.count_incoming_messages(
+                id,
+                member.user_id,
+                member.read_seq.max(member.visible_from_seq - 1),
+                member.visible_upper(conversation.last_seq),
+                unread_cap,
+            ),
+            group: (conversation.kind == ConversationKind::Group)
+                .then(|| self.group_positions(id, conversation.last_seq))
+                .flatten(),
+            left_at,
+        }
     }
 
     /// See [`Tx::group_positions`].
@@ -496,22 +591,9 @@ impl Tx for InMemoryTx {
         up_to: i64,
         cap: u32,
     ) -> DomainResult<u32> {
-        if after >= up_to {
-            return Ok(0);
-        }
-        let count = self
+        Ok(self
             .work
-            .entries
-            .range((conversation, after + 1)..=(conversation, up_to))
-            .map(|(_, entry)| entry)
-            .filter(|entry| {
-                entry.kind == EntryKind::Message
-                    && entry.deleted_at.is_none()
-                    && entry.sender_id != user
-            })
-            .take(cap as usize)
-            .count();
-        Ok(count as u32)
+            .count_incoming_messages(conversation, user, after, up_to, cap))
     }
 
     async fn first_live_message(
@@ -654,25 +736,27 @@ impl Tx for InMemoryTx {
         conversation: ConversationId,
         last_seq: i64,
     ) -> DomainResult<Option<GroupPositions>> {
+        Ok(self.work.group_positions(conversation, last_seq))
+    }
+
+    async fn conversation_overviews(
+        &mut self,
+        user: UserId,
+        changed_since: Option<DateTime<Utc>>,
+        unread_cap: u32,
+    ) -> DomainResult<Vec<ConversationOverview>> {
         let state = &self.work;
         Ok(state
             .members
             .values()
-            .filter(|member| member.conversation_id == conversation && member.is_current())
-            .map(|member| {
-                let delivered_seq = state.delivered_seq(conversation, member.user_id);
-                GroupPositions {
-                    delivered: state.effective_position(
-                        member,
-                        last_seq,
-                        delivered_seq.max(member.read_seq),
-                    ),
-                    read: state.effective_position(member, last_seq, member.read_seq),
+            .filter(|member| member.user_id == user)
+            .filter_map(|member| {
+                let conversation = state.conversations.get(&member.conversation_id)?;
+                if changed_since.is_some_and(|since| conversation.updated_at <= since) {
+                    return None;
                 }
+                Some(state.overview(conversation, member, unread_cap))
             })
-            .reduce(|all, one| GroupPositions {
-                delivered: all.delivered.min(one.delivered),
-                read: all.read.min(one.read),
-            }))
+            .collect())
     }
 }
