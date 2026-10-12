@@ -13,6 +13,14 @@ pub enum ContactState {
     Blocked,
 }
 
+/// One of a user's contact relationships, as that user sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContactSummary {
+    /// The other user.
+    pub user_id: UserId,
+    pub state: ContactState,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConversationKind {
     Direct,

@@ -37,6 +37,13 @@ pub enum Event {
         peer: UserId,
         state: Option<ContactState>,
     },
+    /// `user`'s own read position moved, by reading or by sending; their other devices
+    /// update their unread counts. Published to `user` only.
+    ReadPositionChanged {
+        user: UserId,
+        conversation: ConversationId,
+        read_seq: i64,
+    },
 }
 
 /// The positions a receipt reports.

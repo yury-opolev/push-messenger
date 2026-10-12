@@ -56,8 +56,9 @@ where
     ///
     /// Advances the sender's read position to what the sending device has already received
     /// (its delivery position): replying marks as read everything the user could have seen,
-    /// never messages their device has not received yet. If that passes over a message from
-    /// the other member of a direct conversation, they get a read receipt.
+    /// never messages their device has not received yet. When it moves, the sender's
+    /// devices learn the new position, and if it passes over a message from the other
+    /// member of a direct conversation, they get a read receipt.
     pub async fn send_text(&self, command: SendText) -> DomainResult<SendReceipt> {
         validate_text(&command.body)?;
         let prepared = self
@@ -117,13 +118,14 @@ where
             .get_cursor(command.device, conversation.id)
             .await?
             .unwrap_or(0);
-        tx.raise_read_seq(conversation.id, command.sender, device_position)
+        let read_moved = tx
+            .raise_read_seq(conversation.id, command.sender, device_position)
             .await?;
         let read_receipt = direct_receipt(
             &mut tx,
             &conversation,
             command.sender,
-            member.read_seq,
+            member.read_seq.max(member.visible_from_seq - 1),
             device_position,
         )
         .await?;
@@ -132,6 +134,13 @@ where
         let mut events = vec![Event::EntriesAvailable {
             users: current_member_ids(&members),
         }];
+        if read_moved {
+            events.push(Event::ReadPositionChanged {
+                user: command.sender,
+                conversation: conversation.id,
+                read_seq: device_position,
+            });
+        }
         events.extend(read_receipt);
         self.publish(events).await;
         Ok(receipt)

@@ -14,7 +14,9 @@ where
     N: Notifier,
 {
     /// Records that `user` has read everything up to `seq`. Returns whether the position
-    /// moved; it never moves backwards.
+    /// moved; it never moves backwards. When it moves, the user's devices learn the new
+    /// position, and the other member of a direct conversation gets a read receipt if the
+    /// move passed over a message from them.
     pub async fn read_up_to(
         &self,
         user: UserId,
@@ -28,9 +30,22 @@ where
             return Err(DomainError::SeqOutOfRange);
         }
         let moved = tx.raise_read_seq(conversation, user, seq).await?;
-        let receipt = direct_receipt(&mut tx, &found, user, member.read_seq, seq).await?;
+        // Messages below the member's floor were never visible to them, so they are never
+        // reported as read.
+        let read_before = member.read_seq.max(member.visible_from_seq - 1);
+        let receipt = direct_receipt(&mut tx, &found, user, read_before, seq).await?;
         tx.commit().await?;
-        self.publish(receipt.into_iter().collect()).await;
+
+        let mut events = Vec::new();
+        if moved {
+            events.push(Event::ReadPositionChanged {
+                user,
+                conversation,
+                read_seq: seq,
+            });
+        }
+        events.extend(receipt);
+        self.publish(events).await;
         Ok(moved)
     }
 

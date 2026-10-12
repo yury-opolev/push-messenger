@@ -1,7 +1,7 @@
 mod common;
 
 use common::{Person, World};
-use push_domain::{ContactState, DomainError, Event, UserId, ValidationError};
+use push_domain::{ContactState, ContactSummary, DomainError, Event, UserId, ValidationError};
 
 fn changed(user: &Person, peer: &Person, state: Option<ContactState>) -> Event {
     Event::ContactChanged {
@@ -498,16 +498,20 @@ async fn contacts_are_listed_from_the_owners_side_only() {
         .await
         .unwrap();
 
+    let contact = |person: &Person, state| ContactSummary {
+        user_id: person.user,
+        state,
+    };
     let mut expected = vec![
-        (bob.user, ContactState::Accepted),
-        (carol.user, ContactState::RequestedOut),
-        (dave.user, ContactState::Blocked),
+        contact(&bob, ContactState::Accepted),
+        contact(&carol, ContactState::RequestedOut),
+        contact(&dave, ContactState::Blocked),
     ];
-    expected.sort_by_key(|(peer, _)| *peer);
+    expected.sort_by_key(|summary| summary.user_id);
     assert_eq!(world.svc.list_contacts(alice.user).await, Ok(expected));
     assert_eq!(world.svc.list_contacts(dave.user).await, Ok(vec![]));
     assert_eq!(
         world.svc.list_contacts(carol.user).await,
-        Ok(vec![(alice.user, ContactState::RequestedIn)])
+        Ok(vec![contact(&alice, ContactState::RequestedIn)])
     );
 }
