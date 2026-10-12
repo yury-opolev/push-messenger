@@ -132,11 +132,12 @@ contact (                                  -- one row per direction
 )
 
 invite (
-  code       text primary key,             -- short random code, also used for QR
+  code       text primary key,             -- 10 chars of Crockford base32, also for QR
   user_id    uuid not null references known_user,
   expires_at timestamptz not null,
-  max_uses   int not null default 1,
-  uses       int not null default 0
+  max_uses   int not null default 1,       -- 1 to 100
+  uses       int not null default 0,
+  revoked_at timestamptz
 )
 
 conversation (
@@ -315,20 +316,28 @@ honest statement is "Bob has read up to message N".
 
 - **Direct chats:** when the other member's delivered or read position changes, their
   devices are sent `Receipt{conversation_id, user_id, delivered_seq, read_seq}`.
-- **Groups:** the server pushes only the group-wide minimum
-  (`all_delivered_seq`, `all_read_seq`, taken over all current members), only when it
-  changes, at most once per second per conversation.
+- **Groups:** the server pushes only the group-wide minimums `all_delivered_seq` and
+  `all_read_seq`, taken over the current members: every message up to N has been
+  delivered to (read by) every member other than its sender. A member's own messages never
+  hold these back: each member counts as having reached the point just before the first
+  live message from someone else that they have not received (read). message-svc
+  publishes a change whenever a minimum moves over a live message; the gateway sends at
+  most one per second per conversation, keeping the latest.
 - Position changes that pass only over edits, deletes or system entries send no receipt.
 - Sending advances the sender's read position to what the sending device has received, so
   a reply can also produce a read receipt for the other member of a direct chat.
 - A read implies delivery: a receipt never reports `delivered_seq` below `read_seq`.
+- When a user's read position moves, by reading or by sending, their own devices are told
+  with `ReadPosition{conversation_id, read_seq}`, so all of them show the same unread
+  counts.
 - After connecting, the client calls `ListConversations{changed_since}` to get the current
   positions and unread counts for conversations whose content changed. `changed_since`
   reflects content changes only: a conversation created or an entry appended. Receipt
   positions are not tracked by `updated_at`, so the busy conversation row is not written
-  on every ack and read. A direct conversation's summary carries the other member's
-  `peer_delivered_seq` and `peer_read_seq`, so a reconnecting client refreshes its ticks
-  with one `ListConversations` without `changed_since`.
+  on every ack and read. A conversation's summary carries its receipt positions — the
+  other member's `peer_delivered_seq` and `peer_read_seq` in a direct chat, the group-wide
+  `all_delivered_seq` and `all_read_seq` in a group — so a reconnecting client refreshes
+  its ticks with one `ListConversations` without `changed_since`.
 - Block and unblock do not move `updated_at` either. After a `ContactChanged` event, the
   client also lists without `changed_since` to refresh hidden and unhidden chats. Clients
   pass `changed_since` as the previous listing time minus a safety window.
@@ -451,8 +460,13 @@ Access-token claims: `sub`, `device_id`, `email_verified`, `exp`, `iat`, `jti`, 
   remove/unfriend operation is a candidate for a later version.
 - **Invite link / QR code.** `CreateInvite{expires_in, max_uses}` returns a short code,
   shown as a link or QR code. `RedeemInvite{code}` makes both users accepted contacts
-  immediately: sharing the link is the consent. Codes expire, have a use limit and can be
-  revoked.
+  immediately: sharing the link is the consent. Codes expire (1 minute to 30 days), have a
+  use limit (1 to 100) and can be revoked. A code is 10 characters of Crockford base32
+  (50 random bits, enough because redeeming is rate limited), read case-insensitively. An
+  unknown, revoked, expired or used-up code, and a code whose creator has blocked the
+  redeemer, all give the same "invite not found", so redeeming reveals nothing. Users who
+  are already contacts use nothing up; a pending request between the two becomes
+  accepted.
 - **Only accepted contacts can chat.** `OpenDirect{peer_user_id}` and `Send` in a direct
   conversation require `accepted` on both sides. `blocked` rejects sends both ways and
   hides the conversation from the blocker. After either user blocks the other, neither
@@ -478,17 +492,27 @@ Access-token claims: `sub`, `device_id`, `email_verified`, `exp`, `iat`, `jti`, 
   creator. The creator becomes an admin.
 - Two roles. **Admins** (one or more) rename the group, add and remove members, and
   promote members to admin or demote admins to member. **Members** chat and can leave.
-- A group always has at least one admin. If the last admin leaves or is demoted, the
-  member with the earliest `joined` entry becomes admin, recorded as a system entry. A
-  group with no members left is closed.
+- A group always has at least one admin: the last admin cannot be demoted. If the last
+  admin leaves or is removed, the current member who joined first (lowest
+  `visible_from_seq`, then lowest user id) becomes admin, recorded as a system entry.
+  Admins remove others; an admin who wants to go leaves. A group with no members left is
+  closed.
 - Every membership change is a **system entry** in the log, written under the same
   conversation lock as messages. Sends and membership changes are therefore strictly
-  ordered: a removed member never receives anything after the removal entry.
-- A new member sees history from `visible_from_seq` (the seq of the "added" entry). A
-  member who leaves keeps history up to `left_at_seq`. Rejoining sets a new
+  ordered: a removed member never receives anything after the removal entry. A system
+  entry (`kind = 4`, `content_type = 2`, no device) carries the event as compact JSON with
+  a format version, for example `{"v":1,"type":"members_added","actor":"…","users":["…"]}`.
+  The types are `created`, `members_added`, `member_removed`, `member_left`, `renamed`,
+  `role_changed` and `admin_promoted`; clients show an unknown type as a generic line.
+- A new member sees history from `visible_from_seq` (the seq of the "added" entry), and
+  nothing before it counts as unread: their read position starts at
+  `visible_from_seq - 1`. A member who leaves keeps history up to `left_at_seq` and still
+  lists the group as it was when they left, without its member list. Rejoining sets a new
   `visible_from_seq` and clears `left_at_seq`.
 - The 100-member limit is checked under the conversation lock.
-- Adding a member requires them to be an accepted contact of the admin adding them.
+- Adding a member requires them to be an accepted contact of the admin adding them. Inside
+  a group, members need not be contacts of each other, and blocks between them do not
+  affect the group.
 - Group receipts are aggregated (§4.5). Per-member read lists are out of scope for v1.
 
 ## 7. Wire protocol
@@ -534,6 +558,7 @@ Request frames carry a client-chosen `request_id`, echoed in the response:
 | Deliver | `conversation_id, seq, message_id, client_msg_id, kind, target_message_id, sender_id, content_type, body, client_ts, server_ts, edited_at, edit_seq, deleted` |
 | SendAck | `client_msg_id, message_id, seq, server_ts` (also for Edit and Delete) |
 | Receipt | direct: `conversation_id, user_id, delivered_seq, read_seq`; group: `conversation_id, all_delivered_seq, all_read_seq` |
+| ReadPosition | `conversation_id, read_seq` — the user's own read position moved |
 | ContactEvent | `user_id, state` |
 | Response | `request_id` and the request-specific result |
 | AuthExpiring | `expires_in_s` |
