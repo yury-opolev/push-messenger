@@ -223,6 +223,41 @@ pub enum Receipts {
     },
 }
 
+/// Group-wide positions (spec §4.5): every live message up to `read` has been read, and
+/// every one up to `delivered` delivered, by every current member other than its sender.
+/// `delivered` is never below `read`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GroupPositions {
+    pub delivered: i64,
+    pub read: i64,
+}
+
+/// What a conversation listing needs about one of a user's memberships. The store reads
+/// these for all of a user's memberships at once (`Tx::conversation_overviews`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversationOverview {
+    pub conversation: Conversation,
+    /// The listing user's own member row.
+    pub member: Member,
+    /// The current members, sorted.
+    pub members: Vec<UserId>,
+    /// The current members with the admin role, sorted.
+    pub admins: Vec<UserId>,
+    /// A direct conversation's other member, with their `delivered_seq`. `None` for a
+    /// group, or if there is no other member.
+    pub peer: Option<(Member, i64)>,
+    /// Live messages (`kind = Message`, not deleted) from others with
+    /// `max(read_seq, visible_from_seq - 1) < seq <= member.visible_upper(last_seq)`, at
+    /// most the cap given to the store.
+    pub unread: u32,
+    /// A group's group-wide positions with its log ending at its `last_seq`; `None` for a
+    /// direct conversation or a group without current members.
+    pub group: Option<GroupPositions>,
+    /// For a former member, the `server_ts` of the entry at their `left_at_seq`; `None`
+    /// for a current member, or if that entry does not exist.
+    pub left_at: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConversationState {
     pub conversation_id: ConversationId,

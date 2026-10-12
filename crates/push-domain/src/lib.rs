@@ -31,9 +31,9 @@ pub use history::HistoryPage;
 pub use ids::{ClientMsgId, ConversationId, DeviceId, MessageId, UserId};
 pub use memory::InMemoryStore;
 pub use model::{
-    ContactState, ContactSummary, ContentType, Conversation, ConversationKind, ConversationState,
-    ConversationSummary, Entry, EntryKind, Invite, InviteRecord, Member, MemberState, Positions,
-    Receipts, Role, SendReceipt, direct_key,
+    ContactState, ContactSummary, ContentType, Conversation, ConversationKind,
+    ConversationOverview, ConversationState, ConversationSummary, Entry, EntryKind, GroupPositions,
+    Invite, InviteRecord, Member, MemberState, Positions, Receipts, Role, SendReceipt, direct_key,
 };
 pub use notify::{Event, NoopNotifier, Notifier, ReceiptUpdate, RecordingNotifier};
 pub use send::SendText;

@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use chrono::{DateTime, Utc};
 
 use crate::clock::Clock;
@@ -5,12 +7,12 @@ use crate::contacts::are_contacts;
 use crate::error::{DomainError, DomainResult};
 use crate::ids::{ConversationId, UserId};
 use crate::model::{
-    ContactState, Conversation, ConversationKind, ConversationSummary, Member, Receipts, Role,
-    direct_key,
+    ContactState, Conversation, ConversationKind, ConversationOverview, ConversationSummary,
+    Member, Receipts, Role, direct_key,
 };
 use crate::notify::Notifier;
-use crate::read::group_positions_for;
-use crate::service::{Messaging, current_member_ids};
+use crate::read::visible_group_positions;
+use crate::service::Messaging;
 use crate::store::{InsertOutcome, Store, Tx};
 use crate::validation::{MAX_UNREAD, ValidationError};
 
@@ -111,40 +113,70 @@ where
         changed_since: Option<DateTime<Utc>>,
     ) -> DomainResult<Vec<ConversationSummary>> {
         let mut tx = self.store.begin().await?;
-        let mut memberships = tx.memberships(user).await?;
-        memberships.sort_by_key(|(conversation, _)| conversation.id);
+        let mut overviews = tx
+            .conversation_overviews(user, changed_since, MAX_UNREAD)
+            .await?;
+        let blocked: HashSet<UserId> = tx
+            .contacts_of(user)
+            .await?
+            .into_iter()
+            .filter(|(_, state)| *state == ContactState::Blocked)
+            .map(|(peer, _)| peer)
+            .collect();
+        tx.rollback().await?;
+        overviews.sort_by_key(|overview| overview.conversation.id);
 
         let mut summaries = Vec::new();
-        for (conversation, member) in memberships {
-            if changed_since.is_some_and(|since| conversation.updated_at <= since) {
-                continue;
-            }
-            let members = tx.members(conversation.id).await?;
-            if conversation.kind == ConversationKind::Direct
-                && has_blocked_a_member(&mut tx, user, &members).await?
+        for overview in overviews {
+            // Blocking hides a direct conversation from the blocker.
+            if overview
+                .peer
+                .as_ref()
+                .is_some_and(|(peer, _)| blocked.contains(&peer.user_id))
             {
                 continue;
             }
-            let last_seq = member.visible_upper(conversation.last_seq);
-            let unread_after = member.read_seq.max(member.visible_from_seq - 1);
-            let unread = tx
-                .count_incoming_messages(conversation.id, user, unread_after, last_seq, MAX_UNREAD)
-                .await?;
-            let receipts = receipts(&mut tx, &conversation, &member, &members).await?;
+            let ConversationOverview {
+                conversation,
+                member,
+                members,
+                admins,
+                peer,
+                unread,
+                group,
+                left_at,
+            } = overview;
+            let receipts = if conversation.kind == ConversationKind::Group {
+                let group = visible_group_positions(group, &conversation, &member);
+                Receipts::Group {
+                    all_delivered_seq: group.delivered,
+                    all_read_seq: group.read,
+                }
+            } else {
+                let (peer_delivered_seq, peer_read_seq) = peer
+                    .map_or((0, 0), |(peer, delivered_seq)| {
+                        (delivered_seq.max(peer.read_seq), peer.read_seq)
+                    });
+                Receipts::Direct {
+                    peer_delivered_seq,
+                    peer_read_seq,
+                }
+            };
             let mut summary = ConversationSummary {
                 conversation_id: conversation.id,
                 kind: conversation.kind,
                 title: conversation.title.clone(),
-                last_seq,
+                last_seq: member.visible_upper(conversation.last_seq),
                 read_seq: member.read_seq,
                 unread,
                 receipts,
                 updated_at: conversation.updated_at,
-                members: current_member_ids(&members),
-                admins: current_admin_ids(&members),
+                members,
+                admins,
             };
-            if let Some(left_at_seq) = member.left_at_seq {
-                summary.updated_at = left_at_time(&mut tx, &conversation, left_at_seq).await?;
+            if member.left_at_seq.is_some() {
+                // A former member sees the conversation as it was when they left.
+                summary.updated_at = left_at.unwrap_or(conversation.created_at);
                 if changed_since.is_some_and(|since| summary.updated_at <= since) {
                     continue;
                 }
@@ -153,77 +185,8 @@ where
             }
             summaries.push(summary);
         }
-        tx.rollback().await?;
         Ok(summaries)
     }
-}
-
-/// When a former member's view of a conversation last changed: the time of the entry at
-/// which they left, or the conversation's creation if that entry does not exist.
-async fn left_at_time<T: Tx>(
-    tx: &mut T,
-    conversation: &Conversation,
-    left_at_seq: i64,
-) -> DomainResult<DateTime<Utc>> {
-    let entries = tx
-        .entries_after(conversation.id, left_at_seq - 1, left_at_seq, 0, 1)
-        .await?;
-    Ok(entries
-        .first()
-        .map_or(conversation.created_at, |entry| entry.server_ts))
-}
-
-/// How far the others got, as `member` may see it: the other member's positions in a
-/// direct conversation, with delivered at least read; the group-wide positions in a group.
-async fn receipts<T: Tx>(
-    tx: &mut T,
-    conversation: &Conversation,
-    member: &Member,
-    members: &[Member],
-) -> DomainResult<Receipts> {
-    if conversation.kind == ConversationKind::Group {
-        let group = group_positions_for(tx, conversation, member).await?;
-        return Ok(Receipts::Group {
-            all_delivered_seq: group.delivered,
-            all_read_seq: group.read,
-        });
-    }
-    let Some(peer) = members.iter().find(|other| other.user_id != member.user_id) else {
-        return Ok(Receipts::Direct {
-            peer_delivered_seq: 0,
-            peer_read_seq: 0,
-        });
-    };
-    let delivered_seq = tx.delivered_seq(conversation.id, peer.user_id).await?;
-    Ok(Receipts::Direct {
-        peer_delivered_seq: delivered_seq.max(peer.read_seq),
-        peer_read_seq: peer.read_seq,
-    })
-}
-
-/// The ids of the current admins, sorted.
-fn current_admin_ids(members: &[Member]) -> Vec<UserId> {
-    let mut admins: Vec<UserId> = members
-        .iter()
-        .filter(|member| member.is_current() && member.role == Role::Admin)
-        .map(|member| member.user_id)
-        .collect();
-    admins.sort();
-    admins
-}
-
-/// Whether `user` has blocked any other member.
-async fn has_blocked_a_member<T: Tx>(
-    tx: &mut T,
-    user: UserId,
-    members: &[Member],
-) -> DomainResult<bool> {
-    for member in members.iter().filter(|member| member.user_id != user) {
-        if tx.get_contact(user, member.user_id).await? == Some(ContactState::Blocked) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
 }
 
 pub(crate) async fn require_conversation<T: Tx>(

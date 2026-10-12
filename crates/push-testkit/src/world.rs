@@ -1,18 +1,18 @@
-//! Shared test harness: a `Messaging` service over the in-memory store, a manual clock and
+//! The scenarios' world: a `Messaging` service over a backend's store, a manual clock and
 //! a recording notifier.
-
-#![allow(dead_code)]
 
 use std::sync::Arc;
 
 use chrono::{TimeZone, Utc};
 use push_domain::{
     ClientMsgId, Conversation, ConversationId, DeleteMessage, DeviceId, EditText, Entry, Event,
-    InMemoryStore, ManualClock, Member, MessageRef, Messaging, Policy, RecordingNotifier,
-    SendReceipt, SendText, Store, SystemEvent, Tx, UserId,
+    ManualClock, Member, MessageRef, Messaging, Policy, RecordingNotifier, SendReceipt, SendText,
+    Store, SystemEvent, Tx, UserId,
 };
 
-pub type Svc = Messaging<InMemoryStore, Arc<ManualClock>, Arc<RecordingNotifier>>;
+use crate::Backend;
+
+pub type Svc<S> = Messaging<S, Arc<ManualClock>, Arc<RecordingNotifier>>;
 
 /// A verified user and one of their devices.
 #[derive(Debug, Clone, Copy)]
@@ -21,24 +21,25 @@ pub struct Person {
     pub device: DeviceId,
 }
 
-pub struct World {
-    pub svc: Svc,
-    pub store: InMemoryStore,
+pub struct World<S> {
+    pub svc: Svc<S>,
+    pub store: S,
     pub clock: Arc<ManualClock>,
     pub notifier: Arc<RecordingNotifier>,
 }
 
-impl World {
-    pub fn new() -> Self {
-        Self::with_policy(Policy::default())
+impl<S: Store + Clone> World<S> {
+    /// A world over a new store from `backend`, with the default policy.
+    pub async fn new<B: Backend<Store = S>>(backend: &B) -> Self {
+        Self::with_policy(backend, Policy::default()).await
     }
 
-    pub fn with_policy(policy: Policy) -> Self {
+    pub async fn with_policy<B: Backend<Store = S>>(backend: &B, policy: Policy) -> Self {
         let clock = Arc::new(ManualClock::new(
             Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap(),
         ));
         let notifier = Arc::new(RecordingNotifier::default());
-        let store = InMemoryStore::new();
+        let store = backend.store().await;
         let svc = Messaging::with_policy(
             store.clone(),
             Arc::clone(&clock),

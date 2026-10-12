@@ -11,6 +11,9 @@
 //! - report deadlocks and serialisation failures as [`DomainError::Conflict`], which
 //!   callers may retry;
 //! - enforce the schema's foreign and primary keys, failing with `DomainError::Store`;
+//! - after any method fails, expect the caller to roll back: the transaction may be
+//!   unusable (on Postgres every later statement fails), so no caller continues after an
+//!   error;
 //! - roll back a transaction that is dropped without [`Tx::commit`].
 //!
 //! # Locking
@@ -23,13 +26,17 @@
 //! Redeeming an invite locks the invite row ([`Tx::lock_invite`]) first and the contact
 //! pair second. No operation takes them in the other order.
 //!
+//! A group's positions lock ([`Tx::lock_conversation_positions`]) comes after its
+//! conversation lock: appends and group changes take the conversation lock through
+//! [`Tx::next_seq`] first, acks and reads take only the positions lock.
+//!
 //! # Delivery positions
 //!
 //! Positions are created eagerly, so a device normally has one for every membership of its
 //! user. One can still be missing: a device registered concurrently with a membership
 //! change reads the memberships before the new member row commits. Readers fall back to
-//! `visible_from_seq - 1`, so sync iterates memberships rather than joining only on
-//! existing positions.
+//! `visible_from_seq - 1`, so [`Tx::sync_positions`] starts from the memberships and
+//! joins the positions to them, never the other way round.
 //!
 //! [`DomainError::Conflict`]: crate::error::DomainError::Conflict
 
@@ -38,7 +45,9 @@ use chrono::{DateTime, Utc};
 
 use crate::error::DomainResult;
 use crate::ids::{ClientMsgId, ConversationId, DeviceId, MessageId, UserId};
-use crate::model::{ContactState, Conversation, Entry, InviteRecord, Member};
+use crate::model::{
+    ContactState, Conversation, ConversationOverview, Entry, GroupPositions, InviteRecord, Member,
+};
 
 /// Result of an insert guarded by a uniqueness rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,16 +74,17 @@ pub trait Tx: Send {
     /// Records a verified user. Idempotent.
     async fn insert_user(&mut self, user: UserId) -> DomainResult<()>;
     async fn user_exists(&mut self, user: UserId) -> DomainResult<bool>;
-    /// Records a device if absent. If a device with this id already exists (any owner,
-    /// active or revoked) it does nothing; callers check ownership first with
-    /// `device_exists` / `device_owner`.
-    async fn insert_device(&mut self, device: DeviceId, user: UserId) -> DomainResult<()>;
+    /// Records an active device of `user` unless a device with this id exists (any owner,
+    /// active or revoked), and returns whether the device is now an active device of
+    /// `user`. Postgres checks after `INSERT … ON CONFLICT DO NOTHING`, which waits for a
+    /// concurrent insert of the same id, so two registrations cannot both see `true` for
+    /// different users. Fails with `DomainError::Store` if the device is new and the user
+    /// is not known.
+    async fn insert_device(&mut self, device: DeviceId, user: UserId) -> DomainResult<bool>;
     /// Marks a device revoked. A no-op for an unknown device.
     async fn revoke_device(&mut self, device: DeviceId) -> DomainResult<()>;
     /// The owner of an active device; `None` if the device is unknown or revoked.
     async fn device_owner(&mut self, device: DeviceId) -> DomainResult<Option<UserId>>;
-    /// Whether a device row exists, active or revoked.
-    async fn device_exists(&mut self, device: DeviceId) -> DomainResult<bool>;
     /// The user's active devices.
     /// The order of the result is unspecified.
     async fn devices_of_user(&mut self, user: UserId) -> DomainResult<Vec<DeviceId>>;
@@ -130,8 +140,9 @@ pub trait Tx: Send {
         conversation: Conversation,
     ) -> DomainResult<InsertOutcome>;
     async fn get_conversation(&mut self, id: ConversationId) -> DomainResult<Option<Conversation>>;
-    /// Locks the conversation, increments `last_seq`, sets `updated_at` to `at` and
-    /// returns the new `last_seq`. Both changes are undone if the transaction rolls back.
+    /// Locks the conversation, increments `last_seq`, moves `updated_at` forward to `at`
+    /// (never back: `GREATEST` on Postgres) and returns the new `last_seq`. Both changes are
+    /// undone if the transaction rolls back.
     /// Fails with `ConversationNotFound` if the conversation does not exist.
     /// The conversation row lock is held until the transaction commits or rolls back.
     async fn next_seq(&mut self, id: ConversationId, at: DateTime<Utc>) -> DomainResult<i64>;
@@ -162,6 +173,19 @@ pub trait Tx: Send {
         user: UserId,
         seq: i64,
     ) -> DomainResult<bool>;
+    /// Serialises changes to the conversation's delivery and read positions until the
+    /// transaction ends. Every operation that compares a group's group-wide positions
+    /// before and after a change calls it before reading "before", so two concurrent
+    /// changes cannot both miss a move (under READ COMMITTED each would otherwise see the
+    /// other's old position). It does not lock the conversation row: acks and reads do not
+    /// wait for appends to commit. Appends take it after `next_seq`, never before.
+    /// Postgres: a transaction-scoped advisory lock (`pg_advisory_xact_lock`) on a
+    /// namespaced (tagged) hash of the conversation id, so it cannot share a key with the
+    /// contact-pair lock.
+    async fn lock_conversation_positions(
+        &mut self,
+        conversation: ConversationId,
+    ) -> DomainResult<()>;
 
     // --- The log -----------------------------------------------------------------------
 
@@ -264,4 +288,57 @@ pub trait Tx: Send {
         conversation: ConversationId,
         user: UserId,
     ) -> DomainResult<i64>;
+
+    /// Every member row of the conversation, current and former, each with that member's
+    /// `delivered_seq`, delivered as returned by [`Tx::delivered_seq`] — revoked devices
+    /// included; 0 if the member has no positions. One statement on Postgres. The order
+    /// of the result is unspecified.
+    async fn member_positions(
+        &mut self,
+        conversation: ConversationId,
+    ) -> DomainResult<Vec<(Member, i64)>>;
+
+    /// The memberships of `user` in which `device` has entries left to receive, each with
+    /// the position to sync from: the device's delivery position raised to the member's
+    /// floor (`visible_from_seq - 1`), also when the device has no position. Only rows
+    /// with that position below `member.visible_upper(conversation.last_seq)` are
+    /// returned. As in `memberships`, each conversation is read in the same statement as
+    /// its member row. The order of the result is unspecified.
+    async fn sync_positions(
+        &mut self,
+        user: UserId,
+        device: DeviceId,
+    ) -> DomainResult<Vec<(Conversation, Member, i64)>>;
+
+    /// The group-wide positions of `conversation` with its log ending at `last_seq`: the
+    /// minimums over its current members of their effective positions. `None` if it has
+    /// no current members.
+    ///
+    /// A member's effective position from a raw position `p` skips their own messages,
+    /// edits, deletes, system entries and deleted messages: with
+    /// `from = max(p, visible_from_seq - 1)`, it is `last_seq` if `from >= last_seq`,
+    /// otherwise the `seq` before the first live message from someone else with
+    /// `from < seq <= last_seq` (see `first_live_message`), or `last_seq` if there is none.
+    /// Their effective read position starts from `read_seq`; their effective delivered
+    /// position from `max(delivered_seq, read_seq)`, so it is never below the read one.
+    ///
+    /// Postgres computes it in one statement, however many members the group has.
+    async fn group_positions(
+        &mut self,
+        conversation: ConversationId,
+        last_seq: i64,
+    ) -> DomainResult<Option<GroupPositions>>;
+
+    /// An overview of each conversation `user` is, or was, a member of whose `updated_at`
+    /// is later than `changed_since` (every one without it). Unread counts stop at
+    /// `unread_cap`. Each conversation is read in the same statement as the user's member
+    /// row, as in `memberships`. One statement on Postgres, however many conversations
+    /// there are. The order of the overviews is unspecified; within each, `members` and
+    /// `admins` are sorted by user id (Postgres: `ORDER BY user_id`).
+    async fn conversation_overviews(
+        &mut self,
+        user: UserId,
+        changed_since: Option<DateTime<Utc>>,
+        unread_cap: u32,
+    ) -> DomainResult<Vec<ConversationOverview>>;
 }

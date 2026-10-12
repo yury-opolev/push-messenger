@@ -1,14 +1,14 @@
-mod common;
-
+use crate::{Backend, Case, Person, World, case_list, entries_for, seqs, system_events, text};
 use chrono::TimeDelta;
-use common::{Person, World, entries_for, seqs, system_events, text};
 use push_domain::{
     Clock, ConversationId, DomainError, Event, ReceiptUpdate, Role, SystemEvent, ValidationError,
 };
 
 /// A group of alice (admin), bob and carol; `seq` 1 is its `Created` entry.
-async fn trio() -> (World, Person, Person, Person, ConversationId) {
-    let world = World::new();
+async fn trio<B: Backend>(
+    backend: &B,
+) -> (World<B::Store>, Person, Person, Person, ConversationId) {
+    let world = World::new(backend).await;
     let (alice, bob, carol) = (
         world.person().await,
         world.person().await,
@@ -19,9 +19,8 @@ async fn trio() -> (World, Person, Person, Person, ConversationId) {
     (world, alice, bob, carol, group)
 }
 
-#[tokio::test]
-async fn a_removed_member_receives_nothing_after_the_removal_entry() {
-    let (world, alice, bob, carol, group) = trio().await;
+async fn a_removed_member_receives_nothing_after_the_removal_entry<B: Backend>(backend: &B) {
+    let (world, alice, bob, carol, group) = trio(backend).await;
     world.send(&alice, group, "one").await;
     world.notifier.take();
 
@@ -59,9 +58,8 @@ async fn a_removed_member_receives_nothing_after_the_removal_entry() {
     assert_eq!(world.svc.read_up_to(bob.user, group, 3).await, Ok(true));
 }
 
-#[tokio::test]
-async fn removing_the_member_who_held_the_group_back_completes_the_read() {
-    let (world, alice, bob, carol, group) = trio().await;
+async fn removing_the_member_who_held_the_group_back_completes_the_read<B: Backend>(backend: &B) {
+    let (world, alice, bob, carol, group) = trio(backend).await;
     world.send(&alice, group, "one").await;
     world.svc.read_up_to(bob.user, group, 2).await.unwrap();
     world.notifier.take();
@@ -89,9 +87,8 @@ async fn removing_the_member_who_held_the_group_back_completes_the_read() {
     );
 }
 
-#[tokio::test]
-async fn only_an_admin_removes_others_and_removing_twice_changes_nothing() {
-    let (world, alice, bob, carol, group) = trio().await;
+async fn only_an_admin_removes_others_and_removing_twice_changes_nothing<B: Backend>(backend: &B) {
+    let (world, alice, bob, carol, group) = trio(backend).await;
     let dave = world.person().await;
 
     assert_eq!(
@@ -121,9 +118,8 @@ async fn only_an_admin_removes_others_and_removing_twice_changes_nothing() {
     assert_eq!(world.conversation(group).await.last_seq, 2);
 }
 
-#[tokio::test]
-async fn a_member_leaves_and_leaving_twice_changes_nothing() {
-    let (world, alice, bob, carol, group) = trio().await;
+async fn a_member_leaves_and_leaving_twice_changes_nothing<B: Backend>(backend: &B) {
+    let (world, alice, bob, carol, group) = trio(backend).await;
 
     world.svc.leave_group(bob.user, group).await.unwrap();
     assert_eq!(
@@ -160,9 +156,10 @@ async fn a_member_leaves_and_leaving_twice_changes_nothing() {
     );
 }
 
-#[tokio::test]
-async fn when_the_last_admin_leaves_the_longest_standing_member_is_promoted() {
-    let world = World::new();
+async fn when_the_last_admin_leaves_the_longest_standing_member_is_promoted<B: Backend>(
+    backend: &B,
+) {
+    let world = World::new(backend).await;
     let alice = world.person().await;
     // Dave is created first, so he has the lower user id but joins later than bob.
     let dave = world.person().await;
@@ -198,18 +195,16 @@ async fn when_the_last_admin_leaves_the_longest_standing_member_is_promoted() {
     assert_eq!(seqs(&alices.entries), [1, 2, 3]);
 }
 
-#[tokio::test]
-async fn among_members_who_joined_together_the_lowest_user_id_is_promoted() {
-    let (world, alice, bob, carol, group) = trio().await;
+async fn among_members_who_joined_together_the_lowest_user_id_is_promoted<B: Backend>(backend: &B) {
+    let (world, alice, bob, carol, group) = trio(backend).await;
 
     world.svc.leave_group(alice.user, group).await.unwrap();
     let heir = if bob.user < carol.user { &bob } else { &carol };
     assert_eq!(world.member(group, heir).await.unwrap().role, Role::Admin);
 }
 
-#[tokio::test]
-async fn leaving_a_direct_conversation_is_refused() {
-    let world = World::new();
+async fn leaving_a_direct_conversation_is_refused<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let direct = world.direct_chat(&alice, &bob).await;
 
@@ -219,9 +214,8 @@ async fn leaving_a_direct_conversation_is_refused() {
     );
 }
 
-#[tokio::test]
-async fn removing_from_a_direct_conversation_is_refused() {
-    let world = World::new();
+async fn removing_from_a_direct_conversation_is_refused<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let direct = world.direct_chat(&alice, &bob).await;
 
@@ -231,9 +225,8 @@ async fn removing_from_a_direct_conversation_is_refused() {
     );
 }
 
-#[tokio::test]
-async fn a_group_whose_last_member_left_is_closed() {
-    let world = World::new();
+async fn a_group_whose_last_member_left_is_closed<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let group = world.group(&alice, &[&bob]).await;
     world.svc.leave_group(bob.user, group).await.unwrap();
@@ -247,9 +240,10 @@ async fn a_group_whose_last_member_left_is_closed() {
     );
 }
 
-#[tokio::test]
-async fn a_rejoining_member_sees_only_the_new_range_and_old_acks_change_nothing() {
-    let (world, alice, bob, _carol, group) = trio().await;
+async fn a_rejoining_member_sees_only_the_new_range_and_old_acks_change_nothing<B: Backend>(
+    backend: &B,
+) {
+    let (world, alice, bob, _carol, group) = trio(backend).await;
     world.send(&alice, group, "one").await;
     world.send(&alice, group, "two").await;
     world.svc.ack(bob.device, group, 3).await.unwrap();
@@ -280,9 +274,8 @@ async fn a_rejoining_member_sees_only_the_new_range_and_old_acks_change_nothing(
     assert_eq!(seqs(&history.entries), [7]);
 }
 
-#[tokio::test]
-async fn a_former_member_lists_the_group_as_it_was_when_they_left() {
-    let (world, alice, bob, _carol, group) = trio().await;
+async fn a_former_member_lists_the_group_as_it_was_when_they_left<B: Backend>(backend: &B) {
+    let (world, alice, bob, _carol, group) = trio(backend).await;
     world.clock.advance(TimeDelta::minutes(1));
     world.svc.leave_group(bob.user, group).await.unwrap();
     let left_at = world.clock.now();
@@ -302,4 +295,20 @@ async fn a_former_member_lists_the_group_as_it_was_when_they_left() {
             .unwrap()
             .is_empty()
     );
+}
+
+pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
+    case_list![
+        a_removed_member_receives_nothing_after_the_removal_entry,
+        removing_the_member_who_held_the_group_back_completes_the_read,
+        only_an_admin_removes_others_and_removing_twice_changes_nothing,
+        a_member_leaves_and_leaving_twice_changes_nothing,
+        when_the_last_admin_leaves_the_longest_standing_member_is_promoted,
+        among_members_who_joined_together_the_lowest_user_id_is_promoted,
+        leaving_a_direct_conversation_is_refused,
+        removing_from_a_direct_conversation_is_refused,
+        a_group_whose_last_member_left_is_closed,
+        a_rejoining_member_sees_only_the_new_range_and_old_acks_change_nothing,
+        a_former_member_lists_the_group_as_it_was_when_they_left,
+    ]
 }

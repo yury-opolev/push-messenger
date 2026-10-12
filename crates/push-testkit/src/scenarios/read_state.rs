@@ -1,6 +1,4 @@
-mod common;
-
-use common::World;
+use crate::{Backend, Case, World, case_list};
 use push_domain::{ConversationState, DomainError, MemberState, Positions, UserId};
 
 fn member(state: &ConversationState, user: UserId) -> &MemberState {
@@ -13,9 +11,8 @@ fn member(state: &ConversationState, user: UserId) -> &MemberState {
         .expect("member present")
 }
 
-#[tokio::test]
-async fn the_read_position_only_moves_forward() {
-    let world = World::new();
+async fn the_read_position_only_moves_forward<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let chat = world.direct_chat(&alice, &bob).await;
     for body in ["one", "two", "three"] {
@@ -32,9 +29,8 @@ async fn the_read_position_only_moves_forward() {
     assert_eq!(member(&state, bob.user).read_seq, 2);
 }
 
-#[tokio::test]
-async fn reading_beyond_the_last_message_is_rejected() {
-    let world = World::new();
+async fn reading_beyond_the_last_message_is_rejected<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let chat = world.direct_chat(&alice, &bob).await;
     world.send(&alice, chat, "one").await;
@@ -45,9 +41,8 @@ async fn reading_beyond_the_last_message_is_rejected() {
     );
 }
 
-#[tokio::test]
-async fn sending_marks_received_messages_read() {
-    let world = World::new();
+async fn sending_marks_received_messages_read<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let chat = world.direct_chat(&alice, &bob).await;
     world.send(&bob, chat, "one").await;
@@ -64,9 +59,8 @@ async fn sending_marks_received_messages_read() {
     assert_eq!(member(&state, bob.user).read_seq, 0);
 }
 
-#[tokio::test]
-async fn sending_does_not_mark_unreceived_messages_read() {
-    let world = World::new();
+async fn sending_does_not_mark_unreceived_messages_read<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let chat = world.direct_chat(&alice, &bob).await;
     world.send(&bob, chat, "one").await;
@@ -77,9 +71,8 @@ async fn sending_does_not_mark_unreceived_messages_read() {
     assert_eq!(member(&state, alice.user).delivered_seq, 0);
 }
 
-#[tokio::test]
-async fn sending_does_not_mark_anything_delivered() {
-    let world = World::new();
+async fn sending_does_not_mark_anything_delivered<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let chat = world.direct_chat(&alice, &bob).await;
     world.send(&bob, chat, "one").await;
@@ -90,9 +83,8 @@ async fn sending_does_not_mark_anything_delivered() {
     assert_eq!(member(&state, bob.user).delivered_seq, 0);
 }
 
-#[tokio::test]
-async fn delivered_is_the_furthest_position_across_a_users_devices() {
-    let world = World::new();
+async fn delivered_is_the_furthest_position_across_a_users_devices<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let chat = world.direct_chat(&alice, &bob).await;
     let tablet = world.add_device(&bob).await;
@@ -110,9 +102,8 @@ async fn delivered_is_the_furthest_position_across_a_users_devices() {
     assert_eq!(member(&state, bob.user).delivered_seq, 3);
 }
 
-#[tokio::test]
-async fn read_implies_delivered_in_conversation_state() {
-    let world = World::new();
+async fn read_implies_delivered_in_conversation_state<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let chat = world.direct_chat(&alice, &bob).await;
     for body in ["one", "two"] {
@@ -129,9 +120,8 @@ async fn read_implies_delivered_in_conversation_state() {
     assert_eq!(member(&state, bob.user).read_seq, 2);
 }
 
-#[tokio::test]
-async fn delivered_survives_revoking_the_device_that_received_it() {
-    let world = World::new();
+async fn delivered_survives_revoking_the_device_that_received_it<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let chat = world.direct_chat(&alice, &bob).await;
     let tablet = world.add_device(&bob).await;
@@ -149,9 +139,8 @@ async fn delivered_survives_revoking_the_device_that_received_it() {
     assert_eq!(member(&state, bob.user).delivered_seq, 3);
 }
 
-#[tokio::test]
-async fn only_members_can_read_or_see_state() {
-    let world = World::new();
+async fn only_members_can_read_or_see_state<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob, carol) = (
         world.person().await,
         world.person().await,
@@ -170,9 +159,8 @@ async fn only_members_can_read_or_see_state() {
     );
 }
 
-#[tokio::test]
-async fn a_negative_read_position_is_rejected() {
-    let world = World::new();
+async fn a_negative_read_position_is_rejected<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let chat = world.direct_chat(&alice, &bob).await;
     world.send(&alice, chat, "one").await;
@@ -183,9 +171,8 @@ async fn a_negative_read_position_is_rejected() {
     );
 }
 
-#[tokio::test]
-async fn sending_never_lowers_the_senders_read_position() {
-    let world = World::new();
+async fn sending_never_lowers_the_senders_read_position<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let chat = world.direct_chat(&alice, &bob).await;
     let alice_read = || async {
@@ -210,9 +197,8 @@ async fn sending_never_lowers_the_senders_read_position() {
     assert_eq!(alice_read().await, 3);
 }
 
-#[tokio::test]
-async fn a_groups_state_holds_only_group_wide_positions() {
-    let world = World::new();
+async fn a_groups_state_holds_only_group_wide_positions<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob, carol) = (
         world.person().await,
         world.person().await,
@@ -233,4 +219,21 @@ async fn a_groups_state_holds_only_group_wide_positions() {
             all_read_seq: 1,
         }
     );
+}
+
+pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
+    case_list![
+        the_read_position_only_moves_forward,
+        reading_beyond_the_last_message_is_rejected,
+        sending_marks_received_messages_read,
+        sending_does_not_mark_unreceived_messages_read,
+        sending_does_not_mark_anything_delivered,
+        delivered_is_the_furthest_position_across_a_users_devices,
+        read_implies_delivered_in_conversation_state,
+        delivered_survives_revoking_the_device_that_received_it,
+        only_members_can_read_or_see_state,
+        a_negative_read_position_is_rejected,
+        sending_never_lowers_the_senders_read_position,
+        a_groups_state_holds_only_group_wide_positions,
+    ]
 }

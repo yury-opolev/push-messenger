@@ -1,11 +1,8 @@
-mod common;
-
-use common::{World, bodies};
+use crate::{Backend, Case, World, bodies, case_list};
 use push_domain::{DomainError, Positions, ValidationError};
 
-#[tokio::test]
-async fn a_direct_chat_requires_accepted_contacts() {
-    let world = World::new();
+async fn a_direct_chat_requires_accepted_contacts<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     world
         .svc
@@ -18,9 +15,8 @@ async fn a_direct_chat_requires_accepted_contacts() {
     );
 }
 
-#[tokio::test]
-async fn both_users_get_the_same_direct_conversation() {
-    let world = World::new();
+async fn both_users_get_the_same_direct_conversation<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     world.befriend(&alice, &bob).await;
 
@@ -29,9 +25,8 @@ async fn both_users_get_the_same_direct_conversation() {
     assert_eq!(from_alice, from_bob);
 }
 
-#[tokio::test]
-async fn a_direct_chat_with_yourself_is_invalid() {
-    let world = World::new();
+async fn a_direct_chat_with_yourself_is_invalid<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let alice = world.person().await;
     assert_eq!(
         world.svc.open_direct(alice.user, alice.user).await,
@@ -39,9 +34,8 @@ async fn a_direct_chat_with_yourself_is_invalid() {
     );
 }
 
-#[tokio::test]
-async fn every_device_of_both_users_starts_at_the_beginning() {
-    let world = World::new();
+async fn every_device_of_both_users_starts_at_the_beginning<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let alice_phone = world.add_device(&alice).await;
     let bob_old = world.add_device(&bob).await;
@@ -64,9 +58,8 @@ async fn every_device_of_both_users_starts_at_the_beginning() {
     );
 }
 
-#[tokio::test]
-async fn opening_again_adds_no_duplicate_members() {
-    let world = World::new();
+async fn opening_again_adds_no_duplicate_members<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let chat = world.direct_chat(&alice, &bob).await;
     let again = world.svc.open_direct(alice.user, bob.user).await.unwrap();
@@ -82,9 +75,8 @@ async fn opening_again_adds_no_duplicate_members() {
     assert!(matches!(state.positions, Positions::Members(members) if members.len() == 2));
 }
 
-#[tokio::test]
-async fn opening_after_a_block_is_refused_even_if_the_chat_exists() {
-    let world = World::new();
+async fn opening_after_a_block_is_refused_even_if_the_chat_exists<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     world.direct_chat(&alice, &bob).await;
     world.svc.contact_block(bob.user, alice.user).await.unwrap();
@@ -93,4 +85,15 @@ async fn opening_after_a_block_is_refused_even_if_the_chat_exists() {
         world.svc.open_direct(alice.user, bob.user).await,
         Err(DomainError::NotContact)
     );
+}
+
+pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
+    case_list![
+        a_direct_chat_requires_accepted_contacts,
+        both_users_get_the_same_direct_conversation,
+        a_direct_chat_with_yourself_is_invalid,
+        every_device_of_both_users_starts_at_the_beginning,
+        opening_again_adds_no_duplicate_members,
+        opening_after_a_block_is_refused_even_if_the_chat_exists,
+    ]
 }

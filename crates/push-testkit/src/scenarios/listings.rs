@@ -1,10 +1,8 @@
-mod common;
-
+use crate::{Backend, Case, Person, World, case_list, delete};
 use chrono::TimeDelta;
-use common::{Person, World, delete};
 use push_domain::{
     Clock, ConversationId, ConversationKind, ConversationSummary, MAX_UNREAD, MessageRef, Receipts,
-    UserId,
+    Store, UserId,
 };
 
 fn peer(peer_delivered_seq: i64, peer_read_seq: i64) -> Receipts {
@@ -14,7 +12,11 @@ fn peer(peer_delivered_seq: i64, peer_read_seq: i64) -> Receipts {
     }
 }
 
-async fn summary(world: &World, person: &Person, chat: ConversationId) -> ConversationSummary {
+async fn summary<S: Store>(
+    world: &World<S>,
+    person: &Person,
+    chat: ConversationId,
+) -> ConversationSummary {
     world
         .svc
         .list_conversations(person.user, None)
@@ -25,7 +27,7 @@ async fn summary(world: &World, person: &Person, chat: ConversationId) -> Conver
         .expect("conversation listed")
 }
 
-async fn listed(world: &World, person: &Person) -> Vec<ConversationId> {
+async fn listed<S: Store>(world: &World<S>, person: &Person) -> Vec<ConversationId> {
     world
         .svc
         .list_conversations(person.user, None)
@@ -41,9 +43,8 @@ fn sorted(mut users: Vec<UserId>) -> Vec<UserId> {
     users
 }
 
-#[tokio::test]
-async fn a_new_direct_conversation_is_listed_for_both_members() {
-    let world = World::new();
+async fn a_new_direct_conversation_is_listed_for_both_members<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let chat = world.direct_chat(&alice, &bob).await;
 
@@ -71,9 +72,8 @@ async fn a_new_direct_conversation_is_listed_for_both_members() {
     }
 }
 
-#[tokio::test]
-async fn unread_counts_messages_from_others_after_the_read_position() {
-    let world = World::new();
+async fn unread_counts_messages_from_others_after_the_read_position<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let chat = world.direct_chat(&alice, &bob).await;
     for body in ["one", "two", "three"] {
@@ -89,9 +89,8 @@ async fn unread_counts_messages_from_others_after_the_read_position() {
     assert_eq!((alices.read_seq, alices.unread), (0, 0));
 }
 
-#[tokio::test]
-async fn unread_skips_changes_and_deleted_messages() {
-    let world = World::new();
+async fn unread_skips_changes_and_deleted_messages<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let chat = world.direct_chat(&alice, &bob).await;
     let kept = world.send(&alice, chat, "kept").await;
@@ -107,9 +106,8 @@ async fn unread_skips_changes_and_deleted_messages() {
     assert_eq!((bobs.last_seq, bobs.unread), (4, 1));
 }
 
-#[tokio::test]
-async fn unread_is_capped() {
-    let world = World::new();
+async fn unread_is_capped<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let chat = world.direct_chat(&alice, &bob).await;
     for _ in 0..=MAX_UNREAD {
@@ -119,9 +117,8 @@ async fn unread_is_capped() {
     assert_eq!(summary(&world, &bob, chat).await.unread, MAX_UNREAD);
 }
 
-#[tokio::test]
-async fn unread_and_last_seq_stay_within_the_visible_range() {
-    let world = World::new();
+async fn unread_and_last_seq_stay_within_the_visible_range<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let chat = world.direct_chat(&alice, &bob).await;
     for _ in 0..5 {
@@ -137,9 +134,8 @@ async fn unread_and_last_seq_stay_within_the_visible_range() {
     assert_eq!((bobs.last_seq, bobs.unread), (2, 2));
 }
 
-#[tokio::test]
-async fn changed_since_lists_only_conversations_updated_later() {
-    let world = World::new();
+async fn changed_since_lists_only_conversations_updated_later<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob, carol) = (
         world.person().await,
         world.person().await,
@@ -176,9 +172,8 @@ async fn changed_since_lists_only_conversations_updated_later() {
     assert_eq!(listed(&world, &alice).await, all);
 }
 
-#[tokio::test]
-async fn a_blocked_conversation_is_hidden_from_the_blocker_only() {
-    let world = World::new();
+async fn a_blocked_conversation_is_hidden_from_the_blocker_only<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let chat = world.direct_chat(&alice, &bob).await;
 
@@ -194,9 +189,8 @@ async fn a_blocked_conversation_is_hidden_from_the_blocker_only() {
     assert_eq!(listed(&world, &alice).await, [chat]);
 }
 
-#[tokio::test]
-async fn peer_positions_are_zero_until_the_peer_acks_or_reads() {
-    let world = World::new();
+async fn peer_positions_are_zero_until_the_peer_acks_or_reads<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let chat = world.direct_chat(&alice, &bob).await;
     world.send(&alice, chat, "one").await;
@@ -204,9 +198,8 @@ async fn peer_positions_are_zero_until_the_peer_acks_or_reads() {
     assert_eq!(summary(&world, &alice, chat).await.receipts, peer(0, 0));
 }
 
-#[tokio::test]
-async fn peer_positions_are_listed_but_do_not_count_as_changes() {
-    let world = World::new();
+async fn peer_positions_are_listed_but_do_not_count_as_changes<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let chat = world.direct_chat(&alice, &bob).await;
     for body in ["one", "two", "three"] {
@@ -235,9 +228,8 @@ async fn peer_positions_are_listed_but_do_not_count_as_changes() {
     );
 }
 
-#[tokio::test]
-async fn a_group_is_listed_with_its_admins_and_group_wide_positions() {
-    let world = World::new();
+async fn a_group_is_listed_with_its_admins_and_group_wide_positions<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob, carol) = (
         world.person().await,
         world.person().await,
@@ -277,9 +269,8 @@ async fn a_group_is_listed_with_its_admins_and_group_wide_positions() {
     );
 }
 
-#[tokio::test]
-async fn unread_in_a_group_counts_messages_from_everyone_else() {
-    let world = World::new();
+async fn unread_in_a_group_counts_messages_from_everyone_else<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob, carol) = (
         world.person().await,
         world.person().await,
@@ -291,4 +282,20 @@ async fn unread_in_a_group_counts_messages_from_everyone_else() {
 
     assert_eq!(summary(&world, &alice, group).await.unread, 2);
     assert_eq!(summary(&world, &bob, group).await.unread, 1);
+}
+
+pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
+    case_list![
+        a_new_direct_conversation_is_listed_for_both_members,
+        unread_counts_messages_from_others_after_the_read_position,
+        unread_skips_changes_and_deleted_messages,
+        unread_is_capped,
+        unread_and_last_seq_stay_within_the_visible_range,
+        changed_since_lists_only_conversations_updated_later,
+        a_blocked_conversation_is_hidden_from_the_blocker_only,
+        peer_positions_are_zero_until_the_peer_acks_or_reads,
+        peer_positions_are_listed_but_do_not_count_as_changes,
+        a_group_is_listed_with_its_admins_and_group_wide_positions,
+        unread_in_a_group_counts_messages_from_everyone_else,
+    ]
 }

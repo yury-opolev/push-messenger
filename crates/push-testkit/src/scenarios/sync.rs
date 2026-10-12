@@ -1,11 +1,8 @@
-mod common;
-
-use common::{World, bodies, seqs};
+use crate::{Backend, Case, World, bodies, case_list, seqs};
 use push_domain::DomainError;
 
-#[tokio::test]
-async fn the_recipient_receives_new_messages_in_order() {
-    let world = World::new();
+async fn the_recipient_receives_new_messages_in_order<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let chat = world.direct_chat(&alice, &bob).await;
     world.send(&alice, chat, "one").await;
@@ -17,9 +14,8 @@ async fn the_recipient_receives_new_messages_in_order() {
     assert!(!batch.more);
 }
 
-#[tokio::test]
-async fn the_senders_own_devices_also_receive_the_message() {
-    let world = World::new();
+async fn the_senders_own_devices_also_receive_the_message<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let chat = world.direct_chat(&alice, &bob).await;
     world.send(&alice, chat, "one").await;
@@ -28,9 +24,8 @@ async fn the_senders_own_devices_also_receive_the_message() {
     assert_eq!(bodies(&batch.entries), ["one"]);
 }
 
-#[tokio::test]
-async fn an_ack_is_cumulative_and_stops_redelivery() {
-    let world = World::new();
+async fn an_ack_is_cumulative_and_stops_redelivery<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let chat = world.direct_chat(&alice, &bob).await;
     for body in ["one", "two", "three"] {
@@ -42,9 +37,8 @@ async fn an_ack_is_cumulative_and_stops_redelivery() {
     assert_eq!(bodies(&batch.entries), ["three"]);
 }
 
-#[tokio::test]
-async fn an_ack_never_moves_backwards() {
-    let world = World::new();
+async fn an_ack_never_moves_backwards<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let chat = world.direct_chat(&alice, &bob).await;
     world.send(&alice, chat, "one").await;
@@ -63,9 +57,8 @@ async fn an_ack_never_moves_backwards() {
     );
 }
 
-#[tokio::test]
-async fn an_ack_beyond_the_last_message_is_rejected() {
-    let world = World::new();
+async fn an_ack_beyond_the_last_message_is_rejected<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let chat = world.direct_chat(&alice, &bob).await;
     world.send(&alice, chat, "one").await;
@@ -76,9 +69,8 @@ async fn an_ack_beyond_the_last_message_is_rejected() {
     );
 }
 
-#[tokio::test]
-async fn a_new_device_starts_up_to_date() {
-    let world = World::new();
+async fn a_new_device_starts_up_to_date<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let chat = world.direct_chat(&alice, &bob).await;
     world.send(&alice, chat, "one").await;
@@ -100,9 +92,8 @@ async fn a_new_device_starts_up_to_date() {
     assert_eq!(bodies(&batch.entries), ["three"]);
 }
 
-#[tokio::test]
-async fn sync_respects_the_batch_limit() {
-    let world = World::new();
+async fn sync_respects_the_batch_limit<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let chat = world.direct_chat(&alice, &bob).await;
     for body in ["1", "2", "3", "4", "5"] {
@@ -119,9 +110,8 @@ async fn sync_respects_the_batch_limit() {
     assert!(!rest.more);
 }
 
-#[tokio::test]
-async fn sync_covers_every_conversation_of_the_user() {
-    let world = World::new();
+async fn sync_covers_every_conversation_of_the_user<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob, carol) = (
         world.person().await,
         world.person().await,
@@ -137,9 +127,8 @@ async fn sync_covers_every_conversation_of_the_user() {
     assert_eq!(received, ["from alice", "from carol"]);
 }
 
-#[tokio::test]
-async fn a_revoked_device_can_neither_sync_nor_ack() {
-    let world = World::new();
+async fn a_revoked_device_can_neither_sync_nor_ack<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let chat = world.direct_chat(&alice, &bob).await;
     world.send(&alice, chat, "one").await;
@@ -155,9 +144,8 @@ async fn a_revoked_device_can_neither_sync_nor_ack() {
     );
 }
 
-#[tokio::test]
-async fn a_full_batch_reports_more_only_if_something_remains() {
-    let world = World::new();
+async fn a_full_batch_reports_more_only_if_something_remains<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob, carol) = (
         world.person().await,
         world.person().await,
@@ -178,9 +166,8 @@ async fn a_full_batch_reports_more_only_if_something_remains() {
     assert!(full.more);
 }
 
-#[tokio::test]
-async fn a_zero_limit_is_treated_as_one() {
-    let world = World::new();
+async fn a_zero_limit_is_treated_as_one<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let chat = world.direct_chat(&alice, &bob).await;
     world.send(&alice, chat, "one").await;
@@ -191,9 +178,8 @@ async fn a_zero_limit_is_treated_as_one() {
     assert!(batch.more);
 }
 
-#[tokio::test]
-async fn a_non_member_cannot_ack() {
-    let world = World::new();
+async fn a_non_member_cannot_ack<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob, carol) = (
         world.person().await,
         world.person().await,
@@ -208,9 +194,8 @@ async fn a_non_member_cannot_ack() {
     );
 }
 
-#[tokio::test]
-async fn a_negative_ack_is_rejected() {
-    let world = World::new();
+async fn a_negative_ack_is_rejected<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let chat = world.direct_chat(&alice, &bob).await;
     world.send(&alice, chat, "one").await;
@@ -221,9 +206,8 @@ async fn a_negative_ack_is_rejected() {
     );
 }
 
-#[tokio::test]
-async fn sync_without_ack_returns_the_same_entries() {
-    let world = World::new();
+async fn sync_without_ack_returns_the_same_entries<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let chat = world.direct_chat(&alice, &bob).await;
     world.send(&alice, chat, "one").await;
@@ -234,9 +218,8 @@ async fn sync_without_ack_returns_the_same_entries() {
     assert_eq!(seqs(&second.entries), [1]);
 }
 
-#[tokio::test]
-async fn a_new_device_gets_nothing_from_a_conversation_already_left() {
-    let world = World::new();
+async fn a_new_device_gets_nothing_from_a_conversation_already_left<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     let chat = world.direct_chat(&alice, &bob).await;
     for body in ["one", "two", "three"] {
@@ -250,4 +233,24 @@ async fn a_new_device_gets_nothing_from_a_conversation_already_left() {
     assert!(batch.entries.is_empty());
     let history = world.svc.history(bob.user, chat, None, 10).await.unwrap();
     assert_eq!(seqs(&history.entries), [1, 2]);
+}
+
+pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
+    case_list![
+        the_recipient_receives_new_messages_in_order,
+        the_senders_own_devices_also_receive_the_message,
+        an_ack_is_cumulative_and_stops_redelivery,
+        an_ack_never_moves_backwards,
+        an_ack_beyond_the_last_message_is_rejected,
+        a_new_device_starts_up_to_date,
+        sync_respects_the_batch_limit,
+        sync_covers_every_conversation_of_the_user,
+        a_revoked_device_can_neither_sync_nor_ack,
+        a_full_batch_reports_more_only_if_something_remains,
+        a_zero_limit_is_treated_as_one,
+        a_non_member_cannot_ack,
+        a_negative_ack_is_rejected,
+        sync_without_ack_returns_the_same_entries,
+        a_new_device_gets_nothing_from_a_conversation_already_left,
+    ]
 }

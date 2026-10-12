@@ -1,6 +1,4 @@
-mod common;
-
-use common::{Person, World};
+use crate::{Backend, Case, Person, World, case_list};
 use push_domain::{ContactState, ContactSummary, DomainError, Event, UserId, ValidationError};
 
 fn changed(user: &Person, peer: &Person, state: Option<ContactState>) -> Event {
@@ -11,9 +9,8 @@ fn changed(user: &Person, peer: &Person, state: Option<ContactState>) -> Event {
     }
 }
 
-#[tokio::test]
-async fn request_then_accept_makes_both_sides_accepted() {
-    let world = World::new();
+async fn request_then_accept_makes_both_sides_accepted<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
 
     assert_eq!(
@@ -40,9 +37,8 @@ async fn request_then_accept_makes_both_sides_accepted() {
     );
 }
 
-#[tokio::test]
-async fn crossing_requests_become_accepted() {
-    let world = World::new();
+async fn crossing_requests_become_accepted<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     world
         .svc
@@ -59,9 +55,8 @@ async fn crossing_requests_become_accepted() {
     );
 }
 
-#[tokio::test]
-async fn only_the_recipient_can_accept_a_request() {
-    let world = World::new();
+async fn only_the_recipient_can_accept_a_request<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     assert_eq!(
         world.svc.contact_accept(alice.user, bob.user).await,
@@ -78,9 +73,8 @@ async fn only_the_recipient_can_accept_a_request() {
     );
 }
 
-#[tokio::test]
-async fn declining_removes_the_request_on_both_sides() {
-    let world = World::new();
+async fn declining_removes_the_request_on_both_sides<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     world
         .svc
@@ -102,9 +96,8 @@ async fn declining_removes_the_request_on_both_sides() {
     );
 }
 
-#[tokio::test]
-async fn a_block_is_invisible_to_the_blocked_user() {
-    let world = World::new();
+async fn a_block_is_invisible_to_the_blocked_user<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     world.svc.contact_block(alice.user, bob.user).await.unwrap();
 
@@ -118,9 +111,8 @@ async fn a_block_is_invisible_to_the_blocked_user() {
     );
 }
 
-#[tokio::test]
-async fn the_blocker_cannot_send_requests() {
-    let world = World::new();
+async fn the_blocker_cannot_send_requests<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     world.svc.contact_block(alice.user, bob.user).await.unwrap();
     assert_eq!(
@@ -129,9 +121,8 @@ async fn the_blocker_cannot_send_requests() {
     );
 }
 
-#[tokio::test]
-async fn blocking_ends_an_accepted_contact() {
-    let world = World::new();
+async fn blocking_ends_an_accepted_contact<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     world.befriend(&alice, &bob).await;
     world.svc.contact_block(alice.user, bob.user).await.unwrap();
@@ -141,9 +132,8 @@ async fn blocking_ends_an_accepted_contact() {
     );
 }
 
-#[tokio::test]
-async fn unblocking_allows_a_fresh_request() {
-    let world = World::new();
+async fn unblocking_allows_a_fresh_request<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     world.svc.contact_block(alice.user, bob.user).await.unwrap();
     world
@@ -161,9 +151,8 @@ async fn unblocking_allows_a_fresh_request() {
     );
 }
 
-#[tokio::test]
-async fn a_user_cannot_request_themselves() {
-    let world = World::new();
+async fn a_user_cannot_request_themselves<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let alice = world.person().await;
     assert_eq!(
         world.svc.contact_request(alice.user, alice.user).await,
@@ -171,9 +160,8 @@ async fn a_user_cannot_request_themselves() {
     );
 }
 
-#[tokio::test]
-async fn requesting_an_unknown_user_fails() {
-    let world = World::new();
+async fn requesting_an_unknown_user_fails<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let alice = world.person().await;
     assert_eq!(
         world.svc.contact_request(alice.user, UserId::new()).await,
@@ -181,9 +169,8 @@ async fn requesting_an_unknown_user_fails() {
     );
 }
 
-#[tokio::test]
-async fn a_hidden_request_arrives_when_the_block_is_lifted() {
-    let world = World::new();
+async fn a_hidden_request_arrives_when_the_block_is_lifted<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     world.svc.contact_block(alice.user, bob.user).await.unwrap();
     world
@@ -218,9 +205,8 @@ async fn a_hidden_request_arrives_when_the_block_is_lifted() {
     }
 }
 
-#[tokio::test]
-async fn the_sender_cannot_decline_their_own_request() {
-    let world = World::new();
+async fn the_sender_cannot_decline_their_own_request<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     world
         .svc
@@ -233,9 +219,8 @@ async fn the_sender_cannot_decline_their_own_request() {
     );
 }
 
-#[tokio::test]
-async fn blocking_cancels_a_pending_request_in_either_direction() {
-    let world = World::new();
+async fn blocking_cancels_a_pending_request_in_either_direction<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     world
         .svc
@@ -265,9 +250,8 @@ async fn blocking_cancels_a_pending_request_in_either_direction() {
     );
 }
 
-#[tokio::test]
-async fn a_repeated_request_changes_nothing() {
-    let world = World::new();
+async fn a_repeated_request_changes_nothing<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     for _ in 0..2 {
         assert_eq!(
@@ -281,9 +265,8 @@ async fn a_repeated_request_changes_nothing() {
     );
 }
 
-#[tokio::test]
-async fn a_request_to_an_accepted_contact_stays_accepted() {
-    let world = World::new();
+async fn a_request_to_an_accepted_contact_stays_accepted<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     world.befriend(&alice, &bob).await;
     assert_eq!(
@@ -296,9 +279,8 @@ async fn a_request_to_an_accepted_contact_stays_accepted() {
     );
 }
 
-#[tokio::test]
-async fn contact_operations_reject_self_and_unknown_users() {
-    let world = World::new();
+async fn contact_operations_reject_self_and_unknown_users<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let alice = world.person().await;
     let selfish = Err(DomainError::Invalid(ValidationError::SelfTarget));
     assert_eq!(
@@ -328,9 +310,8 @@ async fn contact_operations_reject_self_and_unknown_users() {
     );
 }
 
-#[tokio::test]
-async fn a_request_and_its_acceptance_are_announced_to_both_users() {
-    let world = World::new();
+async fn a_request_and_its_acceptance_are_announced_to_both_users<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
 
     world
@@ -360,9 +341,8 @@ async fn a_request_and_its_acceptance_are_announced_to_both_users() {
     );
 }
 
-#[tokio::test]
-async fn crossing_requests_announce_acceptance_to_both_users() {
-    let world = World::new();
+async fn crossing_requests_announce_acceptance_to_both_users<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     world
         .svc
@@ -385,9 +365,8 @@ async fn crossing_requests_announce_acceptance_to_both_users() {
     );
 }
 
-#[tokio::test]
-async fn a_request_that_changes_nothing_publishes_nothing() {
-    let world = World::new();
+async fn a_request_that_changes_nothing_publishes_nothing<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     world
         .svc
@@ -404,9 +383,8 @@ async fn a_request_that_changes_nothing_publishes_nothing() {
     assert!(world.notifier.take().is_empty());
 }
 
-#[tokio::test]
-async fn a_decline_is_announced_only_to_the_user_who_declined() {
-    let world = World::new();
+async fn a_decline_is_announced_only_to_the_user_who_declined<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     world
         .svc
@@ -423,9 +401,8 @@ async fn a_decline_is_announced_only_to_the_user_who_declined() {
     assert_eq!(world.notifier.take(), [changed(&bob, &alice, None)]);
 }
 
-#[tokio::test]
-async fn a_block_is_announced_only_to_the_blocker() {
-    let world = World::new();
+async fn a_block_is_announced_only_to_the_blocker<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     world.befriend(&alice, &bob).await;
     world.notifier.take();
@@ -437,9 +414,10 @@ async fn a_block_is_announced_only_to_the_blocker() {
     );
 }
 
-#[tokio::test]
-async fn a_request_hidden_by_a_block_is_announced_only_when_the_block_is_lifted() {
-    let world = World::new();
+async fn a_request_hidden_by_a_block_is_announced_only_when_the_block_is_lifted<B: Backend>(
+    backend: &B,
+) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     world.svc.contact_block(alice.user, bob.user).await.unwrap();
     world.notifier.take();
@@ -465,9 +443,8 @@ async fn a_request_hidden_by_a_block_is_announced_only_when_the_block_is_lifted(
     );
 }
 
-#[tokio::test]
-async fn unblocking_someone_who_is_not_blocked_publishes_nothing() {
-    let world = World::new();
+async fn unblocking_someone_who_is_not_blocked_publishes_nothing<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
     world
         .svc
@@ -477,9 +454,8 @@ async fn unblocking_someone_who_is_not_blocked_publishes_nothing() {
     assert!(world.notifier.take().is_empty());
 }
 
-#[tokio::test]
-async fn contacts_are_listed_from_the_owners_side_only() {
-    let world = World::new();
+async fn contacts_are_listed_from_the_owners_side_only<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
     let (alice, bob, carol, dave) = (
         world.person().await,
         world.person().await,
@@ -514,4 +490,33 @@ async fn contacts_are_listed_from_the_owners_side_only() {
         world.svc.list_contacts(carol.user).await,
         Ok(vec![contact(&alice, ContactState::RequestedIn)])
     );
+}
+
+pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
+    case_list![
+        request_then_accept_makes_both_sides_accepted,
+        crossing_requests_become_accepted,
+        only_the_recipient_can_accept_a_request,
+        declining_removes_the_request_on_both_sides,
+        a_block_is_invisible_to_the_blocked_user,
+        the_blocker_cannot_send_requests,
+        blocking_ends_an_accepted_contact,
+        unblocking_allows_a_fresh_request,
+        a_user_cannot_request_themselves,
+        requesting_an_unknown_user_fails,
+        a_hidden_request_arrives_when_the_block_is_lifted,
+        the_sender_cannot_decline_their_own_request,
+        blocking_cancels_a_pending_request_in_either_direction,
+        a_repeated_request_changes_nothing,
+        a_request_to_an_accepted_contact_stays_accepted,
+        contact_operations_reject_self_and_unknown_users,
+        a_request_and_its_acceptance_are_announced_to_both_users,
+        crossing_requests_announce_acceptance_to_both_users,
+        a_request_that_changes_nothing_publishes_nothing,
+        a_decline_is_announced_only_to_the_user_who_declined,
+        a_block_is_announced_only_to_the_blocker,
+        a_request_hidden_by_a_block_is_announced_only_when_the_block_is_lifted,
+        unblocking_someone_who_is_not_blocked_publishes_nothing,
+        contacts_are_listed_from_the_owners_side_only,
+    ]
 }

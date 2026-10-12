@@ -1,0 +1,23 @@
+[package]
+name = "push-testkit"
+description = "The push-domain behaviour suite, written once and run against every Store."
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+chrono.workspace = true
+libtest-mimic.workspace = true
+push-domain.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "time"] }
+
+[[test]]
+name = "in_memory"
+harness = false
+
+[lints]
+workspace = true
