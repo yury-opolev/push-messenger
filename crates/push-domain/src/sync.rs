@@ -4,6 +4,7 @@ use crate::error::{DomainError, DomainResult};
 use crate::ids::{ConversationId, DeviceId};
 use crate::model::Entry;
 use crate::notify::Notifier;
+use crate::read::direct_receipt;
 use crate::service::{Messaging, require_device};
 use crate::store::{Store, Tx};
 use crate::validation::MAX_SYNC_BATCH;
@@ -76,7 +77,8 @@ where
     }
 
     /// Records that the device holds everything up to `seq`. Returns whether the
-    /// position moved; it never moves backwards.
+    /// position moved; it never moves backwards. If the user's delivered position moved
+    /// over a message from the other member of a direct conversation, they get a receipt.
     pub async fn ack(
         &self,
         device: DeviceId,
@@ -93,8 +95,22 @@ where
         if seq < member.visible_from_seq - 1 {
             return Ok(false);
         }
+        // Count only from the member's floor; matters once group joins exist (Plan 2B).
+        let delivered_before = tx
+            .delivered_seq(conversation, user)
+            .await?
+            .max(member.visible_from_seq - 1);
         let moved = tx.raise_cursor(device, conversation, seq).await?;
+        let receipt = direct_receipt(
+            &mut tx,
+            &found,
+            user,
+            delivered_before,
+            delivered_before.max(seq),
+        )
+        .await?;
         tx.commit().await?;
+        self.publish(receipt.into_iter().collect()).await;
         Ok(moved)
     }
 }

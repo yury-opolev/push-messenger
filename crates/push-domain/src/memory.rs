@@ -383,6 +383,32 @@ impl Tx for InMemoryTx {
             .collect())
     }
 
+    async fn count_incoming_messages(
+        &mut self,
+        conversation: ConversationId,
+        user: UserId,
+        after: i64,
+        up_to: i64,
+        cap: u32,
+    ) -> DomainResult<u32> {
+        if after >= up_to {
+            return Ok(0);
+        }
+        let count = self
+            .work
+            .entries
+            .range((conversation, after + 1)..=(conversation, up_to))
+            .map(|(_, entry)| entry)
+            .filter(|entry| {
+                entry.kind == EntryKind::Message
+                    && entry.deleted_at.is_none()
+                    && entry.sender_id != user
+            })
+            .take(cap as usize)
+            .count();
+        Ok(count as u32)
+    }
+
     async fn messages_before(
         &mut self,
         conversation: ConversationId,
@@ -689,6 +715,40 @@ mod tests {
             seqs(&tx.messages_before(conversation, 1, 1, 10).await.unwrap()),
             Vec::<i64>::new()
         );
+    }
+
+    #[tokio::test]
+    async fn only_live_messages_from_others_are_counted_up_to_the_cap() {
+        let store = InMemoryStore::new();
+        let conversation = conversation();
+        let id = conversation.id;
+        let me = UserId::new();
+        let mut tx = store.begin().await.unwrap();
+        tx.insert_conversation(conversation).await.unwrap();
+        let mut entries = vec![
+            entry(id, 1, ClientMsgId::new()),
+            Entry {
+                sender_id: me,
+                ..entry(id, 2, ClientMsgId::new())
+            },
+            Entry {
+                deleted_at: Some(start()),
+                ..entry(id, 3, ClientMsgId::new())
+            },
+            Entry {
+                kind: EntryKind::Edit,
+                ..entry(id, 4, ClientMsgId::new())
+            },
+        ];
+        entries.extend((5..=7).map(|seq| entry(id, seq, ClientMsgId::new())));
+        for entry in entries {
+            tx.insert_entry(entry).await.unwrap();
+        }
+
+        assert_eq!(tx.count_incoming_messages(id, me, 0, 7, 100).await, Ok(4));
+        assert_eq!(tx.count_incoming_messages(id, me, 1, 4, 100).await, Ok(0));
+        assert_eq!(tx.count_incoming_messages(id, me, 0, 7, 2).await, Ok(2));
+        assert_eq!(tx.count_incoming_messages(id, me, 7, 7, 100).await, Ok(0));
     }
 
     #[tokio::test]

@@ -9,6 +9,7 @@ use crate::model::{
     ContentType, Conversation, ConversationKind, Entry, EntryKind, Member, SendReceipt,
 };
 use crate::notify::{Event, Notifier};
+use crate::read::direct_receipt;
 use crate::service::{Messaging, current_member_ids, require_device};
 use crate::store::{InsertOutcome, Store, Tx};
 use crate::validation::validate_text;
@@ -52,6 +53,9 @@ where
     /// Appends a text message. A retry with the same `client_msg_id` returns the original
     /// receipt, stores nothing new and publishes nothing — even if the sender has since lost
     /// the right to send.
+    ///
+    /// Sending marks the conversation read for the sender; if that passes over a message
+    /// from the other member of a direct conversation, they get a read receipt.
     pub async fn send_text(&self, command: SendText) -> DomainResult<SendReceipt> {
         validate_text(&command.body)?;
         let prepared = self
@@ -67,9 +71,9 @@ where
             mut tx,
             conversation,
             members,
+            member,
             seq,
             now,
-            ..
         } = match prepared {
             Prepared::Retry(receipt) => return Ok(receipt),
             Prepared::Ready(append) => append,
@@ -109,12 +113,15 @@ where
         }
         tx.raise_read_seq(conversation.id, command.sender, seq)
             .await?;
+        let read_receipt =
+            direct_receipt(&mut tx, &conversation, command.sender, member.read_seq, seq).await?;
         tx.commit().await?;
 
-        self.publish(vec![Event::EntriesAvailable {
+        let mut events = vec![Event::EntriesAvailable {
             users: current_member_ids(&members),
-        }])
-        .await;
+        }];
+        events.extend(read_receipt);
+        self.publish(events).await;
         Ok(receipt)
     }
 

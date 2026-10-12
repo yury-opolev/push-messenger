@@ -42,6 +42,7 @@ async fn history_does_not_go_below_visible_from() {
     let (world, bob, chat) = chat_with_six_messages(3, None).await;
     let history = world.svc.history(bob.user, chat, None, 10).await.unwrap();
     assert_eq!(seqs(&history.entries), [3, 4, 5, 6]);
+    assert!(!history.has_more);
 }
 
 #[tokio::test]

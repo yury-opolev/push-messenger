@@ -177,6 +177,17 @@ pub trait Tx: Send {
         targets_from: i64,
         limit: u32,
     ) -> DomainResult<Vec<Entry>>;
+    /// Counts entries with `after < seq <= up_to` that are messages (`kind = Message`), not
+    /// deleted, and sent by someone other than `user`. Stops counting at `cap`, so the
+    /// result is at most `cap`.
+    async fn count_incoming_messages(
+        &mut self,
+        conversation: ConversationId,
+        user: UserId,
+        after: i64,
+        up_to: i64,
+        cap: u32,
+    ) -> DomainResult<u32>;
     /// The newest `limit` entries of kind `Message` or `System` with `from <= seq < before`,
     /// returned oldest first. Edit and delete entries are skipped and do not count towards
     /// `limit`.

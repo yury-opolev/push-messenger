@@ -117,6 +117,26 @@ async fn history_holds_messages_in_their_current_state_and_no_changes() {
     assert_eq!(seqs(&page.entries), [1, 2]);
     assert_eq!(bodies(&page.entries), ["one, edited", ""]);
     assert!(page.entries[1].deleted_at.is_some());
+    assert!(page.entries[1].body.is_none());
+}
+
+#[tokio::test]
+async fn only_edits_below_the_page_mean_no_more() {
+    let world = World::new();
+    let (alice, bob) = (world.person().await, world.person().await);
+    let chat = world.direct_chat(&alice, &bob).await;
+    let first = world.send(&alice, chat, "one").await;
+    for body in ["a", "b", "c"] {
+        world.edit(&alice, chat, &first, body).await;
+    }
+
+    let page = world
+        .svc
+        .history(bob.user, chat, Some(2), 10)
+        .await
+        .unwrap();
+    assert_eq!(seqs(&page.entries), [1]);
+    assert!(!page.has_more);
 }
 
 #[tokio::test]
