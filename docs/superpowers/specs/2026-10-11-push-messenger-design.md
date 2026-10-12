@@ -297,8 +297,9 @@ conversation lock and then hits the conflict, so retries are race-free.
   current `last_seq`, so it starts up to date and loads older messages through
   `FetchHistory`;
 - when a conversation is created or a member is added, every device of each new member
-  gets a position at `visible_from_seq - 1`, so it receives everything from the start of
-  its visibility.
+  that has no position gets one at `visible_from_seq - 1`, so it receives everything from
+  the start of its visibility. A rejoining member's devices keep their older position,
+  and every reader treats positions below `visible_from_seq - 1` as the floor.
 
 ### 4.4 Delivery states
 
@@ -493,9 +494,11 @@ Access-token claims: `sub`, `device_id`, `email_verified`, `exp`, `iat`, `jti`, 
 - Two roles. **Admins** (one or more) rename the group, add and remove members, and
   promote members to admin or demote admins to member. **Members** chat and can leave.
 - A group always has at least one admin: the last admin cannot be demoted. If the last
-  admin leaves or is removed, the current member who joined first (lowest
+  admin leaves, the current member who joined first (lowest
   `visible_from_seq`, then lowest user id) becomes admin, recorded as a system entry.
-  Admins remove others; an admin who wants to go leaves. A group with no members left is
+  This happens only on leaving: an admin can only be removed by another admin, so removal
+  never leaves a group without an admin. Admins remove others; an admin who wants to go
+  leaves. A group with no members left is
   closed.
 - Every membership change is a **system entry** in the log, written under the same
   conversation lock as messages. Sends and membership changes are therefore strictly

@@ -21,8 +21,12 @@ pub const SYSTEM_EVENT_VERSION: u32 = 1;
 
 /// What a system entry records. `actor` is the user whose action caused it; it is also
 /// the entry's `sender_id`.
+///
+/// Decoders must tolerate new event types; `decode` returns `None` for types this version
+/// does not know.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum SystemEvent {
     /// `actor` created the group titled `title` with `users` as its other first members.
     Created {
