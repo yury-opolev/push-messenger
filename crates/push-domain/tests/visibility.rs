@@ -34,14 +34,14 @@ async fn sync_and_history_stop_at_left_at() {
     let batch = world.svc.sync(bob.device, 100).await.unwrap();
     assert_eq!(seqs(&batch.entries), [1, 2, 3, 4]);
     let history = world.svc.history(bob.user, chat, None, 10).await.unwrap();
-    assert_eq!(seqs(&history), [1, 2, 3, 4]);
+    assert_eq!(seqs(&history.entries), [1, 2, 3, 4]);
 }
 
 #[tokio::test]
 async fn history_does_not_go_below_visible_from() {
     let (world, bob, chat) = chat_with_six_messages(3, None).await;
     let history = world.svc.history(bob.user, chat, None, 10).await.unwrap();
-    assert_eq!(seqs(&history), [3, 4, 5, 6]);
+    assert_eq!(seqs(&history.entries), [3, 4, 5, 6]);
 }
 
 #[tokio::test]

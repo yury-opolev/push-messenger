@@ -177,8 +177,10 @@ pub trait Tx: Send {
         targets_from: i64,
         limit: u32,
     ) -> DomainResult<Vec<Entry>>;
-    /// The newest `limit` entries with `from <= seq < before`, returned oldest first.
-    async fn entries_before(
+    /// The newest `limit` entries of kind `Message` or `System` with `from <= seq < before`,
+    /// returned oldest first. Edit and delete entries are skipped and do not count towards
+    /// `limit`.
+    async fn messages_before(
         &mut self,
         conversation: ConversationId,
         from: i64,

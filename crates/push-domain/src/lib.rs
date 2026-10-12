@@ -24,6 +24,7 @@ pub mod validation;
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use edit::{DeleteMessage, EditText, MessageRef};
 pub use error::{DomainError, DomainResult};
+pub use history::HistoryPage;
 pub use ids::{ClientMsgId, ConversationId, DeviceId, MessageId, UserId};
 pub use memory::InMemoryStore;
 pub use model::{

@@ -8,21 +8,31 @@ use crate::service::Messaging;
 use crate::store::{Store, Tx};
 use crate::validation::MAX_HISTORY_PAGE;
 
+/// One page of history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryPage {
+    /// Messages and system entries in their current state, oldest first. Never edit or
+    /// delete entries: their effect is already applied to the messages.
+    pub entries: Vec<Entry>,
+    /// Older entries visible to the caller exist before this page.
+    pub has_more: bool,
+}
+
 impl<S, C, N> Messaging<S, C, N>
 where
     S: Store,
     C: Clock,
     N: Notifier,
 {
-    /// Up to `limit` entries before `before_seq` (or the newest ones), oldest first,
-    /// limited to what `user` may see. `before_seq` is exclusive.
+    /// Up to `limit` messages before `before_seq` (or the newest ones), limited to what
+    /// `user` may see. `before_seq` is exclusive.
     pub async fn history(
         &self,
         user: UserId,
         conversation: ConversationId,
         before_seq: Option<i64>,
         limit: u32,
-    ) -> DomainResult<Vec<Entry>> {
+    ) -> DomainResult<HistoryPage> {
         let limit = limit.clamp(1, MAX_HISTORY_PAGE);
         let mut tx = self.store.begin().await?;
         let found = require_conversation(&mut tx, conversation).await?;
@@ -30,10 +40,15 @@ where
 
         let end = member.visible_upper(found.last_seq) + 1;
         let before = before_seq.map_or(end, |seq| seq.min(end));
-        let page = tx
-            .entries_before(conversation, member.visible_from_seq, before, limit)
+        // One entry beyond the page tells whether older ones exist.
+        let mut entries = tx
+            .messages_before(conversation, member.visible_from_seq, before, limit + 1)
             .await?;
         tx.rollback().await?;
-        Ok(page)
+        let has_more = entries.len() > limit as usize;
+        if has_more {
+            entries.remove(0);
+        }
+        Ok(HistoryPage { entries, has_more })
     }
 }

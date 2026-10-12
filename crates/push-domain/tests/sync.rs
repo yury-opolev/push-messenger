@@ -249,5 +249,5 @@ async fn a_new_device_gets_nothing_from_a_conversation_already_left() {
     let batch = world.svc.sync(new_device, 100).await.unwrap();
     assert!(batch.entries.is_empty());
     let history = world.svc.history(bob.user, chat, None, 10).await.unwrap();
-    assert_eq!(seqs(&history), [1, 2]);
+    assert_eq!(seqs(&history.entries), [1, 2]);
 }

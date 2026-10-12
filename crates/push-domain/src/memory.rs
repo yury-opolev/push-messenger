@@ -383,7 +383,7 @@ impl Tx for InMemoryTx {
             .collect())
     }
 
-    async fn entries_before(
+    async fn messages_before(
         &mut self,
         conversation: ConversationId,
         from: i64,
@@ -398,8 +398,10 @@ impl Tx for InMemoryTx {
             .entries
             .range((conversation, from)..(conversation, before))
             .rev()
+            .map(|(_, entry)| entry)
+            .filter(|entry| matches!(entry.kind, EntryKind::Message | EntryKind::System))
             .take(limit as usize)
-            .map(|(_, entry)| entry.clone())
+            .cloned()
             .collect();
         page.reverse();
         Ok(page)
@@ -676,16 +678,49 @@ mod tests {
             Vec::<i64>::new()
         );
         assert_eq!(
-            seqs(&tx.entries_before(conversation, 1, 5, 2).await.unwrap()),
+            seqs(&tx.messages_before(conversation, 1, 5, 2).await.unwrap()),
             vec![3, 4]
         );
         assert_eq!(
-            seqs(&tx.entries_before(conversation, 2, 3, 10).await.unwrap()),
+            seqs(&tx.messages_before(conversation, 2, 3, 10).await.unwrap()),
             vec![2]
         );
         assert_eq!(
-            seqs(&tx.entries_before(conversation, 1, 1, 10).await.unwrap()),
+            seqs(&tx.messages_before(conversation, 1, 1, 10).await.unwrap()),
             Vec::<i64>::new()
+        );
+    }
+
+    #[tokio::test]
+    async fn messages_before_skips_edits_and_deletes() {
+        let store = InMemoryStore::new();
+        let conversation = conversation();
+        let id = conversation.id;
+        let mut tx = store.begin().await.unwrap();
+        tx.insert_conversation(conversation).await.unwrap();
+        let kinds = [
+            EntryKind::Message,
+            EntryKind::Edit,
+            EntryKind::System,
+            EntryKind::Delete,
+            EntryKind::Message,
+        ];
+        for (seq, kind) in (1..).zip(kinds) {
+            tx.insert_entry(Entry {
+                kind,
+                ..entry(id, seq, ClientMsgId::new())
+            })
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(
+            seqs(&tx.messages_before(id, 1, 6, 2).await.unwrap()),
+            vec![3, 5]
+        );
+        assert_eq!(
+            seqs(&tx.messages_before(id, 1, 6, 10).await.unwrap()),
+            vec![1, 3, 5]
         );
     }
 
