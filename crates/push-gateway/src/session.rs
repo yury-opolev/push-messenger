@@ -1,6 +1,6 @@
 //! The protocol state of one WebSocket connection, without any I/O: which frames are
-//! allowed when, what each one asks the gateway to do, and which entries the client has
-//! already been sent.
+//! allowed when, what each one asks the gateway to do, which entries the client has
+//! already been sent, and when to sync again.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -21,7 +21,8 @@ pub enum Step {
     Identify { user: Uuid, device: Uuid },
     /// Forward a send to message-svc; answer with its `SendAck` or an error.
     Send(Send),
-    /// Forward an ack to message-svc; answer only if it fails.
+    /// Forward an ack to message-svc; answer only if it fails. If it moved the position,
+    /// ask [`Session::sync_after_ack`] whether to sync again.
     Ack(Ack),
     /// Close the connection with this code and reason.
     Close(u16, &'static str),
@@ -32,7 +33,10 @@ enum State {
     /// Connected; the first frame must be `Identify`.
     New,
     /// `Identify` is being checked.
-    Identifying,
+    Identifying {
+        user: Uuid,
+        device: Uuid,
+    },
     Ready {
         device: Uuid,
     },
@@ -45,6 +49,9 @@ pub struct Session {
     /// The highest `seq` sent to the client per conversation, so a sync that repeats
     /// entries the client has not acked yet does not send them twice.
     sent: HashMap<Vec<u8>, i64>,
+    /// The last sync left entries behind (`more`). They come only after an ack, which
+    /// rings nobody, so the session must sync again itself.
+    more_waiting: bool,
 }
 
 impl Session {
@@ -54,6 +61,7 @@ impl Session {
             dev_auth,
             state: State::New,
             sent: HashMap::new(),
+            more_waiting: false,
         }
     }
 
@@ -61,7 +69,7 @@ impl Session {
     pub fn device(&self) -> Option<Uuid> {
         match self.state {
             State::Ready { device } => Some(device),
-            State::New | State::Identifying => None,
+            State::New | State::Identifying { .. } => None,
         }
     }
 
@@ -69,7 +77,7 @@ impl Session {
     pub fn on_binary(&mut self, bytes: &[u8]) -> Step {
         let body = match (decode_frame(bytes), self.state) {
             (Ok(body), _) => body,
-            (Err(_), State::New | State::Identifying) => {
+            (Err(_), State::New | State::Identifying { .. }) => {
                 return Step::Close(close::INVALID_IDENTITY, "the first frame must be Identify");
             }
             (Err(FrameError::TooLarge { .. }), State::Ready { .. }) => {
@@ -89,13 +97,13 @@ impl Session {
                 }
                 match (id(&identify.dev_user_id), id(&identify.dev_device_id)) {
                     (Ok(user), Ok(device)) => {
-                        self.state = State::Identifying;
+                        self.state = State::Identifying { user, device };
                         Step::Identify { user, device }
                     }
                     _ => Step::Close(close::INVALID_IDENTITY, "invalid dev identity"),
                 }
             }
-            (_, State::New | State::Identifying) => {
+            (_, State::New | State::Identifying { .. }) => {
                 Step::Close(close::INVALID_IDENTITY, "the first frame must be Identify")
             }
             (Body::Identify(_), State::Ready { .. }) => {
@@ -112,20 +120,24 @@ impl Session {
     pub fn on_text(&mut self) -> Step {
         match self.state {
             State::Ready { .. } => reply_error(ErrorCode::BadFrame, "frames must be binary"),
-            State::New | State::Identifying => {
+            State::New | State::Identifying { .. } => {
                 Step::Close(close::INVALID_IDENTITY, "the first frame must be Identify")
             }
         }
     }
 
-    /// message-svc confirmed the identity: the `Ready` frame to send.
-    pub fn identified(&mut self, user: Uuid, device: Uuid, heartbeat: Duration) -> Body {
+    /// message-svc confirmed the identity that [`Step::Identify`] asked about: the
+    /// `Ready` frame to send. `None` if no identity is being checked.
+    pub fn identified(&mut self, heartbeat: Duration) -> Option<Body> {
+        let State::Identifying { user, device } = self.state else {
+            return None;
+        };
         self.state = State::Ready { device };
-        Body::Ready(Ready {
+        Some(Body::Ready(Ready {
             user_id: id_bytes(user),
             device_id: id_bytes(device),
             heartbeat_ms: u32::try_from(heartbeat.as_millis()).unwrap_or(u32::MAX),
-        })
+        }))
     }
 
     /// The entries of a sync the client has not been sent on this connection yet,
@@ -143,6 +155,47 @@ impl Session {
                 }
             })
             .collect()
+    }
+
+    /// Records whether the last sync left entries behind.
+    pub fn synced(&mut self, more: bool) {
+        self.more_waiting = more;
+    }
+
+    /// Whether to sync again after an ack: only if the ack `moved` the device's position
+    /// and the last sync left entries behind. Then the next sync returns them.
+    pub fn sync_after_ack(&self, moved: bool) -> bool {
+        moved && self.more_waiting
+    }
+}
+
+/// When to retry a failed sync: after 1 s, doubling up to 30 s, and from 1 s again once a
+/// sync succeeds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetryDelay {
+    next: Duration,
+}
+
+impl RetryDelay {
+    pub const FIRST: Duration = Duration::from_secs(1);
+    pub const MAX: Duration = Duration::from_secs(30);
+
+    /// A sync failed: how long to wait before the next attempt.
+    pub fn failed(&mut self) -> Duration {
+        let delay = self.next;
+        self.next = (self.next * 2).min(Self::MAX);
+        delay
+    }
+
+    /// A sync succeeded.
+    pub fn succeeded(&mut self) {
+        self.next = Self::FIRST;
+    }
+}
+
+impl Default for RetryDelay {
+    fn default() -> Self {
+        Self { next: Self::FIRST }
     }
 }
 
@@ -182,7 +235,7 @@ mod tests {
             session.on_binary(&identify(user, device)),
             Step::Identify { user, device }
         );
-        session.identified(user, device, Duration::from_secs(30));
+        session.identified(Duration::from_secs(30)).unwrap();
         (session, device)
     }
 
@@ -210,16 +263,24 @@ mod tests {
             Step::Identify { user, device }
         );
         assert_eq!(session.device(), None);
-        let ready = session.identified(user, device, Duration::from_secs(30));
+        let ready = session.identified(Duration::from_secs(30));
         assert_eq!(
             ready,
-            Body::Ready(Ready {
+            Some(Body::Ready(Ready {
                 user_id: id_bytes(user),
                 device_id: id_bytes(device),
                 heartbeat_ms: 30_000,
-            })
+            }))
         );
         assert_eq!(session.device(), Some(device));
+        assert_eq!(session.identified(Duration::from_secs(30)), None);
+    }
+
+    #[test]
+    fn identified_without_a_pending_identity_does_nothing() {
+        let mut session = Session::new(true);
+        assert_eq!(session.identified(Duration::from_secs(30)), None);
+        assert_eq!(session.device(), None);
     }
 
     #[test]
@@ -347,5 +408,25 @@ mod tests {
             session.fresh(vec![entry(&a, 1), entry(&a, 2), entry(&a, 3), entry(&b, 1)]),
             vec![entry(&a, 3)]
         );
+    }
+
+    #[test]
+    fn an_ack_syncs_again_only_if_it_moved_and_entries_were_left() {
+        let (mut session, _) = ready_session();
+        assert!(!session.sync_after_ack(true), "nothing was left behind");
+        session.synced(true);
+        assert!(session.sync_after_ack(true));
+        assert!(!session.sync_after_ack(false), "the position did not move");
+        session.synced(false);
+        assert!(!session.sync_after_ack(true));
+    }
+
+    #[test]
+    fn failed_syncs_back_off_from_1_s_to_30_s_and_reset_on_success() {
+        let mut delay = RetryDelay::default();
+        let delays: Vec<u64> = (0..7).map(|_| delay.failed().as_secs()).collect();
+        assert_eq!(delays, [1, 2, 4, 8, 16, 30, 30]);
+        delay.succeeded();
+        assert_eq!(delay.failed(), Duration::from_secs(1));
     }
 }

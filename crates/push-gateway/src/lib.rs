@@ -4,8 +4,10 @@
 
 mod config;
 mod hub;
+mod server;
 mod session;
 
 pub use config::{Config, ConfigError};
 pub use hub::{Hub, Membership};
-pub use session::{Session, Step};
+pub use server::{init_logging, serve, terminated};
+pub use session::{RetryDelay, Session, Step};
