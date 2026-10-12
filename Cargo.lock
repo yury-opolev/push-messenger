@@ -2005,6 +2005,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "push-smoke"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "futures-util",
+ "push-gateway",
+ "push-message-svc",
+ "push-proto",
+ "push-store",
+ "testcontainers-modules",
+ "tokio",
+ "tokio-tungstenite",
+ "tokio-util",
+ "tonic 0.14.5",
+ "uuid",
+]
+
+[[package]]
 name = "push-store"
 version = "0.1.0"
 dependencies = [

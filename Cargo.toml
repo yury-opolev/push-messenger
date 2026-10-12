@@ -5,6 +5,7 @@ members = [
     "crates/push-gateway",
     "crates/push-message-svc",
     "crates/push-proto",
+    "crates/push-smoke",
     "crates/push-store",
     "crates/push-testkit",
 ]
