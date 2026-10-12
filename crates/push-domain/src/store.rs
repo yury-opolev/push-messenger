@@ -179,7 +179,9 @@ pub trait Tx: Send {
     /// changes cannot both miss a move (under READ COMMITTED each would otherwise see the
     /// other's old position). It does not lock the conversation row: acks and reads do not
     /// wait for appends to commit. Appends take it after `next_seq`, never before.
-    /// Postgres: `pg_advisory_xact_lock` on a hash of the conversation id.
+    /// Postgres: a transaction-scoped advisory lock (`pg_advisory_xact_lock`) on a
+    /// namespaced (tagged) hash of the conversation id, so it cannot share a key with the
+    /// contact-pair lock.
     async fn lock_conversation_positions(
         &mut self,
         conversation: ConversationId,
@@ -288,7 +290,9 @@ pub trait Tx: Send {
     ) -> DomainResult<i64>;
 
     /// Every member row of the conversation, current and former, each with that member's
-    /// `delivered_seq`. One statement on Postgres. The order of the result is unspecified.
+    /// `delivered_seq`, delivered as returned by [`Tx::delivered_seq`] — revoked devices
+    /// included; 0 if the member has no positions. One statement on Postgres. The order
+    /// of the result is unspecified.
     async fn member_positions(
         &mut self,
         conversation: ConversationId,
@@ -329,7 +333,8 @@ pub trait Tx: Send {
     /// is later than `changed_since` (every one without it). Unread counts stop at
     /// `unread_cap`. Each conversation is read in the same statement as the user's member
     /// row, as in `memberships`. One statement on Postgres, however many conversations
-    /// there are. The order of the result is unspecified.
+    /// there are. The order of the overviews is unspecified; within each, `members` and
+    /// `admins` are sorted by user id (Postgres: `ORDER BY user_id`).
     async fn conversation_overviews(
         &mut self,
         user: UserId,

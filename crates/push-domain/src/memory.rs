@@ -133,6 +133,7 @@ impl State {
             .values()
             .filter(|row| row.conversation_id == id)
             .collect();
+        // Sorted by user id (members is keyed by (ConversationId, UserId)); the contract requires it.
         let current = |admins_only: bool| -> Vec<UserId> {
             rows.iter()
                 .filter(|row| row.is_current() && (!admins_only || row.role == Role::Admin))

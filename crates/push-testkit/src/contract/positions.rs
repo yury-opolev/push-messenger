@@ -200,7 +200,8 @@ async fn sync_positions_list_memberships_with_something_left_to_receive<B: Backe
 ///
 /// alice has read 2 and her device has 7; bob has read 0, his revoked phone has 6 and his
 /// laptop 1; carol has read 5 and has no device; dave left at 3; erin joined at 6 and her
-/// device still has 3 from an earlier membership.
+/// device still has 1 from an earlier membership: without the floor it would hold the
+/// group-wide delivery position at 1 instead of 5.
 async fn group_positions_are_minimums_of_effective_positions_over_current_members<B: Backend>(
     backend: &B,
 ) {
@@ -247,7 +248,7 @@ async fn group_positions_are_minimums_of_effective_positions_over_current_member
         .await
         .unwrap();
     }
-    let devices = [(alice, 7), (bob, 6), (bob, 1), (erin, 3)];
+    let devices = [(alice, 7), (bob, 6), (bob, 1), (erin, 1)];
     let mut ids = Vec::new();
     for (user, position) in devices {
         let device = DeviceId::new();
@@ -273,6 +274,53 @@ async fn group_positions_are_minimums_of_effective_positions_over_current_member
             read: 1
         })),
         "positions are capped at the end of the log"
+    );
+}
+
+/// Alice has read nothing; bob has read everything. The log is: 1 alice's own message,
+/// 2 bob's deleted message, 3 bob's edit, 4 alice's own message. For alice nothing is left
+/// to receive, so the group-wide positions are 4 only if her own messages, the deleted
+/// message and the edit are all skipped.
+async fn group_positions_skip_own_deleted_and_edited_entries<B: Backend>(backend: &B) {
+    let group = Conversation {
+        kind: ConversationKind::Group,
+        ..conversation()
+    };
+    let id = group.id;
+    let store = store_with(backend, group).await;
+    let [alice, bob] = [(); 2].map(|()| UserId::new());
+    add_users(&store, &[alice, bob]).await;
+    let mut tx = store.begin().await.unwrap();
+    for (seq, sender) in (1..).zip([alice, bob, bob, alice]) {
+        let mut entry = Entry {
+            sender_id: sender,
+            ..entry(id, seq, ClientMsgId::new())
+        };
+        match seq {
+            2 => entry.deleted_at = Some(start()),
+            3 => {
+                entry.kind = EntryKind::Edit;
+                entry.target_seq = Some(1);
+            }
+            _ => {}
+        }
+        tx.insert_entry(entry).await.unwrap();
+    }
+    for (user, read_seq) in [(alice, 0), (bob, 4)] {
+        tx.insert_member(Member {
+            read_seq,
+            ..member(id, user)
+        })
+        .await
+        .unwrap();
+    }
+
+    assert_eq!(
+        tx.group_positions(id, 4).await,
+        Ok(Some(GroupPositions {
+            delivered: 4,
+            read: 4
+        }))
     );
 }
 
@@ -306,6 +354,7 @@ pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
         sync_positions_list_memberships_with_something_left_to_receive,
         a_position_needs_a_known_device_and_conversation,
         group_positions_are_minimums_of_effective_positions_over_current_members,
+        group_positions_skip_own_deleted_and_edited_entries,
         a_group_without_current_members_has_no_positions,
     ]
 }
