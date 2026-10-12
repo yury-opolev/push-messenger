@@ -348,6 +348,8 @@ honest statement is "Bob has read up to message N".
     delete of an already-deleted message fails with `AlreadyDeleted`, and so does an
     edit of one);
   - the caller is the original sender (any of their devices);
+  - in a direct conversation, both contact rows are `accepted`, as for sending (see
+    §5.5);
   - `now() - target.server_ts` is within the window. Edits and deletes are allowed for
     48 hours by default; both limits are server settings.
 - The target is identified by `target_message_id`, or by `target_client_msg_id` when the
@@ -453,7 +455,11 @@ Access-token claims: `sub`, `device_id`, `email_verified`, `exp`, `iat`, `jti`, 
   revoked.
 - **Only accepted contacts can chat.** `OpenDirect{peer_user_id}` and `Send` in a direct
   conversation require `accepted` on both sides. `blocked` rejects sends both ways and
-  hides the conversation from the blocker.
+  hides the conversation from the blocker. After either user blocks the other, neither
+  can send, edit or delete messages in their direct conversation. Earlier messages stay
+  exactly as they were, so the conversation is preserved as evidence (for example of
+  harassment). Unblocking restores the ability to edit and delete within the normal time
+  windows.
 - **Profiles.** `GET /v1/users?ids=…` returns handle and display name for user ids the
   caller shares a contact or conversation with.
 
