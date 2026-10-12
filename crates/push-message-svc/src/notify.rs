@@ -203,6 +203,34 @@ mod tests {
     }
 
     #[test]
+    fn a_group_receipt_goes_to_every_recipient_as_aggregate_positions() {
+        let (alice, bob) = (UserId::new(), UserId::new());
+        let conversation = ConversationId::new();
+        let group_receipt = Kind::ReceiptChanged(ReceiptChanged {
+            conversation_id: id_bytes(conversation.0),
+            positions: Some(receipt_changed::Positions::Group(GroupReceipt {
+                all_delivered_seq: 7,
+                all_read_seq: 5,
+            })),
+        });
+        let messages = notifications(&[Event::Receipt {
+            conversation,
+            to: vec![alice, bob],
+            receipt: ReceiptUpdate::Group {
+                all_delivered_seq: 7,
+                all_read_seq: 5,
+            },
+        }]);
+        assert_eq!(
+            decode(&messages),
+            vec![
+                (notify_channel(alice.0), group_receipt.clone()),
+                (notify_channel(bob.0), group_receipt),
+            ]
+        );
+    }
+
+    #[test]
     fn contact_and_read_position_changes_go_to_their_user_only() {
         let (alice, bob) = (UserId::new(), UserId::new());
         let conversation = ConversationId::new();
