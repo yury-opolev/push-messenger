@@ -158,7 +158,7 @@ pub(crate) async fn are_contacts<T: Tx>(tx: &mut T, a: UserId, b: UserId) -> Dom
 }
 
 /// Writes `owner`'s view of `peer`; `None` removes it. Returns whether it changed.
-async fn set_contact<T: Tx>(
+pub(crate) async fn set_contact<T: Tx>(
     tx: &mut T,
     owner: UserId,
     peer: UserId,
@@ -174,6 +174,6 @@ async fn set_contact<T: Tx>(
     Ok(true)
 }
 
-fn contact_changed(user: UserId, peer: UserId, state: Option<ContactState>) -> Event {
+pub(crate) fn contact_changed(user: UserId, peer: UserId, state: Option<ContactState>) -> Event {
     Event::ContactChanged { user, peer, state }
 }

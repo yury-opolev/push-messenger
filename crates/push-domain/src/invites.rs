@@ -8,13 +8,14 @@ use chrono::TimeDelta;
 use uuid::Uuid;
 
 use crate::clock::Clock;
+use crate::contacts::{are_contacts, contact_changed, set_contact};
 use crate::error::{DomainError, DomainResult};
 use crate::ids::UserId;
-use crate::model::{Invite, InviteRecord};
+use crate::model::{ContactState, Invite, InviteRecord};
 use crate::notify::Notifier;
 use crate::service::Messaging;
 use crate::store::{InsertOutcome, Store, Tx};
-use crate::validation::validate_invite;
+use crate::validation::{ValidationError, validate_invite};
 
 /// Crockford's base32 alphabet: digits and letters without I, L, O and U.
 const CODE_ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
@@ -75,6 +76,56 @@ where
             tx.commit().await?;
         }
         Ok(())
+    }
+
+    /// Makes `redeemer` and the creator of the invite accepted contacts (spec §5.5):
+    /// sharing the code is the consent. Returns the creator.
+    ///
+    /// An unknown, revoked, expired or used-up code is `InviteNotFound`, and so is a code
+    /// whose creator has blocked the redeemer: redeeming is not an oracle and never
+    /// reveals a block. A redeemer who has blocked the creator gets `Blocked`. Users who
+    /// are already contacts succeed without using up the invite. Any pending request
+    /// between the two is replaced by the accepted contact.
+    pub async fn redeem_invite(&self, redeemer: UserId, code: &str) -> DomainResult<UserId> {
+        let code = normalize_code(code).ok_or(DomainError::InviteNotFound)?;
+        let now = self.clock.now();
+        let mut tx = self.store.begin().await?;
+        let mut invite = tx
+            .lock_invite(&code)
+            .await?
+            .filter(|invite| invite.is_usable(now))
+            .ok_or(DomainError::InviteNotFound)?;
+        let creator = invite.user_id;
+        if creator == redeemer {
+            return Err(ValidationError::SelfTarget.into());
+        }
+        if !tx.user_exists(redeemer).await? {
+            return Err(DomainError::UnknownUser);
+        }
+        tx.lock_contact_pair(creator, redeemer).await?;
+        if tx.get_contact(creator, redeemer).await? == Some(ContactState::Blocked) {
+            return Err(DomainError::InviteNotFound);
+        }
+        if tx.get_contact(redeemer, creator).await? == Some(ContactState::Blocked) {
+            return Err(DomainError::Blocked);
+        }
+        if are_contacts(&mut tx, creator, redeemer).await? {
+            tx.rollback().await?;
+            return Ok(creator);
+        }
+
+        let accepted = Some(ContactState::Accepted);
+        let mut events = Vec::new();
+        for (owner, peer) in [(creator, redeemer), (redeemer, creator)] {
+            if set_contact(&mut tx, owner, peer, accepted).await? {
+                events.push(contact_changed(owner, peer, accepted));
+            }
+        }
+        invite.uses += 1;
+        tx.update_invite(invite).await?;
+        tx.commit().await?;
+        self.publish(events).await;
+        Ok(creator)
     }
 }
 
