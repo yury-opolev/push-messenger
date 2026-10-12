@@ -40,6 +40,8 @@ pub enum DomainError {
     NotAGroup,
     #[error("only an admin of this group can do that")]
     NotAdmin,
+    #[error("a group must keep at least one admin")]
+    LastAdmin,
     #[error("a concurrent change conflicted; retry the operation")]
     Conflict,
     #[error("storage error: {0}")]

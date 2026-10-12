@@ -240,6 +240,16 @@ impl Tx for InMemoryTx {
         Ok(conversation.last_seq)
     }
 
+    async fn set_title(&mut self, id: ConversationId, title: String) -> DomainResult<()> {
+        let conversation = self
+            .work
+            .conversations
+            .get_mut(&id)
+            .ok_or(DomainError::ConversationNotFound)?;
+        conversation.title = Some(title);
+        Ok(())
+    }
+
     async fn insert_member(&mut self, member: Member) -> DomainResult<()> {
         if !self
             .work
@@ -1257,5 +1267,28 @@ mod tests {
         assert_eq!(tx.first_live_message(id, 1, 5, None).await, Ok(Some(2)));
         assert_eq!(tx.first_live_message(id, 2, 4, None).await, Ok(None));
         assert_eq!(tx.first_live_message(id, 5, 5, None).await, Ok(None));
+    }
+
+    #[tokio::test]
+    async fn set_title_changes_only_the_title() {
+        let store = InMemoryStore::new();
+        let original = conversation();
+        let id = original.id;
+        let mut tx = store.begin().await.unwrap();
+        tx.insert_conversation(original.clone()).await.unwrap();
+
+        tx.set_title(id, "Trip".into()).await.unwrap();
+        let stored = tx.get_conversation(id).await.unwrap().unwrap();
+        assert_eq!(
+            stored,
+            Conversation {
+                title: Some("Trip".into()),
+                ..original
+            }
+        );
+        assert_eq!(
+            tx.set_title(ConversationId::new(), "Trip".into()).await,
+            Err(DomainError::ConversationNotFound)
+        );
     }
 }

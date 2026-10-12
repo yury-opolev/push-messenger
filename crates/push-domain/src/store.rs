@@ -135,6 +135,9 @@ pub trait Tx: Send {
     /// Fails with `ConversationNotFound` if the conversation does not exist.
     /// The conversation row lock is held until the transaction commits or rolls back.
     async fn next_seq(&mut self, id: ConversationId, at: DateTime<Utc>) -> DomainResult<i64>;
+    /// Sets the title of the conversation. Fails with `ConversationNotFound` if it does not
+    /// exist. Callers hold the conversation lock (taken by `next_seq`).
+    async fn set_title(&mut self, id: ConversationId, title: String) -> DomainResult<()>;
     /// Inserts the member, replacing an existing row for the same conversation and user.
     async fn insert_member(&mut self, member: Member) -> DomainResult<()>;
     async fn get_member(

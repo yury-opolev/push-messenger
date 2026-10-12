@@ -200,15 +200,78 @@ where
         Ok(())
     }
 
+    /// Renames a group. The title is trimmed and must keep 1 to `MAX_TITLE_CHARS`
+    /// characters. A `Renamed` entry records it; renaming to the current title changes
+    /// nothing.
+    pub async fn rename_group(
+        &self,
+        admin: UserId,
+        conversation: ConversationId,
+        title: &str,
+    ) -> DomainResult<()> {
+        let title = validate_title(title)?;
+        let mut change = self.begin_change(conversation).await?;
+        change.require_admin(admin)?;
+        if change.conversation.title.as_deref() == Some(title.as_str()) {
+            return change.cancel().await;
+        }
+        let event = SystemEvent::Renamed {
+            actor: admin,
+            title: title.clone(),
+        };
+        change.append(&event).await?;
+        change.tx.set_title(conversation, title).await?;
+        let events = change.finish(None).await?;
+        self.publish(events).await;
+        Ok(())
+    }
+
+    /// Gives a current member the role `role`. A `RoleChanged` entry records it; giving
+    /// the role they already have changes nothing. Admins may demote themselves, but the
+    /// last admin may not: a group always has an admin (`LastAdmin`).
+    pub async fn set_role(
+        &self,
+        admin: UserId,
+        conversation: ConversationId,
+        user: UserId,
+        role: Role,
+    ) -> DomainResult<()> {
+        let mut change = self.begin_change(conversation).await?;
+        change.require_admin(admin)?;
+        let mut member = change
+            .member(user)
+            .filter(|member| member.is_current())
+            .cloned()
+            .ok_or(DomainError::NotMember)?;
+        if member.role == role {
+            return change.cancel().await;
+        }
+        if role == Role::Member && change.admin_count() == 1 {
+            return Err(DomainError::LastAdmin);
+        }
+        let event = SystemEvent::RoleChanged {
+            actor: admin,
+            user,
+            role,
+        };
+        change.append(&event).await?;
+        member.role = role;
+        change.put_member(member).await?;
+        let events = change.finish(None).await?;
+        self.publish(events).await;
+        Ok(())
+    }
+
     /// Locks a group for a membership or settings change and takes the next `seq`.
     async fn begin_change(&self, conversation: ConversationId) -> DomainResult<GroupChange<S::Tx>> {
         let mut tx = self.store.begin().await?;
+        let now = self.clock.now();
+        let seq = tx.next_seq(conversation, now).await?;
+        // Read under the lock, so the title compared by a rename is the current one.
         let conversation = require_conversation(&mut tx, conversation).await?;
         if conversation.kind != ConversationKind::Group {
             return Err(DomainError::NotAGroup);
         }
-        let now = self.clock.now();
-        let seq = tx.next_seq(conversation.id, now).await?;
         let members = tx.members(conversation.id).await?;
         let before = group_positions(&mut tx, &conversation, seq - 1).await?;
         Ok(GroupChange {
@@ -261,6 +324,13 @@ impl<T: Tx> GroupChange<T> {
         self.members
             .iter()
             .filter(|member| member.is_current())
+            .count()
+    }
+
+    fn admin_count(&self) -> usize {
+        self.members
+            .iter()
+            .filter(|member| member.is_current() && member.role == Role::Admin)
             .count()
     }
 
