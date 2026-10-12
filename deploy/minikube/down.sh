@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Removes push-messenger from the local minikube cluster; the same as down.ps1.
+#
+#   deploy/minikube/down.sh [--cluster NAME] [--delete]
+set -euo pipefail
+
+cluster=push
+delete=false
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --cluster) cluster="$2"; shift 2 ;;
+    --delete) delete=true; shift ;;
+    *) echo "usage: $0 [--cluster NAME] [--delete]" >&2; exit 2 ;;
+  esac
+done
+
+if [[ "$delete" == true ]]; then
+  minikube delete -p "$cluster"
+  exit 0
+fi
+helm uninstall push --kube-context "$cluster" --namespace push --wait --ignore-not-found
+kubectl --context "$cluster" delete namespace push --ignore-not-found --wait=true
