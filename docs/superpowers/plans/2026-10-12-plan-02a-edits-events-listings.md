@@ -101,6 +101,15 @@ These were settled while writing the plan. Do not reopen them during execution.
     user list it publishes, so tests compare events exactly.
 13. **`list_conversations` also lists conversations the user has left**, with `last_seq`
     capped at where they left. What former members see beyond that is refined in Plan 2B.
+14. **`changed_since` reflects content changes only.** `updated_at` moves when a
+    conversation is created or an entry is appended, never on an ack or a read, so the busy
+    conversation row is not written on every receipt. Instead, a summary of a direct
+    conversation carries the other member's positions (`peer_delivered_seq`,
+    `peer_read_seq`), and a reconnecting client refreshes its ticks with one
+    `list_conversations` without `changed_since`. Plan 2B replaces or extends these fields
+    for groups.
+15. **Read implies delivered.** Receipts and summaries report the delivered position as at
+    least the read position.
 
 ## File structure
 
@@ -380,8 +389,15 @@ Replace the whole of `crates/push-domain/src/notify.rs` with:
 //! After a commit, the service publishes typed events: which users have new log entries,
 //! whose delivery or read position moved, and whose contacts changed. Events are best
 //! effort and ephemeral. They carry no message bodies, and losing one only delays a
-//! client: everything they announce is durable and can be read back through sync and the
-//! listings.
+//! client, because everything they announce is durable and can be read back:
+//!
+//! - new entries through `sync`;
+//! - contact changes through `list_contacts`;
+//! - receipt positions through `list_conversations` called without `changed_since`.
+//!   `changed_since` reflects content changes only (a conversation created or an entry
+//!   appended). Receipt positions do not move `updated_at`, so the busy conversation row
+//!   is not written on every ack and read. A reconnecting client refreshes its ticks with
+//!   one listing without `changed_since`.
 
 use std::sync::{Arc, Mutex};
 
@@ -417,6 +433,7 @@ pub enum Event {
 #[non_exhaustive]
 pub enum ReceiptUpdate {
     /// A direct conversation: the positions of the member whose position moved.
+    /// `delivered_seq` is never below `read_seq`: a message read is a message delivered.
     Direct {
         user_id: UserId,
         delivered_seq: i64,
@@ -1219,10 +1236,17 @@ will serve `erase_edit_bodies` from the spec's index on `(conversation_id, targe
 
 - [ ] **Step 1: Write the failing unit tests**
 
-In `crates/push-domain/src/memory.rs`, inside `mod tests`, replace
+In the top-level imports of `crates/push-domain/src/memory.rs`, replace
+`use crate::model::{ContactState, Conversation, Entry, Member};` with:
+
+```rust
+use crate::model::{ContactState, Conversation, Entry, EntryKind, Member};
+```
+
+That brings `EntryKind` into the whole file, so inside `mod tests` replace
 `use crate::model::{ContentType, ConversationKind, EntryKind, Role};` with
-`use crate::model::{ContentType, ConversationKind, Role};` (the top-level import changed at
-the end of this step brings `EntryKind` into the whole file), and append these tests at the end of `mod tests`:
+`use crate::model::{ContentType, ConversationKind, Role};`, and append these tests at the
+end of `mod tests`:
 
 ```rust
     #[tokio::test]
@@ -1334,13 +1358,6 @@ the end of this step brings `EntryKind` into the whole file), and append these t
             .collect();
         assert_eq!(bodies, [true, true, false, true, false]);
     }
-```
-
-In the top-level imports of `memory.rs`, replace
-`use crate::model::{ContactState, Conversation, Entry, Member};` with:
-
-```rust
-use crate::model::{ContactState, Conversation, Entry, EntryKind, Member};
 ```
 
 - [ ] **Step 2: Run the tests to see them fail**
@@ -1888,7 +1905,16 @@ push_domain::Policy`.
 
 - [ ] **Step 4: Add the errors**
 
-In `crates/push-domain/src/error.rs`, add these variants after `SeqOutOfRange`:
+In `crates/push-domain/src/error.rs`, a `client_msg_id` can now clash with an entry of
+another kind from the same sender too (decision 3), so replace the message of
+`ClientIdConflict`:
+
+```rust
+    #[error("this client message id was already used for a different entry")]
+    ClientIdConflict,
+```
+
+and add these variants after `SeqOutOfRange`:
 
 ```rust
     #[error("the target message does not exist in this conversation")]
@@ -3525,9 +3551,13 @@ the other member gets `Receipt{conversation, user_id, delivered_seq, read_seq}`.
 move that passes over at least one live message from someone else counts — not one over
 edits, deletes, system entries, deleted messages or one's own messages. Delivered is the
 furthest position across the user's devices (`Tx::delivered_seq`), so an ack that moves one
-device but not the user's maximum sends nothing. Three paths move a position: `ack`
-(delivered), `read_up_to` (read) and `send_text` (the sender's read, decision 2). All use
-one helper, `direct_receipt`, built on `count_incoming_messages` (decision 10).
+device but not the user's maximum sends nothing. A message read is a message delivered, so
+every receipt reports `delivered_seq` as at least `read_seq` (decision 15). Three paths
+move a position: `ack` (delivered), `read_up_to` (read) and `send_text` (the sender's
+read, decision 2). All use one helper, `direct_receipt`, built on
+`count_incoming_messages` (decision 10). `ack` counts from the member's floor
+(`visible_from_seq - 1`) even if a delivered position is lower, which matters once group
+joins exist (Plan 2B).
 
 - [ ] **Step 1: Write the failing unit test**
 
@@ -3686,7 +3716,7 @@ async fn reading_past_an_edit_sends_nothing() {
 }
 
 #[tokio::test]
-async fn replying_reports_that_the_peers_messages_were_read() {
+async fn replying_reports_that_the_peers_messages_were_read_and_so_delivered() {
     let world = World::new();
     let (alice, bob) = (world.person().await, world.person().await);
     let chat = world.direct_chat(&alice, &bob).await;
@@ -3698,7 +3728,7 @@ async fn replying_reports_that_the_peers_messages_were_read() {
         world.notifier.take(),
         [
             entries_for(&[&alice, &bob]),
-            receipt(chat, &bob, &alice, 0, 2)
+            receipt(chat, &bob, &alice, 2, 2)
         ]
     );
 }
@@ -3711,8 +3741,9 @@ Expected: compile error — `no method named count_incoming_messages found`.
 
 Run: `cargo test -p push-domain --test receipts`
 Expected: the 3 tests that expect a receipt fail (`left: []`, or only the
-`EntriesAvailable` event for `replying_reports_that_the_peers_messages_were_read`); the 4
-tests that expect no event pass.
+`EntriesAvailable` event for
+`replying_reports_that_the_peers_messages_were_read_and_so_delivered`); the 4 tests that
+expect no event pass.
 
 - [ ] **Step 4: Add the counting method**
 
@@ -3836,7 +3867,8 @@ where
 /// direct and the move passed over at least one live message that someone else sent:
 /// moving over edits, deletes, system entries or one's own messages tells nobody anything.
 ///
-/// Reads both positions as this transaction sees them, so call it after the move.
+/// Reads both positions as this transaction sees them, so call it after the move. Reports
+/// `delivered_seq` as at least `read_seq`, so read always implies delivered.
 pub(crate) async fn direct_receipt<T: Tx>(
     tx: &mut T,
     conversation: &Conversation,
@@ -3873,7 +3905,7 @@ pub(crate) async fn direct_receipt<T: Tx>(
         to,
         receipt: ReceiptUpdate::Direct {
             user_id: user,
-            delivered_seq,
+            delivered_seq: delivered_seq.max(read_seq),
             read_seq,
         },
     }))
@@ -3905,7 +3937,11 @@ In `crates/push-domain/src/sync.rs`, add `use crate::read::direct_receipt;` afte
         if seq < member.visible_from_seq - 1 {
             return Ok(false);
         }
-        let delivered_before = tx.delivered_seq(conversation, user).await?;
+        // Count only from the member's floor; matters once group joins exist (Plan 2B).
+        let delivered_before = tx
+            .delivered_seq(conversation, user)
+            .await?
+            .max(member.visible_from_seq - 1);
         let moved = tx.raise_cursor(device, conversation, seq).await?;
         let receipt = direct_receipt(
             &mut tx,
@@ -4165,6 +4201,15 @@ after the user's read position, within their visible range, capped at 100 ("99+"
 user has blocked is left out of the blocker's list (spec §5.5); the blocked user still sees
 it.
 
+A summary of a direct conversation also carries how far the other member got
+(`peer_delivered_seq`, `peer_read_seq`, from `Tx::delivered_seq` and their member row), with
+delivered reported as at least read, exactly as receipts report it. This is how a client
+recovers the receipts it missed while disconnected. `changed_since` reflects content changes
+only (a conversation created or an entry appended): receipt positions do not move
+`updated_at`, so the busy conversation row is not written on every ack and read. A
+reconnecting client refreshes its ticks with one listing without `changed_since`. Plan 2B
+adds group aggregates; for groups these two fields will be replaced or extended then.
+
 - [ ] **Step 1: Write the failing tests**
 
 `crates/push-domain/tests/listings.rs`:
@@ -4226,6 +4271,8 @@ async fn a_new_direct_conversation_is_listed_for_both_members() {
                 last_seq: 0,
                 read_seq: 0,
                 unread: 0,
+                peer_delivered_seq: 0,
+                peer_read_seq: 0,
                 updated_at: world.clock.now(),
                 members: sorted(vec![alice.user, bob.user]),
             }]
@@ -4355,6 +4402,50 @@ async fn a_blocked_conversation_is_hidden_from_the_blocker_only() {
         .unwrap();
     assert_eq!(listed(&world, &alice).await, [chat]);
 }
+
+#[tokio::test]
+async fn peer_positions_are_zero_until_the_peer_acks_or_reads() {
+    let world = World::new();
+    let (alice, bob) = (world.person().await, world.person().await);
+    let chat = world.direct_chat(&alice, &bob).await;
+    world.send(&alice, chat, "one").await;
+
+    let alices = summary(&world, &alice, chat).await;
+    assert_eq!((alices.peer_delivered_seq, alices.peer_read_seq), (0, 0));
+}
+
+#[tokio::test]
+async fn peer_positions_are_listed_but_do_not_count_as_changes() {
+    let world = World::new();
+    let (alice, bob) = (world.person().await, world.person().await);
+    let chat = world.direct_chat(&alice, &bob).await;
+    for body in ["one", "two", "three"] {
+        world.send(&alice, chat, body).await;
+    }
+    let since = world.clock.now();
+    world.clock.advance(TimeDelta::minutes(1));
+
+    world.svc.ack(bob.device, chat, 2).await.unwrap();
+    let alices = summary(&world, &alice, chat).await;
+    assert_eq!((alices.peer_delivered_seq, alices.peer_read_seq), (2, 0));
+
+    world.svc.read_up_to(bob.user, chat, 3).await.unwrap();
+    let alices = summary(&world, &alice, chat).await;
+    assert_eq!(
+        (alices.peer_delivered_seq, alices.peer_read_seq),
+        (3, 3),
+        "read implies delivered"
+    );
+    assert!(
+        world
+            .svc
+            .list_conversations(alice.user, Some(since))
+            .await
+            .unwrap()
+            .is_empty(),
+        "an ack or a read is not a content change"
+    );
+}
 ```
 
 - [ ] **Step 2: Run the tests to see them fail**
@@ -4389,6 +4480,15 @@ pub struct ConversationSummary {
     /// Live messages from others after `read_seq` within the visible range, at most
     /// `MAX_UNREAD`.
     pub unread: u32,
+    /// Direct conversations: the other member's delivered position, the furthest across
+    /// their devices, and never below `peer_read_seq`. Zero for other conversations; Plan
+    /// 2B replaces or extends these fields with group aggregates.
+    pub peer_delivered_seq: i64,
+    /// Direct conversations: the other member's read position. Zero for other
+    /// conversations.
+    pub peer_read_seq: i64,
+    /// When the conversation was created or last had an entry appended. Acks and reads do
+    /// not move it.
     pub updated_at: DateTime<Utc>,
     /// Current members, sorted.
     pub members: Vec<UserId>,
@@ -4430,7 +4530,7 @@ use crate::store::{InsertOutcome, Store, Tx};
 use crate::validation::{MAX_UNREAD, ValidationError};
 ```
 
-and add this `impl` block and helper between the existing `impl` block and
+and add this `impl` block and the two helpers between the existing `impl` block and
 `require_conversation`:
 
 ```rust
@@ -4442,6 +4542,11 @@ where
 {
     /// Every conversation `user` is or was a member of, with positions and unread counts,
     /// sorted by id. With `changed_since`, only those whose `updated_at` is later.
+    ///
+    /// `changed_since` reflects content changes only: a conversation created or an entry
+    /// appended. Receipt positions (`peer_delivered_seq`, `peer_read_seq`) do not move
+    /// `updated_at`, so the busy conversation row is not written on every ack and read. A
+    /// reconnecting client refreshes its ticks with one listing without `changed_since`.
     ///
     /// A direct conversation with someone `user` has blocked is left out: blocking hides it
     /// from the blocker (spec §5.5). The blocked user still sees it.
@@ -4470,6 +4575,8 @@ where
             let unread = tx
                 .count_incoming_messages(conversation.id, user, unread_after, last_seq, MAX_UNREAD)
                 .await?;
+            let (peer_delivered_seq, peer_read_seq) =
+                peer_positions(&mut tx, &conversation, user, &members).await?;
             summaries.push(ConversationSummary {
                 conversation_id: conversation.id,
                 kind: conversation.kind,
@@ -4477,6 +4584,8 @@ where
                 last_seq,
                 read_seq: member.read_seq,
                 unread,
+                peer_delivered_seq,
+                peer_read_seq,
                 updated_at: conversation.updated_at,
                 members: current_member_ids(&members),
             });
@@ -4484,6 +4593,25 @@ where
         tx.rollback().await?;
         Ok(summaries)
     }
+}
+
+/// How far the other member of a direct conversation got, as `(delivered, read)`, with
+/// delivered at least read. `(0, 0)` for other conversations: Plan 2B adds group
+/// aggregates.
+async fn peer_positions<T: Tx>(
+    tx: &mut T,
+    conversation: &Conversation,
+    user: UserId,
+    members: &[Member],
+) -> DomainResult<(i64, i64)> {
+    if conversation.kind != ConversationKind::Direct {
+        return Ok((0, 0));
+    }
+    let Some(peer) = members.iter().find(|member| member.user_id != user) else {
+        return Ok((0, 0));
+    };
+    let delivered_seq = tx.delivered_seq(conversation.id, peer.user_id).await?;
+    Ok((delivered_seq.max(peer.read_seq), peer.read_seq))
 }
 
 /// Whether `user` has blocked any other member.
@@ -4504,7 +4632,7 @@ async fn has_blocked_a_member<T: Tx>(
 - [ ] **Step 5: Run the tests to see them pass**
 
 Run: `cargo test -p push-domain --test listings`
-Expected: `7 passed`.
+Expected: `9 passed`.
 
 - [ ] **Step 6: Run all gates**
 
@@ -4514,7 +4642,7 @@ cargo clippy -p push-domain --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-Expected: 161 tests pass (31 unit, 130 integration), no warnings, no formatting diff.
+Expected: 163 tests pass (31 unit, 132 integration), no warnings, no formatting diff.
 
 - [ ] **Step 7: Commit**
 
@@ -4544,11 +4672,25 @@ In §4.6, in the first check, replace the parenthesis `(deleting twice returns t
 result)` with `(a retry of the same delete returns its original result; a new delete, or
 an edit, of a deleted message is refused)`, re-wrapping the lines at about 88 columns.
 
-In §4.5, add a bullet after the "Position changes that pass only over …" bullet:
+In §4.5, add two bullets after the "Position changes that pass only over …" bullet:
 
 ```markdown
 - Sending marks the conversation read for the sender, so a reply can also produce a read
   receipt for the other member of a direct chat.
+- A read implies delivery: a receipt never reports `delivered_seq` below `read_seq`.
+```
+
+and replace the last bullet of §4.5 ("After connecting, the client calls
+`ListConversations{changed_since}` …") with:
+
+```markdown
+- After connecting, the client calls `ListConversations{changed_since}` to get the current
+  positions and unread counts for conversations whose content changed. `changed_since`
+  reflects content changes only: a conversation created or an entry appended. Receipt
+  positions are not tracked by `updated_at`, so the busy conversation row is not written
+  on every ack and read. A direct conversation's summary carries the other member's
+  `peer_delivered_seq` and `peer_read_seq`, so a reconnecting client refreshes its ticks
+  with one `ListConversations` without `changed_since`.
 ```
 
 In §5.5, add at the end of the "Contact request" bullet: `A decline is announced only to
@@ -4573,7 +4715,7 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 ```
 
-Expected: no formatting diff, no warnings, 161 tests pass.
+Expected: no formatting diff, no warnings, 163 tests pass.
 
 - [ ] **Step 4: Commit and push**
 
@@ -4603,7 +4745,9 @@ review.
 | §4.2 retry answered before permission checks, now for every entry kind | 6 |
 | §4.4 delivered = furthest position across all devices, revoked included (doc) | 1 |
 | §4.5 direct receipts when delivered or read moves, only over real messages from others | 10 |
+| §4.5 read implies delivered in receipts and summaries (added by this plan) | 10, 12, 13 |
 | §4.5 `ListConversations{changed_since}` with positions and unread counts | 4, 12 |
+| §4.5 receipts recovered after reconnect: peer positions in direct summaries, `changed_since` for content only (added by this plan) | 2, 12, 13 |
 | §4.6 edit and delete are log entries with their own `seq` and `client_msg_id` | 6, 7 |
 | §4.6 edit updates body, `edited_at`, `edit_seq`; previous edit text erased | 6 |
 | §4.6 delete sets `deleted_at`, erases the message and every edit of it | 7 |
@@ -4629,6 +4773,8 @@ review.
   members only, sent only when the aggregate changes, at most once per second per
   conversation; never per-member positions.
 - `conversation_state` for groups (aggregates only, former members excluded).
+- Group summaries in `list_conversations`: `peer_delivered_seq` and `peer_read_seq` are
+  replaced or extended by the group aggregates (they are 0 for groups until then).
 - What a former member sees in `list_conversations` (members, `updated_at`).
 - A real test of the ack-below-floor guard once group joins exist.
 - Telling a user's other devices that their own read position moved (today they learn it
