@@ -1,0 +1,8 @@
+# The Docker build context is the repository root; send only what the build needs.
+.git
+.github
+.superpowers
+deploy
+docs
+target
+**/*.md
