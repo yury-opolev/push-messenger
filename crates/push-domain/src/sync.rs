@@ -26,6 +26,10 @@ where
     /// Everything after the device's delivery positions, within each membership's
     /// visible range, up to `limit` entries.
     ///
+    /// Edits and deletes of messages below the member's visible range are never delivered
+    /// (spec §4.6). If such entries end a conversation, the device's position stays before
+    /// them until it acks a later entry; nothing is lost, as they are never delivered.
+    ///
     /// Sync does not advance anything: the position moves only when the device acks.
     /// Calling sync again without acking returns the same entries.
     pub async fn sync(&self, device: DeviceId, limit: u32) -> DomainResult<SyncBatch> {
@@ -49,15 +53,21 @@ where
                 continue;
             }
             let room = limit - entries.len();
-            if room == 0 {
+            // One entry beyond the room tells whether more is waiting.
+            let mut page = tx
+                .entries_after(
+                    conversation.id,
+                    position,
+                    upper,
+                    member.visible_from_seq,
+                    room as u32 + 1,
+                )
+                .await?;
+            if page.len() > room {
+                page.truncate(room);
+                entries.extend(page);
                 more = true;
                 break;
-            }
-            let page = tx
-                .entries_after(conversation.id, position, upper, room as u32)
-                .await?;
-            if page.last().map_or(position, |entry| entry.seq) < upper {
-                more = true;
             }
             entries.extend(page);
         }

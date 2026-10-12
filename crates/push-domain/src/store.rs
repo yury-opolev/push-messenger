@@ -166,12 +166,15 @@ pub trait Tx: Send {
         conversation: ConversationId,
         target_seq: i64,
     ) -> DomainResult<()>;
-    /// Entries with `after < seq <= up_to`, oldest first, at most `limit`.
+    /// Entries with `after < seq <= up_to`, oldest first, at most `limit`. Entries with a
+    /// `target_seq` below `targets_from` (edits and deletes of messages outside the
+    /// reader's visible range) are skipped and do not count towards `limit`.
     async fn entries_after(
         &mut self,
         conversation: ConversationId,
         after: i64,
         up_to: i64,
+        targets_from: i64,
         limit: u32,
     ) -> DomainResult<Vec<Entry>>;
     /// The newest `limit` entries with `from <= seq < before`, returned oldest first.

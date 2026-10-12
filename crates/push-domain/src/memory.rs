@@ -366,6 +366,7 @@ impl Tx for InMemoryTx {
         conversation: ConversationId,
         after: i64,
         up_to: i64,
+        targets_from: i64,
         limit: u32,
     ) -> DomainResult<Vec<Entry>> {
         if after >= up_to {
@@ -375,8 +376,10 @@ impl Tx for InMemoryTx {
             .work
             .entries
             .range((conversation, after + 1)..=(conversation, up_to))
+            .map(|(_, entry)| entry)
+            .filter(|entry| entry.target_seq.is_none_or(|target| target >= targets_from))
             .take(limit as usize)
-            .map(|(_, entry)| entry.clone())
+            .cloned()
             .collect())
     }
 
@@ -661,15 +664,15 @@ mod tests {
         }
 
         assert_eq!(
-            seqs(&tx.entries_after(conversation, 1, 4, 10).await.unwrap()),
+            seqs(&tx.entries_after(conversation, 1, 4, 0, 10).await.unwrap()),
             vec![2, 3, 4]
         );
         assert_eq!(
-            seqs(&tx.entries_after(conversation, 1, 5, 2).await.unwrap()),
+            seqs(&tx.entries_after(conversation, 1, 5, 0, 2).await.unwrap()),
             vec![2, 3]
         );
         assert_eq!(
-            seqs(&tx.entries_after(conversation, 5, 5, 10).await.unwrap()),
+            seqs(&tx.entries_after(conversation, 5, 5, 0, 10).await.unwrap()),
             Vec::<i64>::new()
         );
         assert_eq!(
@@ -805,7 +808,7 @@ mod tests {
             Err(DomainError::Store(_))
         ));
         assert_eq!(
-            seqs(&tx.entries_after(id, 0, 5, 10).await.unwrap()),
+            seqs(&tx.entries_after(id, 0, 5, 0, 10).await.unwrap()),
             vec![1]
         );
     }
@@ -959,12 +962,49 @@ mod tests {
 
         tx.erase_edit_bodies(id, 1).await.unwrap();
         let bodies: Vec<bool> = tx
-            .entries_after(id, 0, 5, 10)
+            .entries_after(id, 0, 5, 0, 10)
             .await
             .unwrap()
             .iter()
             .map(|entry| entry.body.is_some())
             .collect();
         assert_eq!(bodies, [true, true, false, true, false]);
+    }
+
+    #[tokio::test]
+    async fn entries_after_skips_changes_to_messages_below_targets_from() {
+        let store = InMemoryStore::new();
+        let conversation = conversation();
+        let id = conversation.id;
+        let mut tx = store.begin().await.unwrap();
+        tx.insert_conversation(conversation).await.unwrap();
+        for seq in 1..=3 {
+            tx.insert_entry(entry(id, seq, ClientMsgId::new()))
+                .await
+                .unwrap();
+        }
+        for (seq, target) in [(4, 1), (5, 3), (6, 2)] {
+            tx.insert_entry(Entry {
+                kind: EntryKind::Edit,
+                target_seq: Some(target),
+                ..entry(id, seq, ClientMsgId::new())
+            })
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(
+            seqs(&tx.entries_after(id, 2, 6, 3, 10).await.unwrap()),
+            vec![3, 5]
+        );
+        assert_eq!(
+            seqs(&tx.entries_after(id, 0, 6, 2, 3).await.unwrap()),
+            vec![1, 2, 3],
+            "the limit counts only returned entries"
+        );
+        assert_eq!(
+            seqs(&tx.entries_after(id, 3, 6, 2, 2).await.unwrap()),
+            vec![5, 6]
+        );
     }
 }
