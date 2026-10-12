@@ -3,8 +3,16 @@ mod common;
 use chrono::TimeDelta;
 use common::{Person, World, delete};
 use push_domain::{
-    Clock, ConversationId, ConversationKind, ConversationSummary, MAX_UNREAD, MessageRef, UserId,
+    Clock, ConversationId, ConversationKind, ConversationSummary, MAX_UNREAD, MessageRef, Receipts,
+    UserId,
 };
+
+fn peer(peer_delivered_seq: i64, peer_read_seq: i64) -> Receipts {
+    Receipts::Direct {
+        peer_delivered_seq,
+        peer_read_seq,
+    }
+}
 
 async fn summary(world: &World, person: &Person, chat: ConversationId) -> ConversationSummary {
     world
@@ -54,10 +62,10 @@ async fn a_new_direct_conversation_is_listed_for_both_members() {
                 last_seq: 0,
                 read_seq: 0,
                 unread: 0,
-                peer_delivered_seq: 0,
-                peer_read_seq: 0,
+                receipts: peer(0, 0),
                 updated_at: world.clock.now(),
                 members: sorted(vec![alice.user, bob.user]),
+                admins: vec![],
             }]
         );
     }
@@ -193,8 +201,7 @@ async fn peer_positions_are_zero_until_the_peer_acks_or_reads() {
     let chat = world.direct_chat(&alice, &bob).await;
     world.send(&alice, chat, "one").await;
 
-    let alices = summary(&world, &alice, chat).await;
-    assert_eq!((alices.peer_delivered_seq, alices.peer_read_seq), (0, 0));
+    assert_eq!(summary(&world, &alice, chat).await.receipts, peer(0, 0));
 }
 
 #[tokio::test]
@@ -209,14 +216,12 @@ async fn peer_positions_are_listed_but_do_not_count_as_changes() {
     world.clock.advance(TimeDelta::minutes(1));
 
     world.svc.ack(bob.device, chat, 2).await.unwrap();
-    let alices = summary(&world, &alice, chat).await;
-    assert_eq!((alices.peer_delivered_seq, alices.peer_read_seq), (2, 0));
+    assert_eq!(summary(&world, &alice, chat).await.receipts, peer(2, 0));
 
     world.svc.read_up_to(bob.user, chat, 3).await.unwrap();
-    let alices = summary(&world, &alice, chat).await;
     assert_eq!(
-        (alices.peer_delivered_seq, alices.peer_read_seq),
-        (3, 3),
+        summary(&world, &alice, chat).await.receipts,
+        peer(3, 3),
         "read implies delivered"
     );
     assert!(
@@ -228,4 +233,62 @@ async fn peer_positions_are_listed_but_do_not_count_as_changes() {
             .is_empty(),
         "an ack or a read is not a content change"
     );
+}
+
+#[tokio::test]
+async fn a_group_is_listed_with_its_admins_and_group_wide_positions() {
+    let world = World::new();
+    let (alice, bob, carol) = (
+        world.person().await,
+        world.person().await,
+        world.person().await,
+    );
+    let group = world.group(&alice, &[&bob, &carol]).await;
+    world.send(&alice, group, "one").await;
+    world.svc.read_up_to(bob.user, group, 2).await.unwrap();
+
+    let alices = summary(&world, &alice, group).await;
+    assert_eq!(
+        alices,
+        ConversationSummary {
+            conversation_id: group,
+            kind: ConversationKind::Group,
+            title: Some("Group".into()),
+            last_seq: 2,
+            read_seq: 0,
+            unread: 0,
+            receipts: Receipts::Group {
+                all_delivered_seq: 1,
+                all_read_seq: 1,
+            },
+            updated_at: world.clock.now(),
+            members: sorted(vec![alice.user, bob.user, carol.user]),
+            admins: vec![alice.user],
+        }
+    );
+
+    world.svc.read_up_to(carol.user, group, 2).await.unwrap();
+    assert_eq!(
+        summary(&world, &bob, group).await.receipts,
+        Receipts::Group {
+            all_delivered_seq: 2,
+            all_read_seq: 2,
+        }
+    );
+}
+
+#[tokio::test]
+async fn unread_in_a_group_counts_messages_from_everyone_else() {
+    let world = World::new();
+    let (alice, bob, carol) = (
+        world.person().await,
+        world.person().await,
+        world.person().await,
+    );
+    let group = world.group(&alice, &[&bob, &carol]).await;
+    world.send(&bob, group, "from bob").await;
+    world.send(&carol, group, "from carol").await;
+
+    assert_eq!(summary(&world, &alice, group).await.unread, 2);
+    assert_eq!(summary(&world, &bob, group).await.unread, 1);
 }

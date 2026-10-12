@@ -2,7 +2,9 @@ use crate::clock::Clock;
 use crate::conversations::{require_conversation, require_member};
 use crate::error::{DomainError, DomainResult};
 use crate::ids::{ConversationId, UserId};
-use crate::model::{Conversation, ConversationKind, ConversationState, Member, MemberState};
+use crate::model::{
+    Conversation, ConversationKind, ConversationState, Member, MemberState, Positions,
+};
 use crate::notify::{Event, Notifier, ReceiptUpdate};
 use crate::service::{Messaging, current_member_ids};
 use crate::store::{Store, Tx};
@@ -61,22 +63,31 @@ where
     ) -> DomainResult<ConversationState> {
         let mut tx = self.store.begin().await?;
         let found = require_conversation(&mut tx, conversation).await?;
-        require_member(&mut tx, conversation, user).await?;
+        let caller = require_member(&mut tx, conversation, user).await?;
 
-        let mut members = Vec::new();
-        for member in tx.members(conversation).await? {
-            let delivered_seq = tx.delivered_seq(conversation, member.user_id).await?;
-            members.push(MemberState {
-                user_id: member.user_id,
-                delivered_seq: delivered_seq.max(member.read_seq),
-                read_seq: member.read_seq,
-            });
-        }
+        let positions = if found.kind == ConversationKind::Group {
+            let group = group_positions_for(&mut tx, &found, &caller).await?;
+            Positions::Group {
+                all_delivered_seq: group.delivered,
+                all_read_seq: group.read,
+            }
+        } else {
+            let mut members = Vec::new();
+            for member in tx.members(conversation).await? {
+                let delivered_seq = tx.delivered_seq(conversation, member.user_id).await?;
+                members.push(MemberState {
+                    user_id: member.user_id,
+                    delivered_seq: delivered_seq.max(member.read_seq),
+                    read_seq: member.read_seq,
+                });
+            }
+            Positions::Members(members)
+        };
         tx.rollback().await?;
         Ok(ConversationState {
             conversation_id: conversation,
-            last_seq: found.last_seq,
-            members,
+            last_seq: caller.visible_upper(found.last_seq),
+            positions,
         })
     }
 }
@@ -177,6 +188,27 @@ pub(crate) async fn group_positions<T: Tx>(
         });
     }
     Ok(all)
+}
+
+/// The group-wide positions of a group as `member` may see them: never above the end of
+/// their visible range, and zero for a group without members.
+pub(crate) async fn group_positions_for<T: Tx>(
+    tx: &mut T,
+    conversation: &Conversation,
+    member: &Member,
+) -> DomainResult<GroupPositions> {
+    let upper = member.visible_upper(conversation.last_seq);
+    let all = group_positions(tx, conversation, conversation.last_seq).await?;
+    Ok(all.map_or(
+        GroupPositions {
+            delivered: 0,
+            read: 0,
+        },
+        |all| GroupPositions {
+            delivered: all.delivered.min(upper),
+            read: all.read.min(upper),
+        },
+    ))
 }
 
 /// How far `member`, at `position`, has effectively got: see [`group_positions`].

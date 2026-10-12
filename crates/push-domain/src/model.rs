@@ -195,25 +195,53 @@ pub struct ConversationSummary {
     /// Live messages from others after `read_seq` within the visible range, at most
     /// `MAX_UNREAD`.
     pub unread: u32,
-    /// Direct conversations: the other member's delivered position, the furthest across
-    /// their devices, and never below `peer_read_seq`. Zero for other conversations; Plan
-    /// 2B replaces or extends these fields with group aggregates.
-    pub peer_delivered_seq: i64,
-    /// Direct conversations: the other member's read position. Zero for other
-    /// conversations.
-    pub peer_read_seq: i64,
+    /// How far the others got, for delivery and read ticks.
+    pub receipts: Receipts,
     /// When the conversation was created or last had an entry appended. Acks and reads do
     /// not move it.
     pub updated_at: DateTime<Utc>,
     /// Current members, sorted.
     pub members: Vec<UserId>,
+    /// Current admins of a group, sorted. Empty for a direct conversation.
+    pub admins: Vec<UserId>,
+}
+
+/// Receipt positions in a conversation listing. Delivered is never below read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Receipts {
+    /// The other member's positions; delivered is the furthest across their devices.
+    Direct {
+        peer_delivered_seq: i64,
+        peer_read_seq: i64,
+    },
+    /// The group-wide positions over the current members (see
+    /// [`ReceiptUpdate::Group`](crate::notify::ReceiptUpdate::Group)), never above what the
+    /// listing user may see. Zero for a group without members.
+    Group {
+        all_delivered_seq: i64,
+        all_read_seq: i64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConversationState {
     pub conversation_id: ConversationId,
+    /// The highest `seq` the caller may see.
     pub last_seq: i64,
-    pub members: Vec<MemberState>,
+    pub positions: Positions,
+}
+
+/// Delivery and read positions in a conversation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Positions {
+    /// A direct conversation: the positions of both members.
+    Members(Vec<MemberState>),
+    /// A group: only the group-wide positions, as in [`Receipts::Group`]. A member's own
+    /// position in a group is private.
+    Group {
+        all_delivered_seq: i64,
+        all_read_seq: i64,
+    },
 }
 
 /// The unique key of the direct conversation between two users, independent of order.

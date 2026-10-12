@@ -4,7 +4,7 @@ use chrono::TimeDelta;
 use common::{Person, World, bodies, edit, entries_for, seqs, text};
 use push_domain::{
     ClientMsgId, Clock, ConversationId, DomainError, EditText, Entry, EntryKind, MessageId,
-    MessageRef, Policy, SendReceipt, SendText, ValidationError,
+    MessageRef, Policy, Positions, SendReceipt, SendText, ValidationError,
 };
 
 /// Alice and bob in a direct chat, with one message "hello" from alice at seq 1.
@@ -271,8 +271,10 @@ async fn an_edit_leaves_the_senders_read_position_unchanged() {
             .conversation_state(alice.user, chat)
             .await
             .unwrap();
-        state
-            .members
+        let Positions::Members(members) = state.positions else {
+            panic!("a direct conversation lists its members' positions");
+        };
+        members
             .iter()
             .find(|member| member.user_id == alice.user)
             .unwrap()
