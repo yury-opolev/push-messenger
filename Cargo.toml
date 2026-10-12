@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/push-domain",
+    "crates/push-gateway",
     "crates/push-message-svc",
     "crates/push-proto",
     "crates/push-store",
