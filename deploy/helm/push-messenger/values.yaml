@@ -1,0 +1,94 @@
+# Safe defaults. Authentication cannot be switched off from here: devMode stays off
+# unless a values file sets both `devMode.enabled` and `devMode.acknowledge`, and the
+# chart refuses dev mode for an ingress host that is not local (see _helpers.tpl).
+
+images:
+  messageSvc:
+    repository: push-messenger/message-svc
+    tag: dev
+  gateway:
+    repository: push-messenger/gateway
+    tag: dev
+  smoke:
+    repository: push-messenger/smoke
+    tag: dev
+  pullPolicy: IfNotPresent
+
+# Changing this rolls out new gateway and message-svc pods even when the image tags stay
+# the same (the bring-up script sets it after rebuilding the images).
+buildId: ""
+
+# DEV ONLY switches: the gateway accepts identities without a token (PUSH_DEV_AUTH=1),
+# message-svc serves the DevSetup API (PUSH_DEV_SETUP=1), and `helm test` runs the
+# smoke test. Never enable outside a local cluster.
+devMode:
+  enabled: false
+  # Must be exactly "insecure-local-only" when enabled.
+  acknowledge: ""
+
+gateway:
+  replicas: 1
+  # Client ping interval announced in Ready, in milliseconds.
+  heartbeatMs: 30000
+  # Longer than the gateway's own 10 s drain.
+  terminationGracePeriodSeconds: 30
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+
+messageSvc:
+  replicas: 1
+  dbMaxConnections: 10
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+
+postgres:
+  image: postgres:17-alpine
+  # Empty: generated on install and kept on upgrades. If set, use letters and digits
+  # only (it is part of a URL).
+  password: ""
+  storage: 1Gi
+  # Empty: the cluster's default storage class.
+  storageClassName: ""
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+
+redis:
+  image: redis:7-alpine
+  # Empty: generated on install and kept on upgrades. Letters and digits only.
+  password: ""
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 250m
+      memory: 128Mi
+
+ingress:
+  enabled: true
+  className: nginx
+  host: push.example.com
+  # nginx closes a proxied connection that is silent for this long; clients ping every
+  # 30 s (spec §7.5).
+  timeoutSeconds: 120
+
+smoke:
+  # The WebSocket URL the smoke test connects to: the ingress controller inside the
+  # cluster, with `ingress.host` as the Host header, so the test goes through the
+  # ingress like a client.
+  socketUrl: ws://ingress-nginx-controller.ingress-nginx.svc.cluster.local/v1/socket
