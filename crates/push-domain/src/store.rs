@@ -26,6 +26,10 @@
 //! Redeeming an invite locks the invite row ([`Tx::lock_invite`]) first and the contact
 //! pair second. No operation takes them in the other order.
 //!
+//! A group's positions lock ([`Tx::lock_conversation_positions`]) comes after its
+//! conversation lock: appends and group changes take the conversation lock through
+//! [`Tx::next_seq`] first, acks and reads take only the positions lock.
+//!
 //! # Delivery positions
 //!
 //! Positions are created eagerly, so a device normally has one for every membership of its
@@ -167,6 +171,17 @@ pub trait Tx: Send {
         user: UserId,
         seq: i64,
     ) -> DomainResult<bool>;
+    /// Serialises changes to the conversation's delivery and read positions until the
+    /// transaction ends. Every operation that compares a group's group-wide positions
+    /// before and after a change calls it before reading "before", so two concurrent
+    /// changes cannot both miss a move (under READ COMMITTED each would otherwise see the
+    /// other's old position). It does not lock the conversation row: acks and reads do not
+    /// wait for appends to commit. Appends take it after `next_seq`, never before.
+    /// Postgres: `pg_advisory_xact_lock` on a hash of the conversation id.
+    async fn lock_conversation_positions(
+        &mut self,
+        conversation: ConversationId,
+    ) -> DomainResult<()>;
 
     // --- The log -----------------------------------------------------------------------
 

@@ -9,7 +9,7 @@ use crate::error::{DomainError, DomainResult};
 use crate::ids::{ClientMsgId, ConversationId, MessageId, UserId};
 use crate::model::{ContentType, Conversation, ConversationKind, Entry, EntryKind, Member, Role};
 use crate::notify::{Event, Notifier};
-use crate::read::{GroupPositions, group_positions, group_receipt};
+use crate::read::{GroupPositions, group_positions_before, group_receipt};
 use crate::service::{Messaging, current_member_ids};
 use crate::store::{Store, Tx};
 use crate::system::SystemEvent;
@@ -273,7 +273,7 @@ where
             return Err(DomainError::NotAGroup);
         }
         let members = tx.members(conversation.id).await?;
-        let before = group_positions(&mut tx, &conversation, seq - 1).await?;
+        let before = group_positions_before(&mut tx, &conversation, seq - 1).await?;
         Ok(GroupChange {
             tx,
             conversation,

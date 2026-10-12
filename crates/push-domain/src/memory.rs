@@ -321,6 +321,14 @@ impl Tx for InMemoryTx {
         }
     }
 
+    async fn lock_conversation_positions(
+        &mut self,
+        _conversation: ConversationId,
+    ) -> DomainResult<()> {
+        // Every in-memory transaction already holds the store-wide lock.
+        Ok(())
+    }
+
     async fn insert_entry(&mut self, entry: Entry) -> DomainResult<InsertOutcome> {
         if !self.work.conversations.contains_key(&entry.conversation_id) {
             return Err(missing("conversation"));

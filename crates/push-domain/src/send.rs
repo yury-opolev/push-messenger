@@ -9,7 +9,7 @@ use crate::model::{
     ContentType, Conversation, ConversationKind, Entry, EntryKind, Member, SendReceipt,
 };
 use crate::notify::{Event, Notifier};
-use crate::read::{GroupPositions, direct_receipt, group_positions, group_receipt};
+use crate::read::{GroupPositions, direct_receipt, group_positions_before, group_receipt};
 use crate::service::{Messaging, current_member_ids, require_device};
 use crate::store::{InsertOutcome, Store, Tx};
 use crate::validation::validate_text;
@@ -197,7 +197,7 @@ where
                 }
             }
         }
-        let group_before = group_positions(&mut tx, &conversation, seq - 1).await?;
+        let group_before = group_positions_before(&mut tx, &conversation, seq - 1).await?;
         Ok(Prepared::Ready(Box::new(Append {
             tx,
             conversation,

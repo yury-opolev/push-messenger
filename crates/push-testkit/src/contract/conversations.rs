@@ -254,6 +254,24 @@ async fn the_read_position_only_moves_forward<B: Backend>(backend: &B) {
     assert_eq!(tx.get_member(id, alice).await.unwrap().unwrap().read_seq, 3);
 }
 
+async fn the_positions_lock_can_be_taken_again_and_needs_no_row<B: Backend>(backend: &B) {
+    let conversation = conversation();
+    let id = conversation.id;
+    let store = store_with(backend, conversation).await;
+    let mut tx = store.begin().await.unwrap();
+
+    assert_eq!(tx.lock_conversation_positions(id).await, Ok(()));
+    assert_eq!(tx.lock_conversation_positions(id).await, Ok(()));
+    assert_eq!(
+        tx.lock_conversation_positions(ConversationId::new()).await,
+        Ok(())
+    );
+    tx.commit().await.unwrap();
+
+    let mut tx = store.begin().await.unwrap();
+    assert_eq!(tx.lock_conversation_positions(id).await, Ok(()));
+}
+
 pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
     case_list![
         a_conversation_is_read_back_as_stored,
@@ -268,5 +286,6 @@ pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
         a_member_needs_a_known_user_and_conversation,
         memberships_pair_each_membership_with_its_current_conversation,
         the_read_position_only_moves_forward,
+        the_positions_lock_can_be_taken_again_and_needs_no_row,
     ]
 }

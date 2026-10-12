@@ -35,7 +35,7 @@ where
         if seq < member.visible_from_seq - 1 {
             return Ok(false);
         }
-        let group_before = group_positions(&mut tx, &found, found.last_seq).await?;
+        let group_before = group_positions_before(&mut tx, &found, found.last_seq).await?;
         let moved = tx.raise_read_seq(conversation, user, seq).await?;
         // Messages below the member's floor were never visible to them, so they are never
         // reported as read.
@@ -192,6 +192,21 @@ pub(crate) async fn group_positions<T: Tx>(
         });
     }
     Ok(all)
+}
+
+/// The group-wide positions before a change to `conversation`, with its log ending at
+/// `last_seq`, after taking its positions lock so that concurrent changes are compared
+/// one after the other. `None`, without locking, for a direct conversation.
+pub(crate) async fn group_positions_before<T: Tx>(
+    tx: &mut T,
+    conversation: &Conversation,
+    last_seq: i64,
+) -> DomainResult<Option<GroupPositions>> {
+    if conversation.kind != ConversationKind::Group {
+        return Ok(None);
+    }
+    tx.lock_conversation_positions(conversation.id).await?;
+    group_positions(tx, conversation, last_seq).await
 }
 
 /// The group-wide positions of a group as `member` may see them: never above the end of

@@ -4,7 +4,7 @@ use crate::error::{DomainError, DomainResult};
 use crate::ids::{ConversationId, DeviceId};
 use crate::model::Entry;
 use crate::notify::Notifier;
-use crate::read::{direct_receipt, group_positions, group_receipt};
+use crate::read::{direct_receipt, group_positions_before, group_receipt};
 use crate::service::{Messaging, require_device};
 use crate::store::{Store, Tx};
 use crate::validation::MAX_SYNC_BATCH;
@@ -96,7 +96,7 @@ where
         if seq < member.visible_from_seq - 1 {
             return Ok(false);
         }
-        let group_before = group_positions(&mut tx, &found, found.last_seq).await?;
+        let group_before = group_positions_before(&mut tx, &found, found.last_seq).await?;
         // Count only from the member's floor: a rejoining member's old positions lie below
         // it.
         let delivered_before = tx
