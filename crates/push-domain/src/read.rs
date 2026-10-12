@@ -77,15 +77,16 @@ where
                 all_read_seq: group.read,
             }
         } else {
-            let mut members = Vec::new();
-            for member in tx.members(conversation).await? {
-                let delivered_seq = tx.delivered_seq(conversation, member.user_id).await?;
-                members.push(MemberState {
+            let members = tx
+                .member_positions(conversation)
+                .await?
+                .into_iter()
+                .map(|(member, delivered_seq)| MemberState {
                     user_id: member.user_id,
                     delivered_seq: delivered_seq.max(member.read_seq),
                     read_seq: member.read_seq,
-                });
-            }
+                })
+                .collect();
             Positions::Members(members)
         };
         tx.rollback().await?;
@@ -121,12 +122,13 @@ pub(crate) async fn direct_receipt<T: Tx>(
     {
         return Ok(None);
     }
-    let members = tx.members(conversation.id).await?;
-    let read_seq = members
+    let positions = tx.member_positions(conversation.id).await?;
+    let (read_seq, delivered_seq) = positions
         .iter()
-        .find(|member| member.user_id == user)
-        .map(|member| member.read_seq)
+        .find(|(member, _)| member.user_id == user)
+        .map(|(member, delivered_seq)| (member.read_seq, *delivered_seq))
         .ok_or(DomainError::NotMember)?;
+    let members: Vec<Member> = positions.into_iter().map(|(member, _)| member).collect();
     let to: Vec<UserId> = current_member_ids(&members)
         .into_iter()
         .filter(|member| *member != user)
@@ -134,7 +136,6 @@ pub(crate) async fn direct_receipt<T: Tx>(
     if to.is_empty() {
         return Ok(None);
     }
-    let delivered_seq = tx.delivered_seq(conversation.id, user).await?;
     Ok(Some(Event::Receipt {
         conversation: conversation.id,
         to,

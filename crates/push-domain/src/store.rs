@@ -285,6 +285,13 @@ pub trait Tx: Send {
         user: UserId,
     ) -> DomainResult<i64>;
 
+    /// Every member row of the conversation, current and former, each with that member's
+    /// `delivered_seq`. One statement on Postgres. The order of the result is unspecified.
+    async fn member_positions(
+        &mut self,
+        conversation: ConversationId,
+    ) -> DomainResult<Vec<(Member, i64)>>;
+
     /// The group-wide positions of `conversation` with its log ending at `last_seq`: the
     /// minimums over its current members of their effective positions. `None` if it has
     /// no current members.

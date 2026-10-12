@@ -95,6 +95,40 @@ async fn a_position_needs_a_known_device_and_conversation<B: Backend>(backend: &
     }
 }
 
+async fn member_positions_pair_every_member_with_their_furthest_delivery<B: Backend>(backend: &B) {
+    let (conversation, other) = (conversation(), conversation());
+    let id = conversation.id;
+    let store = store_with(backend, conversation).await;
+    let (alice, bob, carol) = (UserId::new(), UserId::new(), UserId::new());
+    add_users(&store, &[alice, bob, carol]).await;
+    let (phone, laptop, bobs) = (DeviceId::new(), DeviceId::new(), DeviceId::new());
+    let mut tx = store.begin().await.unwrap();
+    tx.insert_conversation(other.clone()).await.unwrap();
+    let former = Member {
+        left_at_seq: Some(2),
+        read_seq: 2,
+        ..member(id, carol)
+    };
+    for row in [member(id, alice), member(id, bob), former.clone()] {
+        tx.insert_member(row).await.unwrap();
+    }
+    tx.insert_member(member(other.id, alice)).await.unwrap();
+    for (device, user) in [(phone, alice), (laptop, alice), (bobs, bob)] {
+        tx.insert_device(device, user).await.unwrap();
+    }
+    tx.raise_cursor(phone, id, 3).await.unwrap();
+    tx.raise_cursor(laptop, id, 4).await.unwrap();
+    tx.raise_cursor(bobs, other.id, 9).await.unwrap();
+    tx.revoke_device(laptop).await.unwrap();
+
+    let mut positions = tx.member_positions(id).await.unwrap();
+    positions.sort_by_key(|(member, _)| member.user_id);
+    let mut expected = vec![(member(id, alice), 4), (member(id, bob), 0), (former, 0)];
+    expected.sort_by_key(|(member, _)| member.user_id);
+    assert_eq!(positions, expected);
+    assert_eq!(tx.member_positions(ConversationId::new()).await, Ok(vec![]));
+}
+
 /// A group log with seven entries and five members:
 ///
 /// | seq | entry |
@@ -211,6 +245,7 @@ pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
         positions_only_move_forward,
         raising_an_absent_position_creates_it,
         delivered_is_the_furthest_position_of_any_device_of_the_user,
+        member_positions_pair_every_member_with_their_furthest_delivery,
         a_position_needs_a_known_device_and_conversation,
         group_positions_are_minimums_of_effective_positions_over_current_members,
         a_group_without_current_members_has_no_positions,

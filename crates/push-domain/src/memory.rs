@@ -610,6 +610,22 @@ impl Tx for InMemoryTx {
         Ok(self.work.delivered_seq(conversation, user))
     }
 
+    async fn member_positions(
+        &mut self,
+        conversation: ConversationId,
+    ) -> DomainResult<Vec<(Member, i64)>> {
+        let state = &self.work;
+        Ok(state
+            .members
+            .values()
+            .filter(|member| member.conversation_id == conversation)
+            .map(|member| {
+                let delivered_seq = state.delivered_seq(conversation, member.user_id);
+                (member.clone(), delivered_seq)
+            })
+            .collect())
+    }
+
     async fn group_positions(
         &mut self,
         conversation: ConversationId,
