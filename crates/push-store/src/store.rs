@@ -31,9 +31,12 @@ impl PgStore {
     }
 
     /// Connects a pool to `url` as `options` say. Every connection the pool opens first
-    /// sets the lock, statement and idle-in-transaction timeouts. Fails if the first
-    /// connection cannot be made.
+    /// sets the lock, statement and idle-in-transaction timeouts. Fails if the options do
+    /// not pass [`StoreOptions::validate`] or the first connection cannot be made.
     pub async fn connect(url: &str, options: &StoreOptions) -> Result<Self, sqlx::Error> {
+        options
+            .validate()
+            .map_err(|message| sqlx::Error::Configuration(message.into()))?;
         let settings = options.session_settings();
         let pool = PgPoolOptions::new()
             .max_connections(options.max_connections)

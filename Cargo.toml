@@ -16,7 +16,9 @@ license = "MIT"
 repository = "https://github.com/yury-opolev/push-messenger"
 
 [workspace.dependencies]
+anyhow = "1"
 async-trait = "0.1"
+axum = "0.8"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 libtest-mimic = "0.8"
 prost = "0.14"
@@ -42,11 +44,13 @@ sqlx = { version = "0.8", default-features = false, features = [
 testcontainers-modules = { version = "0.13", features = ["postgres", "redis"] }
 thiserror = "2"
 tokio = { version = "1", features = ["sync"] }
-tokio-stream = "0.1"
+tokio-stream = { version = "0.1", features = ["net"] }
+tokio-util = "0.7"
 tonic = "0.14"
 tonic-prost = "0.14"
 tonic-prost-build = "0.14"
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["serde", "v4", "v7"] }
 
 [workspace.lints.rust]

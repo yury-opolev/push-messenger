@@ -35,6 +35,34 @@ impl Default for StoreOptions {
 }
 
 impl StoreOptions {
+    /// Checks that every timeout is between 1 ms and `i32::MAX` ms. PostgreSQL reads 0 as
+    /// "disabled" and rejects values above `i32::MAX`; a timeout must never silently turn
+    /// off. The error names the offending setting.
+    pub fn validate(&self) -> Result<(), String> {
+        for (name, value) in [
+            ("lock_timeout", self.lock_timeout),
+            ("statement_timeout", self.statement_timeout),
+            (
+                "idle_in_transaction_timeout",
+                self.idle_in_transaction_timeout,
+            ),
+        ] {
+            let millis = value.as_millis();
+            if millis < 1 {
+                return Err(format!(
+                    "{name} is {value:?}; it must be at least 1 ms (0 would disable it)"
+                ));
+            }
+            if millis > i32::MAX as u128 {
+                return Err(format!(
+                    "{name} is {value:?}; it must be at most {} ms",
+                    i32::MAX
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// The `SET` statements run on every new connection. Values are whole milliseconds.
     pub(crate) fn session_settings(&self) -> String {
         format!(
@@ -50,6 +78,78 @@ impl StoreOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_timeout_below_one_millisecond_is_refused_by_name() {
+        for (name, options) in [
+            (
+                "lock_timeout",
+                StoreOptions {
+                    lock_timeout: Duration::ZERO,
+                    ..StoreOptions::default()
+                },
+            ),
+            (
+                "statement_timeout",
+                StoreOptions {
+                    statement_timeout: Duration::from_micros(999),
+                    ..StoreOptions::default()
+                },
+            ),
+            (
+                "idle_in_transaction_timeout",
+                StoreOptions {
+                    idle_in_transaction_timeout: Duration::ZERO,
+                    ..StoreOptions::default()
+                },
+            ),
+        ] {
+            let message = options.validate().unwrap_err();
+            assert!(message.contains(name), "{message}");
+        }
+        let one_millisecond = StoreOptions {
+            lock_timeout: Duration::from_millis(1),
+            ..StoreOptions::default()
+        };
+        assert_eq!(one_millisecond.validate(), Ok(()));
+    }
+
+    #[test]
+    fn a_timeout_above_i32_max_milliseconds_is_refused_by_name() {
+        let limit = Duration::from_millis(i32::MAX as u64);
+        let too_long = limit + Duration::from_millis(1);
+        for (name, options) in [
+            (
+                "lock_timeout",
+                StoreOptions {
+                    lock_timeout: too_long,
+                    ..StoreOptions::default()
+                },
+            ),
+            (
+                "statement_timeout",
+                StoreOptions {
+                    statement_timeout: too_long,
+                    ..StoreOptions::default()
+                },
+            ),
+            (
+                "idle_in_transaction_timeout",
+                StoreOptions {
+                    idle_in_transaction_timeout: too_long,
+                    ..StoreOptions::default()
+                },
+            ),
+        ] {
+            let message = options.validate().unwrap_err();
+            assert!(message.contains(name), "{message}");
+        }
+        let at_limit = StoreOptions {
+            statement_timeout: limit,
+            ..StoreOptions::default()
+        };
+        assert_eq!(at_limit.validate(), Ok(()));
+    }
 
     #[test]
     fn session_settings_set_every_timeout_in_milliseconds() {

@@ -31,6 +31,10 @@ pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
 /// Applies the migrations the database at `url` does not have yet, on a connection of its
 /// own: a migration must not inherit the pool's statement and lock timeouts, which are
 /// sized for requests. Run it as the owner of the database.
+///
+/// This is the entry point services use: at start-up they call
+/// `push_store::migrate_database(url)` on a dedicated connection, not `PgStore::migrate`
+/// on the request pool.
 pub async fn migrate_database(url: &str) -> Result<(), sqlx::migrate::MigrateError> {
     // A one-connection pool without the session settings of `PgStore::connect`.
     let pool = sqlx::postgres::PgPoolOptions::new()
