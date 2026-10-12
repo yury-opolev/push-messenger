@@ -152,8 +152,38 @@ async fn no_one_is_promoted_when_an_admin_leaves_and_another_remains() {
     world.svc.leave_group(alice.user, group).await.unwrap();
     let batch = world.svc.sync(carol.device, 100).await.unwrap();
     assert_eq!(seqs(&batch.entries), [1, 2, 3]);
+    let events = system_events(&batch.entries);
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, Some(SystemEvent::AdminPromoted { .. })))
+    );
+    assert_eq!(world.member(group, &bob).await.unwrap().role, Role::Admin);
     assert_eq!(
         world.member(group, &carol).await.unwrap().role,
         Role::Member
     );
+}
+
+#[tokio::test]
+async fn an_admin_can_demote_themselves_when_another_admin_remains() {
+    let (world, alice, bob, _carol, group) = trio().await;
+    world
+        .svc
+        .set_role(alice.user, group, bob.user, Role::Admin)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        world
+            .svc
+            .set_role(alice.user, group, alice.user, Role::Member)
+            .await,
+        Ok(())
+    );
+    assert_eq!(
+        world.member(group, &alice).await.unwrap().role,
+        Role::Member
+    );
+    assert_eq!(world.member(group, &bob).await.unwrap().role, Role::Admin);
 }

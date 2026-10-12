@@ -208,31 +208,6 @@ async fn among_members_who_joined_together_the_lowest_user_id_is_promoted() {
 }
 
 #[tokio::test]
-async fn an_admin_leaving_while_another_admin_remains_promotes_nobody() {
-    let (world, alice, bob, carol, group) = trio().await;
-    world
-        .svc
-        .set_role(alice.user, group, bob.user, Role::Admin)
-        .await
-        .unwrap();
-
-    world.svc.leave_group(alice.user, group).await.unwrap();
-    let batch = world.svc.sync(carol.device, 100).await.unwrap();
-    let events = system_events(&batch.entries);
-    assert_eq!(events.len(), 3);
-    assert!(
-        !events
-            .iter()
-            .any(|event| matches!(event, Some(SystemEvent::AdminPromoted { .. })))
-    );
-    assert_eq!(world.member(group, &bob).await.unwrap().role, Role::Admin);
-    assert_eq!(
-        world.member(group, &carol).await.unwrap().role,
-        Role::Member
-    );
-}
-
-#[tokio::test]
 async fn leaving_a_direct_conversation_is_refused() {
     let world = World::new();
     let (alice, bob) = (world.person().await, world.person().await);
