@@ -1,7 +1,8 @@
 //! The `auth` schema on a real PostgreSQL (Docker must be running): the migrations run as
-//! the database's owner, a plain role like the chart's, and the constraints hold.
+//! the database's owner, a plain role like the chart's, the constraints hold, and the
+//! worker's role may drain the outbox and run the cleanups, and nothing else.
 
-use push_auth::{MIGRATOR, migrate_database};
+use push_auth::{MIGRATOR, grant_worker_access, migrate_database};
 use sqlx::PgPool;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
@@ -9,7 +10,7 @@ use testcontainers_modules::testcontainers::{ContainerAsync, ImageExt};
 use uuid::Uuid;
 
 /// A running Postgres with a database `push_auth` owned by the plain role `push_auth`,
-/// and the URL to connect as that role.
+/// a plain role `push_worker`, and the URL to connect as `push_auth`.
 async fn auth_database() -> (ContainerAsync<Postgres>, String) {
     let container = Postgres::default()
         .with_tag("17-alpine")
@@ -29,6 +30,7 @@ async fn auth_database() -> (ContainerAsync<Postgres>, String) {
     for statement in [
         "CREATE ROLE push_auth LOGIN PASSWORD 'auth-secret'",
         "CREATE DATABASE push_auth OWNER push_auth",
+        "CREATE ROLE push_worker LOGIN PASSWORD 'worker-secret'",
     ] {
         sqlx::query(statement)
             .execute(&admin)
@@ -163,4 +165,150 @@ async fn a_registration_id_names_one_device_of_a_user() {
     insert(bob).await.expect("another user may use the same id");
     let error = insert(alice).await.expect_err("the same id again");
     assert_eq!(constraint(error), "device_user_id_registration_id_key");
+}
+
+/// The URL of the same database as the worker's role.
+fn worker_url(url: &str) -> String {
+    url.replacen("push_auth:auth-secret@", "push_worker:worker-secret@", 1)
+}
+
+/// The SQLSTATE of a failed statement.
+fn sqlstate(error: sqlx::Error) -> String {
+    error
+        .as_database_error()
+        .and_then(|database| database.code())
+        .unwrap_or_default()
+        .into_owned()
+}
+
+#[tokio::test]
+async fn the_worker_may_drain_the_outbox_and_nothing_else() {
+    let (_container, url) = auth_database().await;
+    let pool = migrated(&url).await;
+    grant_worker_access(&url, "push_worker")
+        .await
+        .expect("grant");
+    grant_worker_access(&url, "push_worker")
+        .await
+        .expect("grant again");
+    let event = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO auth.outbox (event_id, kind, payload) VALUES ($1, 'user.verified', '{}')",
+    )
+    .bind(event)
+    .execute(&pool)
+    .await
+    .expect("an event");
+
+    let worker = PgPool::connect(&worker_url(&url))
+        .await
+        .expect("connect as the worker");
+    let drained: Vec<Uuid> = sqlx::query_scalar(
+        "DELETE FROM auth.outbox WHERE event_id IN (SELECT event_id FROM auth.outbox \
+         ORDER BY created_at, event_id LIMIT 10 FOR UPDATE SKIP LOCKED) RETURNING event_id",
+    )
+    .fetch_all(&worker)
+    .await
+    .expect("drain the outbox");
+    assert_eq!(drained, [event]);
+    for statement in [
+        "SELECT count(*) FROM auth.user_account",
+        "SELECT count(*) FROM auth.refresh_token",
+        "INSERT INTO auth.outbox (event_id, kind, payload) \
+         VALUES (gen_random_uuid(), 'user.verified', '{}')",
+        "UPDATE auth.outbox SET payload = '{}'",
+    ] {
+        let error = sqlx::query(statement)
+            .execute(&worker)
+            .await
+            .expect_err(statement);
+        assert_eq!(sqlstate(error), "42501", "{statement}");
+    }
+}
+
+#[tokio::test]
+async fn the_cleanups_delete_expired_tokens_and_stale_unverified_accounts() {
+    let (_container, url) = auth_database().await;
+    let pool = migrated(&url).await;
+    grant_worker_access(&url, "push_worker")
+        .await
+        .expect("grant");
+    let alice = insert_user(&pool, "alice@example.com", "alice")
+        .await
+        .expect("alice");
+    sqlx::query("UPDATE auth.user_account SET email_verified_at = now() WHERE user_id = $1")
+        .bind(alice)
+        .execute(&pool)
+        .await
+        .expect("verify alice");
+    let device = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO auth.device (device_id, user_id, name, platform, registration_id) \
+         VALUES ($1, $2, 'Phone', 'ios', $1)",
+    )
+    .bind(device)
+    .bind(alice)
+    .execute(&pool)
+    .await
+    .expect("a device");
+    for (hash, expires) in [([1u8; 32], "-1 day"), ([2u8; 32], "1 day")] {
+        sqlx::query(
+            "INSERT INTO auth.refresh_token (token_hash, device_id, expires_at) \
+             VALUES ($1, $2, now() + $3::interval)",
+        )
+        .bind(hash.as_slice())
+        .bind(device)
+        .bind(expires)
+        .execute(&pool)
+        .await
+        .expect("a refresh token");
+    }
+    // Unverified for 8 days, unverified since now, and verified 8 days ago.
+    for (email, handle, verified) in [
+        ("bob@example.com", "bob", false),
+        ("carol@example.com", "carol", false),
+        ("dave@example.com", "dave", true),
+    ] {
+        let user = insert_user(&pool, email, handle).await.expect(handle);
+        if handle != "carol" {
+            sqlx::query(
+                "UPDATE auth.user_account SET created_at = now() - interval '8 days', \
+                 email_verified_at = CASE WHEN $2 THEN now() END WHERE user_id = $1",
+            )
+            .bind(user)
+            .bind(verified)
+            .execute(&pool)
+            .await
+            .expect("age the account");
+        }
+    }
+
+    let worker = PgPool::connect(&worker_url(&url))
+        .await
+        .expect("connect as the worker");
+    let expired = |batch: i32| {
+        sqlx::query_scalar::<_, i32>("SELECT auth.delete_expired_refresh_tokens($1)")
+            .bind(batch)
+            .fetch_one(&worker)
+    };
+    assert_eq!(expired(100).await.expect("tokens"), 1);
+    assert_eq!(expired(100).await.expect("tokens again"), 0);
+    let unverified: i32 =
+        sqlx::query_scalar("SELECT auth.delete_unverified_accounts(interval '7 days', 100)")
+            .fetch_one(&worker)
+            .await
+            .expect("accounts");
+    assert_eq!(unverified, 1);
+
+    let tokens: i64 = sqlx::query_scalar("SELECT count(*) FROM auth.refresh_token")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(tokens, 1, "the live token stays");
+    let handles: Vec<String> =
+        sqlx::query_scalar("SELECT handle::text FROM auth.user_account ORDER BY handle")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(handles, ["alice", "carol", "dave"]);
 }

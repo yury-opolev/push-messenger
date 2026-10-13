@@ -15,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::api::{Api, router};
 use crate::config::Config;
-use crate::db::migrate_database;
+use crate::db::{grant_worker_access, migrate_database};
 use crate::limits::{Limits, RedisCounter};
 use crate::links::LinkSigner;
 use crate::password::Passwords;
@@ -63,6 +63,9 @@ pub async fn serve(
         // Migrations run on a dedicated connection, not on the request pool, whose
         // statement and lock timeouts are sized for requests.
         migrate_database(&config.database_url).await?;
+        if let Some(role) = &config.worker_role {
+            grant_worker_access(&config.database_url, role).await?;
+        }
         let pool = push_store::connect_pool(&config.database_url, &config.store).await?;
         anyhow::Ok(pool)
     })

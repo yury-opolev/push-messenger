@@ -20,7 +20,7 @@ mod service;
 pub mod tokens;
 
 pub use config::{Config, ConfigError};
-pub use db::{MIGRATOR, migrate_database};
+pub use db::{MIGRATOR, grant_worker_access, is_role_name, migrate_database};
 pub use devices::{Caller, DeviceInfo, MAX_ACTIVE_DEVICES, REFRESH_GRACE, Tokens};
 pub use error::AuthError;
 pub use profiles::{OwnProfile, PublicProfile};
