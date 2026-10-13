@@ -1981,6 +1981,7 @@ dependencies = [
 name = "push-auth"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "argon2",
  "async-trait",
  "axum",
@@ -2003,6 +2004,7 @@ dependencies = [
  "tokio-util",
  "tower",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
