@@ -182,6 +182,14 @@ impl Config {
             Sender::Log => set("PUSH_EMAIL_FROM").unwrap_or_default(),
             Sender::Resend { .. } => required("PUSH_EMAIL_FROM")?,
         };
+        if from.chars().any(char::is_control) {
+            return Err(ConfigError::Invalid {
+                name: "PUSH_EMAIL_FROM",
+                value: from,
+                reason: "must not contain control characters (it goes into an email header)"
+                    .to_owned(),
+            });
+        }
         let product_name =
             set("PUSH_EMAIL_PRODUCT_NAME").unwrap_or_else(|| "Push Messenger".to_owned());
         if product_name.chars().any(char::is_control) {
@@ -472,6 +480,16 @@ mod tests {
         }
         let accented = config(&with(&[("PUSH_EMAIL_PRODUCT_NAME", "Æble Chat")])).unwrap();
         assert_eq!(accented.product_name, "Æble Chat");
+        assert!(matches!(
+            config(&with(&[(
+                "PUSH_EMAIL_FROM",
+                "Push <no-reply@push.test>\r\nBcc: victim@example.com"
+            )])),
+            Err(ConfigError::Invalid {
+                name: "PUSH_EMAIL_FROM",
+                ..
+            })
+        ));
     }
 
     #[test]
