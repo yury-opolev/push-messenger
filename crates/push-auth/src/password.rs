@@ -7,13 +7,14 @@
 //! blocking thread and pass a [`HashGate`] first, which bounds how many run at once, how
 //! many wait and for how long.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use argon2::password_hash::rand_core::OsRng;
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::{Algorithm, Argon2, Params, Version};
-use tokio::sync::{Semaphore, SemaphorePermit};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// The outcome of checking a password against a stored hash.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,7 +128,7 @@ fn random_password() -> String {
 /// fails fast with a retryable error instead of piling up memory and latency.
 #[derive(Debug)]
 pub struct HashGate {
-    slots: Semaphore,
+    slots: Arc<Semaphore>,
     waiting: AtomicUsize,
     queue: usize,
     wait: Duration,
@@ -151,7 +152,7 @@ impl HashGate {
     /// a longest wait of `wait`.
     pub fn new(slots: usize, queue: usize, wait: Duration) -> Self {
         Self {
-            slots: Semaphore::new(slots.max(1)),
+            slots: Arc::new(Semaphore::new(slots.max(1))),
             waiting: AtomicUsize::new(0),
             queue,
             wait,
@@ -160,8 +161,8 @@ impl HashGate {
 
     /// A slot, held until the permit is dropped; [`Busy`] at once when the queue is full,
     /// or after `wait` without a free slot.
-    pub async fn enter(&self) -> Result<SemaphorePermit<'_>, Busy> {
-        if let Ok(permit) = self.slots.try_acquire() {
+    pub async fn enter(&self) -> Result<OwnedSemaphorePermit, Busy> {
+        if let Ok(permit) = Arc::clone(&self.slots).try_acquire_owned() {
             return Ok(permit);
         }
         let ahead = self.waiting.fetch_add(1, Ordering::SeqCst);
@@ -169,7 +170,7 @@ impl HashGate {
         if ahead >= self.queue {
             return Err(Busy);
         }
-        match tokio::time::timeout(self.wait, self.slots.acquire()).await {
+        match tokio::time::timeout(self.wait, Arc::clone(&self.slots).acquire_owned()).await {
             Ok(Ok(permit)) => Ok(permit),
             _ => Err(Busy),
         }

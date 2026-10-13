@@ -5,9 +5,16 @@
 //! transaction as each change.
 
 mod db;
+mod error;
 pub mod links;
+pub mod outbox;
 pub mod password;
 pub mod rules;
+mod service;
 pub mod tokens;
 
 pub use db::{MIGRATOR, migrate_database};
+pub use error::AuthError;
+pub use service::{
+    Auth, LINK_SECONDS, REGISTRATION_TOKEN_SECONDS, RegistrationToken, Settings, Signup,
+};

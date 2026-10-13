@@ -28,7 +28,7 @@ pub const MAX_NAME_CHARS: usize = 64;
 pub fn email(raw: &str) -> Result<String, Invalid> {
     let raw = raw.trim();
     let refuse = || invalid("email", "not a valid email address");
-    if raw.len() > 254 || raw.chars().any(|c| c.is_whitespace() || c.is_control()) {
+    if raw.chars().any(|c| c.is_whitespace() || c.is_control()) {
         return Err(refuse());
     }
     let (local, domain) = raw.split_once('@').ok_or_else(refuse)?;
@@ -41,7 +41,12 @@ pub fn email(raw: &str) -> Result<String, Invalid> {
     if !labels_ok {
         return Err(refuse());
     }
-    Ok(format!("{local}@{}", domain.to_lowercase()))
+    // Lower-casing can change the byte count, and the database limits the stored bytes.
+    let normalised = format!("{local}@{}", domain.to_lowercase());
+    if normalised.len() > 254 {
+        return Err(refuse());
+    }
+    Ok(normalised)
 }
 
 /// A public handle, without its `@`: 3 to 30 lower-case letters, digits and underscores,
@@ -162,6 +167,16 @@ mod tests {
         }
         let long_local = format!("{}@example.com", "a".repeat(65));
         assert!(email(&long_local).is_err());
+    }
+
+    #[test]
+    fn the_email_limit_counts_bytes_after_lower_casing() {
+        // 'İ' is 2 bytes and lower-cases to 3: 254 bytes typed, 378 stored.
+        let typed = format!("a@{}.com", "İ".repeat(124));
+        assert_eq!(typed.len(), 254);
+        assert!(email(&typed).is_err());
+        let fits = format!("a@{}.com", "İ".repeat(40));
+        assert!(email(&fits).is_ok());
     }
 
     #[test]
