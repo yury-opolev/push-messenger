@@ -2235,12 +2235,25 @@ async fn the_cleanups_delete_expired_tokens_and_stale_unverified_accounts() {
     };
     assert_eq!(expired(100).await.expect("tokens"), 1);
     assert_eq!(expired(100).await.expect("tokens again"), 0);
+    // A NULL batch or an age under a day cannot touch carol, unverified since now.
+    let misused: Option<i32> =
+        sqlx::query_scalar("SELECT auth.delete_unverified_accounts(interval '0 seconds', NULL)")
+            .fetch_one(&worker)
+            .await
+            .expect("a NULL batch");
+    assert_eq!(misused, None);
+    let misused: i32 =
+        sqlx::query_scalar("SELECT auth.delete_unverified_accounts(interval '-1 day', 100)")
+            .fetch_one(&worker)
+            .await
+            .expect("a negative age");
+    assert_eq!(misused, 1, "only the 8-day-old account, never carol");
     let unverified: i32 =
         sqlx::query_scalar("SELECT auth.delete_unverified_accounts(interval '7 days', 100)")
             .fetch_one(&worker)
             .await
             .expect("accounts");
-    assert_eq!(unverified, 1);
+    assert_eq!(unverified, 0);
 
     let tokens: i64 = sqlx::query_scalar("SELECT count(*) FROM auth.refresh_token")
         .fetch_one(&pool)
@@ -2319,8 +2332,12 @@ Create `crates/push-auth/migrations/0002_worker.sql`:
 ```sql
 -- What the worker may do in the auth schema (Plan 6), besides draining auth.outbox: two
 -- cleanups, as functions, so the rules stay here and the worker never reads accounts or
--- tokens. auth-svc grants EXECUTE on them, and SELECT and DELETE on auth.outbox, to the
--- worker's role at start-up (PUSH_AUTH_WORKER_ROLE).
+-- tokens. auth-svc grants EXECUTE on them, SELECT and DELETE on auth.outbox, and UPDATE of
+-- auth.outbox.created_at (which FOR UPDATE needs), to the worker's role at start-up
+-- (PUSH_AUTH_WORKER_ROLE).
+--
+-- STRICT: a NULL argument deletes nothing. The batch is capped at 10000 and the age at no
+-- less than a day, so a misused caller cannot wipe fresh signups in one call.
 --
 -- SECURITY DEFINER: they run with the rights of their owner, auth-svc's role. The
 -- search_path is pinned, so a caller cannot slip in objects of its own, and nobody may
@@ -2333,13 +2350,13 @@ CREATE INDEX user_account_unverified ON auth.user_account (created_at)
 -- Deletes up to `batch` refresh tokens past their expiry, which nothing can use any more,
 -- rotated and revoked ones included. Returns how many it deleted; call it again until 0.
 CREATE FUNCTION auth.delete_expired_refresh_tokens(batch integer) RETURNS integer
-LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+LANGUAGE sql STRICT SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
     WITH gone AS (
         DELETE FROM auth.refresh_token
         WHERE token_hash IN (
             SELECT token_hash FROM auth.refresh_token
             WHERE expires_at < statement_timestamp()
-            LIMIT batch
+            LIMIT least(batch, 10000)
             FOR UPDATE SKIP LOCKED)
         RETURNING 1)
     SELECT count(*)::integer FROM gone
@@ -2350,16 +2367,16 @@ $$;
 -- somehow has is kept. Returns how many it deleted; call it again until 0.
 CREATE FUNCTION auth.delete_unverified_accounts(older_than interval, batch integer)
 RETURNS integer
-LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+LANGUAGE sql STRICT SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
     WITH gone AS (
         DELETE FROM auth.user_account
         WHERE user_id IN (
             SELECT account.user_id FROM auth.user_account AS account
             WHERE account.email_verified_at IS NULL
-              AND account.created_at < statement_timestamp() - older_than
+              AND account.created_at < statement_timestamp() - greatest(older_than, interval '1 day')
               AND NOT EXISTS (
                   SELECT 1 FROM auth.device WHERE device.user_id = account.user_id)
-            LIMIT batch
+            LIMIT least(batch, 10000)
             FOR UPDATE SKIP LOCKED)
         RETURNING 1)
     SELECT count(*)::integer FROM gone
@@ -2421,6 +2438,10 @@ pub fn is_role_name(name: &str) -> bool {
     matches!(chars.next(), Some('a'..='z' | '_'))
         && name.len() <= 63
         && chars.all(|c| matches!(c, 'a'..='z' | '0'..='9' | '_'))
+        // PostgreSQL reads `public` as every role even when quoted; `none` and `pg_*` are
+        // reserved.
+        && !matches!(name, "public" | "none")
+        && !name.starts_with("pg_")
 }
 
 #[cfg(test)]
@@ -2435,6 +2456,9 @@ mod tests {
         let long = "w".repeat(64);
         for name in [
             "",
+            "public",
+            "none",
+            "pg_monitor",
             "2w",
             "Push",
             "push-worker",
@@ -3111,6 +3135,19 @@ mod tests {
     const LINK: &str = "https://api.example.com/v1/auth/verify?token=abc.def";
 
     #[test]
+    fn a_link_with_quotes_or_angle_brackets_stays_inside_its_href() {
+        let link = "https://api.example.com/v1/auth/verify?token=a\"><script>";
+        let rendered = Templates::default()
+            .render(
+                "verify_email",
+                &json!({"link": link, "handle": "alice", "expires_in_minutes": 30}),
+            )
+            .unwrap();
+        assert!(!rendered.html.contains("<script>"));
+        assert!(rendered.html.contains("token=a&quot;&gt;&lt;script&gt;\">"));
+    }
+
+    #[test]
     fn verify_email_carries_the_link_the_handle_and_the_lifetime() {
         let rendered = Templates::default()
             .render(
@@ -3386,6 +3423,7 @@ impl ResendSender {
     pub fn new(api_url: &str, api_key: String, from: String) -> Result<Self, SendError> {
         let http = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|_| SendError::Permanent("could not build the HTTP client".to_owned()))?;
         Ok(Self {
@@ -3430,7 +3468,13 @@ impl EmailSender for ResendSender {
             });
         }
         // Only Resend's error name: its message can quote the address.
-        let name = answer["name"].as_str().unwrap_or("unknown");
+        let name: String = answer["name"]
+            .as_str()
+            .unwrap_or("unknown")
+            .chars()
+            .filter(|c| c.is_ascii_lowercase() || *c == '_')
+            .take(64)
+            .collect();
         let reason = format!("Resend answered {status} ({name})");
         if is_retryable(status) {
             Err(SendError::Retryable(reason))
@@ -3440,12 +3484,13 @@ impl EmailSender for ResendSender {
     }
 }
 
-/// Rate limits, a concurrent request with the same idempotency key, server errors, and a
-/// missing or wrong API key (401, 403): the emails wait while the key is fixed.
+/// Rate limits, a timeout, a concurrent request with the same idempotency key, server
+/// errors, and a missing or wrong API key (401, 403): the emails wait while the key is fixed.
 fn is_retryable(status: StatusCode) -> bool {
     matches!(
         status,
         StatusCode::TOO_MANY_REQUESTS
+            | StatusCode::REQUEST_TIMEOUT
             | StatusCode::CONFLICT
             | StatusCode::UNAUTHORIZED
             | StatusCode::FORBIDDEN
@@ -4363,7 +4408,11 @@ async fn a_stale_outcome_never_overwrites_a_newer_claim() {
         .unwrap();
     let slow = queue.claim(10).await.unwrap();
     tokio::time::sleep(Duration::from_millis(500)).await;
-    let newer = queue.claim(10).await.unwrap();
+    // The newer claim takes a long lease, so the checks below never race its expiry.
+    let newer = Queue::new(pool.clone(), Duration::from_secs(60))
+        .claim(10)
+        .await
+        .unwrap();
     assert_eq!(newer.len(), 2);
 
     // The slow worker's outcomes come after its lease ended: all of them are dropped.
@@ -4586,7 +4635,7 @@ CREATE TABLE worker.email_message (
     recipient_domain    text NOT NULL,
     template            text NOT NULL,
     -- Without the link: it would sign its holder in.
-    params              jsonb NOT NULL,
+    params              jsonb NOT NULL CHECK (NOT params ? 'link'),
     provider_message_id text UNIQUE,
     -- 1 queued, 2 sent, 3 suppressed, 4 failed.
     status              smallint NOT NULL CHECK (status BETWEEN 1 AND 4),
@@ -5457,6 +5506,9 @@ impl Accounts {
         let bearer = format!("Bearer {token}")
             .parse()
             .map_err(|_| "the Accounts token cannot be sent as metadata".to_owned())?;
+        let mut bearer: MetadataValue<Ascii> = bearer;
+        // Never indexed by HTTP/2 or shown in header dumps.
+        bearer.set_sensitive(true);
         let channel = Endpoint::from_shared(url.to_owned())
             .map_err(|_| "not a valid message-svc URL".to_owned())?
             .connect_timeout(CONNECT_TIMEOUT)
@@ -6330,7 +6382,10 @@ impl Mailer {
                 })
             }
             Err(SendError::Retryable(reason) | SendError::Permanent(reason)) => {
-                sqlx::query("UPDATE worker.email_message SET status = $2 WHERE email_id = $1")
+                // Only while still queued: a late duplicate run must not undo a send.
+                sqlx::query(
+                    "UPDATE worker.email_message SET status = $2 WHERE email_id = $1 AND status = 1",
+                )
                     .bind(job.id)
                     .bind(FAILED)
                     .execute(&self.pool)
@@ -7247,10 +7302,13 @@ impl Cleanup {
                     AGAIN_SOON
                 })
             }
-            Err(_) => Outcome::Failed {
-                reason: format!("{kind}: the database did not answer"),
-                max_attempts: None,
-            },
+            Err(error) => {
+                tracing::warn!(cleanup = kind, %error, "cleanup failed; it runs again later");
+                Outcome::Failed {
+                    reason: format!("{kind}: the database refused or did not answer"),
+                    max_attempts: None,
+                }
+            }
         })
     }
 
@@ -7508,7 +7566,7 @@ impl std::fmt::Debug for Sender {
 /// | `PUSH_ACCOUNTS_TOKEN` | the token message-svc requires for its `Accounts` API, 32 to 256 visible ASCII characters | required |
 /// | `PUSH_EMAIL_SENDER` | `log` (logs instead of sending) or `resend` | `log` |
 /// | `PUSH_EMAIL_FROM` | the From of every email, `Push Messenger <no-reply@push.kubegames.dk>` | required for `resend` |
-/// | `PUSH_EMAIL_PRODUCT_NAME` | the name emails sign with | `Push Messenger` |
+/// | `PUSH_EMAIL_PRODUCT_NAME` | the name emails sign with; no control characters, since it goes into the subject | `Push Messenger` |
 /// | `PUSH_RESEND_API_KEY` | Resend API key | required for `resend` |
 /// | `PUSH_RESEND_API_URL` | Resend's API (`http` only for local hosts, for tests) | `https://api.resend.com` |
 /// | `PUSH_RESEND_WEBHOOK_SECRET` | the webhook's signing secret, `whsec_…`; without it `/v1/webhooks/resend` is not served | none |
@@ -7653,6 +7711,16 @@ impl Config {
             Sender::Log => set("PUSH_EMAIL_FROM").unwrap_or_default(),
             Sender::Resend { .. } => required("PUSH_EMAIL_FROM")?,
         };
+        let product_name =
+            set("PUSH_EMAIL_PRODUCT_NAME").unwrap_or_else(|| "Push Messenger".to_owned());
+        if product_name.chars().any(char::is_control) {
+            return Err(ConfigError::Invalid {
+                name: "PUSH_EMAIL_PRODUCT_NAME",
+                value: product_name,
+                reason: "must not contain control characters (it goes into the email subject)"
+                    .to_owned(),
+            });
+        }
         let webhook_secret = set("PUSH_RESEND_WEBHOOK_SECRET");
         if let Some(secret) = &webhook_secret {
             push_email::ResendWebhooks::new(secret)
@@ -7691,8 +7759,7 @@ impl Config {
             accounts_token,
             sender,
             from,
-            product_name: set("PUSH_EMAIL_PRODUCT_NAME")
-                .unwrap_or_else(|| "Push Messenger".to_owned()),
+            product_name,
             webhook_secret,
             poll: Duration::from_millis(poll_ms),
             unverified_after: DAY.saturating_mul(unverified_days.min(36_500) as u32),
@@ -7784,11 +7851,11 @@ mod tests {
     const REQUIRED: [(&str, &str); 4] = [
         (
             "PUSH_DATABASE_URL",
-            "postgres://push_worker:hunter2@db/push_worker",
+            "postgres://push_worker:dbsecret@db/push_worker",
         ),
         (
             "PUSH_AUTH_DATABASE_URL",
-            "postgres://push_worker:hunter2@db/push_auth",
+            "postgres://push_worker:dbsecret@db/push_auth",
         ),
         ("PUSH_MESSAGE_SVC_URL", "http://message-svc:50051"),
         ("PUSH_ACCOUNTS_TOKEN", TOKEN),
@@ -7911,6 +7978,32 @@ mod tests {
     }
 
     #[test]
+    fn the_product_name_has_no_control_characters() {
+        for name in [
+            "Acme\r\nBcc: victim@example.com",
+            "Acme\nChat",
+            "Acme\rChat",
+            "Acme\tChat",
+            "Acme\u{0}Chat",
+            "Acme\u{7f}Chat",
+        ] {
+            let result = config(&with(&[("PUSH_EMAIL_PRODUCT_NAME", name)]));
+            assert!(
+                matches!(
+                    result,
+                    Err(ConfigError::Invalid {
+                        name: "PUSH_EMAIL_PRODUCT_NAME",
+                        ..
+                    })
+                ),
+                "{name:?}"
+            );
+        }
+        let accented = config(&with(&[("PUSH_EMAIL_PRODUCT_NAME", "Æble Chat")])).unwrap();
+        assert_eq!(accented.product_name, "Æble Chat");
+    }
+
+    #[test]
     fn the_dev_mailbox_is_strict_and_only_for_the_log_sender() {
         for (value, expected) in [("1", true), ("0", false), ("", false)] {
             let config = config(&with(&[("PUSH_DEV_MAILBOX", value)])).unwrap();
@@ -7958,7 +8051,7 @@ mod tests {
     fn secrets_never_show_in_errors_or_debug_output() {
         let message = config(&with(&[(
             "PUSH_AUTH_DATABASE_URL",
-            "mysql://u:hunter2@db/x",
+            "mysql://push:hunter2@db/x",
         )]))
         .unwrap_err()
         .to_string();
@@ -8811,7 +8904,7 @@ before `## License`:
 | `PUSH_RESEND_WEBHOOK_SECRET` | the webhook's signing secret, `whsec_…`; without it the webhook is not served | none |
 | `PUSH_WORKER_POLL_MS` | how often an idle worker looks for work, in milliseconds | `1000` |
 | `PUSH_UNVERIFIED_ACCOUNT_DAYS` | accounts unverified this many days are deleted | `7` |
-| `PUSH_WORKER_RETENTION_DAYS` | buried jobs, email records and delivery events are kept this many days | `30` |
+| `PUSH_WORKER_RETENTION_DAYS` | buried jobs, email records and delivery events are kept this many days; a buried `email.send` job keeps the recipient address until then | `30` |
 | `PUSH_HTTP_ADDR` | address of `/v1/webhooks/resend` (and the DEV ONLY mailbox) | `0.0.0.0:8080` |
 | `PUSH_HEALTH_ADDR` | address of `/healthz` and `/readyz` | `0.0.0.0:8081` |
 | `PUSH_DB_MAX_CONNECTIONS` | size of each of its two pools, at least 1 | `5` |
@@ -8851,7 +8944,8 @@ Implementation notes (push-worker, migration `0001_worker.sql`, Plan 6A):
   `cleanup.worker_records`) are jobs with fixed ids that run hourly; they delete expired
   refresh tokens, accounts unverified for 7 days (a new signup over an unverified account
   resets its `created_at`), and buried jobs, email records and delivery events older than 30
-  days. The suppression list is kept.
+  days. The suppression list is kept. A buried `email.send` job keeps the recipient address
+  in its payload until `delete_dead` removes it with the other buried jobs after 30 days.
 ```
 
 In §5.3, after the last item (`6. The gateway learns the device only from the verified
@@ -8949,6 +9043,24 @@ controller merges after the final review.
 | §7.6 strict DEV ONLY switches with a warning; URLs and secrets never echoed; migrations on a dedicated connection; start-up retries interruptible | 9 |
 | §12 integration tests against real Postgres: outbox relay, `SKIP LOCKED` | 5, 6, 7, 8, 9 |
 
+## Review fixes made after this plan was written
+
+The code blocks above already include these; the commits that made them follow each task's
+own.
+
+- **auth-svc, `0002_worker.sql` (Task 2):** the cleanup functions are `STRICT` (a NULL
+  argument deletes nothing); the batch is `least(batch, 10000)`; the age is
+  `greatest(older_than, interval '1 day')`; `is_role_name` refuses `public`, `none` and
+  `pg_*`.
+- **push-email (Task 3):** 408 is retryable; `ResendSender` follows no redirects; Resend's
+  error name is trimmed to `[a-z_]`, 64 characters at most; a test for link escaping.
+- **push-worker (Tasks 5 to 9):** `email_message.params` has `CHECK (NOT params ? 'link')`;
+  the stale-claim test claims with a separate 60 s-lease queue; the `Accounts` token
+  metadata is marked sensitive; a failed email is marked only while queued; cleanup
+  failures are logged; the product name refuses control characters.
+- **Retention:** a buried `email.send` job keeps the recipient address until `delete_dead`
+  removes it after 30 days.
+
 ## Deferred to later plans
 
 - **The smoke test, the image, the chart and minikube** (Plan 6B): the smoke test waits for
@@ -8981,3 +9093,19 @@ controller merges after the final review.
 - **Old revoked devices** and their positions are not cleaned up.
 - **Email design and languages**; a `List-Unsubscribe` header if non-transactional email
   ever appears.
+- **Plan 7, must-fix:** a per-user advisory lock in `device_registered` and the
+  conversation-join paths. Under READ COMMITTED, an interleaving plus a duplicate
+  `device.registered` can make a new device skip unacked messages.
+- **Plan 8:** the identify oracle (`UNKNOWN_DEVICE` vs `UNAVAILABLE` tells a caller whether a
+  device exists); lower the "identify failed" log level.
+- **Periodic cleanup jobs buried by an older replica never come back.** Seed them with
+  `ON CONFLICT DO UPDATE SET dead_at = NULL`.
+- **Email database errors retry forever** (no `max_attempts` on them).
+- **The unsigned-webhook warn log can be flooded** by anyone who can reach the endpoint.
+- **A test for 413** (a webhook body over the limit).
+- **A verified-body type for webhooks**, so a handler cannot read a body that was not
+  verified.
+- **A grant-failure log** separate from "postgres not reachable" when auth-svc's start-up
+  grant fails.
+- **The relay's `batch > 0` guard.**
+- **`ResendSender` enforcing `https`** itself instead of relying on the configuration.

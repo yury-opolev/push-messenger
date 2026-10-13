@@ -72,6 +72,7 @@ at start-up.
 | `PUSH_GRPC_ADDR` | address of the gRPC API | `0.0.0.0:50051` |
 | `PUSH_HEALTH_ADDR` | address of `/healthz` and `/readyz` | `0.0.0.0:8081` |
 | `PUSH_DB_MAX_CONNECTIONS` | pool size, at least 1 | `10` |
+| `PUSH_ACCOUNTS_TOKEN` | the worker's token for the `Accounts` API, 32 to 256 visible ASCII characters; without it `Accounts` refuses every call | none |
 | `PUSH_DEV_SETUP` | `1` registers the DEV ONLY `DevSetup` service | off |
 
 `push-gateway`:
@@ -101,7 +102,30 @@ at start-up.
 | `PUSH_HTTP_ADDR` | address of the API | `0.0.0.0:8080` |
 | `PUSH_HEALTH_ADDR` | address of `/healthz` and `/readyz` | `0.0.0.0:8081` |
 | `PUSH_DB_MAX_CONNECTIONS` | pool size, at least 1 | `10` |
+| `PUSH_AUTH_WORKER_ROLE` | the worker's role: granted `auth.outbox` and the two cleanup functions at start-up | none |
 | `PUSH_DEV_MAILBOX` | `1` serves the DEV ONLY `GET /dev/mailbox`; refused unless the public URL's host is local | off |
+
+`push-worker`:
+
+| Variable | Meaning | Default |
+|----------|---------|---------|
+| `PUSH_DATABASE_URL` | Postgres URL of the `push_worker` database, as its owner | required |
+| `PUSH_AUTH_DATABASE_URL` | Postgres URL of auth-svc's `push_auth` database, as the worker's role | required |
+| `PUSH_MESSAGE_SVC_URL` | gRPC URL of message-svc, `http://host:50051` (plain `http://` only: the worker is built without TLS) | required |
+| `PUSH_ACCOUNTS_TOKEN` | message-svc's token for its `Accounts` API, the same value as message-svc's | required |
+| `PUSH_EMAIL_SENDER` | `log` (logs instead of sending) or `resend` | `log` |
+| `PUSH_EMAIL_FROM` | the From of every email, `Push Messenger <no-reply@push.kubegames.dk>` | required for `resend` |
+| `PUSH_EMAIL_PRODUCT_NAME` | the name emails sign with | `Push Messenger` |
+| `PUSH_RESEND_API_KEY` | Resend API key | required for `resend` |
+| `PUSH_RESEND_API_URL` | Resend's API (`http` only for `127.0.0.1`/`localhost`) | `https://api.resend.com` |
+| `PUSH_RESEND_WEBHOOK_SECRET` | the webhook's signing secret, `whsec_…`; without it the webhook is not served | none |
+| `PUSH_WORKER_POLL_MS` | how often an idle worker looks for work, in milliseconds | `1000` |
+| `PUSH_UNVERIFIED_ACCOUNT_DAYS` | accounts unverified this many days are deleted | `7` |
+| `PUSH_WORKER_RETENTION_DAYS` | buried jobs, email records and delivery events are kept this many days; a buried `email.send` job keeps the recipient address until then | `30` |
+| `PUSH_HTTP_ADDR` | address of `/v1/webhooks/resend` (and the DEV ONLY mailbox) | `0.0.0.0:8080` |
+| `PUSH_HEALTH_ADDR` | address of `/healthz` and `/readyz` | `0.0.0.0:8081` |
+| `PUSH_DB_MAX_CONNECTIONS` | size of each of its two pools, at least 1 | `5` |
+| `PUSH_DEV_MAILBOX` | `1` serves the DEV ONLY `GET /dev/mailbox`; refused with any sender but `log` | off |
 
 ## License
 

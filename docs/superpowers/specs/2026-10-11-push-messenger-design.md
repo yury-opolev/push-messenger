@@ -284,6 +284,35 @@ email_suppression (
 )
 ```
 
+Implementation notes (push-worker, migration `0001_worker.sql`, Plan 6A):
+
+- The worker has its own database, `push_worker`, owned by its role `push_worker`, which may
+  also connect to `push_auth`: auth-svc grants it (`PUSH_AUTH_WORKER_ROLE`, at start-up)
+  `SELECT`, `DELETE` and `UPDATE (created_at)` on `auth.outbox` — `FOR UPDATE` needs an
+  `UPDATE` right — and `EXECUTE` on `auth.delete_expired_refresh_tokens` and
+  `auth.delete_unverified_accounts`, `SECURITY DEFINER` functions of auth-svc's migration
+  `0002_worker.sql`. It never reads accounts or tokens.
+- `job` also has `dead_at` (a buried job: poison, kept for inspection without an email's
+  `params.link`, never claimed again) and `created_at`. A job's id is its outbox event's
+  id. A claim is `UPDATE … SET attempts = attempts + 1, claimed_at = now(), run_after =
+  now() + 2 min WHERE job_id IN (SELECT … LIMIT 4 FOR UPDATE SKIP LOCKED) RETURNING`: a
+  lease, so a crashed worker's job comes back. A worker claims at most 4 jobs, which it
+  runs one after another within the lease (an attempt, a cleanup run included, takes at
+  most about 15 s). Every outcome is recorded only while the job is still under its claim
+  (`attempts` and `claimed_at` match), so a late one never overwrites a newer claim; at
+  shutdown the jobs not started are given back (`run_after = now()`, `attempts - 1`).
+  Retries wait 1 s, doubling, at most 10 minutes; account events retry without limit, an
+  email gives up after 12 attempts (about 30 minutes, the life of its link).
+- The relay copies a locked batch of outbox rows into `job` (`ON CONFLICT DO NOTHING`),
+  commits, and only then deletes them from the outbox: at least once, never lost.
+- `email_message.params` never holds the link. `email_event.event_id` is `text`: the
+  webhook's `svix-id`, so a redelivered webhook is recorded once.
+- The cleanups (`cleanup.refresh_tokens`, `cleanup.unverified_accounts`,
+  `cleanup.worker_records`) are jobs with fixed ids that run hourly; they delete expired
+  refresh tokens, accounts unverified for 7 days (a new signup over an unverified account
+  resets its `created_at`), and buried jobs, email records and delivery events older than 30
+  days. The suppression list is kept. A buried `email.send` job keeps the recipient address
+  in its payload until `delete_dead` removes it with the other buried jobs after 30 days.
 The worker claims work with `SELECT … FOR UPDATE SKIP LOCKED`, so it scales to several
 replicas without coordination, and work held by a crashed worker is claimed again.
 
@@ -521,6 +550,18 @@ Access-token claims: `sub`, `device_id`, `email_verified`, `exp`, `iat`, `jti`, 
      another user (`PERMISSION_DENIED`, `UNKNOWN_DEVICE`). The gateway (Plan 8) must
      pass this on as "try again shortly", and the SDK must reconnect after a short
      backoff — never treat it as a revocation or sign the user out.
+
+Implementation note (Plan 6A): message-svc's internal `Accounts` gRPC API takes the relayed
+`user.verified`, `device.registered`, `device.revoked` and `user.password_reset`. Every call
+is idempotent and any order ends in the same state: a registration also records the user,
+and a revocation that arrives before the registration records the device as revoked, so the
+registration cannot revive it. Every call needs the shared internal token
+(`authorization: Bearer <PUSH_ACCOUNTS_TOKEN>`, compared in constant time); without it, or
+when message-svc has none, the call is `UNAUTHENTICATED`. A revoked device is refused by
+`Identify` at once (`PERMISSION_DENIED`); a device not relayed yet is `UNAVAILABLE`
+(`retryable`), which the gateway closes with 1011 until Plan 8 gives it a code of its own.
+Publishing `kick:{device_id}` (and kicks on a password reset) comes with Plan 7, closing
+the socket and refusing older tokens with Plan 8.
 
 ### 5.4 Password reset
 
@@ -913,6 +954,23 @@ outbox (
   so we track verification-completion rate by `recipient_domain`. That is the signal for
   switching provider; the traits make switching a configuration change.
 - Local development uses a log-only `EmailSender`.
+
+Implementation notes (push-email, push-worker, Plan 6A):
+
+- Templates `verify_email`, `account_exists` and `reset_password`, as plain text and minimal
+  HTML with escaped parameters; the product name is configurable.
+- `ResendSender` posts to `/emails` with the email's id as `Idempotency-Key` and a
+  `template` tag; 429, 409, 5xx, 401/403 and transport errors are retried, other refusals
+  fail the email. It uses rustls on `ring`.
+- `ResendWebhooks` checks the Svix signature (`v1,` HMAC-SHA256 of
+  `{svix-id}.{svix-timestamp}.{body}`) and refuses timestamps more than 5 minutes off;
+  `email.bounced` with `bounce.type` `Permanent` and `email.complained` add the recipients to
+  `email_suppression`, `email.delivered` is recorded, other types are ignored.
+  `POST /v1/webhooks/resend` is served only with a webhook secret; it answers 401 to a
+  missing, wrong or stale signature and 204 to a signed body it cannot read (logged and
+  dropped: Resend retries anything but a 2xx for days).
+- With `PUSH_DEV_MAILBOX=1` (log sender only) the worker keeps the last 1000 emails it
+  delivered in memory and serves them at `GET /dev/mailbox?to=…` (DEV ONLY).
 
 Azure Communication Services Email is not used: it is being retired (onboarding closes
 2026-10-23, service ends 2028-09-30).
