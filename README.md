@@ -28,9 +28,10 @@ installed:
 starts (or reuses) the minikube profile `push`, enables its ingress addon, builds the
 images into the cluster, installs the chart (`deploy/helm/push-messenger`) with
 `values-minikube.yaml`, and runs the end-to-end smoke test: two users sign up, verify their
-email, register a device and chat through the ingress; the DEV ONLY mailbox and the setup calls go
-to the services directly. `deploy/minikube/up.sh --smoke`
-does the same on Linux and macOS. Both wait for ingress-nginx and retry
+email (the worker's log sender delivers it), register a device, wait for the worker to
+relay it to message-svc, and chat through the ingress; the DEV ONLY mailbox and the setup
+calls go to the services directly. `deploy/minikube/up.sh --smoke` does the same on Linux
+and macOS. Both wait for ingress-nginx and retry
 `helm upgrade --install` up to 5 times while its admission webhook comes up.
 `deploy/minikube/down.ps1` removes everything again: namespace, the
 Secret, the PostgreSQL volume and its data directory (`-Delete` deletes the profile).
@@ -39,18 +40,23 @@ so a later install reuses both and the passwords keep matching. Every pull reque
 verified this way before it is merged.
 
 The minikube values switch on DEV ONLY shortcuts: the gateway accepts any user and device
-id without a token (until it checks access tokens, Plan 8), message-svc serves a setup API,
-and auth-svc shows the email links waiting in its outbox at `/dev/mailbox` (until the
-worker sends email, Plan 6); neither is routed by the ingress. The chart refuses that mode
-unless the values also say `devMode.acknowledge: insecure-local-only` and the ingress host
-is local (`*.local`, `*.localhost` or `*.test`). `pwsh deploy/helm/test-chart.ps1` checks
-the chart without a cluster.
+id without a token (until it checks access tokens, Plan 8), message-svc serves a setup API
+for contacts and conversations (until Plan 7), and the worker, which logs emails instead of
+sending them, shows them at `/dev/mailbox`; none of these is routed by the ingress, which
+reaches the worker only at `/v1/webhooks/resend`. The chart refuses that mode unless the
+values also say `devMode.acknowledge: insecure-local-only` and the ingress host is local
+(`*.local`, `*.localhost` or `*.test`), and refuses it with the Resend sender.
+`pwsh deploy/helm/test-chart.ps1` checks the chart without a cluster.
 
-auth-svc has a database and a role of its own, `push_auth`, which PostgreSQL's init script
-creates when it initialises an empty volume. A cluster whose Postgres volume predates auth-svc
-(Plan 4B) has no such database. `up` stops when the kept Secret `push-secrets` (it survives a plain
-`helm uninstall`) has no `auth-db-password`, or when the running Postgres has no `push_auth`: run
-`deploy/minikube/down.ps1` once, then `up` again.
+auth-svc and the worker have databases and roles of their own, `push_auth` and
+`push_worker`, which PostgreSQL's init scripts create when it initialises an empty volume;
+the worker's role may also drain auth-svc's outbox, which auth-svc grants at start-up.
+message-svc and the worker share a generated Accounts token from the same Secret, which
+the gateway does not get. A
+cluster whose Postgres volume predates them (Plans 4B and 5B) lacks a database. `up` stops
+when the kept Secret `push-secrets` (it survives a plain `helm uninstall`) has no
+`auth-db-password` or `worker-db-password`, or when the running Postgres lacks `push_auth`
+or `push_worker`: run `deploy/minikube/down.ps1` once, then `up` again.
 
 The smoke client checks the access token's audience (`socket_url` with its authority
 replaced by the Host override: `ws://push.local/v1/socket` on minikube) and the refreshed
@@ -103,7 +109,6 @@ at start-up.
 | `PUSH_HEALTH_ADDR` | address of `/healthz` and `/readyz` | `0.0.0.0:8081` |
 | `PUSH_DB_MAX_CONNECTIONS` | pool size, at least 1 | `10` |
 | `PUSH_AUTH_WORKER_ROLE` | the worker's role: granted `auth.outbox` and the two cleanup functions at start-up | none |
-| `PUSH_DEV_MAILBOX` | `1` serves the DEV ONLY `GET /dev/mailbox`; refused unless the public URL's host is local | off |
 
 `push-worker`:
 

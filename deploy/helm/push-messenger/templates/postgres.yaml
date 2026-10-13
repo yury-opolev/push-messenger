@@ -41,8 +41,8 @@ spec:
             - name: postgres
               containerPort: 5432
           env:
-            # One database per service: message-svc owns push_messaging; the init script
-            # creates push_auth for auth-svc.
+            # One database per service: message-svc owns push_messaging; the init scripts
+            # create push_auth for auth-svc and push_worker for the worker.
             - name: POSTGRES_DB
               value: push_messaging
             - name: POSTGRES_USER
@@ -59,6 +59,11 @@ spec:
                 secretKeyRef:
                   name: {{ include "push.secretName" . }}
                   key: auth-db-password
+            - name: PUSH_WORKER_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "push.secretName" . }}
+                  key: worker-db-password
           readinessProbe:
             exec:
               command: ["pg_isready", "-U", "push", "-d", "push_messaging", "-h", "127.0.0.1"]

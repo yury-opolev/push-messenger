@@ -56,6 +56,12 @@ spec:
                   key: redis-url
             - name: PUSH_DB_MAX_CONNECTIONS
               value: {{ .Values.messageSvc.dbMaxConnections | quote }}
+            # Only the worker has this token: the Accounts API refuses calls without it.
+            - name: PUSH_ACCOUNTS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "push.secretName" . }}
+                  key: accounts-token
             - name: PUSH_DEV_SETUP
               value: {{ include "push.devFlag" . | quote }}
           ports:

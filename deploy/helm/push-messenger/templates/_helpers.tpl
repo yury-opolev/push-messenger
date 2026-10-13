@@ -62,9 +62,49 @@ true
 {{- end -}}
 {{- end -}}
 
-{{/* "1" or "0" for the PUSH_DEV_AUTH and PUSH_DEV_SETUP variables. */}}
+{{/* "1" or "0" for the PUSH_DEV_AUTH, PUSH_DEV_SETUP and PUSH_DEV_MAILBOX variables. */}}
 {{- define "push.devFlag" -}}
 {{- if include "push.devMode" . -}}1{{- else -}}0{{- end -}}
+{{- end -}}
+
+{{/*
+"true" when the worker gets a webhook secret, so it serves /v1/webhooks/resend and the
+webhook Ingress is rendered: set in values, kept in the existing Secret, or generated in
+dev mode (secret.yaml).
+*/}}
+{{- define "push.hasWebhook" -}}
+{{- $existing := (lookup "v1" "Secret" .Release.Namespace (include "push.secretName" .)).data | default dict -}}
+{{- if or .Values.worker.email.webhookSecret (hasKey $existing "resend-webhook-secret") (include "push.devMode" .) -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{/*
+Checks the worker's email settings: the sender is log or resend; resend needs an API key
+and a From address and is refused in dev mode, whose mailbox shows every email it sent.
+Dev mode needs exactly one worker: its mailbox is in memory, per replica, so with more
+the smoke test would look in the wrong one.
+*/}}
+{{- define "push.checkEmail" -}}
+{{- $email := .Values.worker.email -}}
+{{- if and (include "push.devMode" .) (gt (int .Values.worker.replicas) 1) -}}
+{{- fail "dev mode keeps the DEV ONLY mailbox in memory, per worker replica: use worker.replicas 1 with it" -}}
+{{- end -}}
+{{- if not (has $email.sender (list "log" "resend")) -}}
+{{- fail (printf "worker.email.sender must be log or resend, not %q" $email.sender) -}}
+{{- end -}}
+{{- if eq $email.sender "resend" -}}
+{{- $existing := (lookup "v1" "Secret" .Release.Namespace (include "push.secretName" .)).data | default dict -}}
+{{- if not (or $email.resendApiKey (hasKey $existing "resend-api-key")) -}}
+{{- fail "worker.email.sender resend needs worker.email.resendApiKey" -}}
+{{- end -}}
+{{- if not $email.from -}}
+{{- fail "worker.email.sender resend needs worker.email.from" -}}
+{{- end -}}
+{{- if include "push.devMode" . -}}
+{{- fail "dev mode shows every email the worker sends at /dev/mailbox: use worker.email.sender log with it" -}}
+{{- end -}}
+{{- end -}}
 {{- end -}}
 
 {{/* Hardened container settings for our own images (distroless, uid 65532). */}}

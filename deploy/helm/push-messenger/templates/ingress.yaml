@@ -26,8 +26,7 @@ spec:
                 port:
                   name: http
 ---
-# auth-svc's public API (spec §2): /v1/auth, /v1/devices and /v1/users. Its DEV ONLY
-# /dev/mailbox is not routed.
+# auth-svc's public API (spec §2): /v1/auth, /v1/devices and /v1/users.
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -81,4 +80,31 @@ spec:
                 port:
                   name: http
           {{- end }}
+{{- if include "push.hasWebhook" . }}
+---
+# Resend's delivery webhooks (spec §9), the worker's only public path: one Exact path, so
+# its DEV ONLY /dev/mailbox is never routed. The worker checks each request's Svix
+# signature and refuses timestamps more than 5 minutes off.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "push.name" (dict "root" . "component" "worker") }}
+  labels:
+    {{- include "push.labels" (dict "root" . "component" "worker") | nindent 4 }}
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: 256k
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  rules:
+    - host: {{ .Values.ingress.host }}
+      http:
+        paths:
+          - path: /v1/webhooks/resend
+            pathType: Exact
+            backend:
+              service:
+                name: {{ include "push.name" (dict "root" . "component" "worker") }}
+                port:
+                  name: http
+{{- end }}
 {{- end }}

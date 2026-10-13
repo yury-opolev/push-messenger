@@ -1,7 +1,7 @@
-//! The auth part of the smoke test: a user signs up, verifies the email through the
-//! DEV ONLY mailbox, signs in, registers a device (and retries the registration, which
-//! must find the same device) and refreshes its tokens, all over auth-svc's public HTTP
-//! API, and checks the access token against the JWKS.
+//! The auth part of the smoke test: a user signs up, verifies the email with the link the
+//! worker's log sender delivered to the DEV ONLY mailbox, signs in, registers a device (and
+//! retries the registration, which must find the same device) and refreshes its tokens, all
+//! over auth-svc's public HTTP API, and checks the access token against the JWKS.
 
 use std::time::{Duration, Instant};
 
@@ -13,7 +13,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::{CONNECT_TIMEOUT, Target, step};
+use crate::{CONNECT_TIMEOUT, Target, WORKER_TIMEOUT, step};
 
 /// A signed-in device.
 pub(crate) struct Enrolled {
@@ -30,8 +30,8 @@ struct Claims {
     aud: String,
 }
 
-/// auth-svc as a client sees it: the public API, through the ingress, and the DEV ONLY
-/// mailbox, straight at the service.
+/// auth-svc as a client sees it: the public API, through the ingress; and the DEV ONLY
+/// mailbox, straight at the worker.
 pub(crate) struct Auth<'a> {
     http: Client,
     target: &'a Target,
@@ -87,8 +87,8 @@ impl<'a> Auth<'a> {
     }
 
     /// Signs `name` up with a fresh address and handle, verifies the address with the
-    /// link from the dev mailbox, signs in, registers a device, retries the registration
-    /// with the same `registration_id` and refreshes its tokens.
+    /// link the worker delivered to the dev mailbox, signs in, registers a device, retries
+    /// the registration with the same `registration_id` and refreshes its tokens.
     pub async fn enroll(&self, name: &str) -> anyhow::Result<Enrolled> {
         let started = Instant::now();
         let suffix = Uuid::now_v7().simple().to_string();
@@ -112,7 +112,7 @@ impl<'a> Auth<'a> {
         )
         .await?;
 
-        let token = self.verification_token(&email).await?;
+        let token = self.verification_token(name, &email).await?;
         let page = public(
             &self.http,
             self.target,
@@ -191,7 +191,7 @@ impl<'a> Auth<'a> {
         let user: Uuid = field(&device, "user_id")?.parse()?;
         let device_id: Uuid = field(&device, "device_id")?.parse()?;
         step(&format!(
-            "{name} signed up, verified the email from the dev mailbox, signed in and registered device {device_id} (a retry returned the same device) in {} ms",
+            "{name} verified the email, signed in and registered device {device_id} (a retry returned the same device) in {} ms",
             started.elapsed().as_millis()
         ));
 
@@ -225,34 +225,53 @@ impl<'a> Auth<'a> {
         })
     }
 
-    /// The token of the newest verification link sent to `email`, from the dev mailbox.
-    async fn verification_token(&self, email: &str) -> anyhow::Result<String> {
+    /// The token of the verification link sent to `email`: the worker relays the
+    /// `email.send` event from auth-svc's outbox and its log sender drops the email into
+    /// the dev mailbox, which is polled until it arrives.
+    async fn verification_token(&self, name: &str, email: &str) -> anyhow::Result<String> {
         let url = format!(
             "{}/dev/mailbox",
             self.target.mailbox_url.trim_end_matches('/')
         );
-        let mailbox: Value = self
-            .http
-            .get(&url)
-            .query(&[("to", email)])
-            .send()
-            .await
-            .and_then(Response::error_for_status)
-            .map_err(|error| error.without_url())
-            .with_context(|| format!("read the dev mailbox at {url}"))?
-            .json()
-            .await
-            .map_err(|error| error.without_url())
-            .context("read the dev mailbox")?;
-        let link = mailbox["emails"]
-            .as_array()
-            .and_then(|emails| {
+        let started = Instant::now();
+        let text = loop {
+            let mailbox: Value = self
+                .http
+                .get(&url)
+                .query(&[("to", email)])
+                .send()
+                .await
+                .and_then(Response::error_for_status)
+                .map_err(|error| error.without_url())
+                .with_context(|| format!("read the dev mailbox at {url}"))?
+                .json()
+                .await
+                .map_err(|error| error.without_url())
+                .context("read the dev mailbox")?;
+            let text = mailbox["emails"].as_array().and_then(|emails| {
                 emails
                     .iter()
                     .find(|email| email["template"] == "verify_email")
-            })
-            .and_then(|email| email["params"]["link"].as_str())
-            .with_context(|| format!("no verification email for {email} in the dev mailbox"))?;
+                    .and_then(|email| email["text"].as_str().map(str::to_owned))
+            });
+            match text {
+                Some(text) => break text,
+                None if started.elapsed() < WORKER_TIMEOUT => {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+                None => bail!(
+                    "no verification email for {email} in the dev mailbox within {WORKER_TIMEOUT:?}"
+                ),
+            }
+        };
+        step(&format!(
+            "{name} signed up; the worker's log sender delivered the verification email after {} ms",
+            started.elapsed().as_millis()
+        ));
+        let link = text
+            .lines()
+            .find(|line| line.starts_with("http"))
+            .context("the verification email has no link")?;
         let token = Url::parse(link)
             .map_err(|_| anyhow::anyhow!("the verification link is not a URL"))?
             .query_pairs()

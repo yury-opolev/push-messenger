@@ -707,12 +707,8 @@ Implementation notes (push-auth, Plan 5A):
 - **Profiles.** `GET /v1/users/lookup` finds verified users only. `GET /v1/users?ids=…`
   needs to know who shares a contact or conversation with the caller, which only
   message-svc knows; it comes with Plan 7.
-- **DEV ONLY mailbox.** auth-svc started with `PUSH_DEV_MAILBOX=1` serves
-  `GET /dev/mailbox?to=…`, the `email.send` payloads in the outbox for one address, so a
-  local cluster and the smoke test can open verification links before the worker sends
-  email (Plan 6). Like the other DEV ONLY switches it accepts only `1` or `0` and logs a
-  warning at start-up; it refuses to start unless the public URL's host is local
-  (`localhost`, `127.0.0.1`, `*.local`, `*.localhost`, `*.test`), like the chart's guard.
+- **DEV ONLY mailbox.** Until Plan 6B auth-svc served the outbox's emails at
+  `/dev/mailbox`; the worker's log sender keeps them now (§9), and auth-svc has no mailbox.
 - **Deferred / open (Plan 5A review).** Refresh sessions slide (30 d) with no absolute
   cap — an owner decision for later. Display names allow bidi and zero-width characters.
   Rate-limit key subjects use plain SHA-256 and should use HMAC. Form POSTs of the link
@@ -973,6 +969,12 @@ Implementation notes (push-email, push-worker, Plan 6A):
 - With `PUSH_DEV_MAILBOX=1` (log sender only) the worker keeps the last 1000 emails it
   delivered in memory and serves them at `GET /dev/mailbox?to=…` (DEV ONLY).
 
+Implementation notes (Plan 6B): the chart's default sender is `log`; `resend` needs
+`worker.email.resendApiKey` and `worker.email.from` and is refused in dev mode. The webhook
+Ingress routes only `/v1/webhooks/resend` (Exact), and only when a webhook secret exists
+(generated in dev mode). Verified on minikube: a signed webhook through the ingress is
+recorded once and suppresses a hard bounce; an unsigned one answers 401.
+
 Azure Communication Services Email is not used: it is being retired (onboarding closes
 2026-10-23, service ends 2028-09-30).
 
@@ -1054,6 +1056,14 @@ Implementation notes (local minikube, Plan 4B):
   `?token=` reached the controller access log. The nginx error log may still show request
   lines on upstream errors (Plan 11). Like the gateway, auth-svc has a 5 s preStop sleep
   and a 30 s termination grace period.
+- The worker (Plan 6B) is a fourth Deployment with its own database `push_worker` and role
+  `push_worker`, created by a second init script, which also grants the role `CONNECT` on
+  `push_auth`; auth-svc grants it `auth.outbox` and two cleanup functions at start-up
+  (`PUSH_AUTH_WORKER_ROLE`). The Secret holds its password and two URLs, the Accounts token
+  (generated and kept; message-svc and the worker read it, the gateway does not), and
+  Resend's API key and webhook secret when set. Its only Ingress routes `Exact`
+  `/v1/webhooks/resend`; its DEV ONLY mailbox is not routed, and dev mode allows one worker
+  only. It has a 5 s preStop sleep and a 30 s grace period.
 - The smoke client verifies the access token's audience (`socket_url` with its authority
   replaced by the Host override, `ws://push.local/v1/socket` on minikube) and the
   refreshed token's `sub` and `device_id`. It never prints response bodies, tokens or
@@ -1071,11 +1081,14 @@ Implementation notes (local minikube, Plan 4B):
   Secret and the PVC and the passwords keep matching the database. `down` wipes the
   Secret, PVC, PVs and the hostpath directory.
 - `deploy/minikube/up.ps1` (and `up.sh`) wait for ingress-nginx, stop at once with
-  "run down.ps1 first" when an existing PostgreSQL volume has no `push_auth` database,
-  retry `helm upgrade --install` up to 5 times, and bring it up on minikube; `helm test`
-  runs `push-smoke` inside the cluster through the ingress controller: two users sign up,
-  verify through the DEV ONLY mailbox, register devices and chat. The Azure plan replaces the in-chart
-  secrets with Key Vault and adds TLS, and may replace the in-chart PostgreSQL and Redis.
+  "run down.ps1 first" when an existing PostgreSQL volume lacks the `push_auth` or
+  `push_worker` database (or the kept Secret their passwords), retry
+  `helm upgrade --install` up to 5 times, and bring it up on minikube; `helm test` runs
+  `push-smoke` inside the cluster through the ingress controller: two users sign up, verify
+  with the emails the worker's log sender delivered to the DEV ONLY mailbox, register
+  devices, wait for the worker to relay them to message-svc, and chat. The Azure plan
+  replaces the in-chart secrets with Key Vault and adds TLS, and may replace the in-chart
+  PostgreSQL and Redis.
 
 ## 12. Testing
 

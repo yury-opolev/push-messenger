@@ -2,6 +2,7 @@ push-messenger {{ .Chart.AppVersion }} is installed as release "{{ .Release.Name
 
 WebSocket endpoint: {{ include "push.socketUrl" . }} (through the ingress controller).
 Auth API: {{ include "push.publicUrl" . }}/v1/auth, /v1/devices and /v1/users; JWKS at /v1/auth/jwks.
+Email: the worker's {{ .Values.worker.email.sender }} sender{{ if include "push.hasWebhook" . }}; Resend webhooks at {{ include "push.publicUrl" . }}/v1/webhooks/resend{{ end }}.
 
 `helm uninstall` keeps the PostgreSQL volume (data-{{ .Release.Name }}-postgres-0) and the
 Secret ({{ include "push.secretName" . }}, helm.sh/resource-policy: keep), so a later install
@@ -12,8 +13,8 @@ alone can leave behind.
 {{- if include "push.devMode" . }}
 
 DEV MODE IS ON: the gateway accepts identities without a token, message-svc serves the
-DevSetup API and auth-svc shows the outbox's email links at /dev/mailbox (not routed by the
-ingress). This is for a local cluster only.
+DevSetup API and the worker shows the emails its log sender delivered at /dev/mailbox (not
+routed by the ingress). This is for a local cluster only.
 
 Run the end-to-end smoke test:
   helm test {{ .Release.Name }} --namespace {{ .Release.Namespace }} --logs

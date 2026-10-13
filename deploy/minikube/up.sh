@@ -48,32 +48,35 @@ if [[ -n "$jobs" ]]; then
   kubectl --context "$cluster" -n ingress-nginx wait --for=condition=complete job --all --timeout=300s
 fi
 
-# PostgreSQL runs the init script that creates auth-svc's database only when it
-# initialises an empty volume. A volume from before auth-svc (Plan 4B) has no push_auth,
-# and auth-svc would never become ready: stop now, not after five slow install attempts.
-predates_auth="The Postgres volume predates auth-svc: it has no push_auth database, and PostgreSQL creates one only on an empty volume. Run deploy/minikube/down.sh --cluster $cluster first (it deletes the cluster's data), then run this script again."
+# PostgreSQL runs the init scripts that create auth-svc's and the worker's databases only
+# when it initialises an empty volume. A volume from before auth-svc (Plan 4B) has no
+# push_auth, one from before the worker (Plan 5B) no push_worker, and the services would
+# never become ready: stop now, not after five slow install attempts.
+predates="The Postgres volume predates auth-svc or the worker: it lacks the push_auth or push_worker database, and PostgreSQL creates them only on an empty volume. Run deploy/minikube/down.sh --cluster $cluster first (it deletes the cluster's data), then run this script again."
 # A plain `helm uninstall` removes the StatefulSet but keeps the volume and the Secret
 # (helm.sh/resource-policy: keep), so the Secret is the evidence that survives it.
 secret_name="$release-secrets"
 secret="$(kubectl --context "$cluster" -n "$namespace" get secret "$secret_name" -o name --ignore-not-found)"
 if [[ -n "$secret" ]]; then
-  auth_password="$(kubectl --context "$cluster" -n "$namespace" get secret "$secret_name" -o jsonpath='{.data.auth-db-password}')"
-  if [[ -z "$auth_password" ]]; then
-    echo "The kept Secret $secret_name has no auth-db-password: it predates auth-svc. $predates_auth" >&2
-    exit 1
-  fi
+  for key in auth-db-password worker-db-password; do
+    password="$(kubectl --context "$cluster" -n "$namespace" get secret "$secret_name" -o "jsonpath={.data.$key}")"
+    if [[ -z "$password" ]]; then
+      echo "The kept Secret $secret_name has no $key: it predates the service that needs it. $predates" >&2
+      exit 1
+    fi
+  done
 fi
 postgres="$(kubectl --context "$cluster" -n "$namespace" get statefulset push-postgres -o name --ignore-not-found)"
 if [[ -n "$postgres" ]]; then
-  step 'check that the Postgres volume has the push_auth database'
+  step 'check that the Postgres volume has the push_auth and push_worker databases'
   kubectl --context "$cluster" -n "$namespace" rollout status statefulset/push-postgres --timeout=300s
-  if ! has_auth="$(kubectl --context "$cluster" -n "$namespace" exec push-postgres-0 -- \
-    psql -U push -d postgres -Atc "SELECT count(*) FROM pg_database WHERE datname = 'push_auth'")"; then
+  if ! databases="$(kubectl --context "$cluster" -n "$namespace" exec push-postgres-0 -- \
+    psql -U push -d postgres -Atc "SELECT count(*) FROM pg_database WHERE datname IN ('push_auth', 'push_worker')")"; then
     echo 'checking the Postgres volume failed' >&2
     exit 1
   fi
-  if [[ "$has_auth" != 1 ]]; then
-    echo "$predates_auth" >&2
+  if [[ "$databases" != 2 ]]; then
+    echo "$predates" >&2
     exit 1
   fi
 fi
@@ -91,7 +94,7 @@ use_cluster_docker() {
 if [[ "$skip_build" == false ]]; then
   (
     use_cluster_docker
-    for target in auth message-svc gateway smoke; do
+    for target in auth message-svc gateway worker smoke; do
       step "build push-messenger/$target:dev"
       docker build -f "$root/deploy/docker/Dockerfile" --target "$target" -t "push-messenger/$target:dev" "$root"
     done
@@ -100,7 +103,7 @@ fi
 # The image ids name the build: a rebuilt image rolls the pods, an unchanged one does not.
 if ! ids="$(use_cluster_docker && docker image inspect --format '{{.Id}}' \
   push-messenger/auth:dev push-messenger/message-svc:dev push-messenger/gateway:dev \
-  push-messenger/smoke:dev)"; then
+  push-messenger/worker:dev push-messenger/smoke:dev)"; then
   echo 'the images are not in the cluster yet; run without --skip-build' >&2
   exit 1
 fi
@@ -134,7 +137,8 @@ echo "push-messenger is up: minikube profile '$cluster', namespace '$namespace'.
 echo 'The gateway is behind ingress-nginx at ws://push.local/v1/socket. From this machine:'
 echo "  kubectl --context $cluster -n ingress-nginx port-forward svc/ingress-nginx-controller 8080:80"
 echo '  then connect to ws://127.0.0.1:8080/v1/socket with the header "Host: push.local".'
-echo '  auth-svc answers on the same port: http://127.0.0.1:8080/v1/auth/..., /v1/devices, /v1/users.'
+echo '  auth-svc answers on the same port: http://127.0.0.1:8080/v1/auth/..., /v1/devices, /v1/users;'
+echo '  the worker takes signed Resend webhooks at http://127.0.0.1:8080/v1/webhooks/resend.'
 
 if [[ "$smoke" == true ]]; then
   step 'run the smoke test'

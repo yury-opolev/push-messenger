@@ -1,5 +1,5 @@
 # Local minikube only (deploy/minikube/up.ps1). Turns on the DEV ONLY identity, setup API
-# and mailbox that the smoke test needs.
+# and mailbox that the smoke test needs; the worker logs emails instead of sending them.
 
 devMode:
   enabled: true

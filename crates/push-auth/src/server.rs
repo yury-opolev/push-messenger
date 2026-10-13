@@ -52,13 +52,6 @@ pub async fn serve(
             .into_future(),
     );
 
-    if config.dev_mailbox {
-        tracing::warn!(
-            "DEV ONLY: PUSH_DEV_MAILBOX=1 serves GET /dev/mailbox, which shows anyone the \
-             email links waiting in the outbox, and with them every account. Never enable it \
-             outside a local cluster."
-        );
-    }
     let Some(pool) = retry("postgres", &shutdown, || async {
         // Migrations run on a dedicated connection, not on the request pool, whose
         // statement and lock timeouts are sized for requests.
@@ -99,7 +92,6 @@ pub async fn serve(
         auth,
         limits: Limits::new(Arc::new(counter)),
         client_ip_header: config.client_ip_header.clone(),
-        dev_mailbox: config.dev_mailbox,
     });
     tracing::info!(addr = %config.http_addr, "serving HTTP");
     let result = axum::serve(

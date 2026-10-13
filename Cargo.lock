@@ -2163,6 +2163,7 @@ dependencies = [
  "push-message-svc",
  "push-proto",
  "push-store",
+ "push-worker",
  "reqwest",
  "serde",
  "serde_json",

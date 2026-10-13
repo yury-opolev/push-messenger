@@ -15,16 +15,20 @@ images:
   smoke:
     repository: push-messenger/smoke
     tag: dev
+  worker:
+    repository: push-messenger/worker
+    tag: dev
   pullPolicy: IfNotPresent
 
-# Changing this rolls out new auth, gateway and message-svc pods even when the image tags
+# Changing this rolls out new auth, gateway, message-svc and worker pods even when the image tags
 # stay the same (the bring-up script sets it after rebuilding the images).
 buildId: ""
 
 # DEV ONLY switches: the gateway accepts identities without a token (PUSH_DEV_AUTH=1),
-# message-svc serves the DevSetup API (PUSH_DEV_SETUP=1), auth-svc serves the outbox's
-# email links at /dev/mailbox (PUSH_DEV_MAILBOX=1), and `helm test` runs the smoke test.
-# Never enable outside a local cluster.
+# message-svc serves the DevSetup API (PUSH_DEV_SETUP=1), the worker shows the emails its
+# log sender delivered at /dev/mailbox (PUSH_DEV_MAILBOX=1), a webhook secret is generated
+# when none is set, and `helm test` runs the smoke test. Never enable outside a local
+# cluster.
 devMode:
   enabled: false
   # Must be exactly "insecure-local-only" when enabled.
@@ -64,6 +68,41 @@ auth:
       cpu: "1"
       memory: 256Mi
 
+worker:
+  # Workers share the queue, so more replicas are safe; dev mode needs exactly 1 (its
+  # DEV ONLY mailbox is in memory, per replica), and the chart refuses more there.
+  replicas: 1
+  # 5 s preStop sleep (the webhook endpoint is behind the ingress) + the job in progress
+  # (at most about 15 s) + giving back the jobs not started + margin.
+  terminationGracePeriodSeconds: 30
+  # Each of its two pools (its own database and auth-svc's outbox).
+  dbMaxConnections: 5
+  email:
+    # log: logs each email instead of sending it. resend: sends through Resend, which
+    # needs resendApiKey and from. Real sending comes with the Azure plan (Plan 11), which
+    # brings the key and the webhook secret through Key Vault.
+    sender: log
+    # The From of every email (owner decision: the push.kubegames.dk domain).
+    from: "Push Messenger <no-reply@push.kubegames.dk>"
+    # The name emails sign with.
+    productName: Push Messenger
+    # Resend's API key and the signing secret of its webhook (whsec_...): kept in the
+    # Secret. Without a webhook secret the worker does not serve the webhook, and the
+    # webhook Ingress is not rendered (in dev mode one is generated).
+    resendApiKey: ""
+    webhookSecret: ""
+  # Accounts left unverified this many days are deleted.
+  unverifiedAccountDays: 7
+  # Buried jobs, email records and delivery events are kept this many days.
+  retentionDays: 30
+  resources:
+    requests:
+      cpu: 50m
+      memory: 32Mi
+    limits:
+      cpu: 500m
+      memory: 128Mi
+
 messageSvc:
   replicas: 1
   terminationGracePeriodSeconds: 30
@@ -83,6 +122,8 @@ postgres:
   password: ""
   # The password of auth-svc's own role, push_auth; the same rules.
   authPassword: ""
+  # The password of the worker's own role, push_worker; the same rules.
+  workerPassword: ""
   storage: 1Gi
   # Empty: the cluster's default storage class.
   storageClassName: ""
