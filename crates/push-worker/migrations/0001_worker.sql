@@ -34,7 +34,7 @@ CREATE TABLE worker.email_message (
     recipient_domain    text NOT NULL,
     template            text NOT NULL,
     -- Without the link: it would sign its holder in.
-    params              jsonb NOT NULL,
+    params              jsonb NOT NULL CHECK (NOT params ? 'link'),
     provider_message_id text UNIQUE,
     -- 1 queued, 2 sent, 3 suppressed, 4 failed.
     status              smallint NOT NULL CHECK (status BETWEEN 1 AND 4),

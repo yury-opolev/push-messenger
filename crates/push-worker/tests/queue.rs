@@ -151,7 +151,11 @@ async fn a_stale_outcome_never_overwrites_a_newer_claim() {
         .unwrap();
     let slow = queue.claim(10).await.unwrap();
     tokio::time::sleep(Duration::from_millis(500)).await;
-    let newer = queue.claim(10).await.unwrap();
+    // The newer claim takes a long lease, so the checks below never race its expiry.
+    let newer = Queue::new(pool.clone(), Duration::from_secs(60))
+        .claim(10)
+        .await
+        .unwrap();
     assert_eq!(newer.len(), 2);
 
     // The slow worker's outcomes come after its lease ended: all of them are dropped.
