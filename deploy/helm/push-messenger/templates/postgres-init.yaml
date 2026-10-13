@@ -1,0 +1,26 @@
+{{- /*
+Runs once, when PostgreSQL initialises an empty data volume (/docker-entrypoint-initdb.d):
+creates auth-svc's own role and database (one database per service, spec §2). The
+password comes from the environment, which reads it from the Secret; this ConfigMap holds
+no credentials. A volume initialised before this script existed (Plan 4B) has no push_auth:
+remove it with deploy/minikube/down.ps1 first.
+*/ -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "push.name" (dict "root" . "component" "postgres-init") }}
+  labels:
+    {{- include "push.labels" (dict "root" . "component" "postgres") | nindent 4 }}
+data:
+  10-push-auth.sh: |
+    # Sourced by the image's entrypoint (bash) as the superuser, before the server opens.
+    psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname postgres \
+      --set=password="$PUSH_AUTH_DB_PASSWORD" <<'SQL'
+    CREATE ROLE push_auth LOGIN PASSWORD :'password';
+    CREATE DATABASE push_auth OWNER push_auth;
+    -- Revoking CONNECT from PUBLIC keeps push_auth out of push_messaging and every
+    -- other role out of push_auth. Superusers bypass it: message-svc still connects as
+    -- the superuser push until Plan 11.
+    REVOKE ALL ON DATABASE push_auth FROM PUBLIC;
+    REVOKE ALL ON DATABASE push_messaging FROM PUBLIC;
+    SQL
