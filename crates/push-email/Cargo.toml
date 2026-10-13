@@ -10,9 +10,13 @@ repository.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+base64.workspace = true
+chrono.workspace = true
+hmac.workspace = true
 # Resend is HTTPS: rustls with ring and the webpki roots, no OpenSSL and no cmake.
 reqwest = { workspace = true, features = ["rustls-tls"] }
 serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 uuid.workspace = true
