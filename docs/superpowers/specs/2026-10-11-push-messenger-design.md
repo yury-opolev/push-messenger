@@ -86,9 +86,11 @@ device (
   user_id      uuid not null references user_account,
   name         text not null,               -- "Yuri's iPhone"
   platform     text not null,               -- ios | android | web | desktop | other
+  registration_id uuid not null,            -- chosen by the client; retries reuse it
   created_at   timestamptz not null default now(),
   last_seen_at timestamptz,
-  revoked_at   timestamptz
+  revoked_at   timestamptz,
+  unique (user_id, registration_id)
 )
 
 refresh_token (
@@ -96,7 +98,8 @@ refresh_token (
   device_id  uuid not null references device,
   expires_at timestamptz not null,
   revoked_at timestamptz,
-  rotated_to bytea                          -- reuse detection
+  rotated_to bytea,                         -- reuse detection
+  rotated_at timestamptz                    -- start of the 30 s grace window
 )
 
 outbox (                                    -- read and deleted by the worker
@@ -437,9 +440,16 @@ Access-token claims: `sub`, `device_id`, `email_verified`, `exp`, `iat`, `jti`, 
 
 1. `POST /v1/auth/signup {email, password, handle, display_name}`. The response is the
    same, in uniform time, whether or not the email exists.
+   - If the email has an **unverified** account, the new signup replaces its password,
+     handle and display name and sends a new link; links sent before stop working.
+     Otherwise whoever signs up first with someone else's address would own the account
+     that person later verifies. A verified account changes nothing and gets an "account
+     exists" email.
 2. auth-svc writes `email.send` (verification) to its outbox in the same transaction.
-3. The link carries an HMAC-signed `{user_id, email, purpose: verify, exp}`. Binding the
-   email means a future email-change feature cannot make old links dangerous.
+3. The link carries an HMAC-signed `{user_id, email, purpose: verify, exp, pw}`, `pw`
+   being a fingerprint of the current `password_hash`. Binding the email means a future
+   email-change feature cannot make old links dangerous; binding `pw` means a link sent
+   before the password changed verifies nothing.
 4. Opening the link sets `email_verified_at` and writes `user.verified` to the outbox.
    It never signs the user in. Verification is the gate that opens API usage.
 5. Unverified accounts cannot register devices or open sockets. They can only ask for
@@ -448,14 +458,24 @@ Access-token claims: `sub`, `device_id`, `email_verified`, `exp`, `iat`, `jti`, 
 ### 5.3 Explicit device registration
 
 1. `POST /v1/auth/login {email, password}` returns a **registration token**. It cannot
-   open a socket or call any other API.
+   open a socket or call any other API. It binds a fingerprint of the password hash, so
+   a password reset makes it worthless.
    - Or `POST /v1/auth/login {email, password, device_id}` for an existing, active
      device, which returns access and refresh tokens directly.
-2. `POST /v1/devices {name, platform}` with the registration token:
-   - refuses if the account already has 10 active devices;
+2. `POST /v1/devices {name, platform, registration_id}` with the registration token.
+   `registration_id` is a UUID the client chooses for this registration and reuses for
+   its retries, like `client_msg_id`:
+   - a retry with the same `registration_id` for the same user returns the same device
+     (with new tokens; the earlier ones are revoked) and never creates a second one,
+     even when the account is at its limit; a revoked device's id is not reused;
+   - otherwise refuses if the account already has 10 active devices;
    - creates the device and writes `device.registered` to the outbox;
    - returns `{device_id, access_token, refresh_token}`.
-3. `POST /v1/auth/refresh` is the only way to get new access tokens afterwards.
+3. `POST /v1/auth/refresh` is the only way to get new access tokens afterwards. Each
+   refresh rotates the refresh token. Presenting the token rotated last again within
+   30 s of its rotation (the answer was lost) returns a new pair and cuts off the pair
+   issued before, so only one branch lives. Presenting it later, or any older or cut-off
+   token, is reuse: every refresh token of the device is revoked.
 4. `GET /v1/devices` lists devices; `DELETE /v1/devices/{id}` revokes one, revokes its
    refresh tokens, and writes `device.revoked`.
 5. The worker relays device events to message-svc. On `device.revoked`, message-svc
@@ -470,6 +490,8 @@ Access-token claims: `sub`, `device_id`, `email_verified`, `exp`, `iat`, `jti`, 
   of the current `password_hash`. Using it changes the password, which invalidates the
   link — single use with no stored state.
 - On reset, every refresh token of the account is revoked and every device is kicked.
+- A completed reset also verifies the email, since the link reached the address; if it
+  was not verified yet, `user.verified` is written too.
 
 ### 5.5 Connecting users
 
@@ -505,8 +527,13 @@ Access-token claims: `sub`, `device_id`, `email_verified`, `exp`, `iat`, `jti`, 
 
 - Argon2id `m=19456 KiB, t=2, p=1` (OWASP minimum), stored as a PHC string so the
   parameters can be raised on next login. Calibrated to about 250 ms on the production VM.
+- Passwords have 8–128 characters and no other rule for now; a check against leaked
+  passwords comes later.
 - Rate limits in Redis, per account and per IP, on signup, login, resend, reset, handle
   lookup and invite redeem. Accounts are never locked; excess requests are refused.
+  Login counts per account **and** IP, so nobody can lock a user out from another
+  address. When Redis is unreachable, the limited endpoints fail closed with a
+  retryable `unavailable` (503).
 - Links are built from a configured base URL, never from the `Host` header. Pages they
   open send `Referrer-Policy: no-referrer`.
 
@@ -828,7 +855,8 @@ Required adverse-condition tests:
 2. Two identical sends at the same moment: one row, no gap in `seq`.
 3. message-svc restarted mid-send: nothing acknowledged is lost.
 4. Redis unavailable: delivery continues through reconnect and the 5-minute sweep, only
-   slower.
+   slower. Signup, login and the other rate-limited auth endpoints answer a retryable
+   `unavailable` until Redis is back; signed-in devices keep refreshing.
 5. Two connections for one device: the SDK applies each entry once.
 6. Device revoked while connected: socket closed within seconds.
 7. Token expires on a live connection: `ReAuth` keeps it open; without it, 4002.

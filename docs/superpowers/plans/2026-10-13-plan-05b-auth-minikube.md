@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Run Plan 5A's auth-svc on the local minikube cluster with the same chart that will deploy to Azure, and prove it end to end: the smoke test now signs two users up through auth-svc's public API, verifies their email with the link from the DEV ONLY mailbox, signs them in, registers a device each, checks the access tokens against the JWKS, refreshes them, and then — as before — delivers a message from one to the other through the gateway. Deliverables: an `auth` image target; auth-svc in the chart with a database and a role of its own (`push_auth`, created by a PostgreSQL init script), generated signing and link keys in the Secret, an Ingress for `/v1/auth`, `/v1/devices` and `/v1/users`, and `PUSH_DEV_MAILBOX` behind the existing dev-mode guard; the smoke test extended; the bring-up scripts building the new image; CI building it; `test-chart.ps1` with 19 checks.
+**Goal:** Run Plan 5A's auth-svc on the local minikube cluster with the same chart that will deploy to Azure, and prove it end to end: the smoke test now signs two users up through auth-svc's public API, verifies their email with the link from the DEV ONLY mailbox, signs them in, registers a device each (and retries the registration, which must return the same device), checks the access tokens against the JWKS, refreshes them, and then — as before — delivers a message from one to the other through the gateway. Deliverables: an `auth` image target; auth-svc in the chart with a database and a role of its own (`push_auth`, created by a PostgreSQL init script), generated signing and link keys in the Secret, an Ingress for `/v1/auth`, `/v1/devices` and `/v1/users`, and `PUSH_DEV_MAILBOX` behind the existing dev-mode guard; a preStop sleep and a grace period for auth-svc, as the gateway has; the smoke test extended; the bring-up scripts building the new image and stopping at once on a PostgreSQL volume without `push_auth`; CI building it; `test-chart.ps1` with 20 checks.
 
-**Architecture:** The Dockerfile's shared builder also builds `push-auth`; a fourth distroless target runs it. In the chart, auth-svc is a Deployment (HTTP 8080, health 8081) behind a ClusterIP Service and a second Ingress on the same host (`push.local` on minikube). PostgreSQL's `/docker-entrypoint-initdb.d` gets a script from a ConfigMap that creates the role and database `push_auth` (the password comes from the Secret through the environment) and lets each database admit only its owner. auth-svc's public URL and token audience come from `ingress.scheme` and `ingress.host` (`http://push.local` and `ws://push.local/v1/socket` on minikube). The smoke Pod reaches auth-svc's public API through the ingress controller with `Host: push.local`, like a client, and the DEV ONLY mailbox straight at the auth Service, which the ingress does not route; it mirrors the users and devices auth-svc registered into message-svc through `DevSetup`, standing in for the worker's relay (Plan 6), and identifies on the WebSocket with those ids through the gateway's DEV ONLY identity (until Plan 8). Spec: `docs/superpowers/specs/2026-10-11-push-messenger-design.md` §2, §5, §7.6, §11; roadmap "Running locally on minikube".
+**Architecture:** The Dockerfile's shared builder also builds `push-auth`; a fourth distroless target runs it. In the chart, auth-svc is a Deployment (HTTP 8080, health 8081) behind a ClusterIP Service and a second Ingress on the same host (`push.local` on minikube). PostgreSQL's `/docker-entrypoint-initdb.d` gets a script from a ConfigMap that creates the role and database `push_auth` (the password comes from the Secret through the environment) and revokes `CONNECT` from `PUBLIC` on both databases, which keeps auth-svc's plain role out of `push_messaging` (message-svc still connects as the superuser `push`, which reaches every database, until Plan 11). auth-svc's public URL and token audience come from `ingress.scheme` and `ingress.host` (`http://push.local` and `ws://push.local/v1/socket` on minikube). The smoke Pod reaches auth-svc's public API through the ingress controller with `Host: push.local`, like a client, and the DEV ONLY mailbox straight at the auth Service, which the ingress does not route; it mirrors the users and devices auth-svc registered into message-svc through `DevSetup`, standing in for the worker's relay (Plan 6), and identifies on the WebSocket with those ids through the gateway's DEV ONLY identity (until Plan 8). Spec: `docs/superpowers/specs/2026-10-11-push-messenger-design.md` §2, §5, §7.6, §11; roadmap "Running locally on minikube".
 
 **Tech Stack:** Docker (BuildKit), minikube 1.34 (Kubernetes 1.31, docker driver, ingress addon), kubectl, Helm 3.16, PowerShell 7 and bash; new Rust dependency `reqwest` 0.12 (0.12.28, default features off, `json`: plain HTTP inside the cluster) for the smoke test, which also uses `jsonwebtoken` 9 from Plan 5A.
 
@@ -39,16 +39,19 @@ $env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Env
 kubectl config current-context
 ```
 
-- **A cluster that still holds the Plan 4B release must be wiped once.** PostgreSQL runs
+- **A cluster that still holds an earlier release must be wiped once.** PostgreSQL runs
   its init scripts only when it initialises an empty volume, so a volume from Plan 4B has
-  no `push_auth` database and auth-svc would never become ready. Task 3 runs
-  `deploy/minikube/down.ps1` before `up.ps1`. Never delete the profile, and never touch
-  other Docker containers on this machine.
+  no `push_auth` database and auth-svc would never become ready (Task 3's `up` scripts
+  notice and stop with "run down.ps1 first"). A volume from an earlier run of this plan
+  with another version of the migration fails differently: auth-svc logs
+  `migration 1 was previously applied but has been modified` and never becomes ready.
+  Task 3 runs `deploy/minikube/down.ps1` before `up.ps1`. Never delete the profile, and
+  never touch other Docker containers on this machine.
 - Helm may print `failed to load plugins … helm-diff … unknown field "platformHooks"`
   first: an outdated plugin, harmless.
 - **Edit files with the edit tool, and keep them LF** (`.gitattributes`:
   `* text=auto eol=lf`). This matters for `up.sh`, which bash refuses with CRLF on Linux.
-- Baseline (after Plan 5A): `cargo test --workspace --locked` passes 686 tests;
+- Baseline (after Plan 5A): `cargo test --workspace --locked` passes 700 tests;
   `deploy/helm/test-chart.ps1` passes 12 checks.
 - **Every task ends green:**
 
@@ -66,9 +69,11 @@ cargo +1.85 build --workspace --all-targets --locked
 
 ## Key rules the configuration must preserve
 
-- **One database per service, admitting only its owner.** auth-svc gets the URL of
-  `push_auth` as the role `push_auth`, the Redis URL and its two keys — never
-  message-svc's database URL; the gateway still gets no database credentials.
+- **One database per service.** auth-svc gets the URL of `push_auth` as the plain role
+  `push_auth`, which cannot connect to `push_messaging`, the Redis URL and its two keys —
+  never message-svc's database URL; the gateway still gets no database credentials.
+  (message-svc still connects as the superuser `push` until Plan 11, which bypasses
+  `CONNECT` grants.)
 - **No secret in git or in a ConfigMap.** The auth database password, the Ed25519 seed
   and the HMAC key are generated on install (`randAlphaNum 32`, `randBytes 32`), kept on
   upgrades by reading the Secret back (`lookup`), and reach the containers only through
@@ -92,8 +97,9 @@ These were settled while writing the plan. Do not reopen them during execution.
    PASSWORD :'password'` (a `psql` variable from `PUSH_AUTH_DB_PASSWORD`, which the
    StatefulSet takes from the Secret), `CREATE DATABASE push_auth OWNER push_auth`, and
    `REVOKE ALL ON DATABASE … FROM PUBLIC` for both databases, so auth-svc cannot even
-   connect to `push_messaging` (verified on minikube). auth-svc is a plain role, not a
-   superuser; its migration creates `citext` as the database owner (Plan 5A, Task 1). An
+   connect to `push_messaging` (verified on minikube). That does not hold message-svc to
+   its database: its role `push` is the image's superuser, which ignores `CONNECT` grants,
+   until Plan 11 gives it a plain role. auth-svc is a plain role, not a superuser; its migration creates `citext` as the database owner (Plan 5A, Task 1). An
    init script runs only on an empty volume: clusters from Plan 4B are wiped once with
    `down.ps1` (no data worth keeping exists). Alternatives were rejected: a Helm hook Job
    would deadlock `helm --wait` (auth-svc is not ready until the database exists), and an
@@ -114,7 +120,9 @@ These were settled while writing the plan. Do not reopen them during execution.
    few seconds after its backends become ready) and fetch the JWKS; sign up with a fresh
    address `<name>.<10 hex>@smoke.test` and handle `<name>_<10 hex>`; read the verification
    link from the mailbox; open the page through the ingress and check
-   `Referrer-Policy: no-referrer`; post the token; sign in; register a device; check the
+   `Referrer-Policy: no-referrer`; post the token; sign in; register a device with a fresh
+   `registration_id` and register again with the same one, which must return the same
+   device (Plan 5A, decision 14); check the
    access token's signature against the JWKS and its `sub`, `device_id` and
    `email_verified` (not `aud`: the smoke test does not know the gateway's public URL; it
    prints it); refresh once. Then it mirrors both users and devices into message-svc with
@@ -127,6 +135,15 @@ These were settled while writing the plan. Do not reopen them during execution.
    two concurrent Argon2id hashes take 38 MiB.
 8. **CI** builds the `auth` image too; the `chart` job runs the extended
    `test-chart.ps1`. The minikube run stays the merge gate, recorded in the pull request.
+9. **auth-svc drains like the gateway:** a native `preStop` `sleep` of 5 s (the image has
+   no shell) lets Kubernetes take the pod out of the Service and Ingress endpoints before
+   SIGTERM, then auth-svc finishes the requests in progress within
+   `terminationGracePeriodSeconds: 30` (a password hash waits at most 2 s for its turn).
+10. **The up scripts check an existing volume first.** When the release's PostgreSQL
+    StatefulSet exists, `up.ps1` and `up.sh` wait for it and ask it whether `push_auth`
+    exists; without it they stop at once with "run down.ps1 first" instead of five
+    10-minute `helm upgrade` attempts. A fresh install has no StatefulSet yet and skips the
+    check.
 
 ## File structure
 
@@ -147,12 +164,13 @@ deploy/helm/push-messenger/
     ├── secret.yaml                           auth password, URL and keys
     ├── postgres-init.yaml                    NEW: the init script (no credentials)
     ├── postgres.yaml                         mounts it, passes the password
-    ├── auth.yaml                             NEW: Service + Deployment
+    ├── auth.yaml                             NEW: Service + Deployment (preStop, grace)
     ├── ingress.yaml                          + the auth Ingress
     ├── tests/smoke.yaml                      --auth, --mailbox
     └── NOTES.txt                             auth endpoints
-deploy/helm/test-chart.ps1                    19 checks
-deploy/minikube/up.ps1, up.sh                 build and roll the auth image
+deploy/helm/test-chart.ps1                    20 checks
+deploy/minikube/up.ps1, up.sh                 build and roll the auth image; refuse a
+                                                volume without push_auth
 .github/workflows/ci.yml                      build the auth image
 README.md, spec §11, roadmap                  docs
 ```
@@ -496,12 +514,15 @@ first run, then a compile error — `struct Target has no field named mailbox_ur
 
 - [ ] **Step 3: Enrolling through auth-svc**
 
-Create `crates/push-smoke/src/auth.rs`:
+The device is registered twice with one `registration_id`: the second answer must name
+the same device, and its tokens are the ones used afterwards (the retry revoked the first
+refresh token). Create `crates/push-smoke/src/auth.rs`:
 
 ```rust
 //! The auth part of the smoke test: a user signs up, verifies the email through the
-//! DEV ONLY mailbox, signs in, registers a device and refreshes its tokens, all over
-//! auth-svc's public HTTP API, and checks the access token against the JWKS.
+//! DEV ONLY mailbox, signs in, registers a device (and retries the registration, which
+//! must find the same device) and refreshes its tokens, all over auth-svc's public HTTP
+//! API, and checks the access token against the JWKS.
 
 use std::time::{Duration, Instant};
 
@@ -579,7 +600,8 @@ impl<'a> Auth<'a> {
     }
 
     /// Signs `name` up with a fresh address and handle, verifies the address with the
-    /// link from the dev mailbox, signs in, registers a device and refreshes its tokens.
+    /// link from the dev mailbox, signs in, registers a device, retries the registration
+    /// with the same `registration_id` and refreshes its tokens.
     pub async fn enroll(&self, name: &str) -> anyhow::Result<Enrolled> {
         let started = Instant::now();
         let suffix = Uuid::now_v7().simple().to_string();
@@ -641,6 +663,26 @@ impl<'a> Auth<'a> {
         )
         .await?;
         let registration = field(&login, "registration_token")?;
+        // The client's idempotency key: the retry below must find the same device.
+        let registration_id = Uuid::now_v7();
+        let body = json!({
+            "name": format!("{name}'s smoke device"),
+            "platform": "other",
+            "registration_id": registration_id,
+        });
+        let first = expect(
+            public(
+                &self.http,
+                self.target,
+                reqwest::Method::POST,
+                "/v1/devices",
+            )
+            .bearer_auth(&registration)
+            .json(&body),
+            StatusCode::CREATED,
+            "register a device",
+        )
+        .await?;
         let device = expect(
             public(
                 &self.http,
@@ -649,15 +691,18 @@ impl<'a> Auth<'a> {
                 "/v1/devices",
             )
             .bearer_auth(&registration)
-            .json(&json!({"name": format!("{name}'s smoke device"), "platform": "other"})),
+            .json(&body),
             StatusCode::CREATED,
-            "register a device",
+            "retry the registration",
         )
         .await?;
+        if field(&device, "device_id")? != field(&first, "device_id")? {
+            bail!("a retried registration of {name}'s device created a second device");
+        }
         let user: Uuid = field(&device, "user_id")?.parse()?;
         let device_id: Uuid = field(&device, "device_id")?.parse()?;
         step(&format!(
-            "{name} signed up, verified the email from the dev mailbox, signed in and registered device {device_id} in {} ms",
+            "{name} signed up, verified the email from the dev mailbox, signed in and registered device {device_id} (a retry returned the same device) in {} ms",
             started.elapsed().as_millis()
         ));
 
@@ -1208,17 +1253,17 @@ cargo test -p push-smoke -- --nocapture
 Expected: the 3 unit tests pass, and the local test prints (ids and times vary):
 
 ```text
-smoke: alice signed up, verified the email from the dev mailbox, signed in and registered device 01a13411-0217-70d3-b6e3-f07b1a8b2815 in 73 ms
+smoke: alice signed up, verified the email from the dev mailbox, signed in and registered device 01a13476-6462-7002-ab3c-e507882e953d (a retry returned the same device) in 72 ms
 smoke: alice's access token verifies against the JWKS (EdDSA, aud ws://push.local/v1/socket); refresh rotated it
-smoke: bob signed up, verified the email from the dev mailbox, signed in and registered device 01a13411-0274-77b6-9ab9-eea99f037123 in 85 ms
+smoke: bob signed up, verified the email from the dev mailbox, signed in and registered device 01a13476-64a7-7321-bda2-c9c681f5ab31 (a retry returned the same device) in 92 ms
 smoke: bob's access token verifies against the JWKS (EdDSA, aud ws://push.local/v1/socket); refresh rotated it
-smoke: mirrored alice=01a13411-01ed-727f-aeed-f7eae9f47016 bob=01a13411-023a-72e4-98fd-ee7df0241255 into message-svc as contacts with a direct conversation
+smoke: mirrored alice=01a13476-643b-74b6-8a39-9647df23890c bob=01a13476-6485-7024-adaa-82d985da4db2 into message-svc as contacts with a direct conversation
 smoke: bob connected (Ready, heartbeat 30000 ms)
 smoke: alice connected (Ready, heartbeat 30000 ms)
-smoke: alice got SendAck seq=1 after 18 ms
+smoke: alice got SendAck seq=1 after 17 ms
 smoke: bob got Deliver seq=1 after 24 ms
 smoke: bob acked; the gateway answered the following Ping
-smoke: PASS in 286 ms
+smoke: PASS in 330 ms
 test the_smoke_test_passes_against_the_whole_stack ... ok
 ```
 
@@ -1233,7 +1278,7 @@ git add Cargo.toml Cargo.lock crates/push-smoke
 git commit -m "feat(smoke): enroll the users through auth-svc before they chat"
 ```
 
-Expected: 686 tests pass (the smoke test is one of them, as before).
+Expected: 700 tests pass (the smoke test is one of them, as before).
 
 ---
 
@@ -1311,10 +1356,10 @@ seconds when the cache mounts hold a previous build); the container prints
 
 - [ ] **Step 2: The failing chart checks**
 
-`test-chart.ps1` gains a `Doc` helper (one rendered document by kind and name) and seven
-checks; the old "no ConfigMap" check becomes "the only ConfigMap is the init script,
-without credentials" (it compares against the generated password). Replace
-`deploy/helm/test-chart.ps1` with:
+`test-chart.ps1` gains a `Doc` helper (one rendered document by kind and name) and eight
+checks, one of them for auth-svc's preStop sleep and grace period; the old "no ConfigMap"
+check becomes "the only ConfigMap is the init script, without credentials" (it compares
+against the generated password). Replace `deploy/helm/test-chart.ps1` with:
 
 ```powershell
 # Checks the Helm chart without a cluster: lint with each values file, the DEV ONLY
@@ -1372,6 +1417,10 @@ Check 'default: auth-svc gets its own database, the gateway none' {
     $auth -match 'key: auth-database-url' -and $auth -notmatch 'key: database-url' -and
         $gateway -match 'PUSH_MESSAGE_SVC_URL' -and $gateway -notmatch 'database-url'
 }
+Check 'default: auth-svc drains like the gateway (preStop sleep, grace period)' {
+    $auth = Doc $default 'Deployment' 'push-auth'
+    $auth -match 'preStop:\s+sleep:\s+seconds: 5' -and $auth -match 'terminationGracePeriodSeconds: 30'
+}
 Check 'default: the ingress routes /v1/auth, /v1/devices and /v1/users to auth-svc, not /dev' {
     $ingress = Doc $default 'Ingress' 'push-auth'
     $ingress -match 'path: /v1/auth\s' -and $ingress -match 'path: /v1/devices\s' -and
@@ -1411,7 +1460,7 @@ pwsh -NoProfile -File deploy/helm/test-chart.ps1
 ```
 
 Expected: the auth checks fail (`FAIL default: auth-svc has no dev mailbox` and others),
-then `8 check(s) failed`.
+then `9 check(s) failed`.
 
 - [ ] **Step 3: Values**
 
@@ -1466,6 +1515,8 @@ gateway:
 
 auth:
   replicas: 1
+  # 5 s preStop sleep + finishing the requests in progress (a password hash waits at
+  # most 2 s for its turn) + margin.
   terminationGracePeriodSeconds: 30
   dbMaxConnections: 10
   # Password hashes computed at once; each takes 19 MiB (Argon2id, spec §5.6).
@@ -1720,7 +1771,9 @@ data:
       --set=password="$PUSH_AUTH_DB_PASSWORD" <<'SQL'
     CREATE ROLE push_auth LOGIN PASSWORD :'password';
     CREATE DATABASE push_auth OWNER push_auth;
-    -- Only each database's owner may connect to it.
+    -- Revoking CONNECT from PUBLIC keeps push_auth out of push_messaging and every
+    -- other role out of push_auth. Superusers bypass it: message-svc still connects as
+    -- the superuser push until Plan 11.
     REVOKE ALL ON DATABASE push_auth FROM PUBLIC;
     REVOKE ALL ON DATABASE push_messaging FROM PUBLIC;
     SQL
@@ -1826,7 +1879,9 @@ spec:
 
 - [ ] **Step 6: auth-svc and its Ingress**
 
-Create `deploy/helm/push-messenger/templates/auth.yaml`:
+The Deployment has the gateway's shutdown budget: a native `preStop` sleep of 5 s and
+`terminationGracePeriodSeconds` from the values (decision 9). Create
+`deploy/helm/push-messenger/templates/auth.yaml`:
 
 ```yaml
 {{- $name := include "push.name" (dict "root" . "component" "auth") -}}
@@ -1865,12 +1920,20 @@ spec:
       {{- end }}
     spec:
       automountServiceAccountToken: false
+      # Shutdown budget, as for the gateway: the 5 s preStop sleep lets Kubernetes take
+      # the pod out of the Service and Ingress endpoints before SIGTERM, on which
+      # auth-svc stops accepting, finishes the requests in progress and closes its pool.
+      # Native sleep action: the image has no shell.
       terminationGracePeriodSeconds: {{ .Values.auth.terminationGracePeriodSeconds }}
       containers:
         - name: auth
           image: {{ include "push.image" .Values.images.auth }}
           imagePullPolicy: {{ .Values.images.pullPolicy }}
           {{- include "push.containerSecurity" . | nindent 10 }}
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: 5
           env:
             # Its own database only: auth-svc never sees message-svc's credentials.
             - name: PUSH_DATABASE_URL
@@ -2067,7 +2130,7 @@ pwsh -NoProfile -File deploy/helm/test-chart.ps1
 helm template push deploy/helm/push-messenger -f deploy/helm/push-messenger/values-minikube.yaml | Select-String 'PUSH_AUTH_PUBLIC_URL|PUSH_AUTH_TOKEN_AUDIENCE|path: /v1' -Context 0,1
 ```
 
-Expected: 19 `ok` lines and `all chart checks passed`; the render shows
+Expected: 20 `ok` lines and `all chart checks passed`; the render shows
 `http://push.local`, `ws://push.local/v1/socket` and the paths `/v1/socket`, `/v1/auth`,
 `/v1/devices`, `/v1/users`.
 
@@ -2089,9 +2152,36 @@ git commit -m "deploy: auth-svc in the image and the chart, with its own databas
 **Files:**
 - Modify: `deploy/minikube/up.ps1`, `deploy/minikube/up.sh`
 
-- [ ] **Step 1: Build and roll the auth image too**
+- [ ] **Step 1: Check an existing volume, and build and roll the auth image too**
 
-In `deploy/minikube/up.ps1`, replace
+In `deploy/minikube/up.ps1`, after the block that waits for the ingress-nginx admission
+jobs (it ends with the two closing braces after
+`throw "the ingress-nginx admission jobs did not complete (exit code $LASTEXITCODE)"`),
+add a blank line and (decision 10):
+
+```powershell
+# PostgreSQL runs the init script that creates auth-svc's database only when it
+# initialises an empty volume. A volume from before auth-svc (Plan 4B) has no push_auth,
+# and auth-svc would never become ready: stop now, not after five slow install attempts.
+$postgres = kubectl --context $Cluster -n $namespace get statefulset push-postgres -o name --ignore-not-found
+if ($LASTEXITCODE -ne 0) {
+    throw "looking for an earlier Postgres failed (exit code $LASTEXITCODE)"
+}
+if ($postgres) {
+    Invoke-Step 'check that the Postgres volume has the push_auth database' {
+        kubectl --context $Cluster -n $namespace rollout status statefulset/push-postgres --timeout=300s
+    }
+    $hasAuth = kubectl --context $Cluster -n $namespace exec push-postgres-0 -- psql -U push -d postgres -Atc "SELECT count(*) FROM pg_database WHERE datname = 'push_auth'"
+    if ($LASTEXITCODE -ne 0) {
+        throw "checking the Postgres volume failed (exit code $LASTEXITCODE)"
+    }
+    if ("$hasAuth".Trim() -ne '1') {
+        throw "The Postgres volume predates auth-svc: it has no push_auth database, and PostgreSQL creates one only on an empty volume. Run deploy/minikube/down.ps1 -Cluster $Cluster first (it deletes the cluster's data), then run this script again."
+    }
+}
+```
+
+replace
 
 ```powershell
         foreach ($target in 'message-svc', 'gateway', 'smoke') {
@@ -2123,7 +2213,30 @@ add
 Write-Host '  auth-svc answers on the same port: http://127.0.0.1:8080/v1/auth/..., /v1/devices, /v1/users.'
 ```
 
-In `deploy/minikube/up.sh`, replace `    for target in message-svc gateway smoke; do` with
+In `deploy/minikube/up.sh`, after the `fi` that closes `if [[ -n "$jobs" ]]; then`, add a
+blank line and:
+
+```bash
+# PostgreSQL runs the init script that creates auth-svc's database only when it
+# initialises an empty volume. A volume from before auth-svc (Plan 4B) has no push_auth,
+# and auth-svc would never become ready: stop now, not after five slow install attempts.
+postgres="$(kubectl --context "$cluster" -n "$namespace" get statefulset push-postgres -o name --ignore-not-found)"
+if [[ -n "$postgres" ]]; then
+  step 'check that the Postgres volume has the push_auth database'
+  kubectl --context "$cluster" -n "$namespace" rollout status statefulset/push-postgres --timeout=300s
+  if ! has_auth="$(kubectl --context "$cluster" -n "$namespace" exec push-postgres-0 -- \
+    psql -U push -d postgres -Atc "SELECT count(*) FROM pg_database WHERE datname = 'push_auth'")"; then
+    echo 'checking the Postgres volume failed' >&2
+    exit 1
+  fi
+  if [[ "$has_auth" != 1 ]]; then
+    echo "The Postgres volume predates auth-svc: it has no push_auth database, and PostgreSQL creates one only on an empty volume. Run deploy/minikube/down.sh --cluster $cluster first (it deletes the cluster's data), then run this script again." >&2
+    exit 1
+  fi
+fi
+```
+
+replace `    for target in message-svc gateway smoke; do` with
 
 ```bash
     for target in auth message-svc gateway smoke; do
@@ -2185,21 +2298,21 @@ seconds after the backends became ready):
 ```text
 smoke: auth-svc answers 503 Service Unavailable yet; retrying
 smoke: auth-svc answers 503 Service Unavailable yet; retrying
-smoke: alice signed up, verified the email from the dev mailbox, signed in and registered device 01a1341b-6451-70b3-9f87-5c667afcf5cf in 61 ms
+smoke: alice signed up, verified the email from the dev mailbox, signed in and registered device 01a13489-7059-7383-b7eb-4fbca94e4034 (a retry returned the same device) in 59 ms
 smoke: alice's access token verifies against the JWKS (EdDSA, aud ws://push.local/v1/socket); refresh rotated it
-smoke: bob signed up, verified the email from the dev mailbox, signed in and registered device 01a1341b-6485-7494-8a26-6d0776a53279 in 48 ms
+smoke: bob signed up, verified the email from the dev mailbox, signed in and registered device 01a13489-708d-7112-9529-e7af44db8e6c (a retry returned the same device) in 49 ms
 smoke: bob's access token verifies against the JWKS (EdDSA, aud ws://push.local/v1/socket); refresh rotated it
-smoke: mirrored alice=01a1341b-642d-713c-ad01-5001215fcec1 bob=01a1341b-646b-75fc-9ecc-55d0c3c8e815 into message-svc as contacts with a direct conversation
+smoke: mirrored alice=01a13489-703a-7210-ad31-6e033cdefedc bob=01a13489-7073-7524-9a56-f92aa60be286 into message-svc as contacts with a direct conversation
 smoke: bob connected (Ready, heartbeat 30000 ms)
 smoke: alice connected (Ready, heartbeat 30000 ms)
-smoke: alice got SendAck seq=1 after 6 ms
-smoke: bob got Deliver seq=1 after 43 ms
+smoke: alice got SendAck seq=1 after 13 ms
+smoke: bob got Deliver seq=1 after 16 ms
 smoke: bob acked; the gateway answered the following Ping
-smoke: PASS in 4243 ms
+smoke: PASS in 4262 ms
 ```
 
-The 61 ms of an enrollment include two Argon2id computations at the OWASP parameters
-(signup and login) in the release build.
+The 59 ms of an enrollment include two Argon2id computations at the OWASP parameters
+(signup and login) and two device registrations (the retry) in the release build.
 
 - [ ] **Step 4: Check what the smoke test does not**
 
@@ -2217,8 +2330,8 @@ Expected: every pod `Running` (`push-smoke` `Completed`), 0 restarts; auth-svc's
 logs show the DEV ONLY warning, `connected` for postgres and redis and `serving HTTP`
 (the first Postgres attempt may log `not reachable yet; retrying` while the database
 starts), no tokens, passwords or emails; the databases `push_auth|push_auth` and
-`push_messaging|push`; the outbox holds `device.registered|2`, `email.send|2`,
-`user.verified|2`; `push_auth` connecting to `push_messaging` fails with
+`push_messaging|push`; the outbox holds `device.registered|2` (a retried registration
+announces nothing), `email.send|2`, `user.verified|2`; `push_auth` connecting to `push_messaging` fails with
 `FATAL: permission denied for database "push_messaging"` and
 `User does not have CONNECT privilege.`; and `push_auth` is not a superuser (`f`).
 
@@ -2246,9 +2359,29 @@ $after = kubectl --context push -n push get secret push-secrets -o jsonpath='{.d
 "signing key kept: $($before -eq $after)"
 ```
 
-Expected: `REVISION: 2`, the smoke test passes again, and `signing key kept: True`.
+Expected: `==> check that the Postgres volume has the push_auth database` (the release's
+StatefulSet exists now), `REVISION: 2`, the smoke test passes again, and
+`signing key kept: True`.
 
-- [ ] **Step 6: Run the gates and commit**
+- [ ] **Step 6: The up scripts refuse a volume without `push_auth`**
+
+Drop the database to stand in for a volume from Plan 4B, then run both scripts:
+
+```powershell
+kubectl --context push -n push exec push-postgres-0 -- psql -U push -d postgres -c "DROP DATABASE push_auth WITH (FORCE)"
+pwsh -NoProfile -File deploy/minikube/up.ps1 -SkipBuild; "exit=$LASTEXITCODE"
+& 'C:\Program Files\Git\bin\bash.exe' deploy/minikube/up.sh --skip-build; "exit=$LASTEXITCODE"
+```
+
+Expected: `DROP DATABASE`; each script prints `==> check that the Postgres volume has the
+push_auth database` and stops within seconds, before building or installing anything —
+`up.ps1` throws `The Postgres volume predates auth-svc: it has no push_auth database, and
+PostgreSQL creates one only on an empty volume. Run deploy/minikube/down.ps1 -Cluster push
+first (it deletes the cluster's data), then run this script again.` and `up.sh` prints the
+same with `down.sh --cluster push`, both with exit code 1. Task 4 starts with `down.ps1`,
+which leaves a fresh cluster again.
+
+- [ ] **Step 7: Run the gates and commit**
 
 ```powershell
 cargo test --workspace --locked
@@ -2259,7 +2392,7 @@ git add deploy/minikube
 git commit -m "deploy: build and roll the auth-svc image on minikube"
 ```
 
-Expected: 686 tests pass. Leave the cluster running for Task 4.
+Expected: 700 tests pass. Leave the cluster running for Task 4.
 
 ---
 
@@ -2317,7 +2450,8 @@ and add, after it, a blank line and:
 ```markdown
 auth-svc has a database and a role of its own, `push_auth`, which PostgreSQL's init script
 creates when it initialises an empty volume. A cluster that still holds a release from before
-auth-svc (Plan 4B) has no such database: run `deploy/minikube/down.ps1` once, then `up`.
+auth-svc (Plan 4B) has no such database; `up` notices and stops: run
+`deploy/minikube/down.ps1` once, then `up` again.
 ```
 
 - [ ] **Step 3: Spec**
@@ -2328,21 +2462,21 @@ starts `` - `deploy/minikube/up.ps1` (and `up.sh`) wait for ingress-nginx ``:
 ```markdown
 - auth-svc (Plan 5B) is a third Deployment with its own database `push_auth` and role
   `push_auth`, created by a PostgreSQL init script (a ConfigMap without credentials; the
-  password comes from the Secret). Each database admits only its owner (`REVOKE ALL …
-  FROM PUBLIC`), so auth-svc cannot connect to `push_messaging`. The Secret also holds the
-  generated Ed25519 seed and HMAC key (`randBytes 32`). A second Ingress routes
+  password comes from the Secret). `REVOKE ALL … FROM PUBLIC` on both databases keeps
+  auth-svc's plain role out of `push_messaging`; message-svc still connects as the
+  superuser `push`, which can reach every database, until Plan 11. The Secret also holds
+  the generated Ed25519 seed and HMAC key (`randBytes 32`). A second Ingress routes
   `/v1/auth`, `/v1/devices` and `/v1/users` to it; the public URL and the token audience
   come from `ingress.scheme` and `ingress.host` (plain `http` only for a local host).
+  Like the gateway, it has a 5 s preStop sleep and a 30 s termination grace period.
 ```
 
-and in that bullet replace `inside the cluster through the ingress controller. The Azure
-plan replaces the in-chart` with `inside the cluster through the ingress controller: two
-users sign up, verify through the DEV ONLY mailbox, register devices and chat. The Azure
-plan replaces the in-chart`, rewrapping the lines so they read:
+and replace that bullet (it says what the up scripts do) with:
 
 ```markdown
-- `deploy/minikube/up.ps1` (and `up.sh`) wait for ingress-nginx, retry `helm upgrade
-  --install` up to 5 times, and bring it up on minikube; `helm test` runs `push-smoke`
+- `deploy/minikube/up.ps1` (and `up.sh`) wait for ingress-nginx, stop at once with
+  "run down.ps1 first" when an existing PostgreSQL volume has no `push_auth` database,
+  retry `helm upgrade --install` up to 5 times, and bring it up on minikube; `helm test` runs `push-smoke`
   inside the cluster through the ingress controller: two users sign up, verify through
   the DEV ONLY mailbox, register devices and chat. The Azure plan replaces the in-chart
   secrets with Key Vault and adds TLS, and may replace the in-chart PostgreSQL and Redis.
@@ -2366,9 +2500,28 @@ deploy/minikube/down.ps1
 deploy/minikube/up.ps1 -Smoke
 ```
 
-Expected: no diff, no warnings, 686 tests on both toolchains, `all chart checks passed`,
-and the smoke test `PASS`. Copy the `smoke:` lines for the pull request. Then stop the
-profile (keep it for later plans) and restore the kubectl context you noted at the start:
+Expected: no diff, no warnings, 700 tests on both toolchains, `all chart checks passed`,
+and the smoke test `PASS`. Recorded while writing this plan (a fresh install after
+`down.ps1`):
+
+```text
+smoke: auth-svc answers 503 Service Unavailable yet; retrying
+smoke: auth-svc answers 503 Service Unavailable yet; retrying
+smoke: alice signed up, verified the email from the dev mailbox, signed in and registered device 01a1348c-4752-71d8-be17-bb25e776a83f (a retry returned the same device) in 61 ms
+smoke: alice's access token verifies against the JWKS (EdDSA, aud ws://push.local/v1/socket); refresh rotated it
+smoke: bob signed up, verified the email from the dev mailbox, signed in and registered device 01a1348c-4785-76d4-a2f2-9f58b5de5587 (a retry returned the same device) in 48 ms
+smoke: bob's access token verifies against the JWKS (EdDSA, aud ws://push.local/v1/socket); refresh rotated it
+smoke: mirrored alice=01a1348c-4730-745d-8051-fb298c375ef6 bob=01a1348c-476c-77e1-b4bc-8bb2ec5c26f7 into message-svc as contacts with a direct conversation
+smoke: bob connected (Ready, heartbeat 30000 ms)
+smoke: alice connected (Ready, heartbeat 30000 ms)
+smoke: alice got SendAck seq=1 after 11 ms
+smoke: bob got Deliver seq=1 after 16 ms
+smoke: bob acked; the gateway answered the following Ping
+smoke: PASS in 4294 ms
+```
+
+Copy the `smoke:` lines for the pull request. Then stop the profile (keep it for later
+plans) and restore the kubectl context you noted at the start:
 
 ```powershell
 minikube stop -p push
@@ -2389,7 +2542,7 @@ Put the smoke output from Step 5 into the body (replace the placeholder line):
 
 ```powershell
 $body = @'
-Implements docs/superpowers/plans/2026-10-13-plan-05b-auth-minikube.md: an auth image target; auth-svc in the chart with its own database and role (push_auth, created by a PostgreSQL init script; each database admits only its owner), generated Ed25519 and HMAC keys in the Secret, an Ingress for /v1/auth, /v1/devices and /v1/users, public URL and token audience from ingress.scheme/host, PUSH_DEV_MAILBOX behind the dev-mode guard; the smoke test signs two users up through auth-svc, verifies them through the DEV ONLY mailbox, registers devices, checks the access tokens against the JWKS, refreshes them, and chats through the gateway; up scripts and CI build the new image; test-chart.ps1 has 19 checks.
+Implements docs/superpowers/plans/2026-10-13-plan-05b-auth-minikube.md: an auth image target; auth-svc in the chart with its own database and role (push_auth, created by a PostgreSQL init script; CONNECT revoked from PUBLIC, so auth-svc cannot reach push_messaging — message-svc stays a superuser until Plan 11), a preStop sleep and grace period like the gateway's, generated Ed25519 and HMAC keys in the Secret, an Ingress for /v1/auth, /v1/devices and /v1/users, public URL and token audience from ingress.scheme/host, PUSH_DEV_MAILBOX behind the dev-mode guard; the smoke test signs two users up through auth-svc, verifies them through the DEV ONLY mailbox, registers devices (a retried registration returns the same device), checks the access tokens against the JWKS, refreshes them, and chats through the gateway; up scripts and CI build the new image, and the up scripts stop at once on a PostgreSQL volume without push_auth; test-chart.ps1 has 20 checks.
 
 Verified on minikube (deploy/minikube/up.ps1 -Smoke):
 
@@ -2411,10 +2564,10 @@ the controller merges after the final review and its own minikube run.
 | §2 each service owns one database and never reads another's (auth-svc cannot connect to `push_messaging`) | 2, 3 |
 | §2 public endpoints `/v1/auth/*`, `/v1/devices/*`, `/v1/users/*` (auth-svc) beside `/v1/socket` | 2, 3 |
 | §5.2 verification is the gate: the smoke test verifies before it can sign in | 1, 3 |
-| §5.3 explicit device registration with a registration token; refresh rotation | 1, 3 |
+| §5.3 explicit device registration with a registration token, idempotent by `registration_id`; refresh rotation | 1, 3 |
 | §5.6 links from a configured base URL; pages with `Referrer-Policy: no-referrer` (checked through the ingress) | 1, 2, 3 |
 | §7.6 DEV ONLY switches, strict and off by default; the gateway's dev identity kept until Plan 8 | 2, 3 |
-| §11 secrets generated, kept in the Secret, never in git or a ConfigMap; probes; hardened containers; the same chart as Azure | 2, 3 |
+| §11 secrets generated, kept in the Secret, never in git or a ConfigMap; probes; graceful shutdown (preStop sleep, grace period); hardened containers; the same chart as Azure | 2, 3 |
 | Roadmap: every plan verified on minikube before merge | 3, 4 |
 
 ## Deferred to later plans
@@ -2432,5 +2585,9 @@ the controller merges after the final review and its own minikube run.
 - **TLS** for the auth API and `https`/`wss` in the smoke test, Key Vault for the keys,
   signing-key rotation, `NetworkPolicies` (only the ingress reaches auth-svc's port 8080;
   only auth-svc reaches `push_auth`) (Plan 11).
-- **The PostgreSQL superuser** for message-svc on minikube (Plan 4B's deferral) remains;
-  auth-svc already runs as a plain owner role.
+- **The PostgreSQL superuser** for message-svc on minikube (Plan 4B's deferral) remains,
+  so revoking `CONNECT` keeps only auth-svc confined; auth-svc already runs as a plain
+  owner role (Plan 11).
+- **Link tokens in ingress access logs**: ingress-nginx logs the query string of the link
+  pages' `GET`, and with it the verify or reset token (single purpose, 30 minutes). The
+  production ingress's log format comes with Plan 11.

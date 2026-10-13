@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** `push-auth`, the auth service of spec §5, as a tested binary: the `auth` schema in a database of its own (`push_auth`); signup with the same answer whether or not the email exists; stateless, HMAC-signed email links for verification and password reset (no token table); verification as the gate to every other API; login that returns a registration token; explicit device registration (at most 10 active devices); EdDSA access tokens published as a JWKS; refresh tokens stored as hashes and rotated with reuse detection; device listing and revocation; handles, the own profile and handle lookup; Argon2id at the OWASP minimum; rate limits in Redis; and an outbox that records every email and every user and device event in the same transaction as the change. Everything is tested against Postgres and Redis containers. Plan 5B adds auth-svc to the image and the chart and runs the smoke test through it on minikube.
+**Goal:** `push-auth`, the auth service of spec §5, as a tested binary: the `auth` schema in a database of its own (`push_auth`); signup with the same answer whether or not the email exists, where a new signup takes an unverified account over from whoever created it; stateless, HMAC-signed email links for verification and password reset (no token table), bound to the password hash so a password change voids them; verification as the gate to every other API; login that returns a registration token; explicit, idempotent device registration (at most 10 active devices); EdDSA access tokens published as a JWKS; refresh tokens stored as hashes and rotated with reuse detection and a 30-second grace window for lost answers; device listing and revocation; handles, the own profile and handle lookup; Argon2id at the OWASP minimum behind a bounded queue; rate limits in Redis that fail closed; a password reset that also verifies the email; and an outbox that records every email and every user and device event in the same transaction as the change. Everything is tested against Postgres and Redis containers. Plan 5B adds auth-svc to the image and the chart and runs the smoke test through it on minikube.
 
-**Architecture:** `push-auth` is a library plus a binary, like `push-message-svc`. An axum router (`api`) serves `/v1/auth/*`, `/v1/devices/*` and `/v1/users/*` as JSON, plus two small HTML pages that email links open. Handlers call `Auth` (`service`, `devices`, `profiles`), which runs SQL with sqlx on a pool made by `push_store::connect_pool` (the request-sized session timeouts of Plan 4A) and writes outbox rows in the same transaction as each change. Credentials live in small pure modules: `password` (Argon2id on blocking threads, bounded by a semaphore), `links` (HMAC-SHA256 signed claims with a purpose), `tokens` (Ed25519 JWTs with `jsonwebtoken`, the JWKS, refresh tokens). `limits` counts requests per IP and per account in Redis, keyed by hashes. `server` migrates with `push_store::run_migrations` on a dedicated connection, retries Postgres and Redis until they answer (interruptible by shutdown), serves `/healthz` and `/readyz`, and shuts down gracefully. message-svc and the gateway are not changed: auth-svc only writes `user.verified`, `device.registered`, `device.revoked` and `user.password_reset` to its outbox, which the worker relays to message-svc in Plan 6. Spec: `docs/superpowers/specs/2026-10-11-push-messenger-design.md` §2, §3.1, §5.1–§5.6, §7.6, §9, §12.
+**Architecture:** `push-auth` is a library plus a binary, like `push-message-svc`. An axum router (`api`) serves `/v1/auth/*`, `/v1/devices/*` and `/v1/users/*` as JSON, plus two small HTML pages that email links open. Handlers call `Auth` (`service`, `devices`, `profiles`), which runs SQL with sqlx on a pool made by `push_store::connect_pool` (the request-sized session timeouts of Plan 4A) and writes outbox rows in the same transaction as each change. Credentials live in small pure modules: `password` (Argon2id on blocking threads, admitted by a `HashGate` that bounds concurrency, queue length and wait), `links` (HMAC-SHA256 signed claims with a purpose and a fingerprint of the password hash), `tokens` (Ed25519 JWTs with `jsonwebtoken`, the JWKS, refresh tokens). `limits` counts requests per IP (IPv6 per /64), per account and IP, and per account in Redis, keyed by hashes, and refuses with a retryable `unavailable` when Redis does not answer. `server` migrates with `push_store::run_migrations` on a dedicated connection, retries Postgres and Redis until they answer (interruptible by shutdown), serves `/healthz` and `/readyz`, and shuts down gracefully. message-svc and the gateway are not changed: auth-svc only writes `user.verified`, `device.registered`, `device.revoked` and `user.password_reset` to its outbox, which the worker relays to message-svc in Plan 6. Spec: `docs/superpowers/specs/2026-10-11-push-messenger-design.md` §2, §3.1, §5.1–§5.6, §7.6, §9, §12.
 
 **Tech Stack:** Rust 2024 edition (toolchain ≥ 1.85). New: `argon2` 0.5 (0.5.3, feature `std`), `jsonwebtoken` 9 (9.3.1, default features off: the `ring` backend), `ring` 0.17, `hmac` 0.12, `sha2` 0.10, `base64` 0.22, `rand` 0.9, and the `json` feature of `sqlx` 0.8; for tests `tower` 0.5 (`util`) and `http-body-util` 0.1. Already in the workspace: `axum` 0.8, `redis` 1 (1.2.x), `tokio`, `tokio-util`, `tracing`, `testcontainers-modules` 0.13.
 
@@ -14,6 +14,11 @@
 
 - **Plan 4B is merged** (PR #7). This plan adds the `push-auth` crate and two functions to
   `push-store`; it changes nothing else.
+- **The spec already has the owner's decisions** of 2026-10-13 (on `main` with this plan):
+  `device.registration_id` and `refresh_token.rotated_at` in §3.1, and §5.2–§5.6 on
+  signup over an unverified account, links bound to the password, idempotent
+  registration, the refresh grace window, reset verifying the email, the password policy
+  and fail-closed rate limits. Task 9 adds the implementation notes.
 - Work from the repository root: `C:\Users\yurio\Documents\github\push-messenger`. Every
   command below starts there.
 - Create the branch from an up-to-date `main`:
@@ -72,24 +77,32 @@ cargo +1.85 build --workspace --all-targets --locked
 - **Verification is the gate** (spec §5.2): login and device registration refuse an
   unverified account with `email_not_verified`; an unverified account can only ask for the
   email again. Opening a verification link never signs anyone in.
-- **No verification or reset token is stored.** Links are signed claims; a reset link
-  binds a fingerprint of the password hash it replaces, so it works once.
+- **No verification or reset token is stored.** Links and registration tokens are signed
+  claims that bind a fingerprint of the password hash: a reset link works once, and any
+  password change (a reset, or a new signup over an unverified account) voids every
+  link and registration token made before it.
+- **Rate limits fail closed.** When Redis does not answer, signup, login, resend, forgot,
+  link opening and lookup answer a retryable `unavailable` (503); refresh is not limited,
+  so signed-in devices keep working.
 - **Nothing secret is stored, logged or echoed in clear:** passwords only as Argon2id PHC
   strings, refresh tokens only as SHA-256, keys and database URLs only in the
   environment; `Config`, `LinkSigner` and `AccessTokens` have redacting `Debug`;
   configuration errors never show a URL or key; Redis keys hold hashes, never an email or
   an IP; logs never contain a token, a password or an email.
 - **No answer reveals whether an email has an account:** signup, resend and forgot answer
-  `202 {"status":"check_email"}` either way, and login answers `invalid_credentials` for an
-  unknown email and a wrong password alike, after the same Argon2id work.
+  `202 {"status":"check_email"}` either way (signup's `handle_taken` counts every
+  account's handle, the email's own included), and login answers `invalid_credentials`
+  for an unknown email and a wrong password alike, after the same Argon2id work.
 - **Links are built from the configured public URL**, never from a `Host` header; the
   pages they open send `Referrer-Policy: no-referrer` and change nothing on `GET`.
 - **DEV ONLY switches are strict:** `PUSH_DEV_MAILBOX` accepts exactly `1` (on) or
-  `0`/empty/unset (off), refuses anything else, and logs a warning at start-up when on.
+  `0`/empty/unset (off), refuses anything else, refuses `1` unless the public URL's host
+  is local, and logs a warning at start-up when on.
 
 ## Decisions made for this plan
 
-These were settled while writing the plan. Do not reopen them during execution.
+These were settled while writing the plan, after its review and with the owner's
+decisions of 2026-10-13 (marked **Owner**). Do not reopen them during execution.
 
 1. **Plan 5 is split.** 5A (this plan) delivers the service, tested against containers;
    5B adds it to the image and the chart, extends the smoke test and verifies it on
@@ -103,25 +116,48 @@ These were settled while writing the plan. Do not reopen them during execution.
 3. **Signed tokens without state.** Email links and the registration token are
    `base64url(JSON claims).base64url(HMAC-SHA256)`, with domain separation
    (`push-link-v1.`) and a `purpose` (`verify`, `reset`, `register`) that is always
-   checked. Verify links bind the email (spec §5.2), reset links `pw`, the first 16 bytes
-   of SHA-256 of the password hash (spec §5.4). The registration token is such a token,
-   not a JWT: the gateway never has the HMAC key, so it can never accept one.
+   checked. Every token carries `pw`, the first 16 bytes of SHA-256 of the account's
+   password hash when it was made, compared with the stored hash under the account's row
+   lock; verify links also bind the email (spec §5.2). So a reset link works once, and a
+   password change voids every earlier link and registration token (review findings A
+   and B: a verification link sent to a squatter, or a registration token that outlived a
+   reset). The registration token is such a token, not a JWT: the gateway never has the
+   HMAC key, so it can never accept one.
 4. **Access tokens are EdDSA JWTs** made with `jsonwebtoken` 9.3 on `ring` (already in the
    lock through sqlx). Version 10 makes you choose `aws-lc-rs` (needs cmake and a C
    toolchain on Windows) or `rust_crypto` (pulls RSA and elliptic-curve crates we do not
    use). The key is a 32-byte Ed25519 seed from the environment; the `kid` is its RFC 7638
    thumbprint; `GET /v1/auth/jwks` publishes it. Claims are exactly spec §5.1's, `aud`
-   being the gateway's URL. Verification inside auth-svc has no leeway.
+   being the gateway's URL. Verification inside auth-svc has no leeway. **Accepted
+   advisory:** 9.3.1 has CVE-2026-25537 (fixed in 10.3.0): a claim with the wrong JSON
+   type counts as absent unless it is required. `exp`, `sub` and `aud` are required, the
+   claims are typed, and only auth-svc signs, so it does not apply; Plan 8's gateway must
+   keep `exp` required (a comment in `tokens.rs` says so).
 5. **Refresh tokens** are 32 random bytes (base64url), stored as SHA-256. A refresh
-   marks the old row `rotated_to` the new hash; presenting a rotated token again revokes
-   every refresh token of that device (reuse detection), so the device must sign in again.
+   marks the old row `rotated_to` the new hash and `rotated_at` now; presenting a rotated
+   token again revokes every refresh token of that device (reuse detection), so the device
+   must sign in again. **Owner: a 30-second grace window.** The token rotated last may be
+   presented again within 30 s of its rotation, if its successor is still live — the
+   client lost the answer. It gets a fresh pair, and the pair issued before is cut off:
+   its refresh token is marked `rotated_to` the new hash with a null `rotated_at`, so it
+   has no window of its own and presenting it is reuse. The presented token keeps its
+   `rotated_at`, so retries never extend the window; presenting it after 30 s, or any
+   older or cut-off token, still revokes the device's tokens. The presented row is locked
+   (`FOR UPDATE`) before its successor's, so concurrent refreshes with one token are
+   serialised and leave exactly one live branch (Task 5 proves it with 5 at once). The
+   cut-off pair's access token stays valid until it expires (at most 15 minutes).
    `login` with `device_id` revokes the device's earlier refresh tokens: a new sign-in
    replaces the old session.
 6. **Signup answers alike for new and existing emails.** The password is hashed first,
-   always. A new email gets an account and a `verify_email` email; an existing unverified
-   one a fresh `verify_email` (its owner may have lost the first); an existing verified
-   one an `account_exists` email. Nothing is changed for an existing email. A taken handle
-   is reported (`handle_taken`): handles are public through lookup anyway.
+   always. A new email gets an account and a `verify_email` email. **An existing
+   unverified account starts over** (review finding A): one
+   `INSERT … ON CONFLICT (email) DO UPDATE … WHERE email_verified_at IS NULL` replaces its
+   password hash, handle and display name, and a new `verify_email` goes out whose `pw`
+   voids the links sent before — otherwise whoever signed up first with someone else's
+   address would own the account that person verifies. An existing verified account
+   changes nothing and gets an `account_exists` email. A handle held by any account, this
+   email's own included, is `handle_taken` (handles are public through lookup anyway), so
+   that answer never depends on the email either; the work done is the same in every case.
 7. **Link pages.** `GET /v1/auth/verify?token=…` and `GET /v1/auth/password/reset?token=…`
    return a minimal page whose button `POST`s the token as a form; a `GET` changes nothing,
    so a mail scanner that opens links does not act for the user. The same `POST` endpoints
@@ -131,7 +167,9 @@ These were settled while writing the plan. Do not reopen them during execution.
 8. **Password reset is in this plan** (roadmap: "stateless email links"). It revokes
    every refresh token of the account and writes `user.password_reset {user_id}`, a fifth
    outbox kind: spec §5.4 kicks every device without revoking them, which none of the four
-   listed kinds says. The worker relays it in Plan 6.
+   listed kinds says. The worker relays it in Plan 6. **Owner: a completed reset also
+   verifies the email** — the link reached the address — and writes `user.verified` if it
+   was not verified before.
 9. **Devices reach message-svc only through the outbox** (spec §2): auth-svc writes
    `user.verified`, `device.registered` and `device.revoked`; Plan 6's worker relays them
    to a new internal message-svc API. message-svc and the gateway are not touched; the
@@ -143,37 +181,56 @@ These were settled while writing the plan. Do not reopen them during execution.
     caller, which only message-svc knows, and auth-svc never reads its database.
 11. **Inputs.** Handles: 3–30 of `a-z`, `0-9`, `_`, starting with a letter, stored lower
     case. Display and device names: 1–64 characters after trimming, no control characters.
-    Passwords: 8–128 characters, used as typed. Emails: one `@`, a dotted domain without
+    **Owner: passwords have 8–128 characters**, used as typed, and no other rule for now;
+    a check against leaked passwords is deferred. Emails: one `@`, a dotted domain without
     empty or hyphen-edged labels, at most 254 bytes; the domain is lower-cased. Platforms:
     `ios`, `android`, `web`, `desktop`, `other`.
 12. **Rate limits** (spec §5.6) are fixed windows: `INCR`, then `EXPIRE … NX`, in one
-    `MULTI`, keyed `rl:{action}:{scope}:{first 16 bytes of SHA-256, hex}`. Per IP and per
-    account: signup 20/h and 5/h, login 60 and 10 per 15 min, resend 20/h and 3/h, forgot
-    20/h and 3/h, opening a link 60/h per IP, handle lookup 120/h per IP and 20/h per user
-    (the spec's number). When Redis does not answer within 500 ms (or shutdown began) the
-    request goes ahead and a warning is logged: Redis is a doorbell (spec §2), and
-    Argon2id keeps guessing slow. The client IP is the configured header (`x-real-ip`,
-    which ingress-nginx overwrites), else the peer address. Refresh is not limited.
+    `MULTI`, keyed `rl:{action}:{scope}:{first 16 bytes of SHA-256, hex}`. Signup 20/h per
+    IP and 5/h per account; resend and forgot 20/h and 3/h; opening a link 60/h per IP;
+    handle lookup 120/h per IP and 20/h per user (the spec's number). **Login** counts
+    60 per 15 min per IP, **10 per 15 min per account and IP**, and 100 per hour per
+    account: a per-account limit alone would let anyone lock a victim out, while this one
+    leaves the owner's own address alone and still caps guessing from many addresses;
+    the limits are counted in that order and a refused request is not counted by the later
+    ones, so a guesser stopped per account and IP does not use up the ceiling. An IPv6
+    client counts by its /64. **Owner: fail closed** — when Redis does not answer within
+    500 ms (or shutdown began) the request is refused with the retryable `unavailable`
+    (503) and a warning is logged. Refresh is not limited. **Client IP:** the last entry
+    of the configured header (`x-real-ip`, which ingress-nginx overwrites; in an
+    `X-Forwarded-For` only the last entry is written by the proxy in front), which assumes
+    exactly one proxy hop; without the header, the peer address.
 13. **Argon2id** `m=19456 KiB, t=2, p=1` as a PHC string; a hash with other parameters
-    still verifies and is replaced on the next login. Hashing runs on `spawn_blocking`,
-    at most `PUSH_AUTH_HASH_CONCURRENCY` (default 2) at once, since each takes 19 MiB.
-    Login checks a dummy hash for an unknown email. The workspace builds `argon2` and
-    `blake2` with `opt-level = 3` in the dev profile, so tests hash in milliseconds.
+    still verifies and is replaced on the next login. Hashing runs on `spawn_blocking`
+    behind a `HashGate`: at most `PUSH_AUTH_HASH_CONCURRENCY` (default 2) at once, since
+    each takes 19 MiB; at most `PUSH_AUTH_HASH_QUEUE` (default 32) requests waiting, each
+    at most 2 s; the rest get the retryable `unavailable` at once, so a login flood fails
+    fast instead of piling up. Login checks a dummy hash for an unknown email. The
+    workspace builds `argon2` and `blake2` with `opt-level = 3` in the dev profile, so
+    tests hash in milliseconds.
 14. **The device limit** (10 active) is counted under `SELECT … FOR UPDATE` on the account
     row, so concurrent registrations cannot pass it together (Task 5 proves it with 13 at
-    once).
+    once). **Owner: idempotent registration.** `POST /v1/devices` takes
+    `registration_id`, a UUID the client chooses for one registration and sends again with
+    its retries, like `client_msg_id`; `unique (user_id, registration_id)` scopes it to the
+    user, over all of the user's devices. Under the same row lock, an active device with
+    that id gets new tokens (its earlier refresh tokens revoked — their answer was lost), no
+    second `device.registered` and no limit check, so a retry succeeds even at the limit;
+    the id of a revoked device stays spent (`device_not_found`).
 15. **Errors** are `{"error": {"code", "message", "retryable"}}` with codes `invalid`,
     `handle_taken`, `invalid_credentials`, `email_not_verified`, `link_invalid`,
     `link_expired`, `unauthorized`, `token_expired`, `too_many_devices`,
     `device_not_found`, `user_not_found`, `rate_limited` (429 with `Retry-After`) and
-    `unavailable` (503). 401s carry `WWW-Authenticate: Bearer`. Every answer is
+    `unavailable` (503, retryable). 401s carry `WWW-Authenticate: Bearer`. Every answer is
     `Cache-Control: no-store` except the JWKS (`public, max-age=300`). Bodies are at most
     16 KiB.
 16. **The DEV ONLY mailbox.** With `PUSH_DEV_MAILBOX=1`, `GET /dev/mailbox?to=…` returns
     the `email.send` payloads waiting in the outbox for one address, newest first. It is
     how a local cluster and the smoke test open verification links before the worker sends
     email (Plan 6). Its path is outside `/v1`, so the ingress of Plan 5B never routes it,
-    and the chart's dev-mode guard (Plan 5B) decides whether it is on.
+    and the chart's dev-mode guard (Plan 5B) decides whether it is on. auth-svc's `Config`
+    refuses `1` unless the public URL's host is local (`localhost`, `127.0.0.1`,
+    `*.local`, `*.localhost`, `*.test`), matching that guard.
 17. **Ids are UUIDv7** (time-ordered), like the domain's: users, devices, outbox events,
     access-token `jti`s.
 18. **`citext` comparisons cast the parameter** (`email = $1::citext`). sqlx binds strings
@@ -193,16 +250,16 @@ crates/push-auth/                           NEW
 │   ├── lib.rs                              modules and exports
 │   ├── main.rs                             the binary
 │   ├── db.rs                               MIGRATOR, migrate_database
-│   ├── password.rs                         Argon2id
+│   ├── password.rs                         Argon2id and the hash gate
 │   ├── rules.rs                            emails, handles, names, passwords, platforms
 │   ├── links.rs                            HMAC-signed links and registration tokens
 │   ├── tokens.rs                           EdDSA access tokens, JWKS, refresh tokens
 │   ├── error.rs                            AuthError: code, status, retryable
 │   ├── outbox.rs                           outbox events and their payloads
 │   ├── service.rs                          Auth: signup, verify, resend, login, reset
-│   ├── devices.rs                          register, sign in again, refresh, list, revoke
+│   ├── devices.rs                          register (idempotent), sign in again, refresh, list, revoke
 │   ├── profiles.rs                         own profile, display name, lookup
-│   ├── limits.rs                           rate limits: Redis and in-memory counters
+│   ├── limits.rs                           rate limits: Redis and in-memory counters, fail closed
 │   ├── api.rs                              the HTTP API and the link pages
 │   ├── config.rs                           Config from the environment
 │   └── server.rs                           serve, health, logging, signals
@@ -462,7 +519,8 @@ workspace = true
 
 The tests create a plain role `push_auth` that owns a database `push_auth` — what Plan 5B's
 chart does — and migrate as that role, so they also prove that a database owner may create
-`citext`. Create `crates/push-auth/tests/schema.rs`:
+`citext`; the last one checks that a `registration_id` names one device per user
+(decision 14). Create `crates/push-auth/tests/schema.rs`:
 
 ```rust
 //! The `auth` schema on a real PostgreSQL (Docker must be running): the migrations run as
@@ -594,8 +652,8 @@ async fn malformed_handles_and_platforms_are_refused() {
         .await
         .expect("a valid account");
     let error = sqlx::query(
-        "INSERT INTO auth.device (device_id, user_id, name, platform) \
-         VALUES ($1, $2, 'Phone', 'toaster')",
+        "INSERT INTO auth.device (device_id, user_id, name, platform, registration_id) \
+         VALUES ($1, $2, 'Phone', 'toaster', $1)",
     )
     .bind(Uuid::now_v7())
     .bind(user)
@@ -603,6 +661,33 @@ async fn malformed_handles_and_platforms_are_refused() {
     .await
     .expect_err("an unknown platform");
     assert_eq!(constraint(error), "device_platform_check");
+}
+
+#[tokio::test]
+async fn a_registration_id_names_one_device_of_a_user() {
+    let (_container, url) = auth_database().await;
+    let pool = migrated(&url).await;
+    let alice = insert_user(&pool, "alice@example.com", "alice")
+        .await
+        .expect("alice");
+    let bob = insert_user(&pool, "bob@example.com", "bob")
+        .await
+        .expect("bob");
+    let registration = Uuid::now_v7();
+    let insert = |user: Uuid| {
+        sqlx::query(
+            "INSERT INTO auth.device (device_id, user_id, name, platform, registration_id) \
+             VALUES ($1, $2, 'Phone', 'ios', $3)",
+        )
+        .bind(Uuid::now_v7())
+        .bind(user)
+        .bind(registration)
+        .execute(&pool)
+    };
+    insert(alice).await.expect("the first device");
+    insert(bob).await.expect("another user may use the same id");
+    let error = insert(alice).await.expect_err("the same id again");
+    assert_eq!(constraint(error), "device_user_id_registration_id_key");
 }
 ```
 
@@ -624,7 +709,9 @@ Expected: a compile error — `unresolved imports push_auth::MIGRATOR, push_auth
 
 - [ ] **Step 4: The migration and the migrator**
 
-Create `crates/push-auth/migrations/0001_auth.sql`:
+Besides spec §3.1's columns, `device` has `registration_id` (decision 14) and
+`refresh_token` has `rotated_at` (decision 5). Create
+`crates/push-auth/migrations/0001_auth.sql`:
 
 ```sql
 -- The auth schema (spec §3.1), owned by auth-svc in its own database, push_auth.
@@ -651,13 +738,17 @@ CREATE TABLE auth.user_account (
 );
 
 CREATE TABLE auth.device (
-    device_id    uuid PRIMARY KEY,
-    user_id      uuid NOT NULL REFERENCES auth.user_account,
-    name         text NOT NULL CHECK (length(name) BETWEEN 1 AND 64),
-    platform     text NOT NULL CHECK (platform IN ('ios', 'android', 'web', 'desktop', 'other')),
-    created_at   timestamptz NOT NULL DEFAULT now(),
-    last_seen_at timestamptz,
-    revoked_at   timestamptz
+    device_id       uuid PRIMARY KEY,
+    user_id         uuid NOT NULL REFERENCES auth.user_account,
+    name            text NOT NULL CHECK (length(name) BETWEEN 1 AND 64),
+    platform        text NOT NULL CHECK (platform IN ('ios', 'android', 'web', 'desktop', 'other')),
+    -- Chosen by the client for one registration and sent again with its retries: a retry
+    -- finds this device instead of creating a second one.
+    registration_id uuid NOT NULL,
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    last_seen_at    timestamptz,
+    revoked_at      timestamptz,
+    UNIQUE (user_id, registration_id)
 );
 -- The device limit counts a user's active devices.
 CREATE INDEX device_active_user ON auth.device (user_id) WHERE revoked_at IS NULL;
@@ -668,8 +759,12 @@ CREATE TABLE auth.refresh_token (
     device_id  uuid NOT NULL REFERENCES auth.device,
     expires_at timestamptz NOT NULL,
     revoked_at timestamptz,
-    -- The token that replaced this one; presenting a rotated token again is reuse.
-    rotated_to bytea
+    -- The token that replaced this one; presenting a replaced token again is reuse,
+    -- except within the grace window below.
+    rotated_to bytea,
+    -- When the holder exchanged this token; null when a retry of the token before it cut
+    -- this one off. The token rotated last may be presented again for 30 s after this.
+    rotated_at timestamptz
 );
 CREATE INDEX refresh_token_device ON auth.refresh_token (device_id);
 
@@ -724,7 +819,7 @@ cargo test -p push-auth
 ```
 
 Expected: cargo records `push-auth` in `Cargo.lock` on the first run, then
-`test result: ok. 3 passed` for `tests\schema.rs`.
+`test result: ok. 4 passed` for `tests\schema.rs`.
 
 - [ ] **Step 6: Run the gates and commit**
 
@@ -737,7 +832,7 @@ git add Cargo.toml Cargo.lock crates/push-store crates/push-auth
 git commit -m "feat(auth): push-auth crate with the auth schema"
 ```
 
-Expected: 619 tests pass, no warnings, no diff.
+Expected: 620 tests pass, no warnings, no diff.
 
 ---
 
@@ -831,7 +926,7 @@ unsafe_code = "forbid"
 all = { level = "warn", priority = -1 }
 ```
 
-Replace `crates/push-auth/Cargo.toml` with:
+Replace `crates/push-auth/Cargo.toml` with (`tokio`'s timer serves the hash gate):
 
 ```toml
 [package]
@@ -849,6 +944,7 @@ argon2.workspace = true
 push-store.workspace = true
 serde.workspace = true
 sqlx.workspace = true
+tokio = { workspace = true, features = ["time"] }
 tracing.workspace = true
 
 [dev-dependencies]
@@ -860,9 +956,11 @@ uuid.workspace = true
 workspace = true
 ```
 
-- [ ] **Step 2: Passwords, with their tests**
+- [ ] **Step 2: Passwords and the hash gate, with their tests**
 
-Create `crates/push-auth/src/password.rs`:
+`HashGate` admits password hashing (decision 13): a free slot at once; otherwise a place
+in a queue of bounded length for a bounded time, else `Busy` at once. Create
+`crates/push-auth/src/password.rs`:
 
 ```rust
 //! Password hashing with Argon2id (spec §5.6).
@@ -871,11 +969,16 @@ Create `crates/push-auth/src/password.rs`:
 //! parameters than the current ones still verifies, and [`Checked::Right`] says when to
 //! store a new hash. Hashing takes about as long as it is configured to (tens to hundreds
 //! of milliseconds) and 19 MiB of memory at the OWASP minimum: callers run it on a
-//! blocking thread and bound how many run at once.
+//! blocking thread and pass a [`HashGate`] first, which bounds how many run at once, how
+//! many wait and for how long.
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use argon2::password_hash::rand_core::OsRng;
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::{Algorithm, Argon2, Params, Version};
+use tokio::sync::{Semaphore, SemaphorePermit};
 
 /// The outcome of checking a password against a stored hash.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -984,6 +1087,60 @@ fn random_password() -> String {
     SaltString::generate(&mut OsRng).as_str().to_owned()
 }
 
+/// Admission to password hashing: at most `slots` hashes at once, at most `queue`
+/// requests waiting for a slot, none waiting longer than `wait`. A flood of logins thus
+/// fails fast with a retryable error instead of piling up memory and latency.
+#[derive(Debug)]
+pub struct HashGate {
+    slots: Semaphore,
+    waiting: AtomicUsize,
+    queue: usize,
+    wait: Duration,
+}
+
+/// The gate is full: the queue is at its length, or the wait ran out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Busy;
+
+/// Counts one waiting request while it lives.
+struct Waiting<'a>(&'a AtomicUsize);
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl HashGate {
+    /// A gate with `slots` concurrent hashes (at least 1), `queue` waiting requests and
+    /// a longest wait of `wait`.
+    pub fn new(slots: usize, queue: usize, wait: Duration) -> Self {
+        Self {
+            slots: Semaphore::new(slots.max(1)),
+            waiting: AtomicUsize::new(0),
+            queue,
+            wait,
+        }
+    }
+
+    /// A slot, held until the permit is dropped; [`Busy`] at once when the queue is full,
+    /// or after `wait` without a free slot.
+    pub async fn enter(&self) -> Result<SemaphorePermit<'_>, Busy> {
+        if let Ok(permit) = self.slots.try_acquire() {
+            return Ok(permit);
+        }
+        let ahead = self.waiting.fetch_add(1, Ordering::SeqCst);
+        let _waiting = Waiting(&self.waiting);
+        if ahead >= self.queue {
+            return Err(Busy);
+        }
+        match tokio::time::timeout(self.wait, self.slots.acquire()).await {
+            Ok(Ok(permit)) => Ok(permit),
+            _ => Err(Busy),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1051,6 +1208,33 @@ mod tests {
             shown,
             "Passwords { memory_kib: 64, iterations: 1, parallelism: 1 }"
         );
+    }
+
+    #[tokio::test]
+    async fn the_hash_gate_bounds_the_queue_and_the_wait() {
+        let gate = HashGate::new(1, 1, Duration::from_millis(100));
+        let held = gate.enter().await.unwrap();
+        let started = std::time::Instant::now();
+        let (waited, refused) = tokio::join!(gate.enter(), async {
+            tokio::task::yield_now().await;
+            gate.enter().await
+        });
+        assert!(matches!(refused, Err(Busy)), "the queue holds one");
+        assert!(matches!(waited, Err(Busy)), "the slot stayed taken");
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        drop(held);
+        assert!(gate.enter().await.is_ok(), "nobody is counted as waiting");
+    }
+
+    #[tokio::test]
+    async fn a_waiting_request_gets_the_slot_that_frees_up() {
+        let gate = HashGate::new(1, 1, Duration::from_secs(5));
+        let held = gate.enter().await.unwrap();
+        let (entered, ()) = tokio::join!(gate.enter(), async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            drop(held);
+        });
+        assert!(entered.is_ok());
     }
 }
 ```
@@ -1295,7 +1479,7 @@ cargo test -p push-auth --lib
 ```
 
 Expected: `Adding argon2 v0.5.3 (available: v0.6.0)`, `blake2`, `password-hash` on the
-first run; then `test result: ok. 11 passed` in well under a second —
+first run; then `test result: ok. 13 passed` in well under a second —
 `the_owasp_parameters_are_the_spec_minimum` hashes with the real parameters, which takes
 seconds without the `opt-level` override.
 
@@ -1310,7 +1494,7 @@ git add Cargo.toml Cargo.lock crates/push-auth
 git commit -m "feat(auth): Argon2id passwords and input rules"
 ```
 
-Expected: 630 tests pass.
+Expected: 633 tests pass.
 
 ---
 
@@ -1435,6 +1619,7 @@ serde_json.workspace = true
 sha2.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, features = ["time"] }
 tracing.workspace = true
 uuid.workspace = true
 
@@ -1448,16 +1633,20 @@ workspace = true
 
 - [ ] **Step 2: Signed links and registration tokens, with their tests**
 
-Create `crates/push-auth/src/links.rs`:
+Every token the service signs will carry `pw`, the `password_stamp` of the account's
+password hash (decision 3); the service checks it in Tasks 4 and 5. Create
+`crates/push-auth/src/links.rs`:
 
 ```rust
 //! Signed, stateless tokens: the email links and the registration token (spec §5.1).
 //!
 //! A token is `payload.signature`: the payload is base64url JSON claims, the signature
 //! an HMAC-SHA256 over the payload under the service's link key. Nothing is stored:
-//! a verification link binds the email it was sent to, a reset link a fingerprint of the
-//! password hash it replaces (so using it once invalidates it), and every token has a
-//! purpose, so one kind can never stand in for another.
+//! a verification link binds the email it was sent to, and every token binds a
+//! fingerprint of the account's password hash when it was made, so changing the password
+//! (a reset, or a new signup over an unverified account) makes every earlier token
+//! worthless, and a used reset link with it. Every token has a purpose, so one kind can
+//! never stand in for another.
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -1489,7 +1678,8 @@ pub struct LinkClaims {
     /// Verify links: the address the link was sent to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
-    /// Reset links: [`password_stamp`] of the password hash being replaced.
+    /// [`password_stamp`] of the account's password hash when the token was made. Every
+    /// token the service signs carries it; a token without it is refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pw: Option<String>,
 }
@@ -1578,8 +1768,8 @@ impl LinkSigner {
     }
 }
 
-/// A short fingerprint of a password hash, for reset links: it changes whenever the
-/// password does, which makes a used link worthless.
+/// A short fingerprint of a password hash for signed tokens: it changes whenever the
+/// password does, which makes every token made before worthless.
 pub fn password_stamp(password_hash: &str) -> String {
     let digest = Sha256::digest(password_hash.as_bytes());
     URL_SAFE_NO_PAD.encode(&digest[..16])
@@ -1676,8 +1866,8 @@ mod tests {
 - [ ] **Step 3: Access tokens, the JWKS and refresh tokens, with their tests**
 
 The last test builds a key from the published JWK with `DecodingKey::from_jwk` and checks a
-token with it, exactly as the gateway will in Plan 8. Create
-`crates/push-auth/src/tokens.rs`:
+token with it, exactly as the gateway will in Plan 8. `verify` keeps `exp` required, which
+keeps CVE-2026-25537 away (decision 4). Create `crates/push-auth/src/tokens.rs`:
 
 ```rust
 //! Sign-in credentials (spec §5.1): access tokens, signed JWTs (EdDSA) published as a
@@ -1804,6 +1994,9 @@ impl AccessTokens {
     pub fn verify(&self, token: &str) -> Result<AccessClaims, TokenError> {
         let mut validation = Validation::new(Algorithm::EdDSA);
         validation.set_audience(&[&self.audience]);
+        // Keep `exp` required: jsonwebtoken before 10.3 skips the check of a claim with
+        // the wrong JSON type unless it is required (CVE-2026-25537). The gateway
+        // (Plan 8) must require it too.
         validation.set_required_spec_claims(&["exp", "sub", "aud"]);
         validation.leeway = 0;
         jsonwebtoken::decode::<AccessClaims>(token, &self.decoding, &validation)
@@ -1950,7 +2143,7 @@ cargo test -p push-auth --lib
 ```
 
 Expected: `Adding jsonwebtoken v9.3.1 (available: v10.3.0)` on the first run, then
-`test result: ok. 22 passed`.
+`test result: ok. 24 passed`.
 
 - [ ] **Step 5: Run the gates and commit**
 
@@ -1963,7 +2156,7 @@ git add Cargo.toml Cargo.lock crates/push-auth
 git commit -m "feat(auth): signed links, EdDSA access tokens with JWKS, refresh tokens"
 ```
 
-Expected: 641 tests pass.
+Expected: 644 tests pass.
 
 ---
 
@@ -2091,7 +2284,7 @@ serde_json.workspace = true
 sha2.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["rt"] }
+tokio = { workspace = true, features = ["rt", "time"] }
 tracing.workspace = true
 uuid.workspace = true
 
@@ -2105,13 +2298,20 @@ workspace = true
 
 - [ ] **Step 2: Write the failing tests**
 
-Create `crates/push-auth/tests/accounts.rs`:
+Besides the happy paths, they cover review finding A
+(`signing_up_again_takes_over_an_unverified_account_and_says_nothing`: a squatter's link
+stops working and the real owner's values win), links without or with a stale `pw`,
+`a_reset_also_verifies_the_email` (decision 8) and
+`a_login_flood_fails_fast_with_a_retryable_error` (a gate of one slot and no queue, the
+OWASP parameters, eight logins at once). Create `crates/push-auth/tests/accounts.rs`:
 
 ```rust
 //! Signup, email verification, login and password reset on a real PostgreSQL (Docker
 //! must be running). Each test starts a container of its own; they run in parallel.
 
-use push_auth::links::{LinkClaims, LinkSigner, Purpose};
+use std::time::Duration;
+
+use push_auth::links::{LinkClaims, LinkSigner, Purpose, password_stamp};
 use push_auth::password::Passwords;
 use push_auth::tokens::AccessTokens;
 use push_auth::{Auth, AuthError, Settings, Signup, migrate_database};
@@ -2156,6 +2356,8 @@ fn settings(passwords: Passwords) -> Settings {
         links: LinkSigner::new(LINK_KEY.to_vec()).unwrap(),
         tokens: AccessTokens::from_seed(&[5; 32], "wss://api.example.com/v1/socket").unwrap(),
         hash_concurrency: 4,
+        hash_queue: 64,
+        hash_wait: Duration::from_secs(5),
     }
 }
 
@@ -2250,48 +2452,84 @@ async fn the_link_verifies_once_announces_the_user_and_opens_login() {
 }
 
 #[tokio::test]
-async fn signing_up_again_changes_nothing_and_says_nothing() {
+async fn signing_up_again_takes_over_an_unverified_account_and_says_nothing() {
     let world = world().await;
+    // Someone signs up first with Alice's address and a password of their own.
     world
         .auth
-        .signup(signup("alice@example.com", "alice"))
+        .signup(Signup {
+            password: "mallory's guess".to_owned(),
+            display_name: "Mallory".to_owned(),
+            ..signup("alice@example.com", "mallory")
+        })
         .await
         .unwrap();
-    // Unverified: the same answer, and another verification email.
+    let first_link = last_link_token(&world.pool, "alice@example.com").await;
+    // Alice signs up: the same answer, and her values replace the first ones.
     world
         .auth
-        .signup(signup("Alice@example.com", "alice2"))
+        .signup(signup("Alice@example.com", "alice"))
         .await
         .unwrap();
+    assert_eq!(
+        world.auth.verify_email(&first_link).await,
+        Err(AuthError::LinkInvalid),
+        "a link sent before the takeover verifies nothing"
+    );
     let token = last_link_token(&world.pool, "alice@example.com").await;
     world.auth.verify_email(&token).await.unwrap();
-    // Verified: the same answer, and an "account exists" email.
+    assert_eq!(
+        world
+            .auth
+            .login("alice@example.com", "mallory's guess")
+            .await,
+        Err(AuthError::InvalidCredentials)
+    );
     world
         .auth
-        .signup(signup("alice@example.com", "alice3"))
+        .login("alice@example.com", "correct horse")
+        .await
+        .unwrap();
+    // Verified: the same answer, an "account exists" email, and nothing changes.
+    world
+        .auth
+        .signup(Signup {
+            password: "another password".to_owned(),
+            ..signup("alice@example.com", "alice3")
+        })
+        .await
+        .unwrap();
+    world
+        .auth
+        .login("alice@example.com", "correct horse")
         .await
         .unwrap();
 
-    let templates: Vec<String> = outbox(&world.pool)
+    let emails: Vec<(String, String)> = outbox(&world.pool)
         .await
         .into_iter()
         .filter(|(kind, _)| kind == "email.send")
-        .map(|(_, payload)| payload["template"].as_str().unwrap().to_owned())
+        .map(|(_, payload)| {
+            (
+                payload["template"].as_str().unwrap().to_owned(),
+                payload["params"]["handle"].as_str().unwrap().to_owned(),
+            )
+        })
         .collect();
     assert_eq!(
-        templates,
-        ["verify_email", "verify_email", "account_exists"]
+        emails,
+        [
+            ("verify_email".to_owned(), "mallory".to_owned()),
+            ("verify_email".to_owned(), "alice".to_owned()),
+            ("account_exists".to_owned(), "alice".to_owned()),
+        ]
     );
-    let accounts: i64 = sqlx::query_scalar("SELECT count(*) FROM auth.user_account")
-        .fetch_one(&world.pool)
-        .await
-        .unwrap();
-    assert_eq!(accounts, 1);
-    let handle: String = sqlx::query_scalar("SELECT handle::text FROM auth.user_account")
-        .fetch_one(&world.pool)
-        .await
-        .unwrap();
-    assert_eq!(handle, "alice");
+    let accounts: Vec<(String, String)> =
+        sqlx::query_as("SELECT handle::text, display_name FROM auth.user_account")
+            .fetch_all(&world.pool)
+            .await
+            .unwrap();
+    assert_eq!(accounts, [("alice".to_owned(), "Alice".to_owned())]);
 }
 
 #[tokio::test]
@@ -2305,6 +2543,14 @@ async fn a_taken_handle_and_invalid_input_are_reported() {
     assert_eq!(
         world.auth.signup(signup("bob@example.com", "@ALICE")).await,
         Err(AuthError::HandleTaken)
+    );
+    assert_eq!(
+        world
+            .auth
+            .signup(signup("alice@example.com", "alice"))
+            .await,
+        Err(AuthError::HandleTaken),
+        "the account's own handle too: the answer does not depend on the email"
     );
     let short_password = Signup {
         password: "short".to_owned(),
@@ -2337,12 +2583,19 @@ async fn forged_expired_and_mismatched_links_are_refused() {
         .unwrap()
         .sub;
     let signer = LinkSigner::new(LINK_KEY.to_vec()).unwrap();
+    let password_hash: String =
+        sqlx::query_scalar("SELECT password_hash FROM auth.user_account WHERE user_id = $1")
+            .bind(user_id)
+            .fetch_one(&world.pool)
+            .await
+            .unwrap();
+    let stamp = password_stamp(&password_hash);
     let claims = |exp: i64, email: &str, purpose: Purpose| LinkClaims {
         sub: user_id,
         purpose,
         exp,
         email: Some(email.to_owned()),
-        pw: None,
+        pw: Some(stamp.clone()),
     };
     let far = i64::MAX;
     let cases = [
@@ -2356,6 +2609,20 @@ async fn forged_expired_and_mismatched_links_are_refused() {
         ),
         (
             signer.sign(&claims(far, "alice@example.com", Purpose::Register)),
+            AuthError::LinkInvalid,
+        ),
+        (
+            signer.sign(&LinkClaims {
+                pw: None,
+                ..claims(far, "alice@example.com", Purpose::Verify)
+            }),
+            AuthError::LinkInvalid,
+        ),
+        (
+            signer.sign(&LinkClaims {
+                pw: Some(password_stamp("another hash")),
+                ..claims(far, "alice@example.com", Purpose::Verify)
+            }),
             AuthError::LinkInvalid,
         ),
         (
@@ -2536,6 +2803,101 @@ async fn new_ids_are_time_ordered() {
         .await
         .unwrap();
     assert_eq!(user_id.get_version_num(), 7);
+}
+
+#[tokio::test]
+async fn a_reset_also_verifies_the_email() {
+    let world = world().await;
+    world
+        .auth
+        .signup(signup("alice@example.com", "alice"))
+        .await
+        .unwrap();
+    let verify_link = last_link_token(&world.pool, "alice@example.com").await;
+    world
+        .auth
+        .forgot_password("alice@example.com")
+        .await
+        .unwrap();
+    let reset = last_link_token(&world.pool, "alice@example.com").await;
+    world
+        .auth
+        .reset_password(&reset, "battery staple")
+        .await
+        .unwrap();
+    world
+        .auth
+        .login("alice@example.com", "battery staple")
+        .await
+        .unwrap();
+    let kinds: Vec<String> = outbox(&world.pool)
+        .await
+        .into_iter()
+        .map(|(kind, _)| kind)
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            "email.send",
+            "email.send",
+            "user.verified",
+            "user.password_reset"
+        ]
+    );
+    assert_eq!(
+        world.auth.verify_email(&verify_link).await,
+        Err(AuthError::LinkInvalid),
+        "the old verification link binds the old password"
+    );
+
+    // A second reset of the now verified account announces no second verification.
+    world
+        .auth
+        .forgot_password("alice@example.com")
+        .await
+        .unwrap();
+    let reset = last_link_token(&world.pool, "alice@example.com").await;
+    world
+        .auth
+        .reset_password(&reset, "correct horse")
+        .await
+        .unwrap();
+    let verified = outbox(&world.pool)
+        .await
+        .into_iter()
+        .filter(|(kind, _)| kind == "user.verified")
+        .count();
+    assert_eq!(verified, 1);
+}
+
+#[tokio::test]
+async fn a_login_flood_fails_fast_with_a_retryable_error() {
+    let world = world().await;
+    let narrow = Auth::new(
+        world.pool.clone(),
+        Settings {
+            hash_concurrency: 1,
+            hash_queue: 0,
+            hash_wait: Duration::from_millis(50),
+            ..settings(Passwords::owasp())
+        },
+    );
+    let attempts: Vec<_> = (0..8)
+        .map(|_| {
+            let auth = narrow.clone();
+            tokio::spawn(async move { auth.login("nobody@example.com", "correct horse").await })
+        })
+        .collect();
+    let mut busy = 0;
+    for attempt in attempts {
+        match attempt.await.unwrap() {
+            Err(AuthError::InvalidCredentials) => {}
+            Err(AuthError::Unavailable) => busy += 1,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    assert!((1..8).contains(&busy), "{busy} of 8 refused");
+    assert!(AuthError::Unavailable.retryable());
 }
 ```
 
@@ -2831,27 +3193,31 @@ mod tests {
 
 - [ ] **Step 5: The account operations**
 
-Create `crates/push-auth/src/service.rs`. Note the `::citext` casts (decision 18) and that
-`signup` hashes before it looks at the email (decision 6):
+Create `crates/push-auth/src/service.rs`. Note the `::citext` casts (decision 18); that
+`signup` hashes before it looks at the email and takes an unverified account over in one
+upsert (decision 6); that `verify_email`, `login` and `reset_password` sign or check `pw`
+(decision 3); that `reset_password` also verifies the email (decision 8); and that hashing
+passes the `HashGate` (`Settings::hash_queue`, `hash_wait`; decision 13):
 
 ```rust
 //! The auth operations (spec §5.1–§5.4), over the `auth` schema.
 //!
 //! Every change and the outbox event announcing it commit in one transaction. Password
-//! hashing runs on blocking threads, at most `hash_concurrency` at a time, because each
-//! hash takes tens of milliseconds and 19 MiB of memory.
+//! hashing runs on blocking threads behind a [`HashGate`]: at most `hash_concurrency`
+//! at a time, because each hash takes tens of milliseconds and 19 MiB of memory, and at
+//! most `hash_queue` waiting, each for at most `hash_wait`, so a flood fails fast with a
+//! retryable `unavailable`.
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sqlx::{PgPool, Row};
-use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 use crate::error::AuthError;
 use crate::links::{LinkClaims, LinkError, LinkSigner, Purpose, password_stamp};
 use crate::outbox::{self, Email, Event, LINK_MINUTES};
-use crate::password::{Checked, Passwords};
+use crate::password::{Checked, HashGate, Passwords};
 use crate::rules;
 use crate::tokens::AccessTokens;
 
@@ -2871,6 +3237,10 @@ pub struct Settings {
     pub tokens: AccessTokens,
     /// Most password hashes computed at once.
     pub hash_concurrency: usize,
+    /// Most requests waiting for a hash slot; more are refused at once.
+    pub hash_queue: usize,
+    /// Longest wait for a hash slot.
+    pub hash_wait: Duration,
 }
 
 /// A new account.
@@ -2894,7 +3264,7 @@ pub struct RegistrationToken {
 pub struct Auth {
     pub(crate) pool: PgPool,
     passwords: Arc<Passwords>,
-    hashing: Arc<Semaphore>,
+    hashing: Arc<HashGate>,
     pub(crate) links: LinkSigner,
     pub(crate) tokens: AccessTokens,
     public_url: String,
@@ -2923,7 +3293,11 @@ impl Auth {
         Self {
             pool,
             passwords: Arc::new(settings.passwords),
-            hashing: Arc::new(Semaphore::new(settings.hash_concurrency.max(1))),
+            hashing: Arc::new(HashGate::new(
+                settings.hash_concurrency,
+                settings.hash_queue,
+                settings.hash_wait,
+            )),
             links: settings.links,
             tokens: settings.tokens,
             public_url: settings.public_url.trim_end_matches('/').to_owned(),
@@ -2943,7 +3317,7 @@ impl Auth {
     async fn hash(&self, password: String) -> Result<String, AuthError> {
         let _permit = self
             .hashing
-            .acquire()
+            .enter()
             .await
             .map_err(|_| AuthError::Unavailable)?;
         let passwords = Arc::clone(&self.passwords);
@@ -2961,7 +3335,7 @@ impl Auth {
     ) -> Result<Checked, AuthError> {
         let _permit = self
             .hashing
-            .acquire()
+            .enter()
             .await
             .map_err(|_| AuthError::Unavailable)?;
         let passwords = Arc::clone(&self.passwords);
@@ -2976,22 +3350,27 @@ impl Auth {
         .map_err(|_| AuthError::Unavailable)
     }
 
-    fn verify_link(&self, user_id: Uuid, email: &str) -> String {
+    fn verify_link(&self, user_id: Uuid, email: &str, password_hash: &str) -> String {
         let token = self.links.sign(&LinkClaims {
             sub: user_id,
             purpose: Purpose::Verify,
             exp: unix_now() + LINK_SECONDS,
             email: Some(email.to_owned()),
-            pw: None,
+            pw: Some(password_stamp(password_hash)),
         });
         format!("{}/v1/auth/verify?token={token}", self.public_url)
     }
 
     /// Creates an unverified account and writes its verification email to the outbox
     /// (spec §5.2). The answer is the same, in the same time, whether or not the email
-    /// has an account: an existing unverified account gets a new verification email, a
-    /// verified one an "account exists" email, and neither changes. Only a taken handle,
-    /// which is public anyway, is reported.
+    /// has an account. An existing unverified account starts over: the new password,
+    /// handle and display name replace the old ones and a new link is sent, which the
+    /// links sent before cannot outlive (they bind the old password hash) — otherwise
+    /// whoever signed up first with someone else's address would own the account that
+    /// person verifies. A verified account changes nothing and gets an "account exists"
+    /// email. A handle held by any account, this email's own included, is reported as
+    /// taken (handles are public through lookup anyway), so that answer never depends on
+    /// the email either.
     pub async fn signup(&self, signup: Signup) -> Result<(), AuthError> {
         let email = rules::email(&signup.email)?;
         let handle = rules::handle(&signup.handle)?;
@@ -3010,54 +3389,60 @@ impl Auth {
         if taken {
             return Err(AuthError::HandleTaken);
         }
-        let user_id = Uuid::now_v7();
-        let inserted = sqlx::query(
+        // One statement for a new account and for a new start of an unverified one, so
+        // concurrent signups for one address cannot both insert. A verified account does
+        // not match the WHERE, and no row comes back.
+        let upserted = sqlx::query(
             "INSERT INTO auth.user_account (user_id, email, handle, display_name, password_hash) \
-             VALUES ($1, $2, $3, $4, $5) ON CONFLICT (email) DO NOTHING RETURNING user_id",
+             VALUES ($1, $2, $3, $4, $5) \
+             ON CONFLICT (email) DO UPDATE SET handle = EXCLUDED.handle, \
+             display_name = EXCLUDED.display_name, password_hash = EXCLUDED.password_hash \
+             WHERE auth.user_account.email_verified_at IS NULL \
+             RETURNING user_id, email::text",
         )
-        .bind(user_id)
+        .bind(Uuid::now_v7())
         .bind(&email)
         .bind(&handle)
         .bind(&display_name)
         .bind(&password_hash)
         .fetch_optional(&mut *tx)
         .await;
-        let inserted = match inserted {
-            Ok(row) => row.is_some(),
+        let upserted = match upserted {
+            Ok(row) => row,
             Err(error) if is_violation(&error, "user_account_handle_key") => {
                 return Err(AuthError::HandleTaken);
             }
             Err(error) => return Err(error.into()),
         };
-        let event = if inserted {
-            Event::EmailSend {
-                user_id,
-                to: email.clone(),
-                email: Email::VerifyEmail {
-                    link: self.verify_link(user_id, &email),
-                    handle,
-                },
-            }
-        } else {
-            let existing = sqlx::query(
-                "SELECT user_id, email::text, handle::text, email_verified_at IS NOT NULL \
-                 FROM auth.user_account WHERE email = $1::citext",
-            )
-            .bind(&email)
-            .fetch_one(&mut *tx)
-            .await?;
-            let user_id: Uuid = existing.get(0);
-            let to: String = existing.get(1);
-            let handle: String = existing.get(2);
-            let email = if existing.get::<bool, _>(3) {
-                Email::AccountExists { handle }
-            } else {
-                Email::VerifyEmail {
-                    link: self.verify_link(user_id, &to),
-                    handle,
+        let event = match upserted {
+            Some(account) => {
+                let user_id: Uuid = account.get(0);
+                let to: String = account.get(1);
+                Event::EmailSend {
+                    user_id,
+                    email: Email::VerifyEmail {
+                        link: self.verify_link(user_id, &to, &password_hash),
+                        handle,
+                    },
+                    to,
                 }
-            };
-            Event::EmailSend { user_id, to, email }
+            }
+            None => {
+                let existing = sqlx::query(
+                    "SELECT user_id, email::text, handle::text \
+                     FROM auth.user_account WHERE email = $1::citext",
+                )
+                .bind(&email)
+                .fetch_one(&mut *tx)
+                .await?;
+                Event::EmailSend {
+                    user_id: existing.get(0),
+                    to: existing.get(1),
+                    email: Email::AccountExists {
+                        handle: existing.get(2),
+                    },
+                }
+            }
         };
         outbox::write(&mut tx, &event).await?;
         tx.commit().await?;
@@ -3071,41 +3456,44 @@ impl Auth {
             .links
             .verify(token, Purpose::Verify, unix_now())
             .map_err(link_error)?;
-        let email = claims.email.ok_or(AuthError::LinkInvalid)?;
+        let (Some(email), Some(stamp)) = (claims.email, claims.pw) else {
+            return Err(AuthError::LinkInvalid);
+        };
         let mut tx = self.pool.begin().await?;
-        // The link binds the address it was sent to: a link for an old address of the
-        // account (after a future email change) verifies nothing.
-        let verified = sqlx::query(
-            "UPDATE auth.user_account SET email_verified_at = now() \
-             WHERE user_id = $1 AND email = $2::citext AND email_verified_at IS NULL RETURNING user_id",
+        // The link binds the address it was sent to and the password hash of that moment:
+        // a link for an old address of the account (after a future email change), or one
+        // sent before a new signup replaced the password, verifies nothing.
+        let account = sqlx::query(
+            "SELECT password_hash, email_verified_at IS NOT NULL FROM auth.user_account \
+             WHERE user_id = $1 AND email = $2::citext FOR UPDATE",
         )
         .bind(claims.sub)
         .bind(&email)
         .fetch_optional(&mut *tx)
         .await?;
-        if verified.is_some() {
-            outbox::write(
-                &mut tx,
-                &Event::UserVerified {
-                    user_id: claims.sub,
-                },
-            )
-            .await?;
-            tx.commit().await?;
+        let Some(account) = account else {
+            return Err(AuthError::LinkInvalid);
+        };
+        let password_hash: String = account.get(0);
+        if password_stamp(&password_hash) != stamp {
+            return Err(AuthError::LinkInvalid);
+        }
+        if account.get::<bool, _>(1) {
             return Ok(());
         }
-        let exists: bool = sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM auth.user_account WHERE user_id = $1 AND email = $2::citext)",
+        sqlx::query("UPDATE auth.user_account SET email_verified_at = now() WHERE user_id = $1")
+            .bind(claims.sub)
+            .execute(&mut *tx)
+            .await?;
+        outbox::write(
+            &mut tx,
+            &Event::UserVerified {
+                user_id: claims.sub,
+            },
         )
-        .bind(claims.sub)
-        .bind(&email)
-        .fetch_one(&mut *tx)
         .await?;
-        if exists {
-            Ok(())
-        } else {
-            Err(AuthError::LinkInvalid)
-        }
+        tx.commit().await?;
+        Ok(())
     }
 
     /// Sends the verification email again if `email` has an unverified account. The
@@ -3114,7 +3502,7 @@ impl Auth {
         let email = rules::email(email)?;
         let mut tx = self.pool.begin().await?;
         let account = sqlx::query(
-            "SELECT user_id, email::text, handle::text FROM auth.user_account \
+            "SELECT user_id, email::text, handle::text, password_hash FROM auth.user_account \
              WHERE email = $1::citext AND email_verified_at IS NULL",
         )
         .bind(&email)
@@ -3123,10 +3511,11 @@ impl Auth {
         if let Some(account) = account {
             let user_id: Uuid = account.get(0);
             let to: String = account.get(1);
+            let password_hash: String = account.get(3);
             let event = Event::EmailSend {
                 user_id,
                 email: Email::VerifyEmail {
-                    link: self.verify_link(user_id, &to),
+                    link: self.verify_link(user_id, &to, &password_hash),
                     handle: account.get(2),
                 },
                 to,
@@ -3137,10 +3526,15 @@ impl Auth {
         Ok(())
     }
 
-    /// Checks an email and password; the account's id if they match and the email is
-    /// verified. An unknown email and a wrong password are the same error and take the
-    /// same time. A hash made with outdated parameters is replaced.
-    pub(crate) async fn sign_in(&self, email: &str, password: &str) -> Result<Uuid, AuthError> {
+    /// Checks an email and password; the account's id and current password hash if they
+    /// match and the email is verified. An unknown email and a wrong password are the
+    /// same error and take the same time. A hash made with outdated parameters is
+    /// replaced.
+    pub(crate) async fn sign_in(
+        &self,
+        email: &str,
+        password: &str,
+    ) -> Result<(Uuid, String), AuthError> {
         let Ok(email) = rules::email(email) else {
             return Err(AuthError::InvalidCredentials);
         };
@@ -3160,35 +3554,40 @@ impl Auth {
             return Err(AuthError::InvalidCredentials);
         };
         let user_id: Uuid = account.get(0);
+        let mut current = stored;
         if rehash {
             let new_hash = self.hash(password.to_owned()).await?;
             // Only if the password did not change meanwhile.
-            sqlx::query(
+            let replaced = sqlx::query(
                 "UPDATE auth.user_account SET password_hash = $3 \
                  WHERE user_id = $1 AND password_hash = $2",
             )
             .bind(user_id)
-            .bind(&stored)
+            .bind(&current)
             .bind(&new_hash)
             .execute(&self.pool)
             .await?;
+            if replaced.rows_affected() == 1 {
+                current = new_hash;
+            }
         }
         if !account.get::<bool, _>(2) {
             return Err(AuthError::EmailNotVerified);
         }
-        Ok(user_id)
+        Ok((user_id, current))
     }
 
     /// `POST /v1/auth/login {email, password}`: a registration token, which can only
-    /// register a device (spec §5.3).
+    /// register a device (spec §5.3). It binds the password hash, so a password reset
+    /// makes it worthless.
     pub async fn login(&self, email: &str, password: &str) -> Result<RegistrationToken, AuthError> {
-        let user_id = self.sign_in(email, password).await?;
+        let (user_id, password_hash) = self.sign_in(email, password).await?;
         let token = self.links.sign(&LinkClaims {
             sub: user_id,
             purpose: Purpose::Register,
             exp: unix_now() + REGISTRATION_TOKEN_SECONDS,
             email: None,
-            pw: None,
+            pw: Some(password_stamp(&password_hash)),
         });
         Ok(RegistrationToken {
             token,
@@ -3231,7 +3630,9 @@ impl Auth {
 
     /// Opens a reset link: sets the new password, revokes every refresh token of the
     /// account and writes `user.password_reset`, on which every device is kicked
-    /// (spec §5.4). Setting the password changes the stamp, so the link works once.
+    /// (spec §5.4). Setting the password changes the stamp, so the link works once. The
+    /// link reached the address, so the email counts as verified from now on; if it was
+    /// not, `user.verified` is written too.
     pub async fn reset_password(&self, token: &str, password: &str) -> Result<(), AuthError> {
         let claims = self
             .links
@@ -3240,23 +3641,28 @@ impl Auth {
         rules::password(password)?;
         let new_hash = self.hash(password.to_owned()).await?;
         let mut tx = self.pool.begin().await?;
-        let current: Option<String> = sqlx::query_scalar(
-            "SELECT password_hash FROM auth.user_account WHERE user_id = $1 FOR UPDATE",
+        let account = sqlx::query(
+            "SELECT password_hash, email_verified_at IS NULL FROM auth.user_account \
+             WHERE user_id = $1 FOR UPDATE",
         )
         .bind(claims.sub)
         .fetch_optional(&mut *tx)
         .await?;
-        let Some(current) = current else {
+        let Some(account) = account else {
             return Err(AuthError::LinkInvalid);
         };
+        let current: String = account.get(0);
         if claims.pw.as_deref() != Some(password_stamp(&current).as_str()) {
             return Err(AuthError::LinkInvalid);
         }
-        sqlx::query("UPDATE auth.user_account SET password_hash = $2 WHERE user_id = $1")
-            .bind(claims.sub)
-            .bind(&new_hash)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(
+            "UPDATE auth.user_account SET password_hash = $2, \
+             email_verified_at = coalesce(email_verified_at, now()) WHERE user_id = $1",
+        )
+        .bind(claims.sub)
+        .bind(&new_hash)
+        .execute(&mut *tx)
+        .await?;
         sqlx::query(
             "UPDATE auth.refresh_token SET revoked_at = now() WHERE revoked_at IS NULL \
              AND device_id IN (SELECT device_id FROM auth.device WHERE user_id = $1)",
@@ -3264,6 +3670,15 @@ impl Auth {
         .bind(claims.sub)
         .execute(&mut *tx)
         .await?;
+        if account.get::<bool, _>(1) {
+            outbox::write(
+                &mut tx,
+                &Event::UserVerified {
+                    user_id: claims.sub,
+                },
+            )
+            .await?;
+        }
         outbox::write(
             &mut tx,
             &Event::UserPasswordReset {
@@ -3316,8 +3731,8 @@ pub use service::{
 cargo test -p push-auth
 ```
 
-Expected: `test result: ok. 24 passed` (lib) and `test result: ok. 10 passed` for
-`tests\accounts.rs`, plus the 3 schema tests.
+Expected: `test result: ok. 26 passed` (lib) and `test result: ok. 12 passed` for
+`tests\accounts.rs`, plus the 4 schema tests.
 
 - [ ] **Step 7: Run the gates and commit**
 
@@ -3330,7 +3745,7 @@ git add Cargo.toml Cargo.lock crates/push-auth
 git commit -m "feat(auth): signup, email verification, login and password reset with the outbox"
 ```
 
-Expected: 653 tests pass.
+Expected: 658 tests pass.
 
 ---
 
@@ -3369,7 +3784,7 @@ serde_json.workspace = true
 sha2.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["rt"] }
+tokio = { workspace = true, features = ["rt", "time"] }
 tracing.workspace = true
 uuid.workspace = true
 
@@ -3384,18 +3799,27 @@ workspace = true
 - [ ] **Step 2: Write the failing tests**
 
 `the_device_limit_holds_under_concurrent_registrations` starts 13 registrations at once
-and expects exactly 10 to succeed. Create `crates/push-auth/tests/devices.rs`:
+and expects exactly 10 to succeed. The refresh tests cover the grace window (decision 5):
+a retry within it gets a new pair and cuts the other branch off, reuse after it or of an
+older token revokes the device, and five concurrent refreshes with one token leave exactly
+one live branch (`after_the_grace_window` moves `rotated_at` back 31 s instead of
+sleeping). `a_retried_registration_returns_the_same_device` covers decision 14, and
+`a_password_reset_makes_a_registration_token_worthless` review finding B. Create
+`crates/push-auth/tests/devices.rs`:
 
 ```rust
 //! Devices, tokens and profiles on a real PostgreSQL (Docker must be running). Each test
 //! starts a container of its own; they run in parallel.
 
 use std::sync::Arc;
+use std::time::Duration;
 
-use push_auth::links::{LinkClaims, LinkSigner, Purpose};
+use push_auth::links::{LinkClaims, LinkSigner, Purpose, password_stamp};
 use push_auth::password::Passwords;
 use push_auth::tokens::{AccessTokens, refresh_hash};
-use push_auth::{Auth, AuthError, Caller, MAX_ACTIVE_DEVICES, Settings, Signup, migrate_database};
+use push_auth::{
+    Auth, AuthError, Caller, MAX_ACTIVE_DEVICES, REFRESH_GRACE, Settings, Signup, migrate_database,
+};
 use serde_json::Value;
 use sqlx::PgPool;
 use testcontainers_modules::postgres::Postgres;
@@ -3431,6 +3855,8 @@ async fn world() -> World {
             links: LinkSigner::new(LINK_KEY.to_vec()).unwrap(),
             tokens: AccessTokens::from_seed(&[5; 32], AUDIENCE).unwrap(),
             hash_concurrency: 4,
+            hash_queue: 64,
+            hash_wait: Duration::from_secs(5),
         },
     );
     World {
@@ -3491,7 +3917,7 @@ async fn a_registered_device_gets_tokens_and_is_announced() {
     let registration = verified(&world, "alice").await;
     let tokens = world
         .auth
-        .register_device(&registration, "Alice's phone", "ios")
+        .register_device(&registration, Uuid::now_v7(), "Alice's phone", "ios")
         .await
         .unwrap();
     assert_eq!(tokens.access_expires_in_s, 900);
@@ -3536,7 +3962,7 @@ async fn each_token_does_only_its_own_job() {
     let registration = verified(&world, "alice").await;
     let tokens = world
         .auth
-        .register_device(&registration, "Phone", "android")
+        .register_device(&registration, Uuid::now_v7(), "Phone", "android")
         .await
         .unwrap();
     let signer = LinkSigner::new(LINK_KEY.to_vec()).unwrap();
@@ -3554,9 +3980,19 @@ async fn each_token_does_only_its_own_job() {
         email: Some("alice@example.com".to_owned()),
         pw: None,
     });
-    for token in [&tokens.access_token, &expired, &verify_link] {
+    let unstamped = signer.sign(&LinkClaims {
+        sub: tokens.user_id,
+        purpose: Purpose::Register,
+        exp: i64::MAX,
+        email: None,
+        pw: None,
+    });
+    for token in [&tokens.access_token, &expired, &verify_link, &unstamped] {
         assert_eq!(
-            world.auth.register_device(token, "Phone", "web").await,
+            world
+                .auth
+                .register_device(token, Uuid::now_v7(), "Phone", "web")
+                .await,
             Err(AuthError::Unauthorized)
         );
     }
@@ -3577,7 +4013,7 @@ async fn each_token_does_only_its_own_job() {
     assert!(matches!(
         world
             .auth
-            .register_device(&registration, "Phone", "toaster")
+            .register_device(&registration, Uuid::now_v7(), "Phone", "toaster")
             .await,
         Err(AuthError::Invalid(_))
     ));
@@ -3591,8 +4027,13 @@ async fn the_device_limit_holds_under_concurrent_registrations() {
     let attempts = (0..MAX_ACTIVE_DEVICES + 3).map(|index| {
         let (auth, registration) = (Arc::clone(&auth), Arc::clone(&registration));
         tokio::spawn(async move {
-            auth.register_device(&registration, &format!("Device {index}"), "other")
-                .await
+            auth.register_device(
+                &registration,
+                Uuid::now_v7(),
+                &format!("Device {index}"),
+                "other",
+            )
+            .await
         })
     });
     let mut registered = Vec::new();
@@ -3616,25 +4057,36 @@ async fn the_device_limit_holds_under_concurrent_registrations() {
         .unwrap();
     world
         .auth
-        .register_device(&registration, "Replacement", "web")
+        .register_device(&registration, Uuid::now_v7(), "Replacement", "web")
         .await
         .unwrap();
     assert_eq!(
         world
             .auth
-            .register_device(&registration, "One too many", "web")
+            .register_device(&registration, Uuid::now_v7(), "One too many", "web")
             .await,
         Err(AuthError::TooManyDevices)
     );
 }
 
+/// Moves every rotation back past the grace window, as if the time had passed.
+async fn after_the_grace_window(pool: &PgPool) {
+    sqlx::query(
+        "UPDATE auth.refresh_token SET rotated_at = rotated_at - make_interval(secs => $1)",
+    )
+    .bind((REFRESH_GRACE.as_secs() + 1) as f64)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
 #[tokio::test]
-async fn refreshing_rotates_and_reuse_revokes_the_device_tokens() {
+async fn refreshing_rotates_and_reuse_after_the_grace_window_revokes_the_device_tokens() {
     let world = world().await;
     let registration = verified(&world, "alice").await;
     let first = world
         .auth
-        .register_device(&registration, "Phone", "ios")
+        .register_device(&registration, Uuid::now_v7(), "Phone", "ios")
         .await
         .unwrap();
     let second = world.auth.refresh(&first.refresh_token).await.unwrap();
@@ -3643,7 +4095,8 @@ async fn refreshing_rotates_and_reuse_revokes_the_device_tokens() {
     assert_ne!(second.access_token, first.access_token);
     world.auth.authenticate(&second.access_token).await.unwrap();
 
-    // The first token was rotated: using it again revokes the whole device session.
+    // The first token was rotated 31 s ago: using it again revokes the whole session.
+    after_the_grace_window(&world.pool).await;
     assert_eq!(
         world.auth.refresh(&first.refresh_token).await,
         Err(AuthError::Unauthorized)
@@ -3666,18 +4119,73 @@ async fn refreshing_rotates_and_reuse_revokes_the_device_tokens() {
 }
 
 #[tokio::test]
+async fn a_lost_refresh_answer_can_be_retried_within_the_grace_window() {
+    let world = world().await;
+    let registration = verified(&world, "alice").await;
+    let first = world
+        .auth
+        .register_device(&registration, Uuid::now_v7(), "Phone", "ios")
+        .await
+        .unwrap();
+    // The answer with `lost` never reaches the client, which retries with `first`.
+    let lost = world.auth.refresh(&first.refresh_token).await.unwrap();
+    let retried = world.auth.refresh(&first.refresh_token).await.unwrap();
+    assert_eq!(retried.device_id, first.device_id);
+    assert_ne!(retried.refresh_token, lost.refresh_token);
+    world
+        .auth
+        .authenticate(&retried.access_token)
+        .await
+        .unwrap();
+    // The branch that lives goes on as usual.
+    let next = world.auth.refresh(&retried.refresh_token).await.unwrap();
+    // The cut-off branch is reuse: the device's tokens are revoked, the live branch too.
+    assert_eq!(
+        world.auth.refresh(&lost.refresh_token).await,
+        Err(AuthError::Unauthorized)
+    );
+    assert_eq!(
+        world.auth.refresh(&next.refresh_token).await,
+        Err(AuthError::Unauthorized)
+    );
+}
+
+#[tokio::test]
+async fn an_older_token_is_reuse_even_within_the_grace_window() {
+    let world = world().await;
+    let registration = verified(&world, "alice").await;
+    let first = world
+        .auth
+        .register_device(&registration, Uuid::now_v7(), "Phone", "ios")
+        .await
+        .unwrap();
+    let second = world.auth.refresh(&first.refresh_token).await.unwrap();
+    let third = world.auth.refresh(&second.refresh_token).await.unwrap();
+    // `first` was rotated a moment ago, but `second` is not the live token any more.
+    assert_eq!(
+        world.auth.refresh(&first.refresh_token).await,
+        Err(AuthError::Unauthorized)
+    );
+    assert_eq!(
+        world.auth.refresh(&third.refresh_token).await,
+        Err(AuthError::Unauthorized),
+        "the device's tokens are revoked"
+    );
+}
+
+#[tokio::test]
 async fn signing_in_on_a_device_replaces_its_session_and_needs_an_active_own_device() {
     let world = world().await;
     let alice = verified(&world, "alice").await;
     let bob = verified(&world, "bob").await;
     let phone = world
         .auth
-        .register_device(&alice, "Phone", "ios")
+        .register_device(&alice, Uuid::now_v7(), "Phone", "ios")
         .await
         .unwrap();
     let bobs = world
         .auth
-        .register_device(&bob, "Laptop", "desktop")
+        .register_device(&bob, Uuid::now_v7(), "Laptop", "desktop")
         .await
         .unwrap();
 
@@ -3727,17 +4235,17 @@ async fn revoking_a_device_ends_its_tokens_and_is_announced() {
     let bob = verified(&world, "bob").await;
     let phone = world
         .auth
-        .register_device(&alice, "Phone", "ios")
+        .register_device(&alice, Uuid::now_v7(), "Phone", "ios")
         .await
         .unwrap();
     let laptop = world
         .auth
-        .register_device(&alice, "Laptop", "desktop")
+        .register_device(&alice, Uuid::now_v7(), "Laptop", "desktop")
         .await
         .unwrap();
     let bobs = world
         .auth
-        .register_device(&bob, "Phone", "android")
+        .register_device(&bob, Uuid::now_v7(), "Phone", "android")
         .await
         .unwrap();
 
@@ -3790,7 +4298,7 @@ async fn a_password_reset_revokes_every_refresh_token() {
     let alice = verified(&world, "alice").await;
     let phone = world
         .auth
-        .register_device(&alice, "Phone", "ios")
+        .register_device(&alice, Uuid::now_v7(), "Phone", "ios")
         .await
         .unwrap();
     world
@@ -3818,7 +4326,7 @@ async fn profiles_show_handles_and_only_the_owner_sees_the_email() {
     let alice = verified(&world, "alice").await;
     let phone = world
         .auth
-        .register_device(&alice, "Phone", "ios")
+        .register_device(&alice, Uuid::now_v7(), "Phone", "ios")
         .await
         .unwrap();
     let own = world.auth.own_profile(caller(&phone)).await.unwrap();
@@ -3864,6 +4372,164 @@ async fn profiles_show_handles_and_only_the_owner_sees_the_email() {
         Err(AuthError::Invalid(_))
     ));
 }
+
+#[tokio::test]
+async fn concurrent_refreshes_with_one_token_leave_exactly_one_live_branch() {
+    let world = world().await;
+    let registration = verified(&world, "alice").await;
+    let first = world
+        .auth
+        .register_device(&registration, Uuid::now_v7(), "Phone", "ios")
+        .await
+        .unwrap();
+    let auth = Arc::new(world.auth.clone());
+    let attempts: Vec<_> = (0..5)
+        .map(|_| {
+            let (auth, token) = (Arc::clone(&auth), first.refresh_token.clone());
+            tokio::spawn(async move { auth.refresh(&token).await })
+        })
+        .collect();
+    let mut issued = Vec::new();
+    for attempt in attempts {
+        issued.push(attempt.await.unwrap().unwrap().refresh_token);
+    }
+    let live: Vec<Vec<u8>> = sqlx::query_scalar(
+        "SELECT token_hash FROM auth.refresh_token \
+         WHERE rotated_to IS NULL AND revoked_at IS NULL",
+    )
+    .fetch_all(&world.pool)
+    .await
+    .unwrap();
+    assert_eq!(live.len(), 1, "one branch lives");
+    assert!(
+        issued
+            .iter()
+            .any(|token| refresh_hash(token).as_slice() == live[0].as_slice())
+    );
+}
+
+#[tokio::test]
+async fn a_retried_registration_returns_the_same_device() {
+    let world = world().await;
+    let registration = verified(&world, "alice").await;
+    let key = Uuid::now_v7();
+    let first = world
+        .auth
+        .register_device(&registration, key, "Phone", "ios")
+        .await
+        .unwrap();
+    let retried = world
+        .auth
+        .register_device(&registration, key, "Phone", "ios")
+        .await
+        .unwrap();
+    assert_eq!(retried.device_id, first.device_id);
+    assert_ne!(retried.refresh_token, first.refresh_token);
+    assert_eq!(
+        world.auth.refresh(&first.refresh_token).await,
+        Err(AuthError::Unauthorized),
+        "the lost answer's tokens are revoked"
+    );
+    let announced = outbox(&world.pool)
+        .await
+        .into_iter()
+        .filter(|(kind, _)| kind == "device.registered")
+        .count();
+    assert_eq!(announced, 1);
+
+    // At the limit a retry still answers, and a new registration does not.
+    for index in 1..MAX_ACTIVE_DEVICES {
+        world
+            .auth
+            .register_device(
+                &registration,
+                Uuid::now_v7(),
+                &format!("Device {index}"),
+                "web",
+            )
+            .await
+            .unwrap();
+    }
+    let at_limit = world
+        .auth
+        .register_device(&registration, key, "Phone", "ios")
+        .await
+        .unwrap();
+    assert_eq!(at_limit.device_id, first.device_id);
+    assert_eq!(
+        world
+            .auth
+            .register_device(&registration, Uuid::now_v7(), "One too many", "web")
+            .await,
+        Err(AuthError::TooManyDevices)
+    );
+
+    // The key belongs to this user only, and a revoked device's key stays spent.
+    let bob = verified(&world, "bob").await;
+    let bobs = world
+        .auth
+        .register_device(&bob, key, "Phone", "ios")
+        .await
+        .unwrap();
+    assert_ne!(bobs.device_id, first.device_id);
+    world
+        .auth
+        .revoke_device(caller(&at_limit), first.device_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        world
+            .auth
+            .register_device(&registration, key, "Phone", "ios")
+            .await,
+        Err(AuthError::DeviceNotFound)
+    );
+}
+
+#[tokio::test]
+async fn a_password_reset_makes_a_registration_token_worthless() {
+    let world = world().await;
+    let registration = verified(&world, "alice").await;
+    world
+        .auth
+        .forgot_password("alice@example.com")
+        .await
+        .unwrap();
+    let (_, payload) = outbox(&world.pool).await.pop().unwrap();
+    let link = payload["params"]["link"].as_str().unwrap();
+    let token = link.split_once("?token=").unwrap().1;
+    world
+        .auth
+        .reset_password(token, "battery staple")
+        .await
+        .unwrap();
+    assert_eq!(
+        world
+            .auth
+            .register_device(&registration, Uuid::now_v7(), "Phone", "ios")
+            .await,
+        Err(AuthError::Unauthorized)
+    );
+    let fresh = world
+        .auth
+        .login("alice@example.com", "battery staple")
+        .await
+        .unwrap();
+    let claims = LinkSigner::new(LINK_KEY.to_vec())
+        .unwrap()
+        .verify(&fresh.token, Purpose::Register, 0)
+        .unwrap();
+    let password_hash: String = sqlx::query_scalar("SELECT password_hash FROM auth.user_account")
+        .fetch_one(&world.pool)
+        .await
+        .unwrap();
+    assert_eq!(claims.pw, Some(password_stamp(&password_hash)));
+    world
+        .auth
+        .register_device(&fresh.token, Uuid::now_v7(), "Phone", "ios")
+        .await
+        .unwrap();
+}
 ```
 
 ```powershell
@@ -3871,23 +4537,28 @@ cargo test -p push-auth --test devices
 ```
 
 Expected: a compile error — `unresolved imports push_auth::Caller,
-push_auth::MAX_ACTIVE_DEVICES`.
+push_auth::MAX_ACTIVE_DEVICES, push_auth::REFRESH_GRACE`.
 
 - [ ] **Step 3: Devices and tokens**
 
-Create `crates/push-auth/src/devices.rs`:
+`register_device` checks the token's `pw` against `password_hash` in the query that
+locks the account row, then looks for the `registration_id` before it counts devices;
+`refresh` takes the grace path only when the presented token's successor is live. Create
+`crates/push-auth/src/devices.rs`:
 
 ```rust
 //! Devices and sign-in tokens (spec §5.1, §5.3): registering a device with a registration
 //! token, signing in again on a known device, refreshing with rotation and reuse
 //! detection, listing and revoking devices, and checking access tokens.
 
+use std::time::Duration;
+
 use chrono::{DateTime, Utc};
 use sqlx::{PgConnection, Row};
 use uuid::Uuid;
 
 use crate::error::AuthError;
-use crate::links::Purpose;
+use crate::links::{Purpose, password_stamp};
 use crate::outbox::{self, Event};
 use crate::rules::{self, Platform};
 use crate::service::{Auth, unix_now};
@@ -3897,6 +4568,10 @@ use crate::tokens::{
 
 /// Most active devices per account (spec §5.3).
 pub const MAX_ACTIVE_DEVICES: i64 = 10;
+
+/// How long after its rotation the refresh token rotated last may be presented again
+/// (spec §5.3), for a client whose refresh answer was lost.
+pub const REFRESH_GRACE: Duration = Duration::from_secs(30);
 
 /// The sign-in credentials of one device.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3959,13 +4634,24 @@ impl Auth {
         })
     }
 
-    /// `POST /v1/devices {name, platform}` with a registration token: creates the device,
-    /// writes `device.registered` and returns its tokens. Refused when the account has
-    /// [`MAX_ACTIVE_DEVICES`] active devices; the account row is locked, so concurrent
-    /// registrations cannot pass the limit together.
+    /// `POST /v1/devices {name, platform, registration_id}` with a registration token:
+    /// creates the device, writes `device.registered` and returns its tokens.
+    ///
+    /// `registration_id` is the client's idempotency key for this registration, like
+    /// `client_msg_id` for a message. A retry with the same id for the same user finds
+    /// the device the first attempt created and returns new tokens for it, revoking the
+    /// earlier ones (their answer was lost), instead of creating a second device; it is
+    /// not counted against the limit, and announces nothing. The id of a revoked device
+    /// stays spent (`device_not_found`). A new id is refused when the account has
+    /// [`MAX_ACTIVE_DEVICES`] active devices. The account row is locked, so concurrent
+    /// registrations cannot pass the limit together and retries of one are serialised.
+    ///
+    /// The token binds the password hash of the sign-in that made it: after a password
+    /// reset it registers nothing.
     pub async fn register_device(
         &self,
         registration_token: &str,
+        registration_id: Uuid,
         name: &str,
         platform: &str,
     ) -> Result<Tokens, AuthError> {
@@ -3973,20 +4659,44 @@ impl Auth {
             .links
             .verify(registration_token, Purpose::Register, unix_now())
             .map_err(|_| AuthError::Unauthorized)?;
+        let stamp = claims.pw.ok_or(AuthError::Unauthorized)?;
         let name = rules::device_name(name)?;
         let platform = Platform::parse(platform)?;
         let mut tx = self.pool.begin().await?;
-        let verified: Option<bool> = sqlx::query_scalar(
-            "SELECT email_verified_at IS NOT NULL FROM auth.user_account \
+        let account = sqlx::query(
+            "SELECT password_hash, email_verified_at IS NOT NULL FROM auth.user_account \
              WHERE user_id = $1 FOR UPDATE",
         )
         .bind(claims.sub)
         .fetch_optional(&mut *tx)
         .await?;
-        match verified {
-            None => return Err(AuthError::Unauthorized),
-            Some(false) => return Err(AuthError::EmailNotVerified),
-            Some(true) => {}
+        let Some(account) = account else {
+            return Err(AuthError::Unauthorized);
+        };
+        let password_hash: String = account.get(0);
+        if password_stamp(&password_hash) != stamp {
+            return Err(AuthError::Unauthorized);
+        }
+        if !account.get::<bool, _>(1) {
+            return Err(AuthError::EmailNotVerified);
+        }
+        let earlier = sqlx::query(
+            "SELECT device_id, revoked_at IS NULL FROM auth.device \
+             WHERE user_id = $1 AND registration_id = $2",
+        )
+        .bind(claims.sub)
+        .bind(registration_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(earlier) = earlier {
+            let device_id: Uuid = earlier.get(0);
+            if !earlier.get::<bool, _>(1) {
+                return Err(AuthError::DeviceNotFound);
+            }
+            revoke_refresh_tokens(&mut tx, device_id).await?;
+            let tokens = self.issue(&mut tx, claims.sub, device_id).await?;
+            tx.commit().await?;
+            return Ok(tokens);
         }
         let active: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM auth.device WHERE user_id = $1 AND revoked_at IS NULL",
@@ -3999,12 +4709,14 @@ impl Auth {
         }
         let device_id = Uuid::now_v7();
         sqlx::query(
-            "INSERT INTO auth.device (device_id, user_id, name, platform) VALUES ($1, $2, $3, $4)",
+            "INSERT INTO auth.device (device_id, user_id, name, platform, registration_id) \
+             VALUES ($1, $2, $3, $4, $5)",
         )
         .bind(device_id)
         .bind(claims.sub)
         .bind(&name)
         .bind(platform.as_str())
+        .bind(registration_id)
         .execute(&mut *tx)
         .await?;
         let tokens = self.issue(&mut tx, claims.sub, device_id).await?;
@@ -4026,7 +4738,7 @@ impl Auth {
         password: &str,
         device_id: Uuid,
     ) -> Result<Tokens, AuthError> {
-        let user_id = self.sign_in(email, password).await?;
+        let (user_id, _) = self.sign_in(email, password).await?;
         let mut tx = self.pool.begin().await?;
         let active = sqlx::query(
             "SELECT 1 FROM auth.device WHERE device_id = $1 AND user_id = $2 \
@@ -4048,16 +4760,26 @@ impl Auth {
     /// `POST /v1/auth/refresh`: exchanges a refresh token for new tokens and retires it
     /// (rotation). Presenting a retired token again means it was copied: every refresh
     /// token of that device is revoked and the device must sign in again.
+    ///
+    /// One exception, for a client whose answer was lost: the token rotated last may be
+    /// presented again within [`REFRESH_GRACE`] of its rotation. It gets a new pair, and
+    /// the pair issued for it before is cut off — its refresh token counts as retired,
+    /// with no grace window of its own — so only one branch lives. The window is not
+    /// extended by such a retry. Presenting the token later, presenting an older one, or
+    /// presenting a cut-off one is reuse as above. The presented token's row is locked
+    /// first and its successor's second, so concurrent refreshes are serialised.
     pub async fn refresh(&self, refresh_token: &str) -> Result<Tokens, AuthError> {
         let hash = refresh_hash(refresh_token);
         let mut tx = self.pool.begin().await?;
         let row = sqlx::query(
-            "SELECT t.device_id, d.user_id, t.rotated_to IS NOT NULL, \
-             t.revoked_at IS NULL AND t.expires_at > now() AND d.revoked_at IS NULL \
+            "SELECT t.device_id, d.user_id, t.rotated_to, \
+             t.revoked_at IS NULL AND t.expires_at > now() AND d.revoked_at IS NULL, \
+             t.rotated_at > now() - make_interval(secs => $2) \
              FROM auth.refresh_token t JOIN auth.device d USING (device_id) \
              WHERE t.token_hash = $1 FOR UPDATE OF t",
         )
         .bind(hash.as_slice())
+        .bind(REFRESH_GRACE.as_secs() as f64)
         .fetch_optional(&mut *tx)
         .await?;
         let Some(row) = row else {
@@ -4065,19 +4787,53 @@ impl Auth {
         };
         let device_id: Uuid = row.get(0);
         let user_id: Uuid = row.get(1);
-        if row.get::<bool, _>(2) {
-            tracing::warn!(%device_id, "a rotated refresh token was used again; revoking the device's tokens");
+        let rotated_to: Option<Vec<u8>> = row.get(2);
+        if !row.get::<bool, _>(3) {
+            return Err(AuthError::Unauthorized);
+        }
+        let Some(successor) = rotated_to else {
+            let tokens = self.issue(&mut tx, user_id, device_id).await?;
+            sqlx::query(
+                "UPDATE auth.refresh_token SET rotated_to = $2, rotated_at = now() \
+                 WHERE token_hash = $1",
+            )
+            .bind(hash.as_slice())
+            .bind(refresh_hash(&tokens.refresh_token).as_slice())
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            return Ok(tokens);
+        };
+        let in_grace = row.get::<Option<bool>, _>(4) == Some(true);
+        let live_successor = in_grace
+            && sqlx::query(
+                "SELECT 1 FROM auth.refresh_token WHERE token_hash = $1 \
+                 AND rotated_to IS NULL AND revoked_at IS NULL AND expires_at > now() \
+                 FOR UPDATE",
+            )
+            .bind(&successor)
+            .fetch_optional(&mut *tx)
+            .await?
+            .is_some();
+        if !live_successor {
+            tracing::warn!(%device_id, "a retired refresh token was used again; revoking the device's tokens");
             revoke_refresh_tokens(&mut tx, device_id).await?;
             tx.commit().await?;
             return Err(AuthError::Unauthorized);
         }
-        if !row.get::<bool, _>(3) {
-            return Err(AuthError::Unauthorized);
-        }
         let tokens = self.issue(&mut tx, user_id, device_id).await?;
+        let new_hash = refresh_hash(&tokens.refresh_token);
+        sqlx::query(
+            "UPDATE auth.refresh_token SET rotated_to = $2, rotated_at = NULL \
+             WHERE token_hash = $1",
+        )
+        .bind(&successor)
+        .bind(new_hash.as_slice())
+        .execute(&mut *tx)
+        .await?;
         sqlx::query("UPDATE auth.refresh_token SET rotated_to = $2 WHERE token_hash = $1")
             .bind(hash.as_slice())
-            .bind(refresh_hash(&tokens.refresh_token).as_slice())
+            .bind(new_hash.as_slice())
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
@@ -4283,7 +5039,7 @@ mod service;
 pub mod tokens;
 
 pub use db::{MIGRATOR, migrate_database};
-pub use devices::{Caller, DeviceInfo, MAX_ACTIVE_DEVICES, Tokens};
+pub use devices::{Caller, DeviceInfo, MAX_ACTIVE_DEVICES, REFRESH_GRACE, Tokens};
 pub use error::AuthError;
 pub use profiles::{OwnProfile, PublicProfile};
 pub use service::{
@@ -4297,7 +5053,7 @@ pub use service::{
 cargo test -p push-auth --test devices
 ```
 
-Expected: `test result: ok. 8 passed`.
+Expected: `test result: ok. 13 passed`.
 
 - [ ] **Step 6: Run the gates and commit**
 
@@ -4310,7 +5066,7 @@ git add Cargo.lock crates/push-auth
 git commit -m "feat(auth): device registration, token rotation, revocation and profiles"
 ```
 
-Expected: 661 tests pass.
+Expected: 671 tests pass.
 
 ---
 
@@ -4366,7 +5122,8 @@ workspace = true
 
 - [ ] **Step 2: Write the failing Redis tests**
 
-Create `crates/push-auth/tests/limits.rs`:
+Login now writes three keys (per IP, per account and IP, per account), and a stopped Redis
+refuses the request (decision 12). Create `crates/push-auth/tests/limits.rs`:
 
 ```rust
 //! The Redis rate-limit counters against a real Redis (Docker must be running).
@@ -4375,6 +5132,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use push_auth::AuthError;
 use push_auth::limits::{Action, Counter, Limit, Limits, Outcome, RedisCounter};
 use testcontainers_modules::redis::Redis;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
@@ -4448,16 +5206,17 @@ async fn redis_never_sees_an_email_or_an_ip() {
         .await
         .unwrap();
     keys.sort();
-    assert_eq!(keys.len(), 2, "{keys:?}");
+    assert_eq!(keys.len(), 3, "{keys:?}");
     assert!(keys[0].starts_with("rl:login:account:"), "{keys:?}");
-    assert!(keys[1].starts_with("rl:login:ip:"), "{keys:?}");
+    assert!(keys[1].starts_with("rl:login:account_ip:"), "{keys:?}");
+    assert!(keys[2].starts_with("rl:login:ip:"), "{keys:?}");
     for key in keys {
         assert!(!key.contains("alice") && !key.contains("203.0.113.7"));
     }
 }
 
 #[tokio::test]
-async fn without_redis_requests_go_ahead_quickly() {
+async fn without_redis_requests_are_refused_quickly_and_may_be_retried() {
     let (container, url) = redis().await;
     let counter = RedisCounter::connect(&url, CancellationToken::new())
         .await
@@ -4465,10 +5224,11 @@ async fn without_redis_requests_go_ahead_quickly() {
     container.stop().await.expect("stop Redis");
     let limits = Limits::new(Arc::new(counter));
     let started = Instant::now();
-    limits
+    let refused = limits
         .check(Action::Login, None, Some("alice@example.com"))
-        .await
-        .unwrap();
+        .await;
+    assert_eq!(refused, Err(AuthError::Unavailable));
+    assert!(refused.unwrap_err().retryable());
     assert!(
         started.elapsed() < Duration::from_secs(5),
         "{:?}",
@@ -4485,7 +5245,9 @@ Expected: a compile error — `unresolved import push_auth::limits`.
 
 - [ ] **Step 3: The limits, with their unit tests**
 
-Create `crates/push-auth/src/limits.rs`:
+`Action::limits` lists `(Scope, Limit)` pairs in counting order; `ip_subject` reduces an
+IPv6 address to its /64 and an IPv4-mapped one to IPv4; a failing counter is
+`AuthError::Unavailable`. Create `crates/push-auth/src/limits.rs`:
 
 ```rust
 //! Rate limits (spec §5.6): per account and per IP, on signup, login, verification resend,
@@ -4493,9 +5255,16 @@ Create `crates/push-auth/src/limits.rs`:
 //! request over a limit is refused with `rate_limited` and a retry delay.
 //!
 //! Counters are fixed windows in Redis (`INCR`, then `EXPIRE … NX`), keyed by a hash of
-//! the subject, so no email address or IP is stored in Redis. When Redis does not answer
-//! within 500 ms the request is let through and a warning logged: Redis is a doorbell,
-//! never a reason to refuse service, and Argon2id still makes guessing slow.
+//! the subject, so no email address or IP is stored in Redis. An IPv6 client is counted
+//! by its /64 prefix, which one subscriber usually holds whole; an IPv4 address (also
+//! mapped into IPv6) whole. Login counts per account **and** IP, so nobody can lock a user
+//! out from another address, under a higher ceiling per account against guessing from
+//! many addresses.
+//!
+//! When Redis does not answer within 500 ms the request is refused with a retryable
+//! `unavailable` and a warning logged (fail closed): without counters nothing would slow
+//! down signup floods, email bombing or guessing. Refresh is not limited, so signed-in
+//! devices keep working.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -4521,6 +5290,38 @@ pub enum Action {
     HandleLookup,
 }
 
+/// Whom a limit counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Scope {
+    /// The client's IP (an IPv6 /64).
+    Ip,
+    /// The account: an email address or a user id.
+    Account,
+    /// The account from one IP.
+    AccountAndIp,
+}
+
+impl Scope {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Ip => "ip",
+            Self::Account => "account",
+            Self::AccountAndIp => "account_ip",
+        }
+    }
+}
+
+const HOUR: u64 = 3600;
+const QUARTER: u64 = 900;
+
+/// At most `max` requests per `seconds`.
+const fn per(max: u32, seconds: u64) -> Limit {
+    Limit {
+        max,
+        window: Duration::from_secs(seconds),
+    }
+}
+
 impl Action {
     fn name(self) -> &'static str {
         match self {
@@ -4533,19 +5334,29 @@ impl Action {
         }
     }
 
-    /// The limits per IP and per account: `(max requests, window)`.
-    pub fn limits(self) -> (Limit, Option<Limit>) {
-        const HOUR: Duration = Duration::from_secs(3600);
-        const QUARTER: Duration = Duration::from_secs(900);
-        let limit = |max, window| Limit { max, window };
+    /// The limits of the action, in the order they are counted. A refused request is not
+    /// counted by the limits after the one that refused it, so a guesser stopped per
+    /// account and IP does not use up the account's ceiling.
+    pub fn limits(self) -> &'static [(Scope, Limit)] {
+        const SIGNUP: &[(Scope, Limit)] =
+            &[(Scope::Ip, per(20, HOUR)), (Scope::Account, per(5, HOUR))];
+        const LOGIN: &[(Scope, Limit)] = &[
+            (Scope::Ip, per(60, QUARTER)),
+            (Scope::AccountAndIp, per(10, QUARTER)),
+            (Scope::Account, per(100, HOUR)),
+        ];
+        const EMAIL: &[(Scope, Limit)] =
+            &[(Scope::Ip, per(20, HOUR)), (Scope::Account, per(3, HOUR))];
+        const LINK: &[(Scope, Limit)] = &[(Scope::Ip, per(60, HOUR))];
+        // Spec §5.5: 20 lookups per hour per user.
+        const LOOKUP: &[(Scope, Limit)] =
+            &[(Scope::Ip, per(120, HOUR)), (Scope::Account, per(20, HOUR))];
         match self {
-            Self::Signup => (limit(20, HOUR), Some(limit(5, HOUR))),
-            Self::Login => (limit(60, QUARTER), Some(limit(10, QUARTER))),
-            Self::ResendVerification => (limit(20, HOUR), Some(limit(3, HOUR))),
-            Self::ForgotPassword => (limit(20, HOUR), Some(limit(3, HOUR))),
-            Self::OpenLink => (limit(60, HOUR), None),
-            // Spec §5.5: 20 lookups per hour per user.
-            Self::HandleLookup => (limit(120, HOUR), Some(limit(20, HOUR))),
+            Self::Signup => SIGNUP,
+            Self::Login => LOGIN,
+            Self::ResendVerification | Self::ForgotPassword => EMAIL,
+            Self::OpenLink => LINK,
+            Self::HandleLookup => LOOKUP,
         }
     }
 }
@@ -4589,31 +5400,34 @@ impl Limits {
     }
 
     /// Counts a request for `action` from `ip` about `account` (an email address or a
-    /// user id); `RateLimited` if either is over its limit. A failing counter lets the
-    /// request through.
+    /// user id); `RateLimited` if any of its limits is exceeded. A failing counter
+    /// refuses the request with the retryable `Unavailable`.
     pub async fn check(
         &self,
         action: Action,
         ip: Option<IpAddr>,
         account: Option<&str>,
     ) -> Result<(), AuthError> {
-        let (per_ip, per_account) = action.limits();
-        let mut checks = Vec::new();
-        if let Some(ip) = ip {
-            checks.push((key(action, "ip", &ip.to_string()), per_ip));
-        }
-        if let (Some(account), Some(limit)) = (account, per_account) {
-            let account = account.trim().to_lowercase();
-            checks.push((key(action, "account", &account), limit));
-        }
-        for (key, limit) in checks {
-            match self.counter.hit(&key, limit).await {
+        let ip = ip.map(ip_subject);
+        let account = account.map(|account| account.trim().to_lowercase());
+        for &(scope, limit) in action.limits() {
+            let subject = match (scope, &ip, &account) {
+                (Scope::Ip, Some(ip), _) => ip.clone(),
+                (Scope::Account, _, Some(account)) => account.clone(),
+                // Length-prefixed, so no account and IP pair can pose as another.
+                (Scope::AccountAndIp, Some(ip), Some(account)) => {
+                    format!("{}:{account}{ip}", account.len())
+                }
+                _ => continue,
+            };
+            match self.counter.hit(&key(action, scope, &subject), limit).await {
                 Ok(Outcome::Allowed) => {}
                 Ok(Outcome::Limited { retry_after_s }) => {
                     return Err(AuthError::RateLimited { retry_after_s });
                 }
                 Err(error) => {
-                    tracing::warn!(%error, action = action.name(), "rate limit not checked");
+                    tracing::warn!(%error, action = action.name(), "rate limit not checked; refusing the request");
+                    return Err(AuthError::Unavailable);
                 }
             }
         }
@@ -4621,17 +5435,32 @@ impl Limits {
     }
 }
 
+/// What an IP is counted as: an IPv4 address whole, also when mapped into IPv6; an IPv6
+/// address by its /64 prefix, since one subscriber usually gets a whole /64.
+fn ip_subject(ip: IpAddr) -> String {
+    match ip.to_canonical() {
+        IpAddr::V4(address) => address.to_string(),
+        IpAddr::V6(address) => {
+            let segments = address.segments();
+            format!(
+                "{:x}:{:x}:{:x}:{:x}::/64",
+                segments[0], segments[1], segments[2], segments[3]
+            )
+        }
+    }
+}
+
 /// `rl:{action}:{scope}:{hash}`: the subject is hashed, never stored.
-fn key(action: Action, scope: &str, subject: &str) -> String {
+fn key(action: Action, scope: Scope, subject: &str) -> String {
     let digest = Sha256::digest(subject.as_bytes());
     let hex: String = digest[..16]
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect();
-    format!("rl:{}:{scope}:{hex}", action.name())
+    format!("rl:{}:{}:{hex}", action.name(), scope.name())
 }
 
-/// How long a Redis call may take before the request goes ahead without it.
+/// How long a Redis call may take before the request is refused without it.
 pub const REDIS_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Counters in Redis.
@@ -4732,9 +5561,13 @@ mod tests {
         Some(IpAddr::from([10, 0, 0, last]))
     }
 
+    fn memory() -> Limits {
+        Limits::new(Arc::new(MemoryCounter::default()))
+    }
+
     #[tokio::test]
     async fn an_account_is_limited_across_ips_and_an_ip_across_accounts() {
-        let limits = Limits::new(Arc::new(MemoryCounter::default()));
+        let limits = memory();
         for attempt in 0..3 {
             limits
                 .check(
@@ -4777,31 +5610,104 @@ mod tests {
         );
     }
 
-    #[test]
-    fn handle_lookups_follow_the_spec() {
-        assert_eq!(
-            Action::HandleLookup.limits().1,
-            Some(Limit {
-                max: 20,
-                window: Duration::from_secs(3600)
-            })
-        );
-    }
-
     #[tokio::test]
-    async fn a_failing_counter_lets_requests_through() {
-        let limits = Limits::new(Arc::new(Broken));
-        for _ in 0..50 {
+    async fn login_counts_per_account_and_ip_under_a_ceiling_per_account() {
+        let limits = memory();
+        for _ in 0..10 {
             limits
                 .check(Action::Login, ip(1), Some("a@example.com"))
                 .await
                 .unwrap();
         }
+        let refused = limits
+            .check(Action::Login, ip(1), Some("a@example.com"))
+            .await;
+        assert!(
+            matches!(refused, Err(AuthError::RateLimited { retry_after_s }) if retry_after_s <= 900),
+            "{refused:?}"
+        );
+        // The owner, from another address, is not locked out.
+        limits
+            .check(Action::Login, ip(2), Some("a@example.com"))
+            .await
+            .unwrap();
+        // Guessing from many addresses meets the ceiling: 100 per hour, 89 to go.
+        for attempt in 0..89u8 {
+            limits
+                .check(Action::Login, ip(3 + attempt / 10), Some("a@example.com"))
+                .await
+                .unwrap();
+        }
+        let refused = limits
+            .check(Action::Login, ip(12), Some("a@example.com"))
+            .await;
+        assert!(
+            matches!(refused, Err(AuthError::RateLimited { retry_after_s }) if retry_after_s > 900),
+            "{refused:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ipv6_clients_are_counted_by_their_64_prefix() {
+        let limits = memory();
+        for host in 0..20u16 {
+            let address = IpAddr::from([0x2001, 0xdb8, 1, 2, host, 0, 0, 1]);
+            limits
+                .check(Action::OpenLink, Some(address), None)
+                .await
+                .unwrap();
+        }
+        for _ in 0..40 {
+            limits
+                .check(Action::OpenLink, "2001:db8:1:2::ffff".parse().ok(), None)
+                .await
+                .unwrap();
+        }
+        assert!(
+            limits
+                .check(Action::OpenLink, "2001:db8:1:2:9::9".parse().ok(), None)
+                .await
+                .is_err(),
+            "60 per hour for the whole /64"
+        );
+        assert!(
+            limits
+                .check(Action::OpenLink, "2001:db8:1:3::1".parse().ok(), None)
+                .await
+                .is_ok(),
+            "another /64"
+        );
+        assert_eq!(
+            ip_subject("::ffff:10.0.0.1".parse().unwrap()),
+            ip_subject("10.0.0.1".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn handle_lookups_follow_the_spec() {
+        assert!(Action::HandleLookup.limits().contains(&(
+            Scope::Account,
+            Limit {
+                max: 20,
+                window: Duration::from_secs(3600)
+            }
+        )));
+    }
+
+    #[tokio::test]
+    async fn a_failing_counter_refuses_with_a_retryable_error() {
+        let limits = Limits::new(Arc::new(Broken));
+        let refused = limits
+            .check(Action::Login, ip(1), Some("a@example.com"))
+            .await;
+        assert_eq!(refused, Err(AuthError::Unavailable));
+        assert!(AuthError::Unavailable.retryable());
+        assert_eq!(AuthError::Unavailable.status(), 503);
     }
 
     #[test]
     fn keys_hash_the_subject() {
-        let key = key(Action::Login, "account", "alice@example.com");
+        let key = key(Action::Login, Scope::Account, "alice@example.com");
         assert!(key.starts_with("rl:login:account:"), "{key}");
         assert!(!key.contains("alice"), "{key}");
         assert_eq!(key.len(), "rl:login:account:".len() + 32);
@@ -4831,7 +5737,7 @@ mod service;
 pub mod tokens;
 
 pub use db::{MIGRATOR, migrate_database};
-pub use devices::{Caller, DeviceInfo, MAX_ACTIVE_DEVICES, Tokens};
+pub use devices::{Caller, DeviceInfo, MAX_ACTIVE_DEVICES, REFRESH_GRACE, Tokens};
 pub use error::AuthError;
 pub use profiles::{OwnProfile, PublicProfile};
 pub use service::{
@@ -4845,9 +5751,9 @@ pub use service::{
 cargo test -p push-auth --lib --test limits
 ```
 
-Expected: `test result: ok. 28 passed` (lib) and `test result: ok. 3 passed` (limits).
-`without_redis_requests_go_ahead_quickly` stops Redis and still lets the request through
-within the 500 ms timeout.
+Expected: `test result: ok. 32 passed` (lib) and `test result: ok. 3 passed` (limits).
+`without_redis_requests_are_refused_quickly_and_may_be_retried` stops Redis and gets the
+retryable `unavailable` well within the 5 s it allows.
 
 - [ ] **Step 5: Run the gates and commit**
 
@@ -4860,7 +5766,7 @@ git add Cargo.lock crates/push-auth
 git commit -m "feat(auth): rate limits in Redis"
 ```
 
-Expected: 668 tests pass.
+Expected: 680 tests pass.
 
 ---
 
@@ -5012,13 +5918,16 @@ workspace = true
 
 The tests drive the router with `tower::ServiceExt::oneshot`, with the client IP in
 `x-real-ip` as the ingress sends it and the DEV ONLY mailbox on (it is how they read
-links). Create `crates/push-auth/tests/api.rs`:
+links). Devices are registered with a `registration_id`; the login test shows that the
+owner, from another address, still signs in after the limit for one address is reached.
+Create `crates/push-auth/tests/api.rs`:
 
 ```rust
 //! The HTTP API end to end over a real PostgreSQL (Docker must be running): requests go
 //! through the router as the ingress would send them, with the client IP in `x-real-ip`.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
@@ -5036,6 +5945,7 @@ use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::{ContainerAsync, ImageExt};
 use tower::ServiceExt;
+use uuid::Uuid;
 
 struct World {
     _container: ContainerAsync<Postgres>,
@@ -5061,6 +5971,8 @@ async fn world(dev_mailbox: bool) -> World {
             links: LinkSigner::new(vec![3; 32]).unwrap(),
             tokens: AccessTokens::from_seed(&[5; 32], "ws://push.local/v1/socket").unwrap(),
             hash_concurrency: 4,
+            hash_queue: 64,
+            hash_wait: Duration::from_secs(5),
         },
     );
     let router = router(Api {
@@ -5087,9 +5999,22 @@ impl Answer {
     }
 }
 
-/// One request; `body` is sent as JSON unless it is a string, which is sent as a form.
+/// One request from the client 198.51.100.7; `body` is sent as JSON unless it is a
+/// string, which is sent as a form.
 async fn call(
     world: &World,
+    method: Method,
+    uri: &str,
+    bearer: Option<&str>,
+    body: Option<Value>,
+) -> Answer {
+    call_from(world, "198.51.100.7", method, uri, bearer, body).await
+}
+
+/// One request from the client `ip`, as the ingress reports it in `x-real-ip`.
+async fn call_from(
+    world: &World,
+    ip: &str,
     method: Method,
     uri: &str,
     bearer: Option<&str>,
@@ -5098,7 +6023,7 @@ async fn call(
     let mut request = Request::builder()
         .method(method)
         .uri(uri)
-        .header("x-real-ip", "198.51.100.7");
+        .header("x-real-ip", ip);
     if let Some(token) = bearer {
         request = request.header("authorization", format!("Bearer {token}"));
     }
@@ -5189,7 +6114,11 @@ async fn with_device(world: &World, name: &str) -> Value {
         Method::POST,
         "/v1/devices",
         Some(&registration),
-        Some(json!({"name": "Phone", "platform": "ios"})),
+        Some(json!({
+            "name": "Phone",
+            "platform": "ios",
+            "registration_id": Uuid::now_v7(),
+        })),
     )
     .await;
     assert_eq!(device.status, StatusCode::CREATED, "{}", device.text);
@@ -5439,7 +6368,7 @@ async fn errors_have_one_format() {
 }
 
 #[tokio::test]
-async fn login_is_rate_limited_per_account_without_locking_it() {
+async fn login_is_rate_limited_per_account_and_ip_without_locking_the_account() {
     let world = world(true).await;
     with_device(&world, "alice").await;
     // with_device logged in once; 9 more wrong attempts fit in the window.
@@ -5471,6 +6400,18 @@ async fn login_is_rate_limited_per_account_without_locking_it() {
         .parse()
         .unwrap();
     assert!((1..=900).contains(&wait), "{wait}");
+
+    // The owner signs in from another address.
+    let elsewhere = call_from(
+        &world,
+        "203.0.113.9",
+        Method::POST,
+        "/v1/auth/login",
+        None,
+        Some(json!({"email": "alice@example.com", "password": "correct horse"})),
+    )
+    .await;
+    assert_eq!(elsewhere.status, StatusCode::OK, "{}", elsewhere.text);
 }
 
 #[tokio::test]
@@ -5518,7 +6459,8 @@ In `crates/push-auth/src/service.rs`, add this method at the end of `impl Auth`,
 
 - [ ] **Step 4: The router, with its unit tests**
 
-Create `crates/push-auth/src/api.rs`:
+`ip_from_header` takes the last entry of the configured header (decision 12). Create
+`crates/push-auth/src/api.rs`:
 
 ```rust
 //! The public HTTP API (spec §2, §5): `/v1/auth/*`, `/v1/devices/*` and `/v1/users/*`,
@@ -5565,7 +6507,7 @@ pub struct Api {
     pub limits: Limits,
     /// The header that carries the client's IP, set by the ingress controller
     /// (`x-real-ip`); without it, the peer address. Only trust a header the proxy in front
-    /// always overwrites.
+    /// always overwrites (or, for `X-Forwarded-For`, appends to): its last entry is used.
     pub client_ip_header: Option<HeaderName>,
     /// DEV ONLY: serve `GET /dev/mailbox`, the outbox's emails to one address.
     pub dev_mailbox: bool,
@@ -5686,8 +6628,7 @@ impl FromRequestParts<Api> for ClientIp {
     async fn from_request_parts(parts: &mut Parts, api: &Api) -> Result<Self, Self::Rejection> {
         let from_header = api.client_ip_header.as_ref().and_then(|name| {
             let value = parts.headers.get(name)?.to_str().ok()?;
-            // X-Forwarded-For lists the client first.
-            value.split(',').next()?.trim().parse().ok()
+            ip_from_header(value)
         });
         let peer = parts
             .extensions
@@ -5695,6 +6636,14 @@ impl FromRequestParts<Api> for ClientIp {
             .map(|ConnectInfo(address)| address.ip());
         Ok(Self(from_header.or(peer)))
     }
+}
+
+/// The client's IP in a header value: its last entry. `X-Real-IP` holds one address,
+/// which ingress-nginx overwrites with the peer it saw. In `X-Forwarded-For` the client
+/// writes the first entries itself and only the last is added by the proxy in front, so
+/// only the last is trusted — which assumes exactly one proxy hop.
+fn ip_from_header(value: &str) -> Option<IpAddr> {
+    value.rsplit(',').next()?.trim().parse().ok()
 }
 
 fn bearer(headers: &HeaderMap) -> Result<&str, AuthError> {
@@ -5929,6 +6878,8 @@ async fn jwks(State(api): State<Api>) -> Response {
 struct DeviceBody {
     name: String,
     platform: String,
+    /// The client's idempotency key for this registration; its retries send it again.
+    registration_id: Uuid,
 }
 
 async fn register_device(
@@ -5938,7 +6889,12 @@ async fn register_device(
 ) -> Result<Response, AuthError> {
     let tokens = api
         .auth
-        .register_device(bearer(&headers)?, &body.name, &body.platform)
+        .register_device(
+            bearer(&headers)?,
+            body.registration_id,
+            &body.name,
+            &body.platform,
+        )
         .await?;
     Ok((StatusCode::CREATED, Json(tokens_json(&tokens))).into_response())
 }
@@ -6119,6 +7075,20 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(response.headers()[WWW_AUTHENTICATE], "Bearer");
     }
+
+    #[test]
+    fn the_client_ip_is_the_last_entry_the_proxy_wrote() {
+        let parsed = |value: &str| ip_from_header(value).map(|ip| ip.to_string());
+        assert_eq!(parsed("203.0.113.7").as_deref(), Some("203.0.113.7"));
+        // A client-supplied first entry is ignored.
+        assert_eq!(
+            parsed("10.9.9.9, 198.51.100.4").as_deref(),
+            Some("198.51.100.4")
+        );
+        assert_eq!(parsed(" 2001:db8::1 ").as_deref(), Some("2001:db8::1"));
+        assert_eq!(parsed("198.51.100.4, unknown"), None);
+        assert_eq!(parsed(""), None);
+    }
 }
 ```
 
@@ -6145,7 +7115,7 @@ mod service;
 pub mod tokens;
 
 pub use db::{MIGRATOR, migrate_database};
-pub use devices::{Caller, DeviceInfo, MAX_ACTIVE_DEVICES, Tokens};
+pub use devices::{Caller, DeviceInfo, MAX_ACTIVE_DEVICES, REFRESH_GRACE, Tokens};
 pub use error::AuthError;
 pub use profiles::{OwnProfile, PublicProfile};
 pub use service::{
@@ -6159,7 +7129,7 @@ pub use service::{
 cargo test -p push-auth --lib --test api
 ```
 
-Expected: `test result: ok. 30 passed` (lib) and `test result: ok. 6 passed` (api).
+Expected: `test result: ok. 35 passed` (lib) and `test result: ok. 6 passed` (api).
 
 - [ ] **Step 6: Run the gates and commit**
 
@@ -6172,7 +7142,7 @@ git add Cargo.toml Cargo.lock crates/push-auth
 git commit -m "feat(auth): the HTTP API and the link pages"
 ```
 
-Expected: 676 tests pass.
+Expected: 689 tests pass.
 
 ---
 
@@ -6401,7 +7371,9 @@ Expected: a compile error — `unresolved imports push_auth::Config, push_auth::
 
 - [ ] **Step 3: Configuration, with its tests**
 
-Create `crates/push-auth/src/config.rs`:
+`PUSH_AUTH_HASH_QUEUE` (default 32) sizes the hash gate's queue, and `PUSH_DEV_MAILBOX=1`
+is refused unless the public URL's host is local (decision 16). Create
+`crates/push-auth/src/config.rs`:
 
 ```rust
 //! Configuration from environment variables.
@@ -6425,13 +7397,15 @@ use push_store::{StoreOptions, check_database_url};
 /// | `PUSH_AUTH_LINK_KEY` | base64 of at least 32 bytes, the HMAC key of links and registration tokens | required |
 /// | `PUSH_AUTH_CLIENT_IP_HEADER` | header with the client IP, set by the ingress (`x-real-ip`) | the peer address |
 /// | `PUSH_AUTH_HASH_CONCURRENCY` | most password hashes at once (19 MiB each) | `2` |
+/// | `PUSH_AUTH_HASH_QUEUE` | most requests waiting for a hash; more get a retryable 503 | `32` |
 /// | `PUSH_HTTP_ADDR` | address of the API | `0.0.0.0:8080` |
 /// | `PUSH_HEALTH_ADDR` | address of `/healthz` and `/readyz` | `0.0.0.0:8081` |
 /// | `PUSH_DB_MAX_CONNECTIONS` | pool size, at least 1 | `10` |
-/// | `PUSH_DEV_MAILBOX` | `1` serves the DEV ONLY `GET /dev/mailbox` | off |
+/// | `PUSH_DEV_MAILBOX` | `1` serves the DEV ONLY `GET /dev/mailbox` (local public URL only) | off |
 ///
 /// `http://` public URLs and `ws://` audiences are accepted only for local hosts
-/// (`localhost`, `127.0.0.1`, `*.local`, `*.localhost`, `*.test`).
+/// (`localhost`, `127.0.0.1`, `*.local`, `*.localhost`, `*.test`), and so is the DEV ONLY
+/// mailbox, like the chart's dev-mode guard.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Config {
     pub database_url: String,
@@ -6442,6 +7416,7 @@ pub struct Config {
     pub link_key: Vec<u8>,
     pub client_ip_header: Option<HeaderName>,
     pub hash_concurrency: usize,
+    pub hash_queue: usize,
     pub http_addr: SocketAddr,
     pub health_addr: SocketAddr,
     pub store: StoreOptions,
@@ -6460,6 +7435,7 @@ impl std::fmt::Debug for Config {
             .field("link_key", &"<redacted>")
             .field("client_ip_header", &self.client_ip_header)
             .field("hash_concurrency", &self.hash_concurrency)
+            .field("hash_queue", &self.hash_queue)
             .field("http_addr", &self.http_addr)
             .field("health_addr", &self.health_addr)
             .field("store", &self.store)
@@ -6557,6 +7533,17 @@ impl Config {
                 reason: "must be at least 1".to_owned(),
             });
         }
+        let dev_mailbox = dev_flag(&lookup, "PUSH_DEV_MAILBOX")?;
+        if dev_mailbox && !is_local_url(&public_url) {
+            return Err(ConfigError::Invalid {
+                name: "PUSH_DEV_MAILBOX",
+                value: "1".to_owned(),
+                reason: "the DEV ONLY mailbox shows every account's email links; it is only \
+                         allowed with a local PUSH_AUTH_PUBLIC_URL host (localhost, 127.0.0.1, \
+                         *.local, *.localhost, *.test)"
+                    .to_owned(),
+            });
+        }
         Ok(Self {
             database_url,
             redis_url,
@@ -6566,12 +7553,19 @@ impl Config {
             link_key,
             client_ip_header,
             hash_concurrency,
+            hash_queue: parsed(&lookup, "PUSH_AUTH_HASH_QUEUE", 32)?,
             http_addr: parsed(&lookup, "PUSH_HTTP_ADDR", ([0, 0, 0, 0], 8080).into())?,
             health_addr: parsed(&lookup, "PUSH_HEALTH_ADDR", ([0, 0, 0, 0], 8081).into())?,
             store,
-            dev_mailbox: dev_flag(&lookup, "PUSH_DEV_MAILBOX")?,
+            dev_mailbox,
         })
     }
+}
+
+/// Whether the host of `url`, a checked public URL, is local.
+fn is_local_url(url: &str) -> bool {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    is_local_host(host_of(rest))
 }
 
 /// A key variable, base64-decoded; the value is never shown.
@@ -6712,6 +7706,7 @@ mod tests {
         assert_eq!(config.http_addr, "0.0.0.0:8080".parse().unwrap());
         assert_eq!(config.health_addr, "0.0.0.0:8081".parse().unwrap());
         assert_eq!(config.hash_concurrency, 2);
+        assert_eq!(config.hash_queue, 32);
         assert_eq!(config.client_ip_header, None);
         assert_eq!(config.store, StoreOptions::default());
         assert!(!config.dev_mailbox);
@@ -6726,12 +7721,21 @@ mod tests {
         }
     }
 
+    /// The required variables with a local public URL, and `name` set to `value`.
+    fn local_with(name: &'static str, value: &'static str) -> Vec<(&'static str, &'static str)> {
+        let mut variables = with("PUSH_AUTH_PUBLIC_URL", "https://push.test");
+        variables.retain(|(key, _)| *key != name);
+        variables.push((name, value));
+        variables
+    }
+
     #[test]
     fn optional_settings_can_be_set() {
-        let mut variables = REQUIRED.to_vec();
+        let mut variables = with("PUSH_AUTH_PUBLIC_URL", "https://push.test");
         variables.extend([
             ("PUSH_AUTH_CLIENT_IP_HEADER", "X-Real-IP"),
             ("PUSH_AUTH_HASH_CONCURRENCY", "4"),
+            ("PUSH_AUTH_HASH_QUEUE", "8"),
             ("PUSH_HTTP_ADDR", "127.0.0.1:7000"),
             ("PUSH_DB_MAX_CONNECTIONS", "3"),
             ("PUSH_DEV_MAILBOX", "1"),
@@ -6742,6 +7746,7 @@ mod tests {
             Some(HeaderName::from_static("x-real-ip"))
         );
         assert_eq!(config.hash_concurrency, 4);
+        assert_eq!(config.hash_queue, 8);
         assert_eq!(config.http_addr, "127.0.0.1:7000".parse().unwrap());
         assert_eq!(config.store.max_connections, 3);
         assert!(config.dev_mailbox);
@@ -6793,7 +7798,7 @@ mod tests {
     fn dev_mailbox_is_on_only_for_exactly_1() {
         for (value, expected) in [("1", true), ("0", false), ("", false)] {
             assert_eq!(
-                config(&with("PUSH_DEV_MAILBOX", value))
+                config(&local_with("PUSH_DEV_MAILBOX", value))
                     .unwrap()
                     .dev_mailbox,
                 expected
@@ -6801,8 +7806,43 @@ mod tests {
         }
         for value in ["true", "yes", " 1"] {
             assert!(
-                config(&with("PUSH_DEV_MAILBOX", value)).is_err(),
+                config(&local_with("PUSH_DEV_MAILBOX", value)).is_err(),
                 "{value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_dev_mailbox_needs_a_local_public_url() {
+        for url in [
+            "http://localhost:8080",
+            "http://127.0.0.1",
+            "https://push.local",
+            "http://push.localhost/",
+            "https://push.test",
+        ] {
+            let mut variables = local_with("PUSH_DEV_MAILBOX", "1");
+            variables.retain(|(key, _)| *key != "PUSH_AUTH_PUBLIC_URL");
+            variables.push(("PUSH_AUTH_PUBLIC_URL", url));
+            assert!(config(&variables).unwrap().dev_mailbox, "{url}");
+        }
+        for url in [
+            "https://api.example.com",
+            "https://localhost.example.com",
+            "https://push.test.example.com",
+        ] {
+            let mut variables = with("PUSH_DEV_MAILBOX", "1");
+            variables.retain(|(key, _)| *key != "PUSH_AUTH_PUBLIC_URL");
+            variables.push(("PUSH_AUTH_PUBLIC_URL", url));
+            assert!(
+                matches!(
+                    config(&variables),
+                    Err(ConfigError::Invalid {
+                        name: "PUSH_DEV_MAILBOX",
+                        ..
+                    })
+                ),
+                "{url}"
             );
         }
     }
@@ -6832,7 +7872,8 @@ mod tests {
 
 - [ ] **Step 4: Serving, health, logging and signals**
 
-Create `crates/push-auth/src/server.rs`:
+A password hash waits at most 2 s for a slot (`HASH_WAIT`). Create
+`crates/push-auth/src/server.rs`:
 
 ```rust
 //! Running the service: the HTTP API, the health endpoints and graceful shutdown.
@@ -6861,6 +7902,8 @@ use crate::tokens::AccessTokens;
 
 /// How long to wait before trying an unreachable dependency again.
 const RETRY_DELAY: Duration = Duration::from_secs(2);
+/// Longest wait for a password-hash slot before a request is refused as `unavailable`.
+const HASH_WAIT: Duration = Duration::from_secs(2);
 
 /// Runs the service until `shutdown` is cancelled, then finishes the requests in
 /// progress and closes the database pool.
@@ -6923,6 +7966,8 @@ pub async fn serve(
             links,
             tokens,
             hash_concurrency: config.hash_concurrency,
+            hash_queue: config.hash_queue,
+            hash_wait: HASH_WAIT,
         },
     );
     let api = router(Api {
@@ -6992,8 +8037,9 @@ fn health_router(health: Health) -> Router {
         .with_state(health)
 }
 
-/// Ready once the database is migrated and answers. Redis is not checked: without it the
-/// rate limits let requests through (see `limits`).
+/// Ready once the database is migrated and answers. Redis is not checked: without it only
+/// the rate-limited endpoints refuse (with a retryable `unavailable`, see `limits`), while
+/// refresh, devices and profiles keep working.
 async fn readyz(State(health): State<Health>) -> (StatusCode, &'static str) {
     if health.shutdown.is_cancelled() {
         return (StatusCode::SERVICE_UNAVAILABLE, "shutting down");
@@ -7096,7 +8142,7 @@ pub mod tokens;
 
 pub use config::{Config, ConfigError};
 pub use db::{MIGRATOR, migrate_database};
-pub use devices::{Caller, DeviceInfo, MAX_ACTIVE_DEVICES, Tokens};
+pub use devices::{Caller, DeviceInfo, MAX_ACTIVE_DEVICES, REFRESH_GRACE, Tokens};
 pub use error::AuthError;
 pub use profiles::{OwnProfile, PublicProfile};
 pub use server::{init_logging, serve, terminated};
@@ -7111,7 +8157,7 @@ pub use service::{
 cargo test -p push-auth
 ```
 
-Expected: lib `38 passed`, `accounts` 10, `api` 6, `devices` 8, `limits` 3, `schema` 3,
+Expected: lib `44 passed`, `accounts` 12, `api` 6, `devices` 13, `limits` 3, `schema` 4,
 `server` 2. `without_a_database_it_is_not_ready_and_still_stops_when_asked` shows that the
 start-up retries stop on shutdown.
 
@@ -7135,7 +8181,7 @@ git add Cargo.lock crates/push-auth
 git commit -m "feat(auth): configuration, serving, health and graceful shutdown"
 ```
 
-Expected: 686 tests pass.
+Expected: 700 tests pass.
 
 ---
 
@@ -7152,7 +8198,7 @@ CI needs no change: the `rust` and `msrv` jobs run the whole workspace, and alre
 
 In `README.md`, after the `push-gateway` table (its last row is
 `` | `PUSH_DEV_AUTH` | `1` accepts DEV ONLY identities without a token | off | ``), add a
-blank line and:
+blank line and the following, keeping a blank line before `## License`:
 
 ```markdown
 `push-auth`:
@@ -7165,12 +8211,13 @@ blank line and:
 | `PUSH_AUTH_TOKEN_AUDIENCE` | the gateway's URL, the access tokens' `aud` (`wss://…/v1/socket`) | required |
 | `PUSH_AUTH_SIGNING_KEY` | base64 of the 32-byte Ed25519 seed that signs access tokens | required |
 | `PUSH_AUTH_LINK_KEY` | base64 of at least 32 bytes, the HMAC key of email links and registration tokens | required |
-| `PUSH_AUTH_CLIENT_IP_HEADER` | header with the client's IP, set by the ingress (`x-real-ip`) | the peer address |
+| `PUSH_AUTH_CLIENT_IP_HEADER` | header with the client's IP, set by the ingress (`x-real-ip`); its last entry is used | the peer address |
 | `PUSH_AUTH_HASH_CONCURRENCY` | most password hashes at once (19 MiB each) | `2` |
+| `PUSH_AUTH_HASH_QUEUE` | most requests waiting for a password hash; more get a retryable 503 | `32` |
 | `PUSH_HTTP_ADDR` | address of the API | `0.0.0.0:8080` |
 | `PUSH_HEALTH_ADDR` | address of `/healthz` and `/readyz` | `0.0.0.0:8081` |
 | `PUSH_DB_MAX_CONNECTIONS` | pool size, at least 1 | `10` |
-| `PUSH_DEV_MAILBOX` | `1` serves the DEV ONLY `GET /dev/mailbox` | off |
+| `PUSH_DEV_MAILBOX` | `1` serves the DEV ONLY `GET /dev/mailbox`; refused unless the public URL's host is local | off |
 ```
 
 - [ ] **Step 2: Record the implementation in the spec**
@@ -7202,7 +8249,11 @@ Implementation notes (push-auth, migration `0001_auth.sql`, Plan 5A):
 - Handles are stored in lower case: 3–30 letters, digits and underscores, starting with a
   letter (a `CHECK`). Display and device names have 1–64 characters; `platform` is checked
   against the five values. A partial index on `device (user_id) where revoked_at is null`
-  serves the device limit.
+  serves the device limit; `unique (user_id, registration_id)` makes a retried
+  registration find its device.
+- `refresh_token.rotated_at` is set when the holder exchanges the token and starts its
+  30-second grace window (§5.3); it is null on a token cut off by a retry of the one
+  before it.
 - Comparisons with a bound email or handle cast the parameter to `citext`
   (`email = $1::citext`): sqlx binds `text`, and `citext = text` compares as text, which
   is case-sensitive.
@@ -7215,7 +8266,7 @@ Implementation notes (push-auth, migration `0001_auth.sql`, Plan 5A):
 
 In §5.6, after the last bullet (`- Links are built from a configured base URL, never from
 the `Host` header. Pages they open send `Referrer-Policy: no-referrer`.`), add a blank line
-and:
+and the following, keeping a blank line before `## 6. Groups (up to 100 members)`:
 
 ```markdown
 Implementation notes (push-auth, Plan 5A):
@@ -7225,42 +8276,70 @@ Implementation notes (push-auth, Plan 5A):
   `POST /v1/auth/password/forgot` (202), `GET|POST /v1/auth/password/reset`,
   `GET /v1/auth/jwks`, `POST|GET /v1/devices`, `DELETE /v1/devices/{id}`,
   `GET|PATCH /v1/users/me` and `GET /v1/users/lookup?handle=…`. Errors are
-  `{"error": {"code", "message", "retryable"}}`; 429 carries `Retry-After`. No answer may
-  be cached except the JWKS.
+  `{"error": {"code", "message", "retryable"}}`; 429 carries `Retry-After`; 503
+  `unavailable` is retryable. No answer may be cached except the JWKS.
 - **Link pages.** A link opens a small page whose button posts the token: a `GET` changes
   nothing, so mail scanners that open links do nothing. Pages send
   `Referrer-Policy: no-referrer`, `Cache-Control: no-store` and a CSP of
   `default-src 'none'`. API clients post the token as JSON instead.
 - **Signed tokens.** Email links and the registration token are
-  `base64url(JSON claims).base64url(HMAC-SHA256)` with `{sub, purpose, exp}` plus `email`
-  (verify) or `pw` (reset: 16 bytes of SHA-256 of the password hash). The purposes
-  `verify`, `reset` and `register` are checked, so no token stands in for another; the
-  gateway does not have the HMAC key, so a registration token can never open a socket.
+  `base64url(JSON claims).base64url(HMAC-SHA256)` with `{sub, purpose, exp, pw}` plus
+  `email` (verify). `pw` is 16 bytes of SHA-256 of the account's password hash when the
+  token was made, checked against the stored hash under the row lock, so a reset — or a
+  new signup over an unverified account — makes every earlier link and registration
+  token worthless. The purposes `verify`, `reset` and `register` are checked, so no token
+  stands in for another; the gateway does not have the HMAC key, so a registration token
+  can never open a socket.
+- **Signup over an unverified account** is one `INSERT … ON CONFLICT (email) DO UPDATE …
+  WHERE email_verified_at IS NULL`: it replaces the password hash, handle and display
+  name, or does nothing for a verified account. A handle held by any account, this
+  email's own included, is `handle_taken`, so no answer depends on the email.
 - **Access tokens** are EdDSA (Ed25519) JWTs with a `kid` (the RFC 7638 thumbprint) and
   the claims of §5.1; `GET /v1/auth/jwks` publishes the key. The signing seed and the HMAC
-  key come from the Secret.
+  key come from the Secret. `jsonwebtoken` 9.3.1 (version 10 drops the `ring` backend) has
+  CVE-2026-25537, fixed in 10.3.0: a claim with the wrong JSON type is
+  treated as absent unless it is required. Accepted, because `exp`, `sub` and `aud` are
+  required and only auth-svc signs; the gateway's check (Plan 8) must require `exp` too.
 - **Refresh tokens** are 32 random bytes, base64url, stored as SHA-256. Refreshing marks
-  the old row `rotated_to`; presenting a rotated token again revokes every refresh token of
-  the device. Signing in again with `device_id` revokes the device's earlier refresh
-  tokens. A client must not refresh twice concurrently with one token.
+  the old row `rotated_to` the new hash and `rotated_at` now. The row rotated last, if its
+  successor is still live and `rotated_at` is under 30 s old, may be presented again: it
+  gets a new pair, its successor is marked `rotated_to` the new hash with a null
+  `rotated_at` (cut off, no window of its own), and its own `rotated_at` stays, so retries
+  never extend the window. Anything else presented after rotation is reuse and revokes
+  every refresh token of the device. The presented row is locked before its successor's,
+  so concurrent refreshes are serialised and leave one live branch. Signing in again with
+  `device_id` revokes the device's earlier refresh tokens. A cut-off pair's access token
+  stays valid until it expires (at most 15 minutes).
+- **Device registration** takes `registration_id`, unique per user among all of its
+  devices. Under the account row lock, an active device with that id gets new tokens
+  (its refresh tokens revoked, no outbox event, no limit check); a revoked one answers
+  `device_not_found`; otherwise the 10-device limit is checked and the device created.
 - **Device limit**: 10 active devices, checked under a row lock on the account, so
   concurrent registrations cannot pass it together.
-- **Timing.** Signup hashes the password before looking at the email; login checks a
-  dummy hash when the email is unknown. Password hashing runs on blocking threads, at most
-  `PUSH_AUTH_HASH_CONCURRENCY` (default 2) at once, 19 MiB each.
+- **Timing and load.** Signup hashes the password before looking at the email; login
+  checks a dummy hash when the email is unknown. Password hashing runs on blocking threads,
+  at most `PUSH_AUTH_HASH_CONCURRENCY` (default 2) at once, 19 MiB each; at most
+  `PUSH_AUTH_HASH_QUEUE` (default 32) requests wait, each at most 2 s, and the rest get a
+  retryable `unavailable` at once.
+- **Passwords** have 8–128 characters, used as typed.
 - **Rate limits** (fixed windows in Redis, keyed by a SHA-256 of the subject):
 
-  | Action | Per IP | Per account |
-  |---|---|---|
-  | signup | 20 / hour | 5 / hour (email) |
-  | login | 60 / 15 min | 10 / 15 min (email) |
-  | verification resend | 20 / hour | 3 / hour (email) |
-  | password forgot | 20 / hour | 3 / hour (email) |
-  | opening a link (verify, reset) | 60 / hour | — |
-  | handle lookup | 120 / hour | 20 / hour (user) |
+  | Action | Per IP | Per account and IP | Per account |
+  |---|---|---|---|
+  | signup | 20 / hour | — | 5 / hour (email) |
+  | login | 60 / 15 min | 10 / 15 min | 100 / hour (email) |
+  | verification resend | 20 / hour | — | 3 / hour (email) |
+  | password forgot | 20 / hour | — | 3 / hour (email) |
+  | opening a link (verify, reset) | 60 / hour | — | — |
+  | handle lookup | 120 / hour | — | 20 / hour (user) |
 
-  The client IP comes from `X-Real-IP`, which ingress-nginx overwrites. When Redis does
-  not answer within 500 ms the request goes ahead and a warning is logged.
+  Limits are counted in the order of the table; a refused request is not counted by the
+  later ones, so a guesser stopped per account and IP does not use up the account's
+  ceiling. An IPv6 client counts by its /64 prefix. The client IP is the last entry of the
+  configured header — `X-Real-IP`, which ingress-nginx overwrites — assuming exactly one
+  proxy in front; without the header, the peer address. When Redis does not answer within
+  500 ms the request is refused with a retryable `unavailable` and a warning is logged
+  (fail closed); refresh is not limited, so signed-in devices keep working.
 - **Profiles.** `GET /v1/users/lookup` finds verified users only. `GET /v1/users?ids=…`
   needs to know who shares a contact or conversation with the caller, which only
   message-svc knows; it comes with Plan 7.
@@ -7268,7 +8347,8 @@ Implementation notes (push-auth, Plan 5A):
   `GET /dev/mailbox?to=…`, the `email.send` payloads in the outbox for one address, so a
   local cluster and the smoke test can open verification links before the worker sends
   email (Plan 6). Like the other DEV ONLY switches it accepts only `1` or `0` and logs a
-  warning at start-up.
+  warning at start-up; it refuses to start unless the public URL's host is local
+  (`localhost`, `127.0.0.1`, `*.local`, `*.localhost`, `*.test`), like the chart's guard.
 ```
 
 - [ ] **Step 3: Mark plan 5A in review**
@@ -7286,7 +8366,7 @@ cargo test --workspace --locked
 cargo +1.85 test --workspace --locked
 ```
 
-Expected: no diff, no warnings, 686 tests on both toolchains.
+Expected: no diff, no warnings, 700 tests on both toolchains.
 
 - [ ] **Step 5: Commit and push**
 
@@ -7300,7 +8380,7 @@ git push -u origin feature/plan-05a-auth-service
 
 ```powershell
 $body = @'
-Implements docs/superpowers/plans/2026-10-13-plan-05a-auth-service.md: the push-auth crate (library and binary) with the auth schema in its own database; signup with uniform answers; stateless HMAC-signed links for email verification and password reset; verification as the gate; login with registration tokens; explicit device registration (10 active at most, race-free); EdDSA access tokens with a JWKS; refresh rotation with reuse detection; device listing and revocation; handles, own profile and lookup; Argon2id at the OWASP minimum; Redis rate limits; the outbox (email.send, user.verified, user.password_reset, device.registered, device.revoked); the DEV ONLY mailbox behind PUSH_DEV_MAILBOX=1. push-store gains run_migrations and connect_pool. 686 tests.
+Implements docs/superpowers/plans/2026-10-13-plan-05a-auth-service.md: the push-auth crate (library and binary) with the auth schema in its own database; signup with uniform answers that takes an unverified account over; stateless HMAC-signed links for email verification and password reset, bound to the password hash; verification as the gate; login with registration tokens (also bound to the password hash); explicit, idempotent device registration (registration_id; 10 active at most, race-free); EdDSA access tokens with a JWKS; refresh rotation with reuse detection and a 30 s grace window; device listing and revocation; handles, own profile and lookup; Argon2id at the OWASP minimum behind a bounded queue; Redis rate limits that fail closed (login per account and IP, IPv6 per /64); a reset that also verifies the email; the outbox (email.send, user.verified, user.password_reset, device.registered, device.revoked); the DEV ONLY mailbox behind PUSH_DEV_MAILBOX=1, for local hosts only. push-store gains run_migrations and connect_pool. 700 tests.
 
 Plan 5B adds auth-svc to the image and the chart and verifies it on minikube.
 '@
@@ -7318,14 +8398,15 @@ the controller merges after the final review.
 | Spec item / decision | Task |
 |---|---|
 | §2 auth-svc owns the `auth` schema in its own database; outbox written in the same transaction | 1, 4, 5 |
-| §3.1 `user_account`, `device`, `refresh_token`, `outbox` (citext email and handle, Argon2id PHC, hashed refresh tokens, `rotated_to`) | 1 |
+| §3.1 `user_account`, `device`, `refresh_token`, `outbox` (citext email and handle, Argon2id PHC, hashed refresh tokens, `rotated_to`, `rotated_at`, `unique (user_id, registration_id)`) | 1 |
 | §5.1 registration token 5 min (signed, unstored); access token EdDSA 15 min with `sub, device_id, email_verified, exp, iat, jti, aud`; refresh 30 days, hashed and rotated; email links 30 min, unstored | 3, 4, 5 |
-| §5.2 uniform signup; `email.send` in the same transaction; link binds `{user_id, email, purpose, exp}`; opening sets `email_verified_at` and writes `user.verified`, never signs in; unverified accounts can only resend | 4, 7 |
-| §5.3 login → registration token, or tokens for an existing active device; `POST /v1/devices` with the 10-device limit and `device.registered`; refresh the only way to new access tokens; list and revoke with `device.revoked` | 5, 7 |
-| §5.4 reset link `{user_id, purpose: reset, exp, pw}`, single use without state; all refresh tokens revoked, devices kicked (`user.password_reset`) | 4, 5, 7 |
+| §5.2 uniform signup; a new signup replaces an unverified account's password, handle and display name; `email.send` in the same transaction; link binds `{user_id, email, purpose, exp, pw}`; opening sets `email_verified_at` and writes `user.verified`, never signs in; unverified accounts can only resend | 4, 7 |
+| §5.3 login → registration token bound to the password hash, or tokens for an existing active device; `POST /v1/devices` with `registration_id` (idempotent retries), the 10-device limit and `device.registered`; refresh the only way to new access tokens, with a 30 s grace window for the token rotated last; list and revoke with `device.revoked` | 5, 7 |
+| §5.4 reset link `{user_id, purpose: reset, exp, pw}`, single use without state; all refresh tokens revoked, devices kicked (`user.password_reset`); the email verified (`user.verified` if it was not) | 4, 5, 7 |
 | §5.5 unique public handles, lookup without email, 20 per hour per user | 5, 6, 7 |
-| §5.6 Argon2id `m=19456, t=2, p=1` as PHC, rehash on login; rate limits per account and per IP on signup, login, resend, reset, lookup; never locked; links from a configured base URL; pages with `Referrer-Policy: no-referrer` | 2, 6, 7, 8 |
-| §7.6 strict DEV ONLY switches with a start-up warning; URLs never echoed; migrations on a dedicated connection; start-up retries interruptible | 8 |
+| §5.6 Argon2id `m=19456, t=2, p=1` as PHC, rehash on login, bounded queue; passwords of 8–128 characters; rate limits per account and per IP on signup, login (per account and IP), resend, reset, lookup, failing closed; never locked; links from a configured base URL; pages with `Referrer-Policy: no-referrer` | 2, 4, 6, 7, 8 |
+| §7.6 strict DEV ONLY switches with a start-up warning (the mailbox for local hosts only); URLs never echoed; migrations on a dedicated connection; start-up retries interruptible | 8 |
+| §12 failure test 4: Redis unavailable — the rate-limited endpoints answer a retryable `unavailable` | 6 |
 | §9 any service sends email by writing `email.send {user_id or address, template, params}` | 4 |
 | §12 integration tests against real Postgres and Redis | 1, 4–8 |
 
@@ -7340,11 +8421,24 @@ the controller merges after the final review.
 - **`GET /v1/users?ids=…`** (Plan 7): auth-svc asks message-svc which of the ids share a
   contact or conversation with the caller.
 - **Access tokens in the gateway** (Plan 8): verifying with the JWKS (cached), `ReAuth`,
-  4001/4002. An access token issued before a password reset stays valid until it expires
-  (at most 15 minutes) unless the gateway also refuses tokens older than the reset.
+  4001/4002, with `exp` required (decision 4). Until then, an access token issued before a
+  password reset (or for a refresh pair cut off in the grace window) stays valid until it
+  expires, at most 15 minutes; Plan 8 can refuse tokens older than the reset.
+- **No `iss` claim** in access tokens: only auth-svc issues them and the gateway checks
+  `aud` and the key; add one if a second issuer ever appears.
 - **Calibrating Argon2id** on the production VM (spec §13), raising the parameters there
   (hashes are upgraded on the next login).
-- **Cleanup jobs** for expired and rotated refresh tokens and old revoked devices
-  (Plan 6's worker).
+- **Cleanup jobs** (Plan 6's worker): expired and rotated refresh tokens, old revoked
+  devices, and **unverified accounts** that nobody verified (they hold an email address
+  and a handle until a new signup takes them over).
+- **A check against leaked passwords** (for example k-anonymity against a breached-password
+  list); for now the only rule is 8–128 characters.
+- **Link tokens in ingress access logs**: verify and reset links carry their token in the
+  query string, so ingress-nginx logs it with the `GET` of the page (Plan 11 configures
+  the production ingress's log format; the token is single-purpose and expires in 30
+  minutes).
+- **`cargo deny` / `cargo audit` in CI**, which would have flagged CVE-2026-25537 and will
+  flag the next advisory; until then advisories are checked by hand, and this one is
+  accepted (decision 4).
 - **Signing-key rotation** (several keys in the JWKS, `kid` selects); **email change**
   (out of scope in v1; links already bind the address).
