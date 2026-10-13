@@ -2205,6 +2205,7 @@ dependencies = [
 name = "push-worker"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "axum",
  "chrono",
@@ -2222,9 +2223,11 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-stream",
+ "tokio-util",
  "tonic 0.14.5",
  "tower",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
