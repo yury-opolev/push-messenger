@@ -96,6 +96,9 @@ impl IntoResponse for AuthError {
             Self::RateLimited { retry_after_s } => {
                 headers.insert(RETRY_AFTER, HeaderValue::from(retry_after_s));
             }
+            Self::Unavailable => {
+                headers.insert(RETRY_AFTER, HeaderValue::from_static("1"));
+            }
             Self::Unauthorized | Self::TokenExpired | Self::InvalidCredentials => {
                 headers.insert(WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
             }
@@ -162,7 +165,15 @@ impl FromRequestParts<Api> for ClientIp {
 
     async fn from_request_parts(parts: &mut Parts, api: &Api) -> Result<Self, Self::Rejection> {
         let from_header = api.client_ip_header.as_ref().and_then(|name| {
-            let value = parts.headers.get(name)?.to_str().ok()?;
+            // The last line: a proxy that appends its own line instead of joining it must
+            // not let the client's line win.
+            let value = parts
+                .headers
+                .get_all(name)
+                .iter()
+                .next_back()?
+                .to_str()
+                .ok()?;
             ip_from_header(value)
         });
         let peer = parts
