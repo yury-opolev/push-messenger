@@ -360,6 +360,10 @@ impl Auth {
             return Err(AuthError::InvalidCredentials);
         };
         let user_id: Uuid = account.get(0);
+        // Before any rehash: a new hash changes `pw` and would void pending links.
+        if !account.get::<bool, _>(2) {
+            return Err(AuthError::EmailNotVerified);
+        }
         let mut current = stored;
         if rehash {
             let new_hash = self.hash(password.to_owned()).await?;
@@ -376,9 +380,6 @@ impl Auth {
             if replaced.rows_affected() == 1 {
                 current = new_hash;
             }
-        }
-        if !account.get::<bool, _>(2) {
-            return Err(AuthError::EmailNotVerified);
         }
         Ok((user_id, current))
     }
