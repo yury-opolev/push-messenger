@@ -11,7 +11,11 @@ repository.workspace = true
 [dependencies]
 anyhow.workspace = true
 futures-util.workspace = true
+jsonwebtoken.workspace = true
 push-proto.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "time"] }
 tokio-tungstenite.workspace = true
 tonic.workspace = true
@@ -19,9 +23,11 @@ uuid.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["io-util"] }
+push-auth.workspace = true
 push-gateway.workspace = true
 push-message-svc.workspace = true
 push-store.workspace = true
+sqlx.workspace = true
 testcontainers-modules.workspace = true
 tokio-util.workspace = true
 

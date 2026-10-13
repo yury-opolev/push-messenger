@@ -1,6 +1,6 @@
 //! The walking skeleton on this machine: Postgres and Redis in containers (Docker must be
-//! running), message-svc and the gateway in this process, and the smoke test against
-//! them over real gRPC and WebSockets.
+//! running), auth-svc, message-svc and the gateway in this process, and the smoke test
+//! against them over real HTTP, gRPC and WebSockets.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -38,6 +38,51 @@ async fn the_smoke_test_passes_against_the_whole_stack() {
     );
     let shutdown = CancellationToken::new();
 
+    // auth-svc has a database of its own in the same server, as in the chart.
+    let admin = sqlx::PgPool::connect(&database_url).await.unwrap();
+    sqlx::query("CREATE DATABASE push_auth")
+        .execute(&admin)
+        .await
+        .unwrap();
+    admin.close().await;
+    let (server_url, _) = database_url.rsplit_once('/').unwrap();
+    let auth_database_url = format!("{server_url}/push_auth");
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let socket_url = format!("ws://{}/v1/socket", listener.local_addr().unwrap());
+    let auth_http = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let auth_health = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let auth_health_addr = auth_health.local_addr().unwrap();
+    let auth_url = format!("http://{}", auth_http.local_addr().unwrap());
+    let auth_variables = [
+        ("PUSH_DATABASE_URL", auth_database_url.as_str()),
+        ("PUSH_REDIS_URL", redis_url.as_str()),
+        ("PUSH_AUTH_PUBLIC_URL", "http://push.local"),
+        ("PUSH_AUTH_TOKEN_AUDIENCE", socket_url.as_str()),
+        // base64 of 32 bytes of 0x07 and of 0x09.
+        (
+            "PUSH_AUTH_SIGNING_KEY",
+            "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=",
+        ),
+        (
+            "PUSH_AUTH_LINK_KEY",
+            "CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk=",
+        ),
+        ("PUSH_DEV_MAILBOX", "1"),
+    ];
+    let auth_config = push_auth::Config::from_lookup(|name| {
+        auth_variables
+            .iter()
+            .find(|(key, _)| *key == name)
+            .map(|(_, value)| value.to_string())
+    })
+    .unwrap();
+    let auth = tokio::spawn(push_auth::serve(
+        auth_config,
+        auth_http,
+        auth_health,
+        shutdown.clone(),
+    ));
+
     let grpc = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let message_svc_health = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let message_svc_health_addr = message_svc_health.local_addr().unwrap();
@@ -56,10 +101,8 @@ async fn the_smoke_test_passes_against_the_whole_stack() {
         shutdown.clone(),
     ));
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let gateway_health = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let gateway_health_addr = gateway_health.local_addr().unwrap();
-    let socket_url = format!("ws://{}/v1/socket", listener.local_addr().unwrap());
     let gateway = tokio::spawn(push_gateway::serve(
         push_gateway::Config {
             message_svc_url: message_svc_url.clone(),
@@ -74,15 +117,21 @@ async fn the_smoke_test_passes_against_the_whole_stack() {
         shutdown.clone(),
     ));
 
+    wait_until_ready("auth-svc", auth_health_addr, &auth).await;
     wait_until_ready("message-svc", message_svc_health_addr, &message_svc).await;
     wait_until_ready("the gateway", gateway_health_addr, &gateway).await;
 
     let target = Target {
+        mailbox_url: auth_url.clone(),
+        auth_url,
         setup_url: message_svc_url,
         socket_url,
         host: None,
     };
-    run(&target).await.expect("the smoke test passes");
+    tokio::time::timeout(Duration::from_secs(120), run(&target))
+        .await
+        .expect("the smoke test finishes within 120 s")
+        .expect("the smoke test passes");
 
     shutdown.cancel();
     message_svc
@@ -90,6 +139,7 @@ async fn the_smoke_test_passes_against_the_whole_stack() {
         .unwrap()
         .expect("message-svc stops cleanly");
     gateway.await.unwrap().expect("the gateway stops cleanly");
+    auth.await.unwrap().expect("auth-svc stops cleanly");
 }
 
 /// Polls `/readyz` of a server task until it answers 200; fails if the task stops first.

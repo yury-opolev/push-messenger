@@ -1,0 +1,104 @@
+{{- $name := include "push.name" (dict "root" . "component" "auth") -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "push.labels" (dict "root" . "component" "auth") | nindent 4 }}
+spec:
+  selector:
+    {{- include "push.selector" (dict "root" . "component" "auth") | nindent 4 }}
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "push.labels" (dict "root" . "component" "auth") | nindent 4 }}
+spec:
+  replicas: {{ .Values.auth.replicas }}
+  selector:
+    matchLabels:
+      {{- include "push.selector" (dict "root" . "component" "auth") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "push.labels" (dict "root" . "component" "auth") | nindent 8 }}
+      {{- with .Values.buildId }}
+      annotations:
+        push-messenger/build-id: {{ . | quote }}
+      {{- end }}
+    spec:
+      automountServiceAccountToken: false
+      # Shutdown budget, as for the gateway: the 5 s preStop sleep lets Kubernetes take
+      # the pod out of the Service and Ingress endpoints before SIGTERM, on which
+      # auth-svc stops accepting, finishes the requests in progress and closes its pool.
+      # Native sleep action: the image has no shell.
+      terminationGracePeriodSeconds: {{ .Values.auth.terminationGracePeriodSeconds }}
+      containers:
+        - name: auth
+          image: {{ include "push.image" .Values.images.auth }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          {{- include "push.containerSecurity" . | nindent 10 }}
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: 5
+          env:
+            # Its own database only: auth-svc never sees message-svc's credentials.
+            - name: PUSH_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "push.secretName" . }}
+                  key: auth-database-url
+            - name: PUSH_REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "push.secretName" . }}
+                  key: redis-url
+            - name: PUSH_AUTH_SIGNING_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "push.secretName" . }}
+                  key: auth-signing-key
+            - name: PUSH_AUTH_LINK_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "push.secretName" . }}
+                  key: auth-link-key
+            # Email links are built from this, never from a request's Host header.
+            - name: PUSH_AUTH_PUBLIC_URL
+              value: {{ include "push.publicUrl" . | quote }}
+            - name: PUSH_AUTH_TOKEN_AUDIENCE
+              value: {{ include "push.socketUrl" . | quote }}
+            # ingress-nginx overwrites X-Real-IP with the client's address.
+            - name: PUSH_AUTH_CLIENT_IP_HEADER
+              value: x-real-ip
+            - name: PUSH_AUTH_HASH_CONCURRENCY
+              value: {{ .Values.auth.hashConcurrency | quote }}
+            - name: PUSH_DB_MAX_CONNECTIONS
+              value: {{ .Values.auth.dbMaxConnections | quote }}
+            - name: PUSH_DEV_MAILBOX
+              value: {{ include "push.devFlag" . | quote }}
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: health
+              containerPort: 8081
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.auth.resources | nindent 12 }}

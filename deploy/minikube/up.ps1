@@ -73,6 +73,43 @@ if ($jobs) {
     }
 }
 
+# PostgreSQL runs the init script that creates auth-svc's database only when it
+# initialises an empty volume. A volume from before auth-svc (Plan 4B) has no push_auth,
+# and auth-svc would never become ready: stop now, not after five slow install attempts.
+$predatesAuth = "The Postgres volume predates auth-svc: it has no push_auth database, and PostgreSQL creates one only on an empty volume. Run deploy/minikube/down.ps1 -Cluster $Cluster first (it deletes the cluster's data), then run this script again."
+# A plain `helm uninstall` removes the StatefulSet but keeps the volume and the Secret
+# (helm.sh/resource-policy: keep), so the Secret is the evidence that survives it.
+$secretName = "$release-secrets"
+$secret = kubectl --context $Cluster -n $namespace get secret $secretName -o name --ignore-not-found
+if ($LASTEXITCODE -ne 0) {
+    throw "looking for the kept Secret failed (exit code $LASTEXITCODE)"
+}
+if ($secret) {
+    $authPassword = kubectl --context $Cluster -n $namespace get secret $secretName -o jsonpath='{.data.auth-db-password}'
+    if ($LASTEXITCODE -ne 0) {
+        throw "reading the kept Secret failed (exit code $LASTEXITCODE)"
+    }
+    if (-not $authPassword) {
+        throw "The kept Secret $secretName has no auth-db-password: it predates auth-svc. $predatesAuth"
+    }
+}
+$postgres = kubectl --context $Cluster -n $namespace get statefulset push-postgres -o name --ignore-not-found
+if ($LASTEXITCODE -ne 0) {
+    throw "looking for an earlier Postgres failed (exit code $LASTEXITCODE)"
+}
+if ($postgres) {
+    Invoke-Step 'check that the Postgres volume has the push_auth database' {
+        kubectl --context $Cluster -n $namespace rollout status statefulset/push-postgres --timeout=300s
+    }
+    $hasAuth = kubectl --context $Cluster -n $namespace exec push-postgres-0 -- psql -U push -d postgres -Atc "SELECT count(*) FROM pg_database WHERE datname = 'push_auth'"
+    if ($LASTEXITCODE -ne 0) {
+        throw "checking the Postgres volume failed (exit code $LASTEXITCODE)"
+    }
+    if ("$hasAuth".Trim() -ne '1') {
+        throw $predatesAuth
+    }
+}
+
 # Build into the cluster's own Docker daemon, so the pods find the images without a
 # registry. The DOCKER_* variables are restored afterwards.
 $dockerVariables = 'DOCKER_TLS_VERIFY', 'DOCKER_HOST', 'DOCKER_CERT_PATH', 'MINIKUBE_ACTIVE_DOCKERD'
@@ -87,7 +124,7 @@ try {
     }
     $dockerEnv | Out-String | Invoke-Expression
     if (-not $SkipBuild) {
-        foreach ($target in 'message-svc', 'gateway', 'smoke') {
+        foreach ($target in 'auth', 'message-svc', 'gateway', 'smoke') {
             Invoke-Step "build push-messenger/${target}:dev" {
                 docker build -f $dockerfile --target $target -t "push-messenger/${target}:dev" $root
             }
@@ -95,7 +132,7 @@ try {
     }
     # The image ids name the build: a rebuilt image rolls the pods, an unchanged one
     # does not.
-    $ids = docker image inspect --format '{{.Id}}' push-messenger/message-svc:dev push-messenger/gateway:dev push-messenger/smoke:dev
+    $ids = docker image inspect --format '{{.Id}}' push-messenger/auth:dev push-messenger/message-svc:dev push-messenger/gateway:dev push-messenger/smoke:dev
     if ($LASTEXITCODE -ne 0) {
         throw 'the images are not in the cluster yet; run without -SkipBuild'
     }
@@ -132,6 +169,7 @@ Write-Host "push-messenger is up: minikube profile '$Cluster', namespace '$names
 Write-Host 'The gateway is behind ingress-nginx at ws://push.local/v1/socket. From this machine:'
 Write-Host "  kubectl --context $Cluster -n ingress-nginx port-forward svc/ingress-nginx-controller 8080:80"
 Write-Host '  then connect to ws://127.0.0.1:8080/v1/socket with the header "Host: push.local".'
+Write-Host '  auth-svc answers on the same port: http://127.0.0.1:8080/v1/auth/..., /v1/devices, /v1/users.'
 Write-Host "Smoke test: deploy/minikube/up.ps1 -Cluster $Cluster -SkipBuild -Smoke"
 Write-Host "Tear down:  deploy/minikube/down.ps1 -Cluster $Cluster"
 

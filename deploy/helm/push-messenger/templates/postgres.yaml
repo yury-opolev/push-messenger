@@ -41,7 +41,8 @@ spec:
             - name: postgres
               containerPort: 5432
           env:
-            # One database per service: message-svc owns push_messaging.
+            # One database per service: message-svc owns push_messaging; the init script
+            # creates push_auth for auth-svc.
             - name: POSTGRES_DB
               value: push_messaging
             - name: POSTGRES_USER
@@ -53,6 +54,11 @@ spec:
                   key: postgres-password
             - name: PGDATA
               value: /var/lib/postgresql/data/pgdata
+            - name: PUSH_AUTH_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "push.secretName" . }}
+                  key: auth-db-password
           readinessProbe:
             exec:
               command: ["pg_isready", "-U", "push", "-d", "push_messaging", "-h", "127.0.0.1"]
@@ -67,6 +73,13 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /var/lib/postgresql/data
+            - name: init
+              mountPath: /docker-entrypoint-initdb.d
+              readOnly: true
+      volumes:
+        - name: init
+          configMap:
+            name: {{ include "push.name" (dict "root" . "component" "postgres-init") }}
   volumeClaimTemplates:
     - metadata:
         name: data

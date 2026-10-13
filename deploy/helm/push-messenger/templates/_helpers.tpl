@@ -20,6 +20,26 @@ app.kubernetes.io/instance: {{ .root.Release.Name }}
 {{- printf "%s-secrets" .Release.Name -}}
 {{- end -}}
 
+{{/*
+The base URL clients reach the API at: email links start with it. Plain http only for a
+local host, as auth-svc itself insists.
+*/}}
+{{- define "push.publicUrl" -}}
+{{- if not (has .Values.ingress.scheme (list "https" "http")) -}}
+{{- fail (printf "ingress.scheme must be https or http, not %q" .Values.ingress.scheme) -}}
+{{- end -}}
+{{- $host := .Values.ingress.host -}}
+{{- if and (eq .Values.ingress.scheme "http") (not (or (hasSuffix ".local" $host) (hasSuffix ".localhost" $host) (hasSuffix ".test" $host))) -}}
+{{- fail (printf "ingress.scheme http is only allowed with a local ingress host (*.local, *.localhost or *.test), not %q" $host) -}}
+{{- end -}}
+{{- printf "%s://%s" .Values.ingress.scheme .Values.ingress.host -}}
+{{- end -}}
+
+{{/* The gateway's WebSocket URL: the audience of access tokens. */}}
+{{- define "push.socketUrl" -}}
+{{- printf "%s://%s/v1/socket" (ternary "wss" "ws" (eq .Values.ingress.scheme "https")) .Values.ingress.host -}}
+{{- end -}}
+
 {{- define "push.image" -}}
 {{- printf "%s:%s" .repository .tag -}}
 {{- end -}}

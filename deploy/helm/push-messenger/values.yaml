@@ -3,6 +3,9 @@
 # chart refuses dev mode for an ingress host that is not local (see _helpers.tpl).
 
 images:
+  auth:
+    repository: push-messenger/auth
+    tag: dev
   messageSvc:
     repository: push-messenger/message-svc
     tag: dev
@@ -14,13 +17,14 @@ images:
     tag: dev
   pullPolicy: IfNotPresent
 
-# Changing this rolls out new gateway and message-svc pods even when the image tags stay
-# the same (the bring-up script sets it after rebuilding the images).
+# Changing this rolls out new auth, gateway and message-svc pods even when the image tags
+# stay the same (the bring-up script sets it after rebuilding the images).
 buildId: ""
 
 # DEV ONLY switches: the gateway accepts identities without a token (PUSH_DEV_AUTH=1),
-# message-svc serves the DevSetup API (PUSH_DEV_SETUP=1), and `helm test` runs the
-# smoke test. Never enable outside a local cluster.
+# message-svc serves the DevSetup API (PUSH_DEV_SETUP=1), auth-svc serves the outbox's
+# email links at /dev/mailbox (PUSH_DEV_MAILBOX=1), and `helm test` runs the smoke test.
+# Never enable outside a local cluster.
 devMode:
   enabled: false
   # Must be exactly "insecure-local-only" when enabled.
@@ -40,6 +44,26 @@ gateway:
       cpu: 500m
       memory: 256Mi
 
+auth:
+  replicas: 1
+  # 5 s preStop sleep + finishing the requests in progress (a password hash waits at
+  # most 2 s for its turn) + margin.
+  terminationGracePeriodSeconds: 30
+  dbMaxConnections: 10
+  # Password hashes computed at once; each takes 19 MiB (Argon2id, spec §5.6).
+  hashConcurrency: 2
+  # Empty: generated on install and kept on upgrades. The Ed25519 seed that signs access
+  # tokens and the HMAC key of email links and registration tokens, base64 of 32 bytes.
+  signingKey: ""
+  linkKey: ""
+  resources:
+    requests:
+      cpu: 100m
+      memory: 64Mi
+    limits:
+      cpu: "1"
+      memory: 256Mi
+
 messageSvc:
   replicas: 1
   terminationGracePeriodSeconds: 30
@@ -57,6 +81,8 @@ postgres:
   # Empty: generated on install and kept on upgrades. If set, use letters and digits
   # only (it is part of a URL).
   password: ""
+  # The password of auth-svc's own role, push_auth; the same rules.
+  authPassword: ""
   storage: 1Gi
   # Empty: the cluster's default storage class.
   storageClassName: ""
@@ -84,11 +110,18 @@ ingress:
   enabled: true
   className: nginx
   host: push.example.com
+  # The scheme clients use: email links start with `<scheme>://<host>` and access tokens
+  # name the gateway at `ws[s]://<host>/v1/socket`. TLS comes with the Azure plan; plain
+  # http is accepted only for a local host.
+  scheme: https
   # nginx closes a proxied connection that is silent for this long; clients ping every
   # 30 s (spec §7.5).
   timeoutSeconds: 120
 
 smoke:
+  # auth-svc's public API as the smoke test reaches it: the ingress controller, with
+  # `ingress.host` as the Host header.
+  authUrl: http://ingress-nginx-controller.ingress-nginx.svc.cluster.local
   # The WebSocket URL the smoke test connects to: the ingress controller inside the
   # cluster, with `ingress.host` as the Host header, so the test goes through the
   # ingress like a client.
