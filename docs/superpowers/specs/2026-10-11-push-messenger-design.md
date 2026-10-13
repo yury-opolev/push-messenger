@@ -313,6 +313,7 @@ Implementation notes (push-worker, migration `0001_worker.sql`, Plan 6A):
   resets its `created_at`), and buried jobs, email records and delivery events older than 30
   days. The suppression list is kept. A buried `email.send` job keeps the recipient address
   in its payload until `delete_dead` removes it with the other buried jobs after 30 days.
+
 The worker claims work with `SELECT … FOR UPDATE SKIP LOCKED`, so it scales to several
 replicas without coordination, and work held by a crashed worker is claimed again.
 
@@ -960,7 +961,7 @@ Implementation notes (push-email, push-worker, Plan 6A):
 - Templates `verify_email`, `account_exists` and `reset_password`, as plain text and minimal
   HTML with escaped parameters; the product name is configurable.
 - `ResendSender` posts to `/emails` with the email's id as `Idempotency-Key` and a
-  `template` tag; 429, 409, 5xx, 401/403 and transport errors are retried, other refusals
+  `template` tag; 408, 429, 409, 5xx, 401/403 and transport errors are retried, other refusals
   fail the email. It uses rustls on `ring`.
 - `ResendWebhooks` checks the Svix signature (`v1,` HMAC-SHA256 of
   `{svix-id}.{svix-timestamp}.{body}`) and refuses timestamps more than 5 minutes off;

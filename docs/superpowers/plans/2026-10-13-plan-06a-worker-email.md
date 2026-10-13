@@ -7711,6 +7711,14 @@ impl Config {
             Sender::Log => set("PUSH_EMAIL_FROM").unwrap_or_default(),
             Sender::Resend { .. } => required("PUSH_EMAIL_FROM")?,
         };
+        if from.chars().any(char::is_control) {
+            return Err(ConfigError::Invalid {
+                name: "PUSH_EMAIL_FROM",
+                value: from,
+                reason: "must not contain control characters (it goes into an email header)"
+                    .to_owned(),
+            });
+        }
         let product_name =
             set("PUSH_EMAIL_PRODUCT_NAME").unwrap_or_else(|| "Push Messenger".to_owned());
         if product_name.chars().any(char::is_control) {
@@ -8001,6 +8009,16 @@ mod tests {
         }
         let accented = config(&with(&[("PUSH_EMAIL_PRODUCT_NAME", "Æble Chat")])).unwrap();
         assert_eq!(accented.product_name, "Æble Chat");
+        assert!(matches!(
+            config(&with(&[(
+                "PUSH_EMAIL_FROM",
+                "Push <no-reply@push.test>\r\nBcc: victim@example.com"
+            )])),
+            Err(ConfigError::Invalid {
+                name: "PUSH_EMAIL_FROM",
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -8856,7 +8874,7 @@ git add Cargo.lock crates/push-worker
 git commit -m "feat(worker): configuration, serving and graceful shutdown"
 ```
 
-Expected: 778 tests pass.
+Expected: 780 tests pass.
 
 ---
 
@@ -9003,7 +9021,7 @@ cargo test --workspace --locked
 cargo +1.85 test --workspace --locked
 ```
 
-Expected: no diff, no warnings, 778 tests on both toolchains.
+Expected: no diff, no warnings, 780 tests on both toolchains.
 
 - [ ] **Step 5: Commit and push**
 
@@ -9017,7 +9035,7 @@ git push -u origin feature/plan-06a-worker-email
 
 ```powershell
 $body = @'
-Implements docs/superpowers/plans/2026-10-13-plan-06a-worker-email.md: push-email (templates, the EmailSender trait with a log sender and a Resend sender on rustls/ring, Svix-verified Resend webhooks) and push-worker (its own database and schema; a job queue claimed with FOR UPDATE SKIP LOCKED, leased, retried with backoff, poison buried; the outbox relay from auth.outbox, at least once; account events relayed to message-svc's new Accounts API; email.send rendered, suppression-checked, recorded and sent once; webhooks feeding the suppression list; hourly cleanups of expired refresh tokens, unverified accounts and old records; health, graceful shutdown). message-svc serves Accounts (idempotent, any order converges: a revocation before the registration wins) to the worker alone, behind a shared internal token; Identify answers a device not relayed yet with a retryable UNAVAILABLE instead of the revoked-device error; claims take at most 4 jobs, outcomes are fenced by the claim, jobs not started are given back at shutdown, and buried jobs keep no link; auth-svc grants the worker's role the outbox and two cleanup functions at start-up, and a signup over an unverified account resets its clock. 778 tests.
+Implements docs/superpowers/plans/2026-10-13-plan-06a-worker-email.md: push-email (templates, the EmailSender trait with a log sender and a Resend sender on rustls/ring, Svix-verified Resend webhooks) and push-worker (its own database and schema; a job queue claimed with FOR UPDATE SKIP LOCKED, leased, retried with backoff, poison buried; the outbox relay from auth.outbox, at least once; account events relayed to message-svc's new Accounts API; email.send rendered, suppression-checked, recorded and sent once; webhooks feeding the suppression list; hourly cleanups of expired refresh tokens, unverified accounts and old records; health, graceful shutdown). message-svc serves Accounts (idempotent, any order converges: a revocation before the registration wins) to the worker alone, behind a shared internal token; Identify answers a device not relayed yet with a retryable UNAVAILABLE instead of the revoked-device error; claims take at most 4 jobs, outcomes are fenced by the claim, jobs not started are given back at shutdown, and buried jobs keep no link; auth-svc grants the worker's role the outbox and two cleanup functions at start-up, and a signup over an unverified account resets its clock. 780 tests.
 
 Plan 6B moves the smoke test to the real flow and puts the worker on minikube.
 '@
@@ -9057,7 +9075,7 @@ own.
 - **push-worker (Tasks 5 to 9):** `email_message.params` has `CHECK (NOT params ? 'link')`;
   the stale-claim test claims with a separate 60 s-lease queue; the `Accounts` token
   metadata is marked sensitive; a failed email is marked only while queued; cleanup
-  failures are logged; the product name refuses control characters.
+  failures are logged; the product name and the From address refuse control characters.
 - **Retention:** a buried `email.send` job keeps the recipient address until `delete_dead`
   removes it after 30 days.
 
