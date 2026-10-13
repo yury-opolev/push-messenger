@@ -7,6 +7,7 @@
 mod db;
 mod devices;
 mod error;
+pub mod limits;
 pub mod links;
 pub mod outbox;
 pub mod password;

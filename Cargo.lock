@@ -1982,12 +1982,14 @@ name = "push-auth"
 version = "0.1.0"
 dependencies = [
  "argon2",
+ "async-trait",
  "base64",
  "chrono",
  "hmac",
  "jsonwebtoken",
  "push-store",
  "rand 0.9.5",
+ "redis",
  "ring",
  "serde",
  "serde_json",
@@ -1996,6 +1998,7 @@ dependencies = [
  "testcontainers-modules",
  "thiserror",
  "tokio",
+ "tokio-util",
  "tracing",
  "uuid",
 ]

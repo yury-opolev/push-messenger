@@ -10,19 +10,22 @@ repository.workspace = true
 
 [dependencies]
 argon2.workspace = true
+async-trait.workspace = true
 base64.workspace = true
 chrono.workspace = true
 hmac.workspace = true
 jsonwebtoken.workspace = true
 push-store.workspace = true
 rand.workspace = true
+redis.workspace = true
 ring.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["rt", "time"] }
+tokio = { workspace = true, features = ["macros", "rt", "time"] }
+tokio-util.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 
