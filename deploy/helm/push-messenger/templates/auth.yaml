@@ -82,8 +82,10 @@ spec:
               value: {{ .Values.auth.hashConcurrency | quote }}
             - name: PUSH_DB_MAX_CONNECTIONS
               value: {{ .Values.auth.dbMaxConnections | quote }}
-            - name: PUSH_DEV_MAILBOX
-              value: {{ include "push.devFlag" . | quote }}
+            # The role the worker connects as: auth-svc grants it auth.outbox and the two
+            # cleanup functions at start-up (the Postgres init script creates it).
+            - name: PUSH_AUTH_WORKER_ROLE
+              value: push_worker
           ports:
             - name: http
               containerPort: 8080

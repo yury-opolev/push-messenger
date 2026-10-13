@@ -1,8 +1,8 @@
 {{- if include "push.devMode" . -}}
 # `helm test <release>` runs the end-to-end smoke test inside the cluster: auth-svc's public
 # API and the WebSockets go through the ingress controller with the ingress host as the
-# Host header, as a client's would; the DEV ONLY mailbox and setup calls go straight to
-# auth-svc and message-svc, which the ingress does not expose.
+# Host header, as a client's would; the DEV ONLY mailbox and the calls to message-svc go
+# straight to the worker and message-svc, which the ingress does not expose.
 apiVersion: v1
 kind: Pod
 metadata:
@@ -24,7 +24,7 @@ spec:
         - --auth
         - {{ .Values.smoke.authUrl | quote }}
         - --mailbox
-        - {{ printf "http://%s:8080" (include "push.name" (dict "root" . "component" "auth")) | quote }}
+        - {{ printf "http://%s:8080" (include "push.name" (dict "root" . "component" "worker")) | quote }}
         - --setup
         - {{ printf "http://%s:50051" (include "push.name" (dict "root" . "component" "message-svc")) | quote }}
         - --socket
