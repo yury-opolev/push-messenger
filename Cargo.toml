@@ -23,8 +23,11 @@ anyhow = "1"
 argon2 = { version = "0.5", features = ["std"] }
 async-trait = "0.1"
 axum = "0.8"
+base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+hmac = "0.12"
+jsonwebtoken = { version = "9", default-features = false }
 libtest-mimic = "0.8"
 prost = "0.14"
 protoc-bin-vendored = "3"
@@ -35,12 +38,15 @@ push-message-svc = { path = "crates/push-message-svc" }
 push-proto = { path = "crates/push-proto" }
 push-store = { path = "crates/push-store" }
 push-testkit = { path = "crates/push-testkit" }
+rand = "0.9"
 redis = { version = "1", default-features = false, features = [
     "connection-manager",
     "tokio-comp",
 ] }
+ring = "0.17"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = [
     "chrono",
     "macros",
