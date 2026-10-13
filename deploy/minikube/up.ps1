@@ -76,6 +76,23 @@ if ($jobs) {
 # PostgreSQL runs the init script that creates auth-svc's database only when it
 # initialises an empty volume. A volume from before auth-svc (Plan 4B) has no push_auth,
 # and auth-svc would never become ready: stop now, not after five slow install attempts.
+$predatesAuth = "The Postgres volume predates auth-svc: it has no push_auth database, and PostgreSQL creates one only on an empty volume. Run deploy/minikube/down.ps1 -Cluster $Cluster first (it deletes the cluster's data), then run this script again."
+# A plain `helm uninstall` removes the StatefulSet but keeps the volume and the Secret
+# (helm.sh/resource-policy: keep), so the Secret is the evidence that survives it.
+$secretName = "$release-secrets"
+$secret = kubectl --context $Cluster -n $namespace get secret $secretName -o name --ignore-not-found
+if ($LASTEXITCODE -ne 0) {
+    throw "looking for the kept Secret failed (exit code $LASTEXITCODE)"
+}
+if ($secret) {
+    $authPassword = kubectl --context $Cluster -n $namespace get secret $secretName -o jsonpath='{.data.auth-db-password}'
+    if ($LASTEXITCODE -ne 0) {
+        throw "reading the kept Secret failed (exit code $LASTEXITCODE)"
+    }
+    if (-not $authPassword) {
+        throw "The kept Secret $secretName has no auth-db-password: it predates auth-svc. $predatesAuth"
+    }
+}
 $postgres = kubectl --context $Cluster -n $namespace get statefulset push-postgres -o name --ignore-not-found
 if ($LASTEXITCODE -ne 0) {
     throw "looking for an earlier Postgres failed (exit code $LASTEXITCODE)"
@@ -89,7 +106,7 @@ if ($postgres) {
         throw "checking the Postgres volume failed (exit code $LASTEXITCODE)"
     }
     if ("$hasAuth".Trim() -ne '1') {
-        throw "The Postgres volume predates auth-svc: it has no push_auth database, and PostgreSQL creates one only on an empty volume. Run deploy/minikube/down.ps1 -Cluster $Cluster first (it deletes the cluster's data), then run this script again."
+        throw $predatesAuth
     }
 }
 

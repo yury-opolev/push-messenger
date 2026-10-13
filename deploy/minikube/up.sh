@@ -51,6 +51,18 @@ fi
 # PostgreSQL runs the init script that creates auth-svc's database only when it
 # initialises an empty volume. A volume from before auth-svc (Plan 4B) has no push_auth,
 # and auth-svc would never become ready: stop now, not after five slow install attempts.
+predates_auth="The Postgres volume predates auth-svc: it has no push_auth database, and PostgreSQL creates one only on an empty volume. Run deploy/minikube/down.sh --cluster $cluster first (it deletes the cluster's data), then run this script again."
+# A plain `helm uninstall` removes the StatefulSet but keeps the volume and the Secret
+# (helm.sh/resource-policy: keep), so the Secret is the evidence that survives it.
+secret_name="$release-secrets"
+secret="$(kubectl --context "$cluster" -n "$namespace" get secret "$secret_name" -o name --ignore-not-found)"
+if [[ -n "$secret" ]]; then
+  auth_password="$(kubectl --context "$cluster" -n "$namespace" get secret "$secret_name" -o jsonpath='{.data.auth-db-password}')"
+  if [[ -z "$auth_password" ]]; then
+    echo "The kept Secret $secret_name has no auth-db-password: it predates auth-svc. $predates_auth" >&2
+    exit 1
+  fi
+fi
 postgres="$(kubectl --context "$cluster" -n "$namespace" get statefulset push-postgres -o name --ignore-not-found)"
 if [[ -n "$postgres" ]]; then
   step 'check that the Postgres volume has the push_auth database'
@@ -61,7 +73,7 @@ if [[ -n "$postgres" ]]; then
     exit 1
   fi
   if [[ "$has_auth" != 1 ]]; then
-    echo "The Postgres volume predates auth-svc: it has no push_auth database, and PostgreSQL creates one only on an empty volume. Run deploy/minikube/down.sh --cluster $cluster first (it deletes the cluster's data), then run this script again." >&2
+    echo "$predates_auth" >&2
     exit 1
   fi
 fi

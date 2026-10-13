@@ -976,7 +976,8 @@ Implementation notes (local minikube, Plan 4B):
 - Deferred to Plan 11: validate hand-set auth keys at render time; `x-real-ip` on Azure
   needs `externalTrafficPolicy: Local` or the PROXY protocol; nginx error-log token exposure.
 - Shutdown: the gateway has a `lifecycle.preStop.sleep.seconds: 5` (ingress-nginx stops
-  routing to it before SIGTERM) and both Deployments set `terminationGracePeriodSeconds: 30`.
+  routing to it before SIGTERM) and all three Deployments (gateway,
+  message-svc, auth-svc) set `terminationGracePeriodSeconds: 30`.
 - Hardening: Redis runs non-root (uid 999) with a read-only root filesystem; the data pods
   use `automountServiceAccountToken: false` and the `RuntimeDefault` seccomp profile.
 - The chart Secret carries `helm.sh/resource-policy: keep`, so `helm uninstall` keeps the

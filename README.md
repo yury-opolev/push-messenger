@@ -28,7 +28,8 @@ installed:
 starts (or reuses) the minikube profile `push`, enables its ingress addon, builds the
 images into the cluster, installs the chart (`deploy/helm/push-messenger`) with
 `values-minikube.yaml`, and runs the end-to-end smoke test: two users sign up, verify their
-email, register a device and chat, all through the ingress. `deploy/minikube/up.sh --smoke`
+email, register a device and chat through the ingress; the DEV ONLY mailbox and the setup calls go
+to the services directly. `deploy/minikube/up.sh --smoke`
 does the same on Linux and macOS. Both wait for ingress-nginx and retry
 `helm upgrade --install` up to 5 times while its admission webhook comes up.
 `deploy/minikube/down.ps1` removes everything again: namespace, the
@@ -46,8 +47,9 @@ is local (`*.local`, `*.localhost` or `*.test`). `pwsh deploy/helm/test-chart.ps
 the chart without a cluster.
 
 auth-svc has a database and a role of its own, `push_auth`, which PostgreSQL's init script
-creates when it initialises an empty volume. A cluster that still holds a release from before
-auth-svc (Plan 4B) has no such database; `up` notices and stops: run
+creates when it initialises an empty volume. A cluster whose Postgres volume predates auth-svc
+(Plan 4B) has no such database. `up` stops when the kept Secret `push-secrets` (it survives a plain
+`helm uninstall`) has no `auth-db-password`, or when the running Postgres has no `push_auth`: run
 `deploy/minikube/down.ps1` once, then `up` again.
 
 The smoke client checks the access token's audience (`socket_url` with its authority
