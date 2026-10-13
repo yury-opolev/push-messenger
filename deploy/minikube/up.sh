@@ -48,6 +48,24 @@ if [[ -n "$jobs" ]]; then
   kubectl --context "$cluster" -n ingress-nginx wait --for=condition=complete job --all --timeout=300s
 fi
 
+# PostgreSQL runs the init script that creates auth-svc's database only when it
+# initialises an empty volume. A volume from before auth-svc (Plan 4B) has no push_auth,
+# and auth-svc would never become ready: stop now, not after five slow install attempts.
+postgres="$(kubectl --context "$cluster" -n "$namespace" get statefulset push-postgres -o name --ignore-not-found)"
+if [[ -n "$postgres" ]]; then
+  step 'check that the Postgres volume has the push_auth database'
+  kubectl --context "$cluster" -n "$namespace" rollout status statefulset/push-postgres --timeout=300s
+  if ! has_auth="$(kubectl --context "$cluster" -n "$namespace" exec push-postgres-0 -- \
+    psql -U push -d postgres -Atc "SELECT count(*) FROM pg_database WHERE datname = 'push_auth'")"; then
+    echo 'checking the Postgres volume failed' >&2
+    exit 1
+  fi
+  if [[ "$has_auth" != 1 ]]; then
+    echo "The Postgres volume predates auth-svc: it has no push_auth database, and PostgreSQL creates one only on an empty volume. Run deploy/minikube/down.sh --cluster $cluster first (it deletes the cluster's data), then run this script again." >&2
+    exit 1
+  fi
+fi
+
 # Point docker at the cluster's own Docker daemon. Called in subshells only, so the
 # DOCKER_* variables do not leak into this script.
 use_cluster_docker() {
@@ -61,7 +79,7 @@ use_cluster_docker() {
 if [[ "$skip_build" == false ]]; then
   (
     use_cluster_docker
-    for target in message-svc gateway smoke; do
+    for target in auth message-svc gateway smoke; do
       step "build push-messenger/$target:dev"
       docker build -f "$root/deploy/docker/Dockerfile" --target "$target" -t "push-messenger/$target:dev" "$root"
     done
@@ -69,7 +87,8 @@ if [[ "$skip_build" == false ]]; then
 fi
 # The image ids name the build: a rebuilt image rolls the pods, an unchanged one does not.
 if ! ids="$(use_cluster_docker && docker image inspect --format '{{.Id}}' \
-  push-messenger/message-svc:dev push-messenger/gateway:dev push-messenger/smoke:dev)"; then
+  push-messenger/auth:dev push-messenger/message-svc:dev push-messenger/gateway:dev \
+  push-messenger/smoke:dev)"; then
   echo 'the images are not in the cluster yet; run without --skip-build' >&2
   exit 1
 fi
@@ -103,6 +122,7 @@ echo "push-messenger is up: minikube profile '$cluster', namespace '$namespace'.
 echo 'The gateway is behind ingress-nginx at ws://push.local/v1/socket. From this machine:'
 echo "  kubectl --context $cluster -n ingress-nginx port-forward svc/ingress-nginx-controller 8080:80"
 echo '  then connect to ws://127.0.0.1:8080/v1/socket with the header "Host: push.local".'
+echo '  auth-svc answers on the same port: http://127.0.0.1:8080/v1/auth/..., /v1/devices, /v1/users.'
 
 if [[ "$smoke" == true ]]; then
   step 'run the smoke test'
