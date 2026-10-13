@@ -199,6 +199,10 @@ fn key(value: &str, name: &'static str) -> Result<Vec<u8>, ConfigError> {
 
 /// Checks a public URL: `secure` scheme, or `local` only for a local host.
 fn check_url(url: &str, secure: &str, local: &str) -> Result<(), String> {
+    // No userinfo or backslashes: either could make the host check read the wrong host.
+    if url.contains(['@', '\\']) {
+        return Err("must be a plain URL with a host, without user info".to_owned());
+    }
     let rest = if let Some(rest) = url.strip_prefix(secure) {
         rest
     } else if let Some(rest) = url.strip_prefix(local) {
@@ -463,6 +467,16 @@ mod tests {
                 ),
                 "{url}"
             );
+        }
+        for url in [
+            "https://evil.com\\.test",
+            "https://user@evil.com",
+            "http://evil.com@push.test",
+        ] {
+            let mut variables = with("PUSH_DEV_MAILBOX", "1");
+            variables.retain(|(key, _)| *key != "PUSH_AUTH_PUBLIC_URL");
+            variables.push(("PUSH_AUTH_PUBLIC_URL", url));
+            assert!(config(&variables).is_err(), "{url}");
         }
     }
 

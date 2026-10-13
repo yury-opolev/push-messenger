@@ -35,8 +35,14 @@ fn config(database_url: &str, redis_url: &str) -> Config {
     .unwrap()
 }
 
-/// `GET path` over a plain socket: the status code and the body.
+/// `GET path` over a plain socket: the status code and the body, or `(0, "")` after 5 s.
 async fn get(addr: SocketAddr, path: &str) -> (u16, String) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), get_once(addr, path))
+        .await
+        .unwrap_or((0, String::new()))
+}
+
+async fn get_once(addr: SocketAddr, path: &str) -> (u16, String) {
     let Ok(mut stream) = TcpStream::connect(addr).await else {
         return (0, String::new());
     };

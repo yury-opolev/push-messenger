@@ -159,7 +159,8 @@ fn health_router(health: Health) -> Router {
         .with_state(health)
 }
 
-/// Ready once the database is migrated and answers. Redis is not checked: without it only
+/// Ready once the database is migrated and answers. Start-up waits for the first Redis
+/// connection, but Redis is not checked afterwards: without it only
 /// the rate-limited endpoints refuse (with a retryable `unavailable`, see `limits`), while
 /// refresh, devices and profiles keep working.
 async fn readyz(State(health): State<Health>) -> (StatusCode, &'static str) {
