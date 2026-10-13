@@ -122,7 +122,10 @@ impl Mailer {
                 })
             }
             Err(SendError::Retryable(reason) | SendError::Permanent(reason)) => {
-                sqlx::query("UPDATE worker.email_message SET status = $2 WHERE email_id = $1")
+                // Only while still queued: a late duplicate run must not undo a send.
+                sqlx::query(
+                    "UPDATE worker.email_message SET status = $2 WHERE email_id = $1 AND status = 1",
+                )
                     .bind(job.id)
                     .bind(FAILED)
                     .execute(&self.pool)
