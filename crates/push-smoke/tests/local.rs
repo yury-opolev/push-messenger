@@ -47,6 +47,8 @@ async fn the_smoke_test_passes_against_the_whole_stack() {
     admin.close().await;
     let (server_url, _) = database_url.rsplit_once('/').unwrap();
     let auth_database_url = format!("{server_url}/push_auth");
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let socket_url = format!("ws://{}/v1/socket", listener.local_addr().unwrap());
     let auth_http = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let auth_health = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let auth_health_addr = auth_health.local_addr().unwrap();
@@ -55,7 +57,7 @@ async fn the_smoke_test_passes_against_the_whole_stack() {
         ("PUSH_DATABASE_URL", auth_database_url.as_str()),
         ("PUSH_REDIS_URL", redis_url.as_str()),
         ("PUSH_AUTH_PUBLIC_URL", "http://push.local"),
-        ("PUSH_AUTH_TOKEN_AUDIENCE", "ws://push.local/v1/socket"),
+        ("PUSH_AUTH_TOKEN_AUDIENCE", socket_url.as_str()),
         // base64 of 32 bytes of 0x07 and of 0x09.
         (
             "PUSH_AUTH_SIGNING_KEY",
@@ -99,10 +101,8 @@ async fn the_smoke_test_passes_against_the_whole_stack() {
         shutdown.clone(),
     ));
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let gateway_health = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let gateway_health_addr = gateway_health.local_addr().unwrap();
-    let socket_url = format!("ws://{}/v1/socket", listener.local_addr().unwrap());
     let gateway = tokio::spawn(push_gateway::serve(
         push_gateway::Config {
             message_svc_url: message_svc_url.clone(),

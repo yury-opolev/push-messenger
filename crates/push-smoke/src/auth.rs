@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, bail};
 use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation};
-use reqwest::{Client, RequestBuilder, Response, StatusCode};
+use reqwest::{Client, RequestBuilder, Response, StatusCode, Url};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -44,6 +44,7 @@ impl<'a> Auth<'a> {
     pub async fn connect(target: &'a Target, timeout: Duration) -> anyhow::Result<Self> {
         let http = Client::builder()
             .timeout(timeout)
+            .no_proxy()
             .build()
             .context("build the HTTP client")?;
         let deadline = Instant::now() + CONNECT_TIMEOUT;
@@ -55,23 +56,30 @@ impl<'a> Auth<'a> {
                 Ok(response) if response.status() == StatusCode::OK => {
                     break response.json::<JwkSet>().await.context("read the JWKS")?;
                 }
-                Ok(response) if Instant::now() < deadline => {
+                Ok(response) if is_transient(response.status()) && Instant::now() < deadline => {
                     step(&format!(
                         "auth-svc answers {} yet; retrying",
                         response.status()
                     ));
                 }
+                Ok(response) => bail!("GET /v1/auth/jwks answered {}", response.status()),
                 Err(error) if Instant::now() < deadline => {
                     step(&format!(
-                        "auth-svc cannot be reached yet ({error}); retrying"
+                        "auth-svc cannot be reached yet ({}); retrying",
+                        error.without_url()
                     ));
                 }
-                Ok(response) => bail!("GET /v1/auth/jwks answered {}", response.status()),
-                Err(error) => return Err(error).context("GET /v1/auth/jwks"),
+                Err(error) => return Err(error.without_url()).context("GET /v1/auth/jwks"),
             }
             tokio::time::sleep(Duration::from_secs(2)).await;
         };
         Ok(Self { http, target, jwks })
+    }
+
+    /// The `aud` the gateway expects: the socket URL, with the authority of the `Host`
+    /// override when there is one.
+    fn expected_audience(&self) -> String {
+        audience(&self.target.socket_url, self.target.host.as_deref())
     }
 
     fn post(&self, path: &str, body: Value) -> RequestBuilder {
@@ -109,10 +117,12 @@ impl<'a> Auth<'a> {
             &self.http,
             self.target,
             reqwest::Method::GET,
-            &format!("/v1/auth/verify?token={token}"),
+            "/v1/auth/verify",
         )
+        .query(&[("token", token.as_str())])
         .send()
         .await
+        .map_err(|error| error.without_url())
         .context("open the verification page")?;
         if page.status() != StatusCode::OK
             || page
@@ -199,9 +209,12 @@ impl<'a> Auth<'a> {
         )
         .await?;
         if field(&refreshed, "device_id")? != device_id.to_string() {
-            bail!("refreshing returned another device: {refreshed}");
+            bail!("refreshing returned another device than {name}'s");
         }
-        self.check_access_token(&field(&refreshed, "access_token")?)?;
+        let renewed = self.check_access_token(&field(&refreshed, "access_token")?)?;
+        if renewed.sub != user || renewed.device_id != device_id {
+            bail!("{name}'s refreshed access token has the wrong claims: {renewed:?}");
+        }
         step(&format!(
             "{name}'s access token verifies against the JWKS (EdDSA, aud {}); refresh rotated it",
             claims.aud
@@ -215,18 +228,22 @@ impl<'a> Auth<'a> {
     /// The token of the newest verification link sent to `email`, from the dev mailbox.
     async fn verification_token(&self, email: &str) -> anyhow::Result<String> {
         let url = format!(
-            "{}/dev/mailbox?to={email}",
+            "{}/dev/mailbox",
             self.target.mailbox_url.trim_end_matches('/')
         );
         let mailbox: Value = self
             .http
             .get(&url)
+            .query(&[("to", email)])
             .send()
             .await
             .and_then(Response::error_for_status)
+            .map_err(|error| error.without_url())
             .with_context(|| format!("read the dev mailbox at {url}"))?
             .json()
-            .await?;
+            .await
+            .map_err(|error| error.without_url())
+            .context("read the dev mailbox")?;
         let link = mailbox["emails"]
             .as_array()
             .and_then(|emails| {
@@ -235,11 +252,14 @@ impl<'a> Auth<'a> {
                     .find(|email| email["template"] == "verify_email")
             })
             .and_then(|email| email["params"]["link"].as_str())
-            .with_context(|| format!("no verification email for {email}: {mailbox}"))?;
-        let (_, token) = link
-            .split_once("?token=")
-            .with_context(|| format!("a verification link without a token: {link}"))?;
-        Ok(token.to_owned())
+            .with_context(|| format!("no verification email for {email} in the dev mailbox"))?;
+        let token = Url::parse(link)
+            .map_err(|_| anyhow::anyhow!("the verification link is not a URL"))?
+            .query_pairs()
+            .find(|(key, _)| key == "token")
+            .map(|(_, token)| token.into_owned())
+            .context("the verification link has no token")?;
+        Ok(token)
     }
 
     /// Checks an access token's signature against the JWKS, as the gateway will.
@@ -252,9 +272,7 @@ impl<'a> Auth<'a> {
             .with_context(|| format!("the JWKS has no key {kid}"))?;
         let key = DecodingKey::from_jwk(jwk).context("load the JWK")?;
         let mut validation = Validation::new(Algorithm::EdDSA);
-        // The audience is the gateway's URL, which the smoke test does not know; it
-        // checks the signature and the identity claims.
-        validation.validate_aud = false;
+        validation.set_audience(&[self.expected_audience()]);
         let data = jsonwebtoken::decode::<Claims>(token, &key, &validation)
             .context("the access token does not verify against the JWKS")?;
         Ok(data.claims)
@@ -280,18 +298,103 @@ async fn expect(
     let response = request
         .send()
         .await
+        .map_err(|error| error.without_url())
         .with_context(|| format!("{what}: request failed"))?;
     let status = response.status();
     let body = response.text().await.unwrap_or_default();
     if status != expected {
-        bail!("{what}: expected {expected}, got {status}: {body}");
+        bail!("{what}: {}", unexpected_status(expected, status, &body));
     }
     Ok(serde_json::from_str(&body).unwrap_or(Value::Null))
+}
+
+/// Describes an unexpected status without the body, which can hold tokens: only the
+/// API's error code and message are quoted.
+fn unexpected_status(expected: StatusCode, status: StatusCode, body: &str) -> String {
+    let error = serde_json::from_str::<Value>(body)
+        .ok()
+        .map(|body| body["error"].clone());
+    let quote = |name: &str| {
+        error
+            .as_ref()
+            .and_then(|error| error[name].as_str().map(str::to_owned))
+    };
+    match (quote("code"), quote("message")) {
+        (Some(code), Some(message)) => {
+            format!("expected {expected}, got {status} ({code}: {message})")
+        }
+        (Some(code), None) => format!("expected {expected}, got {status} ({code})"),
+        _ => format!("expected {expected}, got {status}"),
+    }
+}
+
+/// The statuses of a gateway that is not ready yet.
+fn is_transient(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT
+    )
+}
+
+/// The `aud` of access tokens: `socket_url`, with the authority of `host` when set.
+fn audience(socket_url: &str, host: Option<&str>) -> String {
+    let Some(host) = host else {
+        return socket_url.to_owned();
+    };
+    match socket_url.split_once("://") {
+        Some((scheme, rest)) => {
+            let path = rest.find('/').map_or("", |at| &rest[at..]);
+            format!("{scheme}://{host}{path}")
+        }
+        None => socket_url.to_owned(),
+    }
 }
 
 fn field(value: &Value, name: &str) -> anyhow::Result<String> {
     value[name]
         .as_str()
         .map(str::to_owned)
-        .with_context(|| format!("no {name} in {value}"))
+        .with_context(|| format!("the response has no {name}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_audience_takes_the_authority_of_the_host_override() {
+        assert_eq!(
+            audience("ws://192.168.49.2:80/v1/socket", Some("push.local")),
+            "ws://push.local/v1/socket"
+        );
+        assert_eq!(
+            audience("ws://127.0.0.1:5000/v1/socket", None),
+            "ws://127.0.0.1:5000/v1/socket"
+        );
+    }
+
+    #[test]
+    fn errors_do_not_quote_tokens() {
+        let secret = "eyJhbGciOiJFZERTQSJ9.secret-token";
+        let value = json!({"refresh_token": secret});
+        let missing = field(&value, "access_token").unwrap_err().to_string();
+        assert!(missing.contains("access_token") && !missing.contains(secret));
+
+        let body = json!({"registration_token": secret}).to_string();
+        let plain = unexpected_status(StatusCode::OK, StatusCode::BAD_REQUEST, &body);
+        assert!(plain.contains("400") && !plain.contains(secret));
+
+        let body = json!({"error": {"code": "bad_token", "message": "expired"}, "token": secret})
+            .to_string();
+        let shaped = unexpected_status(StatusCode::OK, StatusCode::UNAUTHORIZED, &body);
+        assert!(shaped.contains("bad_token") && shaped.contains("expired"));
+        assert!(!shaped.contains(secret));
+    }
+
+    #[test]
+    fn only_gateway_errors_are_retried() {
+        assert!(is_transient(StatusCode::SERVICE_UNAVAILABLE));
+        assert!(!is_transient(StatusCode::NOT_FOUND));
+        assert!(!is_transient(StatusCode::INTERNAL_SERVER_ERROR));
+    }
 }
