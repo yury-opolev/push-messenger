@@ -4,6 +4,7 @@
 //! refresh tokens, plus an outbox of events for the other services, written in the same
 //! transaction as each change.
 
+pub mod api;
 mod db;
 mod devices;
 mod error;

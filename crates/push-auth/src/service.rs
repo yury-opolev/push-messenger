@@ -503,6 +503,21 @@ impl Auth {
         tx.commit().await?;
         Ok(())
     }
+
+    /// DEV ONLY: the `email.send` payloads waiting in the outbox for the address `to`,
+    /// newest first (at most 20). Until the worker sends email (Plan 6), this is how a
+    /// local cluster and the smoke test read their verification links.
+    pub async fn dev_mailbox(&self, to: &str) -> Result<Vec<serde_json::Value>, AuthError> {
+        let emails = sqlx::query_scalar(
+            "SELECT payload FROM auth.outbox WHERE kind = 'email.send' \
+             AND lower(payload->>'to') = lower($1) \
+             ORDER BY created_at DESC, event_id DESC LIMIT 20",
+        )
+        .bind(to.trim())
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(emails)
+    }
 }
 
 /// Whether `error` violates the constraint `name`.
