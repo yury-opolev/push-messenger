@@ -293,12 +293,25 @@ async fn the_cleanups_delete_expired_tokens_and_stale_unverified_accounts() {
     };
     assert_eq!(expired(100).await.expect("tokens"), 1);
     assert_eq!(expired(100).await.expect("tokens again"), 0);
+    // A NULL batch or an age under a day cannot touch carol, unverified since now.
+    let misused: Option<i32> =
+        sqlx::query_scalar("SELECT auth.delete_unverified_accounts(interval '0 seconds', NULL)")
+            .fetch_one(&worker)
+            .await
+            .expect("a NULL batch");
+    assert_eq!(misused, None);
+    let misused: i32 =
+        sqlx::query_scalar("SELECT auth.delete_unverified_accounts(interval '-1 day', 100)")
+            .fetch_one(&worker)
+            .await
+            .expect("a negative age");
+    assert_eq!(misused, 1, "only the 8-day-old account, never carol");
     let unverified: i32 =
         sqlx::query_scalar("SELECT auth.delete_unverified_accounts(interval '7 days', 100)")
             .fetch_one(&worker)
             .await
             .expect("accounts");
-    assert_eq!(unverified, 1);
+    assert_eq!(unverified, 0);
 
     let tokens: i64 = sqlx::query_scalar("SELECT count(*) FROM auth.refresh_token")
         .fetch_one(&pool)

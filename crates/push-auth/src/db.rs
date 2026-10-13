@@ -45,6 +45,10 @@ pub fn is_role_name(name: &str) -> bool {
     matches!(chars.next(), Some('a'..='z' | '_'))
         && name.len() <= 63
         && chars.all(|c| matches!(c, 'a'..='z' | '0'..='9' | '_'))
+        // PostgreSQL reads `public` as every role even when quoted; `none` and `pg_*` are
+        // reserved.
+        && !matches!(name, "public" | "none")
+        && !name.starts_with("pg_")
 }
 
 #[cfg(test)]
@@ -59,6 +63,9 @@ mod tests {
         let long = "w".repeat(64);
         for name in [
             "",
+            "public",
+            "none",
+            "pg_monitor",
             "2w",
             "Push",
             "push-worker",
