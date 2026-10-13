@@ -3,12 +3,14 @@ resolver = "3"
 members = [
     "crates/push-auth",
     "crates/push-domain",
+    "crates/push-email",
     "crates/push-gateway",
     "crates/push-message-svc",
     "crates/push-proto",
     "crates/push-smoke",
     "crates/push-store",
     "crates/push-testkit",
+    "crates/push-worker",
 ]
 
 [workspace.package]
@@ -34,11 +36,13 @@ prost = "0.14"
 protoc-bin-vendored = "3"
 push-auth = { path = "crates/push-auth" }
 push-domain = { path = "crates/push-domain" }
+push-email = { path = "crates/push-email" }
 push-gateway = { path = "crates/push-gateway" }
 push-message-svc = { path = "crates/push-message-svc" }
 push-proto = { path = "crates/push-proto" }
 push-store = { path = "crates/push-store" }
 push-testkit = { path = "crates/push-testkit" }
+push-worker = { path = "crates/push-worker" }
 rand = "0.9"
 redis = { version = "1", default-features = false, features = [
     "connection-manager",

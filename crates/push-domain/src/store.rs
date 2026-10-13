@@ -83,6 +83,8 @@ pub trait Tx: Send {
     async fn insert_device(&mut self, device: DeviceId, user: UserId) -> DomainResult<bool>;
     /// Marks a device revoked. A no-op for an unknown device.
     async fn revoke_device(&mut self, device: DeviceId) -> DomainResult<()>;
+    /// The owner of a device, active or revoked; `None` if the device is unknown.
+    async fn device_user(&mut self, device: DeviceId) -> DomainResult<Option<UserId>>;
     /// The owner of an active device; `None` if the device is unknown or revoked.
     async fn device_owner(&mut self, device: DeviceId) -> DomainResult<Option<UserId>>;
     /// The user's active devices.

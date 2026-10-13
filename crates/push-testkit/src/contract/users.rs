@@ -64,6 +64,21 @@ async fn revoking_an_unknown_device_does_nothing<B: Backend>(backend: &B) {
     assert_eq!(tx.revoke_device(DeviceId::new()).await, Ok(()));
 }
 
+async fn device_user_names_the_owner_of_revoked_devices_too<B: Backend>(backend: &B) {
+    let store = backend.store().await;
+    let user = UserId::new();
+    add_users(&store, &[user]).await;
+    let (active, revoked) = (DeviceId::new(), DeviceId::new());
+    let mut tx = store.begin().await.unwrap();
+    tx.insert_device(active, user).await.unwrap();
+    tx.insert_device(revoked, user).await.unwrap();
+    tx.revoke_device(revoked).await.unwrap();
+
+    assert_eq!(tx.device_user(active).await.unwrap(), Some(user));
+    assert_eq!(tx.device_user(revoked).await.unwrap(), Some(user));
+    assert_eq!(tx.device_user(DeviceId::new()).await.unwrap(), None);
+}
+
 pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
     case_list![
         inserting_a_user_twice_is_harmless,
@@ -71,5 +86,6 @@ pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
         inserting_a_known_device_id_changes_nothing,
         a_device_of_an_unknown_user_is_refused,
         revoking_an_unknown_device_does_nothing,
+        device_user_names_the_owner_of_revoked_devices_too,
     ]
 }

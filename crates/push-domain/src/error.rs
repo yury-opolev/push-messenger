@@ -8,6 +8,10 @@ pub enum DomainError {
     UnknownUser,
     #[error("unknown or revoked device")]
     UnknownDevice,
+    /// message-svc has not heard of the device yet: auth-svc registered it, but the worker
+    /// has not relayed it (that takes about a second). Unlike `UnknownDevice`, it passes.
+    #[error("the device is not known yet; retry shortly")]
+    DeviceNotKnownYet,
     #[error("conversation not found")]
     ConversationNotFound,
     #[error("not a member of this conversation")]
@@ -50,9 +54,10 @@ pub enum DomainError {
 
 impl DomainError {
     /// Whether the same operation may succeed if the caller tries it again unchanged.
-    /// Only `Conflict` is retryable: every other error repeats until something changes.
+    /// Only `Conflict` and `DeviceNotKnownYet` are retryable: every other error repeats
+    /// until something changes.
     pub fn is_retryable(&self) -> bool {
-        matches!(self, Self::Conflict)
+        matches!(self, Self::Conflict | Self::DeviceNotKnownYet)
     }
 }
 
@@ -63,8 +68,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_a_conflict_is_retryable() {
+    fn only_a_conflict_and_a_device_not_known_yet_are_retryable() {
         assert!(DomainError::Conflict.is_retryable());
+        assert!(DomainError::DeviceNotKnownYet.is_retryable());
+        assert!(!DomainError::UnknownDevice.is_retryable());
         assert!(!DomainError::NotMember.is_retryable());
         assert!(!DomainError::Store("connection lost".into()).is_retryable());
     }

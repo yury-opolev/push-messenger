@@ -197,12 +197,14 @@ impl Auth {
         }
         // One statement for a new account and for a new start of an unverified one, so
         // concurrent signups for one address cannot both insert. A verified account does
-        // not match the WHERE, and no row comes back.
+        // not match the WHERE, and no row comes back. A new start also restarts the
+        // account's clock: the worker deletes accounts left unverified for long.
         let upserted = sqlx::query(
             "INSERT INTO auth.user_account (user_id, email, handle, display_name, password_hash) \
              VALUES ($1, $2, $3, $4, $5) \
              ON CONFLICT (email) DO UPDATE SET handle = EXCLUDED.handle, \
-             display_name = EXCLUDED.display_name, password_hash = EXCLUDED.password_hash \
+             display_name = EXCLUDED.display_name, password_hash = EXCLUDED.password_hash, \
+             created_at = now() \
              WHERE auth.user_account.email_verified_at IS NULL \
              RETURNING user_id, email::text",
         )

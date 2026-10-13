@@ -9,6 +9,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::get;
 use push_domain::{Messaging, SystemClock};
+use push_proto::internal::v1::accounts_server::AccountsServer;
 use push_proto::internal::v1::dev_setup_server::DevSetupServer;
 use push_proto::internal::v1::messaging_server::MessagingServer;
 use push_store::{PgStore, migrate_database};
@@ -17,7 +18,7 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
-use crate::grpc::{DevSetupApi, MessagingApi};
+use crate::grpc::{AccountsApi, AccountsToken, DevSetupApi, MessagingApi};
 use crate::notify::RedisNotifier;
 
 /// How long to wait before trying an unreachable dependency again.
@@ -52,6 +53,12 @@ pub async fn serve(
              outside a local cluster."
         );
     }
+    if config.accounts_token.is_none() {
+        tracing::warn!(
+            "PUSH_ACCOUNTS_TOKEN is not set: the Accounts API refuses every call, so the \
+             worker cannot relay users and devices"
+        );
+    }
     let Some(store) = retry("postgres", &shutdown, || async {
         // Services migrate with `push_store::migrate_database(url)` on a dedicated
         // connection, not with `PgStore::migrate` on the pool: a migration must not
@@ -80,7 +87,13 @@ pub async fn serve(
         .then(|| DevSetupServer::new(DevSetupApi::new(Arc::clone(&messaging))));
     tracing::info!(addr = %config.grpc_addr, "serving gRPC");
     let result = tonic::transport::Server::builder()
-        .add_service(MessagingServer::new(MessagingApi::new(messaging)))
+        .add_service(MessagingServer::new(MessagingApi::new(Arc::clone(
+            &messaging,
+        ))))
+        .add_service(AccountsServer::with_interceptor(
+            AccountsApi::new(messaging),
+            AccountsToken::new(config.accounts_token.clone()),
+        ))
         .add_optional_service(dev_setup)
         .serve_with_incoming_shutdown(
             TcpListenerStream::new(grpc),

@@ -7,6 +7,8 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use push_store::{StoreOptions, check_database_url};
 
+use crate::db::is_role_name;
+
 /// How the service runs. Read from the environment by [`Config::from_env`]:
 ///
 /// | Variable | Meaning | Default |
@@ -23,6 +25,7 @@ use push_store::{StoreOptions, check_database_url};
 /// | `PUSH_HTTP_ADDR` | address of the API | `0.0.0.0:8080` |
 /// | `PUSH_HEALTH_ADDR` | address of `/healthz` and `/readyz` | `0.0.0.0:8081` |
 /// | `PUSH_DB_MAX_CONNECTIONS` | pool size, at least 1 | `10` |
+/// | `PUSH_AUTH_WORKER_ROLE` | role the worker connects as: granted the outbox and the cleanups at start-up | none |
 /// | `PUSH_DEV_MAILBOX` | `1` serves the DEV ONLY `GET /dev/mailbox` (local public URL only) | off |
 ///
 /// `http://` public URLs and `ws://` audiences are accepted only for local hosts
@@ -42,6 +45,7 @@ pub struct Config {
     pub http_addr: SocketAddr,
     pub health_addr: SocketAddr,
     pub store: StoreOptions,
+    pub worker_role: Option<String>,
     pub dev_mailbox: bool,
 }
 
@@ -61,6 +65,7 @@ impl std::fmt::Debug for Config {
             .field("http_addr", &self.http_addr)
             .field("health_addr", &self.health_addr)
             .field("store", &self.store)
+            .field("worker_role", &self.worker_role)
             .field("dev_mailbox", &self.dev_mailbox)
             .finish()
     }
@@ -155,6 +160,19 @@ impl Config {
                 reason: "must be at least 1".to_owned(),
             });
         }
+        let worker_role = match lookup("PUSH_AUTH_WORKER_ROLE").filter(|v| !v.is_empty()) {
+            None => None,
+            Some(role) if is_role_name(&role) => Some(role),
+            Some(role) => {
+                return Err(ConfigError::Invalid {
+                    name: "PUSH_AUTH_WORKER_ROLE",
+                    value: role,
+                    reason:
+                        "a role name: lower-case letters, digits and _, not starting with a digit"
+                            .to_owned(),
+                });
+            }
+        };
         let dev_mailbox = dev_flag(&lookup, "PUSH_DEV_MAILBOX")?;
         if dev_mailbox && !is_local_url(&public_url) {
             return Err(ConfigError::Invalid {
@@ -179,6 +197,7 @@ impl Config {
             http_addr: parsed(&lookup, "PUSH_HTTP_ADDR", ([0, 0, 0, 0], 8080).into())?,
             health_addr: parsed(&lookup, "PUSH_HEALTH_ADDR", ([0, 0, 0, 0], 8081).into())?,
             store,
+            worker_role,
             dev_mailbox,
         })
     }
@@ -332,6 +351,7 @@ mod tests {
         assert_eq!(config.hash_queue, 32);
         assert_eq!(config.client_ip_header, None);
         assert_eq!(config.store, StoreOptions::default());
+        assert_eq!(config.worker_role, None);
         assert!(!config.dev_mailbox);
     }
 
@@ -361,6 +381,7 @@ mod tests {
             ("PUSH_AUTH_HASH_QUEUE", "8"),
             ("PUSH_HTTP_ADDR", "127.0.0.1:7000"),
             ("PUSH_DB_MAX_CONNECTIONS", "3"),
+            ("PUSH_AUTH_WORKER_ROLE", "push_worker"),
             ("PUSH_DEV_MAILBOX", "1"),
         ]);
         let config = config(&variables).unwrap();
@@ -372,6 +393,7 @@ mod tests {
         assert_eq!(config.hash_queue, 8);
         assert_eq!(config.http_addr, "127.0.0.1:7000".parse().unwrap());
         assert_eq!(config.store.max_connections, 3);
+        assert_eq!(config.worker_role.as_deref(), Some("push_worker"));
         assert!(config.dev_mailbox);
     }
 
@@ -494,6 +516,22 @@ mod tests {
         assert!(!shown.contains("hunter2"), "{shown}");
         assert!(!shown.contains("[7, 7"), "{shown}");
         assert!(shown.contains("https://api.example.com"), "{shown}");
+    }
+
+    #[test]
+    fn the_worker_role_must_be_a_plain_role_name() {
+        for role in ["Push", "push-worker", "w\"; drop", "1w"] {
+            assert!(
+                matches!(
+                    config(&with("PUSH_AUTH_WORKER_ROLE", role)),
+                    Err(ConfigError::Invalid {
+                        name: "PUSH_AUTH_WORKER_ROLE",
+                        ..
+                    })
+                ),
+                "{role}"
+            );
+        }
     }
 
     #[test]

@@ -1,17 +1,19 @@
 //! The whole service on real Postgres and Redis (Docker must be running): readiness, the
-//! dev setup calls, a send that rings the recipient's Redis channel, sync, ack, and
-//! graceful shutdown.
+//! dev setup calls, the worker's account events, a send that rings the recipient's Redis
+//! channel, sync, ack, and graceful shutdown.
 
 use std::net::SocketAddr;
 use std::time::Duration;
 
 use prost::Message;
 use push_message_svc::{Config, serve};
+use push_proto::internal::v1::accounts_client::AccountsClient;
 use push_proto::internal::v1::dev_setup_client::DevSetupClient;
 use push_proto::internal::v1::messaging_client::MessagingClient;
 use push_proto::internal::v1::{
-    AckRequest, MakeContactsRequest, Notification, OpenDirectRequest, RegisterDeviceRequest,
-    RegisterUserRequest, SendRequest, SyncRequest, notification::Kind,
+    AccountDevice, AckRequest, IdentifyRequest, MakeContactsRequest, Notification,
+    OpenDirectRequest, RegisterDeviceRequest, RegisterUserRequest, SendRequest, SyncRequest,
+    notification::Kind,
 };
 use push_proto::v1::{Ack, ContentType, Send};
 use push_proto::{id_bytes, notify_channel};
@@ -25,7 +27,13 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
+use tonic::Request;
+use tonic::metadata::MetadataValue;
+use tonic::transport::Channel;
 use uuid::Uuid;
+
+/// The worker's token for the `Accounts` API.
+const ACCOUNTS_TOKEN: &str = "accounts-token-for-the-service-tests";
 
 struct Running {
     _postgres: ContainerAsync<Postgres>,
@@ -66,6 +74,7 @@ async fn start(dev_setup: bool) -> Running {
         grpc_addr: grpc,
         health_addr: health,
         store: StoreOptions::default(),
+        accounts_token: Some(ACCOUNTS_TOKEN.to_owned()),
         dev_setup,
     };
     let shutdown = CancellationToken::new();
@@ -109,6 +118,7 @@ async fn shutdown_is_honoured_while_the_database_is_unreachable() {
         grpc_addr: grpc.local_addr().unwrap(),
         health_addr: health.local_addr().unwrap(),
         store: StoreOptions::default(),
+        accounts_token: None,
         dev_setup: false,
     };
     let shutdown = CancellationToken::new();
@@ -255,11 +265,47 @@ async fn a_message_goes_from_send_to_ack_and_rings_the_recipient() {
 }
 
 #[tokio::test]
-async fn dev_setup_is_absent_unless_enabled() {
+async fn accounts_are_served_and_dev_setup_is_absent_unless_enabled() {
     let running = start(false).await;
-    let mut setup = DevSetupClient::connect(format!("http://{}", running.grpc))
+    let url = format!("http://{}", running.grpc);
+    let channel = Channel::from_shared(url.clone())
+        .unwrap()
+        .connect()
         .await
         .unwrap();
+    let mut messaging = MessagingClient::connect(url.clone()).await.unwrap();
+    let (user, device) = (Uuid::now_v7(), Uuid::now_v7());
+    let event = AccountDevice {
+        user_id: id_bytes(user),
+        device_id: id_bytes(device),
+    };
+    let identify = IdentifyRequest {
+        user_id: id_bytes(user),
+        device_id: id_bytes(device),
+    };
+    // Not relayed yet: worth retrying, unlike a revoked device.
+    let status = messaging.identify(identify.clone()).await.unwrap_err();
+    assert_eq!(status.code(), tonic::Code::Unavailable);
+
+    // Without the worker's token (the gateway has none) the API refuses.
+    let mut stranger = AccountsClient::new(channel.clone());
+    let status = stranger.device_registered(event.clone()).await.unwrap_err();
+    assert_eq!(status.code(), tonic::Code::Unauthenticated);
+
+    let bearer: MetadataValue<_> = format!("Bearer {ACCOUNTS_TOKEN}").parse().unwrap();
+    let mut accounts = AccountsClient::with_interceptor(channel, move |mut request: Request<()>| {
+        request
+            .metadata_mut()
+            .insert("authorization", bearer.clone());
+        Ok(request)
+    });
+    accounts.device_registered(event.clone()).await.unwrap();
+    messaging.identify(identify.clone()).await.unwrap();
+    accounts.device_revoked(event).await.unwrap();
+    let status = messaging.identify(identify).await.unwrap_err();
+    assert_eq!(status.code(), tonic::Code::PermissionDenied);
+
+    let mut setup = DevSetupClient::connect(url).await.unwrap();
     let status = setup
         .register_user(RegisterUserRequest {
             user_id: id_bytes(Uuid::now_v7()),

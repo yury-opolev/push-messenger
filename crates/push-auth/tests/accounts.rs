@@ -225,6 +225,35 @@ async fn signing_up_again_takes_over_an_unverified_account_and_says_nothing() {
 }
 
 #[tokio::test]
+async fn signing_up_again_restarts_an_unverified_accounts_clock() {
+    let world = world().await;
+    world
+        .auth
+        .signup(signup("alice@example.com", "alice"))
+        .await
+        .unwrap();
+    sqlx::query("UPDATE auth.user_account SET created_at = now() - interval '10 days'")
+        .execute(&world.pool)
+        .await
+        .unwrap();
+    world
+        .auth
+        .signup(signup("alice@example.com", "alice2"))
+        .await
+        .unwrap();
+    let fresh: bool = sqlx::query_scalar(
+        "SELECT created_at > now() - interval '1 minute' FROM auth.user_account",
+    )
+    .fetch_one(&world.pool)
+    .await
+    .unwrap();
+    assert!(
+        fresh,
+        "the worker would delete it as if nobody had signed up"
+    );
+}
+
+#[tokio::test]
 async fn a_taken_handle_and_invalid_input_are_reported() {
     let world = world().await;
     world

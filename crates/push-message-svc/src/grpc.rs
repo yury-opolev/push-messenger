@@ -1,4 +1,5 @@
-//! The gRPC services: `Messaging` for the gateway and the DEV ONLY `DevSetup`.
+//! The gRPC services: `Messaging` for the gateway, `Accounts` for the worker and the
+//! DEV ONLY `DevSetup`.
 
 use std::sync::Arc;
 
@@ -8,12 +9,14 @@ use push_domain::{
 };
 use push_proto::id_bytes;
 use push_proto::internal::v1::{
-    AckRequest, AckResponse, IdentifyRequest, IdentifyResponse, MakeContactsRequest,
-    MakeContactsResponse, OpenDirectRequest, OpenDirectResponse, RegisterDeviceRequest,
-    RegisterDeviceResponse, RegisterUserRequest, RegisterUserResponse, SendRequest, SyncRequest,
-    SyncResponse, dev_setup_server, messaging_server,
+    AccountDevice, AccountUser, AccountsResponse, AckRequest, AckResponse, IdentifyRequest,
+    IdentifyResponse, MakeContactsRequest, MakeContactsResponse, OpenDirectRequest,
+    OpenDirectResponse, RegisterDeviceRequest, RegisterDeviceResponse, RegisterUserRequest,
+    RegisterUserResponse, SendRequest, SyncRequest, SyncResponse, accounts_server,
+    dev_setup_server, messaging_server,
 };
 use push_proto::v1::{ContentType, SendAck};
+use tonic::service::Interceptor;
 use tonic::{Request, Response, Status};
 
 use crate::convert::{deliver, domain_error, from_micros, invalid, parse_id, send_ack};
@@ -107,6 +110,134 @@ where
     }
 }
 
+/// The `Accounts` service: auth-svc's user and device events, relayed by the worker. Every
+/// call is idempotent and any order of calls ends in the same state (see
+/// [`Messaging::device_registered`] and [`Messaging::device_revoked`]).
+pub struct AccountsApi<S, C, N> {
+    messaging: Arc<Messaging<S, C, N>>,
+}
+
+impl<S, C, N> AccountsApi<S, C, N> {
+    pub fn new(messaging: Arc<Messaging<S, C, N>>) -> Self {
+        Self { messaging }
+    }
+}
+
+#[tonic::async_trait]
+impl<S, C, N> accounts_server::Accounts for AccountsApi<S, C, N>
+where
+    S: Store + 'static,
+    C: Clock + 'static,
+    N: Notifier + 'static,
+{
+    async fn user_verified(
+        &self,
+        request: Request<AccountUser>,
+    ) -> Result<Response<AccountsResponse>, Status> {
+        let user = parse_id(&request.into_inner().user_id, "user_id", UserId)?;
+        self.messaging
+            .register_user(user)
+            .await
+            .map_err(domain_error)?;
+        Ok(Response::new(AccountsResponse {}))
+    }
+
+    async fn device_registered(
+        &self,
+        request: Request<AccountDevice>,
+    ) -> Result<Response<AccountsResponse>, Status> {
+        let request = request.into_inner();
+        let user = parse_id(&request.user_id, "user_id", UserId)?;
+        let device = parse_id(&request.device_id, "device_id", DeviceId)?;
+        self.messaging
+            .device_registered(device, user)
+            .await
+            .map_err(domain_error)?;
+        Ok(Response::new(AccountsResponse {}))
+    }
+
+    async fn device_revoked(
+        &self,
+        request: Request<AccountDevice>,
+    ) -> Result<Response<AccountsResponse>, Status> {
+        let request = request.into_inner();
+        let user = parse_id(&request.user_id, "user_id", UserId)?;
+        let device = parse_id(&request.device_id, "device_id", DeviceId)?;
+        self.messaging
+            .device_revoked(device, user)
+            .await
+            .map_err(domain_error)?;
+        Ok(Response::new(AccountsResponse {}))
+    }
+
+    /// Accepted and otherwise ignored for now: message-svc publishes kicks in Plan 7, and
+    /// the gateway acts on them (and refuses tokens older than the reset) in Plan 8.
+    async fn password_reset(
+        &self,
+        request: Request<AccountUser>,
+    ) -> Result<Response<AccountsResponse>, Status> {
+        parse_id(&request.into_inner().user_id, "user_id", UserId)?;
+        Ok(Response::new(AccountsResponse {}))
+    }
+}
+
+/// Guards the `Accounts` service: a call passes only with the shared internal token in its
+/// metadata, `authorization: Bearer <token>`, compared in constant time. The
+/// gateway does not have the token, so it cannot register devices even though it can
+/// reach message-svc. Without a configured token every call is refused.
+#[derive(Clone)]
+pub struct AccountsToken {
+    expected: Option<Arc<str>>,
+}
+
+impl AccountsToken {
+    pub fn new(expected: Option<String>) -> Self {
+        Self {
+            expected: expected.map(Arc::from),
+        }
+    }
+}
+
+impl std::fmt::Debug for AccountsToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AccountsToken")
+            .field("expected", &self.expected.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+impl Interceptor for AccountsToken {
+    fn call(&mut self, request: Request<()>) -> Result<Request<()>, Status> {
+        let Some(expected) = &self.expected else {
+            return Err(Status::unauthenticated(
+                "the Accounts API is off: PUSH_ACCOUNTS_TOKEN is not set",
+            ));
+        };
+        let presented = request
+            .metadata()
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "));
+        match presented {
+            Some(token) if same(token.as_bytes(), expected.as_bytes()) => Ok(request),
+            _ => Err(Status::unauthenticated(
+                "the Accounts API needs the internal token",
+            )),
+        }
+    }
+}
+
+/// Compares in time that depends only on the lengths, never on where the bytes differ.
+fn same(presented: &[u8], expected: &[u8]) -> bool {
+    presented.len() == expected.len()
+        && presented
+            .iter()
+            .zip(expected)
+            .fold(0u8, |difference, (a, b)| difference | (a ^ b))
+            == 0
+}
+
 /// DEV ONLY: sets up users, devices, contacts and direct conversations without auth-svc.
 /// `serve` registers it only when the configuration enables it (`PUSH_DEV_SETUP=1`).
 pub struct DevSetupApi<S, C, N> {
@@ -194,6 +325,7 @@ where
 #[cfg(test)]
 mod tests {
     use push_domain::{Event, InMemoryStore, RecordingNotifier, SystemClock};
+    use push_proto::internal::v1::accounts_server::Accounts as AccountsRpc;
     use push_proto::internal::v1::dev_setup_server::DevSetup;
     use push_proto::internal::v1::messaging_server::Messaging as MessagingRpc;
     use push_proto::v1::{Ack, ErrorCode, Send};
@@ -203,10 +335,12 @@ mod tests {
     use super::*;
 
     type Api = MessagingApi<InMemoryStore, SystemClock, Arc<RecordingNotifier>>;
+    type Accounts = AccountsApi<InMemoryStore, SystemClock, Arc<RecordingNotifier>>;
     type Setup = DevSetupApi<InMemoryStore, SystemClock, Arc<RecordingNotifier>>;
 
     struct World {
         api: Api,
+        accounts: Accounts,
         setup: Setup,
         notifier: Arc<RecordingNotifier>,
     }
@@ -220,6 +354,7 @@ mod tests {
         ));
         World {
             api: MessagingApi::new(Arc::clone(&messaging)),
+            accounts: AccountsApi::new(Arc::clone(&messaging)),
             setup: DevSetupApi::new(messaging),
             notifier,
         }
@@ -431,5 +566,138 @@ mod tests {
             assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
             assert_eq!(error_from_status(&status).code(), ErrorCode::Invalid);
         }
+    }
+
+    fn account_device(user: UserId, device: DeviceId) -> Request<AccountDevice> {
+        Request::new(AccountDevice {
+            user_id: id_bytes(user.0),
+            device_id: id_bytes(device.0),
+        })
+    }
+
+    async fn identify(world: &World, user: UserId, device: DeviceId) -> Result<(), Code> {
+        world
+            .api
+            .identify(Request::new(IdentifyRequest {
+                user_id: id_bytes(user.0),
+                device_id: id_bytes(device.0),
+            }))
+            .await
+            .map(|_| ())
+            .map_err(|status| status.code())
+    }
+
+    #[tokio::test]
+    async fn relayed_account_events_register_and_revoke_devices_in_any_order() {
+        let world = world();
+        let (user, phone, tablet) = (UserId::new(), DeviceId::new(), DeviceId::new());
+        let verified = AccountUser {
+            user_id: id_bytes(user.0),
+        };
+        world
+            .accounts
+            .user_verified(Request::new(verified.clone()))
+            .await
+            .unwrap();
+        world
+            .accounts
+            .user_verified(Request::new(verified))
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            world
+                .accounts
+                .device_registered(account_device(user, phone))
+                .await
+                .unwrap();
+        }
+        assert_eq!(identify(&world, user, phone).await, Ok(()));
+        // A device not relayed yet is worth retrying, unlike a revoked one.
+        assert_eq!(identify(&world, user, tablet).await, Err(Code::Unavailable));
+
+        // The revocation of the tablet overtakes its registration.
+        world
+            .accounts
+            .device_revoked(account_device(user, tablet))
+            .await
+            .unwrap();
+        world
+            .accounts
+            .device_registered(account_device(user, tablet))
+            .await
+            .unwrap();
+        assert_eq!(
+            identify(&world, user, tablet).await,
+            Err(Code::PermissionDenied)
+        );
+        world
+            .accounts
+            .password_reset(Request::new(AccountUser {
+                user_id: id_bytes(user.0),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(identify(&world, user, phone).await, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn relayed_events_that_can_never_succeed_are_refused_for_good() {
+        let world = world();
+        let alice = person(&world).await;
+        let status = world
+            .accounts
+            .device_registered(account_device(UserId::new(), alice.device))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), Code::PermissionDenied);
+        assert!(!error_from_status(&status).retryable);
+
+        let malformed = AccountDevice {
+            user_id: vec![1, 2, 3],
+            device_id: id_bytes(alice.device.0),
+        };
+        let status = world
+            .accounts
+            .device_revoked(Request::new(malformed))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert_eq!(identify(&world, alice.user, alice.device).await, Ok(()));
+    }
+
+    fn with_authorization(value: &str) -> Request<()> {
+        let mut request = Request::new(());
+        request
+            .metadata_mut()
+            .insert("authorization", value.parse().unwrap());
+        request
+    }
+
+    #[test]
+    fn accounts_calls_pass_only_with_the_internal_token() {
+        let token = "a".repeat(32);
+        let mut guard = AccountsToken::new(Some(token.clone()));
+        assert!(
+            guard
+                .call(with_authorization(&format!("Bearer {token}")))
+                .is_ok()
+        );
+        for refused in [
+            Request::new(()),
+            with_authorization(&token),
+            with_authorization(&format!("Bearer {}", "b".repeat(32))),
+            with_authorization(&format!("Basic {token}")),
+            with_authorization("Bearer "),
+        ] {
+            let status = guard.call(refused).unwrap_err();
+            assert_eq!(status.code(), Code::Unauthenticated);
+            assert!(!status.message().contains(&token));
+        }
+        let mut off = AccountsToken::new(None);
+        let status = off
+            .call(with_authorization(&format!("Bearer {token}")))
+            .unwrap_err();
+        assert_eq!(status.code(), Code::Unauthenticated);
+        assert!(!format!("{guard:?}").contains(&token));
     }
 }

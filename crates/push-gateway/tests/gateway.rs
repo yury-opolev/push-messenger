@@ -304,12 +304,19 @@ async fn without_dev_auth_identify_is_closed_with_4001() {
 }
 
 #[tokio::test]
-async fn an_unknown_device_is_closed_with_4001() {
+async fn a_device_of_another_user_is_closed_with_4001() {
     let stack = stack(true).await;
-    let (user, _device) = person(&stack).await;
+    let (alice, _) = person(&stack).await;
+    let (_, bob_device) = person(&stack).await;
     let mut socket = connect(&stack).await;
-    send(&mut socket, identify(user, Uuid::now_v7())).await;
+    send(&mut socket, identify(alice, bob_device)).await;
     assert_eq!(close_code(&mut socket).await, 4001);
+
+    // A device message-svc has not heard of yet (not relayed) is not refused for good:
+    // message-svc answers UNAVAILABLE, and the client retries (Plan 8 gives it its own code).
+    let mut socket = connect(&stack).await;
+    send(&mut socket, identify(alice, Uuid::now_v7())).await;
+    assert_eq!(close_code(&mut socket).await, 1011);
 }
 
 #[tokio::test]
