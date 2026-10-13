@@ -67,6 +67,9 @@ impl Accounts {
         let bearer = format!("Bearer {token}")
             .parse()
             .map_err(|_| "the Accounts token cannot be sent as metadata".to_owned())?;
+        let mut bearer: MetadataValue<Ascii> = bearer;
+        // Never indexed by HTTP/2 or shown in header dumps.
+        bearer.set_sensitive(true);
         let channel = Endpoint::from_shared(url.to_owned())
             .map_err(|_| "not a valid message-svc URL".to_owned())?
             .connect_timeout(CONNECT_TIMEOUT)
