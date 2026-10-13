@@ -112,10 +112,13 @@ impl Cleanup {
                     AGAIN_SOON
                 })
             }
-            Err(_) => Outcome::Failed {
-                reason: format!("{kind}: the database did not answer"),
-                max_attempts: None,
-            },
+            Err(error) => {
+                tracing::warn!(cleanup = kind, %error, "cleanup failed; it runs again later");
+                Outcome::Failed {
+                    reason: format!("{kind}: the database refused or did not answer"),
+                    max_attempts: None,
+                }
+            }
         })
     }
 
