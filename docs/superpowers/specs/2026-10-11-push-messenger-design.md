@@ -660,7 +660,10 @@ Implementation notes (push-auth, Plan 5A):
   Rate-limit key subjects use plain SHA-256 and should use HMAC. Form POSTs of the link
   pages return JSON errors, not HTML. Path, Query, 404 and 405 rejections are plain text.
   `Bearer` is matched case-sensitively. `?token=` must be stripped from ingress access
-  logs (Plan 5B).
+  logs (Plan 5B). A password reset revokes refresh tokens but leaves devices active, so an
+  access token issued before the reset keeps working for up to 15 minutes; later, a
+  `password_changed_at` stamp should make `authenticate` and the gateway reject older
+  tokens.
 
 ## 6. Groups (up to 100 members)
 
