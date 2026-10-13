@@ -62,6 +62,9 @@ Four services and two stores on one k3s node, behind ingress-nginx.
 The single sanctioned exception is the **outbox**: a service writes events to its own
 `outbox` table in the same transaction as the change, and the worker reads and deletes
 them. This is how auth-svc sends email and tells message-svc about users and devices.
+Cleanups of another service's data run as functions that service owns and lets the
+worker's role call (auth-svc: expired refresh tokens, accounts left unverified), so the
+rules stay with the data and the worker never reads it.
 
 **Public endpoints:** `wss://api.<domain>/v1/socket` (gateway) and
 `https://api.<domain>/v1/auth/*`, `/v1/devices/*`, `/v1/users/*` (auth-svc).
@@ -245,10 +248,12 @@ Implementation notes (push-store, migration `0001_messaging.sql`):
 ### 3.3 worker schema
 
 ```sql
-job (
+job (                                       -- job_id = the outbox event's id
   job_id uuid primary key, kind text not null, payload jsonb not null,
   run_after timestamptz not null default now(), attempts int not null default 0,
-  claimed_at timestamptz, failed_reason text
+  claimed_at timestamptz, failed_reason text,
+  dead_at timestamptz,                       -- buried (poison): kept, never claimed
+  created_at timestamptz not null default now()
 )
 
 email_message (
@@ -256,15 +261,15 @@ email_message (
   to_address          citext not null,
   recipient_domain    text not null,       -- for deliverability metrics
   template            text not null,
-  params              jsonb not null,
+  params              jsonb not null,      -- never the link: it signs its holder in
   provider_message_id text,
   status              smallint not null,   -- queued | sent | suppressed | failed
   created_at          timestamptz not null default now(),
   sent_at             timestamptz
 )
 
-email_event (
-  event_id uuid primary key, provider_message_id text not null,
+email_event (                               -- event_id = the webhook's id (svix-id)
+  event_id text primary key, provider_message_id text not null,
   kind smallint not null,                  -- delivered | bounced | complained
   occurred_at timestamptz not null, raw jsonb not null
 )
