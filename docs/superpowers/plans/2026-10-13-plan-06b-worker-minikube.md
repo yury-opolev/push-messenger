@@ -3484,7 +3484,7 @@ deploy/minikube/down.ps1
 deploy/minikube/up.ps1 -Smoke
 ```
 
-Expected: no diff, no warnings, 775 tests on both toolchains, `all chart checks passed`,
+Expected: no diff, no warnings, 777 tests on both toolchains, `all chart checks passed`,
 and the smoke test `PASS` as in Task 3, Step 3.
 Verified on the live cluster (fresh install, Task 4): the worker logs only the id,
 template and domain; through the ingress a signed bounce answers 204 and its replay is

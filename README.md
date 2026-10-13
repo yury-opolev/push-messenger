@@ -30,9 +30,8 @@ images into the cluster, installs the chart (`deploy/helm/push-messenger`) with
 `values-minikube.yaml`, and runs the end-to-end smoke test: two users sign up, verify their
 email (the worker's log sender delivers it), register a device, wait for the worker to
 relay it to message-svc, and chat through the ingress; the DEV ONLY mailbox and the setup
-calls go
-to the services directly. `deploy/minikube/up.sh --smoke`
-does the same on Linux and macOS. Both wait for ingress-nginx and retry
+calls go to the services directly. `deploy/minikube/up.sh --smoke` does the same on Linux
+and macOS. Both wait for ingress-nginx and retry
 `helm upgrade --install` up to 5 times while its admission webhook comes up.
 `deploy/minikube/down.ps1` removes everything again: namespace, the
 Secret, the PostgreSQL volume and its data directory (`-Delete` deletes the profile).
@@ -43,7 +42,7 @@ verified this way before it is merged.
 The minikube values switch on DEV ONLY shortcuts: the gateway accepts any user and device
 id without a token (until it checks access tokens, Plan 8), message-svc serves a setup API
 for contacts and conversations (until Plan 7), and the worker, which logs emails instead of
-sending them, shows them at `/dev/mailbox`; neither is routed by the ingress, which
+sending them, shows them at `/dev/mailbox`; none of these is routed by the ingress, which
 reaches the worker only at `/v1/webhooks/resend`. The chart refuses that mode unless the
 values also say `devMode.acknowledge: insecure-local-only` and the ingress host is local
 (`*.local`, `*.localhost` or `*.test`), and refuses it with the Resend sender.
