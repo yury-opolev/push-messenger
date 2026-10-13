@@ -1,7 +1,7 @@
 //! The auth part of the smoke test: a user signs up, verifies the email with the link the
-//! worker's log sender delivered to the DEV ONLY mailbox, signs in, registers a device (and retries the registration, which
-//! must find the same device) and refreshes its tokens, all over auth-svc's public HTTP
-//! API, and checks the access token against the JWKS.
+//! worker's log sender delivered to the DEV ONLY mailbox, signs in, registers a device (and
+//! retries the registration, which must find the same device) and refreshes its tokens, all
+//! over auth-svc's public HTTP API, and checks the access token against the JWKS.
 
 use std::time::{Duration, Instant};
 
@@ -87,8 +87,8 @@ impl<'a> Auth<'a> {
     }
 
     /// Signs `name` up with a fresh address and handle, verifies the address with the
-    /// link the worker delivered to the dev mailbox, signs in, registers a device, retries the registration
-    /// with the same `registration_id` and refreshes its tokens.
+    /// link the worker delivered to the dev mailbox, signs in, registers a device, retries
+    /// the registration with the same `registration_id` and refreshes its tokens.
     pub async fn enroll(&self, name: &str) -> anyhow::Result<Enrolled> {
         let started = Instant::now();
         let suffix = Uuid::now_v7().simple().to_string();

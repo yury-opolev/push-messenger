@@ -256,6 +256,7 @@ impl Client {
         let (user, device) = (enrolled.user, enrolled.device);
         let mut messaging = MessagingClient::new(channel.clone());
         let started = Instant::now();
+        let mut reported = None;
         loop {
             let identified = messaging
                 .identify(IdentifyRequest {
@@ -271,7 +272,10 @@ impl Client {
                 ),
                 // UNAVAILABLE is message-svc's answer for a device not relayed yet.
                 Err(status) if started.elapsed() < WORKER_TIMEOUT => {
-                    if status.code() != tonic::Code::Unavailable {
+                    // Other codes (message-svc restarting, say) are reported once each.
+                    if status.code() != tonic::Code::Unavailable && reported != Some(status.code())
+                    {
+                        reported = Some(status.code());
                         step(&format!(
                             "message-svc answers {:?} yet; retrying",
                             status.code()
