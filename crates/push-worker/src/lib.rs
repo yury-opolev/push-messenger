@@ -4,7 +4,10 @@
 //! services' outboxes into its job queue: it relays auth-svc's user and device events to
 //! message-svc, sends email, takes delivery webhooks, and runs the cleanup jobs.
 
+pub mod accounts;
 mod db;
+pub mod jobs;
 pub mod queue;
+pub mod relay;
 
 pub use db::{MIGRATOR, migrate_database};

@@ -2206,11 +2206,17 @@ name = "push-worker"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "push-auth",
+ "push-domain",
+ "push-message-svc",
+ "push-proto",
  "push-store",
  "serde_json",
  "sqlx",
  "testcontainers-modules",
  "tokio",
+ "tokio-stream",
+ "tonic 0.14.5",
  "uuid",
 ]
 
