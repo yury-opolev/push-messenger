@@ -249,10 +249,12 @@ impl Auth {
         if !device.get::<bool, _>(1) {
             return Err(AuthError::Unauthorized);
         }
-        // Read again under the device lock: what the first look saw may have changed.
+        // Read again under the device lock: what the first look saw may have changed. The
+        // clock is the statement's, not the transaction's: the lock wait must not stretch
+        // the grace window.
         let row = sqlx::query(
-            "SELECT rotated_to, revoked_at IS NULL AND expires_at > now(), \
-             rotated_at > now() - make_interval(secs => $3) \
+            "SELECT rotated_to, revoked_at IS NULL AND expires_at > statement_timestamp(), \
+             rotated_at > statement_timestamp() - make_interval(secs => $3) \
              FROM auth.refresh_token WHERE token_hash = $1 AND device_id = $2 FOR UPDATE",
         )
         .bind(hash.as_slice())
@@ -270,7 +272,7 @@ impl Auth {
         let Some(successor) = rotated_to else {
             let tokens = self.issue(&mut tx, user_id, device_id).await?;
             sqlx::query(
-                "UPDATE auth.refresh_token SET rotated_to = $2, rotated_at = now() \
+                "UPDATE auth.refresh_token SET rotated_to = $2, rotated_at = statement_timestamp() \
                  WHERE token_hash = $1",
             )
             .bind(hash.as_slice())
@@ -284,7 +286,7 @@ impl Auth {
         let live_successor = in_grace
             && sqlx::query(
                 "SELECT 1 FROM auth.refresh_token WHERE token_hash = $1 \
-                 AND rotated_to IS NULL AND revoked_at IS NULL AND expires_at > now() \
+                 AND rotated_to IS NULL AND revoked_at IS NULL AND expires_at > statement_timestamp() \
                  FOR UPDATE",
             )
             .bind(&successor)

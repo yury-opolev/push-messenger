@@ -472,7 +472,8 @@ impl Auth {
         .await?;
         // Device rows first, in a fixed order, like every other change to a device's tokens.
         sqlx::query(
-            "SELECT device_id FROM auth.device WHERE user_id = $1 ORDER BY device_id FOR UPDATE",
+            "SELECT device_id FROM auth.device WHERE user_id = $1 AND revoked_at IS NULL \
+             ORDER BY device_id FOR UPDATE",
         )
         .bind(claims.sub)
         .fetch_all(&mut *tx)
