@@ -2588,6 +2588,11 @@ the controller merges after the final review and its own minikube run.
 - **The PostgreSQL superuser** for message-svc on minikube (Plan 4B's deferral) remains,
   so revoking `CONNECT` keeps only auth-svc confined; auth-svc already runs as a plain
   owner role (Plan 11).
-- **Link tokens in ingress access logs**: ingress-nginx logs the query string of the link
-  pages' `GET`, and with it the verify or reset token (single purpose, 30 minutes). The
-  production ingress's log format comes with Plan 11.
+- **Link tokens in ingress logs**: the link pages are on their own Ingress,
+  `push-auth-links`, with access logging off (verified on minikube: no `?token=` reached
+  the controller access log). The nginx error log may still show request lines on upstream
+  errors (Plan 11).
+- **Plan 11:** validate hand-set auth keys at render time; `x-real-ip` on Azure needs
+  `externalTrafficPolicy: Local` or the PROXY protocol; nginx error-log token exposure.
+- **Smoke run budget:** the per-IP signup limit (20/h) caps smoke runs to about 10 per
+  hour on a long-lived cluster.

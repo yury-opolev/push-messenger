@@ -128,7 +128,10 @@ async fn the_smoke_test_passes_against_the_whole_stack() {
         socket_url,
         host: None,
     };
-    run(&target).await.expect("the smoke test passes");
+    tokio::time::timeout(Duration::from_secs(120), run(&target))
+        .await
+        .expect("the smoke test finishes within 120 s")
+        .expect("the smoke test passes");
 
     shutdown.cancel();
     message_svc

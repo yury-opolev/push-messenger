@@ -659,8 +659,8 @@ Implementation notes (push-auth, Plan 5A):
   cap — an owner decision for later. Display names allow bidi and zero-width characters.
   Rate-limit key subjects use plain SHA-256 and should use HMAC. Form POSTs of the link
   pages return JSON errors, not HTML. Path, Query, 404 and 405 rejections are plain text.
-  `Bearer` is matched case-sensitively. `?token=` must be stripped from ingress access
-  logs (Plan 5B). A password reset revokes refresh tokens but leaves devices active, so an
+  `Bearer` is matched case-sensitively. `?token=` is kept out of ingress access
+  logs (Plan 5B; the nginx error log is Plan 11). A password reset revokes refresh tokens but leaves devices active, so an
   access token issued before the reset keeps working for up to 15 minutes; later, a
   `password_changed_at` stamp should make `authenticate` and the gateway reject older
   tokens.
@@ -954,6 +954,27 @@ Implementation notes (local minikube, Plan 4B):
   service.
 - Images (`deploy/docker/Dockerfile`, one target per binary from one shared build stage)
   run as a non-root user on distroless, with a read-only root filesystem.
+- auth-svc (Plan 5B) is a third Deployment with its own database `push_auth` and role
+  `push_auth`, created by a PostgreSQL init script (a ConfigMap without credentials; the
+  password comes from the Secret). `REVOKE ALL … FROM PUBLIC` on both databases keeps
+  auth-svc's plain role out of `push_messaging`; message-svc still connects as the
+  superuser `push`, which can reach every database, until Plan 11. The Secret also holds
+  the generated Ed25519 seed and HMAC key (`randBytes 32`). A second Ingress routes
+  `/v1/auth`, `/v1/devices` and `/v1/users` to it; the public URL and the token audience
+  come from `ingress.scheme` and `ingress.host` (plain `http` only for a local host).
+  The token-carrying link pages (`/v1/auth/verify`, `/v1/auth/password/reset`) have their
+  own Ingress, `push-auth-links`, with access logging off; verified on minikube: no
+  `?token=` reached the controller access log. The nginx error log may still show request
+  lines on upstream errors (Plan 11). Like the gateway, auth-svc has a 5 s preStop sleep
+  and a 30 s termination grace period.
+- The smoke client verifies the access token's audience (`socket_url` with its authority
+  replaced by the Host override, `ws://push.local/v1/socket` on minikube) and the
+  refreshed token's `sub` and `device_id`. It never prints response bodies, tokens or
+  token-bearing URLs, retries only on 502, 503, 504 and transport errors, and ignores
+  `HTTP_PROXY`. The per-IP signup limit (20/h) caps smoke runs to about 10 per hour on a
+  long-lived cluster.
+- Deferred to Plan 11: validate hand-set auth keys at render time; `x-real-ip` on Azure
+  needs `externalTrafficPolicy: Local` or the PROXY protocol; nginx error-log token exposure.
 - Shutdown: the gateway has a `lifecycle.preStop.sleep.seconds: 5` (ingress-nginx stops
   routing to it before SIGTERM) and both Deployments set `terminationGracePeriodSeconds: 30`.
 - Hardening: Redis runs non-root (uid 999) with a read-only root filesystem; the data pods
@@ -961,9 +982,11 @@ Implementation notes (local minikube, Plan 4B):
 - The chart Secret carries `helm.sh/resource-policy: keep`, so `helm uninstall` keeps the
   Secret and the PVC and the passwords keep matching the database. `down` wipes the
   Secret, PVC, PVs and the hostpath directory.
-- `deploy/minikube/up.ps1` (and `up.sh`) wait for ingress-nginx, retry `helm upgrade
-  --install` up to 5 times, and bring it up on minikube; `helm test` runs `push-smoke`
-  inside the cluster through the ingress controller. The Azure plan replaces the in-chart
+- `deploy/minikube/up.ps1` (and `up.sh`) wait for ingress-nginx, stop at once with
+  "run down.ps1 first" when an existing PostgreSQL volume has no `push_auth` database,
+  retry `helm upgrade --install` up to 5 times, and bring it up on minikube; `helm test`
+  runs `push-smoke` inside the cluster through the ingress controller: two users sign up,
+  verify through the DEV ONLY mailbox, register devices and chat. The Azure plan replaces the in-chart
   secrets with Key Vault and adds TLS, and may replace the in-chart PostgreSQL and Redis.
 
 ## 12. Testing
