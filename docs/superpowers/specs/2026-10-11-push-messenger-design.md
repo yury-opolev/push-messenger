@@ -64,7 +64,11 @@ The single sanctioned exception is the **outbox**: a service writes events to it
 them. This is how auth-svc sends email and tells message-svc about users and devices.
 Cleanups of another service's data run as functions that service owns and lets the
 worker's role call (auth-svc: expired refresh tokens, accounts left unverified), so the
-rules stay with the data and the worker never reads it.
+rules stay with the data and the worker never reads it. Only the worker may call
+message-svc's `Accounts` API, which records the users and devices auth-svc announces:
+each call carries a shared internal token from the cluster's Secret, which the gateway
+does not get, so a compromised gateway cannot register devices (a NetworkPolicy adds a
+second fence with the Azure plan).
 
 **Public endpoints:** `wss://api.<domain>/v1/socket` (gateway) and
 `https://api.<domain>/v1/auth/*`, `/v1/devices/*`, `/v1/users/*` (auth-svc).
@@ -480,7 +484,8 @@ Access-token claims: `sub`, `device_id`, `email_verified`, `exp`, `iat`, `jti`, 
 4. Opening the link sets `email_verified_at` and writes `user.verified` to the outbox.
    It never signs the user in. Verification is the gate that opens API usage.
 5. Unverified accounts cannot register devices or open sockets. They can only ask for
-   the email to be resent.
+   the email to be resent. An account still unverified 7 days after its last signup is
+   deleted (owner decision, 2026-10-13).
 
 ### 5.3 Explicit device registration
 
@@ -510,6 +515,12 @@ Access-token claims: `sub`, `device_id`, `email_verified`, `exp`, `iat`, `jti`, 
    closes the socket at once with 4003.
 6. The gateway learns the device only from the verified token. message-svc rejects
    `Identify` for a device that is not active in `member_device`.
+   - A device message-svc has **not heard of yet** is not rejected for good: the worker
+     relays `device.registered` about a second after the registration, and until then
+     `Identify` answers `UNAVAILABLE` (retryable), unlike a revoked device or one of
+     another user (`PERMISSION_DENIED`, `UNKNOWN_DEVICE`). The gateway (Plan 8) must
+     pass this on as "try again shortly", and the SDK must reconnect after a short
+     backoff — never treat it as a revocation or sign the user out.
 
 ### 5.4 Password reset
 
@@ -906,6 +917,18 @@ outbox (
 Azure Communication Services Email is not used: it is being retired (onboarding closes
 2026-10-23, service ends 2028-09-30).
 
+Owner decisions (2026-10-13, Plan 6):
+
+- Emails come from `no-reply@push.kubegames.dk` and name the product "Push Messenger"
+  (`Push Messenger <no-reply@push.kubegames.dk>`).
+- Real sending through Resend comes with the Azure plan (Plan 11), with the API key and
+  the webhook secret in Key Vault and the domain's SPF, DKIM and DMARC. Until then the
+  chart's default sender is the log sender: a deployment sends no email.
+- An email gives up after 12 attempts, about 30 minutes, when its link has expired.
+- Emails are plain English text plus minimal HTML for now.
+- The sent-email log, delivery events and buried jobs are kept 30 days; the suppression
+  list is kept forever. Accounts left unverified are deleted after 7 days.
+
 ## 10. Repository layout
 
 ```
@@ -1026,6 +1049,7 @@ Required adverse-condition tests:
 
 - Confirm the Azure Load Balancer idle-timeout annotation against the
   cloud-provider-azure documentation before writing manifests.
-- Choose the production domain and the Resend sending subdomain.
+- The production sender is `no-reply@push.kubegames.dk` (decided 2026-10-13); its DNS
+  (SPF, DKIM, DMARC) and Resend's domain setup come with Plan 11.
 - Calibrate Argon2id on the chosen VM size.
 - Decide whether group endpoints ship in the first release or the second.

@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Run Plan 6A's worker on the local minikube cluster with the same chart that will deploy to Azure, and prove the real flow end to end: two users sign up through auth-svc; the worker relays each `email.send` from auth-svc's outbox and its log sender delivers the verification email into the DEV ONLY mailbox, now the worker's; the users verify, sign in and register devices; the worker relays `user.verified` and `device.registered` to message-svc's `Accounts` API — the smoke test waits for that instead of mirroring users and devices through `DevSetup`; and the two chat through the gateway. Deliverables: the smoke test on the real flow; auth-svc's own DEV ONLY mailbox removed; a `worker` image target; the worker in the chart with a database and a role of its own (`push_worker`, created by a second PostgreSQL init script, allowed to connect to `push_auth`), auth-svc told to grant that role its access, the Resend credentials and webhook secret in the Secret (a webhook secret generated in dev mode), an Ingress for `/v1/webhooks/resend` only, `PUSH_DEV_MAILBOX` behind the dev-mode guard on the worker, and guards that refuse a Resend sender without its key or in dev mode; the bring-up scripts building the new image and stopping at once on a volume or kept Secret from before the worker; CI building it; `test-chart.ps1` with 26 checks.
+**Goal:** Run Plan 6A's worker on the local minikube cluster with the same chart that will deploy to Azure, and prove the real flow end to end: two users sign up through auth-svc; the worker relays each `email.send` from auth-svc's outbox and its log sender delivers the verification email into the DEV ONLY mailbox, now the worker's; the users verify, sign in and register devices; the worker relays `user.verified` and `device.registered` to message-svc's `Accounts` API — the smoke test waits for that instead of mirroring users and devices through `DevSetup`; and the two chat through the gateway. Deliverables: the smoke test on the real flow; auth-svc's own DEV ONLY mailbox removed; a `worker` image target; the worker in the chart with a database and a role of its own (`push_worker`, created by a second PostgreSQL init script, allowed to connect to `push_auth`), auth-svc told to grant that role its access, the shared Accounts token generated into the kept Secret and given to message-svc and the worker only, the Resend credentials and webhook secret in the Secret (a webhook secret generated in dev mode), an Ingress for `/v1/webhooks/resend` only, `PUSH_DEV_MAILBOX` behind the dev-mode guard on the worker, and guards that refuse a Resend sender without its key or in dev mode, and dev mode with more than one worker; the bring-up scripts building the new image and stopping at once on a volume or kept Secret from before the worker; CI building it; `test-chart.ps1` with 28 checks.
 
-**Architecture:** The Dockerfile's shared builder also builds `push-worker`; a fifth distroless target runs it. In the chart, the worker is a Deployment (HTTP 8080 for webhooks and the dev mailbox, health 8081) behind a ClusterIP Service. PostgreSQL's init scripts (a ConfigMap, run in file name order on an empty volume) now also create the role and database `push_worker`, revoke `CONNECT` on it from `PUBLIC` and grant the role `CONNECT` on `push_auth`; auth-svc gets `PUSH_AUTH_WORKER_ROLE=push_worker` and grants the rest at start-up (Plan 6A). The worker gets two URLs from the Secret — its own database as its owner, and `push_auth` as the same role — and message-svc's gRPC address; it never sees message-svc's or auth-svc's own credentials. The smoke Pod reaches the worker's mailbox straight at its Service (the ingress routes only `/v1/webhooks/resend` to the worker) and polls message-svc's `Identify` until each relayed device is accepted; `DevSetup` stays for contacts and the direct conversation (until Plan 7) and the gateway's DEV ONLY identity stays until Plan 8. Spec: `docs/superpowers/specs/2026-10-11-push-messenger-design.md` §2, §5, §9, §11; roadmap "Running locally on minikube".
+**Architecture:** The Dockerfile's shared builder also builds `push-worker`; a fifth distroless target runs it. In the chart, the worker is a Deployment (HTTP 8080 for webhooks and the dev mailbox, health 8081) behind a ClusterIP Service. PostgreSQL's init scripts (a ConfigMap, run in file name order on an empty volume) now also create the role and database `push_worker`, revoke `CONNECT` on it from `PUBLIC` and grant the role `CONNECT` on `push_auth`; auth-svc gets `PUSH_AUTH_WORKER_ROLE=push_worker` and grants the rest at start-up (Plan 6A). The worker gets two URLs from the Secret — its own database as its owner, and `push_auth` as the same role — message-svc's gRPC address and the shared Accounts token, which message-svc gets too and the gateway does not; it never sees message-svc's or auth-svc's own credentials. The smoke Pod reaches the worker's mailbox straight at its Service (the ingress routes only `/v1/webhooks/resend` to the worker) and polls message-svc's `Identify` until each relayed device is accepted (`UNAVAILABLE` means not relayed yet; `PERMISSION_DENIED` fails at once); `DevSetup` stays for contacts and the direct conversation (until Plan 7) and the gateway's DEV ONLY identity stays until Plan 8. Spec: `docs/superpowers/specs/2026-10-11-push-messenger-design.md` §2, §5, §9, §11; roadmap "Running locally on minikube".
 
 **Tech Stack:** Docker (BuildKit), minikube 1.34 (Kubernetes 1.31, docker driver, ingress addon), kubectl, Helm 3.16, PowerShell 7 and bash. No new Rust dependencies.
 
@@ -49,9 +49,9 @@ kubectl config current-context
 - **Edit files with the edit tool, and keep them LF** (`.gitattributes`:
   `* text=auto eol=lf`). This matters for `up.sh`, which bash refuses with CRLF on Linux.
 - **Replace blocks.** "Replace … with …" pairs below are exact copies of the file before and
-  after the change, with two lines of context: find the first block in the file and replace
-  it with the second.
-- Baseline (after Plan 6A): `cargo test --workspace --locked` passes 771 tests;
+  after the change, with two lines of context (more where two would not make the first block
+  unique): find the first block in the file and replace it with the second.
+- Baseline (after Plan 6A): `cargo test --workspace --locked` passes 778 tests;
   `deploy/helm/test-chart.ps1` passes 20 checks.
 - **Every task ends green:**
 
@@ -73,33 +73,40 @@ cargo +1.85 build --workspace --all-targets --locked
   `push_auth` as the plain role `push_worker`, which can read and delete `auth.outbox` and
   call two cleanup functions there and nothing else, and cannot connect to `push_messaging`
   (message-svc still connects as the superuser `push` until Plan 11).
-- **No secret in git or in a ConfigMap.** The worker's database password and, in dev mode,
-  the webhook secret are generated on install, kept on upgrades (`lookup`), and reach the
-  containers only through `secretKeyRef`; the Resend API key and a production webhook
+- **No secret in git or in a ConfigMap.** The worker's database password, the Accounts
+  token and, in dev mode, the webhook secret are generated on install, kept on upgrades
+  (`lookup`), and reach the containers only through `secretKeyRef`; the Resend API key and a production webhook
   secret come from values (Plan 11: Key Vault). The init scripts read passwords from the
   environment.
+- **Only message-svc and the worker get the Accounts token.** message-svc refuses
+  `Accounts` calls without it, so the gateway, which reaches message-svc too, cannot
+  register devices (Plan 6A, decision 17).
 - **The worker exposes one public path.** The only Ingress to the worker routes `Exact`
   `/v1/webhooks/resend`, and only when a webhook secret exists; its DEV ONLY `/dev/mailbox`
   is never routed.
 - **The DEV ONLY mailbox cannot reach a real deployment by accident.** `PUSH_DEV_MAILBOX`
   follows `devMode` (acknowledgement and a local host required), the worker refuses it with
-  any sender but `log`, and the chart refuses dev mode with the Resend sender.
+  any sender but `log`, and the chart refuses dev mode with the Resend sender — and with more
+  than one worker, since the mailbox is in memory, per replica.
 - **Our containers stay hardened** (Plan 4B): non-root uid 65532, read-only root
   filesystem, no privilege escalation, all capabilities dropped, no service-account token;
   a 5 s preStop sleep and a 30 s grace period, like the gateway and auth-svc.
 
 ## Decisions made for this plan
 
-These were settled while writing the plan and verified on minikube. The owner decisions of
-Plan 6A still apply (unverified-account age, retention, sender address, a production
-Resend key). Do not reopen the rest during execution.
+These were settled while writing the plan, revised after its review, and verified on
+minikube. Plan 6A's owner decisions apply (all final): unverified accounts deleted after
+7 days, retention 30 days, the sender `Push Messenger <no-reply@push.kubegames.dk>`, the
+log sender until Plan 11 brings Resend, 12 attempts, plain English text and minimal HTML.
+Do not reopen any of this during execution.
 
 1. **The smoke test runs the real flow.** It reads the verification email from the
    worker's mailbox (`--mailbox` now names the worker), polling for up to 30 s while the
    worker relays `email.send` and its log sender delivers, and takes the link from the
    email's text — so the test also proves the template. After both enrollments it polls
    message-svc's `Identify` for each device (30 s at most) instead of mirroring users and
-   devices through `DevSetup`; `MakeContacts` and `OpenDirect` stay DEV ONLY until Plan 7.
+   devices through `DevSetup`: `UNAVAILABLE` means not relayed yet (Plan 6A, decision 16),
+   `PERMISSION_DENIED` fails the test at once; `MakeContacts` and `OpenDirect` stay DEV ONLY until Plan 7.
    It prints how long the worker took for each step.
 2. **auth-svc's DEV ONLY mailbox goes.** Once the worker drains the outbox it would show
    almost nothing; the worker's log sender keeps the emails instead (Plan 6A, decision 12).
@@ -112,19 +119,24 @@ Resend key). Do not reopen the rest during execution.
    DATABASE push_auth TO push_worker`. Like 5B, it runs only on an empty volume: clusters
    from 5B are wiped once with `down.ps1`.
 4. **Secret keys**: `worker-db-password` (generated), `worker-database-url`,
-   `worker-auth-database-url`, and, when present, `resend-api-key` and
+   `worker-auth-database-url`, `accounts-token` (48 random characters, generated and kept;
+   message-svc and the worker read it, the gateway does not; a Secret from Plan 5B gets
+   one on the upgrade, so it needs no wipe), and, when present, `resend-api-key` and
    `resend-webhook-secret`; the Deployment reads the last two with `optional: true`, so the
    worker serves no webhook without a secret. In dev mode a webhook secret is generated
    (`whsec_` + `randBytes 32`) so the webhook path can be exercised on minikube with signed
    requests.
 5. **Chart values** `worker.email.{sender, from, productName, resendApiKey, webhookSecret}`,
    `worker.unverifiedAccountDays` (7), `worker.retentionDays` (30), `worker.dbMaxConnections`
-   (5) and `postgres.workerPassword`. **The default sender is `log`**: a deployment without
-   a Resend key sends no email until the owner decides (Plan 6A, owner decision 4). The
-   chart refuses `resend` without a key or a From address, an unknown sender, and dev mode
-   with `resend`.
-6. **One replica by default.** The worker scales (claims and drains skip locked rows), but
-   the DEV ONLY mailbox is in memory, so a local cluster keeps one.
+   (5) and `postgres.workerPassword`. **The default sender is `log`**: real sending through
+   Resend comes with Plan 11 (Plan 6A, owner decision 3). `worker.email.from` defaults to
+   `Push Messenger <no-reply@push.kubegames.dk>` and `productName` to `Push Messenger`
+   (owner decision 2). The chart refuses `resend` without a key or a From address, an
+   unknown sender, and dev mode with `resend`.
+6. **One replica by default.** The worker scales (claims and drains skip locked rows, and
+   outcomes are fenced by their claim), but the DEV ONLY mailbox is in memory, per
+   replica, so the chart refuses dev mode with `worker.replicas` above 1 (the smoke test
+   would read the wrong replica's mailbox).
 7. **Resources:** the worker requests 50m CPU and 32 Mi, limited to 500m and 128 Mi.
 8. **The up scripts check for the worker too**: the kept Secret must have
    `worker-db-password` as well as `auth-db-password`, and the running PostgreSQL both
@@ -140,14 +152,15 @@ crates/push-auth/tests/api.rs                 links read from the outbox
 crates/push-smoke/Cargo.toml                  dev: push-worker
 crates/push-smoke/src/auth.rs                 the verification email from the worker's mailbox
 crates/push-smoke/src/lib.rs                  wait for the relay; --mailbox names the worker
-crates/push-smoke/tests/local.rs              the worker in the local stack
+crates/push-smoke/tests/local.rs              the worker (and the Accounts token) in the local stack
 deploy/docker/Dockerfile                      + the worker target
 deploy/helm/push-messenger/
 ├── values.yaml                               images.worker, worker.*, postgres.workerPassword
 ├── values-minikube.yaml                      comment
 └── templates/
-    ├── _helpers.tpl                          push.hasWebhook, push.checkEmail
-    ├── secret.yaml                           worker password and URLs, Resend credentials
+    ├── _helpers.tpl                          push.hasWebhook, push.checkEmail (one dev worker)
+    ├── secret.yaml                           worker password and URLs, Accounts token, Resend
+    ├── message-svc.yaml                      PUSH_ACCOUNTS_TOKEN
     ├── postgres-init.yaml                    + 20-push-worker.sh (no credentials)
     ├── postgres.yaml                         passes the worker's password
     ├── auth.yaml                             PUSH_AUTH_WORKER_ROLE instead of the mailbox
@@ -155,7 +168,7 @@ deploy/helm/push-messenger/
     ├── ingress.yaml                          + the webhook Ingress
     ├── tests/smoke.yaml                      --mailbox names the worker
     └── NOTES.txt                             email and webhooks
-deploy/helm/test-chart.ps1                    26 checks
+deploy/helm/test-chart.ps1                    28 checks
 deploy/minikube/up.ps1, up.sh                 build and roll the worker image; refuse a
                                                 volume or Secret without the worker's
 .github/workflows/ci.yml                      build the worker image
@@ -174,8 +187,9 @@ README.md, spec §5.6, §9, §11, roadmap        docs
 - [ ] **Step 1: The local stack gets the worker, failing**
 
 The local test creates the worker's role and database beside auth-svc's, starts auth-svc
-with `PUSH_AUTH_WORKER_ROLE` instead of `PUSH_DEV_MAILBOX`, starts the worker (log sender,
-dev mailbox, polling every 250 ms), and points `mailbox_url` at it. In
+with `PUSH_AUTH_WORKER_ROLE` instead of `PUSH_DEV_MAILBOX`, gives message-svc and the worker
+the same Accounts token, starts the worker (log sender, dev mailbox, polling every 250 ms),
+and points `mailbox_url` at it. In
 `crates/push-smoke/Cargo.toml`:
 
 Replace
@@ -286,6 +300,46 @@ with
 Replace
 
 ```rust
+    let message_svc_health_addr = message_svc_health.local_addr().unwrap();
+    let message_svc_url = format!("http://{}", grpc.local_addr().unwrap());
+    let message_svc = tokio::spawn(push_message_svc::serve(
+        push_message_svc::Config {
+```
+
+with
+
+```rust
+    let message_svc_health_addr = message_svc_health.local_addr().unwrap();
+    let message_svc_url = format!("http://{}", grpc.local_addr().unwrap());
+    // The worker's token for message-svc's Accounts API, as the chart's Secret holds it.
+    let accounts_token = "accounts-token-for-the-local-smoke-test".to_owned();
+    let message_svc = tokio::spawn(push_message_svc::serve(
+        push_message_svc::Config {
+```
+
+Replace
+
+```rust
+            health_addr: message_svc_health.local_addr().unwrap(),
+            store: StoreOptions::default(),
+            accounts_token: None,
+            dev_setup: true,
+        },
+```
+
+with
+
+```rust
+            health_addr: message_svc_health.local_addr().unwrap(),
+            store: StoreOptions::default(),
+            accounts_token: Some(accounts_token.clone()),
+            dev_setup: true,
+        },
+```
+
+Replace
+
+```rust
     ));
 
     wait_until_ready("auth-svc", auth_health_addr, &auth).await;
@@ -312,9 +366,10 @@ with
             database_url: format!("{worker_server}/push_worker"),
             auth_database_url: format!("{worker_server}/push_auth"),
             message_svc_url: message_svc_url.clone(),
+            accounts_token,
             sender: push_worker::Sender::Log,
             from: String::new(),
-            product_name: "push-messenger".to_owned(),
+            product_name: "Push Messenger".to_owned(),
             webhook_secret: None,
             poll: Duration::from_millis(250),
             unverified_after: Duration::from_secs(7 * 24 * 3600),
@@ -584,8 +639,9 @@ with
 - [ ] **Step 3: Wait for the relay instead of mirroring**
 
 In `crates/push-smoke/src/lib.rs` (the doc comment, the imports, `WORKER_TIMEOUT`, the
-`Target` doc, `run`, `Client::relayed` in place of `Client::mirror`, and the tests' example
-URLs):
+`Target` doc, `run`, `Client::relayed` in place of `Client::mirror` — it waits while
+`Identify` answers `UNAVAILABLE` and fails at once on `PERMISSION_DENIED` — and the tests'
+example URLs):
 
 Replace
 
@@ -808,8 +864,13 @@ impl Client {
                 .await;
             match identified {
                 Ok(_) => break,
+                // Revoked, or another user's: waiting cannot help.
+                Err(status) if status.code() == tonic::Code::PermissionDenied => bail!(
+                    "message-svc refused {name}'s device {device} as revoked or another user's"
+                ),
+                // UNAVAILABLE is message-svc's answer for a device not relayed yet.
                 Err(status) if started.elapsed() < WORKER_TIMEOUT => {
-                    if status.code() != tonic::Code::PermissionDenied {
+                    if status.code() != tonic::Code::Unavailable {
                         step(&format!(
                             "message-svc answers {:?} yet; retrying",
                             status.code()
@@ -919,21 +980,21 @@ Expected: the unit tests pass, and the local test prints the real flow (recorded
 writing this plan; ids and times vary):
 
 ```text
-smoke: alice signed up; the worker's log sender delivered the verification email after 254 ms
-smoke: alice verified the email, signed in and registered device 01a13527-276f-73e8-bfd4-8d8b826442d7 (a retry returned the same device) in 334 ms
-smoke: alice's access token verifies against the JWKS (EdDSA, aud ws://127.0.0.1:59518/v1/socket); refresh rotated it
-smoke: bob signed up; the worker's log sender delivered the verification email after 256 ms
-smoke: bob verified the email, signed in and registered device 01a13527-28b4-71c8-9b2f-87104dd60039 (a retry returned the same device) in 315 ms
-smoke: bob's access token verifies against the JWKS (EdDSA, aud ws://127.0.0.1:59518/v1/socket); refresh rotated it
-smoke: the worker relayed alice's account and device 01a13527-276f-73e8-bfd4-8d8b826442d7 to message-svc (waited 2 ms)
-smoke: the worker relayed bob's account and device 01a13527-28b4-71c8-9b2f-87104dd60039 to message-svc (waited 256 ms)
-smoke: made alice=01a13527-264a-76c2-aa7a-1289102baac6 and bob=01a13527-2794-7515-9478-e1629de88039 contacts with a direct conversation (DEV ONLY setup)
+smoke: alice signed up; the worker's log sender delivered the verification email after 260 ms
+smoke: alice verified the email, signed in and registered device 01a136a0-0e43-75c4-97cb-542348533fb0 (a retry returned the same device) in 327 ms
+smoke: alice's access token verifies against the JWKS (EdDSA, aud ws://127.0.0.1:63308/v1/socket); refresh rotated it
+smoke: bob signed up; the worker's log sender delivered the verification email after 265 ms
+smoke: bob verified the email, signed in and registered device 01a136a0-0f99-7579-a2a1-c1f6e18c803f (a retry returned the same device) in 334 ms
+smoke: bob's access token verifies against the JWKS (EdDSA, aud ws://127.0.0.1:63308/v1/socket); refresh rotated it
+smoke: the worker relayed alice's account and device 01a136a0-0e43-75c4-97cb-542348533fb0 to message-svc (waited 4 ms)
+smoke: the worker relayed bob's account and device 01a136a0-0f99-7579-a2a1-c1f6e18c803f to message-svc (waited 266 ms)
+smoke: made alice=01a136a0-0d1c-7689-8b29-a3268a7606c3 and bob=01a136a0-0e68-74d3-b4e3-1dc0386e3e67 contacts with a direct conversation (DEV ONLY setup)
 smoke: bob connected (Ready, heartbeat 30000 ms)
 smoke: alice connected (Ready, heartbeat 30000 ms)
-smoke: alice got SendAck seq=1 after 17 ms
-smoke: bob got Deliver seq=1 after 21 ms
+smoke: alice got SendAck seq=1 after 21 ms
+smoke: bob got Deliver seq=1 after 27 ms
 smoke: bob acked; the gateway answered the following Ping
-smoke: PASS in 1013 ms
+smoke: PASS in 1061 ms
 ```
 
 Alice's device is relayed while Bob enrolls, hence the short wait.
@@ -1772,7 +1833,7 @@ git add Cargo.lock crates/push-auth crates/push-smoke
 git commit -m "feat(smoke): the worker relays and delivers; the dev mailbox moves to it"
 ```
 
-Expected: 768 tests pass.
+Expected: 775 tests pass.
 
 ---
 
@@ -1788,10 +1849,12 @@ Expected: 768 tests pass.
 
 - [ ] **Step 1: The chart checks, failing**
 
-`test-chart.ps1` grows from 20 to 26 checks: the worker's dev mailbox and sender, both init
+`test-chart.ps1` grows from 20 to 28 checks: the worker's dev mailbox and sender, both init
 scripts without credentials, the worker's two databases (and auth-svc's role variable), the
-worker's drain budget, no webhook Ingress without a secret, exactly one webhook path with
-one, the Resend settings, the minikube mailbox and generated secret, and the refusals. In
+Accounts token shared by message-svc and the worker only, the worker's drain budget, no
+webhook Ingress without a secret, exactly one webhook path with one, the Resend settings,
+the minikube mailbox and generated secret, and the refusals — dev mode with more than one
+worker among them. In
 `deploy/helm/test-chart.ps1`:
 
 Replace
@@ -1857,6 +1920,16 @@ Check 'default: auth-svc and the worker get their own databases, the gateway non
         $worker -match 'key: worker-database-url' -and $worker -match 'key: worker-auth-database-url' -and
         $worker -notmatch 'key: (auth-)?database-url' -and
         $gateway -match 'PUSH_MESSAGE_SVC_URL' -and $gateway -notmatch 'database-url'
+}
+Check 'default: message-svc and the worker share the Accounts token from the Secret, the gateway has none' {
+    $messageSvc = Doc $default 'Deployment' 'push-message-svc'
+    $worker = Doc $default 'Deployment' 'push-worker'
+    $gateway = Doc $default 'Deployment' 'push-gateway'
+    $token = [regex]::Match($default, 'accounts-token: "([^"]+)"').Groups[1].Value
+    $token.Length -eq 48 -and
+        $messageSvc -match 'name: PUSH_ACCOUNTS_TOKEN\s+valueFrom:\s+secretKeyRef:\s+name: push-secrets\s+key: accounts-token' -and
+        $worker -match 'name: PUSH_ACCOUNTS_TOKEN\s+valueFrom:\s+secretKeyRef:\s+name: push-secrets\s+key: accounts-token' -and
+        $gateway -notmatch 'accounts-token' -and -not $messageSvc.Contains($token) -and -not $worker.Contains($token)
 }
 Check 'default: auth-svc and the worker drain like the gateway (preStop sleep, grace period)' {
     $auth = Doc $default 'Deployment' 'push-auth'
@@ -1931,13 +2004,18 @@ with
     (Render @('--set', 'ingress.scheme=http')) -ne 0
 }
 Check 'resend without an API key or a From address is refused' {
-    (Render @('--set', 'worker.email.sender=resend', '--set', 'worker.email.from=a@push.example.com')) -ne 0 -and
-    (Render @('--set', 'worker.email.sender=resend', '--set', 'worker.email.resendApiKey=re_test')) -ne 0
+    (Render @('--set', 'worker.email.sender=resend')) -ne 0 -and
+    (Render @('--set', 'worker.email.sender=resend', '--set', 'worker.email.resendApiKey=re_test',
+        '--set', 'worker.email.from=')) -ne 0
 }
 Check 'dev mode with the resend sender, or an unknown sender, is refused' {
     (Render @('-f', $minikube, '--set', 'worker.email.sender=resend', '--set', 'worker.email.resendApiKey=re_test',
         '--set', 'worker.email.from=a@push.local')) -ne 0 -and
     (Render @('--set', 'worker.email.sender=smtp')) -ne 0
+}
+Check 'dev mode with more than one worker is refused' {
+    (Render @('-f', $minikube, '--set', 'worker.replicas=2')) -ne 0 -and
+    (Render @('--set', 'worker.replicas=2')) -eq 0
 }
 
 if ($failures -gt 0) {
@@ -2089,20 +2167,23 @@ with
       memory: 256Mi
 
 worker:
+  # Workers share the queue, so more replicas are safe; dev mode needs exactly 1 (its
+  # DEV ONLY mailbox is in memory, per replica), and the chart refuses more there.
   replicas: 1
   # 5 s preStop sleep (the webhook endpoint is behind the ingress) + the job in progress
-  # (at most about 15 s) + margin.
+  # (at most about 15 s) + giving back the jobs not started + margin.
   terminationGracePeriodSeconds: 30
   # Each of its two pools (its own database and auth-svc's outbox).
   dbMaxConnections: 5
   email:
     # log: logs each email instead of sending it. resend: sends through Resend, which
-    # needs resendApiKey and from.
+    # needs resendApiKey and from. Real sending comes with the Azure plan (Plan 11), which
+    # brings the key and the webhook secret through Key Vault.
     sender: log
-    # The From of every email, for example "push-messenger <no-reply@mail.example.com>".
-    from: ""
+    # The From of every email (owner decision: the push.kubegames.dk domain).
+    from: "Push Messenger <no-reply@push.kubegames.dk>"
     # The name emails sign with.
-    productName: push-messenger
+    productName: Push Messenger
     # Resend's API key and the signing secret of its webhook (whsec_...): kept in the
     # Secret. Without a webhook secret the worker does not serve the webhook, and the
     # webhook Ingress is not rendered (in dev mode one is generated).
@@ -2164,7 +2245,7 @@ with
 devMode:
 ```
 
-In `deploy/helm/push-messenger/templates/_helpers.tpl` (decisions 4 and 5):
+In `deploy/helm/push-messenger/templates/_helpers.tpl` (decisions 4, 5 and 6):
 
 Replace
 
@@ -2205,9 +2286,14 @@ true
 {{/*
 Checks the worker's email settings: the sender is log or resend; resend needs an API key
 and a From address and is refused in dev mode, whose mailbox shows every email it sent.
+Dev mode needs exactly one worker: its mailbox is in memory, per replica, so with more
+the smoke test would look in the wrong one.
 */}}
 {{- define "push.checkEmail" -}}
 {{- $email := .Values.worker.email -}}
+{{- if and (include "push.devMode" .) (gt (int .Values.worker.replicas) 1) -}}
+{{- fail "dev mode keeps the DEV ONLY mailbox in memory, per worker replica: use worker.replicas 1 with it" -}}
+{{- end -}}
 {{- if not (has $email.sender (list "log" "resend")) -}}
 {{- fail (printf "worker.email.sender must be log or resend, not %q" $email.sender) -}}
 {{- end -}}
@@ -2348,6 +2434,7 @@ with
 {{- $redisPassword := .Values.redis.password | default (get $existing "redis-password" | b64dec) | default (randAlphaNum 32) -}}
 {{- $authPassword := .Values.postgres.authPassword | default (get $existing "auth-db-password" | b64dec) | default (randAlphaNum 32) -}}
 {{- $workerPassword := .Values.postgres.workerPassword | default (get $existing "worker-db-password" | b64dec) | default (randAlphaNum 32) -}}
+{{- $accountsToken := get $existing "accounts-token" | b64dec | default (randAlphaNum 48) -}}
 {{- /* Resend's credentials come from values (Plan 11: Key Vault); a local cluster gets a
 generated webhook secret, so the webhook path can be tried with signed requests. */ -}}
 {{- $resendApiKey := .Values.worker.email.resendApiKey | default (get $existing "resend-api-key" | b64dec) -}}
@@ -2377,6 +2464,9 @@ with
   worker-db-password: {{ $workerPassword | quote }}
   worker-database-url: {{ printf "postgres://push_worker:%s@%s:5432/push_worker" $workerPassword $postgresHost | quote }}
   worker-auth-database-url: {{ printf "postgres://push_worker:%s@%s:5432/push_auth" $workerPassword $postgresHost | quote }}
+  # The worker's token for message-svc's Accounts API. The gateway, which can reach
+  # message-svc too, does not get it, so it cannot register devices.
+  accounts-token: {{ $accountsToken | quote }}
   {{- with $resendApiKey }}
   resend-api-key: {{ . | quote }}
   {{- end }}
@@ -2409,6 +2499,32 @@ with
               value: push_worker
           ports:
             - name: http
+```
+
+In `deploy/helm/push-messenger/templates/message-svc.yaml` (Plan 6A, decision 17):
+
+Replace
+
+```yaml
+            - name: PUSH_DB_MAX_CONNECTIONS
+              value: {{ .Values.messageSvc.dbMaxConnections | quote }}
+            - name: PUSH_DEV_SETUP
+              value: {{ include "push.devFlag" . | quote }}
+```
+
+with
+
+```yaml
+            - name: PUSH_DB_MAX_CONNECTIONS
+              value: {{ .Values.messageSvc.dbMaxConnections | quote }}
+            # Only the worker has this token: the Accounts API refuses calls without it.
+            - name: PUSH_ACCOUNTS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "push.secretName" . }}
+                  key: accounts-token
+            - name: PUSH_DEV_SETUP
+              value: {{ include "push.devFlag" . | quote }}
 ```
 
 - [ ] **Step 5: The worker, its Ingress, the smoke test and the notes**
@@ -2455,8 +2571,8 @@ spec:
       automountServiceAccountToken: false
       # The webhook endpoint is behind the ingress: the 5 s preStop sleep lets Kubernetes
       # take the pod out of its endpoints before SIGTERM, on which the worker finishes the
-      # job in progress and stops. Jobs it claimed but did not start come back to another
-      # replica when their lease ends. Native sleep action: the image has no shell.
+      # job in progress, gives back the jobs it claimed but did not start (another replica
+      # takes them at once) and stops. Native sleep action: the image has no shell.
       terminationGracePeriodSeconds: {{ .Values.worker.terminationGracePeriodSeconds }}
       containers:
         - name: worker
@@ -2482,6 +2598,11 @@ spec:
                   key: worker-auth-database-url
             - name: PUSH_MESSAGE_SVC_URL
               value: {{ printf "http://%s:50051" (include "push.name" (dict "root" . "component" "message-svc")) | quote }}
+            - name: PUSH_ACCOUNTS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "push.secretName" . }}
+                  key: accounts-token
             - name: PUSH_EMAIL_SENDER
               value: {{ .Values.worker.email.sender | quote }}
             - name: PUSH_EMAIL_FROM
@@ -2695,6 +2816,7 @@ ok   default: the worker has no dev mailbox and logs email; auth-svc has no mail
 ok   default: links use https and tokens name the gateway at wss
 ok   default: the only ConfigMap is the Postgres init scripts, without credentials
 ok   default: auth-svc and the worker get their own databases, the gateway none
+ok   default: message-svc and the worker share the Accounts token from the Secret, the gateway has none
 ok   default: auth-svc and the worker drain like the gateway (preStop sleep, grace period)
 ok   default: without a webhook secret there is no webhook Ingress
 ok   default: the ingress routes the auth API, not /dev, and keeps link tokens out of the access log
@@ -2712,6 +2834,7 @@ ok   dev mode with a public ingress host is refused
 ok   plain http with a public ingress host is refused
 ok   resend without an API key or a From address is refused
 ok   dev mode with the resend sender, or an unknown sender, is refused
+ok   dev mode with more than one worker is refused
 all chart checks passed
 ```
 
@@ -2726,7 +2849,7 @@ git add deploy
 git commit -m "deploy: the worker in the image and the chart"
 ```
 
-Expected: 768 tests pass.
+Expected: 775 tests pass.
 
 ---
 
@@ -3076,28 +3199,27 @@ Expected: `release "push" uninstalled`, the namespace and the released volume de
 five images build (`==> build push-messenger/worker:dev` fourth), the install succeeds at
 the first attempt, the notes show
 `Email: the worker's log sender; Resend webhooks at http://push.local/v1/webhooks/resend.`,
-and `helm test` prints `Phase: Succeeded` and the smoke output. Recorded while writing this
-plan (a fresh install; the first two lines are the ingress answering 503 for a few seconds
-after the backends became ready; the worker looks for work every second):
+and `helm test` prints `Phase: Succeeded` and the smoke output. Recorded while revising this
+plan (a fresh install after `down.ps1`; the worker looks for work every second, so an email
+or a device takes up to about a second; a run may start with `smoke: auth-svc answers 503
+Service Unavailable yet; retrying` while the ingress catches up with the backends):
 
 ```text
-smoke: auth-svc answers 503 Service Unavailable yet; retrying
-smoke: auth-svc answers 503 Service Unavailable yet; retrying
-smoke: alice signed up; the worker's log sender delivered the verification email after 1013 ms
-smoke: alice verified the email, signed in and registered device 01a13532-7bff-714e-812c-3154e6e59e6a (a retry returned the same device) in 1071 ms
+smoke: alice signed up; the worker's log sender delivered the verification email after 253 ms
+smoke: alice verified the email, signed in and registered device 01a136b0-5edc-74ae-bb69-567fe02d8c7d (a retry returned the same device) in 322 ms
 smoke: alice's access token verifies against the JWKS (EdDSA, aud ws://push.local/v1/socket); refresh rotated it
-smoke: bob signed up; the worker's log sender delivered the verification email after 1007 ms
-smoke: bob verified the email, signed in and registered device 01a13532-8027-7300-8ff2-ada961a13c80 (a retry returned the same device) in 1060 ms
+smoke: bob signed up; the worker's log sender delivered the verification email after 1006 ms
+smoke: bob verified the email, signed in and registered device 01a136b0-6334-768c-8e48-2d859caa9b5f (a retry returned the same device) in 1110 ms
 smoke: bob's access token verifies against the JWKS (EdDSA, aud ws://push.local/v1/socket); refresh rotated it
-smoke: the worker relayed alice's account and device 01a13532-7bff-714e-812c-3154e6e59e6a to message-svc (waited 0 ms)
-smoke: the worker relayed bob's account and device 01a13532-8027-7300-8ff2-ada961a13c80 to message-svc (waited 1013 ms)
-smoke: made alice=01a13532-77ec-7700-bc9d-1a0d4389d915 and bob=01a13532-7c1b-702b-8ea1-678ee5fd146b contacts with a direct conversation (DEV ONLY setup)
+smoke: the worker relayed alice's account and device 01a136b0-5edc-74ae-bb69-567fe02d8c7d to message-svc (waited 0 ms)
+smoke: the worker relayed bob's account and device 01a136b0-6334-768c-8e48-2d859caa9b5f to message-svc (waited 1010 ms)
+smoke: made alice=01a136b0-5dc1-745e-960b-e862bc3bee26 and bob=01a136b0-5ef5-7083-b88f-0fffb11dd11d contacts with a direct conversation (DEV ONLY setup)
 smoke: bob connected (Ready, heartbeat 30000 ms)
 smoke: alice connected (Ready, heartbeat 30000 ms)
-smoke: alice got SendAck seq=1 after 6 ms
-smoke: bob got Deliver seq=1 after 38 ms
+smoke: alice got SendAck seq=1 after 7 ms
+smoke: bob got Deliver seq=1 after 39 ms
 smoke: bob acked; the gateway answered the following Ping
-smoke: PASS in 7278 ms
+smoke: PASS in 2581 ms
 ```
 
 - [ ] **Step 4: Check what the smoke test does not**
@@ -3113,16 +3235,21 @@ $pw = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String((kubectl --con
 kubectl --context push -n push exec push-postgres-0 -- env PGPASSWORD=$pw psql -h 127.0.0.1 -U push_worker -d push_auth -Atc "select count(*) from auth.user_account"
 kubectl --context push -n push exec push-postgres-0 -- env PGPASSWORD=$pw psql -h 127.0.0.1 -U push_worker -d push_messaging -Atc "select 1"
 kubectl --context push -n push exec push-postgres-0 -- env PGPASSWORD=$pw psql -h 127.0.0.1 -U push_worker -d push_worker -Atc "select rolsuper from pg_roles where rolname = current_user"
+$token = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String((kubectl --context push -n push get secret push-secrets -o jsonpath='{.data.accounts-token}')))
+"accounts-token length: $($token.Length)"
+kubectl --context push -n push logs deploy/push-message-svc | Select-String 'PUSH_ACCOUNTS_TOKEN'
+kubectl --context push -n push get deploy push-gateway -o yaml | Select-String 'accounts-token'
 ```
 
-Expected (recorded while writing this plan): every pod `Running` (`push-smoke`
+Expected (recorded while revising this plan): every pod `Running` (`push-smoke`
 `Completed`), 0 restarts. The worker's JSON logs show the DEV ONLY warning; `connected` for
-postgres; one `not reachable yet; retrying` for `auth-svc's database` with
+postgres (possibly after one `not reachable yet; retrying` while Postgres starts); one
+`not reachable yet; retrying` for `auth-svc's database` with
 `permission denied for schema auth` (the worker started before auth-svc had granted its
 role), then `connected` and `serving HTTP`; and one line per email, without address or body:
 
 ```text
-{"timestamp":"…","level":"INFO","fields":{"message":"email delivered by the log sender (not sent)","email_id":"01a13532-77ec-7700-bc9d-1a0e2e426619","template":"verify_email","recipient_domain":"smoke.test"},"target":"push_email::sender"}
+{"timestamp":"…","level":"INFO","fields":{"message":"email delivered by the log sender (not sent)","email_id":"01a136b0-5dc2-72d7-b61a-d965e9ad41d5","template":"verify_email","recipient_domain":"smoke.test"},"target":"push_email::sender"}
 ```
 
 The databases are `push_auth|push_auth`, `push_messaging|push` and
@@ -3132,7 +3259,10 @@ waiting about an hour (`cleanup.refresh_tokens|0|t|t`, `cleanup.unverified_accou
 rows whose params hold `handle` and `expires_in_minutes` and no link; `push_worker` reading
 `auth.user_account` fails with `permission denied for table user_account`, connecting to
 `push_messaging` fails with `permission denied for database "push_messaging"` and
-`User does not have CONNECT privilege.`; and `push_worker` is not a superuser (`f`).
+`User does not have CONNECT privilege.`; `push_worker` is not a superuser (`f`); the
+Accounts token is 48 characters long; message-svc logs no `PUSH_ACCOUNTS_TOKEN is not set`
+warning (it has the token, and the smoke test's relayed devices prove the worker presents
+it); and the gateway's Deployment never mentions `accounts-token`.
 
 Then post webhooks through the ingress as Resend would, signed with the generated secret,
 and check what the ingress routes:
@@ -3151,6 +3281,11 @@ foreach ($try in 1..2) {
     $answer = Invoke-WebRequest -Method Post -Uri 'http://127.0.0.1:18080/v1/webhooks/resend' -Headers $headers -ContentType 'application/json' -Body $body -SkipHttpErrorCheck
     "signed webhook -> $($answer.StatusCode)"
 }
+$malformed = '{"type":"email.bounced"}'
+$id2 = 'msg_minikube_2'
+$sig2 = 'v1,' + [Convert]::ToBase64String($hmac.ComputeHash([Text.Encoding]::UTF8.GetBytes("$id2.$ts.$malformed")))
+$answer = Invoke-WebRequest -Method Post -Uri 'http://127.0.0.1:18080/v1/webhooks/resend' -Headers @{ Host = 'push.local'; 'svix-id' = $id2; 'svix-timestamp' = "$ts"; 'svix-signature' = $sig2 } -ContentType 'application/json' -Body $malformed -SkipHttpErrorCheck
+"signed but malformed webhook -> $($answer.StatusCode)"
 $answer = Invoke-WebRequest -Method Post -Uri 'http://127.0.0.1:18080/v1/webhooks/resend' -Headers @{ Host = 'push.local' } -ContentType 'application/json' -Body $body -SkipHttpErrorCheck
 "unsigned webhook -> $($answer.StatusCode)"
 foreach ($path in '/dev/mailbox?to=a@b.test', '/v1/webhooks', '/v1/auth/jwks') {
@@ -3163,24 +3298,30 @@ kubectl --context push -n push exec push-postgres-0 -- psql -U push -d push_work
 ```
 
 Expected (recorded): `signed webhook -> 204` twice (the second is a replay, recorded once),
-`unsigned webhook -> 401`, `/dev/mailbox?to=a@b.test -> 404` and `/v1/webhooks -> 404`
-(not routed), `/v1/auth/jwks -> 200`; the suppression list holds `bounce@smoke.test|1`
-(hard bounce) and the event table `msg_minikube_1|2` (bounced) once. The worker logs
-`delivery event recorded` with `"kind":2,"suppressed":1` and, for the unsigned one,
+`signed but malformed webhook -> 204` (Plan 6A, decision 11: Resend would retry anything
+else for days), `unsigned webhook -> 401`, `/dev/mailbox?to=a@b.test -> 404` and
+`/v1/webhooks -> 404` (not routed), `/v1/auth/jwks -> 200`; the suppression list holds
+`bounce@smoke.test|1` (hard bounce) and the event table only `msg_minikube_1|2`
+(bounced), once. The worker logs `delivery event recorded` with
+`"kind":2,"suppressed":1`, for the malformed one `a signed webhook is not a delivery event
+we can read; dropped` with `"webhook_id":"msg_minikube_2"`, and for the unsigned one
 `webhook refused` with `the webhook lacks its signature headers`.
 
 - [ ] **Step 5: An upgrade keeps the secrets**
 
 ```powershell
 $before = kubectl --context push -n push get secret push-secrets -o jsonpath='{.data.resend-webhook-secret}'
+$beforeToken = kubectl --context push -n push get secret push-secrets -o jsonpath='{.data.accounts-token}'
 deploy/minikube/up.ps1 -SkipBuild -Smoke
 $after = kubectl --context push -n push get secret push-secrets -o jsonpath='{.data.resend-webhook-secret}'
+$afterToken = kubectl --context push -n push get secret push-secrets -o jsonpath='{.data.accounts-token}'
 "webhook secret kept: $($before -eq $after)"
+"accounts token kept: $($beforeToken -eq $afterToken)"
 ```
 
 Expected: `==> check that the Postgres volume has the push_auth and push_worker databases`
 (the release's StatefulSet exists now), `REVISION: 2`, the smoke test passes again
-(recorded: `PASS in 2534 ms`), and `webhook secret kept: True`.
+(recorded: `PASS in 3211 ms`), `webhook secret kept: True` and `accounts token kept: True`.
 
 - [ ] **Step 6: The up scripts refuse a volume without `push_worker`**
 
@@ -3197,8 +3338,9 @@ pwsh -NoProfile -File deploy/minikube/up.ps1 -SkipBuild; "exit=$LASTEXITCODE"
 Expected: `DROP DATABASE`; each script prints `==> check that the Postgres volume has the
 push_auth and push_worker databases` and stops within seconds, before building or
 installing anything, with `The Postgres volume predates auth-svc or the worker: it lacks
-the push_auth or push_worker database, …` and `exit=1`. Task 4 starts with `down.ps1`,
-which leaves a fresh cluster again.
+the push_auth or push_worker database, …` and `exit=1` (recorded while writing this plan;
+the revision did not change the scripts). Task 4 starts with `down.ps1`, which leaves a
+fresh cluster again.
 
 - [ ] **Step 7: Run the gates and commit**
 
@@ -3211,7 +3353,7 @@ git add deploy/minikube
 git commit -m "deploy: build and roll the worker image on minikube"
 ```
 
-Expected: 768 tests pass.
+Expected: 775 tests pass.
 
 ---
 
@@ -3263,7 +3405,9 @@ Replace the paragraph that starts `auth-svc has a database and a role of its own
 ```markdown
 auth-svc and the worker have databases and roles of their own, `push_auth` and
 `push_worker`, which PostgreSQL's init scripts create when it initialises an empty volume;
-the worker's role may also drain auth-svc's outbox, which auth-svc grants at start-up. A
+the worker's role may also drain auth-svc's outbox, which auth-svc grants at start-up.
+message-svc and the worker share a generated Accounts token from the same Secret, which
+the gateway does not get. A
 cluster whose Postgres volume predates them (Plans 4B and 5B) lacks a database. `up` stops
 when the kept Secret `push-secrets` (it survives a plain `helm uninstall`) has no
 `auth-db-password` or `worker-db-password`, or when the running Postgres lacks `push_auth`
@@ -3299,9 +3443,11 @@ it ends `a 30 s termination grace period.`), add:
 - The worker (Plan 6B) is a fourth Deployment with its own database `push_worker` and role
   `push_worker`, created by a second init script, which also grants the role `CONNECT` on
   `push_auth`; auth-svc grants it `auth.outbox` and two cleanup functions at start-up
-  (`PUSH_AUTH_WORKER_ROLE`). The Secret holds its password and two URLs, and Resend's API key
-  and webhook secret when set. Its only Ingress routes `Exact` `/v1/webhooks/resend`; its
-  DEV ONLY mailbox is not routed. It has a 5 s preStop sleep and a 30 s grace period.
+  (`PUSH_AUTH_WORKER_ROLE`). The Secret holds its password and two URLs, the Accounts token
+  (generated and kept; message-svc and the worker read it, the gateway does not), and
+  Resend's API key and webhook secret when set. Its only Ingress routes `Exact`
+  `/v1/webhooks/resend`; its DEV ONLY mailbox is not routed, and dev mode allows one worker
+  only. It has a 5 s preStop sleep and a 30 s grace period.
 ```
 
 Replace the bullet that starts ``- `deploy/minikube/up.ps1` (and `up.sh`) wait for
@@ -3337,7 +3483,7 @@ deploy/minikube/down.ps1
 deploy/minikube/up.ps1 -Smoke
 ```
 
-Expected: no diff, no warnings, 768 tests on both toolchains, `all chart checks passed`,
+Expected: no diff, no warnings, 775 tests on both toolchains, `all chart checks passed`,
 and the smoke test `PASS` as in Task 3, Step 3. Copy the `smoke:` lines for the pull
 request. Then stop the profile (keep it for later plans) and restore the kubectl context you
 noted at the start:
@@ -3361,7 +3507,7 @@ Put the smoke output from Step 5 into the body (replace the placeholder line):
 
 ```powershell
 $body = @'
-Implements docs/superpowers/plans/2026-10-13-plan-06b-worker-minikube.md: the smoke test runs the real flow (the worker relays email.send and its log sender delivers the verification email to the DEV ONLY mailbox, now the worker's; the smoke test waits for the worker to relay users and devices to message-svc instead of mirroring them through DevSetup); auth-svc's own mailbox is removed; a worker image target; the worker in the chart with its own database and role (push_worker, a second PostgreSQL init script, CONNECT on push_auth, auth-svc grants the outbox and two cleanup functions), Resend credentials and a webhook secret in the Secret (generated in dev mode), an Ingress for /v1/webhooks/resend only, the dev mailbox behind the dev-mode guard, refusals for resend without a key or in dev mode; up scripts and CI build the new image, and the up scripts stop at once on a volume or Secret from before the worker; test-chart.ps1 has 26 checks.
+Implements docs/superpowers/plans/2026-10-13-plan-06b-worker-minikube.md: the smoke test runs the real flow (the worker relays email.send and its log sender delivers the verification email to the DEV ONLY mailbox, now the worker's; the smoke test waits for the worker to relay users and devices to message-svc instead of mirroring them through DevSetup); auth-svc's own mailbox is removed; a worker image target; the worker in the chart with its own database and role (push_worker, a second PostgreSQL init script, CONNECT on push_auth, auth-svc grants the outbox and two cleanup functions), Resend credentials and a webhook secret in the Secret (generated in dev mode), an Ingress for /v1/webhooks/resend only, the dev mailbox behind the dev-mode guard, refusals for resend without a key or in dev mode and for dev mode with more than one worker; the Accounts token generated into the kept Secret for message-svc and the worker only; up scripts and CI build the new image, and the up scripts stop at once on a volume or Secret from before the worker; test-chart.ps1 has 28 checks.
 
 Verified on minikube (deploy/minikube/up.ps1 -Smoke):
 
@@ -3381,6 +3527,7 @@ controller merges after the final review and its own minikube run.
 | Spec item / decision | Task |
 |---|---|
 | §2 each service owns one database (the worker's role reaches `push_auth` only for the outbox and two cleanups, never `push_messaging`) | 2, 3 |
+| §2 only the worker may call message-svc's `Accounts` API: the token in the Secret, for message-svc and the worker only | 2, 3 |
 | §2 the worker relays auth-svc's user and device events to message-svc; sends email | 1, 3 |
 | §5.2, §5.3 verification through an emailed link; devices relayed from auth-svc, the DEV ONLY mirror gone | 1, 3 |
 | §7.6 DEV ONLY switches, strict and off by default; the mailbox only beside the log sender | 1, 2 |
@@ -3397,7 +3544,15 @@ controller merges after the final review and its own minikube run.
 - **Production email** (Plan 11): Resend's API key and webhook secret through Key Vault, the
   sending domain with SPF, DKIM and DMARC, open and click tracking off at Resend, TLS on the
   webhook path; the owner decisions of Plan 6A.
-- **A NetworkPolicy** for message-svc's `Accounts` API and the worker's port (Plan 11).
-- **Several workers on a local cluster**: the DEV ONLY mailbox is in memory, per replica.
+- **A NetworkPolicy** for message-svc's `Accounts` API and the worker's port — a Plan 11
+  must-do; until then only the shared token keeps `Accounts` to the worker.
+- **Several workers on a local cluster**: the DEV ONLY mailbox is in memory, per replica, so
+  the chart refuses dev mode with more than one.
+- **Checking `worker.email.webhookSecret`'s format when the chart renders** (`whsec_` and
+  base64); today the worker refuses a malformed secret at start-up, after the install.
+- **A dev webhook secret can outlive dev mode**: the generated secret stays in the kept
+  Secret if the same release later leaves dev mode (Plan 11's Key Vault secrets replace it).
+- **Unsetting `PUSH_AUTH_WORKER_ROLE` does not revoke the grants** auth-svc gave the role
+  earlier; revoking them is manual SQL until a deployment needs it.
 - **`x-real-ip`, the nginx error log, the superuser `push`** — as listed in Plan 5B,
   unchanged (Plan 11).

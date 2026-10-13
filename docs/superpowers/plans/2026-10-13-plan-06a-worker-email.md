@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** The worker of spec §2, §3.3 and §9 as tested code: `push-email` (the email templates, a provider-neutral `EmailSender` with a log-only sender for local work and a Resend sender, and a `WebhookVerifier` that checks Resend's Svix signatures and turns bounces and complaints into delivery events) and `push-worker` (its own database `push_worker` with the `worker` schema; a job queue claimed with `FOR UPDATE SKIP LOCKED`, leased, retried with backoff and burying poison; the outbox relay that moves auth-svc's events into that queue at least once; the relay of `user.verified`, `device.registered`, `device.revoked` and `user.password_reset` to a new internal message-svc API; `email.send` rendered, checked against the suppression list, recorded and sent once; Resend webhooks feeding the suppression list; and the cleanup jobs — expired refresh tokens, accounts left unverified, the worker's own old records). message-svc gains the `Accounts` gRPC API, idempotent and correct in any order; auth-svc gains what the worker's role may do in its database: drain `auth.outbox` and call two cleanup functions, nothing else. Everything is tested against Postgres containers, an in-process message-svc and a stand-in for Resend. Plan 6B moves the smoke test to the real flow, adds the worker to the image and the chart and verifies it on minikube.
+**Goal:** The worker of spec §2, §3.3 and §9 as tested code: `push-email` (the email templates, a provider-neutral `EmailSender` with a log-only sender for local work and a Resend sender, and a `WebhookVerifier` that checks Resend's Svix signatures and turns bounces and complaints into delivery events) and `push-worker` (its own database `push_worker` with the `worker` schema; a job queue claimed with `FOR UPDATE SKIP LOCKED`, leased, retried with backoff and burying poison; the outbox relay that moves auth-svc's events into that queue at least once; the relay of `user.verified`, `device.registered`, `device.revoked` and `user.password_reset` to a new internal message-svc API; `email.send` rendered, checked against the suppression list, recorded and sent once; Resend webhooks feeding the suppression list; and the cleanup jobs — expired refresh tokens, accounts left unverified, the worker's own old records). message-svc gains the `Accounts` gRPC API, idempotent, correct in any order and callable only with the worker's shared internal token, and its `Identify` now tells a device not relayed yet (retryable) from a revoked one; auth-svc gains what the worker's role may do in its database: drain `auth.outbox` and call two cleanup functions, nothing else. Everything is tested against Postgres containers, an in-process message-svc and a stand-in for Resend. Plan 6B moves the smoke test to the real flow, adds the worker to the image and the chart and verifies it on minikube.
 
-**Architecture:** auth-svc keeps writing events to `auth.outbox` in the same transaction as each change (Plan 5A). The worker connects to two databases: its own, as the owner `push_worker`, and auth-svc's `push_auth` as the same role, which auth-svc grants (at start-up, `PUSH_AUTH_WORKER_ROLE`) `SELECT`/`DELETE` on `auth.outbox` (plus `UPDATE` of `created_at` alone, which `FOR UPDATE` requires) and `EXECUTE` on two `SECURITY DEFINER` functions. The **relay** locks a batch of outbox rows (`FOR UPDATE SKIP LOCKED`), inserts them into `worker.job` with the event id as the job id (`ON CONFLICT DO NOTHING`, committed in the worker's database), then deletes them from the outbox and commits there: at least once, never lost, and a second copy is ignored. The **job loop** claims due jobs with `UPDATE … WHERE job_id IN (SELECT … FOR UPDATE SKIP LOCKED) RETURNING`, which leases them for 2 minutes; each job ends `Done` (deleted), `RunAgain` (periodic), `Failed` (retried after 1 s doubling to 10 minutes) or `Poison` (buried with `dead_at`, kept for inspection). Account events go to message-svc's new `Accounts` gRPC service, whose calls are idempotent and commute: a registration also records the user, and a revocation that arrives first records the device as revoked, so a late registration cannot revive it. `email.send` jobs are rendered by `push-email`, refused for suppressed addresses, recorded in `worker.email_message` (without the link) and sent with the job id as the idempotency key. `POST /v1/webhooks/resend` verifies the Svix signature within a 5-minute window, records the event once by its `svix-id`, and suppresses hard bounces and complaints. The cleanups are periodic jobs with fixed ids in the same queue, so one replica runs each. Spec: `docs/superpowers/specs/2026-10-11-push-messenger-design.md` §2, §3.1, §3.3, §5.3, §5.4, §9, §11, §12.
+**Architecture:** auth-svc keeps writing events to `auth.outbox` in the same transaction as each change (Plan 5A). The worker connects to two databases: its own, as the owner `push_worker`, and auth-svc's `push_auth` as the same role, which auth-svc grants (at start-up, `PUSH_AUTH_WORKER_ROLE`) `SELECT`/`DELETE` on `auth.outbox` (plus `UPDATE` of `created_at` alone, which `FOR UPDATE` requires) and `EXECUTE` on two `SECURITY DEFINER` functions. The **relay** locks a batch of outbox rows (`FOR UPDATE SKIP LOCKED`), inserts them into `worker.job` with the event id as the job id (`ON CONFLICT DO NOTHING`, committed in the worker's database), then deletes them from the outbox and commits there: at least once, never lost, and a second copy is ignored. The **job loop** claims at most 4 due jobs at a time with `UPDATE … WHERE job_id IN (SELECT … FOR UPDATE SKIP LOCKED) RETURNING`, which leases them for 2 minutes — 4 attempts of at most about 15 s each fit in it with room to spare; each job ends `Done` (deleted), `RunAgain` (periodic), `Failed` (retried after 1 s doubling to 10 minutes) or `Poison` (buried with `dead_at`, kept for inspection without an email's link). An outcome is recorded only under the claim it ran under (`attempts` and `claimed_at`), so a late one never overwrites a newer claim, and at shutdown the jobs not started are given back. Account events go to message-svc's new `Accounts` gRPC service, with the shared internal token in their metadata (the gateway has none), whose calls are idempotent and commute: a registration also records the user, and a revocation that arrives first records the device as revoked, so a late registration cannot revive it. `email.send` jobs are rendered by `push-email`, refused for suppressed addresses, recorded in `worker.email_message` (without the link) and sent with the job id as the idempotency key. `POST /v1/webhooks/resend` verifies the Svix signature within a 5-minute window, records the event once by its `svix-id`, and suppresses hard bounces and complaints; a signed body it cannot read is logged and acknowledged, since Resend retries anything but a 2xx for days. The cleanups are periodic jobs with fixed ids in the same queue, so one replica runs each. Spec: `docs/superpowers/specs/2026-10-11-push-messenger-design.md` §2, §3.1, §3.3, §5.3, §5.4, §9, §11, §12.
 
 **Tech Stack:** Rust 2024 edition (toolchain ≥ 1.85). New: `reqwest` 0.12's `rustls-tls` feature for `push-email` only (rustls 0.23 on `ring`, webpki roots: no OpenSSL, no cmake — it builds on 1.85 and on Windows; verified against `api.resend.com` while writing this plan). Already in the workspace: `axum` 0.8, `sqlx` 0.8, `tonic` 0.14, `hmac` 0.12, `sha2` 0.10, `base64` 0.22, `chrono`, `testcontainers-modules` 0.13; for tests `tower` 0.5 and `http-body-util` 0.1.
 
@@ -44,8 +44,8 @@ $env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Env
 - **Do not pipe `cargo fmt`.** Run `cargo fmt --all -- --check` on its own and read the exit
   code. The code in this plan is formatted, so a diff means a copying mistake.
 - **Replace blocks.** "Replace … with …" pairs below are exact copies of the file before and
-  after the change, with two lines of context: find the first block in the file and replace
-  it with the second.
+  after the change, with two lines of context (more where two would not make the first block
+  unique): find the first block in the file and replace it with the second.
 - Baseline (after Plan 5B): `cargo test --workspace --locked` passes 706 tests.
 - **Cargo.lock.** Tasks that add a crate or a dependency first run `cargo test -p <crate>`
   without `--locked`, which records it; the gates then run with `--locked`. Resolver 3 with
@@ -64,8 +64,9 @@ cargo +1.85 build --workspace --all-targets --locked
 - **Postgres tests connect to `127.0.0.1`, never `localhost`** (on Windows `localhost`
   tries IPv6 first and every connect costs about 2 s). Testcontainers' Postgres is
   `postgres`/`postgres`.
-- **Scope rule:** no changes to `push-gateway`; no Dockerfile, chart, scripts or smoke test
-  (Plan 6B); the DEV ONLY mailbox of auth-svc stays until Plan 6B moves it to the worker; no
+- **Scope rule:** no changes to `push-gateway` beyond one test (Task 1: a device not
+  relayed yet is no longer refused like a revoked one); no Dockerfile, chart or scripts, and
+  in the smoke test only message-svc's new configuration field (Plan 6B); the DEV ONLY mailbox of auth-svc stays until Plan 6B moves it to the worker; no
   kick signals (Plan 7) and no token checks in the gateway (Plan 8).
 
 ## Key rules the code must preserve
@@ -86,24 +87,32 @@ cargo +1.85 build --workspace --all-targets --locked
   with `dead_at` and a reason; it stays in `worker.job` for inspection (and is deleted after
   the retention period).
 - **Several workers can run.** Claims and drains use `FOR UPDATE SKIP LOCKED`; a claim is a
-  lease, so a crashed worker's job comes back; periodic jobs have fixed ids, so one replica
-  runs each.
+  lease, so a crashed worker's job comes back; a claimed batch fits in its lease; an
+  outcome is recorded only under the claim it belongs to, never over a newer one; jobs
+  claimed but not started are given back at shutdown; periodic jobs have fixed ids, so one
+  replica runs each.
+- **Only the worker calls `Accounts`.** message-svc refuses every `Accounts` call that
+  lacks the shared internal token (`authorization: Bearer …`, compared in constant time),
+  and every call when it has no token configured. The gateway never gets the token.
 - **Nothing secret is logged or kept longer than needed:** logs name a job by id, kind and
   attempt count, an email by id, template and recipient domain — never an address, a body,
-  a link, a token or a key. `worker.email_message` keeps no link. `Config`, `ResendSender`,
-  `ResendWebhooks`, `OutgoingEmail`, `Rendered` and `DeliveryEvent` have redacting `Debug`.
+  a link, a token or a key. `worker.email_message` keeps no link, and a buried job keeps
+  its payload without `params.link`. Both services' `Config`, `AccountsToken`,
+  `ResendSender`, `ResendWebhooks`, `OutgoingEmail`, `Rendered` and `DeliveryEvent` have
+  redacting `Debug`.
   Errors never quote URLs, keys or Resend's messages (which can quote addresses).
 - **Webhooks are verified before anything is read:** a Svix HMAC-SHA256 over
   `{id}.{timestamp}.{body}`, compared in constant time, with the timestamp within 5 minutes
-  of our clock.
+  of our clock. Only what a retry could fix gets anything but a 2xx: a signed body that is
+  not a readable delivery event is logged and answered 204.
 - **DEV ONLY switches are strict:** `PUSH_DEV_MAILBOX` accepts exactly `1` or `0`/empty, is
   refused with any sender but `log`, and logs a warning at start-up.
 
 ## Decisions made for this plan
 
-These were settled while writing the plan and verified in a worktree. The owner's open
-questions are listed under "Owner decisions needed" below; the defaults chosen for them are
-marked **Default**. Do not reopen the rest during execution.
+These were settled while writing the plan, revised after its review, and verified in a
+worktree. The owner's decisions are listed under "Owner decisions" below; all are final.
+Do not reopen any of them during execution.
 
 1. **Plan 6 is split.** 6A (this plan) delivers the services, tested against containers;
    6B moves the smoke test to the real flow (the DEV ONLY mirror into message-svc goes, the
@@ -113,24 +122,40 @@ marked **Default**. Do not reopen the rest during execution.
    into `worker.job` (job id = event id, `ON CONFLICT DO NOTHING`), commits there, and only
    then deletes them from the outbox; a crash in between re-copies rows the queue ignores.
    Workers claim with `FOR UPDATE SKIP LOCKED` and lease by moving `run_after` 2 minutes
-   ahead (`attempts + 1`), so several replicas share the work without coordination and a
-   crashed worker's jobs come back. Within a claim, jobs run oldest first (UUIDv7 ids).
+   ahead (`attempts + 1`, `claimed_at = now()`), so several replicas share the work without
+   coordination and a crashed worker's jobs come back. Within a claim, jobs run oldest first
+   (UUIDv7 ids), one after another, so **a claim takes at most 4 jobs**: an attempt takes at
+   most about 15 s (message-svc: a 5 s connect and a 10 s call timeout; Resend: a 10 s
+   request timeout; statements of a few milliseconds; a cleanup run starts no batch after
+   5 s, decision 13), so a batch ends within about 60 s of its 120 s lease. (The first draft
+   claimed 50: later jobs of a batch outlived their lease, a second replica claimed and ran
+   them as well, and emails used up their 12 attempts early.) **A claim is fenced:** every
+   `UPDATE` and `DELETE` of `Queue::finish` also matches the claim's `attempts` and
+   `claimed_at`, so an outcome that comes after the lease ended — when another worker may
+   hold a newer claim — is dropped (`finish` returns `false`, the worker logs it).
+   `claimed_at` is needed besides `attempts` because a periodic job's attempts start again
+   at 0 after each run. **At shutdown** the jobs of a batch not started yet are given back
+   (`Queue::release`: `run_after = now()`, `attempts - 1`, `claimed_at = NULL`, fenced the
+   same way), so another replica takes them at once instead of after the lease.
 3. **Retries and poison.** A failure worth retrying waits 1 s, doubling, at most 10 minutes
    (`backoff`). Account events retry for as long as it takes (message-svc must learn every
    one); an email gives up after 12 attempts — about half an hour, when its 30-minute link
-   has expired anyway — and is then marked `failed`. Poison (a malformed payload, an unknown
+   has expired anyway (owner decision 4) — and is then marked `failed`. Poison (a malformed payload, an unknown
    kind or template, `INVALID_ARGUMENT`/`PERMISSION_DENIED`/… from message-svc, a refusal by
-   Resend) is buried at once: `dead_at`, `failed_reason`, never claimed again. The schema of
-   spec §3.3 gains `job.dead_at` and `job.created_at` for that.
+   Resend) is buried at once: `dead_at`, `failed_reason`, never claimed again. A buried
+   job keeps its payload for inspection without `params.link` (`payload #- '{params,link}'`),
+   so a buried email cannot sign anyone in during the retention period. The schema of spec
+   §3.3 gains `job.dead_at` and `job.created_at` for that.
 4. **message-svc's `Accounts` API** (gRPC, `push.internal.v1.Accounts`) has one call per
    event: `UserVerified`, `DeviceRegistered`, `DeviceRevoked`, `PasswordReset`. It is always
-   served (not DEV ONLY). Idempotency and ordering are the domain's: `device_registered`
+   served (not DEV ONLY), to the worker alone (decision 17). Idempotency and ordering are the domain's: `device_registered`
    records the user too (auth-svc registers devices only for verified users), creates the
    device with its delivery positions, and is a no-op for a device already known for that
    user, revoked or not; `device_revoked` records user and device if they are new and marks
    the device revoked, so a revocation that overtakes the registration still wins; a device
    id that belongs to another user is `PERMISSION_DENIED` (poison). A new store call,
-   `Tx::device_user`, names a device's owner whether or not it is revoked.
+   `Tx::device_user`, names a device's owner whether or not it is revoked; `Identify` uses
+   it to tell a device not relayed yet from a revoked one (decision 16).
 5. **Kicks.** On `device.revoked`, message-svc marks the device revoked, so `Identify`
    refuses it from then on (a reconnect fails). `PasswordReset` is accepted and otherwise
    ignored for now: publishing `kick:{device_id}` is Plan 7 (message-svc's Redis kick) and
@@ -147,7 +172,7 @@ marked **Default**. Do not reopen the rest during execution.
    database a migration runs in (tests included) and would fix its name; the role name is
    checked (`[a-z_][a-z0-9_]{0,62}`) before it is quoted into SQL.
 7. **Unverified accounts.** The cleanup deletes accounts whose email was never verified and
-   that were created more than `PUSH_UNVERIFIED_ACCOUNT_DAYS` ago (**Default: 7 days**);
+   that were created more than `PUSH_UNVERIFIED_ACCOUNT_DAYS` ago (7 days, owner decision 1);
    such an account has no devices, and one that has is kept. A new signup over an
    unverified account now also resets its `created_at`, so the cleanup never deletes an
    account whose fresh verification link is still valid.
@@ -156,8 +181,8 @@ marked **Default**. Do not reopen the rest during execution.
    moot. Both auth cleanups delete in batches of 1000, at most 50 batches a run, hourly.
 9. **Email.** `push-email` renders three templates (`verify_email`, `account_exists`,
    `reset_password`) as plain text and minimal HTML with every parameter escaped and links
-   restricted to `http(s)://`; the product name is configurable
-   (`PUSH_EMAIL_PRODUCT_NAME`, **Default: `push-messenger`**). The worker checks
+   restricted to `http(s)://`, in English (owner decision 5); the product name is
+   configurable (`PUSH_EMAIL_PRODUCT_NAME`, default `Push Messenger`, owner decision 2). The worker checks
    `worker.email_suppression` first (a suppressed address is recorded as `suppressed` and
    skipped), records the email in `worker.email_message` (status `queued`, the params
    **without the link**), sends with the job id as the idempotency key, and records `sent`
@@ -171,7 +196,9 @@ marked **Default**. Do not reopen the rest during execution.
     request with the same key), 5xx, transport errors **and 401/403** (a missing or wrong key:
     the emails wait while it is fixed) are retryable, other refusals permanent. Only Resend's
     error `name` is quoted, never its message. `http://` API URLs are accepted only for
-    `127.0.0.1`/`localhost`, for tests.
+    `127.0.0.1`/`localhost`, for tests. The From address is `PUSH_EMAIL_FROM`, which is
+    `Push Messenger <no-reply@push.kubegames.dk>` in production (owner decision 2); real
+    sending through Resend comes with Plan 11 (owner decision 3).
 11. **Webhooks.** `WebhookVerifier::verify` checks Resend's Svix signature (`svix-id`,
     `svix-timestamp`, `svix-signature`: `v1,` + base64 HMAC-SHA256 of
     `{id}.{timestamp}.{body}` with the base64 key after `whsec_`; any of several signatures,
@@ -182,20 +209,26 @@ marked **Default**. Do not reopen the rest during execution.
     same on every redelivery, so a replay inside the window is a no-op (spec §3.3 had
     `uuid`). Hard bounces and complaints add to `worker.email_suppression` both the addresses
     the event names and the address the email was sent to. `POST /v1/webhooks/resend` answers
-    204, 400 (not a delivery event), 401 (unsigned, forged or stale) or 503 (database), and
-    is served only when `PUSH_RESEND_WEBHOOK_SECRET` is set; bodies are at most 256 KiB.
+    204 (recorded, a replay, an event nothing acts on, or a signed body that is not a
+    delivery event it can read — logged with its `svix-id` and dropped, since Resend sends
+    anything but a 2xx again for days), 401 (unsigned, forged or stale) or 503 (database),
+    and is served only when `PUSH_RESEND_WEBHOOK_SECRET` is set; bodies are at most 256 KiB.
 12. **The DEV ONLY mailbox moves to the worker** (Plan 6B switches the smoke test and the
     chart and removes auth-svc's). With `PUSH_DEV_MAILBOX=1` and the log sender, a
     `MailboxSender` wraps `LogSender` and keeps the last 1000 emails it delivered in memory;
     `GET /dev/mailbox?to=…` shows the newest 20 for one address (template, subject, text).
     In memory, because it exists only beside the log sender on a local cluster with one
-    worker; refused with any other sender, since it shows sign-in links.
+    worker (Plan 6B's chart refuses dev mode with more); refused with any other sender,
+    since it shows sign-in links.
 13. **Cleanups are jobs.** `cleanup.refresh_tokens`, `cleanup.unverified_accounts` and
     `cleanup.worker_records` have fixed ids, are added on every start (`ON CONFLICT DO
     NOTHING`), run hourly (`RunAgain`), and come back after a minute when a run left more
-    than 50 batches. `cleanup.worker_records` deletes buried jobs, `email_message` and
-    `email_event` rows older than `PUSH_WORKER_RETENTION_DAYS` (**Default: 30 days**). The
-    suppression list is never cleaned up.
+    than 50 batches or ran 5 s (it starts no batch after that, so with a 10 s statement
+    timeout a run takes at most about 15 s, like any other job: inside its lease, and
+    inside the pod's 30 s grace period with the 5 s preStop sleep). `cleanup.worker_records`
+    deletes buried jobs, `email_message` and `email_event` rows older than
+    `PUSH_WORKER_RETENTION_DAYS` (30 days, owner decision 6). The suppression list is never
+    cleaned up.
 14. **Latency.** An idle worker looks for work every `PUSH_WORKER_POLL_MS` (**1000**); the
     relay wakes the job loop at once when it moved events. Delivery of an email or a device
     to message-svc therefore takes about a second. `LISTEN/NOTIFY` is deferred.
@@ -203,40 +236,65 @@ marked **Default**. Do not reopen the rest during execution.
     and auth-svc's answers with the outbox readable — that is, once auth-svc has granted the
     role its access; message-svc is not waited for (its events wait in the queue). Start-up
     retries every 2 s and every loop select!s against shutdown; on SIGTERM the worker
-    finishes the job in progress and stops; jobs it claimed but did not start come back when
-    their lease ends.
+    finishes the job in progress, gives back the jobs it claimed but did not start (due at
+    once, for any replica; decision 2) and stops.
+16. **A device not relayed yet is not a revoked device.** Between auth-svc's registration
+    and the worker's relay (about a second) `Identify` refused a new device with the same
+    `PERMISSION_DENIED`/`UNKNOWN_DEVICE` as a revoked one, which a client would take as
+    "signed out". `Identify` now answers a device message-svc has never heard of with
+    `UNAVAILABLE`, `ErrorCode::Unavailable` and `retryable: true`
+    (`DomainError::DeviceNotKnownYet`, which `is_retryable`), and keeps `PERMISSION_DENIED`
+    for a revoked device or one of another user. The gateway passes `UNAVAILABLE` on as
+    close code 1011 for now, which clients retry; **Plan 8** gives it a close code of its
+    own ("try again shortly"), and its SDK reconnects after a short backoff and never signs
+    the user out for it (spec §5.3).
+17. **Only the worker may call `Accounts`.** Until Plan 11's NetworkPolicy, any pod that
+    reaches message-svc — a compromised gateway — could otherwise register devices. The
+    `Accounts` service is wrapped in an interceptor, `AccountsToken`, that requires
+    `authorization: Bearer <PUSH_ACCOUNTS_TOKEN>` metadata and compares it in constant time;
+    message-svc without a token (a cluster from Plan 5B until 6B) refuses every call with
+    `UNAUTHENTICATED` and warns at start-up. The worker sends the token
+    (`PUSH_ACCOUNTS_TOKEN`, required, 32 to 256 visible ASCII characters, never shown); a
+    refusal is retried, since the fix is configuration. Plan 6B generates the token into
+    the kept Secret and gives it to message-svc and the worker only. The NetworkPolicy
+    remains a Plan 11 must-do.
+18. **`PUSH_MESSAGE_SVC_URL` is plain `http://`.** tonic is built without TLS, so an
+    `https://` URL could never connect and every account event would wait forever; the
+    worker's configuration refuses anything but `http://` at start-up.
 
-## Owner decisions needed
+## Owner decisions
 
-These are the owner's to make; the plan ships with the defaults shown, each a configuration
-value, so changing one later changes no code.
+The owner decided these on 2026-10-13; all are final and recorded in the spec (§5.2, §9,
+§13). Each is a configuration value or a chart default, so a later change changes no code.
 
-1. **Unverified-account age**: delete accounts unverified for 7 days
-   (`PUSH_UNVERIFIED_ACCOUNT_DAYS`)?
-2. **Retention** of email records, delivery events and buried jobs: 30 days
-   (`PUSH_WORKER_RETENTION_DAYS`)? The suppression list is kept forever.
-3. **Sender address and domain** (`PUSH_EMAIL_FROM`, for example
-   `push-messenger <no-reply@mail.<domain>>`), and the product name in emails
-   (`PUSH_EMAIL_PRODUCT_NAME`). Spec §13 already lists the production domain and the
-   Resend sending subdomain as open.
-4. **Does production need a Resend API key now?** The chart (Plan 6B) defaults to the log
-   sender; Plan 11 would add the key and the webhook secret through Key Vault. Until then a
-   deployment sends no email.
-5. **Giving up on an email after about 30 minutes** (12 attempts): links expire then. Keep?
-6. **Email wording and look**: plain text plus minimal HTML, English only.
+1. **Unverified accounts** are deleted after 7 days (`PUSH_UNVERIFIED_ACCOUNT_DAYS`, default
+   7).
+2. **Sender and product name:** `Push Messenger <no-reply@push.kubegames.dk>`
+   (`PUSH_EMAIL_FROM`; the chart's default in Plan 6B) and "Push Messenger"
+   (`PUSH_EMAIL_PRODUCT_NAME`, default), in the templates.
+3. **Real sending through Resend comes with the Azure plan (Plan 11)**, with the API key
+   and the webhook secret in Key Vault. The chart defaults to the log sender.
+4. **An email gives up after about 30 minutes** (12 attempts).
+5. **Plain English text plus minimal HTML** for now.
+6. **Retention:** the sent-email log, delivery events and buried jobs are kept 30 days
+   (`PUSH_WORKER_RETENTION_DAYS`, default 30); the suppression list is kept forever.
 
 ## File structure
 
 ```
 Cargo.toml                                    + push-email, push-worker
 crates/push-domain/src/store.rs, memory.rs    + Tx::device_user
-crates/push-domain/src/service.rs             + device_registered, device_revoked
+crates/push-domain/src/error.rs               + DeviceNotKnownYet (retryable)
+crates/push-domain/src/service.rs             + device_registered, device_revoked; identify
 crates/push-store/src/store.rs                + device_user
 crates/push-testkit/src/contract/users.rs     + 1 contract case
 crates/push-testkit/src/scenarios/devices.rs  + 5 scenarios (relayed events in any order)
 crates/push-proto/proto/push/internal/v1/messaging.proto   + service Accounts
-crates/push-message-svc/src/grpc.rs, server.rs, lib.rs     + AccountsApi, always served
-crates/push-message-svc/tests/service.rs      Accounts over real Postgres
+crates/push-message-svc/src/grpc.rs, server.rs, lib.rs     + AccountsApi, AccountsToken
+crates/push-message-svc/src/config.rs, convert.rs           PUSH_ACCOUNTS_TOKEN; UNAVAILABLE
+crates/push-message-svc/tests/service.rs      Accounts over real Postgres, with the token
+crates/push-gateway/tests/gateway.rs          a device not relayed yet is not 4001
+crates/push-smoke/tests/local.rs              message-svc's new configuration field
 crates/push-auth/migrations/0002_worker.sql   NEW: cleanup functions, indexes
 crates/push-auth/src/db.rs                    + grant_worker_access, is_role_name
 crates/push-auth/src/config.rs, server.rs     + PUSH_AUTH_WORKER_ROLE, granted at start-up
@@ -256,7 +314,7 @@ crates/push-worker/                           NEW
 ├── src/
 │   ├── lib.rs, main.rs                       exports, the binary
 │   ├── db.rs                                 MIGRATOR, migrate_database
-│   ├── queue.rs                              Queue: enqueue, claim, finish, backoff
+│   ├── queue.rs                              Queue: enqueue, claim, finish, release, backoff
 │   ├── relay.rs                              OutboxRelay
 │   ├── accounts.rs                           AccountEvent, Accounts (gRPC client)
 │   ├── email.rs                              Mailer, Mailbox, MailboxSender
@@ -267,7 +325,7 @@ crates/push-worker/                           NEW
 │   ├── config.rs                             Config from the environment
 │   └── server.rs                             serve, loops, health, logging, signals
 └── tests/
-    ├── queue.rs                              claims, leases, backoff, burial
+    ├── queue.rs                              claims, leases, fences, release, burial
     ├── relay.rs                              outbox → queue → message-svc
     ├── email.rs                              sending, suppression, webhooks, HTTP
     ├── cleanup.rs                            the cleanups
@@ -279,15 +337,16 @@ docs/superpowers/plans/2026-10-11-roadmap.md                 6A in review
 
 ---
 
-### Task 1: message-svc's `Accounts` API, idempotent in any order
+### Task 1: message-svc's `Accounts` API: idempotent in any order, the worker's alone
 
 **Files:**
-- Modify: `crates/push-domain/src/store.rs`, `src/memory.rs`, `src/service.rs`,
-  `crates/push-store/src/store.rs`, `crates/push-testkit/src/contract/users.rs`,
-  `crates/push-testkit/src/scenarios/devices.rs`,
+- Modify: `crates/push-domain/src/error.rs`, `src/store.rs`, `src/memory.rs`,
+  `src/service.rs`, `crates/push-store/src/store.rs`,
+  `crates/push-testkit/src/contract/users.rs`, `crates/push-testkit/src/scenarios/devices.rs`,
   `crates/push-proto/proto/push/internal/v1/messaging.proto`,
-  `crates/push-message-svc/src/grpc.rs`, `src/server.rs`, `src/lib.rs`,
-  `crates/push-message-svc/tests/service.rs`
+  `crates/push-message-svc/src/config.rs`, `src/convert.rs`, `src/grpc.rs`, `src/server.rs`,
+  `src/lib.rs`, `crates/push-message-svc/tests/service.rs`,
+  `crates/push-gateway/tests/gateway.rs`, `crates/push-smoke/tests/local.rs`
 
 - [ ] **Step 1: The storage contract and the scenarios, failing**
 
@@ -346,8 +405,8 @@ with
 }
 ```
 
-Relayed events in every order (decisions 4 and 5). In
-`crates/push-testkit/src/scenarios/devices.rs`:
+Relayed events in every order (decisions 4 and 5), and `Identify` asking to retry a device
+not relayed yet (decision 16). In `crates/push-testkit/src/scenarios/devices.rs`:
 
 Replace
 
@@ -361,6 +420,34 @@ with
 ```rust
 use crate::{Backend, Case, World, bodies, case_list};
 use push_domain::{DeviceId, DomainError, UserId};
+```
+
+Replace
+
+```rust
+}
+
+async fn a_device_id_of_another_user_cannot_be_registered<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
+```
+
+with
+
+```rust
+}
+
+async fn identify_asks_to_retry_a_device_not_relayed_yet<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
+    let (user, device) = (UserId::new(), DeviceId::new());
+    let refused = world.svc.identify(device, user).await.unwrap_err();
+    assert_eq!(refused, DomainError::DeviceNotKnownYet);
+    assert!(refused.is_retryable());
+    world.svc.device_registered(device, user).await.unwrap();
+    assert_eq!(world.svc.identify(device, user).await, Ok(()));
+}
+
+async fn a_device_id_of_another_user_cannot_be_registered<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
 ```
 
 Replace
@@ -453,6 +540,9 @@ pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
 Replace
 
 ```rust
+        identify_rejects_a_device_of_another_user,
+        identify_rejects_a_revoked_device,
+        a_device_id_of_another_user_cannot_be_registered,
         a_revoked_device_cannot_be_registered_again,
         registering_the_same_user_and_device_twice_is_harmless,
     ]
@@ -462,6 +552,10 @@ Replace
 with
 
 ```rust
+        identify_rejects_a_device_of_another_user,
+        identify_rejects_a_revoked_device,
+        identify_asks_to_retry_a_device_not_relayed_yet,
+        a_device_id_of_another_user_cannot_be_registered,
         a_revoked_device_cannot_be_registered_again,
         registering_the_same_user_and_device_twice_is_harmless,
         a_relayed_registration_records_the_user_too,
@@ -478,9 +572,82 @@ cargo test -p push-testkit
 ```
 
 Expected: compile errors — no method `device_user` on the transaction, no methods
-`device_registered` and `device_revoked` on `Messaging`.
+`device_registered` and `device_revoked` on `Messaging`, no variant `DeviceNotKnownYet` on
+`DomainError`.
 
 - [ ] **Step 2: The domain and both stores**
+
+In `crates/push-domain/src/error.rs` (decision 16: the one error besides `Conflict` worth
+retrying unchanged):
+
+Replace
+
+```rust
+    #[error("unknown or revoked device")]
+    UnknownDevice,
+    #[error("conversation not found")]
+    ConversationNotFound,
+```
+
+with
+
+```rust
+    #[error("unknown or revoked device")]
+    UnknownDevice,
+    /// message-svc has not heard of the device yet: auth-svc registered it, but the worker
+    /// has not relayed it (that takes about a second). Unlike `UnknownDevice`, it passes.
+    #[error("the device is not known yet; retry shortly")]
+    DeviceNotKnownYet,
+    #[error("conversation not found")]
+    ConversationNotFound,
+```
+
+Replace
+
+```rust
+impl DomainError {
+    /// Whether the same operation may succeed if the caller tries it again unchanged.
+    /// Only `Conflict` is retryable: every other error repeats until something changes.
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, Self::Conflict)
+    }
+}
+```
+
+with
+
+```rust
+impl DomainError {
+    /// Whether the same operation may succeed if the caller tries it again unchanged.
+    /// Only `Conflict` and `DeviceNotKnownYet` are retryable: every other error repeats
+    /// until something changes.
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, Self::Conflict | Self::DeviceNotKnownYet)
+    }
+}
+```
+
+Replace
+
+```rust
+    #[test]
+    fn only_a_conflict_is_retryable() {
+        assert!(DomainError::Conflict.is_retryable());
+        assert!(!DomainError::NotMember.is_retryable());
+        assert!(!DomainError::Store("connection lost".into()).is_retryable());
+```
+
+with
+
+```rust
+    #[test]
+    fn only_a_conflict_and_a_device_not_known_yet_are_retryable() {
+        assert!(DomainError::Conflict.is_retryable());
+        assert!(DomainError::DeviceNotKnownYet.is_retryable());
+        assert!(!DomainError::UnknownDevice.is_retryable());
+        assert!(!DomainError::NotMember.is_retryable());
+        assert!(!DomainError::Store("connection lost".into()).is_retryable());
+```
 
 In `crates/push-domain/src/store.rs`:
 
@@ -559,7 +726,8 @@ with
 ```
 
 In `crates/push-domain/src/service.rs`, `register_device`'s cursor loop moves into
-`create_cursors`, which the relayed registration shares:
+`create_cursors`, which the relayed registration shares, and `identify` tells a device it
+never heard of from a revoked one:
 
 Replace
 
@@ -636,6 +804,39 @@ with
 Replace
 
 ```rust
+    /// Confirms that a connecting device is active and belongs to the user in its token.
+    pub async fn identify(&self, device: DeviceId, user: UserId) -> DomainResult<()> {
+        let mut tx = self.store.begin().await?;
+        let owner = require_device(&mut tx, device).await?;
+        tx.rollback().await?;
+        if owner == user {
+```
+
+with
+
+```rust
+    /// Confirms that a connecting device is active and belongs to the user in its token.
+    /// A device never heard of is `DeviceNotKnownYet` (retryable): auth-svc registered it
+    /// and the worker has not relayed it yet. A revoked device, or one of another user, is
+    /// `UnknownDevice`.
+    pub async fn identify(&self, device: DeviceId, user: UserId) -> DomainResult<()> {
+        let mut tx = self.store.begin().await?;
+        let Some(owner) = tx.device_owner(device).await? else {
+            let known = tx.device_user(device).await?.is_some();
+            tx.rollback().await?;
+            return Err(if known {
+                DomainError::UnknownDevice
+            } else {
+                DomainError::DeviceNotKnownYet
+            });
+        };
+        tx.rollback().await?;
+        if owner == user {
+```
+
+Replace
+
+```rust
 }
 
 /// The owner of an active device, or `UnknownDevice`.
@@ -663,14 +864,15 @@ pub(crate) async fn require_device<T: Tx>(tx: &mut T, device: DeviceId) -> Domai
 ```
 
 ```powershell
-cargo test -p push-testkit
+cargo test -p push-domain -p push-testkit
 cargo test -p push-store --test postgres
 ```
 
 Expected: the in-memory suite and the Postgres suite (`postgres`, Docker) pass, each with
-6 more cases than before (5 scenarios, 1 contract case).
+7 more cases than before (6 scenarios, 1 contract case), and push-domain's
+`only_a_conflict_and_a_device_not_known_yet_are_retryable`.
 
-- [ ] **Step 3: The gRPC contract, the API and its tests**
+- [ ] **Step 3: The gRPC contract, the API, the token and their tests**
 
 In `crates/push-proto/proto/push/internal/v1/messaging.proto`:
 
@@ -697,6 +899,27 @@ with
 Replace
 
 ```protobuf
+service Messaging {
+  // Confirms that the device is active and belongs to the user.
+  rpc Identify(IdentifyRequest) returns (IdentifyResponse);
+  // Appends a text message; answers after commit.
+```
+
+with
+
+```protobuf
+service Messaging {
+  // Confirms that the device is active and belongs to the user. A revoked device, or one
+  // of another user, is PERMISSION_DENIED (UNKNOWN_DEVICE); a device message-svc has never
+  // heard of is UNAVAILABLE (retryable): auth-svc registered it and the worker has not
+  // relayed it yet, which takes about a second.
+  rpc Identify(IdentifyRequest) returns (IdentifyResponse);
+  // Appends a text message; answers after commit.
+```
+
+Replace
+
+```protobuf
 }
 
 message IdentifyRequest {
@@ -712,7 +935,9 @@ with
 // (spec §2, §5.3). Delivery is at least once and in no particular order, so every call is
 // idempotent and any order of calls ends in the same state. A device id that belongs to
 // another user is PERMISSION_DENIED; malformed ids are INVALID_ARGUMENT; both are
-// permanent. Storage problems are UNAVAILABLE or ABORTED: retry.
+// permanent. Storage problems are UNAVAILABLE or ABORTED: retry. Every call carries the
+// shared internal token as `authorization: Bearer <token>` metadata; without it the call
+// is UNAUTHENTICATED, so the gateway, which can reach message-svc, cannot register devices.
 service Accounts {
   // user.verified: the user may use messaging.
   rpc UserVerified(AccountUser) returns (AccountsResponse);
@@ -756,8 +981,54 @@ message AccountDevice {
 message AccountsResponse {}
 ```
 
+In `crates/push-message-svc/src/convert.rs` (decision 16: `UNAVAILABLE`, retryable):
+
+Replace
+
+```rust
+            (Code::PermissionDenied, ErrorCode::UnknownDevice)
+        }
+        DomainError::ConversationNotFound => (Code::NotFound, ErrorCode::ConversationNotFound),
+        DomainError::NotMember => (Code::FailedPrecondition, ErrorCode::NotMember),
+```
+
+with
+
+```rust
+            (Code::PermissionDenied, ErrorCode::UnknownDevice)
+        }
+        DomainError::DeviceNotKnownYet => (Code::Unavailable, ErrorCode::Unavailable),
+        DomainError::ConversationNotFound => (Code::NotFound, ErrorCode::ConversationNotFound),
+        DomainError::NotMember => (Code::FailedPrecondition, ErrorCode::NotMember),
+```
+
+Replace
+
+```rust
+        assert_eq!(device.code(), Code::PermissionDenied);
+        assert_eq!(error_from_status(&device).code(), ErrorCode::UnknownDevice);
+    }
+}
+```
+
+with
+
+```rust
+        assert_eq!(device.code(), Code::PermissionDenied);
+        assert_eq!(error_from_status(&device).code(), ErrorCode::UnknownDevice);
+
+        let not_yet = domain_error(DomainError::DeviceNotKnownYet);
+        assert_eq!(not_yet.code(), Code::Unavailable);
+        let not_yet = error_from_status(&not_yet);
+        assert_eq!(not_yet.code(), ErrorCode::Unavailable);
+        assert!(not_yet.retryable);
+    }
+}
+```
+
 In `crates/push-message-svc/src/grpc.rs`: the imports, `AccountsApi` after `MessagingApi`,
-an `AccountsApi` in the unit tests' world, and two unit tests:
+the `AccountsToken` interceptor (decision 17), an `AccountsApi` in the unit tests' world,
+and three unit tests:
 
 Replace
 
@@ -787,6 +1058,7 @@ use push_proto::internal::v1::{
     SyncResponse, dev_setup_server, messaging_server,
 };
 use push_proto::v1::{ContentType, SendAck};
+use tonic::{Request, Response, Status};
 ```
 
 with
@@ -801,6 +1073,8 @@ use push_proto::internal::v1::{
     dev_setup_server, messaging_server,
 };
 use push_proto::v1::{ContentType, SendAck};
+use tonic::service::Interceptor;
+use tonic::{Request, Response, Status};
 ```
 
 Replace
@@ -888,6 +1162,63 @@ where
     }
 }
 
+/// Guards the `Accounts` service: a call passes only with the shared internal token in its
+/// metadata, `authorization: Bearer <PUSH_ACCOUNTS_TOKEN>`, compared in constant time. The
+/// gateway does not have the token, so it cannot register devices even though it can
+/// reach message-svc. Without a configured token every call is refused.
+#[derive(Clone)]
+pub struct AccountsToken {
+    expected: Option<Arc<str>>,
+}
+
+impl AccountsToken {
+    pub fn new(expected: Option<String>) -> Self {
+        Self {
+            expected: expected.map(Arc::from),
+        }
+    }
+}
+
+impl std::fmt::Debug for AccountsToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AccountsToken")
+            .field("expected", &self.expected.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+impl Interceptor for AccountsToken {
+    fn call(&mut self, request: Request<()>) -> Result<Request<()>, Status> {
+        let Some(expected) = &self.expected else {
+            return Err(Status::unauthenticated(
+                "the Accounts API is off: PUSH_ACCOUNTS_TOKEN is not set",
+            ));
+        };
+        let presented = request
+            .metadata()
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "));
+        match presented {
+            Some(token) if same(token.as_bytes(), expected.as_bytes()) => Ok(request),
+            _ => Err(Status::unauthenticated(
+                "the Accounts API needs the internal token",
+            )),
+        }
+    }
+}
+
+/// Compares in time that depends only on the lengths, never on where the bytes differ.
+fn same(presented: &[u8], expected: &[u8]) -> bool {
+    presented.len() == expected.len()
+        && presented
+            .iter()
+            .zip(expected)
+            .fold(0u8, |difference, (a, b)| difference | (a ^ b))
+            == 0
+}
+
 /// DEV ONLY: sets up users, devices, contacts and direct conversations without auth-svc.
 /// `serve` registers it only when the configuration enables it (`PUSH_DEV_SETUP=1`).
 ```
@@ -959,6 +1290,7 @@ with
 Replace
 
 ```rust
+            assert_eq!(error_from_status(&status).code(), ErrorCode::Invalid);
         }
     }
 }
@@ -967,6 +1299,7 @@ Replace
 with
 
 ```rust
+            assert_eq!(error_from_status(&status).code(), ErrorCode::Invalid);
         }
     }
 
@@ -1014,6 +1347,8 @@ with
                 .unwrap();
         }
         assert_eq!(identify(&world, user, phone).await, Ok(()));
+        // A device not relayed yet is worth retrying, unlike a revoked one.
+        assert_eq!(identify(&world, user, tablet).await, Err(Code::Unavailable));
 
         // The revocation of the tablet overtakes its registration.
         world
@@ -1064,12 +1399,244 @@ with
         assert_eq!(status.code(), Code::InvalidArgument);
         assert_eq!(identify(&world, alice.user, alice.device).await, Ok(()));
     }
+
+    fn with_authorization(value: &str) -> Request<()> {
+        let mut request = Request::new(());
+        request
+            .metadata_mut()
+            .insert("authorization", value.parse().unwrap());
+        request
+    }
+
+    #[test]
+    fn accounts_calls_pass_only_with_the_internal_token() {
+        let token = "a".repeat(32);
+        let mut guard = AccountsToken::new(Some(token.clone()));
+        assert!(
+            guard
+                .call(with_authorization(&format!("Bearer {token}")))
+                .is_ok()
+        );
+        for refused in [
+            Request::new(()),
+            with_authorization(&token),
+            with_authorization(&format!("Bearer {}", "b".repeat(32))),
+            with_authorization(&format!("Bearer {token}x")),
+            with_authorization("Bearer "),
+        ] {
+            let status = guard.call(refused).unwrap_err();
+            assert_eq!(status.code(), Code::Unauthenticated);
+            assert!(!status.message().contains(&token));
+        }
+        let mut off = AccountsToken::new(None);
+        let status = off
+            .call(with_authorization(&format!("Bearer {token}")))
+            .unwrap_err();
+        assert_eq!(status.code(), Code::Unauthenticated);
+        assert!(!format!("{guard:?}").contains(&token));
+    }
 }
+```
+
+In `crates/push-message-svc/src/config.rs` (`PUSH_ACCOUNTS_TOKEN`, optional, checked and
+never shown):
+
+Replace
+
+```rust
+/// | `PUSH_HEALTH_ADDR` | address of `/healthz` and `/readyz` | `0.0.0.0:8081` |
+/// | `PUSH_DB_MAX_CONNECTIONS` | pool size, at least 1 | `10` |
+/// | `PUSH_DEV_SETUP` | `1` registers the DEV ONLY `DevSetup` service | off |
+#[derive(Clone, PartialEq, Eq)]
+```
+
+with
+
+```rust
+/// | `PUSH_HEALTH_ADDR` | address of `/healthz` and `/readyz` | `0.0.0.0:8081` |
+/// | `PUSH_DB_MAX_CONNECTIONS` | pool size, at least 1 | `10` |
+/// | `PUSH_ACCOUNTS_TOKEN` | the worker's token for the `Accounts` API, 32 to 256 visible ASCII characters; without it `Accounts` refuses every call | none |
+/// | `PUSH_DEV_SETUP` | `1` registers the DEV ONLY `DevSetup` service | off |
+#[derive(Clone, PartialEq, Eq)]
+```
+
+Replace
+
+```rust
+    pub health_addr: SocketAddr,
+    pub store: StoreOptions,
+    pub dev_setup: bool,
+}
+```
+
+with
+
+```rust
+    pub health_addr: SocketAddr,
+    pub store: StoreOptions,
+    pub accounts_token: Option<String>,
+    pub dev_setup: bool,
+}
+```
+
+Replace
+
+```rust
+            .field("health_addr", &self.health_addr)
+            .field("store", &self.store)
+            .field("dev_setup", &self.dev_setup)
+            .finish()
+```
+
+with
+
+```rust
+            .field("health_addr", &self.health_addr)
+            .field("store", &self.store)
+            .field(
+                "accounts_token",
+                &self.accounts_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("dev_setup", &self.dev_setup)
+            .finish()
+```
+
+Replace
+
+```rust
+            )
+        })?;
+        Ok(Self {
+            database_url,
+```
+
+with
+
+```rust
+            )
+        })?;
+        let accounts_token = lookup("PUSH_ACCOUNTS_TOKEN").filter(|value| !value.is_empty());
+        if let Some(token) = &accounts_token {
+            check_token(token).map_err(|reason| redacted("PUSH_ACCOUNTS_TOKEN", reason))?;
+        }
+        Ok(Self {
+            database_url,
+```
+
+Replace
+
+```rust
+            health_addr: parsed(&lookup, "PUSH_HEALTH_ADDR", ([0, 0, 0, 0], 8081).into())?,
+            store,
+            dev_setup: dev_flag(&lookup, "PUSH_DEV_SETUP")?,
+        })
+```
+
+with
+
+```rust
+            health_addr: parsed(&lookup, "PUSH_HEALTH_ADDR", ([0, 0, 0, 0], 8081).into())?,
+            store,
+            accounts_token,
+            dev_setup: dev_flag(&lookup, "PUSH_DEV_SETUP")?,
+        })
+```
+
+Replace
+
+```rust
+}
+
+/// An invalid URL variable; the value is never shown because it carries a password.
+fn redacted(name: &'static str, reason: String) -> ConfigError {
+```
+
+with
+
+```rust
+}
+
+/// A shared token fit for a header: 32 to 256 visible ASCII characters.
+fn check_token(token: &str) -> Result<(), String> {
+    if (32..=256).contains(&token.len()) && token.bytes().all(|byte| byte.is_ascii_graphic()) {
+        Ok(())
+    } else {
+        Err("use 32 to 256 visible ASCII characters".to_owned())
+    }
+}
+
+/// An invalid URL variable; the value is never shown because it carries a password.
+fn redacted(name: &'static str, reason: String) -> ConfigError {
+```
+
+Replace
+
+```rust
+        assert_eq!(config.health_addr, "0.0.0.0:8081".parse().unwrap());
+        assert_eq!(config.store, StoreOptions::default());
+        assert!(!config.dev_setup);
+    }
+
+    #[test]
+    fn the_urls_are_required() {
+```
+
+with
+
+```rust
+        assert_eq!(config.health_addr, "0.0.0.0:8081".parse().unwrap());
+        assert_eq!(config.store, StoreOptions::default());
+        assert_eq!(config.accounts_token, None);
+        assert!(!config.dev_setup);
+    }
+
+    #[test]
+    fn the_accounts_token_is_checked_and_never_shown() {
+        let token = "t0ken-".repeat(6);
+        let mut variables = REQUIRED.to_vec();
+        variables.push(("PUSH_ACCOUNTS_TOKEN", &token));
+        let configured = config(&variables).unwrap();
+        assert_eq!(configured.accounts_token.as_deref(), Some(token.as_str()));
+        assert!(!format!("{configured:?}").contains(&token));
+        for bad in ["too-short", "with a space but long enough to pass 32"] {
+            let mut variables = REQUIRED.to_vec();
+            variables.push(("PUSH_ACCOUNTS_TOKEN", bad));
+            let message = config(&variables).unwrap_err().to_string();
+            assert!(message.contains("PUSH_ACCOUNTS_TOKEN"), "{message}");
+            assert!(!message.contains(bad), "{message}");
+        }
+    }
+
+    #[test]
+    fn the_urls_are_required() {
+```
+
+The smoke test's local stack builds message-svc's `Config` too; it gets no token for now
+(Plan 6B starts the worker there). In `crates/push-smoke/tests/local.rs`:
+
+Replace
+
+```rust
+            health_addr: message_svc_health.local_addr().unwrap(),
+            store: StoreOptions::default(),
+            dev_setup: true,
+        },
+```
+
+with
+
+```rust
+            health_addr: message_svc_health.local_addr().unwrap(),
+            store: StoreOptions::default(),
+            accounts_token: None,
+            dev_setup: true,
+        },
 ```
 
 In `crates/push-message-svc/tests/service.rs`, the test that proves `DevSetup` is off by
 default now also drives `Accounts` over real Postgres — it must be served without dev
-setup:
+setup, refuse a caller without the token, and answer `Identify` for a device not relayed
+yet with `UNAVAILABLE`:
 
 Replace
 
@@ -1124,6 +1691,72 @@ use push_proto::v1::{Ack, ContentType, Send};
 Replace
 
 ```rust
+use tokio_stream::StreamExt;
+use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
+
+struct Running {
+    _postgres: ContainerAsync<Postgres>,
+```
+
+with
+
+```rust
+use tokio_stream::StreamExt;
+use tokio_util::sync::CancellationToken;
+use tonic::Request;
+use tonic::metadata::MetadataValue;
+use tonic::transport::Channel;
+use uuid::Uuid;
+
+/// The worker's token for the `Accounts` API.
+const ACCOUNTS_TOKEN: &str = "accounts-token-for-the-service-tests";
+
+struct Running {
+    _postgres: ContainerAsync<Postgres>,
+```
+
+Replace
+
+```rust
+        health_addr: health,
+        store: StoreOptions::default(),
+        dev_setup,
+    };
+```
+
+with
+
+```rust
+        health_addr: health,
+        store: StoreOptions::default(),
+        accounts_token: Some(ACCOUNTS_TOKEN.to_owned()),
+        dev_setup,
+    };
+```
+
+Replace
+
+```rust
+        health_addr: health.local_addr().unwrap(),
+        store: StoreOptions::default(),
+        dev_setup: false,
+    };
+```
+
+with
+
+```rust
+        health_addr: health.local_addr().unwrap(),
+        store: StoreOptions::default(),
+        accounts_token: None,
+        dev_setup: false,
+    };
+```
+
+Replace
+
+```rust
 #[tokio::test]
 async fn dev_setup_is_absent_unless_enabled() {
     let running = start(false).await;
@@ -1141,18 +1774,38 @@ with
 async fn accounts_are_served_and_dev_setup_is_absent_unless_enabled() {
     let running = start(false).await;
     let url = format!("http://{}", running.grpc);
-    let mut accounts = AccountsClient::connect(url.clone()).await.unwrap();
+    let channel = Channel::from_shared(url.clone())
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
     let mut messaging = MessagingClient::connect(url.clone()).await.unwrap();
     let (user, device) = (Uuid::now_v7(), Uuid::now_v7());
     let event = AccountDevice {
         user_id: id_bytes(user),
         device_id: id_bytes(device),
     };
-    accounts.device_registered(event.clone()).await.unwrap();
     let identify = IdentifyRequest {
         user_id: id_bytes(user),
         device_id: id_bytes(device),
     };
+    // Not relayed yet: worth retrying, unlike a revoked device.
+    let status = messaging.identify(identify.clone()).await.unwrap_err();
+    assert_eq!(status.code(), tonic::Code::Unavailable);
+
+    // Without the worker's token (the gateway has none) the API refuses.
+    let mut stranger = AccountsClient::new(channel.clone());
+    let status = stranger.device_registered(event.clone()).await.unwrap_err();
+    assert_eq!(status.code(), tonic::Code::Unauthenticated);
+
+    let bearer: MetadataValue<_> = format!("Bearer {ACCOUNTS_TOKEN}").parse().unwrap();
+    let mut accounts = AccountsClient::with_interceptor(channel, move |mut request: Request<()>| {
+        request
+            .metadata_mut()
+            .insert("authorization", bearer.clone());
+        Ok(request)
+    });
+    accounts.device_registered(event.clone()).await.unwrap();
     messaging.identify(identify.clone()).await.unwrap();
     accounts.device_revoked(event).await.unwrap();
     let status = messaging.identify(identify).await.unwrap_err();
@@ -1167,16 +1820,18 @@ async fn accounts_are_served_and_dev_setup_is_absent_unless_enabled() {
 cargo test -p push-message-svc
 ```
 
-Expected: the unit tests pass, among them the 2 new ones
+Expected: the unit tests pass, among them the 4 new ones
 (`relayed_account_events_register_and_revoke_devices_in_any_order`,
-`relayed_events_that_can_never_succeed_are_refused_for_good`), and
-`accounts_are_served_and_dev_setup_is_absent_unless_enabled` FAILS: the call answers
-`Unimplemented`, since the server does not serve `Accounts` yet.
+`relayed_events_that_can_never_succeed_are_refused_for_good`,
+`accounts_calls_pass_only_with_the_internal_token`,
+`the_accounts_token_is_checked_and_never_shown`), and
+`accounts_are_served_and_dev_setup_is_absent_unless_enabled` FAILS: the call without the
+token answers `Unimplemented`, since the server does not serve `Accounts` yet.
 
-- [ ] **Step 4: Serve it**
+- [ ] **Step 4: Serve it, behind the token**
 
 Register the service in `crates/push-message-svc/src/server.rs` — always, not only in dev
-mode:
+mode, and wrapped in `AccountsToken`; without a token it warns at start-up:
 
 Replace
 
@@ -1209,8 +1864,32 @@ with
 
 ```rust
 use crate::config::Config;
-use crate::grpc::{AccountsApi, DevSetupApi, MessagingApi};
+use crate::grpc::{AccountsApi, AccountsToken, DevSetupApi, MessagingApi};
 use crate::notify::RedisNotifier;
+```
+
+Replace
+
+```rust
+        );
+    }
+    let Some(store) = retry("postgres", &shutdown, || async {
+        // Services migrate with `push_store::migrate_database(url)` on a dedicated
+```
+
+with
+
+```rust
+        );
+    }
+    if config.accounts_token.is_none() {
+        tracing::warn!(
+            "PUSH_ACCOUNTS_TOKEN is not set: the Accounts API refuses every call, so the \
+             worker cannot relay users and devices"
+        );
+    }
+    let Some(store) = retry("postgres", &shutdown, || async {
+        // Services migrate with `push_store::migrate_database(url)` on a dedicated
 ```
 
 Replace
@@ -1231,12 +1910,15 @@ with
         .add_service(MessagingServer::new(MessagingApi::new(Arc::clone(
             &messaging,
         ))))
-        .add_service(AccountsServer::new(AccountsApi::new(messaging)))
+        .add_service(AccountsServer::with_interceptor(
+            AccountsApi::new(messaging),
+            AccountsToken::new(config.accounts_token.clone()),
+        ))
         .add_optional_service(dev_setup)
         .serve_with_incoming_shutdown(
 ```
 
-and export it from `crates/push-message-svc/src/lib.rs`:
+and export both from `crates/push-message-svc/src/lib.rs`:
 
 Replace
 
@@ -1275,17 +1957,55 @@ with
 
 ```rust
 pub use config::{Config, ConfigError};
-pub use grpc::{AccountsApi, DevSetupApi, MessagingApi};
+pub use grpc::{AccountsApi, AccountsToken, DevSetupApi, MessagingApi};
 pub use notify::RedisNotifier;
 pub use server::{init_logging, serve, terminated};
 ```
 
+The gateway's test of an unknown device used a device id nobody registered, which is now
+"not known yet" (`UNAVAILABLE`, which the gateway closes with 1011 until Plan 8 gives it a
+code of its own); a device of another user is still refused for good with 4001. In
+`crates/push-gateway/tests/gateway.rs`:
+
+Replace
+
+```rust
+#[tokio::test]
+async fn an_unknown_device_is_closed_with_4001() {
+    let stack = stack(true).await;
+    let (user, _device) = person(&stack).await;
+    let mut socket = connect(&stack).await;
+    send(&mut socket, identify(user, Uuid::now_v7())).await;
+    assert_eq!(close_code(&mut socket).await, 4001);
+}
+```
+
+with
+
+```rust
+#[tokio::test]
+async fn a_device_of_another_user_is_closed_with_4001() {
+    let stack = stack(true).await;
+    let (alice, _) = person(&stack).await;
+    let (_, bob_device) = person(&stack).await;
+    let mut socket = connect(&stack).await;
+    send(&mut socket, identify(alice, bob_device)).await;
+    assert_eq!(close_code(&mut socket).await, 4001);
+
+    // A device message-svc has not heard of yet (not relayed) is not refused for good:
+    // message-svc answers UNAVAILABLE, and the client retries (Plan 8 gives it its own code).
+    let mut socket = connect(&stack).await;
+    send(&mut socket, identify(alice, Uuid::now_v7())).await;
+    assert_eq!(close_code(&mut socket).await, 1011);
+}
+```
+
 ```powershell
-cargo test -p push-message-svc
+cargo test -p push-message-svc -p push-gateway
 ```
 
 Expected: everything passes, `accounts_are_served_and_dev_setup_is_absent_unless_enabled`
-included.
+and `a_device_of_another_user_is_closed_with_4001` included.
 
 - [ ] **Step 5: Run the gates and commit**
 
@@ -1298,7 +2018,7 @@ git add crates
 git commit -m "feat(message-svc): the Accounts API for relayed auth events"
 ```
 
-Expected: 720 tests pass, no warnings, no diff.
+Expected: 724 tests pass, no warnings, no diff.
 
 ---
 
@@ -2069,7 +2789,7 @@ git add crates/push-auth
 git commit -m "feat(auth): outbox and cleanup access for the worker's role"
 ```
 
-Expected: 725 tests pass.
+Expected: 729 tests pass.
 
 ---
 
@@ -2180,7 +2900,8 @@ pub use templates::{Rendered, TemplateError, Templates};
 - [ ] **Step 2: The templates, with their tests**
 
 Each test module comes with its code here; the tests are the first thing to read. Create
-`crates/push-email/src/templates.rs` (decision 9):
+`crates/push-email/src/templates.rs` (decision 9; the default product name is
+"Push Messenger", owner decision 2):
 
 ```rust
 //! The email templates of auth-svc's `email.send` events (spec §3.1): plain text and a
@@ -2222,7 +2943,7 @@ pub struct Templates {
 }
 
 impl Templates {
-    /// `product` names the service in subjects and bodies, `push-messenger` by default.
+    /// `product` names the service in subjects and bodies, `Push Messenger` by default.
     pub fn new(product: impl Into<String>) -> Self {
         Self {
             product: product.into(),
@@ -2338,7 +3059,7 @@ impl Templates {
 
 impl Default for Templates {
     fn default() -> Self {
-        Self::new("push-messenger")
+        Self::new("Push Messenger")
     }
 }
 
@@ -2399,7 +3120,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             rendered.subject,
-            "Verify your email address for push-messenger"
+            "Verify your email address for Push Messenger"
         );
         assert!(rendered.text.starts_with("Hi @alice,\n\n"));
         assert!(rendered.text.contains(&format!("\n\n{LINK}\n\n")));
@@ -2484,7 +3205,7 @@ mod tests {
         let shown = format!("{rendered:?}");
         assert!(!shown.contains("token"), "{shown}");
         assert!(
-            shown.contains("Reset your push-messenger password"),
+            shown.contains("Reset your Push Messenger password"),
             "{shown}"
         );
     }
@@ -2661,7 +3382,7 @@ impl std::fmt::Debug for ResendSender {
 
 impl ResendSender {
     /// A sender that posts to `{api_url}/emails` ([`RESEND_API_URL`] in production) with
-    /// `api_key`, from the address `from` (`Name <no-reply@example.com>`).
+    /// `api_key`, from the address `from` (`Push Messenger <no-reply@push.kubegames.dk>`).
     pub fn new(api_url: &str, api_key: String, from: String) -> Result<Self, SendError> {
         let http = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
@@ -2906,7 +3627,7 @@ git add Cargo.toml Cargo.lock crates/push-email
 git commit -m "feat(email): templates, the log sender and the Resend sender"
 ```
 
-Expected: 738 tests pass, and the 1.85 build compiles rustls.
+Expected: 742 tests pass, and the 1.85 build compiles rustls.
 
 ---
 
@@ -3396,7 +4117,7 @@ git add Cargo.lock crates/push-email
 git commit -m "feat(email): Resend webhooks with Svix signatures"
 ```
 
-Expected: 744 tests pass.
+Expected: 748 tests pass.
 
 ---
 
@@ -3451,7 +4172,7 @@ rand = "0.9"
 redis = { version = "1", default-features = false, features = [
 ```
 
-Create `crates/push-worker/Cargo.toml`:
+Create `crates/push-worker/Cargo.toml` (`chrono` for the claim time, decision 2):
 
 ```toml
 [package]
@@ -3465,6 +4186,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+chrono.workspace = true
 push-store.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
@@ -3481,18 +4203,22 @@ workspace = true
 - [ ] **Step 2: The queue's tests, failing**
 
 The tests migrate as a plain owner role (the chart's `push_worker`), then cover adding a job
-twice, six concurrent claimers over 60 jobs (no job twice), a lease that ends, and every
-outcome (decisions 2 and 3). Create `crates/push-worker/tests/queue.rs`:
+twice, six concurrent claimers over 60 jobs (no job twice), a lease that ends, outcomes
+that come after the lease ended and must leave the newer claim alone (a periodic job's
+included, whose attempts start again at 0), jobs given back at shutdown, and every outcome,
+with a buried email keeping no link (decisions 2 and 3). Create
+`crates/push-worker/tests/queue.rs`:
 
 ```rust
 //! The job queue on a real PostgreSQL (Docker must be running): the migration as a plain
 //! owner, idempotent enqueueing, claims that never hand one job to two workers, leases
-//! that expire, backoff, burial and cleanup.
+//! that expire, stale outcomes that never overwrite a newer claim, jobs given back at
+//! shutdown, backoff, burial without links and cleanup.
 
 use std::collections::HashSet;
 use std::time::Duration;
 
-use push_worker::queue::{Job, NewJob, Outcome, Queue};
+use push_worker::queue::{NewJob, Outcome, Queue};
 use push_worker::{MIGRATOR, migrate_database};
 use serde_json::json;
 use sqlx::PgPool;
@@ -3577,20 +4303,16 @@ async fn the_owner_migrates_and_a_job_is_added_once_claimed_once_and_deleted() {
 
     let claimed = queue.claim(10).await.unwrap();
     assert_eq!(claimed.len(), 2);
+    let job = &claimed[0];
     assert_eq!(
-        claimed[0],
-        Job {
-            id: first.id,
-            kind: "user.verified".to_owned(),
-            payload: json!({"n": 1}),
-            attempts: 1,
-        }
+        (job.id, job.kind.as_str(), &job.payload, job.attempts),
+        (first.id, "user.verified", &json!({"n": 1}), 1)
     );
     assert!(
         queue.claim(10).await.unwrap().is_empty(),
         "leased jobs are not due"
     );
-    queue.finish(&claimed[0], Outcome::Done).await.unwrap();
+    assert!(queue.finish(job, Outcome::Done).await.unwrap());
     assert_eq!(job_row(&pool, first.id).await, None);
 }
 
@@ -3631,15 +4353,95 @@ async fn a_job_held_by_a_crashed_worker_comes_back_when_its_lease_ends() {
 }
 
 #[tokio::test]
+async fn a_stale_outcome_never_overwrites_a_newer_claim() {
+    let (_container, pool) = worker_database().await;
+    let queue = Queue::new(pool.clone(), Duration::from_millis(300));
+    let periodic = job("cleanup");
+    queue
+        .enqueue(&[job("email.send"), periodic.clone()])
+        .await
+        .unwrap();
+    let slow = queue.claim(10).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let newer = queue.claim(10).await.unwrap();
+    assert_eq!(newer.len(), 2);
+
+    // The slow worker's outcomes come after its lease ended: all of them are dropped.
+    for (job, outcome) in [
+        (&slow[0], Outcome::Done),
+        (&slow[0], Outcome::Poison("too late".to_owned())),
+        (
+            &slow[1],
+            Outcome::Failed {
+                reason: "too late".to_owned(),
+                max_attempts: None,
+            },
+        ),
+        (&slow[1], Outcome::RunAgain(Duration::from_secs(3600))),
+    ] {
+        assert!(!queue.finish(job, outcome).await.unwrap());
+    }
+    for job in &newer {
+        assert_eq!(
+            job_row(&pool, job.id).await,
+            Some((2, None, false, true)),
+            "the newer claim is untouched"
+        );
+    }
+
+    // A periodic job's attempts start again at 0 after each run; the claim time still
+    // tells a later claim from the one that ran it.
+    let periodic_claim = newer.iter().find(|job| job.id == periodic.id).unwrap();
+    assert!(
+        queue
+            .finish(periodic_claim, Outcome::RunAgain(Duration::ZERO))
+            .await
+            .unwrap()
+    );
+    let next = queue.claim(10).await.unwrap();
+    assert_eq!((next[0].id, next[0].attempts), (periodic.id, 1));
+    let stale = slow.iter().find(|job| job.id == periodic.id).unwrap();
+    assert_eq!(stale.attempts, 1);
+    assert!(!queue.finish(stale, Outcome::Done).await.unwrap());
+    assert!(queue.finish(&next[0], Outcome::Done).await.unwrap());
+}
+
+#[tokio::test]
+async fn jobs_given_back_at_shutdown_are_due_at_once_without_the_attempt() {
+    let (_container, pool) = worker_database().await;
+    let queue = Queue::new(pool.clone(), Duration::from_secs(60));
+    queue
+        .enqueue(&[job("email.send"), job("device.revoked")])
+        .await
+        .unwrap();
+    let claimed = queue.claim(10).await.unwrap();
+    assert_eq!(queue.release(&claimed).await.unwrap(), 2);
+    assert_eq!(
+        queue.release(&claimed).await.unwrap(),
+        0,
+        "no longer under that claim"
+    );
+    for job in &claimed {
+        assert_eq!(job_row(&pool, job.id).await, Some((0, None, false, false)));
+    }
+    let again = queue.claim(10).await.unwrap();
+    assert_eq!(again.len(), 2);
+    assert!(again.iter().all(|job| job.attempts == 1));
+    assert!(!queue.finish(&claimed[0], Outcome::Done).await.unwrap());
+}
+
+#[tokio::test]
 async fn failures_back_off_poison_is_buried_and_periodic_jobs_run_again() {
     let (_container, pool) = worker_database().await;
     let queue = Queue::new(pool.clone(), Duration::from_secs(60));
-    let (flaky, limited, poison, periodic) = (
-        job("email.send"),
-        job("email.send"),
-        job("device.revoked"),
-        job("cleanup"),
-    );
+    let limited = NewJob {
+        payload: json!({
+            "template": "verify_email",
+            "params": {"link": "https://push.test/v1/auth/verify?token=secret", "handle": "alice"},
+        }),
+        ..job("email.send")
+    };
+    let (flaky, poison, periodic) = (job("email.send"), job("device.revoked"), job("cleanup"));
     queue
         .enqueue(&[
             flaky.clone(),
@@ -3688,6 +4490,17 @@ async fn failures_back_off_poison_is_buried_and_periodic_jobs_run_again() {
     assert_eq!(
         job_row(&pool, periodic.id).await,
         Some((0, None, false, true))
+    );
+    // A buried email keeps its payload for inspection, but not the link.
+    let kept: serde_json::Value =
+        sqlx::query_scalar("SELECT payload FROM worker.job WHERE job_id = $1")
+            .bind(limited.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        kept,
+        json!({"template": "verify_email", "params": {"handle": "alice"}})
     );
 
     // The backoff of the first failure is 1 s; the buried jobs never come back.
@@ -3822,7 +4635,9 @@ pub async fn migrate_database(url: &str) -> Result<(), sqlx::migrate::MigrateErr
 
 - [ ] **Step 4: The queue**
 
-Create `crates/push-worker/src/queue.rs`:
+Create `crates/push-worker/src/queue.rs` (`finish` matches the claim's `attempts` and
+`claimed_at` in every statement, and returns whether the job was still under that claim;
+`release` gives back jobs not started):
 
 ```rust
 //! The job queue in `worker.job` (spec §3.3): at least once, shared by every replica.
@@ -3832,9 +4647,15 @@ Create `crates/push-worker/src/queue.rs`:
 //! goes up. A job is deleted when it is done, put back with a backoff when it failed, and
 //! buried (`dead_at`) when it can never succeed. A worker that dies holding a job only
 //! delays it: the job is due again when the lease ends.
+//!
+//! A claim is named by the job's `attempts` and `claimed_at`, and every outcome is recorded
+//! only while the job is still under that claim: when a slow worker's lease ended and
+//! another worker claimed the job again, the slow worker's outcome is dropped instead of
+//! overwriting the newer claim.
 
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -3862,6 +4683,8 @@ pub struct Job {
     pub payload: Value,
     /// Attempts so far, this one included.
     pub attempts: i32,
+    /// When this claim was made; with `attempts`, it names the claim.
+    pub claimed_at: DateTime<Utc>,
 }
 
 /// How an attempt ended.
@@ -3923,13 +4746,13 @@ impl Queue {
     /// Claims up to `limit` due jobs, oldest first, and leases them. Jobs another worker
     /// holds are skipped, not waited for.
     pub async fn claim(&self, limit: i64) -> sqlx::Result<Vec<Job>> {
-        let rows: Vec<(Uuid, String, Value, i32)> = sqlx::query_as(
+        let rows: Vec<(Uuid, String, Value, i32, DateTime<Utc>)> = sqlx::query_as(
             "UPDATE worker.job SET attempts = attempts + 1, claimed_at = now(), \
              run_after = now() + make_interval(secs => $2) \
              WHERE job_id IN (SELECT job_id FROM worker.job \
                  WHERE dead_at IS NULL AND run_after <= now() \
                  ORDER BY run_after, job_id LIMIT $1 FOR UPDATE SKIP LOCKED) \
-             RETURNING job_id, kind, payload, attempts",
+             RETURNING job_id, kind, payload, attempts, claimed_at",
         )
         .bind(limit)
         .bind(self.lease.as_secs_f64())
@@ -3937,11 +4760,12 @@ impl Queue {
         .await?;
         let mut jobs: Vec<Job> = rows
             .into_iter()
-            .map(|(id, kind, payload, attempts)| Job {
+            .map(|(id, kind, payload, attempts, claimed_at)| Job {
                 id,
                 kind,
                 payload,
                 attempts,
+                claimed_at,
             })
             .collect();
         // UUIDv7 ids are time-ordered: handle older events first.
@@ -3949,35 +4773,70 @@ impl Queue {
         Ok(jobs)
     }
 
-    /// Records how the attempt at `job` ended.
-    pub async fn finish(&self, job: &Job, outcome: Outcome) -> sqlx::Result<()> {
+    /// Records how the attempt at `job` ended, if the job is still under this claim, and
+    /// returns whether it was. `false` means the lease ended and another worker claimed the
+    /// job again: the outcome is dropped, never written over the newer claim.
+    ///
+    /// A buried job keeps its payload for inspection, without `params.link`: an email's
+    /// link would sign its holder in.
+    pub async fn finish(&self, job: &Job, outcome: Outcome) -> sqlx::Result<bool> {
+        let under_claim = |sql: &'static str| {
+            sqlx::query(sql)
+                .bind(job.id)
+                .bind(job.attempts)
+                .bind(job.claimed_at)
+        };
         let query = match outcome {
-            Outcome::Done => sqlx::query("DELETE FROM worker.job WHERE job_id = $1").bind(job.id),
-            Outcome::RunAgain(after) => sqlx::query(
-                "UPDATE worker.job SET run_after = now() + make_interval(secs => $2), \
-                 attempts = 0, claimed_at = NULL, failed_reason = NULL WHERE job_id = $1",
+            Outcome::Done => under_claim(
+                "DELETE FROM worker.job WHERE job_id = $1 AND attempts = $2 AND claimed_at = $3",
+            ),
+            Outcome::RunAgain(after) => under_claim(
+                "UPDATE worker.job SET run_after = now() + make_interval(secs => $4), \
+                 attempts = 0, claimed_at = NULL, failed_reason = NULL \
+                 WHERE job_id = $1 AND attempts = $2 AND claimed_at = $3",
             )
-            .bind(job.id)
             .bind(after.as_secs_f64()),
             Outcome::Failed {
                 reason,
                 max_attempts,
-            } if max_attempts.is_none_or(|max| job.attempts < max) => sqlx::query(
-                "UPDATE worker.job SET run_after = now() + make_interval(secs => $2), \
-                 claimed_at = NULL, failed_reason = $3 WHERE job_id = $1",
+            } if max_attempts.is_none_or(|max| job.attempts < max) => under_claim(
+                "UPDATE worker.job SET run_after = now() + make_interval(secs => $4), \
+                 claimed_at = NULL, failed_reason = $5 \
+                 WHERE job_id = $1 AND attempts = $2 AND claimed_at = $3",
             )
-            .bind(job.id)
             .bind(backoff(job.attempts).as_secs_f64())
             .bind(cut(reason)),
-            Outcome::Failed { reason, .. } | Outcome::Poison(reason) => sqlx::query(
-                "UPDATE worker.job SET dead_at = now(), claimed_at = NULL, failed_reason = $2 \
-                 WHERE job_id = $1",
+            Outcome::Failed { reason, .. } | Outcome::Poison(reason) => under_claim(
+                "UPDATE worker.job SET dead_at = now(), claimed_at = NULL, failed_reason = $4, \
+                 payload = payload #- '{params,link}' \
+                 WHERE job_id = $1 AND attempts = $2 AND claimed_at = $3",
             )
-            .bind(job.id)
             .bind(cut(reason)),
         };
-        query.execute(&self.pool).await?;
-        Ok(())
+        Ok(query.execute(&self.pool).await?.rows_affected() == 1)
+    }
+
+    /// Gives back jobs claimed but not started (at shutdown): due again at once, the
+    /// claim's attempt undone. A job no longer under that claim is left alone. Returns how
+    /// many went back.
+    pub async fn release(&self, jobs: &[Job]) -> sqlx::Result<u64> {
+        let ids: Vec<Uuid> = jobs.iter().map(|job| job.id).collect();
+        let attempts: Vec<i32> = jobs.iter().map(|job| job.attempts).collect();
+        let claimed: Vec<DateTime<Utc>> = jobs.iter().map(|job| job.claimed_at).collect();
+        let released = sqlx::query(
+            "UPDATE worker.job AS job SET run_after = now(), attempts = job.attempts - 1, \
+             claimed_at = NULL \
+             FROM UNNEST($1::uuid[], $2::int4[], $3::timestamptz[]) \
+                 AS claim (job_id, attempts, claimed_at) \
+             WHERE job.job_id = claim.job_id AND job.attempts = claim.attempts \
+                 AND job.claimed_at = claim.claimed_at",
+        )
+        .bind(&ids)
+        .bind(&attempts)
+        .bind(&claimed)
+        .execute(&self.pool)
+        .await?;
+        Ok(released.rows_affected())
     }
 
     /// Deletes up to `batch` buried jobs that died more than `older_than` ago. Returns how
@@ -4044,7 +4903,9 @@ cargo test -p push-worker
 ```
 
 Expected: the unit tests (`retries_back_off_from_1_s_to_10_minutes`, `long_reasons_are_cut`)
-and `test result: ok. 4 passed` for `tests\queue.rs`.
+and `test result: ok. 6 passed` for `tests\queue.rs`. Without the fence,
+`a_stale_outcome_never_overwrites_a_newer_claim` fails: the slow worker's `Done` deletes
+the job the newer claim holds.
 
 - [ ] **Step 5: Run the gates and commit**
 
@@ -4057,7 +4918,7 @@ git add Cargo.toml Cargo.lock crates/push-worker
 git commit -m "feat(worker): the worker schema and the job queue"
 ```
 
-Expected: 750 tests pass. (Clippy's `cloned_ref_to_slice_refs` is why the test enqueues
+Expected: 756 tests pass. (Clippy's `cloned_ref_to_slice_refs` is why the test enqueues
 `std::slice::from_ref(&first)` rather than `&[first.clone()]`.)
 
 ---
@@ -4072,7 +4933,8 @@ Expected: 750 tests pass. (Clippy's `cloned_ref_to_slice_refs` is why the test e
 - [ ] **Step 1: Dependencies**
 
 `tonic` and `push-proto` for message-svc's API; for the tests, auth-svc's migrations and
-outbox events, and message-svc's APIs on an in-memory store. Replace
+outbox events, and message-svc's APIs (with its `AccountsToken`) on an in-memory store.
+Replace
 `crates/push-worker/Cargo.toml` with:
 
 ```toml
@@ -4087,6 +4949,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+chrono.workspace = true
 push-proto.workspace = true
 push-store.workspace = true
 serde_json.workspace = true
@@ -4114,7 +4977,9 @@ and its grant given, as auth-svc does at start-up — write events with auth-svc
 store in the test process. They check that events move once (also after a worker died
 between queueing and deleting), that the account events applied in the worst order (all
 reversed) leave the revoked device revoked, that a redelivery changes nothing, and which
-outcomes are poison and which are retried. Create `crates/push-worker/tests/relay.rs`:
+outcomes are poison and which are retried — a wrong token among the latter. message-svc
+requires the token, so every relayed event also proves the worker sends it. Create
+`crates/push-worker/tests/relay.rs`:
 
 ```rust
 //! The relay end to end (Docker must be running): auth-svc's outbox in its own database,
@@ -4124,9 +4989,10 @@ outcomes are poison and which are retried. Create `crates/push-worker/tests/rela
 use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::Utc;
 use push_auth::outbox::Event;
 use push_domain::{InMemoryStore, Messaging, RecordingNotifier, SystemClock};
-use push_message_svc::{AccountsApi, MessagingApi};
+use push_message_svc::{AccountsApi, AccountsToken, MessagingApi};
 use push_proto::id_bytes;
 use push_proto::internal::v1::IdentifyRequest;
 use push_proto::internal::v1::accounts_server::AccountsServer;
@@ -4146,6 +5012,9 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Channel;
 use uuid::Uuid;
 
+/// The shared token message-svc requires for its `Accounts` API.
+const ACCOUNTS_TOKEN: &str = "accounts-token-for-the-relay-tests";
+
 struct World {
     _container: ContainerAsync<Postgres>,
     /// auth-svc's database as its owner, to write events.
@@ -4153,6 +5022,7 @@ struct World {
     queue: Queue,
     relay: OutboxRelay,
     jobs: Jobs,
+    message_svc: String,
     messaging: MessagingClient<Channel>,
 }
 
@@ -4200,8 +5070,9 @@ async fn world() -> World {
         auth: PgPool::connect(&auth_url).await.unwrap(),
         relay: OutboxRelay::new(source, queue.clone(), 100),
         queue,
-        jobs: Jobs::new(Accounts::new(&message_svc).unwrap()),
-        messaging: MessagingClient::connect(message_svc).await.unwrap(),
+        jobs: Jobs::new(Accounts::new(&message_svc, ACCOUNTS_TOKEN).unwrap()),
+        messaging: MessagingClient::connect(message_svc.clone()).await.unwrap(),
+        message_svc,
     }
 }
 
@@ -4218,7 +5089,10 @@ async fn message_svc() -> String {
         .add_service(MessagingServer::new(MessagingApi::new(Arc::clone(
             &messaging,
         ))))
-        .add_service(AccountsServer::new(AccountsApi::new(messaging)))
+        .add_service(AccountsServer::with_interceptor(
+            AccountsApi::new(messaging),
+            AccountsToken::new(Some(ACCOUNTS_TOKEN.to_owned())),
+        ))
         .serve_with_incoming(TcpListenerStream::new(listener));
     tokio::spawn(server);
     url
@@ -4381,12 +5255,14 @@ async fn events_that_can_never_apply_are_poison_and_outages_are_retried() {
         kind: "device.registered".to_owned(),
         payload: json!({"user_id": bob}),
         attempts: 1,
+        claimed_at: Utc::now(),
     });
     jobs.push(Job {
         id: Uuid::now_v7(),
         kind: "sms.send".to_owned(),
         payload: json!({}),
         attempts: 1,
+        claimed_at: Utc::now(),
     });
     for job in &jobs {
         let outcome = world.jobs.run(job).await;
@@ -4398,29 +5274,36 @@ async fn events_that_can_never_apply_are_poison_and_outages_are_retried() {
     }
     assert!(identifies(&world, alice, device).await);
 
-    // message-svc is not there: retried, for as long as it takes.
+    // message-svc is not there, or refuses a wrong token: retried, for as long as it
+    // takes.
     let unused = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let gone = format!("http://{}", unused.local_addr().unwrap());
     drop(unused);
-    let jobs = Jobs::new(Accounts::new(&gone).unwrap());
-    let outcome = jobs
-        .run(&Job {
-            id: Uuid::now_v7(),
-            kind: "user.verified".to_owned(),
-            payload: json!({"user_id": alice}),
-            attempts: 1,
-        })
-        .await;
-    assert!(
-        matches!(
-            outcome,
-            Outcome::Failed {
-                max_attempts: None,
-                ..
-            }
-        ),
-        "{outcome:?}"
-    );
+    let wrong_token = "not-the-accounts-token-of-this-cluster";
+    for accounts in [
+        Accounts::new(&gone, ACCOUNTS_TOKEN).unwrap(),
+        Accounts::new(&world.message_svc, wrong_token).unwrap(),
+    ] {
+        let outcome = Jobs::new(accounts)
+            .run(&Job {
+                id: Uuid::now_v7(),
+                kind: "user.verified".to_owned(),
+                payload: json!({"user_id": alice}),
+                attempts: 1,
+                claimed_at: Utc::now(),
+            })
+            .await;
+        assert!(
+            matches!(
+                outcome,
+                Outcome::Failed {
+                    max_attempts: None,
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+    }
 }
 ```
 
@@ -4500,8 +5383,9 @@ impl OutboxRelay {
 
 - [ ] **Step 4: The account events and the jobs**
 
-Create `crates/push-worker/src/accounts.rs` (decisions 3 and 4: refusals that no retry can
-change are poison, everything else is retried without limit):
+Create `crates/push-worker/src/accounts.rs` (decisions 3, 4 and 17: refusals that no retry
+can change are poison, everything else — `UNAUTHENTICATED` included — is retried without
+limit; every call carries the token):
 
 ```rust
 //! auth-svc's user and device events, applied in message-svc through its `Accounts` API.
@@ -4512,8 +5396,11 @@ use push_proto::id_bytes;
 use push_proto::internal::v1::accounts_client::AccountsClient;
 use push_proto::internal::v1::{AccountDevice, AccountUser};
 use serde_json::Value;
+use tonic::codegen::InterceptedService;
+use tonic::metadata::{Ascii, MetadataValue};
+use tonic::service::Interceptor;
 use tonic::transport::{Channel, Endpoint};
-use tonic::{Code, Status};
+use tonic::{Code, Request, Status};
 use uuid::Uuid;
 
 use crate::queue::Outcome;
@@ -4559,20 +5446,24 @@ impl AccountEvent {
 /// queue's at-least-once, any-order delivery is safe.
 #[derive(Debug, Clone)]
 pub struct Accounts {
-    client: AccountsClient<Channel>,
+    client: AccountsClient<InterceptedService<Channel, Bearer>>,
 }
 
 impl Accounts {
-    /// A client for message-svc at `url` (`http://host:50051`). It connects on first use
+    /// A client for message-svc at `url` (`http://host:50051`) that presents `token`, the
+    /// shared internal token message-svc requires for this API. It connects on first use
     /// and reconnects by itself.
-    pub fn new(url: &str) -> Result<Self, String> {
+    pub fn new(url: &str, token: &str) -> Result<Self, String> {
+        let bearer = format!("Bearer {token}")
+            .parse()
+            .map_err(|_| "the Accounts token cannot be sent as metadata".to_owned())?;
         let channel = Endpoint::from_shared(url.to_owned())
             .map_err(|_| "not a valid message-svc URL".to_owned())?
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(CALL_TIMEOUT)
             .connect_lazy();
         Ok(Self {
-            client: AccountsClient::new(channel),
+            client: AccountsClient::with_interceptor(channel, Bearer(bearer)),
         })
     }
 
@@ -4610,9 +5501,29 @@ impl Accounts {
     }
 }
 
+/// Adds `authorization: Bearer <token>` to every call.
+#[derive(Clone)]
+struct Bearer(MetadataValue<Ascii>);
+
+impl std::fmt::Debug for Bearer {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Bearer(<redacted>)")
+    }
+}
+
+impl Interceptor for Bearer {
+    fn call(&mut self, mut request: Request<()>) -> Result<Request<()>, Status> {
+        request
+            .metadata_mut()
+            .insert("authorization", self.0.clone());
+        Ok(request)
+    }
+}
+
 /// Refusals that no retry can change are poison; the rest (unavailable, aborted,
-/// deadline exceeded, transport errors) are retried for as long as it takes, since
-/// message-svc must learn every account event eventually.
+/// deadline exceeded, transport errors, and unauthenticated: a token to fix in the
+/// configuration) are retried for as long as it takes, since message-svc must learn every
+/// account event eventually.
 fn outcome(status: &Status) -> Outcome {
     let reason = format!("message-svc answered {:?}", status.code());
     match status.code() {
@@ -4673,6 +5584,7 @@ mod tests {
             Status::aborted("conflict"),
             Status::deadline_exceeded("slow"),
             Status::unknown("transport"),
+            Status::unauthenticated("wrong token"),
         ] {
             assert!(
                 matches!(
@@ -4751,7 +5663,7 @@ pub use db::{MIGRATOR, migrate_database};
 cargo test -p push-worker
 ```
 
-Expected: 4 unit tests, `tests\queue.rs` 4, `tests\relay.rs` 3 — all pass.
+Expected: 4 unit tests, `tests\queue.rs` 6, `tests\relay.rs` 3 — all pass.
 
 - [ ] **Step 5: Run the gates and commit**
 
@@ -4764,7 +5676,7 @@ git add Cargo.lock crates/push-worker
 git commit -m "feat(worker): relay auth-svc's account events to message-svc"
 ```
 
-Expected: 755 tests pass.
+Expected: 761 tests pass.
 
 ---
 
@@ -4859,6 +5771,7 @@ repository.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+chrono.workspace = true
 axum.workspace = true
 push-email.workspace = true
 push-proto.workspace = true
@@ -4890,9 +5803,10 @@ workspace = true
 A scripted sender records what it was given and answers from a queue of results. The tests
 cover sending once and recording without the link, a suppressed address, retries until the
 12th attempt and refusals, webhooks recorded once that suppress hard bounces and complaints
-(also the address an email went to, found by the provider's id) and refuse forgeries, and
-the HTTP API: signed webhooks in, unsigned out, and the mailbox only when enabled
-(decisions 9–12). Create `crates/push-worker/tests/email.rs`:
+(also the address an email went to, found by the provider's id), drop signed bodies they
+cannot read and refuse forgeries, and the HTTP API: signed webhooks in (204, a signed but
+malformed one too), unsigned out, and the mailbox only when enabled (decisions 9–12).
+Create `crates/push-worker/tests/email.rs`:
 
 ```rust
 //! Email on a real PostgreSQL (Docker must be running): sending once, suppression,
@@ -4905,6 +5819,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use chrono::Utc;
 use http_body_util::BodyExt;
 use push_email::{EmailSender, LogSender, OutgoingEmail, ResendWebhooks, SendError, Templates};
 use push_worker::deliveries::{Deliveries, Received};
@@ -4964,6 +5879,7 @@ fn verify_email(to: &str) -> Job {
             "params": {"link": LINK, "handle": "alice", "expires_in_minutes": 30},
         }),
         attempts: 1,
+        claimed_at: Utc::now(),
     }
 }
 
@@ -5086,6 +6002,11 @@ fn webhook(
     })
     .to_string()
     .into_bytes();
+    signed(id, body)
+}
+
+/// `body` with Resend's signature headers, signed now.
+fn signed(id: &str, body: Vec<u8>) -> (Vec<(String, String)>, Vec<u8>) {
     let timestamp = now();
     let signature = ResendWebhooks::new(SECRET)
         .unwrap()
@@ -5163,6 +6084,16 @@ async fn webhooks_are_recorded_once_and_hard_bounces_and_complaints_suppress() {
         receive(&deliveries, &opened).await.unwrap(),
         Received::Ignored
     );
+    // Signed, but not an event we can read: dropped, yet acknowledged.
+    for body in [
+        b"not json".to_vec(),
+        br#"{"type":"email.bounced"}"#.to_vec(),
+    ] {
+        assert_eq!(
+            receive(&deliveries, &signed("msg_9", body)).await.unwrap(),
+            Received::Malformed
+        );
+    }
 
     assert_eq!(
         suppressed(&pool).await,
@@ -5233,6 +6164,12 @@ async fn the_http_api_takes_signed_webhooks_and_serves_the_mailbox_only_in_dev()
             .await
             .0,
         StatusCode::UNAUTHORIZED
+    );
+    // Signed but malformed: 204, or Resend would send it again for days.
+    let (headers, body) = signed("msg_3", b"not json".to_vec());
+    assert_eq!(
+        call(&production, post(&headers, body)).await.0,
+        StatusCode::NO_CONTENT
     );
 
     let mailbox_request = || {
@@ -5558,7 +6495,8 @@ mod tests {
 
 Create `crates/push-worker/src/deliveries.rs`. `receive` takes the header lookup as
 `&(dyn Fn … + Sync)`: the future holds it across `.await`, and axum's handler must be
-`Send`:
+`Send`. A verified body it cannot read is `Received::Malformed`, logged with its `svix-id`
+(decision 11):
 
 ```rust
 //! Delivery webhooks (spec §9): verified, recorded once in `worker.email_event`, and hard
@@ -5580,12 +6518,15 @@ pub enum Received {
     Replay,
     /// A kind of event nothing acts on.
     Ignored,
+    /// Signed by the provider, but not a delivery event we can read: logged and dropped.
+    /// It is acknowledged all the same, since the provider would send it again for days.
+    Malformed,
 }
 
 /// Why a webhook was not taken.
 #[derive(Debug, thiserror::Error)]
 pub enum DeliveryError {
-    /// Not genuine, too old, or not a delivery event: never worth sending again.
+    /// Unsigned, forged or too old: never worth sending again.
     #[error(transparent)]
     Refused(#[from] WebhookError),
     /// The worker's database did not answer: the provider should send it again.
@@ -5621,10 +6562,21 @@ impl Deliveries {
         body: &[u8],
     ) -> Result<Received, DeliveryError> {
         let id = self.verifier.verify(header, body, SystemTime::now())?;
-        let Some(event) = self.verifier.parse(body)? else {
-            return Ok(Received::Ignored);
+        let malformed = || {
+            tracing::warn!(
+                webhook_id = %id,
+                "a signed webhook is not a delivery event we can read; dropped"
+            );
+            Ok(Received::Malformed)
         };
-        let raw: Value = serde_json::from_slice(body).map_err(|_| WebhookError::Malformed)?;
+        let (event, raw) = match (
+            self.verifier.parse(body),
+            serde_json::from_slice::<Value>(body),
+        ) {
+            (Ok(None), _) => return Ok(Received::Ignored),
+            (Ok(Some(event)), Ok(raw)) => (event, raw),
+            _ => return malformed(),
+        };
         let (kind, reason) = match event.kind {
             DeliveryKind::Delivered => (1_i16, None),
             DeliveryKind::Bounced { .. } => (2, Some(1_i16)),
@@ -5676,7 +6628,8 @@ impl Deliveries {
 }
 ```
 
-Create `crates/push-worker/src/http.rs`:
+Create `crates/push-worker/src/http.rs` (only a refused signature is 401; everything a
+retry could not fix is 204):
 
 ```rust
 //! The worker's HTTP API: Resend's delivery webhooks and the DEV ONLY mailbox.
@@ -5723,9 +6676,10 @@ pub fn router(http: Http) -> Router {
     router
 }
 
-/// 204 once recorded (or a replay, or an event nothing acts on); 400 for a body that is
-/// not a delivery event; 401 for a missing or wrong signature or a stale timestamp; 503
-/// when the database did not answer. Resend sends anything not answered 2xx again later.
+/// 204 once recorded (or a replay, an event nothing acts on, or a signed body that is not
+/// a delivery event, which is logged and dropped); 401 for a missing or wrong signature or
+/// a stale timestamp; 503 when the database did not answer. Resend sends anything not
+/// answered 2xx again, for days, so only what a retry could fix is not a 2xx.
 async fn webhook(
     State(deliveries): State<Deliveries>,
     headers: HeaderMap,
@@ -5741,11 +6695,7 @@ async fn webhook(
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(DeliveryError::Refused(error)) => {
             tracing::warn!(%error, "webhook refused");
-            let status = match error {
-                push_email::WebhookError::Malformed => StatusCode::BAD_REQUEST,
-                _ => StatusCode::UNAUTHORIZED,
-            };
-            (status, error.to_string()).into_response()
+            (StatusCode::UNAUTHORIZED, error.to_string()).into_response()
         }
         Err(error @ DeliveryError::Database(_)) => {
             tracing::warn!(%error, "webhook not recorded");
@@ -5849,7 +6799,7 @@ Replace
 ```rust
 use push_auth::outbox::Event;
 use push_domain::{InMemoryStore, Messaging, RecordingNotifier, SystemClock};
-use push_message_svc::{AccountsApi, MessagingApi};
+use push_message_svc::{AccountsApi, AccountsToken, MessagingApi};
 use push_proto::id_bytes;
 ```
 
@@ -5859,7 +6809,7 @@ with
 use push_auth::outbox::Event;
 use push_domain::{InMemoryStore, Messaging, RecordingNotifier, SystemClock};
 use push_email::{LogSender, Templates};
-use push_message_svc::{AccountsApi, MessagingApi};
+use push_message_svc::{AccountsApi, AccountsToken, MessagingApi};
 use push_proto::id_bytes;
 ```
 
@@ -5888,7 +6838,7 @@ Replace
     queue: Queue,
     relay: OutboxRelay,
     jobs: Jobs,
-    messaging: MessagingClient<Channel>,
+    message_svc: String,
 ```
 
 with
@@ -5898,7 +6848,7 @@ with
     relay: OutboxRelay,
     mailer: Mailer,
     jobs: Jobs,
-    messaging: MessagingClient<Channel>,
+    message_svc: String,
 ```
 
 Replace
@@ -5931,9 +6881,9 @@ Replace
 ```rust
         relay: OutboxRelay::new(source, queue.clone(), 100),
         queue,
-        jobs: Jobs::new(Accounts::new(&message_svc).unwrap()),
-        messaging: MessagingClient::connect(message_svc).await.unwrap(),
-    }
+        jobs: Jobs::new(Accounts::new(&message_svc, ACCOUNTS_TOKEN).unwrap()),
+        messaging: MessagingClient::connect(message_svc.clone()).await.unwrap(),
+        message_svc,
 ```
 
 with
@@ -5941,30 +6891,33 @@ with
 ```rust
         relay: OutboxRelay::new(source, queue.clone(), 100),
         queue,
-        jobs: Jobs::new(Accounts::new(&message_svc).unwrap(), mailer.clone()),
+        jobs: Jobs::new(
+            Accounts::new(&message_svc, ACCOUNTS_TOKEN).unwrap(),
+            mailer.clone(),
+        ),
         mailer,
-        messaging: MessagingClient::connect(message_svc).await.unwrap(),
-    }
+        messaging: MessagingClient::connect(message_svc.clone()).await.unwrap(),
+        message_svc,
 ```
 
 Replace
 
 ```rust
-    let gone = format!("http://{}", unused.local_addr().unwrap());
-    drop(unused);
-    let jobs = Jobs::new(Accounts::new(&gone).unwrap());
-    let outcome = jobs
-        .run(&Job {
+        Accounts::new(&world.message_svc, wrong_token).unwrap(),
+    ] {
+        let outcome = Jobs::new(accounts)
+            .run(&Job {
+                id: Uuid::now_v7(),
 ```
 
 with
 
 ```rust
-    let gone = format!("http://{}", unused.local_addr().unwrap());
-    drop(unused);
-    let jobs = Jobs::new(Accounts::new(&gone).unwrap(), world.mailer.clone());
-    let outcome = jobs
-        .run(&Job {
+        Accounts::new(&world.message_svc, wrong_token).unwrap(),
+    ] {
+        let outcome = Jobs::new(accounts, world.mailer.clone())
+            .run(&Job {
+                id: Uuid::now_v7(),
 ```
 
 ```powershell
@@ -5972,7 +6925,7 @@ cargo test -p push-worker -p push-email
 ```
 
 Expected: `push-email` 19, and for `push-worker` 6 unit tests, `tests\email.rs` 5,
-`tests\queue.rs` 4, `tests\relay.rs` 3 — all pass.
+`tests\queue.rs` 6, `tests\relay.rs` 3 — all pass.
 
 - [ ] **Step 7: Run the gates and commit**
 
@@ -5985,7 +6938,7 @@ git add Cargo.lock crates/push-email crates/push-worker
 git commit -m "feat(worker): email jobs, delivery webhooks and the dev mailbox"
 ```
 
-Expected: 762 tests pass.
+Expected: 768 tests pass.
 
 ---
 
@@ -6176,12 +7129,13 @@ Expected: a compile error — `push_worker::cleanup` does not exist.
 
 - [ ] **Step 2: The cleanups**
 
-Create `crates/push-worker/src/cleanup.rs`:
+Create `crates/push-worker/src/cleanup.rs` (a run starts no batch after 5 s, so it stays
+inside its lease; decision 13):
 
 ```rust
 //! The cleanup jobs: periodic jobs in the queue, so one replica runs each at a time.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::json;
 use sqlx::PgPool;
@@ -6200,6 +7154,10 @@ pub const WORKER_RECORDS: &str = "cleanup.worker_records";
 const BATCH: i32 = 1000;
 /// Batches per run; a run that leaves more behind comes back after [`AGAIN_SOON`].
 const MAX_BATCHES: u32 = 50;
+/// A run starts no batch after this long, and comes back after [`AGAIN_SOON`] too: with a
+/// batch's statement timeout of 10 s, a run takes at most about 15 s, like any other job,
+/// well inside the queue's lease and the pod's grace period.
+const RUN_BUDGET: Duration = Duration::from_secs(5);
 const AGAIN_SOON: Duration = Duration::from_secs(60);
 
 /// How long things are kept, and how often the cleanups run.
@@ -6253,9 +7211,10 @@ impl Cleanup {
 
     /// Runs the cleanup `kind`; `None` if `kind` is not a cleanup.
     pub async fn run(&self, kind: &str) -> Option<Outcome> {
+        let deadline = Instant::now() + RUN_BUDGET;
         let result = match kind {
             REFRESH_TOKENS => {
-                self.batches(|| {
+                self.batches(deadline, || {
                     sqlx::query_scalar("SELECT auth.delete_expired_refresh_tokens($1)")
                         .bind(BATCH)
                         .fetch_one(&self.auth)
@@ -6264,7 +7223,7 @@ impl Cleanup {
             }
             UNVERIFIED_ACCOUNTS => {
                 let older_than = self.retention.unverified_accounts.as_secs_f64();
-                self.batches(|| {
+                self.batches(deadline, || {
                     sqlx::query_scalar(
                         "SELECT auth.delete_unverified_accounts(make_interval(secs => $1), $2)",
                     )
@@ -6274,7 +7233,7 @@ impl Cleanup {
                 })
                 .await
             }
-            WORKER_RECORDS => self.worker_records().await,
+            WORKER_RECORDS => self.worker_records(deadline).await,
             _ => return None,
         };
         Some(match result {
@@ -6295,15 +7254,18 @@ impl Cleanup {
         })
     }
 
-    /// Calls `delete` until a batch comes back short, at most [`MAX_BATCHES`] times.
-    /// Returns how many rows went, and whether nothing is left.
-    async fn batches<F, Fut>(&self, delete: F) -> sqlx::Result<(i64, bool)>
+    /// Calls `delete` until a batch comes back short, at most [`MAX_BATCHES`] times and
+    /// not after `deadline`. Returns how many rows went, and whether nothing is left.
+    async fn batches<F, Fut>(&self, deadline: Instant, delete: F) -> sqlx::Result<(i64, bool)>
     where
         F: Fn() -> Fut,
         Fut: Future<Output = sqlx::Result<i32>>,
     {
         let mut deleted = 0;
         for _ in 0..MAX_BATCHES {
+            if Instant::now() >= deadline {
+                break;
+            }
             let batch = delete().await?;
             deleted += i64::from(batch);
             if batch < BATCH {
@@ -6313,10 +7275,10 @@ impl Cleanup {
         Ok((deleted, false))
     }
 
-    async fn worker_records(&self) -> sqlx::Result<(i64, bool)> {
+    async fn worker_records(&self, deadline: Instant) -> sqlx::Result<(i64, bool)> {
         let older_than = self.retention.worker_records;
         let jobs = self
-            .batches(|| async {
+            .batches(deadline, || async {
                 let deleted = self.queue.delete_dead(older_than, i64::from(BATCH)).await?;
                 Ok(deleted as i32)
             })
@@ -6333,7 +7295,7 @@ impl Cleanup {
                  SELECT count(*)::integer FROM gone"
             );
             let (deleted, done) = self
-                .batches(|| {
+                .batches(deadline, || {
                     sqlx::query_scalar(&statement)
                         .bind(older_than.as_secs_f64())
                         .bind(BATCH)
@@ -6440,7 +7402,7 @@ git add crates/push-worker
 git commit -m "feat(worker): cleanup jobs"
 ```
 
-Expected: 763 tests pass.
+Expected: 769 tests pass.
 
 ---
 
@@ -6470,6 +7432,7 @@ repository.workspace = true
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+chrono.workspace = true
 axum.workspace = true
 push-email.workspace = true
 push-proto.workspace = true
@@ -6502,7 +7465,8 @@ workspace = true
 - [ ] **Step 2: The configuration, with its tests**
 
 Create `crates/push-worker/src/config.rs` (every variable is in the table of its doc
-comment; decisions 10–15):
+comment; decisions 10–15, 17 and 18: `PUSH_ACCOUNTS_TOKEN` is required, and
+`PUSH_MESSAGE_SVC_URL` must be `http://`):
 
 ```rust
 //! Configuration from environment variables.
@@ -6540,10 +7504,11 @@ impl std::fmt::Debug for Sender {
 /// |---|---|---|
 /// | `PUSH_DATABASE_URL` | Postgres URL of the `push_worker` database, as its owner | required |
 /// | `PUSH_AUTH_DATABASE_URL` | Postgres URL of auth-svc's `push_auth` database, as the worker's role | required |
-/// | `PUSH_MESSAGE_SVC_URL` | gRPC URL of message-svc, `http://host:50051` | required |
+/// | `PUSH_MESSAGE_SVC_URL` | gRPC URL of message-svc, `http://host:50051` (plain `http://` only: the worker is built without TLS) | required |
+/// | `PUSH_ACCOUNTS_TOKEN` | the token message-svc requires for its `Accounts` API, 32 to 256 visible ASCII characters | required |
 /// | `PUSH_EMAIL_SENDER` | `log` (logs instead of sending) or `resend` | `log` |
-/// | `PUSH_EMAIL_FROM` | the From of every email, `Name <no-reply@example.com>` | required for `resend` |
-/// | `PUSH_EMAIL_PRODUCT_NAME` | the name emails sign with | `push-messenger` |
+/// | `PUSH_EMAIL_FROM` | the From of every email, `Push Messenger <no-reply@push.kubegames.dk>` | required for `resend` |
+/// | `PUSH_EMAIL_PRODUCT_NAME` | the name emails sign with | `Push Messenger` |
 /// | `PUSH_RESEND_API_KEY` | Resend API key | required for `resend` |
 /// | `PUSH_RESEND_API_URL` | Resend's API (`http` only for local hosts, for tests) | `https://api.resend.com` |
 /// | `PUSH_RESEND_WEBHOOK_SECRET` | the webhook's signing secret, `whsec_…`; without it `/v1/webhooks/resend` is not served | none |
@@ -6559,6 +7524,7 @@ pub struct Config {
     pub database_url: String,
     pub auth_database_url: String,
     pub message_svc_url: String,
+    pub accounts_token: String,
     pub sender: Sender,
     pub from: String,
     pub product_name: String,
@@ -6579,6 +7545,7 @@ impl std::fmt::Debug for Config {
             .field("database_url", &"<redacted>")
             .field("auth_database_url", &"<redacted>")
             .field("message_svc_url", &self.message_svc_url)
+            .field("accounts_token", &"<redacted>")
             .field("sender", &self.sender)
             .field("from", &self.from)
             .field("product_name", &self.product_name)
@@ -6637,12 +7604,23 @@ impl Config {
         check_database_url(&auth_database_url)
             .map_err(|reason| redacted("PUSH_AUTH_DATABASE_URL", reason))?;
         let message_svc_url = required("PUSH_MESSAGE_SVC_URL")?;
-        if !message_svc_url.starts_with("http://") && !message_svc_url.starts_with("https://") {
+        if !message_svc_url.starts_with("http://") {
             return Err(ConfigError::Invalid {
                 name: "PUSH_MESSAGE_SVC_URL",
                 value: message_svc_url,
-                reason: "must start with http:// or https://".to_owned(),
+                reason: "must start with http:// (the worker speaks plain gRPC to message-svc \
+                         inside the cluster and is built without TLS)"
+                    .to_owned(),
             });
+        }
+        let accounts_token = required("PUSH_ACCOUNTS_TOKEN")?;
+        if !((32..=256).contains(&accounts_token.len())
+            && accounts_token.bytes().all(|byte| byte.is_ascii_graphic()))
+        {
+            return Err(redacted(
+                "PUSH_ACCOUNTS_TOKEN",
+                "use 32 to 256 visible ASCII characters".to_owned(),
+            ));
         }
         let sender = match set("PUSH_EMAIL_SENDER").as_deref() {
             None | Some("log") => Sender::Log,
@@ -6710,10 +7688,11 @@ impl Config {
             database_url,
             auth_database_url,
             message_svc_url,
+            accounts_token,
             sender,
             from,
             product_name: set("PUSH_EMAIL_PRODUCT_NAME")
-                .unwrap_or_else(|| "push-messenger".to_owned()),
+                .unwrap_or_else(|| "Push Messenger".to_owned()),
             webhook_secret,
             poll: Duration::from_millis(poll_ms),
             unverified_after: DAY.saturating_mul(unverified_days.min(36_500) as u32),
@@ -6800,7 +7779,9 @@ mod tests {
 
     const SECRET: &str = "whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw";
 
-    const REQUIRED: [(&str, &str); 3] = [
+    const TOKEN: &str = "accounts-token-of-the-config-tests";
+
+    const REQUIRED: [(&str, &str); 4] = [
         (
             "PUSH_DATABASE_URL",
             "postgres://push_worker:hunter2@db/push_worker",
@@ -6810,6 +7791,7 @@ mod tests {
             "postgres://push_worker:hunter2@db/push_auth",
         ),
         ("PUSH_MESSAGE_SVC_URL", "http://message-svc:50051"),
+        ("PUSH_ACCOUNTS_TOKEN", TOKEN),
     ];
 
     fn with(extra: &[(&'static str, &'static str)]) -> Vec<(&'static str, &'static str)> {
@@ -6823,7 +7805,8 @@ mod tests {
     fn defaults_apply_when_only_the_required_variables_are_set() {
         let config = config(&REQUIRED).unwrap();
         assert_eq!(config.sender, Sender::Log);
-        assert_eq!(config.product_name, "push-messenger");
+        assert_eq!(config.accounts_token, TOKEN);
+        assert_eq!(config.product_name, "Push Messenger");
         assert_eq!(config.webhook_secret, None);
         assert_eq!(config.poll, Duration::from_secs(1));
         assert_eq!(config.unverified_after, DAY * 7);
@@ -6840,6 +7823,33 @@ mod tests {
             let mut variables = REQUIRED.to_vec();
             variables.remove(index);
             assert_eq!(config(&variables), Err(ConfigError::Missing(name)));
+        }
+    }
+
+    #[test]
+    fn message_svc_is_reached_over_plain_http_with_a_header_safe_token() {
+        for url in [
+            "https://message-svc:50051",
+            "message-svc:50051",
+            "grpc://m:1",
+        ] {
+            assert!(
+                matches!(
+                    config(&with(&[("PUSH_MESSAGE_SVC_URL", url)])),
+                    Err(ConfigError::Invalid {
+                        name: "PUSH_MESSAGE_SVC_URL",
+                        ..
+                    })
+                ),
+                "{url}"
+            );
+        }
+        for token in ["short", "a token with spaces, long enough otherwise"] {
+            let message = config(&with(&[("PUSH_ACCOUNTS_TOKEN", token)]))
+                .unwrap_err()
+                .to_string();
+            assert!(message.contains("PUSH_ACCOUNTS_TOKEN"), "{message}");
+            assert!(!message.contains(token), "{message}");
         }
     }
 
@@ -6969,6 +7979,7 @@ mod tests {
         );
         assert!(!shown.contains("hunter2"), "{shown}");
         assert!(!shown.contains("MfKQ"), "{shown}");
+        assert!(!shown.contains(TOKEN), "{shown}");
         assert!(shown.contains("http://message-svc:50051"), "{shown}");
     }
 }
@@ -6996,7 +8007,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use push_auth::outbox::{Email, Event};
 use push_domain::{InMemoryStore, Messaging, RecordingNotifier, SystemClock};
 use push_email::ResendWebhooks;
-use push_message_svc::{AccountsApi, MessagingApi};
+use push_message_svc::{AccountsApi, AccountsToken, MessagingApi};
 use push_proto::id_bytes;
 use push_proto::internal::v1::IdentifyRequest;
 use push_proto::internal::v1::accounts_server::AccountsServer;
@@ -7016,15 +8027,18 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 const SECRET: &str = "whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw";
+/// The shared token message-svc requires for its `Accounts` API.
+const ACCOUNTS_TOKEN: &str = "accounts-token-for-the-server-tests";
 
 fn config(database_url: String, auth_database_url: String, message_svc_url: String) -> Config {
     Config {
         database_url,
         auth_database_url,
         message_svc_url,
+        accounts_token: ACCOUNTS_TOKEN.to_owned(),
         sender: Sender::Log,
         from: String::new(),
-        product_name: "push-messenger".to_owned(),
+        product_name: "Push Messenger".to_owned(),
         webhook_secret: Some(SECRET.to_owned()),
         poll: Duration::from_millis(100),
         unverified_after: Duration::from_secs(7 * 24 * 3600),
@@ -7050,7 +8064,10 @@ async fn message_svc() -> String {
             .add_service(MessagingServer::new(MessagingApi::new(Arc::clone(
                 &messaging,
             ))))
-            .add_service(AccountsServer::new(AccountsApi::new(messaging)))
+            .add_service(AccountsServer::with_interceptor(
+                AccountsApi::new(messaging),
+                AccountsToken::new(Some(ACCOUNTS_TOKEN.to_owned())),
+            ))
             .serve_with_incoming(TcpListenerStream::new(listener)),
     );
     url
@@ -7294,7 +8311,8 @@ Expected: compile errors — `push_worker::Config`, `Sender` and `serve` do not 
 
 - [ ] **Step 4: Serving**
 
-Create `crates/push-worker/src/server.rs`:
+Create `crates/push-worker/src/server.rs` (`JOB_BATCH` and its arithmetic, decision 2; at
+shutdown `run_jobs` gives back the rest of its batch; a dropped late outcome is logged):
 
 ```rust
 //! Running the worker: the relay and job loops, the HTTP API, the health endpoints and
@@ -7327,15 +8345,25 @@ use crate::relay::OutboxRelay;
 
 /// How long to wait before trying an unreachable dependency again.
 const RETRY_DELAY: Duration = Duration::from_secs(2);
-/// A claimed job is someone else's for this long: far longer than any attempt takes.
+/// A claimed job is someone else's for this long.
 const LEASE: Duration = Duration::from_secs(120);
-/// Jobs claimed at once, and outbox events moved at once.
-const BATCH: i64 = 50;
+/// Jobs claimed at once. They run one after another, so the last one starts only after
+/// the others ended, and the whole batch must fit in the lease, or another worker claims
+/// the jobs not started yet and they run twice. An attempt takes at most about 15 s
+/// (message-svc: a 5 s connect and a 10 s call timeout; Resend: a 10 s request timeout,
+/// plus statements of a few milliseconds; a cleanup run starts no batch after 5 s, and a
+/// batch's statement times out after 10 s), so 4 jobs take at most about 60 s of the
+/// 120 s lease. Even then a late outcome is never recorded over a newer claim
+/// (`Queue::finish`).
+const JOB_BATCH: i64 = 4;
+/// Outbox events moved at once.
+const OUTBOX_BATCH: i64 = 50;
 /// The cleanups run this often.
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
-/// Runs the worker until `shutdown` is cancelled, then finishes the job in progress and
-/// closes its pools. Jobs it claimed but did not start come back when their lease ends.
+/// Runs the worker until `shutdown` is cancelled, then finishes the job in progress, gives
+/// back the jobs it claimed but did not start (due again at once, for any replica), and
+/// closes its pools.
 ///
 /// The health endpoints answer at once: `/healthz` always, `/readyz` once both databases
 /// answer (its own migrated, auth-svc's with the outbox readable), and never after
@@ -7363,7 +8391,8 @@ pub async fn serve(
              a local cluster."
         );
     }
-    let accounts = Accounts::new(&config.message_svc_url).map_err(anyhow::Error::msg)?;
+    let accounts = Accounts::new(&config.message_svc_url, &config.accounts_token)
+        .map_err(anyhow::Error::msg)?;
     let mailbox = config.dev_mailbox.then(Mailbox::default);
     let sender: Arc<dyn EmailSender> = match (&config.sender, &mailbox) {
         (Sender::Log, Some(mailbox)) => Arc::new(MailboxSender::new(LogSender, mailbox.clone())),
@@ -7425,7 +8454,7 @@ pub async fn serve(
         },
     );
     let jobs = Jobs::new(accounts, mailer).with_cleanup(cleanup);
-    let relay = OutboxRelay::new(auth.clone(), queue.clone(), BATCH);
+    let relay = OutboxRelay::new(auth.clone(), queue.clone(), OUTBOX_BATCH);
     let deliveries = webhooks.map(|webhooks| Deliveries::new(pool.clone(), Arc::new(webhooks)));
     let _ = ready.pool.set(pool.clone());
 
@@ -7485,7 +8514,8 @@ async fn run_relay(
 }
 
 /// Claims and runs due jobs, one at a time, until shutdown; when there are none, waits for
-/// `poll` or for the relay to move events.
+/// `poll` or for the relay to move events. At shutdown the jobs of the batch not started
+/// yet are given back.
 async fn run_jobs(
     queue: Queue,
     jobs: Jobs,
@@ -7496,18 +8526,26 @@ async fn run_jobs(
     loop {
         let claimed = tokio::select! {
             () = shutdown.cancelled() => return,
-            claimed = queue.claim(BATCH) => claimed,
+            claimed = queue.claim(JOB_BATCH) => claimed,
         };
         match claimed {
             Ok(batch) if !batch.is_empty() => {
-                for job in batch {
+                for (index, job) in batch.iter().enumerate() {
                     if shutdown.is_cancelled() {
+                        release(&queue, &batch[index..]).await;
                         return;
                     }
-                    let outcome = jobs.run(&job).await;
-                    log(&job, &outcome);
-                    if let Err(error) = queue.finish(&job, outcome).await {
-                        tracing::warn!(job_id = %job.id, %error, "recording a job's outcome failed");
+                    let outcome = jobs.run(job).await;
+                    log(job, &outcome);
+                    match queue.finish(job, outcome).await {
+                        Ok(true) => {}
+                        Ok(false) => tracing::warn!(
+                            job_id = %job.id,
+                            "the job's lease ended before it finished; its outcome is dropped"
+                        ),
+                        Err(error) => {
+                            tracing::warn!(job_id = %job.id, %error, "recording a job's outcome failed");
+                        }
                     }
                 }
                 continue;
@@ -7520,6 +8558,15 @@ async fn run_jobs(
             () = moved.notified() => {}
             () = tokio::time::sleep(poll) => {}
         }
+    }
+}
+
+/// Gives back jobs claimed but not started, so another replica can take them at once.
+/// If that fails, they come back when their lease ends.
+async fn release(queue: &Queue, jobs: &[Job]) {
+    match queue.release(jobs).await {
+        Ok(released) => tracing::info!(released, "gave back the jobs not started"),
+        Err(error) => tracing::warn!(%error, "giving back the jobs not started failed"),
     }
 }
 
@@ -7701,8 +8748,8 @@ pub use server::{init_logging, serve, terminated};
 cargo test -p push-worker
 ```
 
-Expected: 12 unit tests (6 configuration), and `tests\cleanup.rs` 1, `tests\email.rs` 5,
-`tests\queue.rs` 4, `tests\relay.rs` 3, `tests\server.rs` 2 — all pass. The worker's
+Expected: 13 unit tests (7 configuration), and `tests\cleanup.rs` 1, `tests\email.rs` 5,
+`tests\queue.rs` 6, `tests\relay.rs` 3, `tests\server.rs` 2 — all pass. The worker's
 first readiness probe answers 503 while it waits for auth-svc's grant, then 200.
 
 - [ ] **Step 5: Run the gates and commit**
@@ -7716,7 +8763,7 @@ git add Cargo.lock crates/push-worker
 git commit -m "feat(worker): configuration, serving and graceful shutdown"
 ```
 
-Expected: 771 tests pass.
+Expected: 778 tests pass.
 
 ---
 
@@ -7731,8 +8778,14 @@ CI needs no change: the `rust` and `msrv` jobs run the whole workspace and alrea
 
 - [ ] **Step 1: Document the configuration**
 
-In `README.md`, in the `push-auth` table, insert before its last row (the one for
-`PUSH_DEV_MAILBOX`):
+In `README.md`, in the `push-message-svc` table, insert before its last row (the one for
+`PUSH_DEV_SETUP`):
+
+```markdown
+| `PUSH_ACCOUNTS_TOKEN` | the worker's token for the `Accounts` API, 32 to 256 visible ASCII characters; without it `Accounts` refuses every call | none |
+```
+
+In the `push-auth` table, insert before its last row (the one for `PUSH_DEV_MAILBOX`):
 
 ```markdown
 | `PUSH_AUTH_WORKER_ROLE` | the worker's role: granted `auth.outbox` and the two cleanup functions at start-up | none |
@@ -7748,10 +8801,11 @@ before `## License`:
 |----------|---------|---------|
 | `PUSH_DATABASE_URL` | Postgres URL of the `push_worker` database, as its owner | required |
 | `PUSH_AUTH_DATABASE_URL` | Postgres URL of auth-svc's `push_auth` database, as the worker's role | required |
-| `PUSH_MESSAGE_SVC_URL` | gRPC URL of message-svc, `http://host:50051` | required |
+| `PUSH_MESSAGE_SVC_URL` | gRPC URL of message-svc, `http://host:50051` (plain `http://` only: the worker is built without TLS) | required |
+| `PUSH_ACCOUNTS_TOKEN` | message-svc's token for its `Accounts` API, the same value as message-svc's | required |
 | `PUSH_EMAIL_SENDER` | `log` (logs instead of sending) or `resend` | `log` |
-| `PUSH_EMAIL_FROM` | the From of every email, `Name <no-reply@example.com>` | required for `resend` |
-| `PUSH_EMAIL_PRODUCT_NAME` | the name emails sign with | `push-messenger` |
+| `PUSH_EMAIL_FROM` | the From of every email, `Push Messenger <no-reply@push.kubegames.dk>` | required for `resend` |
+| `PUSH_EMAIL_PRODUCT_NAME` | the name emails sign with | `Push Messenger` |
 | `PUSH_RESEND_API_KEY` | Resend API key | required for `resend` |
 | `PUSH_RESEND_API_URL` | Resend's API (`http` only for `127.0.0.1`/`localhost`) | `https://api.resend.com` |
 | `PUSH_RESEND_WEBHOOK_SECRET` | the webhook's signing secret, `whsec_…`; without it the webhook is not served | none |
@@ -7778,12 +8832,17 @@ Implementation notes (push-worker, migration `0001_worker.sql`, Plan 6A):
   `UPDATE` right — and `EXECUTE` on `auth.delete_expired_refresh_tokens` and
   `auth.delete_unverified_accounts`, `SECURITY DEFINER` functions of auth-svc's migration
   `0002_worker.sql`. It never reads accounts or tokens.
-- `job` also has `dead_at` (a buried job: poison, kept for inspection, never claimed again)
-  and `created_at`. A job's id is its outbox event's id. A claim is
-  `UPDATE … SET attempts = attempts + 1, run_after = now() + 2 min WHERE job_id IN (SELECT …
-  FOR UPDATE SKIP LOCKED) RETURNING`: a lease, so a crashed worker's job comes back. Retries
-  wait 1 s, doubling, at most 10 minutes; account events retry without limit, an email gives
-  up after 12 attempts (about 30 minutes, the life of its link).
+- `job` also has `dead_at` (a buried job: poison, kept for inspection without an email's
+  `params.link`, never claimed again) and `created_at`. A job's id is its outbox event's
+  id. A claim is `UPDATE … SET attempts = attempts + 1, claimed_at = now(), run_after =
+  now() + 2 min WHERE job_id IN (SELECT … LIMIT 4 FOR UPDATE SKIP LOCKED) RETURNING`: a
+  lease, so a crashed worker's job comes back. A worker claims at most 4 jobs, which it
+  runs one after another within the lease (an attempt, a cleanup run included, takes at
+  most about 15 s). Every outcome is recorded only while the job is still under its claim
+  (`attempts` and `claimed_at` match), so a late one never overwrites a newer claim; at
+  shutdown the jobs not started are given back (`run_after = now()`, `attempts - 1`).
+  Retries wait 1 s, doubling, at most 10 minutes; account events retry without limit, an
+  email gives up after 12 attempts (about 30 minutes, the life of its link).
 - The relay copies a locked batch of outbox rows into `job` (`ON CONFLICT DO NOTHING`),
   commits, and only then deletes them from the outbox: at least once, never lost.
 - `email_message.params` never holds the link. `email_event.event_id` is `text`: the
@@ -7796,16 +8855,21 @@ Implementation notes (push-worker, migration `0001_worker.sql`, Plan 6A):
 ```
 
 In §5.3, after the last item (`6. The gateway learns the device only from the verified
-token. …`, which ends `active in `member_device`.`), add a blank line and:
+token. …`, whose sub-bullet ends `never treat it as a revocation or sign the user out.`),
+add a blank line and:
 
 ```markdown
 Implementation note (Plan 6A): message-svc's internal `Accounts` gRPC API takes the relayed
 `user.verified`, `device.registered`, `device.revoked` and `user.password_reset`. Every call
 is idempotent and any order ends in the same state: a registration also records the user,
 and a revocation that arrives before the registration records the device as revoked, so the
-registration cannot revive it. A revoked device is refused by `Identify` at once; publishing
-`kick:{device_id}` (and kicks on a password reset) comes with Plan 7, closing the socket and
-refusing older tokens with Plan 8.
+registration cannot revive it. Every call needs the shared internal token
+(`authorization: Bearer <PUSH_ACCOUNTS_TOKEN>`, compared in constant time); without it, or
+when message-svc has none, the call is `UNAUTHENTICATED`. A revoked device is refused by
+`Identify` at once (`PERMISSION_DENIED`); a device not relayed yet is `UNAVAILABLE`
+(`retryable`), which the gateway closes with 1011 until Plan 8 gives it a code of its own.
+Publishing `kick:{device_id}` (and kicks on a password reset) comes with Plan 7, closing
+the socket and refusing older tokens with Plan 8.
 ```
 
 In §9, after the bullet `- Local development uses a log-only `EmailSender`.`, add a blank
@@ -7823,7 +8887,9 @@ Implementation notes (push-email, push-worker, Plan 6A):
   `{svix-id}.{svix-timestamp}.{body}`) and refuses timestamps more than 5 minutes off;
   `email.bounced` with `bounce.type` `Permanent` and `email.complained` add the recipients to
   `email_suppression`, `email.delivered` is recorded, other types are ignored.
-  `POST /v1/webhooks/resend` is served only with a webhook secret.
+  `POST /v1/webhooks/resend` is served only with a webhook secret; it answers 401 to a
+  missing, wrong or stale signature and 204 to a signed body it cannot read (logged and
+  dropped: Resend retries anything but a 2xx for days).
 - With `PUSH_DEV_MAILBOX=1` (log sender only) the worker keeps the last 1000 emails it
   delivered in memory and serves them at `GET /dev/mailbox?to=…` (DEV ONLY).
 ```
@@ -7843,7 +8909,7 @@ cargo test --workspace --locked
 cargo +1.85 test --workspace --locked
 ```
 
-Expected: no diff, no warnings, 771 tests on both toolchains.
+Expected: no diff, no warnings, 778 tests on both toolchains.
 
 - [ ] **Step 5: Commit and push**
 
@@ -7857,7 +8923,7 @@ git push -u origin feature/plan-06a-worker-email
 
 ```powershell
 $body = @'
-Implements docs/superpowers/plans/2026-10-13-plan-06a-worker-email.md: push-email (templates, the EmailSender trait with a log sender and a Resend sender on rustls/ring, Svix-verified Resend webhooks) and push-worker (its own database and schema; a job queue claimed with FOR UPDATE SKIP LOCKED, leased, retried with backoff, poison buried; the outbox relay from auth.outbox, at least once; account events relayed to message-svc's new Accounts API; email.send rendered, suppression-checked, recorded and sent once; webhooks feeding the suppression list; hourly cleanups of expired refresh tokens, unverified accounts and old records; health, graceful shutdown). message-svc serves Accounts (idempotent, any order converges: a revocation before the registration wins); auth-svc grants the worker's role the outbox and two cleanup functions at start-up, and a signup over an unverified account resets its clock. 771 tests.
+Implements docs/superpowers/plans/2026-10-13-plan-06a-worker-email.md: push-email (templates, the EmailSender trait with a log sender and a Resend sender on rustls/ring, Svix-verified Resend webhooks) and push-worker (its own database and schema; a job queue claimed with FOR UPDATE SKIP LOCKED, leased, retried with backoff, poison buried; the outbox relay from auth.outbox, at least once; account events relayed to message-svc's new Accounts API; email.send rendered, suppression-checked, recorded and sent once; webhooks feeding the suppression list; hourly cleanups of expired refresh tokens, unverified accounts and old records; health, graceful shutdown). message-svc serves Accounts (idempotent, any order converges: a revocation before the registration wins) to the worker alone, behind a shared internal token; Identify answers a device not relayed yet with a retryable UNAVAILABLE instead of the revoked-device error; claims take at most 4 jobs, outcomes are fenced by the claim, jobs not started are given back at shutdown, and buried jobs keep no link; auth-svc grants the worker's role the outbox and two cleanup functions at start-up, and a signup over an unverified account resets its clock. 778 tests.
 
 Plan 6B moves the smoke test to the real flow and puts the worker on minikube.
 '@
@@ -7874,10 +8940,10 @@ controller merges after the final review.
 
 | Spec item / decision | Task |
 |---|---|
-| §2 the worker drains service outboxes, sends email, relays events, runs cleanup jobs; each service owns its database (the worker reads `auth.outbox` and two cleanup functions only) | 2, 6, 7, 8, 9 |
+| §2 the worker drains service outboxes, sends email, relays events, runs cleanup jobs; each service owns its database (the worker reads `auth.outbox` and two cleanup functions only); only the worker may call `Accounts` (shared token) | 1, 2, 6, 7, 8, 9 |
 | §3.3 `job`, `email_message`, `email_event`, `email_suppression`; claims with `FOR UPDATE SKIP LOCKED`, several replicas, a crashed worker's work claimed again | 5, 6 |
 | §5.2 unverified accounts (cleanup; a new signup restarts the clock) | 2, 8 |
-| §5.3 the worker relays device events to message-svc; `device.revoked` marks the device revoked; `Identify` refuses a device not active in `member_device` | 1, 6 |
+| §5.3 the worker relays device events to message-svc; `device.revoked` marks the device revoked; `Identify` refuses a device not active in `member_device`, and asks to retry one not relayed yet | 1, 6 |
 | §5.4 `user.password_reset` relayed (kicks: Plans 7 and 8) | 1, 6 |
 | §9 Resend behind `EmailSender::send(message, idempotency_key)` and `WebhookVerifier::verify`/`parse`; the worker renders, checks `email_suppression` and sends; hard bounces and complaints suppress; `recipient_domain` recorded; log-only sender locally | 3, 4, 7 |
 | §7.6 strict DEV ONLY switches with a warning; URLs and secrets never echoed; migrations on a dedicated connection; start-up retries interruptible | 9 |
@@ -7892,8 +8958,20 @@ controller merges after the final review.
   every device on `user.password_reset`; Plan 8: the gateway closes kicked sockets with 4003
   and refuses tokens older than a password reset).
 - **`LISTEN/NOTIFY`** to wake the worker at once instead of polling every second.
-- **A NetworkPolicy** so only the worker can call message-svc's `Accounts` API (and only the
-  gateway its `Messaging` API) (Plan 11); today any pod in the namespace can.
+- **A NetworkPolicy** so only the worker can reach message-svc's `Accounts` API (and only
+  the gateway its `Messaging` API) — a Plan 11 must-do. Until then any pod in the namespace
+  can reach message-svc, and only the shared token keeps `Accounts` to the worker.
+- **A close code of its own for a device not relayed yet** (Plan 8): the gateway closes
+  with 1011 on message-svc's `UNAVAILABLE` today; the SDK must reconnect after a short
+  backoff and never sign the user out for it (spec §5.3).
+- **Rotating the Accounts token** without a restart: message-svc and the worker read it
+  at start-up; a rotation is a coordinated restart of both (Plan 11 with Key Vault).
+- **Checking `worker.email.webhookSecret`'s format when the chart renders** (`whsec_` and
+  base64); today the worker refuses a malformed secret at start-up.
+- **A dev webhook secret can outlive dev mode**: the generated secret stays in the kept
+  Secret if the same release later leaves dev mode; Plan 11's Key Vault secrets replace it.
+- **Unsetting `PUSH_AUTH_WORKER_ROLE` does not revoke the grants** auth-svc gave the role
+  earlier; revoking them is manual SQL until a deployment needs it.
 - **Deliverability metrics**: the verification-completion rate by `recipient_domain`
   (spec §9) — the data is recorded; the query or dashboard is not.
 - **Resend's other events** (`email.failed`, `email.suppressed`, `email.delivery_delayed`)
