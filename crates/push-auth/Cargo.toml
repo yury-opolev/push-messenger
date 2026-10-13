@@ -1,0 +1,21 @@
+[package]
+name = "push-auth"
+description = "The push-messenger auth service: accounts, email links, devices and tokens."
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+push-store.workspace = true
+sqlx.workspace = true
+
+[dev-dependencies]
+testcontainers-modules.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+uuid.workspace = true
+
+[lints]
+workspace = true

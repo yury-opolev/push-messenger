@@ -1931,6 +1931,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "push-auth"
+version = "0.1.0"
+dependencies = [
+ "push-store",
+ "sqlx",
+ "testcontainers-modules",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "push-domain"
 version = "0.1.0"
 dependencies = [

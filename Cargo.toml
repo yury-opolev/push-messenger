@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/push-auth",
     "crates/push-domain",
     "crates/push-gateway",
     "crates/push-message-svc",
@@ -26,6 +27,7 @@ futures-util = { version = "0.3", default-features = false, features = ["sink"] 
 libtest-mimic = "0.8"
 prost = "0.14"
 protoc-bin-vendored = "3"
+push-auth = { path = "crates/push-auth" }
 push-domain = { path = "crates/push-domain" }
 push-gateway = { path = "crates/push-gateway" }
 push-message-svc = { path = "crates/push-message-svc" }

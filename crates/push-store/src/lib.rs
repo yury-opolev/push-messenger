@@ -48,13 +48,46 @@ pub fn check_database_url(url: &str) -> Result<(), String> {
 /// `push_store::migrate_database(url)` on a dedicated connection, not `PgStore::migrate`
 /// on the request pool.
 pub async fn migrate_database(url: &str) -> Result<(), sqlx::migrate::MigrateError> {
-    // A one-connection pool without the session settings of `PgStore::connect`.
+    run_migrations(url, &MIGRATOR).await
+}
+
+/// Applies `migrator`'s migrations that the database at `url` does not have yet, the way
+/// [`migrate_database`] does: on a one-connection pool of its own, without the session
+/// timeouts of [`connect_pool`]. Every service migrates its own database with it.
+pub async fn run_migrations(
+    url: &str,
+    migrator: &sqlx::migrate::Migrator,
+) -> Result<(), sqlx::migrate::MigrateError> {
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)
         .acquire_timeout(std::time::Duration::from_secs(5))
         .connect(url)
         .await?;
-    let result = MIGRATOR.run(&pool).await;
+    let result = migrator.run(&pool).await;
     pool.close().await;
     result
+}
+
+/// Connects a request pool to `url` as `options` say: every connection the pool opens
+/// first sets the lock, statement and idle-in-transaction timeouts. Fails if the options
+/// do not pass [`StoreOptions::validate`] or the first connection cannot be made.
+pub async fn connect_pool(url: &str, options: &StoreOptions) -> Result<sqlx::PgPool, sqlx::Error> {
+    use sqlx::Executor;
+
+    options
+        .validate()
+        .map_err(|message| sqlx::Error::Configuration(message.into()))?;
+    let settings = options.session_settings();
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(options.max_connections)
+        .acquire_timeout(options.acquire_timeout)
+        .after_connect(move |connection, _| {
+            let settings = settings.clone();
+            Box::pin(async move {
+                connection.execute(settings.as_str()).await?;
+                Ok(())
+            })
+        })
+        .connect(url)
+        .await
 }
