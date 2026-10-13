@@ -438,9 +438,9 @@ with
 
 ```rust
 //! The auth part of the smoke test: a user signs up, verifies the email with the link the
-//! worker's log sender delivered to the DEV ONLY mailbox, signs in, registers a device (and retries the registration, which
-//! must find the same device) and refreshes its tokens, all over auth-svc's public HTTP
-//! API, and checks the access token against the JWKS.
+//! worker's log sender delivered to the DEV ONLY mailbox, signs in, registers a device (and
+//! retries the registration, which must find the same device) and refreshes its tokens, all
+//! over auth-svc's public HTTP API, and checks the access token against the JWKS.
 ```
 
 Replace
@@ -498,8 +498,8 @@ with
 
 ```rust
     /// Signs `name` up with a fresh address and handle, verifies the address with the
-    /// link the worker delivered to the dev mailbox, signs in, registers a device, retries the registration
-    /// with the same `registration_id` and refreshes its tokens.
+    /// link the worker delivered to the dev mailbox, signs in, registers a device, retries
+    /// the registration with the same `registration_id` and refreshes its tokens.
     pub async fn enroll(&self, name: &str) -> anyhow::Result<Enrolled> {
 ```
 
@@ -855,6 +855,7 @@ impl Client {
         let (user, device) = (enrolled.user, enrolled.device);
         let mut messaging = MessagingClient::new(channel.clone());
         let started = Instant::now();
+        let mut reported = None;
         loop {
             let identified = messaging
                 .identify(IdentifyRequest {
@@ -870,7 +871,10 @@ impl Client {
                 ),
                 // UNAVAILABLE is message-svc's answer for a device not relayed yet.
                 Err(status) if started.elapsed() < WORKER_TIMEOUT => {
-                    if status.code() != tonic::Code::Unavailable {
+                    // Other codes (message-svc restarting, say) are reported once each.
+                    if status.code() != tonic::Code::Unavailable && reported != Some(status.code())
+                    {
+                        reported = Some(status.code());
                         step(&format!(
                             "message-svc answers {:?} yet; retrying",
                             status.code()
@@ -3199,27 +3203,24 @@ Expected: `release "push" uninstalled`, the namespace and the released volume de
 five images build (`==> build push-messenger/worker:dev` fourth), the install succeeds at
 the first attempt, the notes show
 `Email: the worker's log sender; Resend webhooks at http://push.local/v1/webhooks/resend.`,
-and `helm test` prints `Phase: Succeeded` and the smoke output. Recorded while revising this
-plan (a fresh install after `down.ps1`; the worker looks for work every second, so an email
+and `helm test` prints `Phase: Succeeded` and the smoke output. Recorded on the final run (Task 4, a fresh install after `down.ps1`, ids elided; the worker looks for work every second, so an email
 or a device takes up to about a second; a run may start with `smoke: auth-svc answers 503
 Service Unavailable yet; retrying` while the ingress catches up with the backends):
 
 ```text
-smoke: alice signed up; the worker's log sender delivered the verification email after 253 ms
-smoke: alice verified the email, signed in and registered device 01a136b0-5edc-74ae-bb69-567fe02d8c7d (a retry returned the same device) in 322 ms
+smoke: alice signed up; the worker's log sender delivered the verification email after 1009 ms
+smoke: alice verified the email, signed in and registered device … (a retry returned the same device) in 1070 ms
 smoke: alice's access token verifies against the JWKS (EdDSA, aud ws://push.local/v1/socket); refresh rotated it
-smoke: bob signed up; the worker's log sender delivered the verification email after 1006 ms
-smoke: bob verified the email, signed in and registered device 01a136b0-6334-768c-8e48-2d859caa9b5f (a retry returned the same device) in 1110 ms
+smoke: bob signed up; the worker's log sender delivered the verification email after 1009 ms
+smoke: bob verified the email, signed in and registered device … (a retry returned the same device) in 1058 ms
 smoke: bob's access token verifies against the JWKS (EdDSA, aud ws://push.local/v1/socket); refresh rotated it
-smoke: the worker relayed alice's account and device 01a136b0-5edc-74ae-bb69-567fe02d8c7d to message-svc (waited 0 ms)
-smoke: the worker relayed bob's account and device 01a136b0-6334-768c-8e48-2d859caa9b5f to message-svc (waited 1010 ms)
-smoke: made alice=01a136b0-5dc1-745e-960b-e862bc3bee26 and bob=01a136b0-5ef5-7083-b88f-0fffb11dd11d contacts with a direct conversation (DEV ONLY setup)
-smoke: bob connected (Ready, heartbeat 30000 ms)
-smoke: alice connected (Ready, heartbeat 30000 ms)
+smoke: the worker relayed alice's account and device … to message-svc (waited 0 ms)
+smoke: the worker relayed bob's account and device … to message-svc (waited 1026 ms)
+smoke: made alice=… and bob=… contacts with a direct conversation (DEV ONLY setup)
 smoke: alice got SendAck seq=1 after 7 ms
-smoke: bob got Deliver seq=1 after 39 ms
+smoke: bob got Deliver seq=1 after 43 ms
 smoke: bob acked; the gateway answered the following Ping
-smoke: PASS in 2581 ms
+smoke: PASS in 7301 ms
 ```
 
 - [ ] **Step 4: Check what the smoke test does not**
@@ -3484,7 +3485,13 @@ deploy/minikube/up.ps1 -Smoke
 ```
 
 Expected: no diff, no warnings, 775 tests on both toolchains, `all chart checks passed`,
-and the smoke test `PASS` as in Task 3, Step 3. Copy the `smoke:` lines for the pull
+and the smoke test `PASS` as in Task 3, Step 3.
+Verified on the live cluster (fresh install, Task 4): the worker logs only the id,
+template and domain; through the ingress a signed bounce answers 204 and its replay is
+recorded once, a signed but malformed request answers 204, an unsigned one 401;
+`/dev/mailbox` answers 404; the worker role is refused on `auth.user_account` and on
+push_messaging; Accounts calls without the token are refused; an upgrade rerun passes and
+keeps the secrets; both guards stop the script with "run down first". Copy the `smoke:` lines for the pull
 request. Then stop the profile (keep it for later plans) and restore the kubectl context you
 noted at the start:
 
@@ -3552,6 +3559,8 @@ controller merges after the final review and its own minikube run.
   base64); today the worker refuses a malformed secret at start-up, after the install.
 - **A dev webhook secret can outlive dev mode**: the generated secret stays in the kept
   Secret if the same release later leaves dev mode (Plan 11's Key Vault secrets replace it).
+- **The mailbox poll stops at once on an HTTP error** instead of retrying (the smoke test).
+- **The four 30 s worker waits sum to the 120 s total.**
 - **Unsetting `PUSH_AUTH_WORKER_ROLE` does not revoke the grants** auth-svc gave the role
   earlier; revoking them is manual SQL until a deployment needs it.
 - **`x-real-ip`, the nginx error log, the superuser `push`** — as listed in Plan 5B,
