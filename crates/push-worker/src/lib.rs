@@ -5,6 +5,7 @@
 //! message-svc, sends email, takes delivery webhooks, and runs the cleanup jobs.
 
 pub mod accounts;
+pub mod cleanup;
 mod db;
 pub mod deliveries;
 pub mod email;
