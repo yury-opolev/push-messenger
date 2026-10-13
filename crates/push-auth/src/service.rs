@@ -470,6 +470,13 @@ impl Auth {
         .bind(&new_hash)
         .execute(&mut *tx)
         .await?;
+        // Device rows first, in a fixed order, like every other change to a device's tokens.
+        sqlx::query(
+            "SELECT device_id FROM auth.device WHERE user_id = $1 ORDER BY device_id FOR UPDATE",
+        )
+        .bind(claims.sub)
+        .fetch_all(&mut *tx)
+        .await?;
         sqlx::query(
             "UPDATE auth.refresh_token SET revoked_at = now() WHERE revoked_at IS NULL \
              AND device_id IN (SELECT device_id FROM auth.device WHERE user_id = $1)",

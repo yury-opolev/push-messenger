@@ -54,6 +54,11 @@ pub struct DeviceInfo {
 
 impl Auth {
     /// A new refresh token for `device`, stored as its hash, and a new access token.
+    ///
+    /// Every change to a device's tokens happens under the lock of its device row, taken
+    /// first (after the account row, where that is locked): the caller holds it, so the
+    /// `last_seen_at` update below takes no second lock, and a revocation, which sees
+    /// the tokens as of after it got the lock, cannot miss a token inserted here.
     async fn issue(
         &self,
         connection: &mut PgConnection,
@@ -133,7 +138,7 @@ impl Auth {
         }
         let earlier = sqlx::query(
             "SELECT device_id, revoked_at IS NULL FROM auth.device \
-             WHERE user_id = $1 AND registration_id = $2",
+             WHERE user_id = $1 AND registration_id = $2 FOR UPDATE",
         )
         .bind(claims.sub)
         .bind(registration_id)
@@ -217,29 +222,49 @@ impl Auth {
     /// the pair issued for it before is cut off — its refresh token counts as retired,
     /// with no grace window of its own — so only one branch lives. The window is not
     /// extended by such a retry. Presenting the token later, presenting an older one, or
-    /// presenting a cut-off one is reuse as above. The presented token's row is locked
-    /// first and its successor's second, so concurrent refreshes are serialised.
+    /// presenting a cut-off one is reuse as above. The device row is locked first, then the
+    /// presented token's row and its successor's, so every change to a device's tokens is
+    /// serialised, and a revocation cannot miss a token a concurrent refresh issues.
     pub async fn refresh(&self, refresh_token: &str) -> Result<Tokens, AuthError> {
         let hash = refresh_hash(refresh_token);
         let mut tx = self.pool.begin().await?;
+        let device_id: Option<Uuid> =
+            sqlx::query_scalar("SELECT device_id FROM auth.refresh_token WHERE token_hash = $1")
+                .bind(hash.as_slice())
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some(device_id) = device_id else {
+            return Err(AuthError::Unauthorized);
+        };
+        let device = sqlx::query(
+            "SELECT user_id, revoked_at IS NULL FROM auth.device WHERE device_id = $1 FOR UPDATE",
+        )
+        .bind(device_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(device) = device else {
+            return Err(AuthError::Unauthorized);
+        };
+        let user_id: Uuid = device.get(0);
+        if !device.get::<bool, _>(1) {
+            return Err(AuthError::Unauthorized);
+        }
+        // Read again under the device lock: what the first look saw may have changed.
         let row = sqlx::query(
-            "SELECT t.device_id, d.user_id, t.rotated_to, \
-             t.revoked_at IS NULL AND t.expires_at > now() AND d.revoked_at IS NULL, \
-             t.rotated_at > now() - make_interval(secs => $2) \
-             FROM auth.refresh_token t JOIN auth.device d USING (device_id) \
-             WHERE t.token_hash = $1 FOR UPDATE OF t",
+            "SELECT rotated_to, revoked_at IS NULL AND expires_at > now(), \
+             rotated_at > now() - make_interval(secs => $3) \
+             FROM auth.refresh_token WHERE token_hash = $1 AND device_id = $2 FOR UPDATE",
         )
         .bind(hash.as_slice())
+        .bind(device_id)
         .bind(REFRESH_GRACE.as_secs() as f64)
         .fetch_optional(&mut *tx)
         .await?;
         let Some(row) = row else {
             return Err(AuthError::Unauthorized);
         };
-        let device_id: Uuid = row.get(0);
-        let user_id: Uuid = row.get(1);
-        let rotated_to: Option<Vec<u8>> = row.get(2);
-        if !row.get::<bool, _>(3) {
+        let rotated_to: Option<Vec<u8>> = row.get(0);
+        if !row.get::<bool, _>(1) {
             return Err(AuthError::Unauthorized);
         }
         let Some(successor) = rotated_to else {
@@ -255,7 +280,7 @@ impl Auth {
             tx.commit().await?;
             return Ok(tokens);
         };
-        let in_grace = row.get::<Option<bool>, _>(4) == Some(true);
+        let in_grace = row.get::<Option<bool>, _>(2) == Some(true);
         let live_successor = in_grace
             && sqlx::query(
                 "SELECT 1 FROM auth.refresh_token WHERE token_hash = $1 \
@@ -344,6 +369,7 @@ impl Auth {
     /// message-svc kicks it (spec §5.3).
     pub async fn revoke_device(&self, caller: Caller, device_id: Uuid) -> Result<(), AuthError> {
         let mut tx = self.pool.begin().await?;
+        // The update locks the device row before the tokens are touched.
         let revoked = sqlx::query(
             "UPDATE auth.device SET revoked_at = now() WHERE device_id = $1 AND user_id = $2 \
              AND revoked_at IS NULL RETURNING device_id",

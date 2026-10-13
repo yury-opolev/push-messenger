@@ -2,6 +2,7 @@
 //! starts a container of its own; they run in parallel.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use push_auth::links::{LinkClaims, LinkSigner, Purpose, password_stamp};
@@ -15,6 +16,7 @@ use sqlx::PgPool;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::{ContainerAsync, ImageExt};
+use tokio::sync::Barrier;
 use uuid::Uuid;
 
 const LINK_KEY: [u8; 32] = [3; 32];
@@ -719,4 +721,111 @@ async fn a_password_reset_makes_a_registration_token_worthless() {
         .register_device(&fresh.token, Uuid::now_v7(), "Phone", "ios")
         .await
         .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reuse_detection_leaves_no_live_token_while_the_thief_keeps_refreshing() {
+    let world = world().await;
+    let registration = verified(&world, "alice").await;
+    for round in 0..20_u64 {
+        let first = world
+            .auth
+            .register_device(&registration, Uuid::now_v7(), "Phone", "ios")
+            .await
+            .unwrap();
+        let second = world.auth.refresh(&first.refresh_token).await.unwrap();
+        let third = world.auth.refresh(&second.refresh_token).await.unwrap();
+        after_the_grace_window(&world.pool).await;
+
+        let done = Arc::new(AtomicBool::new(false));
+        let thief = {
+            let (auth, done) = (world.auth.clone(), Arc::clone(&done));
+            tokio::spawn(async move {
+                let mut latest = third.refresh_token;
+                while !done.load(Ordering::SeqCst) {
+                    match auth.refresh(&latest).await {
+                        Ok(next) => latest = next.refresh_token,
+                        Err(AuthError::Unauthorized) => break,
+                        Err(other) => panic!("unexpected {other:?}"),
+                    }
+                }
+                latest
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(round % 5 * 4)).await;
+        // The user presents a token rotated long ago: reuse.
+        assert_eq!(
+            world.auth.refresh(&first.refresh_token).await,
+            Err(AuthError::Unauthorized)
+        );
+        done.store(true, Ordering::SeqCst);
+        let latest = thief.await.unwrap();
+        assert_eq!(
+            world.auth.refresh(&latest).await,
+            Err(AuthError::Unauthorized),
+            "round {round}: the thief's newest token must be dead"
+        );
+        let live: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM auth.refresh_token \
+             WHERE device_id = $1 AND rotated_to IS NULL AND revoked_at IS NULL",
+        )
+        .bind(first.device_id)
+        .fetch_one(&world.pool)
+        .await
+        .unwrap();
+        assert_eq!(live, 0, "round {round}: no live token is left");
+        world
+            .auth
+            .revoke_device(caller(&first), first.device_id)
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn refreshing_while_the_device_is_revoked_never_fails_with_a_store_error() {
+    let world = world().await;
+    let registration = verified(&world, "alice").await;
+    for round in 0..20 {
+        let tokens = world
+            .auth
+            .register_device(&registration, Uuid::now_v7(), "Phone", "ios")
+            .await
+            .unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let refreshing = {
+            let (auth, barrier) = (world.auth.clone(), Arc::clone(&barrier));
+            let token = tokens.refresh_token.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                auth.refresh(&token).await
+            })
+        };
+        let (owner, device_id) = (caller(&tokens), tokens.device_id);
+        let revoking = {
+            let (auth, barrier) = (world.auth.clone(), Arc::clone(&barrier));
+            tokio::spawn(async move {
+                barrier.wait().await;
+                auth.revoke_device(owner, device_id).await
+            })
+        };
+        let refreshed = refreshing.await.unwrap();
+        assert!(
+            matches!(refreshed, Ok(_) | Err(AuthError::Unauthorized)),
+            "round {round}: refresh gave {refreshed:?}"
+        );
+        assert_eq!(revoking.await.unwrap(), Ok(()), "round {round}");
+        let live: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM auth.refresh_token \
+             WHERE device_id = $1 AND revoked_at IS NULL",
+        )
+        .bind(tokens.device_id)
+        .fetch_one(&world.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            live, 0,
+            "round {round}: the revoked device has no live token"
+        );
+    }
 }
