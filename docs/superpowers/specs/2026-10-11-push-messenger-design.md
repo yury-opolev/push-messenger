@@ -105,11 +105,33 @@ refresh_token (
 outbox (                                    -- read and deleted by the worker
   event_id   uuid primary key,
   kind       text not null,                 -- email.send | user.verified |
+                                            -- user.password_reset |
                                             -- device.registered | device.revoked
   payload    jsonb not null,
   created_at timestamptz not null default now()
 )
 ```
+
+Implementation notes (push-auth, migration `0001_auth.sql`, Plan 5A):
+
+- auth-svc has its own database, `push_auth`, owned by its own role. The migration creates
+  the `citext` extension (trusted, so the database owner may) and the `auth` schema.
+- Handles are stored in lower case: 3–30 letters, digits and underscores, starting with a
+  letter (a `CHECK`). Display and device names have 1–64 characters; `platform` is checked
+  against the five values. A partial index on `device (user_id) where revoked_at is null`
+  serves the device limit; `unique (user_id, registration_id)` makes a retried
+  registration find its device.
+- `refresh_token.rotated_at` is set when the holder exchanges the token and starts its
+  30-second grace window (§5.3); it is null on a token cut off by a retry of the one
+  before it.
+- Comparisons with a bound email or handle cast the parameter to `citext`
+  (`email = $1::citext`): sqlx binds `text`, and `citext = text` compares as text, which
+  is case-sensitive.
+- Outbox payloads are JSON: `email.send {user_id, to, template, params}` (templates
+  `verify_email {link, handle, expires_in_minutes}`, `account_exists {handle}`,
+  `reset_password {link, expires_in_minutes}`); `user.verified {user_id}`;
+  `user.password_reset {user_id}`, on which every device of the user is kicked (§5.4);
+  `device.registered` and `device.revoked {user_id, device_id}`. New ids are UUIDv7.
 
 ### 3.2 messaging schema (message-svc)
 
@@ -531,11 +553,114 @@ Access-token claims: `sub`, `device_id`, `email_verified`, `exp`, `iat`, `jti`, 
   passwords comes later.
 - Rate limits in Redis, per account and per IP, on signup, login, resend, reset, handle
   lookup and invite redeem. Accounts are never locked; excess requests are refused.
-  Login counts per account **and** IP, so nobody can lock a user out from another
-  address. When Redis is unreachable, the limited endpoints fail closed with a
+  Login counts per account **and** IP, so a single address cannot lock a user out; the
+  per-account ceiling (100 per hour) still lets an attacker with about 10 addresses
+  block the owner's logins for up to an hour, an accepted trade-off. When Redis is unreachable, the limited endpoints fail closed with a
   retryable `unavailable` (503).
 - Links are built from a configured base URL, never from the `Host` header. Pages they
   open send `Referrer-Policy: no-referrer`.
+
+Implementation notes (push-auth, Plan 5A):
+
+- **Endpoints.** `POST /v1/auth/signup` (202), `GET|POST /v1/auth/verify`,
+  `POST /v1/auth/verify/resend` (202), `POST /v1/auth/login`, `POST /v1/auth/refresh`,
+  `POST /v1/auth/password/forgot` (202), `GET|POST /v1/auth/password/reset`,
+  `GET /v1/auth/jwks`, `POST|GET /v1/devices`, `DELETE /v1/devices/{id}`,
+  `GET|PATCH /v1/users/me` and `GET /v1/users/lookup?handle=…`. Errors are
+  `{"error": {"code", "message", "retryable"}}`; 429 carries `Retry-After`; 503
+  `unavailable` is retryable and carries `Retry-After: 1`. No answer may be cached except
+  the JWKS.
+- **Link pages.** A link opens a small page whose button posts the token: a `GET` changes
+  nothing, so mail scanners that open links do nothing. Pages send
+  `Referrer-Policy: no-referrer`, `Cache-Control: no-store` and a CSP of
+  `default-src 'none'`. API clients post the token as JSON instead.
+- **Signed tokens.** Email links and the registration token are
+  `base64url(JSON claims).base64url(HMAC-SHA256)` with `{sub, purpose, exp, pw}` plus
+  `email` (verify). `pw` is 16 bytes of SHA-256 of the account's password hash when the
+  token was made, checked against the stored hash under the row lock, so a reset — or a
+  new signup over an unverified account — makes every earlier link and registration
+  token worthless. The purposes `verify`, `reset` and `register` are checked, so no token
+  stands in for another; the gateway does not have the HMAC key, so a registration token
+  can never open a socket.
+- **Signup over an unverified account** is one `INSERT … ON CONFLICT (email) DO UPDATE …
+  WHERE email_verified_at IS NULL`: it replaces the password hash, handle and display
+  name, or does nothing for a verified account. A handle held by any account, this
+  email's own included, is `handle_taken`, so no answer depends on the email.
+- **Login rehash.** A hash with outdated parameters is replaced on login only after the
+  email-verified check, so an unverified login never changes the hash and never voids
+  pending links.
+- **Access tokens** are EdDSA (Ed25519) JWTs with a `kid` (the RFC 7638 thumbprint) and
+  the claims of §5.1; `GET /v1/auth/jwks` publishes the key. The signing seed and the HMAC
+  key come from the Secret. `jsonwebtoken` 9.3.1 (version 10 drops the `ring` backend) has
+  CVE-2026-25537, fixed in 10.3.0: a claim with the wrong JSON type is
+  treated as absent unless it is required. Accepted, because `exp`, `sub` and `aud` are
+  required and only auth-svc signs; the gateway's check (Plan 8) must require `exp` too.
+- **Refresh tokens** are 32 random bytes, base64url, stored as SHA-256. Refreshing marks
+  the old row `rotated_to` the new hash and `rotated_at` now. The row rotated last, if its
+  successor is still live and `rotated_at` is under 30 s old, may be presented again: it
+  gets a new pair, its successor is marked `rotated_to` the new hash with a null
+  `rotated_at` (cut off, no window of its own), and its own `rotated_at` stays, so retries
+  never extend the window. Anything else presented after rotation is reuse and revokes
+  every refresh token of the device. Signing in again with `device_id` revokes the
+  device's earlier refresh tokens. A cut-off pair's access token stays valid until it
+  expires (at most 15 minutes).
+- **Lock order.** Every path that changes a device's refresh tokens locks the device row
+  first, in the order user row → device rows → token rows. Concurrent refreshes are
+  thereby serialised and leave one live branch, a stolen token cannot survive a
+  revocation or reuse detection, and the paths cannot deadlock. The grace window and the
+  expiry use the statement clock (`statement_timestamp()`), so lock waits do not stretch
+  them.
+- **Device registration** takes `registration_id`, unique per user among all of its
+  devices. Under the account row lock, an active device with that id gets new tokens
+  (its refresh tokens revoked, no outbox event, no limit check); a revoked one answers
+  `device_not_found`; otherwise the 10-device limit is checked and the device created.
+- **Device limit**: 10 active devices, checked under a row lock on the account, so
+  concurrent registrations cannot pass it together.
+- **Timing and load.** Signup hashes the password before looking at the email; login
+  checks a dummy hash when the email is unknown. Password hashing runs on blocking threads,
+  at most `PUSH_AUTH_HASH_CONCURRENCY` (default 2) at once, 19 MiB each, the gate's permit
+  held inside the blocking task until the hash is done; at most `PUSH_AUTH_HASH_QUEUE`
+  (default 32) requests wait, each at most 2 s, and the rest get a retryable
+  `unavailable` at once.
+- **Inputs.** An email is normalised first and its length (≤ 254 bytes) checked after
+  that. Passwords have 8–128 characters, used as typed.
+- **Rate limits** (fixed windows in Redis, keyed by a SHA-256 of the subject):
+
+  | Action | Per IP | Per account and IP | Per account |
+  |---|---|---|---|
+  | signup | 20 / hour | — | 5 / hour (email) |
+  | login | 60 / 15 min | 10 / 15 min | 100 / hour (email) |
+  | verification resend | 20 / hour | — | 3 / hour (email) |
+  | password forgot | 20 / hour | — | 3 / hour (email) |
+  | opening a link (verify, reset) | 60 / hour | — | — |
+  | handle lookup | 120 / hour | — | 20 / hour (user) |
+
+  Limits are counted in the order of the table; a refused request is not counted by the
+  later ones, so a guesser stopped per account and IP does not use up the account's
+  ceiling. An IPv6 client counts by its /64 prefix. The client IP comes from the last line
+  of the configured header (`X-Real-IP`), then its last comma-separated entry; without the
+  header, the peer address. Trust assumption: exactly one proxy in front that overwrites
+  or appends to the header. Without such a proxy clients can spoof the header, which only
+  weakens rate limiting. The per-account ceiling (100 / hour) lets an attacker with about
+  10 addresses lock an account owner out of login for up to an hour; this is an accepted
+  trade-off. When Redis does not answer within 500 ms the request is refused with a
+  retryable `unavailable` and a warning is logged (fail closed); refresh is not limited,
+  so signed-in devices keep working.
+- **Profiles.** `GET /v1/users/lookup` finds verified users only. `GET /v1/users?ids=…`
+  needs to know who shares a contact or conversation with the caller, which only
+  message-svc knows; it comes with Plan 7.
+- **DEV ONLY mailbox.** auth-svc started with `PUSH_DEV_MAILBOX=1` serves
+  `GET /dev/mailbox?to=…`, the `email.send` payloads in the outbox for one address, so a
+  local cluster and the smoke test can open verification links before the worker sends
+  email (Plan 6). Like the other DEV ONLY switches it accepts only `1` or `0` and logs a
+  warning at start-up; it refuses to start unless the public URL's host is local
+  (`localhost`, `127.0.0.1`, `*.local`, `*.localhost`, `*.test`), like the chart's guard.
+- **Deferred / open (Plan 5A review).** Refresh sessions slide (30 d) with no absolute
+  cap — an owner decision for later. Display names allow bidi and zero-width characters.
+  Rate-limit key subjects use plain SHA-256 and should use HMAC. Form POSTs of the link
+  pages return JSON errors, not HTML. Path, Query, 404 and 405 rejections are plain text.
+  `Bearer` is matched case-sensitively. `?token=` must be stripped from ingress access
+  logs (Plan 5B).
 
 ## 6. Groups (up to 100 members)
 

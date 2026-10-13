@@ -69,6 +69,24 @@ at start-up.
 | `PUSH_HEARTBEAT_MS` | client ping interval announced in `Ready`, 1000 to 600000 | `30000` |
 | `PUSH_DEV_AUTH` | `1` accepts DEV ONLY identities without a token | off |
 
+`push-auth`:
+
+| Variable | Meaning | Default |
+|----------|---------|---------|
+| `PUSH_DATABASE_URL` | Postgres URL of the `push_auth` database, as its owner | required |
+| `PUSH_REDIS_URL` | Redis URL for rate limits, `redis://:password@host:6379` | required |
+| `PUSH_AUTH_PUBLIC_URL` | base URL of email links, `https://api.example.com` (`http` only for local hosts) | required |
+| `PUSH_AUTH_TOKEN_AUDIENCE` | the gateway's URL, the access tokens' `aud` (`wss://…/v1/socket`) | required |
+| `PUSH_AUTH_SIGNING_KEY` | base64 of the 32-byte Ed25519 seed that signs access tokens | required |
+| `PUSH_AUTH_LINK_KEY` | base64 of at least 32 bytes, the HMAC key of email links and registration tokens | required |
+| `PUSH_AUTH_CLIENT_IP_HEADER` | header with the client's IP, set by the ingress (`x-real-ip`); its last line, then last entry is used; assumes exactly one proxy in front that overwrites or appends it, otherwise clients can spoof it (weakening rate limits only) | the peer address |
+| `PUSH_AUTH_HASH_CONCURRENCY` | most password hashes at once (19 MiB each) | `2` |
+| `PUSH_AUTH_HASH_QUEUE` | most requests waiting for a password hash; more get a retryable 503 (`Retry-After: 1`) | `32` |
+| `PUSH_HTTP_ADDR` | address of the API | `0.0.0.0:8080` |
+| `PUSH_HEALTH_ADDR` | address of `/healthz` and `/readyz` | `0.0.0.0:8081` |
+| `PUSH_DB_MAX_CONNECTIONS` | pool size, at least 1 | `10` |
+| `PUSH_DEV_MAILBOX` | `1` serves the DEV ONLY `GET /dev/mailbox`; refused unless the public URL's host is local | off |
+
 ## License
 
 MIT
