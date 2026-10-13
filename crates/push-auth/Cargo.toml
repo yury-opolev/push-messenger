@@ -9,8 +9,12 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+argon2.workspace = true
 push-store.workspace = true
+serde.workspace = true
 sqlx.workspace = true
+tokio = { workspace = true, features = ["time"] }
+tracing.workspace = true
 
 [dev-dependencies]
 testcontainers-modules.workspace = true

@@ -5,5 +5,7 @@
 //! transaction as each change.
 
 mod db;
+pub mod password;
+pub mod rules;
 
 pub use db::{MIGRATOR, migrate_database};

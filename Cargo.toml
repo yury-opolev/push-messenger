@@ -20,6 +20,7 @@ repository = "https://github.com/yury-opolev/push-messenger"
 
 [workspace.dependencies]
 anyhow = "1"
+argon2 = { version = "0.5", features = ["std"] }
 async-trait = "0.1"
 axum = "0.8"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
@@ -60,6 +61,13 @@ tonic-prost-build = "0.14"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["serde", "v4", "v7"] }
+
+# Argon2id is far too slow unoptimised, and the auth tests hash many passwords.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
