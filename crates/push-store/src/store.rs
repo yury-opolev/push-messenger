@@ -7,8 +7,8 @@ use push_domain::{
     DomainError, DomainResult, Entry, EntryKind, GroupPositions, InsertOutcome, InviteRecord,
     Member, MessageId, Store, Tx, UserId,
 };
-use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
-use sqlx::{Executor, PgConnection, Postgres, Row, Transaction};
+use sqlx::postgres::{PgPool, PgRow};
+use sqlx::{PgConnection, Postgres, Row, Transaction};
 use uuid::Uuid;
 
 use crate::codes::{decode, encode};
@@ -34,23 +34,7 @@ impl PgStore {
     /// sets the lock, statement and idle-in-transaction timeouts. Fails if the options do
     /// not pass [`StoreOptions::validate`] or the first connection cannot be made.
     pub async fn connect(url: &str, options: &StoreOptions) -> Result<Self, sqlx::Error> {
-        options
-            .validate()
-            .map_err(|message| sqlx::Error::Configuration(message.into()))?;
-        let settings = options.session_settings();
-        let pool = PgPoolOptions::new()
-            .max_connections(options.max_connections)
-            .acquire_timeout(options.acquire_timeout)
-            .after_connect(move |connection, _| {
-                let settings = settings.clone();
-                Box::pin(async move {
-                    connection.execute(settings.as_str()).await?;
-                    Ok(())
-                })
-            })
-            .connect(url)
-            .await?;
-        Ok(Self::new(pool))
+        Ok(Self::new(crate::connect_pool(url, options).await?))
     }
 
     /// Applies the migrations the database does not have yet on this pool, whose statement

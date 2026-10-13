@@ -8442,3 +8442,8 @@ the controller merges after the final review.
   accepted (decision 4).
 - **Signing-key rotation** (several keys in the JWKS, `kid` selects); **email change**
   (out of scope in v1; links already bind the address).
+- **Review follow-ups (Plan 5A)**: refresh sessions slide (30 d) with no absolute cap
+  (an owner decision for later); display names allow bidi and zero-width characters;
+  rate-limit key subjects use plain SHA-256 and should use HMAC; link-page form POSTs
+  return JSON errors, not HTML; Path/Query/404/405 rejections are plain text; `Bearer` is
+  matched case-sensitively; strip `?token=` from ingress access logs (Plan 5B).

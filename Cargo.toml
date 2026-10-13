@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/push-auth",
     "crates/push-domain",
     "crates/push-gateway",
     "crates/push-message-svc",
@@ -19,27 +20,37 @@ repository = "https://github.com/yury-opolev/push-messenger"
 
 [workspace.dependencies]
 anyhow = "1"
+argon2 = { version = "0.5", features = ["std"] }
 async-trait = "0.1"
 axum = "0.8"
+base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+hmac = "0.12"
+http-body-util = "0.1"
+jsonwebtoken = { version = "9", default-features = false }
 libtest-mimic = "0.8"
 prost = "0.14"
 protoc-bin-vendored = "3"
+push-auth = { path = "crates/push-auth" }
 push-domain = { path = "crates/push-domain" }
 push-gateway = { path = "crates/push-gateway" }
 push-message-svc = { path = "crates/push-message-svc" }
 push-proto = { path = "crates/push-proto" }
 push-store = { path = "crates/push-store" }
 push-testkit = { path = "crates/push-testkit" }
+rand = "0.9"
 redis = { version = "1", default-features = false, features = [
     "connection-manager",
     "tokio-comp",
 ] }
+ring = "0.17"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = [
     "chrono",
+    "json",
     "macros",
     "migrate",
     "postgres",
@@ -55,9 +66,17 @@ tokio-util = { version = "0.7", features = ["rt"] }
 tonic = "0.14"
 tonic-prost = "0.14"
 tonic-prost-build = "0.14"
+tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["serde", "v4", "v7"] }
+
+# Argon2id is far too slow unoptimised, and the auth tests hash many passwords.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
