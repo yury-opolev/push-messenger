@@ -1,4 +1,4 @@
-use crate::{Backend, Case, World, case_list};
+use crate::{Backend, Case, World, bodies, case_list};
 use push_domain::{DeviceId, DomainError, UserId};
 
 async fn registering_a_device_for_an_unknown_user_fails<B: Backend>(backend: &B) {
@@ -36,6 +36,16 @@ async fn identify_rejects_a_revoked_device<B: Backend>(backend: &B) {
     );
 }
 
+async fn identify_asks_to_retry_a_device_not_relayed_yet<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
+    let (user, device) = (UserId::new(), DeviceId::new());
+    let refused = world.svc.identify(device, user).await.unwrap_err();
+    assert_eq!(refused, DomainError::DeviceNotKnownYet);
+    assert!(refused.is_retryable());
+    world.svc.device_registered(device, user).await.unwrap();
+    assert_eq!(world.svc.identify(device, user).await, Ok(()));
+}
+
 async fn a_device_id_of_another_user_cannot_be_registered<B: Backend>(backend: &B) {
     let world = World::new(backend).await;
     let alice = world.person().await;
@@ -68,14 +78,89 @@ async fn registering_the_same_user_and_device_twice_is_harmless<B: Backend>(back
     assert_eq!(world.svc.identify(alice.device, alice.user).await, Ok(()));
 }
 
+async fn a_relayed_registration_records_the_user_too<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
+    let (user, device) = (UserId::new(), DeviceId::new());
+    world.svc.device_registered(device, user).await.unwrap();
+    world.svc.device_registered(device, user).await.unwrap();
+    world.svc.register_user(user).await.unwrap();
+    assert_eq!(world.svc.identify(device, user).await, Ok(()));
+}
+
+async fn a_relayed_registration_starts_up_to_date<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
+    let (alice, bob) = (world.person().await, world.person().await);
+    let chat = world.direct_chat(&alice, &bob).await;
+    world.send(&alice, chat, "one").await;
+
+    let tablet = DeviceId::new();
+    world.svc.device_registered(tablet, bob.user).await.unwrap();
+    assert!(
+        world
+            .svc
+            .sync(tablet, 100)
+            .await
+            .unwrap()
+            .entries
+            .is_empty()
+    );
+    world.send(&alice, chat, "two").await;
+    let batch = world.svc.sync(tablet, 100).await.unwrap();
+    assert_eq!(bodies(&batch.entries), ["two"]);
+}
+
+async fn a_revocation_relayed_before_the_registration_wins<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
+    let (user, device) = (UserId::new(), DeviceId::new());
+    world.svc.device_revoked(device, user).await.unwrap();
+    world.svc.device_registered(device, user).await.unwrap();
+    world.svc.device_revoked(device, user).await.unwrap();
+    assert_eq!(
+        world.svc.identify(device, user).await,
+        Err(DomainError::UnknownDevice)
+    );
+}
+
+async fn a_relayed_revocation_closes_an_active_device<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
+    let alice = world.person().await;
+    let tablet = world.add_device(&alice).await;
+    world.svc.device_revoked(tablet, alice.user).await.unwrap();
+    assert_eq!(
+        world.svc.identify(tablet, alice.user).await,
+        Err(DomainError::UnknownDevice)
+    );
+    assert_eq!(world.svc.identify(alice.device, alice.user).await, Ok(()));
+}
+
+async fn relayed_events_for_another_users_device_are_refused<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
+    let (alice, bob) = (world.person().await, world.person().await);
+    assert_eq!(
+        world.svc.device_registered(alice.device, bob.user).await,
+        Err(DomainError::UnknownDevice)
+    );
+    assert_eq!(
+        world.svc.device_revoked(alice.device, bob.user).await,
+        Err(DomainError::UnknownDevice)
+    );
+    assert_eq!(world.svc.identify(alice.device, alice.user).await, Ok(()));
+}
+
 pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
     case_list![
         registering_a_device_for_an_unknown_user_fails,
         identify_accepts_the_users_own_active_device,
         identify_rejects_a_device_of_another_user,
         identify_rejects_a_revoked_device,
+        identify_asks_to_retry_a_device_not_relayed_yet,
         a_device_id_of_another_user_cannot_be_registered,
         a_revoked_device_cannot_be_registered_again,
         registering_the_same_user_and_device_twice_is_harmless,
+        a_relayed_registration_records_the_user_too,
+        a_relayed_registration_starts_up_to_date,
+        a_revocation_relayed_before_the_registration_wins,
+        a_relayed_revocation_closes_an_active_device,
+        relayed_events_for_another_users_device_are_refused,
     ]
 }

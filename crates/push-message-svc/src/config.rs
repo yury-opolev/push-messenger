@@ -13,6 +13,7 @@ use push_store::{StoreOptions, check_database_url};
 /// | `PUSH_GRPC_ADDR` | address of the gRPC API | `0.0.0.0:50051` |
 /// | `PUSH_HEALTH_ADDR` | address of `/healthz` and `/readyz` | `0.0.0.0:8081` |
 /// | `PUSH_DB_MAX_CONNECTIONS` | pool size, at least 1 | `10` |
+/// | `PUSH_ACCOUNTS_TOKEN` | the worker's token for the `Accounts` API, 32 to 256 visible ASCII characters; without it `Accounts` refuses every call | none |
 /// | `PUSH_DEV_SETUP` | `1` registers the DEV ONLY `DevSetup` service | off |
 #[derive(Clone, PartialEq, Eq)]
 pub struct Config {
@@ -21,6 +22,7 @@ pub struct Config {
     pub grpc_addr: SocketAddr,
     pub health_addr: SocketAddr,
     pub store: StoreOptions,
+    pub accounts_token: Option<String>,
     pub dev_setup: bool,
 }
 
@@ -33,6 +35,10 @@ impl std::fmt::Debug for Config {
             .field("grpc_addr", &self.grpc_addr)
             .field("health_addr", &self.health_addr)
             .field("store", &self.store)
+            .field(
+                "accounts_token",
+                &self.accounts_token.as_ref().map(|_| "<redacted>"),
+            )
             .field("dev_setup", &self.dev_setup)
             .finish()
     }
@@ -82,14 +88,28 @@ impl Config {
                 "not a valid Redis URL, expected redis://[:password@]host:6379".to_owned(),
             )
         })?;
+        let accounts_token = lookup("PUSH_ACCOUNTS_TOKEN").filter(|value| !value.is_empty());
+        if let Some(token) = &accounts_token {
+            check_token(token).map_err(|reason| redacted("PUSH_ACCOUNTS_TOKEN", reason))?;
+        }
         Ok(Self {
             database_url,
             redis_url,
             grpc_addr: parsed(&lookup, "PUSH_GRPC_ADDR", ([0, 0, 0, 0], 50051).into())?,
             health_addr: parsed(&lookup, "PUSH_HEALTH_ADDR", ([0, 0, 0, 0], 8081).into())?,
             store,
+            accounts_token,
             dev_setup: dev_flag(&lookup, "PUSH_DEV_SETUP")?,
         })
+    }
+}
+
+/// A shared token fit for a header: 32 to 256 visible ASCII characters.
+fn check_token(token: &str) -> Result<(), String> {
+    if (32..=256).contains(&token.len()) && token.bytes().all(|byte| byte.is_ascii_graphic()) {
+        Ok(())
+    } else {
+        Err("use 32 to 256 visible ASCII characters".to_owned())
     }
 }
 
@@ -172,7 +192,25 @@ mod tests {
         assert_eq!(config.grpc_addr, "0.0.0.0:50051".parse().unwrap());
         assert_eq!(config.health_addr, "0.0.0.0:8081".parse().unwrap());
         assert_eq!(config.store, StoreOptions::default());
+        assert_eq!(config.accounts_token, None);
         assert!(!config.dev_setup);
+    }
+
+    #[test]
+    fn the_accounts_token_is_checked_and_never_shown() {
+        let token = "t0ken-".repeat(6);
+        let mut variables = REQUIRED.to_vec();
+        variables.push(("PUSH_ACCOUNTS_TOKEN", &token));
+        let configured = config(&variables).unwrap();
+        assert_eq!(configured.accounts_token.as_deref(), Some(token.as_str()));
+        assert!(!format!("{configured:?}").contains(&token));
+        for bad in ["too-short", "with a space but long enough to pass 32"] {
+            let mut variables = REQUIRED.to_vec();
+            variables.push(("PUSH_ACCOUNTS_TOKEN", bad));
+            let message = config(&variables).unwrap_err().to_string();
+            assert!(message.contains("PUSH_ACCOUNTS_TOKEN"), "{message}");
+            assert!(!message.contains(bad), "{message}");
+        }
     }
 
     #[test]

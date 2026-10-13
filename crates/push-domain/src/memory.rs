@@ -258,6 +258,10 @@ impl Tx for InMemoryTx {
         Ok(())
     }
 
+    async fn device_user(&mut self, device: DeviceId) -> DomainResult<Option<UserId>> {
+        Ok(self.work.devices.get(&device).map(|row| row.user))
+    }
+
     async fn device_owner(&mut self, device: DeviceId) -> DomainResult<Option<UserId>> {
         Ok(self
             .work

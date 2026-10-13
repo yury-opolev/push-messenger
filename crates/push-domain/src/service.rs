@@ -77,16 +77,42 @@ where
         if !tx.insert_device(device, user).await? {
             return Err(DomainError::UnknownDevice);
         }
-        for (conversation, member) in tx.memberships(user).await? {
-            let position = member.visible_upper(conversation.last_seq);
-            tx.create_cursor_if_absent(device, conversation.id, position)
-                .await?;
-        }
+        create_cursors(&mut tx, device, user).await?;
         tx.commit().await
     }
 
     pub async fn revoke_device(&self, device: DeviceId) -> DomainResult<()> {
         let mut tx = self.store.begin().await?;
+        tx.revoke_device(device).await?;
+        tx.commit().await
+    }
+
+    /// auth-svc registered `device` for `user` (`device.registered`, relayed by the
+    /// worker). Idempotent, and correct in any order with [`Self::device_revoked`] and
+    /// [`Self::register_user`]: the user is recorded too, since auth-svc registers devices
+    /// only for verified users, and a device already revoked stays revoked. A device id
+    /// that belongs to another user is `UnknownDevice`.
+    pub async fn device_registered(&self, device: DeviceId, user: UserId) -> DomainResult<()> {
+        let mut tx = self.store.begin().await?;
+        tx.insert_user(user).await?;
+        if tx.insert_device(device, user).await? {
+            create_cursors(&mut tx, device, user).await?;
+        } else if tx.device_user(device).await? != Some(user) {
+            return Err(DomainError::UnknownDevice);
+        }
+        tx.commit().await
+    }
+
+    /// auth-svc revoked `device` of `user` (`device.revoked`, relayed by the worker).
+    /// Idempotent and correct in any order: a revocation that arrives before the
+    /// registration records the device as revoked, so the registration cannot bring it
+    /// back. A device id that belongs to another user is `UnknownDevice`.
+    pub async fn device_revoked(&self, device: DeviceId, user: UserId) -> DomainResult<()> {
+        let mut tx = self.store.begin().await?;
+        tx.insert_user(user).await?;
+        if !tx.insert_device(device, user).await? && tx.device_user(device).await? != Some(user) {
+            return Err(DomainError::UnknownDevice);
+        }
         tx.revoke_device(device).await?;
         tx.commit().await
     }
@@ -99,9 +125,20 @@ where
     }
 
     /// Confirms that a connecting device is active and belongs to the user in its token.
+    /// A device never heard of is `DeviceNotKnownYet` (retryable): auth-svc registered it
+    /// and the worker has not relayed it yet. A revoked device, or one of another user, is
+    /// `UnknownDevice`.
     pub async fn identify(&self, device: DeviceId, user: UserId) -> DomainResult<()> {
         let mut tx = self.store.begin().await?;
-        let owner = require_device(&mut tx, device).await?;
+        let Some(owner) = tx.device_owner(device).await? else {
+            let known = tx.device_user(device).await?.is_some();
+            tx.rollback().await?;
+            return Err(if known {
+                DomainError::UnknownDevice
+            } else {
+                DomainError::DeviceNotKnownYet
+            });
+        };
         tx.rollback().await?;
         if owner == user {
             Ok(())
@@ -109,6 +146,17 @@ where
             Err(DomainError::UnknownDevice)
         }
     }
+}
+
+/// Starts a new device up to date in every conversation of its user, including ones the
+/// user has left (up to where they left).
+async fn create_cursors<T: Tx>(tx: &mut T, device: DeviceId, user: UserId) -> DomainResult<()> {
+    for (conversation, member) in tx.memberships(user).await? {
+        let position = member.visible_upper(conversation.last_seq);
+        tx.create_cursor_if_absent(device, conversation.id, position)
+            .await?;
+    }
+    Ok(())
 }
 
 /// The owner of an active device, or `UnknownDevice`.

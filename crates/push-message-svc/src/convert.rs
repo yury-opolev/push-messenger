@@ -46,6 +46,7 @@ pub(crate) fn domain_error(error: DomainError) -> Status {
         DomainError::UnknownUser | DomainError::UnknownDevice => {
             (Code::PermissionDenied, ErrorCode::UnknownDevice)
         }
+        DomainError::DeviceNotKnownYet => (Code::Unavailable, ErrorCode::Unavailable),
         DomainError::ConversationNotFound => (Code::NotFound, ErrorCode::ConversationNotFound),
         DomainError::NotMember => (Code::FailedPrecondition, ErrorCode::NotMember),
         DomainError::NotContact => (Code::FailedPrecondition, ErrorCode::NotContact),
@@ -233,5 +234,11 @@ mod tests {
         let device = domain_error(DomainError::UnknownDevice);
         assert_eq!(device.code(), Code::PermissionDenied);
         assert_eq!(error_from_status(&device).code(), ErrorCode::UnknownDevice);
+
+        let not_yet = domain_error(DomainError::DeviceNotKnownYet);
+        assert_eq!(not_yet.code(), Code::Unavailable);
+        let not_yet = error_from_status(&not_yet);
+        assert_eq!(not_yet.code(), ErrorCode::Unavailable);
+        assert!(not_yet.retryable);
     }
 }

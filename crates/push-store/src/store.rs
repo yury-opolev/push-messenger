@@ -167,6 +167,16 @@ impl Tx for PgTx {
         Ok(())
     }
 
+    async fn device_user(&mut self, device: DeviceId) -> DomainResult<Option<UserId>> {
+        let owner: Option<Uuid> =
+            sqlx::query_scalar("SELECT user_id FROM messaging.member_device WHERE device_id = $1")
+                .bind(device.0)
+                .fetch_optional(self.conn())
+                .await
+                .map_err(store_error)?;
+        Ok(owner.map(UserId))
+    }
+
     async fn device_owner(&mut self, device: DeviceId) -> DomainResult<Option<UserId>> {
         let owner: Option<Uuid> = sqlx::query_scalar(
             "SELECT user_id FROM messaging.member_device \

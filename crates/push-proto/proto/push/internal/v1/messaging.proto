@@ -1,6 +1,6 @@
-// The internal API of message-svc, called by the gateway (spec §2). Never exposed outside
-// the cluster. Callers pass the user and device the gateway verified; message-svc trusts
-// them.
+// The internal API of message-svc, called by the gateway (Messaging) and the worker
+// (Accounts) (spec §2). Never exposed outside the cluster. Callers pass the user and
+// device the gateway verified, or auth-svc announced; message-svc trusts them.
 //
 // Errors are gRPC statuses whose `details` hold an encoded `push.v1.Error`, which the
 // gateway forwards to the client.
@@ -12,7 +12,10 @@ package push.internal.v1;
 import "push/v1/frame.proto";
 
 service Messaging {
-  // Confirms that the device is active and belongs to the user.
+  // Confirms that the device is active and belongs to the user. A revoked device, or one
+  // of another user, is PERMISSION_DENIED (UNKNOWN_DEVICE); a device message-svc has never
+  // heard of is UNAVAILABLE (retryable): auth-svc registered it and the worker has not
+  // relayed it yet, which takes about a second.
   rpc Identify(IdentifyRequest) returns (IdentifyResponse);
   // Appends a text message; answers after commit.
   rpc Send(SendRequest) returns (push.v1.SendAck);
@@ -31,6 +34,27 @@ service DevSetup {
   // Makes two users accepted contacts: a request from `user_id`, accepted by `peer_id`.
   rpc MakeContacts(MakeContactsRequest) returns (MakeContactsResponse);
   rpc OpenDirect(OpenDirectRequest) returns (OpenDirectResponse);
+}
+
+// auth-svc's user and device events, relayed by the worker from auth-svc's outbox
+// (spec §2, §5.3). Delivery is at least once and in no particular order, so every call is
+// idempotent and any order of calls ends in the same state. A device id that belongs to
+// another user is PERMISSION_DENIED; malformed ids are INVALID_ARGUMENT; both are
+// permanent. Storage problems are UNAVAILABLE or ABORTED: retry. Every call carries the
+// shared internal token as `authorization: Bearer <token>` metadata; without it the call
+// is UNAUTHENTICATED, so the gateway, which can reach message-svc, cannot register devices.
+service Accounts {
+  // user.verified: the user may use messaging.
+  rpc UserVerified(AccountUser) returns (AccountsResponse);
+  // device.registered: also records the user, since only verified users get devices.
+  rpc DeviceRegistered(AccountDevice) returns (AccountsResponse);
+  // device.revoked: Identify refuses the device from now on, even when this arrives
+  // before the registration.
+  rpc DeviceRevoked(AccountDevice) returns (AccountsResponse);
+  // user.password_reset: every device of the user is to be kicked. Accepted and
+  // otherwise ignored until message-svc publishes kicks (Plan 7) and the gateway closes
+  // kicked sockets and refuses older tokens (Plan 8).
+  rpc PasswordReset(AccountUser) returns (AccountsResponse);
 }
 
 message IdentifyRequest {
@@ -147,3 +171,14 @@ message OpenDirectRequest {
 message OpenDirectResponse {
   bytes conversation_id = 1;
 }
+
+message AccountUser {
+  bytes user_id = 1;
+}
+
+message AccountDevice {
+  bytes user_id = 1;
+  bytes device_id = 2;
+}
+
+message AccountsResponse {}
