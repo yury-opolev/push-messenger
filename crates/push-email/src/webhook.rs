@@ -120,6 +120,15 @@ impl ResendWebhooks {
         }
         Ok(Self { key })
     }
+
+    /// The `svix-signature` header for `body`, sent as webhook `id` at `timestamp` (Unix
+    /// seconds): what Resend would send. For tests and tools that stand in for Resend.
+    pub fn sign(&self, id: &str, timestamp: u64, body: &[u8]) -> String {
+        let mut mac = Hmac::<Sha256>::new_from_slice(&self.key).expect("HMAC takes any key");
+        mac.update(format!("{id}.{timestamp}.").as_bytes());
+        mac.update(body);
+        format!("v1,{}", STANDARD.encode(mac.finalize().into_bytes()))
+    }
 }
 
 impl WebhookVerifier for ResendWebhooks {
@@ -239,7 +248,7 @@ mod tests {
     }
 
     #[test]
-    fn svixs_example_verifies() {
+    fn svixs_example_verifies_and_signs_the_same() {
         let genuine = headers(ID, TIMESTAMP, SIGNATURE);
         assert_eq!(
             verify(&genuine, BODY, at(TIMESTAMP + 10)),
@@ -248,6 +257,8 @@ mod tests {
         // One of several signatures is enough, while the secret is rotated.
         let rotated = headers(ID, TIMESTAMP, &format!("v1,AAAA {SIGNATURE}"));
         assert_eq!(verify(&rotated, BODY, at(TIMESTAMP)), Ok(ID.to_owned()));
+        let webhooks = ResendWebhooks::new(SECRET).unwrap();
+        assert_eq!(webhooks.sign(ID, TIMESTAMP, BODY), SIGNATURE);
     }
 
     #[test]

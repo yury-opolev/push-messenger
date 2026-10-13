@@ -8,6 +8,7 @@ use std::time::Duration;
 use chrono::Utc;
 use push_auth::outbox::Event;
 use push_domain::{InMemoryStore, Messaging, RecordingNotifier, SystemClock};
+use push_email::{LogSender, Templates};
 use push_message_svc::{AccountsApi, AccountsToken, MessagingApi};
 use push_proto::id_bytes;
 use push_proto::internal::v1::IdentifyRequest;
@@ -15,6 +16,7 @@ use push_proto::internal::v1::accounts_server::AccountsServer;
 use push_proto::internal::v1::messaging_client::MessagingClient;
 use push_proto::internal::v1::messaging_server::MessagingServer;
 use push_worker::accounts::Accounts;
+use push_worker::email::Mailer;
 use push_worker::jobs::Jobs;
 use push_worker::queue::{Job, Outcome, Queue};
 use push_worker::relay::OutboxRelay;
@@ -37,6 +39,7 @@ struct World {
     auth: PgPool,
     queue: Queue,
     relay: OutboxRelay,
+    mailer: Mailer,
     jobs: Jobs,
     message_svc: String,
     messaging: MessagingClient<Channel>,
@@ -71,10 +74,9 @@ async fn world() -> World {
     let worker_url = format!("postgres://push_worker:worker-secret@{server}/push_worker");
     push_worker::migrate_database(&worker_url).await.unwrap();
 
-    let queue = Queue::new(
-        PgPool::connect(&worker_url).await.unwrap(),
-        Duration::from_secs(60),
-    );
+    let pool = PgPool::connect(&worker_url).await.unwrap();
+    let queue = Queue::new(pool.clone(), Duration::from_secs(60));
+    let mailer = Mailer::new(pool, Arc::new(LogSender), Templates::default());
     let source = PgPool::connect(&format!(
         "postgres://push_worker:worker-secret@{server}/push_auth"
     ))
@@ -86,7 +88,11 @@ async fn world() -> World {
         auth: PgPool::connect(&auth_url).await.unwrap(),
         relay: OutboxRelay::new(source, queue.clone(), 100),
         queue,
-        jobs: Jobs::new(Accounts::new(&message_svc, ACCOUNTS_TOKEN).unwrap()),
+        jobs: Jobs::new(
+            Accounts::new(&message_svc, ACCOUNTS_TOKEN).unwrap(),
+            mailer.clone(),
+        ),
+        mailer,
         messaging: MessagingClient::connect(message_svc.clone()).await.unwrap(),
         message_svc,
     }
@@ -300,7 +306,7 @@ async fn events_that_can_never_apply_are_poison_and_outages_are_retried() {
         Accounts::new(&gone, ACCOUNTS_TOKEN).unwrap(),
         Accounts::new(&world.message_svc, wrong_token).unwrap(),
     ] {
-        let outcome = Jobs::new(accounts)
+        let outcome = Jobs::new(accounts, world.mailer.clone())
             .run(&Job {
                 id: Uuid::now_v7(),
                 kind: "user.verified".to_owned(),

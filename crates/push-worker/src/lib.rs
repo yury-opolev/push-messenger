@@ -6,6 +6,9 @@
 
 pub mod accounts;
 mod db;
+pub mod deliveries;
+pub mod email;
+pub mod http;
 pub mod jobs;
 pub mod queue;
 pub mod relay;

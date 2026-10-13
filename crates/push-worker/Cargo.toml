@@ -9,21 +9,29 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+async-trait.workspace = true
 chrono.workspace = true
+axum.workspace = true
+push-email.workspace = true
 push-proto.workspace = true
 push-store.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
+thiserror.workspace = true
 tonic.workspace = true
+tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+http-body-util.workspace = true
 push-auth.workspace = true
 push-domain.workspace = true
 push-message-svc.workspace = true
 testcontainers-modules.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "time"] }
 tokio-stream.workspace = true
+tower.workspace = true
 
 [lints]
 workspace = true

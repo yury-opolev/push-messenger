@@ -2205,18 +2205,26 @@ dependencies = [
 name = "push-worker"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "axum",
  "chrono",
+ "http-body-util",
  "push-auth",
  "push-domain",
+ "push-email",
  "push-message-svc",
  "push-proto",
  "push-store",
+ "serde",
  "serde_json",
  "sqlx",
  "testcontainers-modules",
+ "thiserror",
  "tokio",
  "tokio-stream",
  "tonic 0.14.5",
+ "tower",
+ "tracing",
  "uuid",
 ]
 
