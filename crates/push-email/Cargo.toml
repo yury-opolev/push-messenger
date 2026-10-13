@@ -1,0 +1,25 @@
+[package]
+name = "push-email"
+description = "Email for push-messenger: templates, the sender and webhook traits, Resend and a log-only sender."
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+# Resend is HTTPS: rustls with ring and the webpki roots, no OpenSSL and no cmake.
+reqwest = { workspace = true, features = ["rustls-tls"] }
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }
+
+[lints]
+workspace = true

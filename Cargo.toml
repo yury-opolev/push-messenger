@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/push-auth",
     "crates/push-domain",
+    "crates/push-email",
     "crates/push-gateway",
     "crates/push-message-svc",
     "crates/push-proto",
@@ -34,6 +35,7 @@ prost = "0.14"
 protoc-bin-vendored = "3"
 push-auth = { path = "crates/push-auth" }
 push-domain = { path = "crates/push-domain" }
+push-email = { path = "crates/push-email" }
 push-gateway = { path = "crates/push-gateway" }
 push-message-svc = { path = "crates/push-message-svc" }
 push-proto = { path = "crates/push-proto" }
