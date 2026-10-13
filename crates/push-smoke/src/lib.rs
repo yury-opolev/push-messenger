@@ -2,12 +2,14 @@
 //!
 //! Against a deployment it:
 //!
-//! 1. enrolls Alice and Bob through auth-svc's public API: each signs up, verifies the
-//!    email with the link from the DEV ONLY mailbox, signs in, registers a device, checks
-//!    the access token against the JWKS and refreshes it;
-//! 2. mirrors both users and devices into message-svc and makes them accepted contacts
-//!    with a direct conversation, through message-svc's DEV ONLY `DevSetup` API (the
-//!    worker will relay auth-svc's events instead, Plan 6);
+//! 1. enrolls Alice and Bob through auth-svc's public API: each signs up, waits for the
+//!    verification email that the worker's log sender delivers to the DEV ONLY mailbox,
+//!    verifies with its link, signs in, registers a device, checks the access token
+//!    against the JWKS and refreshes it;
+//! 2. waits until the worker has relayed both users and devices from auth-svc's outbox to
+//!    message-svc (message-svc's `Identify` accepts each device), then makes them accepted
+//!    contacts with a direct conversation through message-svc's DEV ONLY `DevSetup` API
+//!    (until contact requests, Plan 7);
 //! 3. connects Bob's WebSocket and then Alice's, each with a DEV ONLY `Identify` naming
 //!    the device auth-svc registered, and waits for `Ready`;
 //! 4. sends a message from Alice and waits for her `SendAck`;
@@ -16,8 +18,8 @@
 //!    gateway handles a connection's frames in order and answers a failed ack with an
 //!    `Error`.
 //!
-//! The deployment must run auth-svc with `PUSH_DEV_MAILBOX=1`, message-svc with
-//! `PUSH_DEV_SETUP=1` and the gateway with `PUSH_DEV_AUTH=1`.
+//! The deployment must run the worker with the log sender and `PUSH_DEV_MAILBOX=1`,
+//! message-svc with `PUSH_DEV_SETUP=1` and the gateway with `PUSH_DEV_AUTH=1`.
 
 mod auth;
 
@@ -26,9 +28,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, bail};
 use futures_util::{SinkExt, StreamExt};
 use push_proto::internal::v1::dev_setup_client::DevSetupClient;
-use push_proto::internal::v1::{
-    MakeContactsRequest, OpenDirectRequest, RegisterDeviceRequest, RegisterUserRequest,
-};
+use push_proto::internal::v1::messaging_client::MessagingClient;
+use push_proto::internal::v1::{IdentifyRequest, MakeContactsRequest, OpenDirectRequest};
 use push_proto::v1::frame::Body;
 use push_proto::v1::{Ack, ContentType, Identify, Ping, Send};
 use push_proto::{decode_frame, encode_frame, id_bytes};
@@ -45,6 +46,9 @@ const STEP_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long to keep trying to connect: an ingress may answer 503 for a few seconds after
 /// its backends become ready.
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long the worker may take to deliver an email or relay an event: it looks for work
+/// every second.
+pub(crate) const WORKER_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long a closing handshake may take; the test has passed by then.
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -56,10 +60,11 @@ type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 pub struct Target {
     /// Base URL of auth-svc's public API: `http://host` (the ingress controller).
     pub auth_url: String,
-    /// Base URL of auth-svc itself, for the DEV ONLY mailbox, which the ingress does not
-    /// route: `http://push-auth:8080`.
+    /// Base URL of the worker, for the DEV ONLY mailbox of its log sender, which the
+    /// ingress does not route: `http://push-worker:8080`.
     pub mailbox_url: String,
-    /// gRPC URL of message-svc, for the dev setup calls: `http://host:50051`.
+    /// gRPC URL of message-svc, to see the relayed devices and for the dev setup calls:
+    /// `http://host:50051`.
     pub setup_url: String,
     /// WebSocket URL of the gateway: `ws://host/v1/socket`.
     pub socket_url: String,
@@ -140,9 +145,9 @@ pub async fn run(target: &Target) -> anyhow::Result<()> {
         .connect()
         .await
         .with_context(|| format!("connect to message-svc at {}", target.setup_url))?;
+    let alice = Client::relayed("alice", alice, &channel).await?;
+    let bob = Client::relayed("bob", bob, &channel).await?;
     let mut setup = DevSetupClient::new(channel);
-    let alice = Client::mirror("alice", alice, &mut setup).await?;
-    let bob = Client::mirror("bob", bob, &mut setup).await?;
     setup
         .make_contacts(MakeContactsRequest {
             user_id: id_bytes(alice.user),
@@ -160,7 +165,7 @@ pub async fn run(target: &Target) -> anyhow::Result<()> {
         .into_inner()
         .conversation_id;
     step(&format!(
-        "mirrored alice={} bob={} into message-svc as contacts with a direct conversation",
+        "made alice={} and bob={} contacts with a direct conversation (DEV ONLY setup)",
         alice.user, bob.user
     ));
 
@@ -241,27 +246,49 @@ pub async fn run(target: &Target) -> anyhow::Result<()> {
 }
 
 impl Client {
-    /// Registers a user and device that auth-svc enrolled with message-svc, as the
-    /// worker's relay of `user.verified` and `device.registered` will (Plan 6).
-    async fn mirror(
+    /// Waits until the worker has relayed the user and device auth-svc enrolled to
+    /// message-svc, which then accepts the device in `Identify`.
+    async fn relayed(
         name: &'static str,
         enrolled: auth::Enrolled,
-        setup: &mut DevSetupClient<tonic::transport::Channel>,
+        channel: &tonic::transport::Channel,
     ) -> anyhow::Result<Self> {
         let (user, device) = (enrolled.user, enrolled.device);
-        setup
-            .register_user(RegisterUserRequest {
-                user_id: id_bytes(user),
-            })
-            .await
-            .with_context(|| format!("register {name}"))?;
-        setup
-            .register_device(RegisterDeviceRequest {
-                user_id: id_bytes(user),
-                device_id: id_bytes(device),
-            })
-            .await
-            .with_context(|| format!("register {name}'s device"))?;
+        let mut messaging = MessagingClient::new(channel.clone());
+        let started = Instant::now();
+        loop {
+            let identified = messaging
+                .identify(IdentifyRequest {
+                    user_id: id_bytes(user),
+                    device_id: id_bytes(device),
+                })
+                .await;
+            match identified {
+                Ok(_) => break,
+                // Revoked, or another user's: waiting cannot help.
+                Err(status) if status.code() == tonic::Code::PermissionDenied => bail!(
+                    "message-svc refused {name}'s device {device} as revoked or another user's"
+                ),
+                // UNAVAILABLE is message-svc's answer for a device not relayed yet.
+                Err(status) if started.elapsed() < WORKER_TIMEOUT => {
+                    if status.code() != tonic::Code::Unavailable {
+                        step(&format!(
+                            "message-svc answers {:?} yet; retrying",
+                            status.code()
+                        ));
+                    }
+                }
+                Err(status) => bail!(
+                    "the worker did not relay {name}'s device to message-svc within {WORKER_TIMEOUT:?}: {:?}",
+                    status.code()
+                ),
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        step(&format!(
+            "the worker relayed {name}'s account and device {device} to message-svc (waited {} ms)",
+            started.elapsed().as_millis()
+        ));
         Ok(Self { name, user, device })
     }
 
@@ -355,7 +382,7 @@ mod tests {
                 "--auth",
                 "http://ingress",
                 "--mailbox",
-                "http://auth:8080",
+                "http://worker:8080",
                 "--setup",
                 "http://svc:50051",
                 "--socket",
@@ -369,7 +396,7 @@ mod tests {
             target,
             Ok(Target {
                 auth_url: "http://ingress".to_owned(),
-                mailbox_url: "http://auth:8080".to_owned(),
+                mailbox_url: "http://worker:8080".to_owned(),
                 setup_url: "http://svc:50051".to_owned(),
                 socket_url: "ws://ingress/v1/socket".to_owned(),
                 host: Some("push.local".to_owned()),
@@ -383,7 +410,7 @@ mod tests {
             args(&["--socket", "ws://gw/v1/socket"]),
             |name| match name {
                 "PUSH_SMOKE_AUTH_URL" => Some("http://auth:8080".to_owned()),
-                "PUSH_SMOKE_MAILBOX_URL" => Some("http://auth:8080".to_owned()),
+                "PUSH_SMOKE_MAILBOX_URL" => Some("http://worker:8080".to_owned()),
                 "PUSH_SMOKE_SETUP_URL" => Some("http://svc:50051".to_owned()),
                 _ => None,
             },
@@ -392,7 +419,7 @@ mod tests {
             target,
             Ok(Target {
                 auth_url: "http://auth:8080".to_owned(),
-                mailbox_url: "http://auth:8080".to_owned(),
+                mailbox_url: "http://worker:8080".to_owned(),
                 setup_url: "http://svc:50051".to_owned(),
                 socket_url: "ws://gw/v1/socket".to_owned(),
                 host: None,

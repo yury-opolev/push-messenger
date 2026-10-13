@@ -44,13 +44,11 @@ pub struct Api {
     /// (`x-real-ip`); without it, the peer address. Only trust a header the proxy in front
     /// always overwrites (or, for `X-Forwarded-For`, appends to): its last entry is used.
     pub client_ip_header: Option<HeaderName>,
-    /// DEV ONLY: serve `GET /dev/mailbox`, the outbox's emails to one address.
-    pub dev_mailbox: bool,
 }
 
-/// The router of the public API (and, when enabled, the DEV ONLY mailbox).
+/// The router of the public API.
 pub fn router(api: Api) -> Router {
-    let mut router = Router::new()
+    Router::new()
         .route("/v1/auth/signup", post(signup))
         .route("/v1/auth/verify", get(verify_page).post(verify))
         .route("/v1/auth/verify/resend", post(resend))
@@ -62,11 +60,7 @@ pub fn router(api: Api) -> Router {
         .route("/v1/devices", post(register_device).get(list_devices))
         .route("/v1/devices/{device_id}", delete(revoke_device))
         .route("/v1/users/me", get(own_profile).patch(set_display_name))
-        .route("/v1/users/lookup", get(lookup));
-    if api.dev_mailbox {
-        router = router.route("/dev/mailbox", get(dev_mailbox));
-    }
-    router
+        .route("/v1/users/lookup", get(lookup))
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(axum::middleware::map_response(no_store_by_default))
         .with_state(api)
@@ -536,21 +530,6 @@ async fn lookup(
         "display_name": profile.display_name,
     }))
     .into_response())
-}
-
-#[derive(Deserialize)]
-struct MailboxQuery {
-    #[serde(default)]
-    to: String,
-}
-
-/// DEV ONLY: the emails the outbox holds for one address, newest first.
-async fn dev_mailbox(
-    State(api): State<Api>,
-    Query(query): Query<MailboxQuery>,
-) -> Result<Response, AuthError> {
-    let emails = api.auth.dev_mailbox(&query.to).await?;
-    Ok(Json(json!({"emails": emails})).into_response())
 }
 
 /// A small HTML page with the headers every link page needs.

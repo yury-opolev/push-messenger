@@ -27,6 +27,7 @@ push-auth.workspace = true
 push-gateway.workspace = true
 push-message-svc.workspace = true
 push-store.workspace = true
+push-worker.workspace = true
 sqlx.workspace = true
 testcontainers-modules.workspace = true
 tokio-util.workspace = true

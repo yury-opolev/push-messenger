@@ -1,6 +1,6 @@
 //! The walking skeleton on this machine: Postgres and Redis in containers (Docker must be
-//! running), auth-svc, message-svc and the gateway in this process, and the smoke test
-//! against them over real HTTP, gRPC and WebSockets.
+//! running), auth-svc, the worker, message-svc and the gateway in this process, and the
+//! smoke test against them over real HTTP, gRPC and WebSockets.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -38,15 +38,23 @@ async fn the_smoke_test_passes_against_the_whole_stack() {
     );
     let shutdown = CancellationToken::new();
 
-    // auth-svc has a database of its own in the same server, as in the chart.
+    // auth-svc and the worker have databases of their own in the same server, as in the
+    // chart; the worker's role may also drain auth-svc's outbox, which auth-svc grants.
     let admin = sqlx::PgPool::connect(&database_url).await.unwrap();
-    sqlx::query("CREATE DATABASE push_auth")
-        .execute(&admin)
-        .await
-        .unwrap();
+    for statement in [
+        "CREATE DATABASE push_auth",
+        "CREATE ROLE push_worker LOGIN PASSWORD 'worker-secret'",
+        "CREATE DATABASE push_worker OWNER push_worker",
+    ] {
+        sqlx::query(statement).execute(&admin).await.unwrap();
+    }
     admin.close().await;
     let (server_url, _) = database_url.rsplit_once('/').unwrap();
     let auth_database_url = format!("{server_url}/push_auth");
+    let worker_server = format!(
+        "postgres://push_worker:worker-secret@127.0.0.1:{}",
+        postgres.get_host_port_ipv4(5432).await.unwrap()
+    );
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let socket_url = format!("ws://{}/v1/socket", listener.local_addr().unwrap());
     let auth_http = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -67,7 +75,7 @@ async fn the_smoke_test_passes_against_the_whole_stack() {
             "PUSH_AUTH_LINK_KEY",
             "CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk=",
         ),
-        ("PUSH_DEV_MAILBOX", "1"),
+        ("PUSH_AUTH_WORKER_ROLE", "push_worker"),
     ];
     let auth_config = push_auth::Config::from_lookup(|name| {
         auth_variables
@@ -87,6 +95,8 @@ async fn the_smoke_test_passes_against_the_whole_stack() {
     let message_svc_health = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let message_svc_health_addr = message_svc_health.local_addr().unwrap();
     let message_svc_url = format!("http://{}", grpc.local_addr().unwrap());
+    // The worker's token for message-svc's Accounts API, as the chart's Secret holds it.
+    let accounts_token = "accounts-token-for-the-local-smoke-test".to_owned();
     let message_svc = tokio::spawn(push_message_svc::serve(
         push_message_svc::Config {
             database_url,
@@ -94,7 +104,7 @@ async fn the_smoke_test_passes_against_the_whole_stack() {
             grpc_addr: grpc.local_addr().unwrap(),
             health_addr: message_svc_health.local_addr().unwrap(),
             store: StoreOptions::default(),
-            accounts_token: None,
+            accounts_token: Some(accounts_token.clone()),
             dev_setup: true,
         },
         grpc,
@@ -118,12 +128,40 @@ async fn the_smoke_test_passes_against_the_whole_stack() {
         shutdown.clone(),
     ));
 
+    let worker_http = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let worker_health = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let worker_health_addr = worker_health.local_addr().unwrap();
+    let worker_url = format!("http://{}", worker_http.local_addr().unwrap());
+    let worker = tokio::spawn(push_worker::serve(
+        push_worker::Config {
+            database_url: format!("{worker_server}/push_worker"),
+            auth_database_url: format!("{worker_server}/push_auth"),
+            message_svc_url: message_svc_url.clone(),
+            accounts_token,
+            sender: push_worker::Sender::Log,
+            from: String::new(),
+            product_name: "Push Messenger".to_owned(),
+            webhook_secret: None,
+            poll: Duration::from_millis(250),
+            unverified_after: Duration::from_secs(7 * 24 * 3600),
+            retention: Duration::from_secs(30 * 24 * 3600),
+            http_addr: worker_http.local_addr().unwrap(),
+            health_addr: worker_health_addr,
+            store: StoreOptions::default(),
+            dev_mailbox: true,
+        },
+        worker_http,
+        worker_health,
+        shutdown.clone(),
+    ));
+
     wait_until_ready("auth-svc", auth_health_addr, &auth).await;
+    wait_until_ready("the worker", worker_health_addr, &worker).await;
     wait_until_ready("message-svc", message_svc_health_addr, &message_svc).await;
     wait_until_ready("the gateway", gateway_health_addr, &gateway).await;
 
     let target = Target {
-        mailbox_url: auth_url.clone(),
+        mailbox_url: worker_url,
         auth_url,
         setup_url: message_svc_url,
         socket_url,
@@ -141,6 +179,7 @@ async fn the_smoke_test_passes_against_the_whole_stack() {
         .expect("message-svc stops cleanly");
     gateway.await.unwrap().expect("the gateway stops cleanly");
     auth.await.unwrap().expect("auth-svc stops cleanly");
+    worker.await.unwrap().expect("the worker stops cleanly");
 }
 
 /// Polls `/readyz` of a server task until it answers 200; fails if the task stops first.

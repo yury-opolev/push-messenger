@@ -25,9 +25,10 @@ use uuid::Uuid;
 struct World {
     _container: ContainerAsync<Postgres>,
     router: Router,
+    pool: PgPool,
 }
 
-async fn world(dev_mailbox: bool) -> World {
+async fn world() -> World {
     let container = Postgres::default()
         .with_tag("17-alpine")
         .start()
@@ -39,7 +40,7 @@ async fn world(dev_mailbox: bool) -> World {
     migrate_database(&url).await.expect("migrate");
     let pool = PgPool::connect(&url).await.expect("connect");
     let auth = Auth::new(
-        pool,
+        pool.clone(),
         Settings {
             public_url: "http://push.local".to_owned(),
             passwords: Passwords::new(64, 1, 1).unwrap(),
@@ -54,12 +55,27 @@ async fn world(dev_mailbox: bool) -> World {
         auth,
         limits: Limits::new(Arc::new(MemoryCounter::default())),
         client_ip_header: Some(HeaderName::from_static("x-real-ip")),
-        dev_mailbox,
     });
     World {
         _container: container,
         router,
+        pool,
     }
+}
+
+/// The link of the newest `template` email to `to`, from the outbox, where the worker
+/// would pick it up.
+async fn last_link(world: &World, to: &str, template: &str) -> String {
+    sqlx::query_scalar(
+        "SELECT payload->'params'->>'link' FROM auth.outbox WHERE kind = 'email.send' \
+         AND payload->>'to' = $1 AND payload->>'template' = $2 \
+         ORDER BY created_at DESC, event_id DESC LIMIT 1",
+    )
+    .bind(to)
+    .bind(template)
+    .fetch_one(&world.pool)
+    .await
+    .unwrap()
 }
 
 struct Answer {
@@ -124,7 +140,7 @@ async fn call_from(
 }
 
 /// Signs up `name@example.com` and returns the token of its verification link, read from
-/// the DEV ONLY mailbox.
+/// the outbox.
 async fn sign_up(world: &World, name: &str) -> String {
     let answer = call(
         world,
@@ -141,16 +157,7 @@ async fn sign_up(world: &World, name: &str) -> String {
     .await;
     assert_eq!(answer.status, StatusCode::ACCEPTED, "{}", answer.text);
     assert_eq!(answer.json(), json!({"status": "check_email"}));
-    let mailbox = call(
-        world,
-        Method::GET,
-        &format!("/dev/mailbox?to={name}@example.com"),
-        None,
-        None,
-    )
-    .await
-    .json();
-    let link = mailbox["emails"][0]["params"]["link"].as_str().unwrap();
+    let link = last_link(world, &format!("{name}@example.com"), "verify_email").await;
     assert!(
         link.starts_with("http://push.local/v1/auth/verify?token="),
         "{link}"
@@ -202,7 +209,7 @@ async fn with_device(world: &World, name: &str) -> Value {
 
 #[tokio::test]
 async fn sign_up_verify_register_and_use_a_device() {
-    let world = world(true).await;
+    let world = world().await;
     let tokens = with_device(&world, "alice").await;
     assert_eq!(tokens["token_type"], "Bearer");
     assert_eq!(tokens["expires_in_s"], 900);
@@ -282,7 +289,7 @@ async fn sign_up_verify_register_and_use_a_device() {
 
 #[tokio::test]
 async fn link_pages_change_nothing_and_leak_nothing() {
-    let world = world(true).await;
+    let world = world().await;
     let token = sign_up(&world, "alice").await;
     let page = call(
         &world,
@@ -357,7 +364,7 @@ async fn link_pages_change_nothing_and_leak_nothing() {
 
 #[tokio::test]
 async fn a_password_reset_works_through_its_page() {
-    let world = world(true).await;
+    let world = world().await;
     with_device(&world, "alice").await;
     let forgot = call(
         &world,
@@ -368,17 +375,7 @@ async fn a_password_reset_works_through_its_page() {
     )
     .await;
     assert_eq!(forgot.status, StatusCode::ACCEPTED);
-    let mailbox = call(
-        &world,
-        Method::GET,
-        "/dev/mailbox?to=ALICE@example.com",
-        None,
-        None,
-    )
-    .await
-    .json();
-    assert_eq!(mailbox["emails"][0]["template"], "reset_password");
-    let link = mailbox["emails"][0]["params"]["link"].as_str().unwrap();
+    let link = last_link(&world, "alice@example.com", "reset_password").await;
     let path = link.strip_prefix("http://push.local").unwrap();
     let page = call(&world, Method::GET, path, None, None).await;
     assert_eq!(page.headers["referrer-policy"], "no-referrer");
@@ -409,7 +406,7 @@ async fn a_password_reset_works_through_its_page() {
 
 #[tokio::test]
 async fn errors_have_one_format() {
-    let world = world(true).await;
+    let world = world().await;
     let garbage = call(
         &world,
         Method::POST,
@@ -444,7 +441,7 @@ async fn errors_have_one_format() {
 
 #[tokio::test]
 async fn login_is_rate_limited_per_account_and_ip_without_locking_the_account() {
-    let world = world(true).await;
+    let world = world().await;
     with_device(&world, "alice").await;
     // with_device logged in once; 9 more wrong attempts fit in the window.
     for _ in 0..9 {
@@ -487,18 +484,4 @@ async fn login_is_rate_limited_per_account_and_ip_without_locking_the_account() 
     )
     .await;
     assert_eq!(elsewhere.status, StatusCode::OK, "{}", elsewhere.text);
-}
-
-#[tokio::test]
-async fn the_dev_mailbox_exists_only_when_enabled() {
-    let world = world(false).await;
-    let answer = call(
-        &world,
-        Method::GET,
-        "/dev/mailbox?to=a@example.com",
-        None,
-        None,
-    )
-    .await;
-    assert_eq!(answer.status, StatusCode::NOT_FOUND);
 }

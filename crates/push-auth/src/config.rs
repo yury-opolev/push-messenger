@@ -26,11 +26,9 @@ use crate::db::is_role_name;
 /// | `PUSH_HEALTH_ADDR` | address of `/healthz` and `/readyz` | `0.0.0.0:8081` |
 /// | `PUSH_DB_MAX_CONNECTIONS` | pool size, at least 1 | `10` |
 /// | `PUSH_AUTH_WORKER_ROLE` | role the worker connects as: granted the outbox and the cleanups at start-up | none |
-/// | `PUSH_DEV_MAILBOX` | `1` serves the DEV ONLY `GET /dev/mailbox` (local public URL only) | off |
 ///
 /// `http://` public URLs and `ws://` audiences are accepted only for local hosts
-/// (`localhost`, `127.0.0.1`, `*.local`, `*.localhost`, `*.test`), and so is the DEV ONLY
-/// mailbox, like the chart's dev-mode guard.
+/// (`localhost`, `127.0.0.1`, `*.local`, `*.localhost`, `*.test`), like the chart's guard.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Config {
     pub database_url: String,
@@ -46,7 +44,6 @@ pub struct Config {
     pub health_addr: SocketAddr,
     pub store: StoreOptions,
     pub worker_role: Option<String>,
-    pub dev_mailbox: bool,
 }
 
 impl std::fmt::Debug for Config {
@@ -66,7 +63,6 @@ impl std::fmt::Debug for Config {
             .field("health_addr", &self.health_addr)
             .field("store", &self.store)
             .field("worker_role", &self.worker_role)
-            .field("dev_mailbox", &self.dev_mailbox)
             .finish()
     }
 }
@@ -173,17 +169,6 @@ impl Config {
                 });
             }
         };
-        let dev_mailbox = dev_flag(&lookup, "PUSH_DEV_MAILBOX")?;
-        if dev_mailbox && !is_local_url(&public_url) {
-            return Err(ConfigError::Invalid {
-                name: "PUSH_DEV_MAILBOX",
-                value: "1".to_owned(),
-                reason: "the DEV ONLY mailbox shows every account's email links; it is only \
-                         allowed with a local PUSH_AUTH_PUBLIC_URL host (localhost, 127.0.0.1, \
-                         *.local, *.localhost, *.test)"
-                    .to_owned(),
-            });
-        }
         Ok(Self {
             database_url,
             redis_url,
@@ -198,15 +183,8 @@ impl Config {
             health_addr: parsed(&lookup, "PUSH_HEALTH_ADDR", ([0, 0, 0, 0], 8081).into())?,
             store,
             worker_role,
-            dev_mailbox,
         })
     }
-}
-
-/// Whether the host of `url`, a checked public URL, is local.
-fn is_local_url(url: &str) -> bool {
-    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
-    is_local_host(host_of(rest))
 }
 
 /// A key variable, base64-decoded; the value is never shown.
@@ -286,23 +264,6 @@ where
     }
 }
 
-/// A DEV ONLY switch: on only for exactly `1`; off when unset, empty or `0`. Anything
-/// else (`true`, `yes`) is refused, so a typo can never switch it on or leave it in doubt.
-fn dev_flag(
-    lookup: &impl Fn(&str) -> Option<String>,
-    name: &'static str,
-) -> Result<bool, ConfigError> {
-    match lookup(name).as_deref() {
-        None | Some("") | Some("0") => Ok(false),
-        Some("1") => Ok(true),
-        Some(other) => Err(ConfigError::Invalid {
-            name,
-            value: other.to_owned(),
-            reason: "use 1 to enable or 0 to disable".to_owned(),
-        }),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -352,7 +313,6 @@ mod tests {
         assert_eq!(config.client_ip_header, None);
         assert_eq!(config.store, StoreOptions::default());
         assert_eq!(config.worker_role, None);
-        assert!(!config.dev_mailbox);
     }
 
     #[test]
@@ -362,14 +322,6 @@ mod tests {
             variables.remove(index);
             assert_eq!(config(&variables), Err(ConfigError::Missing(name)));
         }
-    }
-
-    /// The required variables with a local public URL, and `name` set to `value`.
-    fn local_with(name: &'static str, value: &'static str) -> Vec<(&'static str, &'static str)> {
-        let mut variables = with("PUSH_AUTH_PUBLIC_URL", "https://push.test");
-        variables.retain(|(key, _)| *key != name);
-        variables.push((name, value));
-        variables
     }
 
     #[test]
@@ -382,7 +334,6 @@ mod tests {
             ("PUSH_HTTP_ADDR", "127.0.0.1:7000"),
             ("PUSH_DB_MAX_CONNECTIONS", "3"),
             ("PUSH_AUTH_WORKER_ROLE", "push_worker"),
-            ("PUSH_DEV_MAILBOX", "1"),
         ]);
         let config = config(&variables).unwrap();
         assert_eq!(
@@ -394,7 +345,6 @@ mod tests {
         assert_eq!(config.http_addr, "127.0.0.1:7000".parse().unwrap());
         assert_eq!(config.store.max_connections, 3);
         assert_eq!(config.worker_role.as_deref(), Some("push_worker"));
-        assert!(config.dev_mailbox);
     }
 
     #[test]
@@ -410,6 +360,9 @@ mod tests {
             ("PUSH_AUTH_PUBLIC_URL", "ftp://api.example.com"),
             ("PUSH_AUTH_PUBLIC_URL", "https://api.example.com/?x=1"),
             ("PUSH_AUTH_PUBLIC_URL", "https://"),
+            ("PUSH_AUTH_PUBLIC_URL", "https://evil.com\\.test"),
+            ("PUSH_AUTH_PUBLIC_URL", "https://user@evil.com"),
+            ("PUSH_AUTH_PUBLIC_URL", "http://evil.com@push.test"),
             ("PUSH_AUTH_TOKEN_AUDIENCE", "ws://api.example.com/v1/socket"),
             (
                 "PUSH_AUTH_TOKEN_AUDIENCE",
@@ -436,69 +389,6 @@ mod tests {
             let message = config(&with(name, value)).unwrap_err().to_string();
             assert!(message.contains(name), "{message}");
             assert!(!message.contains(value), "{message}");
-        }
-    }
-
-    #[test]
-    fn dev_mailbox_is_on_only_for_exactly_1() {
-        for (value, expected) in [("1", true), ("0", false), ("", false)] {
-            assert_eq!(
-                config(&local_with("PUSH_DEV_MAILBOX", value))
-                    .unwrap()
-                    .dev_mailbox,
-                expected
-            );
-        }
-        for value in ["true", "yes", " 1"] {
-            assert!(
-                config(&local_with("PUSH_DEV_MAILBOX", value)).is_err(),
-                "{value:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn the_dev_mailbox_needs_a_local_public_url() {
-        for url in [
-            "http://localhost:8080",
-            "http://127.0.0.1",
-            "https://push.local",
-            "http://push.localhost/",
-            "https://push.test",
-        ] {
-            let mut variables = local_with("PUSH_DEV_MAILBOX", "1");
-            variables.retain(|(key, _)| *key != "PUSH_AUTH_PUBLIC_URL");
-            variables.push(("PUSH_AUTH_PUBLIC_URL", url));
-            assert!(config(&variables).unwrap().dev_mailbox, "{url}");
-        }
-        for url in [
-            "https://api.example.com",
-            "https://localhost.example.com",
-            "https://push.test.example.com",
-        ] {
-            let mut variables = with("PUSH_DEV_MAILBOX", "1");
-            variables.retain(|(key, _)| *key != "PUSH_AUTH_PUBLIC_URL");
-            variables.push(("PUSH_AUTH_PUBLIC_URL", url));
-            assert!(
-                matches!(
-                    config(&variables),
-                    Err(ConfigError::Invalid {
-                        name: "PUSH_DEV_MAILBOX",
-                        ..
-                    })
-                ),
-                "{url}"
-            );
-        }
-        for url in [
-            "https://evil.com\\.test",
-            "https://user@evil.com",
-            "http://evil.com@push.test",
-        ] {
-            let mut variables = with("PUSH_DEV_MAILBOX", "1");
-            variables.retain(|(key, _)| *key != "PUSH_AUTH_PUBLIC_URL");
-            variables.push(("PUSH_AUTH_PUBLIC_URL", url));
-            assert!(config(&variables).is_err(), "{url}");
         }
     }
 
