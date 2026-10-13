@@ -205,6 +205,19 @@ mod tests {
     const LINK: &str = "https://api.example.com/v1/auth/verify?token=abc.def";
 
     #[test]
+    fn a_link_with_quotes_or_angle_brackets_stays_inside_its_href() {
+        let link = "https://api.example.com/v1/auth/verify?token=a\"><script>";
+        let rendered = Templates::default()
+            .render(
+                "verify_email",
+                &json!({"link": link, "handle": "alice", "expires_in_minutes": 30}),
+            )
+            .unwrap();
+        assert!(!rendered.html.contains("<script>"));
+        assert!(rendered.html.contains("token=a&quot;&gt;&lt;script&gt;\">"));
+    }
+
+    #[test]
     fn verify_email_carries_the_link_the_handle_and_the_lifetime() {
         let rendered = Templates::default()
             .render(

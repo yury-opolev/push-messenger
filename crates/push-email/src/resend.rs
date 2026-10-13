@@ -42,6 +42,7 @@ impl ResendSender {
     pub fn new(api_url: &str, api_key: String, from: String) -> Result<Self, SendError> {
         let http = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|_| SendError::Permanent("could not build the HTTP client".to_owned()))?;
         Ok(Self {
@@ -86,7 +87,13 @@ impl EmailSender for ResendSender {
             });
         }
         // Only Resend's error name: its message can quote the address.
-        let name = answer["name"].as_str().unwrap_or("unknown");
+        let name: String = answer["name"]
+            .as_str()
+            .unwrap_or("unknown")
+            .chars()
+            .filter(|c| c.is_ascii_lowercase() || *c == '_')
+            .take(64)
+            .collect();
         let reason = format!("Resend answered {status} ({name})");
         if is_retryable(status) {
             Err(SendError::Retryable(reason))
@@ -96,12 +103,13 @@ impl EmailSender for ResendSender {
     }
 }
 
-/// Rate limits, a concurrent request with the same idempotency key, server errors, and a
-/// missing or wrong API key (401, 403): the emails wait while the key is fixed.
+/// Rate limits, a timeout, a concurrent request with the same idempotency key, server
+/// errors, and a missing or wrong API key (401, 403): the emails wait while the key is fixed.
 fn is_retryable(status: StatusCode) -> bool {
     matches!(
         status,
         StatusCode::TOO_MANY_REQUESTS
+            | StatusCode::REQUEST_TIMEOUT
             | StatusCode::CONFLICT
             | StatusCode::UNAUTHORIZED
             | StatusCode::FORBIDDEN
