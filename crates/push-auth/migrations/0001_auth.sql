@@ -11,7 +11,7 @@ CREATE SCHEMA auth;
 
 CREATE TABLE auth.user_account (
     user_id           uuid PRIMARY KEY,
-    email             citext NOT NULL UNIQUE CHECK (length(email) BETWEEN 3 AND 254),
+    email             citext NOT NULL UNIQUE CHECK (octet_length(email) BETWEEN 3 AND 254),
     -- Null until the verification link is opened: no API access before that.
     email_verified_at timestamptz,
     handle            citext NOT NULL UNIQUE CHECK (handle::text ~ '^[a-z][a-z0-9_]{2,29}$'),
@@ -45,7 +45,7 @@ CREATE TABLE auth.refresh_token (
     revoked_at timestamptz,
     -- The token that replaced this one; presenting a replaced token again is reuse,
     -- except within the grace window below.
-    rotated_to bytea,
+    rotated_to bytea CHECK (length(rotated_to) = 32),
     -- When the holder exchanged this token; null when a retry of the token before it cut
     -- this one off. The token rotated last may be presented again for 30 s after this.
     rotated_at timestamptz
