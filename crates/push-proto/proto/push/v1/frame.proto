@@ -159,6 +159,16 @@ message Request {
   oneof body {
     ListConversations list_conversations = 2;
     FetchHistory fetch_history = 3;
+    OpenDirect open_direct = 4;
+    ContactRequest contact_request = 5;
+    ContactAccept contact_accept = 6;
+    ContactDecline contact_decline = 7;
+    ContactBlock contact_block = 8;
+    ContactUnblock contact_unblock = 9;
+    ListContacts list_contacts = 10;
+    CreateInvite create_invite = 11;
+    RedeemInvite redeem_invite = 12;
+    RevokeInvite revoke_invite = 13;
   }
 }
 
@@ -168,8 +178,18 @@ message Response {
   oneof body {
     ConversationList conversations = 2;
     HistoryPage history = 3;
+    DirectOpened direct_opened = 4;
+    // ContactRequest: the caller's view of the relationship now.
+    Contact contact = 5;
+    ContactList contacts = 6;
+    Invite invite = 7;
+    InviteRedeemed invite_redeemed = 8;
+    // A request that answers nothing but success.
+    Done done = 9;
   }
 }
+
+message Done {}
 
 // The caller's conversations, current and left, sorted by id, with positions, unread
 // counts and receipt positions. A direct conversation with a user the caller has blocked
@@ -243,6 +263,98 @@ message HistoryPage {
   repeated Deliver entries = 1;
   // Older entries exist before this page.
   bool has_more = 2;
+}
+
+// The direct conversation with an accepted contact, created the first time it is opened.
+message OpenDirect {
+  bytes peer_user_id = 1;
+}
+
+message DirectOpened {
+  bytes conversation_id = 1;
+}
+
+// Asks another user to become a contact (spec §5.5). If they already asked the caller,
+// both become accepted contacts at once.
+message ContactRequest {
+  bytes user_id = 1;
+}
+
+// Accepts the request the other user sent.
+message ContactAccept {
+  bytes user_id = 1;
+}
+
+// Declines the request the other user sent. To them a decline looks like a block.
+message ContactDecline {
+  bytes user_id = 1;
+}
+
+// Blocks the other user, ending any contact; they are never told. After a block neither
+// user can send, edit or delete in their direct conversation, which stays as it was.
+message ContactBlock {
+  bytes user_id = 1;
+}
+
+// Removes a block. A request the block had hidden becomes an ordinary pending request.
+message ContactUnblock {
+  bytes user_id = 1;
+}
+
+enum ContactState {
+  // No relationship.
+  CONTACT_STATE_NONE = 0;
+  CONTACT_STATE_REQUESTED_OUT = 1;
+  CONTACT_STATE_REQUESTED_IN = 2;
+  CONTACT_STATE_ACCEPTED = 3;
+  CONTACT_STATE_BLOCKED = 4;
+}
+
+// One of the caller's relationships, as the caller sees it. Nobody is told that someone
+// blocked them.
+message Contact {
+  bytes user_id = 1;
+  ContactState state = 2;
+}
+
+message ListContacts {}
+
+message ContactList {
+  // Sorted by user id.
+  repeated Contact contacts = 1;
+}
+
+// A code the caller can share as a link or QR code; redeeming it makes the redeemer an
+// accepted contact of the caller.
+message CreateInvite {
+  // 60 seconds to 30 days.
+  uint32 expires_in_s = 1;
+  // 1 to 100.
+  uint32 max_uses = 2;
+}
+
+message Invite {
+  // Ten characters of Crockford base32.
+  string code = 1;
+  int64 expires_at = 2;
+  uint32 max_uses = 3;
+  uint32 uses = 4;
+}
+
+// Read case-insensitively; dashes and spaces are ignored. An unknown, revoked, expired or
+// used-up code, and one whose creator has blocked the caller, are all INVITE_NOT_FOUND.
+message RedeemInvite {
+  string code = 1;
+}
+
+message InviteRedeemed {
+  // The invite's creator, now an accepted contact.
+  bytes user_id = 1;
+}
+
+// Revokes one of the caller's invites. Revoking again does nothing.
+message RevokeInvite {
+  string code = 1;
 }
 
 message Ping {}

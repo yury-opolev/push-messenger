@@ -13,9 +13,11 @@ use push_proto::internal::v1::{
     DeleteRequest, EditRequest, ReadUpToRequest, RequestCall, SendRequest,
 };
 use push_proto::v1::{
-    self, ContentType, ConversationKind, Delete, Deliver, DirectReceipts, Edit, EntryKind,
-    ErrorCode, FetchHistory, ListConversations, ReadUpTo, SendAck, conversation_summary, delete,
-    edit, request, response,
+    self, Contact, ContactAccept, ContactBlock, ContactRequest, ContactState, ContactUnblock,
+    ContentType, ConversationKind, CreateInvite, Delete, Deliver, DirectReceipts, Done, Edit,
+    EntryKind, ErrorCode, FetchHistory, InviteRedeemed, ListContacts, ListConversations,
+    OpenDirect, ReadUpTo, RedeemInvite, RevokeInvite, SendAck, conversation_summary, delete, edit,
+    request, response,
 };
 use push_proto::{error_from_status, id_bytes};
 use tonic::{Code, Request, Status};
@@ -400,4 +402,175 @@ async fn a_failed_request_carries_its_request_id() {
     };
     let status = world.api.request(Request::new(empty)).await.unwrap_err();
     assert_eq!(failure(&status), (ErrorCode::Invalid, true));
+}
+
+async fn contacts(world: &World, of: &Person) -> Vec<Contact> {
+    let list = request::Body::ListContacts(ListContacts {});
+    let response::Body::Contacts(listed) = world.request(of, list).await.unwrap() else {
+        panic!("not a contact list");
+    };
+    listed.contacts
+}
+
+fn contact(person: &Person, state: ContactState) -> Contact {
+    Contact {
+        user_id: id_bytes(person.user.0),
+        state: state.into(),
+    }
+}
+
+#[tokio::test]
+async fn contacts_are_requested_accepted_and_blocked_and_a_block_freezes_the_chat() {
+    let world = world();
+    let (alice, bob) = (world.person().await, world.person().await);
+    let ask = request::Body::ContactRequest(ContactRequest {
+        user_id: id_bytes(bob.user.0),
+    });
+    assert_eq!(
+        world.request(&alice, ask).await.unwrap(),
+        response::Body::Contact(contact(&bob, ContactState::RequestedOut))
+    );
+    assert_eq!(
+        contacts(&world, &bob).await,
+        [contact(&alice, ContactState::RequestedIn)]
+    );
+
+    // A direct conversation needs an accepted contact.
+    let open = request::Body::OpenDirect(OpenDirect {
+        peer_user_id: id_bytes(bob.user.0),
+    });
+    let status = world.request(&alice, open.clone()).await.unwrap_err();
+    assert_eq!(failure(&status), (ErrorCode::NotContact, true));
+    let accept = request::Body::ContactAccept(ContactAccept {
+        user_id: id_bytes(alice.user.0),
+    });
+    assert_eq!(
+        world.request(&bob, accept.clone()).await.unwrap(),
+        response::Body::Done(Done {})
+    );
+    let status = world.request(&bob, accept).await.unwrap_err();
+    assert_eq!(failure(&status).0, ErrorCode::NoPendingRequest);
+    let response::Body::DirectOpened(opened) = world.request(&alice, open).await.unwrap() else {
+        panic!("not an opened conversation");
+    };
+    let from_bob = request::Body::OpenDirect(OpenDirect {
+        peer_user_id: id_bytes(alice.user.0),
+    });
+    assert_eq!(
+        world.request(&bob, from_bob).await.unwrap(),
+        response::Body::DirectOpened(opened.clone())
+    );
+    let chat = ConversationId(push_proto::id(&opened.conversation_id).unwrap());
+    let sent = world.send(&alice, chat, "before the block").await;
+
+    // After a block nobody can change the chat, which stays as evidence; nobody is told.
+    let block = request::Body::ContactBlock(ContactBlock {
+        user_id: id_bytes(alice.user.0),
+    });
+    world.request(&bob, block).await.unwrap();
+    let status = world
+        .edit(&alice, chat, message_id(&sent), "after the block")
+        .await
+        .unwrap_err();
+    assert_eq!(failure(&status).0, ErrorCode::NotContact);
+    let target = delete::Target::TargetMessageId(sent.message_id.clone());
+    let status = world.delete(&alice, chat, Some(target)).await.unwrap_err();
+    assert_eq!(failure(&status).0, ErrorCode::NotContact);
+    assert!(contacts(&world, &alice).await.is_empty());
+    assert_eq!(
+        contacts(&world, &bob).await,
+        [contact(&alice, ContactState::Blocked)]
+    );
+    let entries = world.sync(bob.device).await;
+    assert_eq!(
+        entries[0].body.as_deref(),
+        Some(b"before the block".as_slice())
+    );
+
+    let unblock = request::Body::ContactUnblock(ContactUnblock {
+        user_id: id_bytes(alice.user.0),
+    });
+    world.request(&bob, unblock).await.unwrap();
+    assert!(contacts(&world, &bob).await.is_empty());
+
+    let stranger = request::Body::ContactRequest(ContactRequest {
+        user_id: id_bytes(UserId::new().0),
+    });
+    let status = world.request(&alice, stranger).await.unwrap_err();
+    assert_eq!(failure(&status).0, ErrorCode::UserNotFound);
+    let own = request::Body::ContactRequest(ContactRequest {
+        user_id: id_bytes(alice.user.0),
+    });
+    let status = world.request(&alice, own).await.unwrap_err();
+    assert_eq!(failure(&status).0, ErrorCode::Invalid);
+}
+
+#[tokio::test]
+async fn an_invite_makes_contacts_until_it_is_revoked_and_never_reveals_a_block() {
+    let world = world();
+    let (alice, carol, dave, erin) = (
+        world.person().await,
+        world.person().await,
+        world.person().await,
+        world.person().await,
+    );
+    let create = request::Body::CreateInvite(CreateInvite {
+        expires_in_s: 3600,
+        max_uses: 3,
+    });
+    let response::Body::Invite(invite) = world.request(&alice, create).await.unwrap() else {
+        panic!("not an invite");
+    };
+    assert_eq!(invite.code.len(), 10);
+    assert_eq!((invite.max_uses, invite.uses), (3, 0));
+
+    let redeem = |code: &str| {
+        request::Body::RedeemInvite(RedeemInvite {
+            code: code.to_owned(),
+        })
+    };
+    // Codes are read case-insensitively.
+    let lower = invite.code.to_lowercase();
+    assert_eq!(
+        world.request(&carol, redeem(&lower)).await.unwrap(),
+        response::Body::InviteRedeemed(InviteRedeemed {
+            user_id: id_bytes(alice.user.0),
+        })
+    );
+    assert_eq!(
+        contacts(&world, &carol).await,
+        [contact(&alice, ContactState::Accepted)]
+    );
+
+    // The creator's block looks like an unknown code.
+    world
+        .svc
+        .contact_block(alice.user, dave.user)
+        .await
+        .unwrap();
+    let status = world
+        .request(&dave, redeem(&invite.code))
+        .await
+        .unwrap_err();
+    assert_eq!(failure(&status), (ErrorCode::InviteNotFound, true));
+
+    let revoke = request::Body::RevokeInvite(RevokeInvite {
+        code: invite.code.clone(),
+    });
+    assert_eq!(
+        world.request(&alice, revoke).await.unwrap(),
+        response::Body::Done(Done {})
+    );
+    let status = world
+        .request(&erin, redeem(&invite.code))
+        .await
+        .unwrap_err();
+    assert_eq!(failure(&status).0, ErrorCode::InviteNotFound);
+
+    let too_many = request::Body::CreateInvite(CreateInvite {
+        expires_in_s: 3600,
+        max_uses: 101,
+    });
+    let status = world.request(&alice, too_many).await.unwrap_err();
+    assert_eq!(failure(&status).0, ErrorCode::Invalid);
 }

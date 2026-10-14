@@ -1,7 +1,7 @@
 //! Between domain values and protobuf messages.
 
 use chrono::{DateTime, Utc};
-use push_domain::{ContentType, DomainError, Entry, EntryKind, SendReceipt};
+use push_domain::{ContactState, ContentType, DomainError, Entry, EntryKind, SendReceipt};
 use push_proto::v1::{self, Deliver, ErrorCode, SendAck};
 use push_proto::{error_status, id, id_bytes};
 use tonic::{Code, Status};
@@ -127,6 +127,17 @@ fn content_type(content_type: ContentType) -> v1::ContentType {
     match content_type {
         ContentType::Text => v1::ContentType::Text,
         ContentType::SystemEvent => v1::ContentType::SystemEvent,
+    }
+}
+
+/// A user's view of a relationship; `None` is no relationship.
+pub(crate) fn contact_state(state: Option<ContactState>) -> v1::ContactState {
+    match state {
+        None => v1::ContactState::None,
+        Some(ContactState::RequestedOut) => v1::ContactState::RequestedOut,
+        Some(ContactState::RequestedIn) => v1::ContactState::RequestedIn,
+        Some(ContactState::Accepted) => v1::ContactState::Accepted,
+        Some(ContactState::Blocked) => v1::ContactState::Blocked,
     }
 }
 

@@ -2,13 +2,15 @@
 
 use async_trait::async_trait;
 use prost::Message;
-use push_domain::{ContactState, Event, KickReason, Notifier, ReceiptUpdate};
+use push_domain::{Event, KickReason, Notifier, ReceiptUpdate};
 use push_proto::internal::v1::{
     self as internal, ContactChanged, DirectReceipt, EntriesAvailable, GroupReceipt, Kick,
     Notification, ReadPositionChanged, ReceiptChanged, notification::Kind, receipt_changed,
 };
 use push_proto::{id_bytes, kick_channel, notify_channel};
 use redis::aio::ConnectionManager;
+
+use crate::convert::contact_state;
 
 /// Publishes each event as small [`Notification`]s on the Redis channels of the users it
 /// concerns (`notify:{user_id}`), and kicks as [`Kick`]s on the channels of the devices
@@ -142,16 +144,6 @@ fn message(user: uuid::Uuid, kind: Kind) -> (String, Vec<u8>) {
     (notify_channel(user), notification.encode_to_vec())
 }
 
-fn contact_state(state: Option<ContactState>) -> internal::ContactState {
-    match state {
-        None => internal::ContactState::None,
-        Some(ContactState::RequestedOut) => internal::ContactState::RequestedOut,
-        Some(ContactState::RequestedIn) => internal::ContactState::RequestedIn,
-        Some(ContactState::Accepted) => internal::ContactState::Accepted,
-        Some(ContactState::Blocked) => internal::ContactState::Blocked,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use push_domain::{ConversationId, DeviceId, UserId};
@@ -269,7 +261,7 @@ mod tests {
                     notify_channel(alice.0),
                     Kind::ContactChanged(ContactChanged {
                         peer_id: id_bytes(bob.0),
-                        state: internal::ContactState::None.into(),
+                        state: push_proto::v1::ContactState::None.into(),
                     })
                 ),
                 (

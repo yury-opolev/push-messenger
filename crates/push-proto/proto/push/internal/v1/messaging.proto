@@ -168,17 +168,9 @@ message GroupReceipt {
   int64 all_read_seq = 2;
 }
 
-enum ContactState {
-  CONTACT_STATE_NONE = 0;
-  CONTACT_STATE_REQUESTED_OUT = 1;
-  CONTACT_STATE_REQUESTED_IN = 2;
-  CONTACT_STATE_ACCEPTED = 3;
-  CONTACT_STATE_BLOCKED = 4;
-}
-
 message ContactChanged {
   bytes peer_id = 1;
-  ContactState state = 2;
+  push.v1.ContactState state = 2;
 }
 
 message ReadPositionChanged {

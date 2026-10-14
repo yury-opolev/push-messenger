@@ -2,22 +2,26 @@
 //! request frames, from protobuf to the domain and back. The gateway calls them on behalf
 //! of the user and device it verified.
 
+use chrono::TimeDelta;
 use push_domain::{
     ClientMsgId, Clock, ConversationId, ConversationKind, ConversationSummary, DeleteMessage,
-    DeviceId, EditText, MAX_HISTORY_PAGE, MessageId, MessageRef, Messaging, Notifier, Receipts,
-    Store, UserId,
+    DeviceId, DomainResult, EditText, MAX_HISTORY_PAGE, MessageId, MessageRef, Messaging, Notifier,
+    Receipts, Store, UserId,
 };
 use push_proto::internal::v1::{
     DeleteRequest, EditRequest, ReadUpToRequest, ReadUpToResponse, RequestCall,
 };
 use push_proto::v1::{
-    self, ConversationList, DirectReceipts, GroupReceipts, HistoryPage, SendAck,
+    self, Contact, ContactList, ConversationList, DirectOpened, DirectReceipts, Done,
+    GroupReceipts, HistoryPage, Invite, InviteRedeemed, ListContacts, SendAck,
     conversation_summary, delete, edit, request, response,
 };
 use push_proto::{error_from_status, error_status, id_bytes};
 use tonic::Status;
 
-use crate::convert::{deliver, domain_error, from_micros, invalid, micros, parse_id, send_ack};
+use crate::convert::{
+    contact_state, deliver, domain_error, from_micros, invalid, micros, parse_id, send_ack,
+};
 
 /// `Edit`: the edit entry's receipt, after commit.
 pub(crate) async fn edit<S: Store, C: Clock, N: Notifier>(
@@ -163,7 +167,95 @@ async fn answer<S: Store, C: Clock, N: Notifier>(
                 has_more: page.has_more,
             })
         }
+        request::Body::OpenDirect(open) => {
+            let peer = parse_id(&open.peer_user_id, "peer_user_id", UserId)?;
+            let conversation = messaging
+                .open_direct(user, peer)
+                .await
+                .map_err(domain_error)?;
+            response::Body::DirectOpened(DirectOpened {
+                conversation_id: id_bytes(conversation.0),
+            })
+        }
+        request::Body::ContactRequest(contact) => {
+            let state = messaging
+                .contact_request(user, other(&contact.user_id)?)
+                .await
+                .map_err(domain_error)?;
+            response::Body::Contact(Contact {
+                user_id: contact.user_id,
+                state: contact_state(Some(state)).into(),
+            })
+        }
+        request::Body::ContactAccept(contact) => done(
+            messaging
+                .contact_accept(user, other(&contact.user_id)?)
+                .await,
+        )?,
+        request::Body::ContactDecline(contact) => done(
+            messaging
+                .contact_decline(user, other(&contact.user_id)?)
+                .await,
+        )?,
+        request::Body::ContactBlock(contact) => done(
+            messaging
+                .contact_block(user, other(&contact.user_id)?)
+                .await,
+        )?,
+        request::Body::ContactUnblock(contact) => done(
+            messaging
+                .contact_unblock(user, other(&contact.user_id)?)
+                .await,
+        )?,
+        request::Body::ListContacts(ListContacts {}) => {
+            let contacts = messaging.list_contacts(user).await.map_err(domain_error)?;
+            response::Body::Contacts(ContactList {
+                contacts: contacts
+                    .into_iter()
+                    .map(|contact| Contact {
+                        user_id: id_bytes(contact.user_id.0),
+                        state: contact_state(Some(contact.state)).into(),
+                    })
+                    .collect(),
+            })
+        }
+        request::Body::CreateInvite(create) => {
+            let expires_in = TimeDelta::seconds(i64::from(create.expires_in_s));
+            let invite = messaging
+                .create_invite(user, expires_in, create.max_uses)
+                .await
+                .map_err(domain_error)?;
+            response::Body::Invite(Invite {
+                code: invite.code,
+                expires_at: micros(invite.expires_at),
+                max_uses: invite.max_uses,
+                uses: invite.uses,
+            })
+        }
+        request::Body::RedeemInvite(redeem) => {
+            let creator = messaging
+                .redeem_invite(user, &redeem.code)
+                .await
+                .map_err(domain_error)?;
+            response::Body::InviteRedeemed(InviteRedeemed {
+                user_id: id_bytes(creator.0),
+            })
+        }
+        request::Body::RevokeInvite(revoke) => {
+            done(messaging.revoke_invite(user, &revoke.code).await)?
+        }
     })
+}
+
+/// The other user a contact request names.
+fn other(user_id: &[u8]) -> Result<UserId, Status> {
+    parse_id(user_id, "user_id", UserId)
+}
+
+/// The answer to a request that returns nothing but success.
+fn done(result: DomainResult<()>) -> Result<response::Body, Status> {
+    result.map_err(domain_error)?;
+    Ok(response::Body::Done(Done {}))
 }
 
 fn summary(summary: ConversationSummary) -> v1::ConversationSummary {
