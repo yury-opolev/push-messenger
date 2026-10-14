@@ -33,7 +33,8 @@ pub mod close {
     /// The access token is invalid (signature, audience, an unverified email) or older
     /// than the user's last password reset: sign in again.
     pub const INVALID_IDENTITY: u16 = 4001;
-    /// The access token expired: refresh it, then reconnect.
+    /// The access token expired, names a key the gateway does not hold, or no `ReAuth`
+    /// came by `exp + 30 s`: refresh it, then reconnect.
     pub const REAUTH_REQUIRED: u16 = 4002;
     /// Another connection of the device took over, or the device was revoked: stop.
     pub const TAKEN_OVER: u16 = 4003;
@@ -47,7 +48,7 @@ pub mod close {
     /// A protocol violation before `Ready`: no `Identify` within 5 s, or another frame
     /// first. Reconnect with backoff.
     pub const PROTOCOL_ERROR: u16 = 1002;
-    /// The client stopped sending frames (no `Ping` within the idle timeout).
+    /// The client sent no frame of any kind for two and a half heartbeats.
     pub const POLICY_VIOLATION: u16 = 1008;
     /// A message larger than the WebSocket limit.
     pub const MESSAGE_TOO_BIG: u16 = 1009;
