@@ -30,8 +30,8 @@
 //! conversation lock: appends and group changes take the conversation lock through
 //! [`Tx::next_seq`] first, acks and reads take only the positions lock.
 //!
-//! User locks ([`Tx::lock_users`]) come last. The global order is: contact pair (`open_direct`)
-//! → conversation row ([`Tx::next_seq`]) → conversation positions → users. `add_members`
+//! User locks ([`Tx::lock_users`]) come last. The global order is: contact pair /
+//! conversation row ([`Tx::next_seq`]) → positions → users. `add_members`
 //! takes the positions lock while it reads the group's positions, before it locks the
 //! users it adds, so never take user locks before the positions lock in a path that also
 //! takes positions. A device registration takes only its user's lock. A transaction takes
