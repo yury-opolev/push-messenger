@@ -206,6 +206,7 @@ pub(crate) fn error_frame(code: ErrorCode, message: &str) -> Body {
         message: message.to_owned(),
         retryable: false,
         client_msg_id: None,
+        request_id: None,
     })
 }
 

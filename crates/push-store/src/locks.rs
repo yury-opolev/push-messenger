@@ -37,6 +37,18 @@ pub(crate) fn conversation_positions(conversation: ConversationId) -> i64 {
     fnv1a(b"conversation-positions", &[conversation.0])
 }
 
+/// The locks serialising device registrations with conversation joins, one per user,
+/// sorted and without duplicates: every transaction takes them in the same order.
+pub(crate) fn users(users: &[UserId]) -> Vec<i64> {
+    let mut keys: Vec<i64> = users
+        .iter()
+        .map(|user| fnv1a(b"user-devices", &[user.0]))
+        .collect();
+    keys.sort_unstable();
+    keys.dedup();
+    keys
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -62,5 +74,18 @@ mod tests {
             conversation_positions(ConversationId(id)),
             fnv1a(b"contact-pair", &[id])
         );
+        assert_ne!(
+            users(&[UserId(id)]),
+            [conversation_positions(ConversationId(id))]
+        );
+    }
+
+    #[test]
+    fn user_locks_are_sorted_and_unique_in_any_order() {
+        let (a, b) = (UserId::new(), UserId::new());
+        let keys = users(&[b, a, b]);
+        assert_eq!(keys, users(&[a, b]));
+        assert_eq!(keys.len(), 2);
+        assert!(keys[0] < keys[1]);
     }
 }

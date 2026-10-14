@@ -1,5 +1,5 @@
-//! The gRPC services: `Messaging` for the gateway, `Accounts` for the worker and the
-//! DEV ONLY `DevSetup`.
+//! The gRPC services: `Messaging` for the gateway, `Accounts` for the worker, `Directory`
+//! for auth-svc and the DEV ONLY `DevSetup`.
 
 use std::sync::Arc;
 
@@ -9,17 +9,19 @@ use push_domain::{
 };
 use push_proto::id_bytes;
 use push_proto::internal::v1::{
-    AccountDevice, AccountUser, AccountsResponse, AckRequest, AckResponse, IdentifyRequest,
-    IdentifyResponse, MakeContactsRequest, MakeContactsResponse, OpenDirectRequest,
-    OpenDirectResponse, RegisterDeviceRequest, RegisterDeviceResponse, RegisterUserRequest,
-    RegisterUserResponse, SendRequest, SyncRequest, SyncResponse, accounts_server,
-    dev_setup_server, messaging_server,
+    AccountDevice, AccountUser, AccountsResponse, AckRequest, AckResponse, DeleteRequest,
+    EditRequest, IdentifyRequest, IdentifyResponse, MakeContactsRequest, MakeContactsResponse,
+    OpenDirectRequest, OpenDirectResponse, ReadUpToRequest, ReadUpToResponse,
+    RegisterDeviceRequest, RegisterDeviceResponse, RegisterUserRequest, RegisterUserResponse,
+    RequestCall, SendRequest, SyncRequest, SyncResponse, VisibleUsersRequest, VisibleUsersResponse,
+    accounts_server, dev_setup_server, directory_server, messaging_server,
 };
 use push_proto::v1::{ContentType, SendAck};
 use tonic::service::Interceptor;
 use tonic::{Request, Response, Status};
 
 use crate::convert::{deliver, domain_error, from_micros, invalid, parse_id, send_ack};
+use crate::requests;
 
 /// The `Messaging` service: what the gateway calls for a connected device. The gateway
 /// passes the user and device it verified.
@@ -108,6 +110,36 @@ where
             .map_err(domain_error)?;
         Ok(Response::new(AckResponse { moved }))
     }
+
+    async fn edit(&self, request: Request<EditRequest>) -> Result<Response<SendAck>, Status> {
+        requests::edit(&self.messaging, request.into_inner())
+            .await
+            .map(Response::new)
+    }
+
+    async fn delete(&self, request: Request<DeleteRequest>) -> Result<Response<SendAck>, Status> {
+        requests::delete(&self.messaging, request.into_inner())
+            .await
+            .map(Response::new)
+    }
+
+    async fn read_up_to(
+        &self,
+        request: Request<ReadUpToRequest>,
+    ) -> Result<Response<ReadUpToResponse>, Status> {
+        requests::read_up_to(&self.messaging, request.into_inner())
+            .await
+            .map(Response::new)
+    }
+
+    async fn request(
+        &self,
+        request: Request<RequestCall>,
+    ) -> Result<Response<push_proto::v1::Response>, Status> {
+        requests::request(&self.messaging, request.into_inner())
+            .await
+            .map(Response::new)
+    }
 }
 
 /// The `Accounts` service: auth-svc's user and device events, relayed by the worker. Every
@@ -170,49 +202,117 @@ where
         Ok(Response::new(AccountsResponse {}))
     }
 
-    /// Accepted and otherwise ignored for now: message-svc publishes kicks in Plan 7, and
-    /// the gateway acts on them (and refuses tokens older than the reset) in Plan 8.
     async fn password_reset(
         &self,
         request: Request<AccountUser>,
     ) -> Result<Response<AccountsResponse>, Status> {
-        parse_id(&request.into_inner().user_id, "user_id", UserId)?;
+        let user = parse_id(&request.into_inner().user_id, "user_id", UserId)?;
+        self.messaging
+            .password_reset(user)
+            .await
+            .map_err(domain_error)?;
         Ok(Response::new(AccountsResponse {}))
     }
 }
 
-/// Guards the `Accounts` service: a call passes only with the shared internal token in its
-/// metadata, `authorization: Bearer <token>`, compared in constant time. The
-/// gateway does not have the token, so it cannot register devices even though it can
-/// reach message-svc. Without a configured token every call is refused.
-#[derive(Clone)]
-pub struct AccountsToken {
-    expected: Option<Arc<str>>,
+/// The `Directory` service: whose profiles a user may see, for auth-svc's
+/// `GET /v1/users?ids=…` (see [`Messaging::visible_users`]).
+pub struct DirectoryApi<S, C, N> {
+    messaging: Arc<Messaging<S, C, N>>,
 }
 
-impl AccountsToken {
-    pub fn new(expected: Option<String>) -> Self {
+impl<S, C, N> DirectoryApi<S, C, N> {
+    pub fn new(messaging: Arc<Messaging<S, C, N>>) -> Self {
+        Self { messaging }
+    }
+}
+
+/// Most user ids one `VisibleUsers` call may ask about.
+pub const MAX_VISIBLE_USERS: usize = 100;
+
+#[tonic::async_trait]
+impl<S, C, N> directory_server::Directory for DirectoryApi<S, C, N>
+where
+    S: Store + 'static,
+    C: Clock + 'static,
+    N: Notifier + 'static,
+{
+    async fn visible_users(
+        &self,
+        request: Request<VisibleUsersRequest>,
+    ) -> Result<Response<VisibleUsersResponse>, Status> {
+        let request = request.into_inner();
+        let user = parse_id(&request.user_id, "user_id", UserId)?;
+        if request.user_ids.len() > MAX_VISIBLE_USERS {
+            return Err(invalid(format!(
+                "user_ids: at most {MAX_VISIBLE_USERS} ids"
+            )));
+        }
+        let candidates = request
+            .user_ids
+            .iter()
+            .map(|id| parse_id(id, "user_ids", UserId))
+            .collect::<Result<Vec<_>, _>>()?;
+        let visible = self
+            .messaging
+            .visible_users(user, &candidates)
+            .await
+            .map_err(domain_error)?;
+        Ok(Response::new(VisibleUsersResponse {
+            user_ids: visible.iter().map(|user| id_bytes(user.0)).collect(),
+        }))
+    }
+}
+
+/// Guards an internal service: a call passes only with its shared internal token in its
+/// metadata, `authorization: Bearer <token>`, compared in constant time. Each service
+/// has a token of its own, given only to its caller: the worker's for `Accounts`,
+/// auth-svc's for `Directory`. The gateway has neither, so it cannot register devices or
+/// read relationships even though it can reach message-svc. Without a configured token
+/// every call is refused.
+#[derive(Clone)]
+pub struct InternalToken {
+    expected: Option<Arc<str>>,
+    /// Why every call is refused without a configured token.
+    off: &'static str,
+    /// Why a call without the right token is refused.
+    refused: &'static str,
+}
+
+impl InternalToken {
+    /// The worker's token for `Accounts` (`PUSH_ACCOUNTS_TOKEN`).
+    pub fn accounts(expected: Option<String>) -> Self {
         Self {
             expected: expected.map(Arc::from),
+            off: "the Accounts API is off: PUSH_ACCOUNTS_TOKEN is not set",
+            refused: "the Accounts API needs the internal token",
+        }
+    }
+
+    /// auth-svc's token for `Directory` (`PUSH_DIRECTORY_TOKEN`).
+    pub fn directory(expected: Option<String>) -> Self {
+        Self {
+            expected: expected.map(Arc::from),
+            off: "the Directory API is off: PUSH_DIRECTORY_TOKEN is not set",
+            refused: "the Directory API needs the internal token",
         }
     }
 }
 
-impl std::fmt::Debug for AccountsToken {
+impl std::fmt::Debug for InternalToken {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("AccountsToken")
+            .debug_struct("InternalToken")
             .field("expected", &self.expected.as_ref().map(|_| "<redacted>"))
+            .field("off", &self.off)
             .finish()
     }
 }
 
-impl Interceptor for AccountsToken {
+impl Interceptor for InternalToken {
     fn call(&mut self, request: Request<()>) -> Result<Request<()>, Status> {
         let Some(expected) = &self.expected else {
-            return Err(Status::unauthenticated(
-                "the Accounts API is off: PUSH_ACCOUNTS_TOKEN is not set",
-            ));
+            return Err(Status::unauthenticated(self.off));
         };
         let presented = request
             .metadata()
@@ -221,9 +321,7 @@ impl Interceptor for AccountsToken {
             .and_then(|value| value.strip_prefix("Bearer "));
         match presented {
             Some(token) if same(token.as_bytes(), expected.as_bytes()) => Ok(request),
-            _ => Err(Status::unauthenticated(
-                "the Accounts API needs the internal token",
-            )),
+            _ => Err(Status::unauthenticated(self.refused)),
         }
     }
 }
@@ -324,9 +422,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use push_domain::{Event, InMemoryStore, RecordingNotifier, SystemClock};
+    use push_domain::{Event, InMemoryStore, KickReason, RecordingNotifier, SystemClock};
     use push_proto::internal::v1::accounts_server::Accounts as AccountsRpc;
     use push_proto::internal::v1::dev_setup_server::DevSetup;
+    use push_proto::internal::v1::directory_server::Directory as DirectoryRpc;
     use push_proto::internal::v1::messaging_server::Messaging as MessagingRpc;
     use push_proto::v1::{Ack, ErrorCode, Send};
     use push_proto::{error_from_status, id};
@@ -337,11 +436,13 @@ mod tests {
     type Api = MessagingApi<InMemoryStore, SystemClock, Arc<RecordingNotifier>>;
     type Accounts = AccountsApi<InMemoryStore, SystemClock, Arc<RecordingNotifier>>;
     type Setup = DevSetupApi<InMemoryStore, SystemClock, Arc<RecordingNotifier>>;
+    type Directory = DirectoryApi<InMemoryStore, SystemClock, Arc<RecordingNotifier>>;
 
     struct World {
         api: Api,
         accounts: Accounts,
         setup: Setup,
+        directory: Directory,
         notifier: Arc<RecordingNotifier>,
     }
 
@@ -355,7 +456,8 @@ mod tests {
         World {
             api: MessagingApi::new(Arc::clone(&messaging)),
             accounts: AccountsApi::new(Arc::clone(&messaging)),
-            setup: DevSetupApi::new(messaging),
+            setup: DevSetupApi::new(Arc::clone(&messaging)),
+            directory: DirectoryApi::new(messaging),
             notifier,
         }
     }
@@ -568,6 +670,92 @@ mod tests {
         }
     }
 
+    /// The error a call answered with, which must be `INVALID_ARGUMENT` naming `field`.
+    fn assert_invalid(status: Status, field: &str) {
+        assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+        let error = error_from_status(&status);
+        assert_eq!(error.code(), ErrorCode::Invalid);
+        assert!(!error.retryable);
+        assert!(error.message.starts_with(field), "{}", error.message);
+    }
+
+    #[tokio::test]
+    async fn malformed_ids_on_identify_sync_and_ack_are_invalid() {
+        let world = world();
+        let (_alice, bob, conversation) = chat(&world).await;
+        let short = vec![1, 2, 3];
+
+        let identify = |user_id: Vec<u8>, device_id: Vec<u8>| {
+            Request::new(IdentifyRequest { user_id, device_id })
+        };
+        let status = world
+            .api
+            .identify(identify(short.clone(), id_bytes(bob.device.0)))
+            .await
+            .unwrap_err();
+        assert_invalid(status, "user_id");
+        let status = world
+            .api
+            .identify(identify(id_bytes(bob.user.0), Vec::new()))
+            .await
+            .unwrap_err();
+        assert_invalid(status, "device_id");
+
+        let status = world
+            .api
+            .sync(Request::new(SyncRequest {
+                device_id: short.clone(),
+                limit: 0,
+            }))
+            .await
+            .unwrap_err();
+        assert_invalid(status, "device_id");
+
+        let ack = |device_id: Vec<u8>, conversation_id: Vec<u8>| {
+            Request::new(AckRequest {
+                device_id,
+                ack: Some(Ack {
+                    conversation_id,
+                    seq: 0,
+                }),
+            })
+        };
+        let status = world
+            .api
+            .ack(ack(short.clone(), id_bytes(conversation.0)))
+            .await
+            .unwrap_err();
+        assert_invalid(status, "device_id");
+        let status = world
+            .api
+            .ack(ack(id_bytes(bob.device.0), short))
+            .await
+            .unwrap_err();
+        assert_invalid(status, "conversation_id");
+        let status = world
+            .api
+            .ack(Request::new(AckRequest {
+                device_id: id_bytes(bob.device.0),
+                ack: None,
+            }))
+            .await
+            .unwrap_err();
+        assert_invalid(status, "ack");
+    }
+
+    #[tokio::test]
+    async fn a_sync_without_an_ack_returns_the_same_entries() {
+        let world = world();
+        let (alice, bob, conversation) = chat(&world).await;
+        for body in ["one", "two"] {
+            let request = send_request(&alice, conversation, body);
+            world.api.send(Request::new(request)).await.unwrap();
+        }
+        let first = sync(&world, bob.device, 0).await;
+        assert_eq!(first.entries.len(), 2);
+        assert_eq!(sync(&world, bob.device, 0).await, first);
+    }
+
     fn account_device(user: UserId, device: DeviceId) -> Request<AccountDevice> {
         Request::new(AccountDevice {
             user_id: id_bytes(user.0),
@@ -630,6 +818,7 @@ mod tests {
             identify(&world, user, tablet).await,
             Err(Code::PermissionDenied)
         );
+        world.notifier.take();
         world
             .accounts
             .password_reset(Request::new(AccountUser {
@@ -637,6 +826,14 @@ mod tests {
             }))
             .await
             .unwrap();
+        // The phone is kicked, to sign in again; the revoked tablet is not active.
+        assert_eq!(
+            world.notifier.take(),
+            [Event::Kick {
+                devices: vec![phone],
+                reason: KickReason::PasswordReset,
+            }]
+        );
         assert_eq!(identify(&world, user, phone).await, Ok(()));
     }
 
@@ -676,7 +873,7 @@ mod tests {
     #[test]
     fn accounts_calls_pass_only_with_the_internal_token() {
         let token = "a".repeat(32);
-        let mut guard = AccountsToken::new(Some(token.clone()));
+        let mut guard = InternalToken::accounts(Some(token.clone()));
         assert!(
             guard
                 .call(with_authorization(&format!("Bearer {token}")))
@@ -693,11 +890,82 @@ mod tests {
             assert_eq!(status.code(), Code::Unauthenticated);
             assert!(!status.message().contains(&token));
         }
-        let mut off = AccountsToken::new(None);
+        let mut off = InternalToken::accounts(None);
         let status = off
             .call(with_authorization(&format!("Bearer {token}")))
             .unwrap_err();
         assert_eq!(status.code(), Code::Unauthenticated);
         assert!(!format!("{guard:?}").contains(&token));
+    }
+
+    #[tokio::test]
+    async fn the_directory_answers_who_shares_a_contact_or_a_conversation() {
+        let world = world();
+        let (alice, bob, _chat) = chat(&world).await;
+        let stranger = person(&world).await;
+        let ask = |user: &Person, user_ids: Vec<Vec<u8>>| {
+            Request::new(VisibleUsersRequest {
+                user_id: id_bytes(user.user.0),
+                user_ids,
+            })
+        };
+        let candidates = vec![
+            id_bytes(stranger.user.0),
+            id_bytes(bob.user.0),
+            id_bytes(alice.user.0),
+        ];
+        let visible = world
+            .directory
+            .visible_users(ask(&alice, candidates))
+            .await
+            .unwrap()
+            .into_inner()
+            .user_ids;
+        let mut expected = vec![id_bytes(alice.user.0), id_bytes(bob.user.0)];
+        expected.sort();
+        assert_eq!(visible, expected);
+
+        let status = world
+            .directory
+            .visible_users(ask(&alice, vec![vec![1, 2, 3]]))
+            .await
+            .unwrap_err();
+        assert_invalid(status, "user_ids");
+        // Malformed ids would fail the parse; the limit must be checked first.
+        let too_many = vec![vec![1, 2, 3]; MAX_VISIBLE_USERS + 1];
+        let status = world
+            .directory
+            .visible_users(ask(&alice, too_many))
+            .await
+            .unwrap_err();
+        assert_invalid(status.clone(), "user_ids");
+        assert!(
+            error_from_status(&status).message.contains("at most 100"),
+            "{status:?}"
+        );
+    }
+
+    #[test]
+    fn each_internal_api_has_a_token_of_its_own() {
+        let (directory_token, accounts_token) = ("d".repeat(32), "a".repeat(32));
+        let mut directory = InternalToken::directory(Some(directory_token.clone()));
+        let bearer = |token: &str| with_authorization(&format!("Bearer {token}"));
+        assert!(directory.call(bearer(&directory_token)).is_ok());
+        let status = directory.call(bearer(&accounts_token)).unwrap_err();
+        assert_eq!(status.code(), Code::Unauthenticated);
+        assert_eq!(
+            status.message(),
+            "the Directory API needs the internal token"
+        );
+        let mut accounts = InternalToken::accounts(Some(accounts_token));
+        assert!(accounts.call(bearer(&directory_token)).is_err());
+        let status = InternalToken::directory(None)
+            .call(bearer(&directory_token))
+            .unwrap_err();
+        assert_eq!(
+            status.message(),
+            "the Directory API is off: PUSH_DIRECTORY_TOKEN is not set"
+        );
+        assert!(!format!("{directory:?}").contains(&directory_token));
     }
 }

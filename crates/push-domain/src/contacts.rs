@@ -83,7 +83,15 @@ where
         let mut tx = self.begin_pair(me, peer).await?;
         let blocked = Some(ContactState::Blocked);
         let mut events = Vec::new();
-        if set_contact(&mut tx, me, peer, blocked).await? {
+        // The block records whether `me` could see `peer` until now, so that blocking a
+        // stranger never makes them visible. A block already in place keeps its record.
+        let previous = tx.get_contact(me, peer).await?;
+        if previous != blocked {
+            let sees_peer = matches!(
+                previous,
+                Some(ContactState::RequestedIn | ContactState::Accepted)
+            );
+            tx.put_block(me, peer, sees_peer).await?;
             events.push(contact_changed(me, peer, blocked));
         }
         if tx.get_contact(peer, me).await? != blocked {
@@ -135,6 +143,31 @@ where
             .collect();
         contacts.sort_by_key(|contact| contact.user_id);
         Ok(contacts)
+    }
+
+    /// The users among `candidates` whose profiles `user` may see (spec §5.5): `user`
+    /// themselves, everyone they share or shared a conversation with, and the peers of
+    /// their contact rows as they see them: requests they received and accepted contacts,
+    /// and users they blocked, but only if they could see that user when they blocked them
+    /// (their row was a received request, an accepted contact or a block that counted).
+    /// Blocking a stranger grants nothing, or the stranger's own block would reveal
+    /// whoever blocked them. Their own pending request to someone grants nothing either.
+    /// Sorted, without duplicates. Someone who blocked `user` stays hidden unless they
+    /// share a conversation, so nobody learns of a block through it.
+    pub async fn visible_users(
+        &self,
+        user: UserId,
+        candidates: &[UserId],
+    ) -> DomainResult<Vec<UserId>> {
+        let mut tx = self.store.begin().await?;
+        let mut visible = tx.related_users(user, candidates).await?;
+        tx.rollback().await?;
+        if candidates.contains(&user) {
+            visible.push(user);
+        }
+        visible.sort();
+        visible.dedup();
+        Ok(visible)
     }
 
     /// Begins a transaction for an operation between two distinct, known users.

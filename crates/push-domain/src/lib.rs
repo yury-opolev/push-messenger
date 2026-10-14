@@ -35,7 +35,7 @@ pub use model::{
     ConversationOverview, ConversationState, ConversationSummary, Entry, EntryKind, GroupPositions,
     Invite, InviteRecord, Member, MemberState, Positions, Receipts, Role, SendReceipt, direct_key,
 };
-pub use notify::{Event, NoopNotifier, Notifier, ReceiptUpdate, RecordingNotifier};
+pub use notify::{Event, KickReason, NoopNotifier, Notifier, ReceiptUpdate, RecordingNotifier};
 pub use send::SendText;
 pub use service::{Messaging, Policy};
 pub use store::{InsertOutcome, Store, Tx};

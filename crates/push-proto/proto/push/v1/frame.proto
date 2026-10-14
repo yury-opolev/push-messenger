@@ -30,7 +30,9 @@ message Frame {
     Pong pong = 36;
   }
   // 5-31: the other client frames of spec §7.1 (ReAuth, Edit, Delete, ReadUpTo and the
-  // request frames); 37-63: the other server frames of §7.2. Assigned as they are added.
+  // request frames); 37-63: the other server frames of §7.2. Assigned as they are added:
+  // Edit, Delete, ReadUpTo, Request and Response are defined below and message-svc serves
+  // them over gRPC (Plan 7); the gateway carries them in a Frame from Plan 8.
 }
 
 // Must be the first frame, within 5 seconds of connecting.
@@ -80,7 +82,7 @@ message Send {
   reserved "ephemeral", "urgent", "attachments";
 }
 
-// The entry is durably stored. Also the answer to Edit and Delete (later plans).
+// The entry is durably stored. Also the answer to Edit and Delete.
 message SendAck {
   bytes client_msg_id = 1;
   bytes message_id = 2;
@@ -117,6 +119,301 @@ message Ack {
   int64 seq = 2;
 }
 
+// Changes the text of one of the sender's own messages (spec §4.6), within 48 hours of
+// sending it. Answered with the edit entry's SendAck.
+message Edit {
+  // The edit's own UUIDv7, chosen before the first attempt and reused on every retry.
+  bytes client_msg_id = 1;
+  bytes conversation_id = 2;
+  // The message to change: its server id, or the client_msg_id it was sent with when the
+  // client has not learned the server id yet.
+  oneof target {
+    bytes target_message_id = 3;
+    bytes target_client_msg_id = 4;
+  }
+  bytes body = 5;
+  optional int64 client_ts = 6;
+}
+
+// Erases one of the sender's own messages (spec §4.6), within 48 hours of sending it.
+// Answered with the delete entry's SendAck.
+message Delete {
+  bytes client_msg_id = 1;
+  bytes conversation_id = 2;
+  oneof target {
+    bytes target_message_id = 3;
+    bytes target_client_msg_id = 4;
+  }
+}
+
+// "I have read everything up to seq in this conversation." Positions only move forward.
+message ReadUpTo {
+  bytes conversation_id = 1;
+  int64 seq = 2;
+}
+
+// A request (spec §7.1). It is answered by a Response, or an Error, with its request_id.
+message Request {
+  // Chosen by the client.
+  uint64 request_id = 1;
+  oneof body {
+    ListConversations list_conversations = 2;
+    FetchHistory fetch_history = 3;
+    OpenDirect open_direct = 4;
+    ContactRequest contact_request = 5;
+    ContactAccept contact_accept = 6;
+    ContactDecline contact_decline = 7;
+    ContactBlock contact_block = 8;
+    ContactUnblock contact_unblock = 9;
+    ListContacts list_contacts = 10;
+    CreateInvite create_invite = 11;
+    RedeemInvite redeem_invite = 12;
+    RevokeInvite revoke_invite = 13;
+    CreateGroup create_group = 14;
+    AddMembers add_members = 15;
+    RemoveMember remove_member = 16;
+    LeaveGroup leave_group = 17;
+    RenameGroup rename_group = 18;
+    SetRole set_role = 19;
+  }
+}
+
+// The answer to a Request.
+message Response {
+  uint64 request_id = 1;
+  oneof body {
+    ConversationList conversations = 2;
+    HistoryPage history = 3;
+    DirectOpened direct_opened = 4;
+    // ContactRequest: the caller's view of the relationship now.
+    Contact contact = 5;
+    ContactList contacts = 6;
+    Invite invite = 7;
+    InviteRedeemed invite_redeemed = 8;
+    // A request that answers nothing but success.
+    Done done = 9;
+    GroupCreated group_created = 10;
+  }
+}
+
+message Done {}
+
+// The caller's conversations, current and left, sorted by id, with positions, unread
+// counts and receipt positions. A direct conversation with a user the caller has blocked
+// is left out.
+message ListConversations {
+  // Only conversations created or appended to after this time. Pass the time of the
+  // previous listing minus a safety window of a few seconds; leave it out to refresh every
+  // conversation's receipt positions, which do not count as changes.
+  optional int64 changed_since = 1;
+}
+
+enum ConversationKind {
+  CONVERSATION_KIND_UNSPECIFIED = 0;
+  CONVERSATION_KIND_DIRECT = 1;
+  CONVERSATION_KIND_GROUP = 2;
+}
+
+message ConversationList {
+  repeated ConversationSummary conversations = 1;
+}
+
+message ConversationSummary {
+  bytes conversation_id = 1;
+  ConversationKind kind = 2;
+  // Groups only.
+  optional string title = 3;
+  // The highest seq the caller may see: the end of the log, or where the caller left.
+  int64 last_seq = 4;
+  // The caller's own read position.
+  int64 read_seq = 5;
+  // Messages from others after read_seq, at most 100 ("99+").
+  uint32 unread = 6;
+  oneof receipts {
+    DirectReceipts direct = 7;
+    GroupReceipts group = 8;
+  }
+  // When the conversation was created or last appended to (as the caller last saw it, for
+  // a group they left).
+  int64 updated_at = 9;
+  // Current members, sorted; empty for a group the caller left.
+  repeated bytes members = 10;
+  // Current admins of a group, sorted.
+  repeated bytes admins = 11;
+}
+
+// The other member's positions; delivered is never below read.
+message DirectReceipts {
+  int64 peer_delivered_seq = 1;
+  int64 peer_read_seq = 2;
+}
+
+// Every message up to these positions has been delivered to (read by) every current
+// member other than its sender; never per-member positions.
+message GroupReceipts {
+  int64 all_delivered_seq = 1;
+  int64 all_read_seq = 2;
+}
+
+// Older messages and system entries of a conversation, in their current state: never
+// edit or delete entries. Limited to what the caller may see.
+message FetchHistory {
+  bytes conversation_id = 1;
+  // Exclusive; leave it out for the newest page.
+  optional int64 before_seq = 2;
+  // At most 100; 0 means 100.
+  uint32 limit = 3;
+}
+
+message HistoryPage {
+  // Oldest first.
+  repeated Deliver entries = 1;
+  // Older entries exist before this page.
+  bool has_more = 2;
+}
+
+// The direct conversation with an accepted contact, created the first time it is opened.
+message OpenDirect {
+  bytes peer_user_id = 1;
+}
+
+message DirectOpened {
+  bytes conversation_id = 1;
+}
+
+// Asks another user to become a contact (spec §5.5). If they already asked the caller,
+// both become accepted contacts at once.
+message ContactRequest {
+  bytes user_id = 1;
+}
+
+// Accepts the request the other user sent.
+message ContactAccept {
+  bytes user_id = 1;
+}
+
+// Declines the request the other user sent. To them a decline looks like a block.
+message ContactDecline {
+  bytes user_id = 1;
+}
+
+// Blocks the other user, ending any contact; they are never told. After a block neither
+// user can send, edit or delete in their direct conversation, which stays as it was.
+message ContactBlock {
+  bytes user_id = 1;
+}
+
+// Removes a block. A request the block had hidden becomes an ordinary pending request.
+message ContactUnblock {
+  bytes user_id = 1;
+}
+
+enum ContactState {
+  // No relationship.
+  CONTACT_STATE_NONE = 0;
+  CONTACT_STATE_REQUESTED_OUT = 1;
+  CONTACT_STATE_REQUESTED_IN = 2;
+  CONTACT_STATE_ACCEPTED = 3;
+  CONTACT_STATE_BLOCKED = 4;
+}
+
+// One of the caller's relationships, as the caller sees it. Nobody is told that someone
+// blocked them.
+message Contact {
+  bytes user_id = 1;
+  ContactState state = 2;
+}
+
+message ListContacts {}
+
+message ContactList {
+  // Sorted by user id.
+  repeated Contact contacts = 1;
+}
+
+// A code the caller can share as a link or QR code; redeeming it makes the redeemer an
+// accepted contact of the caller.
+message CreateInvite {
+  // 60 seconds to 30 days.
+  uint32 expires_in_s = 1;
+  // 1 to 100.
+  uint32 max_uses = 2;
+}
+
+message Invite {
+  // Ten characters of Crockford base32.
+  string code = 1;
+  int64 expires_at = 2;
+  uint32 max_uses = 3;
+  uint32 uses = 4;
+}
+
+// Read case-insensitively; dashes and spaces are ignored. An unknown, revoked, expired or
+// used-up code, and one whose creator has blocked the caller, are all INVITE_NOT_FOUND.
+// Redeeming your own code is INVALID; redeeming the code of someone you blocked is BLOCKED.
+message RedeemInvite {
+  string code = 1;
+}
+
+message InviteRedeemed {
+  // The invite's creator, now an accepted contact.
+  bytes user_id = 1;
+}
+
+// Revokes one of the caller's invites. Revoking again does nothing.
+message RevokeInvite {
+  string code = 1;
+}
+
+// A group (spec §6) with the caller as its admin. Every other member must be an accepted
+// contact of the caller; a group has at most 100 members.
+message CreateGroup {
+  // 1 to 100 characters after trimming.
+  string title = 1;
+  repeated bytes member_ids = 2;
+}
+
+message GroupCreated {
+  bytes conversation_id = 1;
+}
+
+// Admins only. The new members must be accepted contacts of the admin; they see the log
+// from the entry that adds them.
+message AddMembers {
+  bytes conversation_id = 1;
+  repeated bytes user_ids = 2;
+}
+
+// Admins only; an admin who wants to go leaves instead.
+message RemoveMember {
+  bytes conversation_id = 1;
+  bytes user_id = 2;
+}
+
+// When the last admin leaves, the member who joined first becomes admin.
+message LeaveGroup {
+  bytes conversation_id = 1;
+}
+
+// Admins only.
+message RenameGroup {
+  bytes conversation_id = 1;
+  string title = 2;
+}
+
+enum Role {
+  ROLE_UNSPECIFIED = 0;
+  ROLE_ADMIN = 1;
+  ROLE_MEMBER = 2;
+}
+
+// Admins only. A group keeps at least one admin: the last one cannot be demoted.
+message SetRole {
+  bytes conversation_id = 1;
+  bytes user_id = 2;
+  Role role = 3;
+}
+
 message Ping {}
 
 message Pong {}
@@ -137,6 +434,27 @@ enum ErrorCode {
   ERROR_CODE_UNAVAILABLE = 9;
   // Any other rejection; `message` says which.
   ERROR_CODE_REJECTED = 10;
+  // The other user does not exist (or has not verified their email yet).
+  ERROR_CODE_USER_NOT_FOUND = 11;
+  // Accept or Decline without a request from that user.
+  ERROR_CODE_NO_PENDING_REQUEST = 12;
+  // The caller has blocked the other user.
+  ERROR_CODE_BLOCKED = 13;
+  // Edit or Delete: no such message in the conversation.
+  ERROR_CODE_TARGET_NOT_FOUND = 14;
+  // Edit or Delete of someone else's message.
+  ERROR_CODE_NOT_SENDER = 15;
+  ERROR_CODE_ALREADY_DELETED = 16;
+  // Edit or Delete after the allowed time (48 hours by default).
+  ERROR_CODE_WINDOW_EXPIRED = 17;
+  // Unknown, revoked, expired or used up: one answer for all, so redeeming reveals nothing.
+  ERROR_CODE_INVITE_NOT_FOUND = 18;
+  // A group has at most 100 members.
+  ERROR_CODE_GROUP_FULL = 19;
+  ERROR_CODE_NOT_A_GROUP = 20;
+  ERROR_CODE_NOT_ADMIN = 21;
+  // A group must keep at least one admin.
+  ERROR_CODE_LAST_ADMIN = 22;
 }
 
 message Error {
@@ -144,6 +462,8 @@ message Error {
   string message = 2;
   // Whether the same frame may succeed if sent again unchanged.
   bool retryable = 3;
-  // Set when the error answers a Send.
+  // Set when the error answers a Send, Edit or Delete.
   optional bytes client_msg_id = 4;
+  // Set when the error answers a Request.
+  optional uint64 request_id = 5;
 }

@@ -79,6 +79,7 @@ at start-up.
 | `PUSH_HEALTH_ADDR` | address of `/healthz` and `/readyz` | `0.0.0.0:8081` |
 | `PUSH_DB_MAX_CONNECTIONS` | pool size, at least 1 | `10` |
 | `PUSH_ACCOUNTS_TOKEN` | the worker's token for the `Accounts` API, 32 to 256 visible ASCII characters; without it `Accounts` refuses every call | none |
+| `PUSH_DIRECTORY_TOKEN` | auth-svc's token for the `Directory` API, 32 to 256 visible ASCII characters and different from `PUSH_ACCOUNTS_TOKEN`; without it `Directory` refuses every call | none |
 | `PUSH_DEV_SETUP` | `1` registers the DEV ONLY `DevSetup` service | off |
 
 `push-gateway`:
@@ -109,6 +110,8 @@ at start-up.
 | `PUSH_HEALTH_ADDR` | address of `/healthz` and `/readyz` | `0.0.0.0:8081` |
 | `PUSH_DB_MAX_CONNECTIONS` | pool size, at least 1 | `10` |
 | `PUSH_AUTH_WORKER_ROLE` | the worker's role: granted `auth.outbox` and the two cleanup functions at start-up | none |
+| `PUSH_MESSAGE_SVC_URL` | gRPC URL of message-svc, `http://host:50051` (plain `http://` only), asked whose profiles a caller may see; without it `GET /v1/users` answers 503 | none |
+| `PUSH_DIRECTORY_TOKEN` | message-svc's token for its `Directory` API, the same value as message-svc's, 32 to 256 visible ASCII characters; required with `PUSH_MESSAGE_SVC_URL` | none |
 
 `push-worker`:
 

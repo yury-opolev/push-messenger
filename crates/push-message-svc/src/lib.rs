@@ -1,16 +1,20 @@
 //! push-message-svc: the messaging core of push-messenger (spec §2) as a gRPC service.
 //!
-//! It owns the `messaging` schema (through `push-store`), answers the gateway's calls,
-//! records the users and devices the worker relays from auth-svc and, after every commit,
-//! rings the affected users' Redis channels so their gateways sync them.
+//! It owns the `messaging` schema (through `push-store`), answers the gateway's calls on
+//! behalf of connected devices (every client frame of spec §7.1), records the users and
+//! devices the worker relays from auth-svc and, after every commit, rings the affected
+//! users' Redis channels so their gateways sync them, and kicks revoked devices.
 
 mod config;
 mod convert;
 mod grpc;
 mod notify;
+mod requests;
 mod server;
 
 pub use config::{Config, ConfigError};
-pub use grpc::{AccountsApi, AccountsToken, DevSetupApi, MessagingApi};
+pub use grpc::{
+    AccountsApi, DevSetupApi, DirectoryApi, InternalToken, MAX_VISIBLE_USERS, MessagingApi,
+};
 pub use notify::RedisNotifier;
 pub use server::{init_logging, serve, terminated};

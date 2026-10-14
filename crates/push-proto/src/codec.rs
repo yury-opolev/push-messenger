@@ -59,24 +59,75 @@ pub fn notify_channel(user: Uuid) -> String {
     format!("notify:{user}")
 }
 
+/// The Redis channel message-svc publishes a device's
+/// [`Kick`](crate::internal::v1::Kick) on, and the gateway holding the device subscribes
+/// to: `kick:{device_id}`.
+pub fn kick_channel(device: Uuid) -> String {
+    format!("kick:{device}")
+}
+
 /// A gRPC status carrying `error` for the client, as message-svc answers.
+///
+/// The details (`grpc-status-details-bin`) follow gRPC's rich error model: a
+/// `google.rpc.Status` whose `details` hold the `push.v1.Error` as a `google.protobuf.Any`
+/// (type URL [`ERROR_TYPE_URL`]), so any gRPC tool can read them.
 pub fn error_status(code: tonic::Code, error: Error) -> tonic::Status {
     let message = error.message.clone();
-    tonic::Status::with_details(code, message, error.encode_to_vec().into())
+    let details = RpcStatus {
+        code: code as i32,
+        message: message.clone(),
+        details: vec![Any {
+            type_url: ERROR_TYPE_URL.to_owned(),
+            value: error.encode_to_vec(),
+        }],
+    };
+    tonic::Status::with_details(code, message, details.encode_to_vec().into())
 }
 
 /// The client error a gRPC status carries. A status without one — message-svc is
 /// unreachable, or failed before answering — becomes a retryable `UNAVAILABLE`.
 pub fn error_from_status(status: &tonic::Status) -> Error {
-    match Error::decode(status.details()) {
-        Ok(error) if error.code() != ErrorCode::Unspecified => error,
+    let carried = RpcStatus::decode(status.details())
+        .ok()
+        .and_then(|rich| {
+            rich.details
+                .into_iter()
+                .find(|detail| detail.type_url == ERROR_TYPE_URL)
+        })
+        .and_then(|detail| Error::decode(detail.value.as_slice()).ok());
+    match carried {
+        Some(error) if error.code() != ErrorCode::Unspecified => error,
         _ => Error {
             code: ErrorCode::Unavailable.into(),
             message: "the message service is unavailable".to_owned(),
             retryable: true,
             client_msg_id: None,
+            request_id: None,
         },
     }
+}
+
+/// The type URL of a `push.v1.Error` packed in a `google.protobuf.Any`.
+pub const ERROR_TYPE_URL: &str = "type.googleapis.com/push.v1.Error";
+
+/// `google.rpc.Status`: what gRPC's rich error model puts in `grpc-status-details-bin`.
+#[derive(Clone, PartialEq, prost::Message)]
+struct RpcStatus {
+    #[prost(int32, tag = "1")]
+    code: i32,
+    #[prost(string, tag = "2")]
+    message: String,
+    #[prost(message, repeated, tag = "3")]
+    details: Vec<Any>,
+}
+
+/// `google.protobuf.Any`.
+#[derive(Clone, PartialEq, prost::Message)]
+struct Any {
+    #[prost(string, tag = "1")]
+    type_url: String,
+    #[prost(bytes = "vec", tag = "2")]
+    value: Vec<u8>,
 }
 
 #[cfg(test)]
@@ -134,11 +185,15 @@ mod tests {
     }
 
     #[test]
-    fn a_users_channel_is_named_after_the_user() {
+    fn channels_are_named_after_their_user_or_device() {
         let user = Uuid::parse_str("0192f5a0-0000-7000-8000-000000000001").unwrap();
         assert_eq!(
             notify_channel(user),
             "notify:0192f5a0-0000-7000-8000-000000000001"
+        );
+        assert_eq!(
+            kick_channel(user),
+            "kick:0192f5a0-0000-7000-8000-000000000001"
         );
     }
 
@@ -149,6 +204,7 @@ mod tests {
             message: "the users are not accepted contacts".to_owned(),
             retryable: false,
             client_msg_id: Some(id_bytes(Uuid::now_v7())),
+            request_id: Some(7),
         };
         let status = error_status(tonic::Code::FailedPrecondition, error.clone());
         assert_eq!(status.code(), tonic::Code::FailedPrecondition);
@@ -161,5 +217,50 @@ mod tests {
         let error = error_from_status(&tonic::Status::unavailable("connection refused"));
         assert_eq!(error.code(), ErrorCode::Unavailable);
         assert!(error.retryable);
+    }
+
+    #[test]
+    fn the_details_are_a_google_rpc_status_with_the_error_as_any() {
+        let error = Error {
+            code: ErrorCode::NotMember.into(),
+            message: "not a member of this conversation".to_owned(),
+            retryable: false,
+            client_msg_id: None,
+            request_id: None,
+        };
+        let status = error_status(tonic::Code::FailedPrecondition, error.clone());
+        let rich = RpcStatus::decode(status.details()).unwrap();
+        assert_eq!(rich.code, tonic::Code::FailedPrecondition as i32);
+        assert_eq!(rich.message, "not a member of this conversation");
+        assert_eq!(rich.details.len(), 1);
+        assert_eq!(rich.details[0].type_url, ERROR_TYPE_URL);
+        assert_eq!(Error::decode(rich.details[0].value.as_slice()), Ok(error));
+
+        // A bare push.v1.Error, or an Any of another type, is not a client error.
+        let bare = tonic::Status::with_details(
+            tonic::Code::FailedPrecondition,
+            "bare",
+            Error {
+                code: ErrorCode::NotMember.into(),
+                ..Error::default()
+            }
+            .encode_to_vec()
+            .into(),
+        );
+        assert_eq!(error_from_status(&bare).code(), ErrorCode::Unavailable);
+        let other = RpcStatus {
+            code: tonic::Code::FailedPrecondition as i32,
+            message: "other".to_owned(),
+            details: vec![Any {
+                type_url: "type.googleapis.com/google.rpc.ErrorInfo".to_owned(),
+                value: rich.details[0].value.clone(),
+            }],
+        };
+        let other = tonic::Status::with_details(
+            tonic::Code::FailedPrecondition,
+            "other",
+            other.encode_to_vec().into(),
+        );
+        assert_eq!(error_from_status(&other).code(), ErrorCode::Unavailable);
     }
 }

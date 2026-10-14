@@ -14,6 +14,7 @@ use push_store::{StoreOptions, check_database_url};
 /// | `PUSH_HEALTH_ADDR` | address of `/healthz` and `/readyz` | `0.0.0.0:8081` |
 /// | `PUSH_DB_MAX_CONNECTIONS` | pool size, at least 1 | `10` |
 /// | `PUSH_ACCOUNTS_TOKEN` | the worker's token for the `Accounts` API, 32 to 256 visible ASCII characters; without it `Accounts` refuses every call | none |
+/// | `PUSH_DIRECTORY_TOKEN` | auth-svc's token for the `Directory` API, 32 to 256 visible ASCII characters and different from `PUSH_ACCOUNTS_TOKEN`; without it `Directory` refuses every call | none |
 /// | `PUSH_DEV_SETUP` | `1` registers the DEV ONLY `DevSetup` service | off |
 #[derive(Clone, PartialEq, Eq)]
 pub struct Config {
@@ -23,6 +24,7 @@ pub struct Config {
     pub health_addr: SocketAddr,
     pub store: StoreOptions,
     pub accounts_token: Option<String>,
+    pub directory_token: Option<String>,
     pub dev_setup: bool,
 }
 
@@ -38,6 +40,10 @@ impl std::fmt::Debug for Config {
             .field(
                 "accounts_token",
                 &self.accounts_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "directory_token",
+                &self.directory_token.as_ref().map(|_| "<redacted>"),
             )
             .field("dev_setup", &self.dev_setup)
             .finish()
@@ -88,9 +94,14 @@ impl Config {
                 "not a valid Redis URL, expected redis://[:password@]host:6379".to_owned(),
             )
         })?;
-        let accounts_token = lookup("PUSH_ACCOUNTS_TOKEN").filter(|value| !value.is_empty());
-        if let Some(token) = &accounts_token {
-            check_token(token).map_err(|reason| redacted("PUSH_ACCOUNTS_TOKEN", reason))?;
+        let accounts_token = token(&lookup, "PUSH_ACCOUNTS_TOKEN")?;
+        let directory_token = token(&lookup, "PUSH_DIRECTORY_TOKEN")?;
+        if accounts_token.is_some() && accounts_token == directory_token {
+            return Err(redacted(
+                "PUSH_DIRECTORY_TOKEN",
+                "must differ from PUSH_ACCOUNTS_TOKEN: each internal API has a token of its own"
+                    .to_owned(),
+            ));
         }
         Ok(Self {
             database_url,
@@ -99,9 +110,22 @@ impl Config {
             health_addr: parsed(&lookup, "PUSH_HEALTH_ADDR", ([0, 0, 0, 0], 8081).into())?,
             store,
             accounts_token,
+            directory_token,
             dev_setup: dev_flag(&lookup, "PUSH_DEV_SETUP")?,
         })
     }
+}
+
+/// An internal token: unset or empty is `None`; otherwise it must pass [`check_token`].
+fn token(
+    lookup: &impl Fn(&str) -> Option<String>,
+    name: &'static str,
+) -> Result<Option<String>, ConfigError> {
+    let token = lookup(name).filter(|value| !value.is_empty());
+    if let Some(token) = &token {
+        check_token(token).map_err(|reason| redacted(name, reason))?;
+    }
+    Ok(token)
 }
 
 /// A shared token fit for a header: 32 to 256 visible ASCII characters.
@@ -193,24 +217,48 @@ mod tests {
         assert_eq!(config.health_addr, "0.0.0.0:8081".parse().unwrap());
         assert_eq!(config.store, StoreOptions::default());
         assert_eq!(config.accounts_token, None);
+        assert_eq!(config.directory_token, None);
         assert!(!config.dev_setup);
     }
 
     #[test]
-    fn the_accounts_token_is_checked_and_never_shown() {
-        let token = "t0ken-".repeat(6);
+    fn the_internal_tokens_are_checked_and_never_shown() {
+        let (accounts, directory) = ("t0ken-".repeat(6), "d1rectory-".repeat(4));
         let mut variables = REQUIRED.to_vec();
-        variables.push(("PUSH_ACCOUNTS_TOKEN", &token));
+        variables.push(("PUSH_ACCOUNTS_TOKEN", &accounts));
+        variables.push(("PUSH_DIRECTORY_TOKEN", &directory));
         let configured = config(&variables).unwrap();
-        assert_eq!(configured.accounts_token.as_deref(), Some(token.as_str()));
-        assert!(!format!("{configured:?}").contains(&token));
-        for bad in ["too-short", "with a space but long enough to pass 32"] {
-            let mut variables = REQUIRED.to_vec();
-            variables.push(("PUSH_ACCOUNTS_TOKEN", bad));
-            let message = config(&variables).unwrap_err().to_string();
-            assert!(message.contains("PUSH_ACCOUNTS_TOKEN"), "{message}");
-            assert!(!message.contains(bad), "{message}");
+        assert_eq!(
+            configured.accounts_token.as_deref(),
+            Some(accounts.as_str())
+        );
+        assert_eq!(
+            configured.directory_token.as_deref(),
+            Some(directory.as_str())
+        );
+        let shown = format!("{configured:?}");
+        assert!(!shown.contains(&accounts) && !shown.contains(&directory));
+        for name in ["PUSH_ACCOUNTS_TOKEN", "PUSH_DIRECTORY_TOKEN"] {
+            for bad in ["too-short", "with a space but long enough to pass 32"] {
+                let mut variables = REQUIRED.to_vec();
+                variables.push((name, bad));
+                let message = config(&variables).unwrap_err().to_string();
+                assert!(message.contains(name), "{message}");
+                assert!(!message.contains(bad), "{message}");
+            }
         }
+    }
+
+    #[test]
+    fn the_two_internal_tokens_must_differ() {
+        let shared = "s4me-".repeat(8);
+        let mut variables = REQUIRED.to_vec();
+        variables.push(("PUSH_ACCOUNTS_TOKEN", &shared));
+        variables.push(("PUSH_DIRECTORY_TOKEN", &shared));
+        let message = config(&variables).unwrap_err().to_string();
+        assert!(message.contains("PUSH_ACCOUNTS_TOKEN"), "{message}");
+        assert!(message.contains("PUSH_DIRECTORY_TOKEN"), "{message}");
+        assert!(!message.contains(&shared), "{message}");
     }
 
     #[test]

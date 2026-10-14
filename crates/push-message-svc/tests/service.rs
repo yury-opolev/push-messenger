@@ -1,6 +1,6 @@
 //! The whole service on real Postgres and Redis (Docker must be running): readiness, the
-//! dev setup calls, the worker's account events, a send that rings the recipient's Redis
-//! channel, sync, ack, and graceful shutdown.
+//! dev setup calls, the worker's account events (a revocation kicks the device on Redis),
+//! a send that rings the recipient's Redis channel, sync, ack, and graceful shutdown.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -9,14 +9,19 @@ use prost::Message;
 use push_message_svc::{Config, serve};
 use push_proto::internal::v1::accounts_client::AccountsClient;
 use push_proto::internal::v1::dev_setup_client::DevSetupClient;
+use push_proto::internal::v1::directory_client::DirectoryClient;
 use push_proto::internal::v1::messaging_client::MessagingClient;
 use push_proto::internal::v1::{
-    AccountDevice, AckRequest, IdentifyRequest, MakeContactsRequest, Notification,
-    OpenDirectRequest, RegisterDeviceRequest, RegisterUserRequest, SendRequest, SyncRequest,
-    notification::Kind,
+    AccountDevice, AckRequest, EditRequest, IdentifyRequest, Kick, KickReason, MakeContactsRequest,
+    Notification, OpenDirectRequest, ReadUpToRequest, RegisterDeviceRequest, RegisterUserRequest,
+    RequestCall, SendRequest, SyncRequest, VisibleUsersRequest, notification::Kind,
 };
-use push_proto::v1::{Ack, ContentType, Send};
-use push_proto::{id_bytes, notify_channel};
+use push_proto::v1::{
+    self, Ack, ContactAccept, ContactRequest, ContentType, CreateGroup, CreateInvite, Edit,
+    FetchHistory, GroupReceipts, ListConversations, ReadUpTo, RedeemInvite, Send,
+    conversation_summary, edit, request, response,
+};
+use push_proto::{id_bytes, kick_channel, notify_channel};
 use push_store::StoreOptions;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::redis::Redis;
@@ -29,11 +34,15 @@ use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
 use tonic::Request;
 use tonic::metadata::MetadataValue;
+use tonic::service::Interceptor;
+use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
 use uuid::Uuid;
 
 /// The worker's token for the `Accounts` API.
 const ACCOUNTS_TOKEN: &str = "accounts-token-for-the-service-tests";
+/// auth-svc's token for the `Directory` API.
+const DIRECTORY_TOKEN: &str = "directory-token-for-the-service-tests";
 
 struct Running {
     _postgres: ContainerAsync<Postgres>,
@@ -75,6 +84,7 @@ async fn start(dev_setup: bool) -> Running {
         health_addr: health,
         store: StoreOptions::default(),
         accounts_token: Some(ACCOUNTS_TOKEN.to_owned()),
+        directory_token: Some(DIRECTORY_TOKEN.to_owned()),
         dev_setup,
     };
     let shutdown = CancellationToken::new();
@@ -119,6 +129,7 @@ async fn shutdown_is_honoured_while_the_database_is_unreachable() {
         health_addr: health.local_addr().unwrap(),
         store: StoreOptions::default(),
         accounts_token: None,
+        directory_token: None,
         dev_setup: false,
     };
     let shutdown = CancellationToken::new();
@@ -301,7 +312,21 @@ async fn accounts_are_served_and_dev_setup_is_absent_unless_enabled() {
     });
     accounts.device_registered(event.clone()).await.unwrap();
     messaging.identify(identify.clone()).await.unwrap();
+
+    // A revocation kicks the device through its Redis channel.
+    let mut bell = redis::Client::open(running.redis_url.as_str())
+        .unwrap()
+        .get_async_pubsub()
+        .await
+        .unwrap();
+    bell.subscribe(kick_channel(device)).await.unwrap();
     accounts.device_revoked(event).await.unwrap();
+    let kicked = tokio::time::timeout(Duration::from_secs(5), bell.on_message().next())
+        .await
+        .expect("the device's channel rings within 5 s")
+        .unwrap();
+    let kick = Kick::decode(kicked.get_payload_bytes()).unwrap();
+    assert_eq!(kick.reason(), KickReason::DeviceRevoked);
     let status = messaging.identify(identify).await.unwrap_err();
     assert_eq!(status.code(), tonic::Code::PermissionDenied);
 
@@ -313,6 +338,205 @@ async fn accounts_are_served_and_dev_setup_is_absent_unless_enabled() {
         .await
         .unwrap_err();
     assert_eq!(status.code(), tonic::Code::Unimplemented);
+    running.shutdown.cancel();
+    running.server.await.unwrap().unwrap();
+}
+
+/// The Accounts client the worker uses, with the internal token.
+async fn accounts_client(
+    url: String,
+) -> AccountsClient<InterceptedService<Channel, impl Interceptor>> {
+    let channel = Channel::from_shared(url).unwrap().connect().await.unwrap();
+    let bearer: MetadataValue<_> = format!("Bearer {ACCOUNTS_TOKEN}").parse().unwrap();
+    AccountsClient::with_interceptor(channel, move |mut request: Request<()>| {
+        request
+            .metadata_mut()
+            .insert("authorization", bearer.clone());
+        Ok(request)
+    })
+}
+
+/// A request frame as `user`.
+fn call(user: Uuid, body: request::Body) -> RequestCall {
+    RequestCall {
+        user_id: id_bytes(user),
+        request: Some(v1::Request {
+            request_id: 1,
+            body: Some(body),
+        }),
+    }
+}
+
+#[tokio::test]
+async fn the_client_requests_and_the_directory_run_on_postgres() {
+    let running = start(false).await;
+    let url = format!("http://{}", running.grpc);
+    let mut accounts = accounts_client(url.clone()).await;
+    let mut messaging = MessagingClient::connect(url).await.unwrap();
+    let (alice, bob, carol) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+    let devices = [Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7()];
+    for (user, device) in [alice, bob, carol].into_iter().zip(devices) {
+        accounts
+            .device_registered(AccountDevice {
+                user_id: id_bytes(user),
+                device_id: id_bytes(device),
+            })
+            .await
+            .unwrap();
+    }
+
+    // Alice invites Bob; Carol asks Alice, who accepts.
+    let create = request::Body::CreateInvite(CreateInvite {
+        expires_in_s: 600,
+        max_uses: 1,
+    });
+    let Some(response::Body::Invite(invite)) = messaging
+        .request(call(alice, create))
+        .await
+        .unwrap()
+        .into_inner()
+        .body
+    else {
+        panic!("not an invite");
+    };
+    let redeem = request::Body::RedeemInvite(RedeemInvite { code: invite.code });
+    messaging.request(call(bob, redeem)).await.unwrap();
+    let ask = request::Body::ContactRequest(ContactRequest {
+        user_id: id_bytes(alice),
+    });
+    messaging.request(call(carol, ask)).await.unwrap();
+    let accept = request::Body::ContactAccept(ContactAccept {
+        user_id: id_bytes(carol),
+    });
+    messaging.request(call(alice, accept)).await.unwrap();
+
+    let group = request::Body::CreateGroup(CreateGroup {
+        title: "Trip".to_owned(),
+        member_ids: vec![id_bytes(bob), id_bytes(carol)],
+    });
+    let Some(response::Body::GroupCreated(created)) = messaging
+        .request(call(alice, group))
+        .await
+        .unwrap()
+        .into_inner()
+        .body
+    else {
+        panic!("not a created group");
+    };
+    let sent = messaging
+        .send(SendRequest {
+            user_id: id_bytes(alice),
+            device_id: id_bytes(devices[0]),
+            send: Some(Send {
+                client_msg_id: id_bytes(Uuid::now_v7()),
+                conversation_id: created.conversation_id.clone(),
+                content_type: ContentType::Text.into(),
+                body: b"helo".to_vec(),
+                client_ts: None,
+            }),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    messaging
+        .edit(EditRequest {
+            user_id: id_bytes(alice),
+            device_id: id_bytes(devices[0]),
+            edit: Some(Edit {
+                client_msg_id: id_bytes(Uuid::now_v7()),
+                conversation_id: created.conversation_id.clone(),
+                target: Some(edit::Target::TargetMessageId(sent.message_id)),
+                body: b"hello".to_vec(),
+                client_ts: None,
+            }),
+        })
+        .await
+        .unwrap();
+    let read = messaging
+        .read_up_to(ReadUpToRequest {
+            user_id: id_bytes(bob),
+            read: Some(ReadUpTo {
+                conversation_id: created.conversation_id.clone(),
+                seq: sent.seq,
+            }),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(read.moved);
+
+    let fetch = request::Body::FetchHistory(FetchHistory {
+        conversation_id: created.conversation_id.clone(),
+        before_seq: None,
+        limit: 0,
+    });
+    let Some(response::Body::History(page)) = messaging
+        .request(call(carol, fetch))
+        .await
+        .unwrap()
+        .into_inner()
+        .body
+    else {
+        panic!("not a history page");
+    };
+    let bodies: Vec<Option<&[u8]>> = page
+        .entries
+        .iter()
+        .map(|entry| entry.body.as_deref())
+        .collect();
+    assert_eq!(bodies.len(), 2, "the created entry and the message");
+    assert_eq!(bodies[1], Some(b"hello".as_slice()));
+
+    let list = request::Body::ListConversations(ListConversations::default());
+    let Some(response::Body::Conversations(listed)) = messaging
+        .request(call(alice, list))
+        .await
+        .unwrap()
+        .into_inner()
+        .body
+    else {
+        panic!("not a conversation list");
+    };
+    assert_eq!(listed.conversations.len(), 1);
+    assert_eq!(listed.conversations[0].title.as_deref(), Some("Trip"));
+    assert_eq!(
+        listed.conversations[0].receipts,
+        Some(conversation_summary::Receipts::Group(GroupReceipts {
+            all_delivered_seq: 1,
+            all_read_seq: 1,
+        })),
+        "Bob read the message, Carol did not: only the created entry counts as read by all"
+    );
+
+    // auth-svc asks whose profiles Carol may see: her contact Alice and Bob, from the
+    // group, but not a stranger.
+    let channel = Channel::from_shared(format!("http://{}", running.grpc))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let ask = VisibleUsersRequest {
+        user_id: id_bytes(carol),
+        user_ids: vec![id_bytes(Uuid::now_v7()), id_bytes(bob), id_bytes(alice)],
+    };
+    let status = DirectoryClient::new(channel.clone())
+        .visible_users(ask.clone())
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::Unauthenticated);
+    let bearer: MetadataValue<_> = format!("Bearer {DIRECTORY_TOKEN}").parse().unwrap();
+    let mut directory =
+        DirectoryClient::with_interceptor(channel, move |mut request: Request<()>| {
+            request
+                .metadata_mut()
+                .insert("authorization", bearer.clone());
+            Ok(request)
+        });
+    let visible = directory.visible_users(ask).await.unwrap().into_inner();
+    let mut expected = vec![id_bytes(alice), id_bytes(bob)];
+    expected.sort();
+    assert_eq!(visible.user_ids, expected);
+
     running.shutdown.cancel();
     running.server.await.unwrap().unwrap();
 }

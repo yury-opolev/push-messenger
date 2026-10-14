@@ -9,7 +9,7 @@ use chrono::Utc;
 use push_auth::outbox::Event;
 use push_domain::{InMemoryStore, Messaging, RecordingNotifier, SystemClock};
 use push_email::{LogSender, Templates};
-use push_message_svc::{AccountsApi, AccountsToken, MessagingApi};
+use push_message_svc::{AccountsApi, InternalToken, MessagingApi};
 use push_proto::id_bytes;
 use push_proto::internal::v1::IdentifyRequest;
 use push_proto::internal::v1::accounts_server::AccountsServer;
@@ -113,7 +113,7 @@ async fn message_svc() -> String {
         ))))
         .add_service(AccountsServer::with_interceptor(
             AccountsApi::new(messaging),
-            AccountsToken::new(Some(ACCOUNTS_TOKEN.to_owned())),
+            InternalToken::accounts(Some(ACCOUNTS_TOKEN.to_owned())),
         ))
         .serve_with_incoming(TcpListenerStream::new(listener));
     tokio::spawn(server);

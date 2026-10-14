@@ -4,7 +4,7 @@ use crate::clock::Clock;
 use crate::error::{DomainError, DomainResult};
 use crate::ids::{DeviceId, UserId};
 use crate::model::Member;
-use crate::notify::{Event, Notifier};
+use crate::notify::{Event, KickReason, Notifier};
 use crate::store::{Store, Tx};
 
 /// Server settings for changing messages after they are sent.
@@ -74,6 +74,7 @@ where
         if !tx.user_exists(user).await? {
             return Err(DomainError::UnknownUser);
         }
+        tx.lock_users(&[user]).await?;
         if !tx.insert_device(device, user).await? {
             return Err(DomainError::UnknownDevice);
         }
@@ -95,6 +96,7 @@ where
     pub async fn device_registered(&self, device: DeviceId, user: UserId) -> DomainResult<()> {
         let mut tx = self.store.begin().await?;
         tx.insert_user(user).await?;
+        tx.lock_users(&[user]).await?;
         if tx.insert_device(device, user).await? {
             create_cursors(&mut tx, device, user).await?;
         } else if tx.device_user(device).await? != Some(user) {
@@ -106,7 +108,8 @@ where
     /// auth-svc revoked `device` of `user` (`device.revoked`, relayed by the worker).
     /// Idempotent and correct in any order: a revocation that arrives before the
     /// registration records the device as revoked, so the registration cannot bring it
-    /// back. A device id that belongs to another user is `UnknownDevice`.
+    /// back. A device id that belongs to another user is `UnknownDevice`. After the commit
+    /// the device is kicked, every time: a repeated kick is harmless.
     pub async fn device_revoked(&self, device: DeviceId, user: UserId) -> DomainResult<()> {
         let mut tx = self.store.begin().await?;
         tx.insert_user(user).await?;
@@ -114,7 +117,32 @@ where
             return Err(DomainError::UnknownDevice);
         }
         tx.revoke_device(device).await?;
-        tx.commit().await
+        tx.commit().await?;
+        self.publish(vec![Event::Kick {
+            devices: vec![device],
+            reason: KickReason::DeviceRevoked,
+        }])
+        .await;
+        Ok(())
+    }
+
+    /// auth-svc reset `user`'s password (`user.password_reset`, relayed by the worker):
+    /// every active device of the user is kicked, to sign in again with the new password.
+    /// The devices stay registered. Changes nothing, so a repeated event only kicks again;
+    /// a user message-svc has not heard of has no devices to kick.
+    pub async fn password_reset(&self, user: UserId) -> DomainResult<()> {
+        let mut tx = self.store.begin().await?;
+        let mut devices = tx.devices_of_user(user).await?;
+        tx.rollback().await?;
+        if !devices.is_empty() {
+            devices.sort();
+            self.publish(vec![Event::Kick {
+                devices,
+                reason: KickReason::PasswordReset,
+            }])
+            .await;
+        }
+        Ok(())
     }
 
     /// Publishes events after a commit. Publishes nothing when there is nothing to say.
@@ -149,7 +177,9 @@ where
 }
 
 /// Starts a new device up to date in every conversation of its user, including ones the
-/// user has left (up to where they left).
+/// user has left (up to where they left). The caller holds the user's lock
+/// ([`Tx::lock_users`]), so no membership of the user is being created meanwhile: every
+/// membership gets a position, here or by the join.
 async fn create_cursors<T: Tx>(tx: &mut T, device: DeviceId, user: UserId) -> DomainResult<()> {
     for (conversation, member) in tx.memberships(user).await? {
         let position = member.visible_upper(conversation.last_seq);

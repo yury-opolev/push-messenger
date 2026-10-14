@@ -4,6 +4,7 @@
 //! `push-store` runs them.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::TimeDelta;
 use push_domain::{
@@ -255,6 +256,65 @@ async fn concurrent_registrations_of_one_device_give_it_one_owner<B: Backend>(ba
     }
 }
 
+/// A device relayed while its user joins a conversation must still receive everything
+/// from the join on, even when the relay repeats `device.registered` (at least once).
+/// Without a lock on the user, each transaction misses the other's uncommitted row: the
+/// join finds no new device, the registration no new membership, and the repeated
+/// registration then starts the device at the end of the log, past entries it never
+/// received.
+async fn a_device_registered_during_a_join_misses_nothing<B: Backend>(backend: &B) {
+    let world = Arc::new(World::new(backend).await);
+    let (alice, bob, carol) = (
+        world.person().await,
+        world.person().await,
+        world.person().await,
+    );
+    let group = world.group(&alice, &[&bob]).await;
+    world.befriend(&alice, &carol).await;
+    let phone = DeviceId::new();
+
+    // An uncommitted position of Carol's first device makes the join wait in the middle:
+    // after it has written Carol's member row and listed her devices, before it commits.
+    let mut holder = world.store.begin().await.unwrap();
+    holder
+        .create_cursor_if_absent(carol.device, group, 0)
+        .await
+        .unwrap();
+    let join = {
+        let world = Arc::clone(&world);
+        tokio::spawn(async move {
+            world
+                .svc
+                .add_members(alice.user, group, &[carol.user])
+                .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let registration = {
+        let world = Arc::clone(&world);
+        tokio::spawn(async move { world.svc.device_registered(phone, carol.user).await })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    holder.rollback().await.unwrap();
+    join.await.unwrap().unwrap();
+    registration.await.unwrap().unwrap();
+
+    let sent = world.send(&alice, group, "after the join").await;
+    // The worker relays at least once: the registration arrives again.
+    world
+        .svc
+        .device_registered(phone, carol.user)
+        .await
+        .unwrap();
+    let synced = world.svc.sync(phone, 100).await.unwrap().entries;
+    assert!(
+        synced.iter().any(|entry| entry.seq == sent.seq),
+        "the new device skipped seq {}: it got {:?}",
+        sent.seq,
+        seqs(&synced)
+    );
+}
+
 async fn a_deadlock_is_reported_as_a_retryable_conflict<B: Backend>(backend: &B) {
     let store = backend.store().await;
     let [a, b, c, d] = [(); 4].map(|()| UserId::new());
@@ -297,6 +357,7 @@ pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
         concurrent_redeems_never_exceed_the_use_limit,
         concurrent_acks_by_different_members_produce_the_group_receipt,
         concurrent_registrations_of_one_device_give_it_one_owner,
+        a_device_registered_during_a_join_misses_nothing,
         a_deadlock_is_reported_as_a_retryable_conflict,
     ]
     .into_iter()

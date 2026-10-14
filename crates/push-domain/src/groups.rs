@@ -79,14 +79,15 @@ where
         };
         tx.insert_entry(system_entry(id, seq, &created, now))
             .await?;
+        let mut users = others.clone();
+        users.push(creator);
+        tx.lock_users(&users).await?;
         join(&mut tx, id, creator, Role::Admin, seq).await?;
         for other in &others {
             join(&mut tx, id, *other, Role::Member, seq).await?;
         }
         tx.commit().await?;
 
-        let mut users = others;
-        users.push(creator);
         users.sort();
         self.publish(vec![Event::EntriesAvailable { users }]).await;
         Ok(id)
@@ -129,6 +130,7 @@ where
             actor: admin,
             users: added.clone(),
         };
+        change.tx.lock_users(&added).await?;
         let seq = change.append(&event).await?;
         for user in added {
             join(&mut change.tx, conversation, user, Role::Member, seq).await?;
@@ -399,7 +401,9 @@ impl<T: Tx> GroupChange<T> {
 /// Makes `user` a current member who sees the log from `seq`, the entry that let them in.
 /// Nothing before it is visible or unread: the read position starts at `seq - 1`, and so
 /// does every active device's delivery position. A device that already has a position (a
-/// member rejoining) keeps it; readers never look below `visible_from_seq - 1`.
+/// member rejoining) keeps it; readers never look below `visible_from_seq - 1`. The
+/// caller holds `user`'s lock ([`Tx::lock_users`]), so no device of theirs is being
+/// registered meanwhile.
 async fn join<T: Tx>(
     tx: &mut T,
     conversation: ConversationId,

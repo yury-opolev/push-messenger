@@ -1,9 +1,12 @@
-// The internal API of message-svc, called by the gateway (Messaging) and the worker
-// (Accounts) (spec §2). Never exposed outside the cluster. Callers pass the user and
-// device the gateway verified, or auth-svc announced; message-svc trusts them.
+// The internal API of message-svc, called by the gateway (Messaging), the worker
+// (Accounts) and auth-svc (Directory) (spec §2). Never exposed outside the cluster.
+// Callers pass the user and device the gateway verified, or auth-svc announced;
+// message-svc trusts them.
 //
-// Errors are gRPC statuses whose `details` hold an encoded `push.v1.Error`, which the
-// gateway forwards to the client.
+// Errors are gRPC statuses whose details (`grpc-status-details-bin`) follow gRPC's rich
+// error model: a `google.rpc.Status` with the client's `push.v1.Error` packed as a
+// `google.protobuf.Any` (type URL `type.googleapis.com/push.v1.Error`). The gateway
+// forwards that error to the client.
 
 syntax = "proto3";
 
@@ -19,10 +22,24 @@ service Messaging {
   rpc Identify(IdentifyRequest) returns (IdentifyResponse);
   // Appends a text message; answers after commit.
   rpc Send(SendRequest) returns (push.v1.SendAck);
-  // Entries after the device's delivery positions, oldest first per conversation.
+  // Entries after the device's delivery positions, oldest first per conversation. A read:
+  // it never moves a position. Positions move only on Ack (spec §4.7), so a Sync repeated
+  // before the client acks returns the same entries again; a caller that syncs on every
+  // notification skips the entries it already sent on the connection (the gateway does).
   rpc Sync(SyncRequest) returns (SyncResponse);
   // Records that the device holds everything up to a seq.
   rpc Ack(AckRequest) returns (AckResponse);
+  // Changes the text of one of the user's messages; answers after commit with the edit
+  // entry's SendAck.
+  rpc Edit(EditRequest) returns (push.v1.SendAck);
+  // Erases one of the user's messages; answers after commit with the delete entry's
+  // SendAck.
+  rpc Delete(DeleteRequest) returns (push.v1.SendAck);
+  // Moves the user's read position in a conversation.
+  rpc ReadUpTo(ReadUpToRequest) returns (ReadUpToResponse);
+  // Any request frame (spec §7.1), on behalf of the user. The Response carries the
+  // request's request_id, and so does the Error of a failed call.
+  rpc Request(RequestCall) returns (push.v1.Response);
 }
 
 // DEV ONLY: setup calls for local clusters and the smoke test, registered only by a
@@ -49,12 +66,27 @@ service Accounts {
   // device.registered: also records the user, since only verified users get devices.
   rpc DeviceRegistered(AccountDevice) returns (AccountsResponse);
   // device.revoked: Identify refuses the device from now on, even when this arrives
-  // before the registration.
+  // before the registration; the device is kicked (`kick:{device_id}`).
   rpc DeviceRevoked(AccountDevice) returns (AccountsResponse);
-  // user.password_reset: every device of the user is to be kicked. Accepted and
-  // otherwise ignored until message-svc publishes kicks (Plan 7) and the gateway closes
-  // kicked sockets and refuses older tokens (Plan 8).
+  // user.password_reset: every active device of the user is kicked
+  // (`kick:{device_id}`), to sign in again. The gateway closes kicked sockets and refuses
+  // tokens older than the reset in Plan 8.
   rpc PasswordReset(AccountUser) returns (AccountsResponse);
+}
+
+// Whose profile a user may see (spec §5.5), for auth-svc's `GET /v1/users?ids=…`: auth-svc
+// owns the profiles, message-svc the contacts and conversations. Every call carries
+// auth-svc's own internal token as `authorization: Bearer <token>` metadata (not the
+// worker's); without it the call is UNAUTHENTICATED.
+service Directory {
+  // The users among user_ids whose profile user_id may see: user_id itself, everyone it
+  // shares or shared a conversation with, and the users it has a contact row for as it
+  // sees them: requests it received, accepted contacts, and users it blocked, but only
+  // those it could already see when it blocked them (blocking a stranger grants nothing).
+  // A request user_id sent itself grants nothing, so someone it blocked cannot regain
+  // sight of its profile by asking again. At most 100 ids; malformed ids are
+  // INVALID_ARGUMENT.
+  rpc VisibleUsers(VisibleUsersRequest) returns (VisibleUsersResponse);
 }
 
 message IdentifyRequest {
@@ -92,6 +124,33 @@ message AckResponse {
   bool moved = 1;
 }
 
+message EditRequest {
+  bytes user_id = 1;
+  bytes device_id = 2;
+  push.v1.Edit edit = 3;
+}
+
+message DeleteRequest {
+  bytes user_id = 1;
+  bytes device_id = 2;
+  push.v1.Delete delete = 3;
+}
+
+message ReadUpToRequest {
+  bytes user_id = 1;
+  push.v1.ReadUpTo read = 2;
+}
+
+message ReadUpToResponse {
+  // Whether the user's read position moved.
+  bool moved = 1;
+}
+
+message RequestCall {
+  bytes user_id = 1;
+  push.v1.Request request = 2;
+}
+
 // Published on the Redis channel `notify:{user_id}` after a commit (spec §4.3). Never
 // carries message bodies: a lost notification only delays the client.
 message Notification {
@@ -125,22 +184,28 @@ message GroupReceipt {
   int64 all_read_seq = 2;
 }
 
-enum ContactState {
-  CONTACT_STATE_NONE = 0;
-  CONTACT_STATE_REQUESTED_OUT = 1;
-  CONTACT_STATE_REQUESTED_IN = 2;
-  CONTACT_STATE_ACCEPTED = 3;
-  CONTACT_STATE_BLOCKED = 4;
-}
-
 message ContactChanged {
   bytes peer_id = 1;
-  ContactState state = 2;
+  push.v1.ContactState state = 2;
 }
 
 message ReadPositionChanged {
   bytes conversation_id = 1;
   int64 read_seq = 2;
+}
+
+// Published on the Redis channel `kick:{device_id}` (spec §5.3, §5.4): the gateway holding
+// the device closes its socket at once (Plan 8). Never carries anything but the reason.
+message Kick {
+  KickReason reason = 1;
+}
+
+enum KickReason {
+  KICK_REASON_UNSPECIFIED = 0;
+  // The device was revoked: the client stops (close code 4003).
+  KICK_REASON_DEVICE_REVOKED = 1;
+  // The user's password was reset: the client signs in again (close code 4001).
+  KICK_REASON_PASSWORD_RESET = 2;
 }
 
 message RegisterUserRequest {
@@ -182,3 +247,13 @@ message AccountDevice {
 }
 
 message AccountsResponse {}
+
+message VisibleUsersRequest {
+  bytes user_id = 1;
+  repeated bytes user_ids = 2;
+}
+
+message VisibleUsersResponse {
+  // Sorted, without duplicates.
+  repeated bytes user_ids = 1;
+}

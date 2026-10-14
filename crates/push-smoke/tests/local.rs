@@ -105,6 +105,7 @@ async fn the_smoke_test_passes_against_the_whole_stack() {
             health_addr: message_svc_health.local_addr().unwrap(),
             store: StoreOptions::default(),
             accounts_token: Some(accounts_token.clone()),
+            directory_token: None,
             dev_setup: true,
         },
         grpc,

@@ -2,16 +2,19 @@
 
 use async_trait::async_trait;
 use prost::Message;
-use push_domain::{ContactState, Event, Notifier, ReceiptUpdate};
+use push_domain::{Event, KickReason, Notifier, ReceiptUpdate};
 use push_proto::internal::v1::{
-    self as internal, ContactChanged, DirectReceipt, EntriesAvailable, GroupReceipt, Notification,
-    ReadPositionChanged, ReceiptChanged, notification::Kind, receipt_changed,
+    self as internal, ContactChanged, DirectReceipt, EntriesAvailable, GroupReceipt, Kick,
+    Notification, ReadPositionChanged, ReceiptChanged, notification::Kind, receipt_changed,
 };
-use push_proto::{id_bytes, notify_channel};
+use push_proto::{id_bytes, kick_channel, notify_channel};
 use redis::aio::ConnectionManager;
 
+use crate::convert::contact_state;
+
 /// Publishes each event as small [`Notification`]s on the Redis channels of the users it
-/// concerns (`notify:{user_id}`). Never a message body: a gateway that hears
+/// concerns (`notify:{user_id}`), and kicks as [`Kick`]s on the channels of the devices
+/// (`kick:{device_id}`). Never a message body: a gateway that hears
 /// `EntriesAvailable` syncs the user's devices.
 ///
 /// Best effort, as `Notifier` requires: a failed publish is logged and dropped, since
@@ -115,10 +118,25 @@ pub(crate) fn notifications(events: &[Event]) -> Vec<(String, Vec<u8>)> {
                 });
                 messages.push(message(user.0, kind));
             }
+            Event::Kick { devices, reason } => {
+                let kick = Kick {
+                    reason: kick_reason(*reason).into(),
+                };
+                for device in devices {
+                    messages.push((kick_channel(device.0), kick.encode_to_vec()));
+                }
+            }
             _ => {}
         }
     }
     messages
+}
+
+fn kick_reason(reason: KickReason) -> internal::KickReason {
+    match reason {
+        KickReason::DeviceRevoked => internal::KickReason::DeviceRevoked,
+        KickReason::PasswordReset => internal::KickReason::PasswordReset,
+    }
 }
 
 fn message(user: uuid::Uuid, kind: Kind) -> (String, Vec<u8>) {
@@ -126,19 +144,9 @@ fn message(user: uuid::Uuid, kind: Kind) -> (String, Vec<u8>) {
     (notify_channel(user), notification.encode_to_vec())
 }
 
-fn contact_state(state: Option<ContactState>) -> internal::ContactState {
-    match state {
-        None => internal::ContactState::None,
-        Some(ContactState::RequestedOut) => internal::ContactState::RequestedOut,
-        Some(ContactState::RequestedIn) => internal::ContactState::RequestedIn,
-        Some(ContactState::Accepted) => internal::ContactState::Accepted,
-        Some(ContactState::Blocked) => internal::ContactState::Blocked,
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use push_domain::{ConversationId, UserId};
+    use push_domain::{ConversationId, DeviceId, UserId};
 
     use super::*;
 
@@ -253,7 +261,7 @@ mod tests {
                     notify_channel(alice.0),
                     Kind::ContactChanged(ContactChanged {
                         peer_id: id_bytes(bob.0),
-                        state: internal::ContactState::None.into(),
+                        state: push_proto::v1::ContactState::None.into(),
                     })
                 ),
                 (
@@ -270,5 +278,35 @@ mod tests {
     #[test]
     fn no_events_publish_nothing() {
         assert!(notifications(&[]).is_empty());
+    }
+
+    #[test]
+    fn a_kick_goes_to_each_device_with_its_reason() {
+        let (phone, laptop) = (DeviceId::new(), DeviceId::new());
+        let messages = notifications(&[
+            Event::Kick {
+                devices: vec![phone, laptop],
+                reason: KickReason::PasswordReset,
+            },
+            Event::Kick {
+                devices: vec![phone],
+                reason: KickReason::DeviceRevoked,
+            },
+        ]);
+        let decoded: Vec<(String, internal::KickReason)> = messages
+            .iter()
+            .map(|(channel, payload)| {
+                let kick = Kick::decode(payload.as_slice()).unwrap();
+                (channel.clone(), kick.reason())
+            })
+            .collect();
+        assert_eq!(
+            decoded,
+            vec![
+                (kick_channel(phone.0), internal::KickReason::PasswordReset),
+                (kick_channel(laptop.0), internal::KickReason::PasswordReset),
+                (kick_channel(phone.0), internal::KickReason::DeviceRevoked),
+            ]
+        );
     }
 }

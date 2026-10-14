@@ -1,5 +1,6 @@
-//! Profiles and handles (spec §5.5): the caller's own profile, and finding a user by
-//! @handle. Emails are never shown to anyone but their owner.
+//! Profiles and handles (spec §5.5): the caller's own profile, finding a user by @handle,
+//! and the profiles of users the caller shares a contact or a conversation with. Emails
+//! are never shown to anyone but their owner.
 
 use sqlx::Row;
 use uuid::Uuid;
@@ -77,5 +78,25 @@ impl Auth {
             handle: row.get(1),
             display_name: row.get(2),
         })
+    }
+
+    /// The profiles of the verified users among `users`, sorted by user id. The caller
+    /// checks first that they may be shown (`GET /v1/users?ids=…` asks message-svc).
+    pub async fn profiles(&self, users: &[Uuid]) -> Result<Vec<PublicProfile>, AuthError> {
+        let rows = sqlx::query(
+            "SELECT user_id, handle::text, display_name FROM auth.user_account \
+             WHERE user_id = ANY($1) AND email_verified_at IS NOT NULL ORDER BY user_id",
+        )
+        .bind(users)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|row| PublicProfile {
+                user_id: row.get(0),
+                handle: row.get(1),
+                display_name: row.get(2),
+            })
+            .collect())
     }
 }

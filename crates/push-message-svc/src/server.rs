@@ -11,6 +11,7 @@ use axum::routing::get;
 use push_domain::{Messaging, SystemClock};
 use push_proto::internal::v1::accounts_server::AccountsServer;
 use push_proto::internal::v1::dev_setup_server::DevSetupServer;
+use push_proto::internal::v1::directory_server::DirectoryServer;
 use push_proto::internal::v1::messaging_server::MessagingServer;
 use push_store::{PgStore, migrate_database};
 use tokio::net::TcpListener;
@@ -18,18 +19,19 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
-use crate::grpc::{AccountsApi, AccountsToken, DevSetupApi, MessagingApi};
+use crate::grpc::{AccountsApi, DevSetupApi, DirectoryApi, InternalToken, MessagingApi};
 use crate::notify::RedisNotifier;
 
 /// How long to wait before trying an unreachable dependency again.
 const RETRY_DELAY: Duration = Duration::from_secs(2);
 
 /// Runs the service until `shutdown` is cancelled, then finishes the calls in progress
-/// and closes the database pool.
+/// and closes the database pool. `grpc` and `health` must be bound already.
 ///
 /// The health endpoints answer at once: `/healthz` always, `/readyz` only once the
-/// database is migrated and answers a ping, and never after shutdown began. Postgres and
-/// Redis are retried until they answer, so the service may start before them.
+/// database is migrated and answers a ping and Redis has connected, and never after
+/// shutdown began. Postgres and Redis are retried until they answer, so the service may
+/// start before them.
 pub async fn serve(
     config: Config,
     grpc: TcpListener,
@@ -59,6 +61,12 @@ pub async fn serve(
              worker cannot relay users and devices"
         );
     }
+    if config.directory_token.is_none() {
+        tracing::warn!(
+            "PUSH_DIRECTORY_TOKEN is not set: the Directory API refuses every call, so \
+             auth-svc cannot show profiles"
+        );
+    }
     let Some(store) = retry("postgres", &shutdown, || async {
         // Services migrate with `push_store::migrate_database(url)` on a dedicated
         // connection, not with `PgStore::migrate` on the pool: a migration must not
@@ -81,6 +89,9 @@ pub async fn serve(
     };
     let _ = ready.store.set(store.clone());
 
+    // Ready before tonic's serve_with_incoming_shutdown runs: `grpc` is already bound and
+    // listening (the caller binds it, as `main` does), so a client that connects as soon as
+    // /readyz answers waits in the listen backlog until the server accepts, a moment later.
     let messaging = Arc::new(Messaging::new(store.clone(), SystemClock, notifier));
     let dev_setup = config
         .dev_setup
@@ -91,8 +102,12 @@ pub async fn serve(
             &messaging,
         ))))
         .add_service(AccountsServer::with_interceptor(
-            AccountsApi::new(messaging),
-            AccountsToken::new(config.accounts_token.clone()),
+            AccountsApi::new(Arc::clone(&messaging)),
+            InternalToken::accounts(config.accounts_token.clone()),
+        ))
+        .add_service(DirectoryServer::with_interceptor(
+            DirectoryApi::new(messaging),
+            InternalToken::directory(config.directory_token.clone()),
         ))
         .add_optional_service(dev_setup)
         .serve_with_incoming_shutdown(

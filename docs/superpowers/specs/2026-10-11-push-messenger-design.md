@@ -244,8 +244,12 @@ Implementation notes (push-store, migration `0001_messaging.sql`):
   `UPDATE conversation SET last_seq = last_seq + 1, updated_at = greatest(updated_at, $at)
   … RETURNING last_seq`, whose row lock serialises appends. Contact pairs and a group's
   receipt positions are serialised with `pg_advisory_xact_lock` on a 64-bit FNV-1a hash of
-  a per-kind tag and the ids; invites with `SELECT … FOR UPDATE`. Serialization failures
-  and deadlocks are reported as a retryable conflict.
+  a per-kind tag and the ids; invites with `SELECT … FOR UPDATE`. Registering a device and
+  joining a conversation (opening a direct one, creating a group, adding members) take a
+  per-user advisory lock for every user concerned, sorted, in one statement (Plan 7A), so
+  neither misses the other's uncommitted row and every membership has a delivery position
+  for every device. Lock order: contact pair / conversation row, positions, users.
+  Serialization failures and deadlocks are reported as a retryable conflict.
 - The `outbox` table above is **not** part of the messaging migration yet: the plan that
   first needs it (worker/auth) adds it.
 
@@ -378,6 +382,11 @@ conversation lock and then hits the conflict, so retries are race-free.
 4. The SDK stores them locally and sends `Ack{conversation_id, seq}`, meaning
    "I have everything up to `seq`".
 5. message-svc sets `delivered_seq = GREATEST(delivered_seq, seq)`.
+
+`Sync` is a read: it never moves a position. A sync repeated before the device acks returns
+the same entries; the gateway skips those it already sent on the connection, and syncs
+again after an ack only when the ack moved the position and the last sync left entries
+behind.
 
 **Where a device starts.** Delivery positions are created eagerly, never on first sync:
 - when a device is registered, it gets a position at each of its user's conversations'
@@ -552,17 +561,20 @@ Access-token claims: `sub`, `device_id`, `email_verified`, `exp`, `iat`, `jti`, 
      pass this on as "try again shortly", and the SDK must reconnect after a short
      backoff — never treat it as a revocation or sign the user out.
 
-Implementation note (Plan 6A): message-svc's internal `Accounts` gRPC API takes the relayed
-`user.verified`, `device.registered`, `device.revoked` and `user.password_reset`. Every call
-is idempotent and any order ends in the same state: a registration also records the user,
-and a revocation that arrives before the registration records the device as revoked, so the
-registration cannot revive it. Every call needs the shared internal token
-(`authorization: Bearer <PUSH_ACCOUNTS_TOKEN>`, compared in constant time); without it, or
-when message-svc has none, the call is `UNAUTHENTICATED`. A revoked device is refused by
+Implementation notes (Plans 6A and 7A): message-svc's internal `Accounts` gRPC API takes the
+relayed `user.verified`, `device.registered`, `device.revoked` and `user.password_reset`.
+Every call is idempotent and any order ends in the same state: a registration also records
+the user, and a revocation that arrives before the registration records the device as
+revoked, so the registration cannot revive it. Every call needs the worker's internal token
+(`authorization: Bearer <PUSH_ACCOUNTS_TOKEN>`, compared in constant time); without it, or when
+message-svc has none, the call is `UNAUTHENTICATED`. A revoked device is refused by
 `Identify` at once (`PERMISSION_DENIED`); a device not relayed yet is `UNAVAILABLE`
 (`retryable`), which the gateway closes with 1011 until Plan 8 gives it a code of its own.
-Publishing `kick:{device_id}` (and kicks on a password reset) comes with Plan 7, closing
-the socket and refusing older tokens with Plan 8.
+After committing a revocation message-svc publishes `Kick{reason: DEVICE_REVOKED}` on
+`kick:{device_id}`, every time it is relayed; after a relayed password reset it publishes
+`Kick{reason: PASSWORD_RESET}` for every active device of the user, which stay registered.
+The gateway closes kicked sockets with Plan 8: 4003 for a revocation, 4001 ("sign in
+again") for a password reset (owner decision), and refuses tokens older than a reset.
 
 ### 5.4 Password reset
 
@@ -601,7 +613,17 @@ the socket and refusing older tokens with Plan 8.
   harassment). Unblocking restores the ability to edit and delete within the normal time
   windows.
 - **Profiles.** `GET /v1/users?ids=…` returns handle and display name for user ids the
-  caller shares a contact or conversation with.
+  caller shares a contact or conversation with. Implementation (Plan 7A): auth-svc asks
+  message-svc's internal `Directory` API, with a token of its own, which ids the caller may
+  see, and answers the verified profiles among them from its own database, sorted by id
+  and intersected with the requested ids. The caller may see themselves; every user with
+  an incoming request to them or an accepted contact; a user they blocked, if they could
+  already see that user when blocking (`sees_peer`; their own outgoing request grants
+  nothing); and every user who is or was in a conversation with them. Names of people
+  they can no longer chat with therefore stay visible next to old messages: after a block
+  in either direction and after leaving a group (owner decision). 1 to 100 ids; other and
+  unknown ids are left out; without message-svc's answer it fails closed with a retryable
+  503.
 
 ### 5.6 Passwords and rate limits
 
@@ -705,8 +727,7 @@ Implementation notes (push-auth, Plan 5A):
   retryable `unavailable` and a warning is logged (fail closed); refresh is not limited,
   so signed-in devices keep working.
 - **Profiles.** `GET /v1/users/lookup` finds verified users only. `GET /v1/users?ids=…`
-  needs to know who shares a contact or conversation with the caller, which only
-  message-svc knows; it comes with Plan 7.
+  asks message-svc's `Directory` API (Plan 7A, §5.5).
 - **DEV ONLY mailbox.** Until Plan 6B auth-svc served the outbox's emails at
   `/dev/mailbox`; the worker's log sender keeps them now (§9), and auth-svc has no mailbox.
 - **Deferred / open (Plan 5A review).** Refresh sessions slide (30 d) with no absolute
@@ -848,6 +869,16 @@ Implementation notes (push-proto, Plan 4A):
 - A failed gRPC call carries the client's `Error` frame, encoded, in the status details;
   the gateway forwards it, adding the `client_msg_id` of the `Send` it answers. Storage
   failures and conflicts are `retryable`.
+- The details of a failed call (`grpc-status-details-bin`) are a `google.rpc.Status` whose
+  `details` hold the `push.v1.Error` as a `google.protobuf.Any` with type URL
+  `type.googleapis.com/push.v1.Error` (Plan 7A). Every domain error has a client
+  `ErrorCode` of its own; only retryable errors share `UNAVAILABLE`. Because of this
+  format, the gateway and message-svc must be deployed together.
+- The client frames `Edit`, `Delete`, `ReadUpTo`, `Request` (a `request_id` and a `oneof`
+  of the 18 request bodies of §7.1) and `Response` are defined in `frame.proto` (Plan 7A);
+  message-svc's `Messaging` service serves them as `Edit`, `Delete`, `ReadUpTo` and
+  `Request`, whose `Response` and `Error` carry the request's `request_id`. They join
+  `Frame` with Plan 8.
 - message-svc publishes a small `Notification` (entries available, receipt, contact
   change, read position; never a body) on `notify:{user_id}` after every commit. The
   gateway subscribes to the channels of the users it holds and syncs their devices; it
@@ -1124,4 +1155,5 @@ Required adverse-condition tests:
 - The production sender is `no-reply@push.kubegames.dk` (decided 2026-10-13); its DNS
   (SPF, DKIM, DMARC) and Resend's domain setup come with Plan 11.
 - Calibrate Argon2id on the chosen VM size.
-- Decide whether group endpoints ship in the first release or the second.
+- Groups: message-svc serves them in full from Plan 7A, but they are not exposed to apps in
+  the first release (owner decision): the Plan 8 gateway hides group frames.

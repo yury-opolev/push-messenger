@@ -117,7 +117,7 @@ member promoted when the last admin leaves, aggregate group receipts, one invite
    one statement. `register_device` and `device_registered` take their user's lock before
    inserting the device and reading the memberships; `open_direct`, `create_group` and
    `add_members` take the lock of every user they add, once, before listing their devices.
-   Lock order: contact pair → conversation (`next_seq`) → users → conversation positions;
+   Lock order: contact pair / conversation row (`next_seq`) → positions → users;
    a registration takes only its user's. Redeeming an invite makes contacts and joins no
    conversation, and a rejoin is `add_members`, so these are all the join paths. The
    concurrency case of Task 1 holds the join between its member row and its commit while a
@@ -144,12 +144,18 @@ member promoted when the last admin leaves, aggregate group receipts, one invite
 6. **The contact check behind `GET /v1/users?ids=…` is message-svc's `Directory` API**, a
    separate gRPC service with `VisibleUsers(user_id, user_ids)`, guarded by a token of its
    own (`PUSH_DIRECTORY_TOKEN`) that only auth-svc and message-svc get — not the Accounts
-   token, so auth-svc cannot register devices and the worker cannot read relationships. A
-   caller may see: themselves; every user they have a contact row for, in any state
-   (requests either way, accepted contacts, users they blocked); and every user who is or
-   was a member of a conversation they are or were a member of. Someone who blocked the
-   caller has deleted the caller's row, so they stay hidden unless they share a
-   conversation. At most 100 ids; one SQL statement (`Tx::related_users`).
+   token, so auth-svc cannot register devices and the worker cannot read relationships.
+   message-svc refuses to start with equal tokens. A caller may see: themselves; every user
+   who is or was a member of a conversation they are or were a member of; and the peers
+   of their contact rows as they see them — a request they received, an accepted contact,
+   and a user they blocked only if they could already see that user when blocking
+   (`contact.sees_peer`, written by `Tx::put_block`, migration
+   `0002_contact_sees_peer.sql`, existing blocks backfilled to true). Their own outgoing
+   request grants nothing, so a stranger cannot be revealed by asking or by blocking
+   first. Someone who blocked the caller has deleted the caller's row, so they stay hidden
+   unless they share a conversation. At most 100 ids; one SQL statement
+   (`Tx::related_users`). auth-svc intersects message-svc's answer with the ids it asked
+   for.
 7. **auth-svc's `GET /v1/users?ids=…`** takes 1 to 100 comma-separated user ids, asks
    `Directory`, and answers `{"users": [{user_id, handle, display_name}]}` for the verified
    users among the allowed ones, sorted by id; other and unknown ids are left out, so the
@@ -158,7 +164,7 @@ member promoted when the last admin leaves, aggregate group receipts, one invite
    worker's) and `PUSH_DIRECTORY_TOKEN` are set together or not at all; without them
    auth-svc warns at start-up and the endpoint answers 503. The client connects lazily
    (2 s connect, 5 s call timeout), so auth-svc starts without message-svc. No rate limit:
-   ids are random 128-bit values and only related users' profiles are ever shown.
+   ids are UUIDv7 values with 74 random bits and only related users' profiles are ever shown.
 8. **Sync stays a read.** Delivery positions move only on `Ack` (spec §4.7); a sync
    repeated before the client acks returns the same entries, which the proto now says. No
    "after" position is added: it would let a client that never acks be pushed its whole
@@ -190,23 +196,39 @@ member promoted when the last admin leaves, aggregate group receipts, one invite
 | `/readyz` turns ready before the gRPC serve call | Task 2: checked, the listener is pre-bound; documented (decision 9) |
 | The `Identify` oracle (`UNKNOWN_DEVICE` vs `UNAVAILABLE`) | Plan 8, which turns them into close codes (Deferred) |
 
-## Owner decisions needed
+## Owner decisions
 
-The plan proceeds with the recommendation in each case; a different answer changes a line
-of documentation (and, for 1, a constant in Plan 8), not this plan's code.
+Settled by the owner after the plan was written. They change a line of documentation (and,
+for 1 and 3, what Plan 8 builds), not this plan's code.
 
-1. **The close code for a password-reset kick.** Spec §7.4 gives 4003 ("another
-   connection took over, or device revoked: stop") for revocations. After a password reset
-   the device is not revoked but its refresh token is, so the client must sign in again —
-   **recommended: 4001** ("sign in again"). Plan 8 applies it; this plan only sends the
-   reason.
-2. **Profiles of former co-members.** This plan shows a user the profiles of everyone who
-   is or was in a conversation with them, so a former group member's name still shows in
-   the history. **Recommended: keep.** The alternative, current members only, would leave
-   old messages without names.
-3. **Groups in the first release.** Spec §13 left open whether group endpoints ship in the
-   first release. message-svc serves them from this plan; **recommended: the gateway
-   exposes them in Plan 8 too.**
+1. **A password-reset kick closes with 4001, "sign in again".** A revocation kick closes
+   with 4003. Spec §7.4 gives 4003 for revocations; after a password reset the device is
+   not revoked but its refresh token is. Plan 8 applies the codes; this plan only sends
+   the reason.
+2. **Names of people you can no longer chat with stay visible next to old messages.** This
+   covers both directions of a block and having left a group: the `Directory` API counts
+   everyone who is or was in a conversation with the caller.
+3. **Groups are not exposed to apps in the first release.** The Plan 8 gateway hides group
+   frames; the server keeps full group support (spec §13, roadmap row 8).
+
+## Review fixes made after the plan was written
+
+Task 1, 2, 5, 6, 7 and 8 code blocks below were synced to the committed files.
+
+- **Lock order.** The comment in push-domain `store.rs` and decision 3 read: contact pair /
+  conversation row → positions → users.
+- **Visibility (Directory).** The caller's own `RequestedOut` row grants nothing; a
+  `Blocked` row counts only if the blocker could already see the peer when blocking
+  (`sees_peer`; migration `0002_contact_sees_peer.sql`, existing blocks backfilled to true);
+  shared or former conversations still count; auth-svc intersects message-svc's answer
+  with the requested ids.
+- **Tokens.** message-svc refuses equal `PUSH_ACCOUNTS_TOKEN` and `PUSH_DIRECTORY_TOKEN`.
+- **Titles.** Group titles refuse control characters (`ValidationError::TitleControl`).
+- **Comments.** The `KickReason` comment names the close codes 4003 and 4001; the
+  `RedeemInvite` comment names INVALID and BLOCKED; two wording fixes in message-svc's
+  `server.rs`.
+- **Spec §7.6.** Error details are a `google.rpc.Status` with an `Any(push.v1.Error)`;
+  the gateway and message-svc must be deployed together because of the details format.
 
 ## File structure
 
@@ -408,10 +430,13 @@ with
 ```rust
 //! [`Tx::next_seq`] first, acks and reads take only the positions lock.
 //!
-//! User locks ([`Tx::lock_users`]) come after the contact-pair lock (`open_direct`) and
-//! the conversation lock (adding members) and before the positions lock; a device
-//! registration takes only its user's lock. A transaction takes its user locks in one
-//! call, so no two transactions wait for each other's user locks in a cycle.
+//! User locks ([`Tx::lock_users`]) come last. The global order is: contact pair /
+//! conversation row ([`Tx::next_seq`]) → positions → users. `add_members`
+//! takes the positions lock while it reads the group's positions, before it locks the
+//! users it adds, so never take user locks before the positions lock in a path that also
+//! takes positions. A device registration takes only its user's lock. A transaction takes
+//! its user locks in one call, so no two transactions wait for each other's user locks in
+//! a cycle.
 //!
 //! # Delivery positions
 //!
@@ -1444,7 +1469,7 @@ with
 /// and closes the database pool. `grpc` and `health` must be bound already.
 ///
 /// The health endpoints answer at once: `/healthz` always, `/readyz` only once the
-/// database is migrated and answers a ping and Redis is connected, and never after
+/// database is migrated and answers a ping and Redis has connected, and never after
 /// shutdown began. Postgres and Redis are retried until they answer, so the service may
 /// start before them.
 pub async fn serve(
@@ -1465,9 +1490,9 @@ with
 ```rust
     let _ = ready.store.set(store.clone());
 
-    // Ready before `serve` is called: `grpc` is already bound and listening (the caller
-    // binds it, as `main` does), so a client that connects as soon as /readyz answers
-    // waits in the listen backlog until the server accepts, a moment later.
+    // Ready before tonic's serve_with_incoming_shutdown runs: `grpc` is already bound and
+    // listening (the caller binds it, as `main` does), so a client that connects as soon as
+    // /readyz answers waits in the listen backlog until the server accepts, a moment later.
     let messaging = Arc::new(Messaging::new(store.clone(), SystemClock, notifier));
     let dev_setup = config
 ```
@@ -1901,7 +1926,7 @@ enum KickReason {
   KICK_REASON_UNSPECIFIED = 0;
   // The device was revoked: the client stops (close code 4003).
   KICK_REASON_DEVICE_REVOKED = 1;
-  // The user's password was reset: the client signs in again.
+  // The user's password was reset: the client signs in again (close code 4001).
   KICK_REASON_PASSWORD_RESET = 2;
 }
 
@@ -4030,6 +4055,7 @@ message Invite {
 
 // Read case-insensitively; dashes and spaces are ignored. An unknown, revoked, expired or
 // used-up code, and one whose creator has blocked the caller, are all INVITE_NOT_FOUND.
+// Redeeming your own code is INVALID; redeeming the code of someone you blocked is BLOCKED.
 message RedeemInvite {
   string code = 1;
 }
@@ -4619,6 +4645,115 @@ async fn group_requests_refuse_what_the_rules_forbid() {
 }
 ```
 
+Group titles refuse control characters, which PostgreSQL text cannot store (a NUL came back
+as a retryable store error): `ValidationError::TitleControl` (review fix). In
+`crates/push-message-svc/src/requests/tests.rs`, at the end of
+`group_requests_refuse_what_the_rules_forbid`:
+
+Replace
+
+```rust
+    let status = world.request(&alice, unspecified).await.unwrap_err();
+    assert_eq!(failure(&status), (ErrorCode::Invalid, true));
+}
+```
+
+with
+
+```rust
+    let status = world.request(&alice, unspecified).await.unwrap_err();
+    assert_eq!(failure(&status), (ErrorCode::Invalid, true));
+
+    // A title PostgreSQL could not store is refused as invalid, not retried as a store error.
+    for title in ["a\u{0}b", "", &"t".repeat(101)] {
+        let bad_title = request::Body::CreateGroup(CreateGroup {
+            title: title.to_owned(),
+            member_ids: vec![],
+        });
+        let status = world.request(&alice, bad_title).await.unwrap_err();
+        assert_eq!(failure(&status).0, ErrorCode::Invalid, "{title:?}");
+    }
+}
+```
+
+In `crates/push-domain/src/validation.rs`:
+
+Replace
+
+```rust
+    #[error("a group title is {actual} characters; the limit is {limit}")]
+    TitleTooLong { actual: usize, limit: usize },
+}
+
+```
+
+with
+
+```rust
+    #[error("a group title is {actual} characters; the limit is {limit}")]
+    TitleTooLong { actual: usize, limit: usize },
+    #[error("a group title cannot contain control characters")]
+    TitleControl,
+}
+
+```
+
+Replace
+
+```rust
+
+/// Checks a group title and returns it without leading and trailing whitespace. It must
+/// keep 1 to `MAX_TITLE_CHARS` characters.
+pub fn validate_title(title: &str) -> Result<String, ValidationError> {
+    let title = title.trim();
+    let chars = title.chars().count();
+    if chars == 0 {
+```
+
+with
+
+```rust
+
+/// Checks a group title and returns it without leading and trailing whitespace. It must
+/// keep 1 to `MAX_TITLE_CHARS` characters and no control characters (PostgreSQL text
+/// refuses NUL, and line breaks have no place in a title).
+pub fn validate_title(title: &str) -> Result<String, ValidationError> {
+    let title = title.trim();
+    if title.chars().any(char::is_control) {
+        return Err(ValidationError::TitleControl);
+    }
+    let chars = title.chars().count();
+    if chars == 0 {
+```
+
+Replace
+
+```rust
+        );
+    }
+}
+```
+
+with
+
+```rust
+        );
+    }
+
+    #[test]
+    fn rejects_control_characters_inside_titles() {
+        for title in ["a\u{0}b", "line\nbreak", "tab\there", "del\u{7f}"] {
+            assert_eq!(
+                validate_title(title),
+                Err(ValidationError::TitleControl),
+                "{title:?}"
+            );
+        }
+        assert_eq!(validate_title("  Ærø team  "), Ok("Ærø team".to_owned()));
+    }
+}
+```
+
 And the whole client API over real Postgres, with users relayed through `Accounts`: an
 invite and a request make contacts, a group, a send, an edit, a read, history and a
 listing whose group-wide receipts count only what every member read. In
@@ -5179,13 +5314,11 @@ async fn related_users_have_a_contact_row_of_the_user_or_share_a_conversation<B:
     let [alice, bob, carol, dave, erin] = [(); 5].map(|()| UserId::new());
     add_users(&store, &[alice, bob, carol, dave, erin]).await;
     let mut tx = store.begin().await.unwrap();
-    tx.put_contact(alice, bob, ContactState::RequestedOut)
+    tx.put_contact(alice, bob, ContactState::RequestedIn)
         .await
         .unwrap();
     // Only Carol's row names Alice.
-    tx.put_contact(carol, alice, ContactState::Blocked)
-        .await
-        .unwrap();
+    tx.put_block(carol, alice, true).await.unwrap();
     tx.insert_member(member(chat.id, alice)).await.unwrap();
     let mut former = member(chat.id, dave);
     former.left_at_seq = Some(0);
@@ -5201,6 +5334,62 @@ async fn related_users_have_a_contact_row_of_the_user_or_share_a_conversation<B:
     assert_eq!(tx.related_users(carol, &[alice]).await, Ok(vec![alice]));
     assert_eq!(tx.related_users(erin, &[alice, bob]).await, Ok(vec![]));
     assert_eq!(tx.related_users(alice, &[]).await, Ok(vec![]));
+}
+
+async fn an_outgoing_request_alone_makes_nobody_related<B: Backend>(backend: &B) {
+    let chat = conversation();
+    let store = store_with(backend, chat.clone()).await;
+    let [alice, bob, carol, dave, erin] = [(); 5].map(|()| UserId::new());
+    add_users(&store, &[alice, bob, carol, dave, erin]).await;
+    let mut tx = store.begin().await.unwrap();
+    for peer in [bob, carol, dave] {
+        tx.put_contact(alice, peer, ContactState::RequestedOut)
+            .await
+            .unwrap();
+    }
+    tx.put_contact(alice, erin, ContactState::Accepted)
+        .await
+        .unwrap();
+    // Carol shares a conversation with Alice besides the request; Dave left it.
+    tx.insert_member(member(chat.id, alice)).await.unwrap();
+    tx.insert_member(member(chat.id, carol)).await.unwrap();
+    let mut former = member(chat.id, dave);
+    former.left_at_seq = Some(0);
+    tx.insert_member(former).await.unwrap();
+
+    let mut related = tx
+        .related_users(alice, &[bob, carol, dave, erin])
+        .await
+        .unwrap();
+    related.sort();
+    let mut expected = vec![carol, dave, erin];
+    expected.sort();
+    assert_eq!(related, expected, "Bob is only asked, never seen");
+}
+
+async fn a_block_without_sight_of_the_peer_makes_nobody_related<B: Backend>(backend: &B) {
+    let store = store_with(backend, conversation()).await;
+    let [alice, bob, carol] = [(); 3].map(|()| UserId::new());
+    add_users(&store, &[alice, bob, carol]).await;
+    let mut tx = store.begin().await.unwrap();
+    tx.put_block(alice, bob, false).await.unwrap();
+    tx.put_block(alice, carol, true).await.unwrap();
+    assert_eq!(
+        tx.related_users(alice, &[bob, carol]).await,
+        Ok(vec![carol])
+    );
+    // Replacing the row forgets the record; so does blocking again without sight.
+    tx.put_contact(alice, carol, ContactState::Blocked)
+        .await
+        .unwrap();
+    assert_eq!(tx.related_users(alice, &[bob, carol]).await, Ok(vec![]));
+    tx.put_block(alice, carol, true).await.unwrap();
+    tx.put_block(alice, carol, false).await.unwrap();
+    assert_eq!(tx.related_users(alice, &[carol]).await, Ok(vec![]));
+    assert_eq!(
+        tx.get_contact(alice, carol).await,
+        Ok(Some(ContactState::Blocked))
+    );
 }
 
 pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
@@ -5222,11 +5411,15 @@ with
         an_invite_of_an_unknown_user_is_refused,
         update_invite_changes_only_uses_and_revocation,
         related_users_have_a_contact_row_of_the_user_or_share_a_conversation,
+        an_outgoing_request_alone_makes_nobody_related,
+        a_block_without_sight_of_the_peer_makes_nobody_related,
     ]
 }
 ```
 
-Requests either way and shared groups make profiles visible; a block stays hidden. In
+A request someone received, an accepted contact and a shared group make profiles visible; the
+user's own request grants nothing, and a block only counts if the blocker could already see the
+peer (decision 6). In
 `crates/push-testkit/src/scenarios/contacts.rs`:
 
 Replace
@@ -5287,7 +5480,11 @@ async fn profiles_are_visible_to_relations_and_conversation_members<B: Backend>(
     assert_eq!(
         visible(&bob, &[&alice]).await,
         [alice.user],
-        "a request, either way"
+        "a request Bob received"
+    );
+    assert!(
+        visible(&alice, &[&bob]).await.is_empty(),
+        "Alice's own pending request grants nothing"
     );
     assert_eq!(
         visible(&carol, &[&dave, &carol, &stranger, &dave]).await,
@@ -5304,6 +5501,152 @@ async fn profiles_are_visible_to_relations_and_conversation_members<B: Backend>(
     );
     assert!(visible(&stranger, &[&alice, &bob]).await.is_empty());
 }
+
+async fn a_blocked_user_who_sends_a_new_request_still_cannot_see_the_blocker<B: Backend>(
+    backend: &B,
+) {
+    let world = World::new(backend).await;
+    let (alice, xavier) = (world.person().await, world.person().await);
+    world
+        .svc
+        .contact_request(xavier.user, alice.user)
+        .await
+        .unwrap();
+    world
+        .svc
+        .contact_block(alice.user, xavier.user)
+        .await
+        .unwrap();
+    world
+        .svc
+        .contact_request(xavier.user, alice.user)
+        .await
+        .unwrap();
+    assert_eq!(
+        world.svc.contact_state(xavier.user, alice.user).await,
+        Ok(Some(ContactState::RequestedOut))
+    );
+    let seen_by_xavier = world.svc.visible_users(xavier.user, &[alice.user]).await;
+    assert_eq!(seen_by_xavier, Ok(vec![]), "the new request grants nothing");
+    let seen_by_alice = world.svc.visible_users(alice.user, &[xavier.user]).await;
+    assert_eq!(seen_by_alice, Ok(vec![xavier.user]), "Alice blocked Xavier");
+}
+
+async fn blocking_someone_gives_no_sight_of_a_peer_the_blocker_never_saw<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
+    let (alice, xavier, stranger) = (
+        world.person().await,
+        world.person().await,
+        world.person().await,
+    );
+    let visible = |user: &Person, other: &Person| {
+        let (svc, user, other) = (&world.svc, user.user, other.user);
+        async move { svc.visible_users(user, &[other]).await.unwrap() }
+    };
+    world
+        .svc
+        .contact_block(alice.user, xavier.user)
+        .await
+        .unwrap();
+    world
+        .svc
+        .contact_block(xavier.user, alice.user)
+        .await
+        .unwrap();
+    assert!(
+        visible(&xavier, &alice).await.is_empty(),
+        "Xavier's own block on a stranger grants nothing"
+    );
+    assert!(
+        visible(&alice, &xavier).await.is_empty(),
+        "Alice never saw Xavier before blocking him"
+    );
+    world
+        .svc
+        .contact_block(stranger.user, alice.user)
+        .await
+        .unwrap();
+    assert!(visible(&stranger, &alice).await.is_empty());
+    // Asking first and then blocking is no better: the pending request granted nothing.
+    world
+        .svc
+        .contact_request(alice.user, stranger.user)
+        .await
+        .unwrap();
+    world
+        .svc
+        .contact_block(alice.user, stranger.user)
+        .await
+        .unwrap();
+    assert!(visible(&alice, &stranger).await.is_empty());
+}
+
+async fn a_block_keeps_the_sight_the_blocker_had<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
+    let (alice, bob, carol, dave) = (
+        world.person().await,
+        world.person().await,
+        world.person().await,
+        world.person().await,
+    );
+    let visible = |user: &Person, other: &Person| {
+        let (svc, user, other) = (&world.svc, user.user, other.user);
+        async move { svc.visible_users(user, &[other]).await.unwrap() }
+    };
+    // Accepted, then blocked.
+    world
+        .svc
+        .contact_request(alice.user, bob.user)
+        .await
+        .unwrap();
+    world
+        .svc
+        .contact_accept(bob.user, alice.user)
+        .await
+        .unwrap();
+    world.svc.contact_block(alice.user, bob.user).await.unwrap();
+    assert_eq!(visible(&alice, &bob).await, [bob.user]);
+    assert!(visible(&bob, &alice).await.is_empty());
+    // Blocking again changes nothing.
+    world.svc.contact_block(alice.user, bob.user).await.unwrap();
+    assert_eq!(visible(&alice, &bob).await, [bob.user]);
+    // Carol's block back grants nothing: the row of her request vanished when Alice blocked.
+    world
+        .svc
+        .contact_request(carol.user, alice.user)
+        .await
+        .unwrap();
+    world
+        .svc
+        .contact_block(alice.user, carol.user)
+        .await
+        .unwrap();
+    world
+        .svc
+        .contact_block(carol.user, alice.user)
+        .await
+        .unwrap();
+    assert!(visible(&carol, &alice).await.is_empty());
+    assert_eq!(visible(&alice, &carol).await, [carol.user]);
+    // A shared conversation still shows names, block or no block.
+    world.group(&alice, &[&dave]).await;
+    world
+        .svc
+        .contact_block(dave.user, alice.user)
+        .await
+        .unwrap();
+    assert_eq!(visible(&dave, &alice).await, [alice.user]);
+    // Unblocking forgets the sight: a fresh block of a stranger grants nothing.
+    world
+        .svc
+        .contact_unblock(alice.user, bob.user)
+        .await
+        .unwrap();
+    assert!(visible(&alice, &bob).await.is_empty());
+    world.svc.contact_block(alice.user, bob.user).await.unwrap();
+    assert!(visible(&alice, &bob).await.is_empty());
+}
+
 pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
     case_list![
 ```
@@ -5323,6 +5666,9 @@ with
         unblocking_someone_who_is_not_blocked_publishes_nothing,
         contacts_are_listed_from_the_owners_side_only,
         profiles_are_visible_to_relations_and_conversation_members,
+        a_blocked_user_who_sends_a_new_request_still_cannot_see_the_blocker,
+        blocking_someone_gives_no_sight_of_a_peer_the_blocker_never_saw,
+        a_block_keeps_the_sight_the_blocker_had,
     ]
 }
 ```
@@ -5352,9 +5698,11 @@ with
     async fn contacts_of(&mut self, owner: UserId) -> DomainResult<Vec<(UserId, ContactState)>>;
 
     /// The users among `candidates`, other than `user`, whom `user` has a contact row for
-    /// (in any state), or who are or were members of a conversation `user` is or was a
-    /// member of. Duplicates in `candidates` are ignored. One statement on Postgres. The
-    /// order of the result is unspecified.
+    /// in any state but `RequestedOut` (the user's own pending request grants nothing),
+    /// except a `Blocked` row written without sight of the peer (see `put_block`), or
+    /// who are or were members of a conversation `user` is or was a member of. Duplicates
+    /// in `candidates` are ignored. One statement on Postgres. The order of the result is
+    /// unspecified.
     async fn related_users(
         &mut self,
         user: UserId,
@@ -5397,10 +5745,14 @@ with
             .copied()
             .filter(|candidate| *candidate != user)
             .filter(|candidate| {
-                self.work.contacts.contains_key(&(user, *candidate))
-                    || self.work.members.keys().any(|(conversation, member)| {
-                        member == candidate && shared.contains(conversation)
-                    })
+                matches!(
+                    self.work.contacts.get(&(user, *candidate)),
+                    Some(state) if *state != ContactState::RequestedOut
+                        && (*state != ContactState::Blocked
+                            || self.work.sighted_blocks.contains(&(user, *candidate)))
+                ) || self.work.members.keys().any(|(conversation, member)| {
+                    member == candidate && shared.contains(conversation)
+                })
             })
             .collect();
         related.sort();
@@ -5435,11 +5787,14 @@ with
         candidates: &[UserId],
     ) -> DomainResult<Vec<UserId>> {
         let candidates: Vec<Uuid> = candidates.iter().map(|candidate| candidate.0).collect();
+        // State 1 is requested_out: the user's own pending request grants nothing. State 4
+        // is blocked: it counts only if the user could see the peer when blocking.
         let related: Vec<Uuid> = sqlx::query_scalar(
             "SELECT DISTINCT candidate FROM unnest($2::uuid[]) AS candidate \
              WHERE candidate <> $1 AND ( \
                EXISTS (SELECT 1 FROM messaging.contact \
-                       WHERE owner_id = $1 AND peer_id = candidate) \
+                       WHERE owner_id = $1 AND peer_id = candidate AND state <> 1 \
+                         AND (state <> 4 OR sees_peer)) \
                OR EXISTS (SELECT 1 FROM messaging.conversation_member mine \
                           JOIN messaging.conversation_member theirs USING (conversation_id) \
                           WHERE mine.user_id = $1 AND theirs.user_id = candidate))",
@@ -5473,10 +5828,14 @@ with
     }
 
     /// The users among `candidates` whose profiles `user` may see (spec §5.5): `user`
-    /// themselves, everyone they have a relationship with as they see it (requests either
-    /// way, accepted contacts, users they blocked), and everyone they share or shared a
-    /// conversation with. Sorted, without duplicates. Someone who blocked `user` stays
-    /// hidden unless they share a conversation, so nobody learns of a block through it.
+    /// themselves, everyone they share or shared a conversation with, and the peers of
+    /// their contact rows as they see them: requests they received and accepted contacts,
+    /// and users they blocked, but only if they could see that user when they blocked them
+    /// (their row was a received request, an accepted contact or a block that counted).
+    /// Blocking a stranger grants nothing, or the stranger's own block would reveal
+    /// whoever blocked them. Their own pending request to someone grants nothing either.
+    /// Sorted, without duplicates. Someone who blocked `user` stays hidden unless they
+    /// share a conversation, so nobody learns of a block through it.
     pub async fn visible_users(
         &self,
         user: UserId,
@@ -5497,12 +5856,218 @@ with
     async fn begin_pair(&self, a: UserId, b: UserId) -> DomainResult<S::Tx> {
 ```
 
+A block records whether the blocker could see the peer when blocking, so that blocking a
+stranger does not reveal whoever blocked them (decision 6): `Tx::put_block`, a `sees_peer`
+column, and a rule in `block` (review fix). Create `crates/push-store/migrations/0002_contact_sees_peer.sql`:
+
+```sql
+-- Whether the owner could see the peer's profile when they blocked them. A block counts
+-- toward the owner's visibility of the peer only if true, so blocking a stranger does not
+-- reveal whoever blocked them. Written only with state = 4 (blocked).
+ALTER TABLE messaging.contact ADD COLUMN sees_peer boolean NOT NULL DEFAULT false;
+
+-- The earlier rule counted every block. Existing blocks keep their sight, the
+-- conservative choice: the history of what each blocker saw was never recorded.
+UPDATE messaging.contact SET sees_peer = true WHERE state = 4;
+```
+
+In `crates/push-domain/src/contacts.rs`:
+
+Replace
+
+```rust
+        let blocked = Some(ContactState::Blocked);
+        let mut events = Vec::new();
+        if set_contact(&mut tx, me, peer, blocked).await? {
+            events.push(contact_changed(me, peer, blocked));
+        }
+```
+
+with
+
+```rust
+        let blocked = Some(ContactState::Blocked);
+        let mut events = Vec::new();
+        // The block records whether `me` could see `peer` until now, so that blocking a
+        // stranger never makes them visible. A block already in place keeps its record.
+        let previous = tx.get_contact(me, peer).await?;
+        if previous != blocked {
+            let sees_peer = matches!(
+                previous,
+                Some(ContactState::RequestedIn | ContactState::Accepted)
+            );
+            tx.put_block(me, peer, sees_peer).await?;
+            events.push(contact_changed(me, peer, blocked));
+        }
+```
+
+In `crates/push-domain/src/store.rs`:
+
+Replace
+
+```rust
+        state: ContactState,
+    ) -> DomainResult<()>;
+    /// A no-op if the row is absent.
+    async fn delete_contact(&mut self, owner: UserId, peer: UserId) -> DomainResult<()>;
+```
+
+with
+
+```rust
+        state: ContactState,
+    ) -> DomainResult<()>;
+    /// Inserts or replaces the row with a `Blocked` one, recording whether `owner` could see
+    /// `peer` when blocking (`related_users` counts the row only then). `put_contact`
+    /// records `false`.
+    async fn put_block(&mut self, owner: UserId, peer: UserId, sees_peer: bool)
+    -> DomainResult<()>;
+    /// A no-op if the row is absent.
+    async fn delete_contact(&mut self, owner: UserId, peer: UserId) -> DomainResult<()>;
+```
+
+In `crates/push-domain/src/memory.rs`:
+
+Replace
+
+```rust
+    devices: HashMap<DeviceId, DeviceRow>,
+    contacts: HashMap<(UserId, UserId), ContactState>,
+    invites: HashMap<String, InviteRecord>,
+    conversations: HashMap<ConversationId, Conversation>,
+```
+
+with
+
+```rust
+    devices: HashMap<DeviceId, DeviceRow>,
+    contacts: HashMap<(UserId, UserId), ContactState>,
+    /// Blocked rows whose owner could see the peer when blocking.
+    sighted_blocks: HashSet<(UserId, UserId)>,
+    invites: HashMap<String, InviteRecord>,
+    conversations: HashMap<ConversationId, Conversation>,
+```
+
+Replace
+
+```rust
+        }
+        self.work.contacts.insert((owner, peer), state);
+        Ok(())
+    }
+```
+
+with
+
+```rust
+        }
+        self.work.contacts.insert((owner, peer), state);
+        self.work.sighted_blocks.remove(&(owner, peer));
+        Ok(())
+    }
+
+    async fn put_block(
+        &mut self,
+        owner: UserId,
+        peer: UserId,
+        sees_peer: bool,
+    ) -> DomainResult<()> {
+        self.put_contact(owner, peer, ContactState::Blocked).await?;
+        if sees_peer {
+            self.work.sighted_blocks.insert((owner, peer));
+        }
+        Ok(())
+    }
+```
+
+Replace
+
+```rust
+    async fn delete_contact(&mut self, owner: UserId, peer: UserId) -> DomainResult<()> {
+        self.work.contacts.remove(&(owner, peer));
+        Ok(())
+    }
+```
+
+with
+
+```rust
+    async fn delete_contact(&mut self, owner: UserId, peer: UserId) -> DomainResult<()> {
+        self.work.contacts.remove(&(owner, peer));
+        self.work.sighted_blocks.remove(&(owner, peer));
+        Ok(())
+    }
+```
+
+In `crates/push-store/src/store.rs`:
+
+Replace
+
+```rust
+            "INSERT INTO messaging.contact (owner_id, peer_id, state) VALUES ($1, $2, $3) \
+             ON CONFLICT (owner_id, peer_id) \
+             DO UPDATE SET state = excluded.state, updated_at = now()",
+        )
+        .bind(owner.0)
+```
+
+with
+
+```rust
+            "INSERT INTO messaging.contact (owner_id, peer_id, state) VALUES ($1, $2, $3) \
+             ON CONFLICT (owner_id, peer_id) \
+             DO UPDATE SET state = excluded.state, sees_peer = false, updated_at = now()",
+        )
+        .bind(owner.0)
+```
+
+Replace
+
+```rust
+    }
+
+    async fn delete_contact(&mut self, owner: UserId, peer: UserId) -> DomainResult<()> {
+        sqlx::query("DELETE FROM messaging.contact WHERE owner_id = $1 AND peer_id = $2")
+```
+
+with
+
+```rust
+    }
+
+    async fn put_block(
+        &mut self,
+        owner: UserId,
+        peer: UserId,
+        sees_peer: bool,
+    ) -> DomainResult<()> {
+        sqlx::query(
+            "INSERT INTO messaging.contact (owner_id, peer_id, state, sees_peer) \
+             VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (owner_id, peer_id) \
+             DO UPDATE SET state = excluded.state, sees_peer = excluded.sees_peer, \
+                           updated_at = now()",
+        )
+        .bind(owner.0)
+        .bind(peer.0)
+        .bind(encode(ContactState::Blocked))
+        .bind(sees_peer)
+        .execute(self.conn())
+        .await
+        .map_err(store_error)?;
+        Ok(())
+    }
+
+    async fn delete_contact(&mut self, owner: UserId, peer: UserId) -> DomainResult<()> {
+        sqlx::query("DELETE FROM messaging.contact WHERE owner_id = $1 AND peer_id = $2")
+```
+
 ```powershell
 cargo test -p push-testkit
 cargo test -p push-store --test postgres -- contract::contacts scenarios::contacts
 ```
 
-Expected: both suites pass, each with 2 more cases than before.
+Expected: both suites pass, the contract with 3 more cases than before and the scenarios with 4 more.
 
 - [ ] **Step 3: The `Directory` service and its token, tests first**
 
@@ -5548,10 +6113,13 @@ with
 // auth-svc's own internal token as `authorization: Bearer …` metadata (not the worker's);
 // without it the call is UNAUTHENTICATED.
 service Directory {
-  // The users among user_ids whose profile user_id may see: user_id itself, the users it
-  // has a relationship with as it sees it (requests either way, accepted contacts, users
-  // it blocked) and everyone it shares or shared a conversation with. At most 100 ids;
-  // malformed ids are INVALID_ARGUMENT.
+  // The users among user_ids whose profile user_id may see: user_id itself, everyone it
+  // shares or shared a conversation with, and the users it has a contact row for as it
+  // sees them: requests it received, accepted contacts, and users it blocked, but only
+  // those it could already see when it blocked them (blocking a stranger grants nothing).
+  // A request user_id sent itself grants nothing, so someone it blocked cannot regain
+  // sight of its profile by asking again. At most 100 ids; malformed ids are
+  // INVALID_ARGUMENT.
   rpc VisibleUsers(VisibleUsersRequest) returns (VisibleUsersResponse);
 }
 
@@ -5941,15 +6509,18 @@ with
             .await
             .unwrap_err();
         assert_invalid(status, "user_ids");
-        let too_many = (0..=MAX_VISIBLE_USERS)
-            .map(|_| id_bytes(UserId::new().0))
-            .collect();
+        // Malformed ids would fail the parse; the limit must be checked first.
+        let too_many = vec![vec![1, 2, 3]; MAX_VISIBLE_USERS + 1];
         let status = world
             .directory
             .visible_users(ask(&alice, too_many))
             .await
             .unwrap_err();
-        assert_invalid(status, "user_ids");
+        assert_invalid(status.clone(), "user_ids");
+        assert!(
+            error_from_status(&status).message.contains("at most 100"),
+            "{status:?}"
+        );
     }
 
     #[test]
@@ -5995,7 +6566,7 @@ with
 ```rust
 /// | `PUSH_DB_MAX_CONNECTIONS` | pool size, at least 1 | `10` |
 /// | `PUSH_ACCOUNTS_TOKEN` | the worker's token for the `Accounts` API, 32 to 256 visible ASCII characters; without it `Accounts` refuses every call | none |
-/// | `PUSH_DIRECTORY_TOKEN` | auth-svc's token for the `Directory` API, 32 to 256 visible ASCII characters; without it `Directory` refuses every call | none |
+/// | `PUSH_DIRECTORY_TOKEN` | auth-svc's token for the `Directory` API, 32 to 256 visible ASCII characters and different from `PUSH_ACCOUNTS_TOKEN`; without it `Directory` refuses every call | none |
 /// | `PUSH_DEV_SETUP` | `1` registers the DEV ONLY `DevSetup` service | off |
 #[derive(Clone, PartialEq, Eq)]
 ```
@@ -6061,6 +6632,13 @@ with
         })?;
         let accounts_token = token(&lookup, "PUSH_ACCOUNTS_TOKEN")?;
         let directory_token = token(&lookup, "PUSH_DIRECTORY_TOKEN")?;
+        if accounts_token.is_some() && accounts_token == directory_token {
+            return Err(redacted(
+                "PUSH_DIRECTORY_TOKEN",
+                "must differ from PUSH_ACCOUNTS_TOKEN: each internal API has a token of its own"
+                    .to_owned(),
+            ));
+        }
         Ok(Self {
             database_url,
 ```
@@ -6175,6 +6753,18 @@ with
                 assert!(!message.contains(bad), "{message}");
             }
         }
+    }
+
+    #[test]
+    fn the_two_internal_tokens_must_differ() {
+        let shared = "s4me-".repeat(8);
+        let mut variables = REQUIRED.to_vec();
+        variables.push(("PUSH_ACCOUNTS_TOKEN", &shared));
+        variables.push(("PUSH_DIRECTORY_TOKEN", &shared));
+        let message = config(&variables).unwrap_err().to_string();
+        assert!(message.contains("PUSH_ACCOUNTS_TOKEN"), "{message}");
+        assert!(message.contains("PUSH_DIRECTORY_TOKEN"), "{message}");
+        assert!(!message.contains(&shared), "{message}");
     }
 ```
 
@@ -7044,6 +7634,8 @@ with
 struct Relations {
     pairs: Mutex<Vec<(Uuid, Uuid)>>,
     down: AtomicBool,
+    /// Ids the answer contains although nobody asked for them.
+    extra: Mutex<Vec<Uuid>>,
 }
 
 impl Relations {
@@ -7064,11 +7656,13 @@ impl Directory for Relations {
             return Err(AuthError::Unavailable);
         }
         let pairs = self.pairs.lock().unwrap();
-        Ok(candidates
+        let mut visible: Vec<Uuid> = candidates
             .iter()
             .copied()
             .filter(|user| *user == caller || pairs.contains(&(caller, *user)))
-            .collect())
+            .collect();
+        visible.extend(self.extra.lock().unwrap().iter().copied());
+        Ok(visible)
     }
 }
 ```
@@ -7171,6 +7765,27 @@ async fn profiles_are_shown_only_to_related_users() {
     let answer = call(&world, Method::GET, &ask(&[id(&bob)]), Some(access), None).await;
     assert_eq!(answer.status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(answer.json()["error"]["retryable"], true);
+}
+
+#[tokio::test]
+async fn a_profile_nobody_asked_for_is_never_returned() {
+    let world = world().await;
+    let alice = with_device(&world, "alice").await;
+    let bob = with_device(&world, "bob").await;
+    let carol = with_device(&world, "carol").await;
+    let id = |tokens: &Value| Uuid::parse_str(tokens["user_id"].as_str().unwrap()).unwrap();
+    world.directory.relate(id(&alice), id(&bob));
+    // message-svc's answer wrongly contains Carol, whom Alice did not ask for.
+    world.directory.extra.lock().unwrap().push(id(&carol));
+    let access = alice["access_token"].as_str().unwrap();
+
+    let uri = format!("/v1/users?ids={}", id(&bob));
+    let answer = call(&world, Method::GET, &uri, Some(access), None).await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.text);
+    let users = answer.json()["users"].as_array().unwrap().clone();
+    assert_eq!(users.len(), 1, "{}", answer.text);
+    assert_eq!(users[0]["handle"], "bob");
+    assert!(!answer.text.contains("carol"), "{}", answer.text);
 }
 ```
 
@@ -7422,7 +8037,9 @@ async fn profiles(
 ) -> Result<Response, AuthError> {
     let caller = caller(&api, &headers).await?;
     let ids = rules::user_ids(&query.ids)?;
-    let visible = api.directory.visible_users(caller.user_id, &ids).await?;
+    let mut visible = api.directory.visible_users(caller.user_id, &ids).await?;
+    // Defence in depth: never show a profile that was not asked for, whatever the answer.
+    visible.retain(|user| ids.binary_search(user).is_ok());
     let profiles = api.auth.profiles(&visible).await?;
     let users: Vec<Value> = profiles
         .iter()
@@ -7735,7 +8352,7 @@ git add Cargo.lock crates
 git commit -m "feat(auth): GET /v1/users?ids= shows profiles message-svc allows"
 ```
 
-Expected: 808 tests pass, no warnings, no diff.
+Expected: 821 tests pass, no warnings, no diff.
 
 ---
 
@@ -7754,7 +8371,7 @@ In `README.md`, in the `push-message-svc` table, insert after the row for
 `PUSH_ACCOUNTS_TOKEN`:
 
 ```markdown
-| `PUSH_DIRECTORY_TOKEN` | auth-svc's token for the `Directory` API, 32 to 256 visible ASCII characters; without it `Directory` refuses every call | none |
+| `PUSH_DIRECTORY_TOKEN` | auth-svc's token for the `Directory` API, 32 to 256 visible ASCII characters and different from `PUSH_ACCOUNTS_TOKEN`; without it `Directory` refuses every call | none |
 ```
 
 In the `push-auth` table, insert after its last row (the one for `PUSH_AUTH_WORKER_ROLE`):
@@ -7778,7 +8395,7 @@ READ COMMITTED.` with:
   joining a conversation (opening a direct one, creating a group, adding members) take a
   per-user advisory lock for every user concerned, sorted, in one statement (Plan 7A), so
   neither misses the other's uncommitted row and every membership has a delivery position
-  for every device. Lock order: contact pair, conversation, users, conversation positions.
+  for every device. Lock order: contact pair / conversation row, positions, users.
   Serialization failures and deadlocks are reported as a retryable conflict.
 ```
 
@@ -7800,14 +8417,15 @@ relayed `user.verified`, `device.registered`, `device.revoked` and `user.passwor
 Every call is idempotent and any order ends in the same state: a registration also records
 the user, and a revocation that arrives before the registration records the device as
 revoked, so the registration cannot revive it. Every call needs the worker's internal token
-(`authorization: Bearer <token>`, compared in constant time); without it, or when
+(`authorization: Bearer <PUSH_ACCOUNTS_TOKEN>`, compared in constant time); without it, or when
 message-svc has none, the call is `UNAUTHENTICATED`. A revoked device is refused by
 `Identify` at once (`PERMISSION_DENIED`); a device not relayed yet is `UNAVAILABLE`
 (`retryable`), which the gateway closes with 1011 until Plan 8 gives it a code of its own.
 After committing a revocation message-svc publishes `Kick{reason: DEVICE_REVOKED}` on
 `kick:{device_id}`, every time it is relayed; after a relayed password reset it publishes
 `Kick{reason: PASSWORD_RESET}` for every active device of the user, which stay registered.
-The gateway closes kicked sockets and refuses tokens older than a reset with Plan 8.
+The gateway closes kicked sockets with Plan 8: 4003 for a revocation, 4001 ("sign in
+again") for a password reset (owner decision), and refuses tokens older than a reset.
 ```
 
 In §5.5, replace the bullet that starts `- **Profiles.** `GET /v1/users?ids=…` returns` with:
@@ -7816,11 +8434,15 @@ In §5.5, replace the bullet that starts `- **Profiles.** `GET /v1/users?ids=…
 - **Profiles.** `GET /v1/users?ids=…` returns handle and display name for user ids the
   caller shares a contact or conversation with. Implementation (Plan 7A): auth-svc asks
   message-svc's internal `Directory` API, with a token of its own, which ids the caller may
-  see — the caller, every user the caller has a relationship with as the caller sees it
-  (requests either way, accepted contacts, users the caller blocked) and every user who is
-  or was in a conversation with the caller — and answers the verified profiles among them
-  from its own database, sorted by id. 1 to 100 ids; other and unknown ids are left out;
-  without message-svc's answer it fails closed with a retryable 503.
+  see, and answers the verified profiles among them from its own database, sorted by id
+  and intersected with the requested ids. The caller may see themselves; every user with
+  an incoming request to them or an accepted contact; a user they blocked, if they could
+  already see that user when blocking (`sees_peer`; their own outgoing request grants
+  nothing); and every user who is or was in a conversation with them. Names of people
+  they can no longer chat with therefore stay visible next to old messages: after a block
+  in either direction and after leaving a group (owner decision). 1 to 100 ids; other and
+  unknown ids are left out; without message-svc's answer it fails closed with a retryable
+  503.
 ```
 
 In §5.6, in the implementation notes, replace the bullet that starts `- **Profiles.**
@@ -7838,7 +8460,8 @@ frame`, add:
 - The details of a failed call (`grpc-status-details-bin`) are a `google.rpc.Status` whose
   `details` hold the `push.v1.Error` as a `google.protobuf.Any` with type URL
   `type.googleapis.com/push.v1.Error` (Plan 7A). Every domain error has a client
-  `ErrorCode` of its own; only retryable errors share `UNAVAILABLE`.
+  `ErrorCode` of its own; only retryable errors share `UNAVAILABLE`. Because of this
+  format, the gateway and message-svc must be deployed together.
 - The client frames `Edit`, `Delete`, `ReadUpTo`, `Request` (a `request_id` and a `oneof`
   of the 18 request bodies of §7.1) and `Response` are defined in `frame.proto` (Plan 7A);
   message-svc's `Messaging` service serves them as `Edit`, `Delete`, `ReadUpTo` and
@@ -7850,8 +8473,8 @@ In §13, replace the bullet `- Decide whether group endpoints ship in the first 
 second.` with:
 
 ```markdown
-- Group endpoints: message-svc serves them from Plan 7A; whether the gateway exposes them
-  in the first release is to be confirmed with the owner (recommended: yes, in Plan 8).
+- Groups: message-svc serves them in full from Plan 7A, but they are not exposed to apps in
+  the first release (owner decision): the Plan 8 gateway hides group frames.
 ```
 
 - [ ] **Step 3: Mark plan 7A in review**
@@ -7868,7 +8491,7 @@ cargo test --workspace --locked
 cargo +1.85 test --workspace --locked
 ```
 
-Expected: no diff, no warnings, 808 tests on both toolchains.
+Expected: no diff, no warnings, 821 tests on both toolchains.
 
 - [ ] **Step 5: Commit and push**
 
@@ -7882,7 +8505,7 @@ git push -u origin feature/plan-07a-message-service
 
 ```powershell
 $body = @'
-Implements docs/superpowers/plans/2026-10-13-plan-07a-message-service.md: message-svc serves the whole messaging core over gRPC for the gateway to call on behalf of an identified device. New client frames Edit, Delete, ReadUpTo, Request and Response (frame.proto; the gateway carries them in Plan 8) and Messaging RPCs Edit, Delete, ReadUpTo and Request cover contacts, invites, direct conversations, groups of up to 100 with admins, read positions, 48-hour edits and deletes, history and listings with unread counts and receipts. Relayed revocations and password resets kick devices on kick:{device_id}. A Directory API behind auth-svc's own token says whose profiles a user may see, and auth-svc serves GET /v1/users?ids= from it. Review fixes: a per-user advisory lock serialises device registrations with joins (a repeated device.registered could start a device past messages it never received; proven by a Postgres concurrency case), every domain error has its own code, error details are a google.rpc.Status with the client error as an Any, sync is documented as a read, and /readyz is checked against the pre-bound listener. 808 tests.
+Implements docs/superpowers/plans/2026-10-13-plan-07a-message-service.md: message-svc serves the whole messaging core over gRPC for the gateway to call on behalf of an identified device. New client frames Edit, Delete, ReadUpTo, Request and Response (frame.proto; the gateway carries them in Plan 8) and Messaging RPCs Edit, Delete, ReadUpTo and Request cover contacts, invites, direct conversations, groups of up to 100 with admins, read positions, 48-hour edits and deletes, history and listings with unread counts and receipts. Relayed revocations and password resets kick devices on kick:{device_id}. A Directory API behind auth-svc's own token says whose profiles a user may see, and auth-svc serves GET /v1/users?ids= from it. Review fixes: a per-user advisory lock serialises device registrations with joins (a repeated device.registered could start a device past messages it never received; proven by a Postgres concurrency case), every domain error has its own code, error details are a google.rpc.Status with the client error as an Any, sync is documented as a read, and /readyz is checked against the pre-bound listener. 821 tests.
 
 Plan 7B moves the smoke test onto the new API, removes DevSetup and verifies it on minikube.
 '@
@@ -7918,8 +8541,8 @@ controller merges after the final review.
   the new API and the kicks, `DevSetup` goes, the chart passes the Directory token to
   auth-svc and message-svc and auth-svc's message-svc URL.
 - **The gateway** (Plan 8): the new frames in `Frame`, `Response` and `Error` forwarding,
-  `ReAuth`, close codes — closing kicked sockets (4003 for a revoked device; a
-  password-reset kick per owner decision 1), refusing tokens older than a password reset,
+  `ReAuth`, close codes — closing kicked sockets (4003 for a revoked device, 4001 for a
+  password reset, owner decision 1), refusing tokens older than a password reset,
   a close code of its own for a device not relayed yet, and turning `Identify`'s
   `UNKNOWN_DEVICE`/`UNAVAILABLE` difference into close codes without making it an oracle
   for device ids. Receipts, read positions and contact events reach clients then, too.
@@ -7933,3 +8556,28 @@ controller merges after the final review.
   could come with load tests (Plan 11).
 - **gRPC load balancing across message-svc replicas** (from Plan 4): auth-svc's client,
   like the gateway's, holds one connection.
+
+**Plan 8 MUST**
+
+- The Messaging gRPC API has no caller auth and trusts any `user_id`: restrict it to the
+  gateway with a shared token, like `Accounts`, or a NetworkPolicy.
+- A per-frame size limit on `Request`.
+- Rate limits on `RedeemInvite`, `ContactRequest` (id probing) and `CreateInvite` over the
+  `Request` RPC; the comment in `invites.rs` claims a transport limit that does not exist
+  yet.
+- `ContactRequest` `USER_NOT_FOUND` reveals whether an id exists.
+- A reset kick is lost if the Redis publish fails, so `password_changed_at` must be
+  checked and the gateway must subscribe to `kick` before `Identify`.
+- The `Identify` oracle.
+
+**Before groups ship**
+
+- A `CreateGroup` retry creates a second group: a client id is needed for idempotency.
+- Bidi and format characters in titles.
+- Contacts are checked before `lock_users` in `create_group`.
+
+**Later**
+
+- A "remove contact" operation, to hide a block.
+- `locks.rs` comment: a cross-kind hash collision could deadlock (retryable).
+- UUIDv7 has 74 random bits, not 128; any doc that says otherwise is corrected.
