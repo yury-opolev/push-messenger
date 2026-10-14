@@ -148,13 +148,15 @@ if [[ "$smoke" == true ]]; then
   step 'wait for the old worker pod to go away'
   deadline=$((SECONDS + 90))
   while true; do
-    mapfile -t worker_pods < <(kubectl --context "$cluster" -n "$namespace" get pods -l "$worker_selector" -o name)
-    echo "worker pods: ${#worker_pods[@]} (${worker_pods[*]})"
-    if [[ "${#worker_pods[@]}" -eq 1 ]]; then
+    pods="$(kubectl --context "$cluster" -n "$namespace" get pods -l "$worker_selector" -o name)"
+    # grep -c exits 1 on a count of 0, which is fine here: `|| true` keeps set -e quiet.
+    worker_pod_count="$(printf '%s\n' "$pods" | grep -c . || true)"
+    echo "worker pods: $worker_pod_count ($(echo $pods))"
+    if [[ "$worker_pod_count" -eq 1 ]]; then
       break
     fi
     if [[ "$SECONDS" -gt "$deadline" ]]; then
-      echo "more than one worker pod (${#worker_pods[@]}) after 90 s; the smoke test needs exactly one" >&2
+      echo "timed out after 90 s: expected exactly one worker pod (found $worker_pod_count)" >&2
       exit 1
     fi
     sleep 2

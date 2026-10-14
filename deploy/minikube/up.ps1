@@ -191,7 +191,7 @@ if ($Smoke) {
             break
         }
         if ((Get-Date) -gt $deadline) {
-            throw "more than one worker pod ($($workerPods.Count)) after 90 s; the smoke test needs exactly one"
+            throw "timed out after 90 s: expected exactly one worker pod (found $($workerPods.Count))"
         }
         Start-Sleep -Seconds 2
     }

@@ -34,8 +34,9 @@ other's allowed profiles, chat through the ingress, edit, read, form a group and
 and finally a revoked device and a password reset are kicked on Redis. The DEV ONLY mailbox
 and the calls to message-svc's API (the gateway carries them from Plan 8) go to the
 services directly. `deploy/minikube/up.sh --smoke` does the same on Linux
-and macOS. Both wait for ingress-nginx and retry
-`helm upgrade --install` up to 5 times while its admission webhook comes up.
+and macOS. Both wait for ingress-nginx, retry
+`helm upgrade --install` up to 5 times while its admission webhook comes up, and
+(with `--smoke`) wait until only one worker pod is left before the smoke test.
 `deploy/minikube/down.ps1` removes everything again: namespace, the
 Secret, the PostgreSQL volume and its data directory (`-Delete` deletes the profile).
 `helm uninstall` alone keeps the Secret (`helm.sh/resource-policy: keep`) and the volume,

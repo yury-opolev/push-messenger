@@ -4034,7 +4034,7 @@ git add crates
 git commit -m "refactor(message-svc): remove the DEV ONLY DevSetup API"
 ```
 
-Expected: 807 tests pass (the `PUSH_DEV_SETUP` configuration test is gone), no warnings,
+Expected: 822 tests pass (the `PUSH_DEV_SETUP` configuration test is gone), no warnings,
 no diff.
 
 ---
@@ -4398,7 +4398,7 @@ git add deploy
 git commit -m "feat(chart): the Directory token, auth-svc's message-svc URL and the smoke test's Redis URL"
 ```
 
-Expected: 807 tests pass, no warnings, no diff.
+Expected: 822 tests pass, no warnings, no diff.
 
 ---
 
@@ -4726,7 +4726,7 @@ cargo +1.85 test --workspace --locked
 pwsh deploy/helm/test-chart.ps1
 ```
 
-Expected: no diff, no warnings, 807 tests on both toolchains, 29 chart checks.
+Expected: no diff, no warnings, 822 tests on both toolchains, 29 chart checks.
 
 - [ ] **Step 5: Commit and push**
 
@@ -4740,7 +4740,7 @@ git push -u origin feature/plan-07b-message-minikube
 
 ```powershell
 $body = @'
-Implements docs/superpowers/plans/2026-10-13-plan-07b-message-minikube.md: the smoke test drives Plan 7A's API end to end — contacts by request and by invite, the direct conversation, profiles only for related users through auth-svc's GET /v1/users?ids=, edit, read, a group and a delete delivered to Bob's open WebSocket, history with the message erased, and kicks on Redis after a device revocation and a password reset relayed by the worker. The DEV ONLY DevSetup API is removed. The chart generates and keeps a Directory token for auth-svc and message-svc only, gives auth-svc message-svc's URL, and gives the smoke Pod the Redis URL from the Secret; test-chart.ps1 has 29 checks. Verified on minikube (profile push, Kubernetes 1.31): smoke PASS, and an upgrade keeps the token. 807 tests.
+Implements docs/superpowers/plans/2026-10-13-plan-07b-message-minikube.md: the smoke test drives Plan 7A's API end to end — contacts by request and by invite, the direct conversation, profiles only for related users through auth-svc's GET /v1/users?ids=, edit, read, a group and a delete delivered to Bob's open WebSocket, history with the message erased, and kicks on Redis after a device revocation and a password reset relayed by the worker. The DEV ONLY DevSetup API is removed. The chart generates and keeps a Directory token for auth-svc and message-svc only, gives auth-svc message-svc's URL, and gives the smoke Pod the Redis URL from the Secret; test-chart.ps1 has 29 checks. Verified on minikube (profile push, Kubernetes 1.31): smoke PASS, and an upgrade keeps the token. 822 tests.
 '@
 gh pr create --base main --title "Plan 7B: the message service on minikube" --body $body
 gh pr checks --watch
@@ -4776,3 +4776,8 @@ controller merges after the final review.
 - **`register_device` in push-domain has no production caller now** that `DevSetup` is gone;
   remove it or give it a caller later.
 - **A blank line is left in message-svc's `server.rs`** where the `DevSetup` wiring was.
+
+## Review fixes
+
+- **identify reads a device once.** It read the owner of an active device and then, in a second statement, the owner of any device, so a worker commit of `device_registered` between the two made a legitimate new device `UnknownDevice` instead of the retryable `DeviceNotKnownYet` (the flaky local smoke test). `Tx::device_state` now returns the owner and whether the device is active from one statement (Postgres: `SELECT user_id, revoked_at IS NULL`), and `identify` maps absent to `DeviceNotKnownYet`, another user's or revoked to `UnknownDevice`, active to `Ok`. `require_device` makes one read and `device_registered`/`device_revoked` read after their own insert, so they needed no change. A contract case pins the mapping on both stores.
+- **`up.sh` counts worker pods without `mapfile`** (macOS bash 3.2 has none): `pods=$(kubectl ... -o name)` and `grep -c .` with `|| true`. Both scripts time out with "expected exactly one worker pod (found N)".

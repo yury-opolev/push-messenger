@@ -1118,7 +1118,9 @@ Implementation notes (local minikube, Plan 4B):
 - `deploy/minikube/up.ps1` (and `up.sh`) wait for ingress-nginx, stop at once with
   "run down.ps1 first" when an existing PostgreSQL volume lacks the `push_auth` or
   `push_worker` database (or the kept Secret their passwords), retry
-  `helm upgrade --install` up to 5 times, and bring it up on minikube; `helm test` runs
+  `helm upgrade --install` up to 5 times, and bring it up on minikube; with `--smoke` they
+  then wait until the old worker pod is gone (exactly one worker pod remains, so the DEV
+  ONLY mailbox is the new worker's), and `helm test` runs
   `push-smoke` inside the cluster through the ingress controller: three users sign up,
   verify with the emails the worker's log sender delivered to the DEV ONLY mailbox,
   register devices and wait for the worker to relay them to message-svc; they become
