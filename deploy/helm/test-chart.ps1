@@ -34,7 +34,7 @@ Check 'lint with values-minikube.yaml' { helm lint $chart --strict -f $minikube 
 
 $default = helm template push $chart | Out-String
 Check 'default: the gateway refuses dev identities' { $default -match 'name: PUSH_DEV_AUTH\s+value: "0"' }
-Check 'default: message-svc has no DevSetup API' { $default -match 'name: PUSH_DEV_SETUP\s+value: "0"' }
+Check 'default: the DevSetup switch is gone' { $default -notmatch 'PUSH_DEV_SETUP' }
 Check 'default: no smoke test' { $default -notmatch 'helm.sh/hook: test' }
 Check 'default: the worker has no dev mailbox and logs email; auth-svc has no mailbox at all' {
     $worker = Doc $default 'Deployment' 'push-worker'
@@ -76,6 +76,19 @@ Check 'default: message-svc and the worker share the Accounts token from the Sec
         $worker -match 'name: PUSH_ACCOUNTS_TOKEN\s+valueFrom:\s+secretKeyRef:\s+name: push-secrets\s+key: accounts-token' -and
         $gateway -notmatch 'accounts-token' -and -not $messageSvc.Contains($token) -and -not $worker.Contains($token)
 }
+Check 'default: auth-svc and message-svc share the Directory token from the Secret, nobody else has it' {
+    $auth = Doc $default 'Deployment' 'push-auth'
+    $messageSvc = Doc $default 'Deployment' 'push-message-svc'
+    $token = [regex]::Match($default, 'directory-token: "([^"]+)"').Groups[1].Value
+    $token.Length -eq 48 -and
+        $auth -match 'name: PUSH_DIRECTORY_TOKEN\s+valueFrom:\s+secretKeyRef:\s+name: push-secrets\s+key: directory-token' -and
+        $messageSvc -match 'name: PUSH_DIRECTORY_TOKEN\s+valueFrom:\s+secretKeyRef:\s+name: push-secrets\s+key: directory-token' -and
+        $auth -match 'name: PUSH_MESSAGE_SVC_URL\s+value: "http://push-message-svc:50051"' -and
+        $auth -notmatch 'accounts-token' -and
+        (Doc $default 'Deployment' 'push-worker') -notmatch 'directory-token' -and
+        (Doc $default 'Deployment' 'push-gateway') -notmatch 'directory-token' -and
+        -not $auth.Contains($token) -and -not $messageSvc.Contains($token)
+}
 Check 'default: auth-svc and the worker drain like the gateway (preStop sleep, grace period)' {
     $auth = Doc $default 'Deployment' 'push-auth'
     $worker = Doc $default 'Deployment' 'push-worker'
@@ -111,7 +124,12 @@ Check 'resend: the worker sends through Resend with the key from the Secret' {
 
 $dev = helm template push $chart -f $minikube | Out-String
 Check 'minikube: dev identities on' { $dev -match 'name: PUSH_DEV_AUTH\s+value: "1"' }
-Check 'minikube: DevSetup API on' { $dev -match 'name: PUSH_DEV_SETUP\s+value: "1"' }
+Check 'minikube: the smoke test calls message-svc and reads the Redis URL from the Secret' {
+    $smoke = Doc $dev 'Pod' 'push-smoke'
+    $smoke -match '- --message-svc\s+- "http://push-message-svc:50051"' -and
+        $smoke -match 'name: PUSH_SMOKE_REDIS_URL\s+valueFrom:\s+secretKeyRef:\s+name: push-secrets\s+key: redis-url' -and
+        $smoke -notmatch 'redis://' -and $dev -notmatch 'PUSH_DEV_SETUP'
+}
 Check 'minikube: the worker''s dev mailbox on' {
     (Doc $dev 'Deployment' 'push-worker') -match 'name: PUSH_DEV_MAILBOX\s+value: "1"'
 }
