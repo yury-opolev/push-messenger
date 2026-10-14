@@ -1,6 +1,7 @@
-//! The walking skeleton on this machine: Postgres and Redis in containers (Docker must be
-//! running), auth-svc, the worker, message-svc and the gateway in this process, and the
-//! smoke test against them over real HTTP, gRPC and WebSockets.
+//! The whole system on this machine: Postgres and Redis in containers (Docker must be
+//! running), auth-svc, the worker, message-svc and the gateway in this process, wired as
+//! the chart wires them (each internal API behind its own token), and the smoke test
+//! against them over real HTTP, gRPC and WebSockets.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -61,6 +62,11 @@ async fn the_smoke_test_passes_against_the_whole_stack() {
     let auth_health = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let auth_health_addr = auth_health.local_addr().unwrap();
     let auth_url = format!("http://{}", auth_http.local_addr().unwrap());
+    let grpc = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let message_svc_url = format!("http://{}", grpc.local_addr().unwrap());
+    // auth-svc's token for message-svc's Directory API, as the chart's Secret holds it.
+    // message-svc refuses it equal to the Accounts token.
+    let directory_token = "directory-token-for-the-local-smoke-test";
     let auth_variables = [
         ("PUSH_DATABASE_URL", auth_database_url.as_str()),
         ("PUSH_REDIS_URL", redis_url.as_str()),
@@ -76,6 +82,8 @@ async fn the_smoke_test_passes_against_the_whole_stack() {
             "CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk=",
         ),
         ("PUSH_AUTH_WORKER_ROLE", "push_worker"),
+        ("PUSH_MESSAGE_SVC_URL", message_svc_url.as_str()),
+        ("PUSH_DIRECTORY_TOKEN", directory_token),
     ];
     let auth_config = push_auth::Config::from_lookup(|name| {
         auth_variables
@@ -91,10 +99,8 @@ async fn the_smoke_test_passes_against_the_whole_stack() {
         shutdown.clone(),
     ));
 
-    let grpc = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let message_svc_health = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let message_svc_health_addr = message_svc_health.local_addr().unwrap();
-    let message_svc_url = format!("http://{}", grpc.local_addr().unwrap());
     // The worker's token for message-svc's Accounts API, as the chart's Secret holds it.
     let accounts_token = "accounts-token-for-the-local-smoke-test".to_owned();
     let message_svc = tokio::spawn(push_message_svc::serve(
@@ -105,8 +111,8 @@ async fn the_smoke_test_passes_against_the_whole_stack() {
             health_addr: message_svc_health.local_addr().unwrap(),
             store: StoreOptions::default(),
             accounts_token: Some(accounts_token.clone()),
-            directory_token: None,
-            dev_setup: true,
+            directory_token: Some(directory_token.to_owned()),
+            dev_setup: false,
         },
         grpc,
         message_svc_health,
@@ -164,7 +170,7 @@ async fn the_smoke_test_passes_against_the_whole_stack() {
     let target = Target {
         mailbox_url: worker_url,
         auth_url,
-        setup_url: message_svc_url,
+        message_svc_url,
         socket_url,
         host: None,
     };

@@ -1,7 +1,8 @@
 //! The auth part of the smoke test: a user signs up, verifies the email with the link the
 //! worker's log sender delivered to the DEV ONLY mailbox, signs in, registers a device (and
 //! retries the registration, which must find the same device) and refreshes its tokens, all
-//! over auth-svc's public HTTP API, and checks the access token against the JWKS.
+//! over auth-svc's public HTTP API, and checks the access token against the JWKS. Later the
+//! users read each other's profiles there too.
 
 use std::time::{Duration, Instant};
 
@@ -19,6 +20,8 @@ use crate::{CONNECT_TIMEOUT, Target, WORKER_TIMEOUT, step};
 pub(crate) struct Enrolled {
     pub user: Uuid,
     pub device: Uuid,
+    /// The device's current access token. Never printed.
+    pub access_token: String,
 }
 
 /// The access-token claims the smoke test checks.
@@ -112,7 +115,11 @@ impl<'a> Auth<'a> {
         )
         .await?;
 
-        let token = self.verification_token(name, &email).await?;
+        let (token, waited) = self.mailbox_token(&email, "verify_email").await?;
+        step(&format!(
+            "{name} signed up; the worker's log sender delivered the verification email after {} ms",
+            waited.as_millis()
+        ));
         let page = public(
             &self.http,
             self.target,
@@ -222,13 +229,43 @@ impl<'a> Auth<'a> {
         Ok(Enrolled {
             user,
             device: device_id,
+            access_token: field(&refreshed, "access_token")?,
         })
     }
 
-    /// The token of the verification link sent to `email`: the worker relays the
-    /// `email.send` event from auth-svc's outbox and its log sender drops the email into
-    /// the dev mailbox, which is polled until it arrives.
-    async fn verification_token(&self, name: &str, email: &str) -> anyhow::Result<String> {
+    /// The user ids among `ids` whose profiles `GET /v1/users?ids=…` shows the holder of
+    /// `access_token`; every profile shown must have a handle.
+    pub async fn profiles(&self, access_token: &str, ids: &[Uuid]) -> anyhow::Result<Vec<Uuid>> {
+        let ids: Vec<String> = ids.iter().map(Uuid::to_string).collect();
+        let answer = expect(
+            public(&self.http, self.target, reqwest::Method::GET, "/v1/users")
+                .query(&[("ids", ids.join(","))])
+                .bearer_auth(access_token),
+            StatusCode::OK,
+            "read profiles",
+        )
+        .await?;
+        let users = answer["users"]
+            .as_array()
+            .context("the profiles answer has no users")?;
+        users
+            .iter()
+            .map(|user| {
+                field(user, "handle")?;
+                Ok(field(user, "user_id")?.parse()?)
+            })
+            .collect()
+    }
+
+    /// The token of the link in the newest `template` email to `email`, and how long it
+    /// took to come: the worker relays the `email.send` event from auth-svc's outbox and
+    /// its log sender drops the email into the dev mailbox, which is polled until it
+    /// arrives.
+    async fn mailbox_token(
+        &self,
+        email: &str,
+        template: &str,
+    ) -> anyhow::Result<(String, Duration)> {
         let url = format!(
             "{}/dev/mailbox",
             self.target.mailbox_url.trim_end_matches('/')
@@ -251,7 +288,8 @@ impl<'a> Auth<'a> {
             let text = mailbox["emails"].as_array().and_then(|emails| {
                 emails
                     .iter()
-                    .find(|email| email["template"] == "verify_email")
+                    .rev()
+                    .find(|email| email["template"] == template)
                     .and_then(|email| email["text"].as_str().map(str::to_owned))
             });
             match text {
@@ -260,25 +298,21 @@ impl<'a> Auth<'a> {
                     tokio::time::sleep(Duration::from_millis(250)).await;
                 }
                 None => bail!(
-                    "no verification email for {email} in the dev mailbox within {WORKER_TIMEOUT:?}"
+                    "no {template} email for {email} in the dev mailbox within {WORKER_TIMEOUT:?}"
                 ),
             }
         };
-        step(&format!(
-            "{name} signed up; the worker's log sender delivered the verification email after {} ms",
-            started.elapsed().as_millis()
-        ));
         let link = text
             .lines()
             .find(|line| line.starts_with("http"))
-            .context("the verification email has no link")?;
+            .with_context(|| format!("the {template} email has no link"))?;
         let token = Url::parse(link)
-            .map_err(|_| anyhow::anyhow!("the verification link is not a URL"))?
+            .map_err(|_| anyhow::anyhow!("the {template} link is not a URL"))?
             .query_pairs()
             .find(|(key, _)| key == "token")
             .map(|(_, token)| token.into_owned())
-            .context("the verification link has no token")?;
-        Ok(token)
+            .with_context(|| format!("the {template} link has no token"))?;
+        Ok((token, started.elapsed()))
     }
 
     /// Checks an access token's signature against the JWKS, as the gateway will.
