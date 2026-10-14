@@ -333,7 +333,9 @@ message DirectOpened {
 }
 
 // Asks another user to become a contact (spec §5.5). If they already asked the caller,
-// both become accepted contacts at once.
+// both become accepted contacts at once. An id that is not a verified user is answered
+// REQUESTED_OUT and nothing is stored, so requests never reveal which ids exist; Accept
+// and Decline answer it NO_PENDING_REQUEST, Block and Unblock succeed.
 message ContactRequest {
   bytes user_id = 1;
 }
@@ -485,7 +487,8 @@ enum ErrorCode {
   ERROR_CODE_UNAVAILABLE = 9;
   // Any other rejection; `message` says which.
   ERROR_CODE_REJECTED = 10;
-  // The other user does not exist (or has not verified their email yet).
+  // The caller is not a known user. Never answers about another user's id: requests
+  // name unknown ids as strangers, so no answer reveals which ids exist.
   ERROR_CODE_USER_NOT_FOUND = 11;
   // Accept or Decline without a request from that user.
   ERROR_CODE_NO_PENDING_REQUEST = 12;

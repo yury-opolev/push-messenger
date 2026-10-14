@@ -493,11 +493,18 @@ async fn contacts_are_requested_accepted_and_blocked_and_a_block_freezes_the_cha
     world.request(&bob, unblock).await.unwrap();
     assert!(contacts(&world, &bob).await.is_empty());
 
+    // An id that is no user looks like someone who has not answered yet.
+    let unknown = UserId::new();
     let stranger = request::Body::ContactRequest(ContactRequest {
-        user_id: id_bytes(UserId::new().0),
+        user_id: id_bytes(unknown.0),
     });
-    let status = world.request(&alice, stranger).await.unwrap_err();
-    assert_eq!(failure(&status).0, ErrorCode::UserNotFound);
+    assert_eq!(
+        world.request(&alice, stranger).await.unwrap(),
+        response::Body::Contact(Contact {
+            user_id: id_bytes(unknown.0),
+            state: ContactState::RequestedOut.into(),
+        })
+    );
     let own = request::Body::ContactRequest(ContactRequest {
         user_id: id_bytes(alice.user.0),
     });
