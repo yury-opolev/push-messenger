@@ -170,13 +170,15 @@ where
         Ok(Response::new(AccountsResponse {}))
     }
 
-    /// Accepted and otherwise ignored for now: message-svc publishes kicks in Plan 7, and
-    /// the gateway acts on them (and refuses tokens older than the reset) in Plan 8.
     async fn password_reset(
         &self,
         request: Request<AccountUser>,
     ) -> Result<Response<AccountsResponse>, Status> {
-        parse_id(&request.into_inner().user_id, "user_id", UserId)?;
+        let user = parse_id(&request.into_inner().user_id, "user_id", UserId)?;
+        self.messaging
+            .password_reset(user)
+            .await
+            .map_err(domain_error)?;
         Ok(Response::new(AccountsResponse {}))
     }
 }
@@ -324,7 +326,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use push_domain::{Event, InMemoryStore, RecordingNotifier, SystemClock};
+    use push_domain::{Event, InMemoryStore, KickReason, RecordingNotifier, SystemClock};
     use push_proto::internal::v1::accounts_server::Accounts as AccountsRpc;
     use push_proto::internal::v1::dev_setup_server::DevSetup;
     use push_proto::internal::v1::messaging_server::Messaging as MessagingRpc;
@@ -716,6 +718,7 @@ mod tests {
             identify(&world, user, tablet).await,
             Err(Code::PermissionDenied)
         );
+        world.notifier.take();
         world
             .accounts
             .password_reset(Request::new(AccountUser {
@@ -723,6 +726,14 @@ mod tests {
             }))
             .await
             .unwrap();
+        // The phone is kicked, to sign in again; the revoked tablet is not active.
+        assert_eq!(
+            world.notifier.take(),
+            [Event::Kick {
+                devices: vec![phone],
+                reason: KickReason::PasswordReset,
+            }]
+        );
         assert_eq!(identify(&world, user, phone).await, Ok(()));
     }
 

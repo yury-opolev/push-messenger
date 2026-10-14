@@ -54,11 +54,11 @@ service Accounts {
   // device.registered: also records the user, since only verified users get devices.
   rpc DeviceRegistered(AccountDevice) returns (AccountsResponse);
   // device.revoked: Identify refuses the device from now on, even when this arrives
-  // before the registration.
+  // before the registration; the device is kicked (`kick:{device_id}`).
   rpc DeviceRevoked(AccountDevice) returns (AccountsResponse);
-  // user.password_reset: every device of the user is to be kicked. Accepted and
-  // otherwise ignored until message-svc publishes kicks (Plan 7) and the gateway closes
-  // kicked sockets and refuses older tokens (Plan 8).
+  // user.password_reset: every active device of the user is kicked
+  // (`kick:{device_id}`), to sign in again. The gateway closes kicked sockets and refuses
+  // tokens older than the reset in Plan 8.
   rpc PasswordReset(AccountUser) returns (AccountsResponse);
 }
 
@@ -146,6 +146,20 @@ message ContactChanged {
 message ReadPositionChanged {
   bytes conversation_id = 1;
   int64 read_seq = 2;
+}
+
+// Published on the Redis channel `kick:{device_id}` (spec §5.3, §5.4): the gateway holding
+// the device closes its socket at once (Plan 8). Never carries anything but the reason.
+message Kick {
+  KickReason reason = 1;
+}
+
+enum KickReason {
+  KICK_REASON_UNSPECIFIED = 0;
+  // The device was revoked: the client stops (close code 4003).
+  KICK_REASON_DEVICE_REVOKED = 1;
+  // The user's password was reset: the client signs in again.
+  KICK_REASON_PASSWORD_RESET = 2;
 }
 
 message RegisterUserRequest {

@@ -1,5 +1,5 @@
 use crate::{Backend, Case, World, bodies, case_list};
-use push_domain::{DeviceId, DomainError, UserId};
+use push_domain::{DeviceId, DomainError, Event, KickReason, UserId};
 
 async fn registering_a_device_for_an_unknown_user_fails<B: Backend>(backend: &B) {
     let world = World::new(backend).await;
@@ -147,6 +147,61 @@ async fn relayed_events_for_another_users_device_are_refused<B: Backend>(backend
     assert_eq!(world.svc.identify(alice.device, alice.user).await, Ok(()));
 }
 
+async fn a_relayed_revocation_kicks_the_device<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
+    let alice = world.person().await;
+    let tablet = world.add_device(&alice).await;
+    world.notifier.take();
+    world.svc.device_revoked(tablet, alice.user).await.unwrap();
+    // Every copy of the event kicks again: harmless, and nothing is lost if the first
+    // kick was.
+    world.svc.device_revoked(tablet, alice.user).await.unwrap();
+    let kick = Event::Kick {
+        devices: vec![tablet],
+        reason: KickReason::DeviceRevoked,
+    };
+    assert_eq!(world.notifier.take(), vec![kick.clone(), kick]);
+
+    // A refused revocation kicks nobody.
+    let bob = world.person().await;
+    world.notifier.take();
+    assert!(
+        world
+            .svc
+            .device_revoked(bob.device, alice.user)
+            .await
+            .is_err()
+    );
+    assert_eq!(world.notifier.take(), []);
+}
+
+async fn a_password_reset_kicks_every_active_device_of_the_user<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
+    let (alice, bob) = (world.person().await, world.person().await);
+    let laptop = world.add_device(&alice).await;
+    let revoked = world.add_device(&alice).await;
+    world.svc.device_revoked(revoked, alice.user).await.unwrap();
+    world.notifier.take();
+
+    world.svc.password_reset(alice.user).await.unwrap();
+    let mut devices = vec![alice.device, laptop];
+    devices.sort();
+    assert_eq!(
+        world.notifier.take(),
+        [Event::Kick {
+            devices,
+            reason: KickReason::PasswordReset,
+        }]
+    );
+    // The devices stay registered: a new sign-in on them works.
+    assert_eq!(world.svc.identify(laptop, alice.user).await, Ok(()));
+    assert_eq!(world.svc.identify(bob.device, bob.user).await, Ok(()));
+
+    // A user message-svc has not heard of has nothing to kick.
+    world.svc.password_reset(UserId::new()).await.unwrap();
+    assert_eq!(world.notifier.take(), []);
+}
+
 pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
     case_list![
         registering_a_device_for_an_unknown_user_fails,
@@ -162,5 +217,7 @@ pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
         a_revocation_relayed_before_the_registration_wins,
         a_relayed_revocation_closes_an_active_device,
         relayed_events_for_another_users_device_are_refused,
+        a_relayed_revocation_kicks_the_device,
+        a_password_reset_kicks_every_active_device_of_the_user,
     ]
 }

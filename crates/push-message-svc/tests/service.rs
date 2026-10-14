@@ -1,6 +1,6 @@
 //! The whole service on real Postgres and Redis (Docker must be running): readiness, the
-//! dev setup calls, the worker's account events, a send that rings the recipient's Redis
-//! channel, sync, ack, and graceful shutdown.
+//! dev setup calls, the worker's account events (a revocation kicks the device on Redis),
+//! a send that rings the recipient's Redis channel, sync, ack, and graceful shutdown.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -11,12 +11,12 @@ use push_proto::internal::v1::accounts_client::AccountsClient;
 use push_proto::internal::v1::dev_setup_client::DevSetupClient;
 use push_proto::internal::v1::messaging_client::MessagingClient;
 use push_proto::internal::v1::{
-    AccountDevice, AckRequest, IdentifyRequest, MakeContactsRequest, Notification,
-    OpenDirectRequest, RegisterDeviceRequest, RegisterUserRequest, SendRequest, SyncRequest,
-    notification::Kind,
+    AccountDevice, AckRequest, IdentifyRequest, Kick, KickReason, MakeContactsRequest,
+    Notification, OpenDirectRequest, RegisterDeviceRequest, RegisterUserRequest, SendRequest,
+    SyncRequest, notification::Kind,
 };
 use push_proto::v1::{Ack, ContentType, Send};
-use push_proto::{id_bytes, notify_channel};
+use push_proto::{id_bytes, kick_channel, notify_channel};
 use push_store::StoreOptions;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::redis::Redis;
@@ -301,7 +301,21 @@ async fn accounts_are_served_and_dev_setup_is_absent_unless_enabled() {
     });
     accounts.device_registered(event.clone()).await.unwrap();
     messaging.identify(identify.clone()).await.unwrap();
+
+    // A revocation kicks the device through its Redis channel.
+    let mut bell = redis::Client::open(running.redis_url.as_str())
+        .unwrap()
+        .get_async_pubsub()
+        .await
+        .unwrap();
+    bell.subscribe(kick_channel(device)).await.unwrap();
     accounts.device_revoked(event).await.unwrap();
+    let kicked = tokio::time::timeout(Duration::from_secs(5), bell.on_message().next())
+        .await
+        .expect("the device's channel rings within 5 s")
+        .unwrap();
+    let kick = Kick::decode(kicked.get_payload_bytes()).unwrap();
+    assert_eq!(kick.reason(), KickReason::DeviceRevoked);
     let status = messaging.identify(identify).await.unwrap_err();
     assert_eq!(status.code(), tonic::Code::PermissionDenied);
 

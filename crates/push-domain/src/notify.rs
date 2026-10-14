@@ -1,9 +1,10 @@
 //! Events for the transport layer.
 //!
 //! After a commit, the service publishes typed events: which users have new log entries,
-//! whose delivery or read position moved, and whose contacts changed. Events are best
-//! effort and ephemeral. They carry no message bodies, and losing one only delays a
-//! client, because everything they announce is durable and can be read back:
+//! whose delivery or read position moved, whose contacts changed, and which devices must
+//! disconnect. Events are best effort and ephemeral. They carry no message bodies, and
+//! losing one only delays a client, because everything they announce is durable and can
+//! be read back:
 //!
 //! - new entries through `sync`;
 //! - contact changes through `list_contacts`;
@@ -11,13 +12,16 @@
 //!   `changed_since` reflects content changes only (a conversation created or an entry
 //!   appended). Receipt positions do not move `updated_at`, so the busy conversation row
 //!   is not written on every ack and read. A reconnecting client refreshes its ticks with
-//!   one listing without `changed_since`.
+//!   one listing without `changed_since`;
+//! - a kick through `identify`, which refuses a revoked device, and through the access
+//!   token, which a password reset stops renewing: a lost kick leaves a socket open until
+//!   the gateway next checks the device or the token (Plan 8).
 
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
-use crate::ids::{ConversationId, UserId};
+use crate::ids::{ConversationId, DeviceId, UserId};
 use crate::model::ContactState;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,6 +48,23 @@ pub enum Event {
         conversation: ConversationId,
         read_seq: i64,
     },
+    /// These devices must be disconnected at once (spec §5.3, §5.4). Published to the
+    /// devices, not to their users. Repeating a kick is harmless.
+    Kick {
+        /// Sorted.
+        devices: Vec<DeviceId>,
+        reason: KickReason,
+    },
+}
+
+/// Why devices are kicked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KickReason {
+    /// The device was revoked: it must stop.
+    DeviceRevoked,
+    /// The user's password was reset: every refresh token is revoked, so the device must
+    /// sign in again.
+    PasswordReset,
 }
 
 /// The positions a receipt reports.

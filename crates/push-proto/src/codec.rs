@@ -59,6 +59,13 @@ pub fn notify_channel(user: Uuid) -> String {
     format!("notify:{user}")
 }
 
+/// The Redis channel message-svc publishes a device's
+/// [`Kick`](crate::internal::v1::Kick) on, and the gateway holding the device subscribes
+/// to: `kick:{device_id}`.
+pub fn kick_channel(device: Uuid) -> String {
+    format!("kick:{device}")
+}
+
 /// A gRPC status carrying `error` for the client, as message-svc answers.
 ///
 /// The details (`grpc-status-details-bin`) follow gRPC's rich error model: a
@@ -177,11 +184,15 @@ mod tests {
     }
 
     #[test]
-    fn a_users_channel_is_named_after_the_user() {
+    fn channels_are_named_after_their_user_or_device() {
         let user = Uuid::parse_str("0192f5a0-0000-7000-8000-000000000001").unwrap();
         assert_eq!(
             notify_channel(user),
             "notify:0192f5a0-0000-7000-8000-000000000001"
+        );
+        assert_eq!(
+            kick_channel(user),
+            "kick:0192f5a0-0000-7000-8000-000000000001"
         );
     }
 

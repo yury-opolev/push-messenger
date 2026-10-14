@@ -4,7 +4,7 @@ use crate::clock::Clock;
 use crate::error::{DomainError, DomainResult};
 use crate::ids::{DeviceId, UserId};
 use crate::model::Member;
-use crate::notify::{Event, Notifier};
+use crate::notify::{Event, KickReason, Notifier};
 use crate::store::{Store, Tx};
 
 /// Server settings for changing messages after they are sent.
@@ -108,7 +108,8 @@ where
     /// auth-svc revoked `device` of `user` (`device.revoked`, relayed by the worker).
     /// Idempotent and correct in any order: a revocation that arrives before the
     /// registration records the device as revoked, so the registration cannot bring it
-    /// back. A device id that belongs to another user is `UnknownDevice`.
+    /// back. A device id that belongs to another user is `UnknownDevice`. After the commit
+    /// the device is kicked, every time: a repeated kick is harmless.
     pub async fn device_revoked(&self, device: DeviceId, user: UserId) -> DomainResult<()> {
         let mut tx = self.store.begin().await?;
         tx.insert_user(user).await?;
@@ -116,10 +117,35 @@ where
             return Err(DomainError::UnknownDevice);
         }
         tx.revoke_device(device).await?;
-        tx.commit().await
+        tx.commit().await?;
+        self.publish(vec![Event::Kick {
+            devices: vec![device],
+            reason: KickReason::DeviceRevoked,
+        }])
+        .await;
+        Ok(())
     }
 
-    /// Publishes events after a commit. Publishes nothing when there is nothing to say.
+    /// auth-svc reset `user`'s password (`user.password_reset`, relayed by the worker):
+    /// every active device of the user is kicked, to sign in again with the new password.
+    /// The devices stay registered. Changes nothing, so a repeated event only kicks again;
+    /// a user message-svc has not heard of has no devices to kick.
+    pub async fn password_reset(&self, user: UserId) -> DomainResult<()> {
+        let mut tx = self.store.begin().await?;
+        let mut devices = tx.devices_of_user(user).await?;
+        tx.rollback().await?;
+        if !devices.is_empty() {
+            devices.sort();
+            self.publish(vec![Event::Kick {
+                devices,
+                reason: KickReason::PasswordReset,
+            }])
+            .await;
+        }
+        Ok(())
+    }
+
+    /// Publishes events after a commit. Publishes nothing when there is nothing to say. Publishes nothing when there is nothing to say.
     pub(crate) async fn publish(&self, events: Vec<Event>) {
         if !events.is_empty() {
             self.notifier.publish(&events).await;
