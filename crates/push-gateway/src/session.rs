@@ -21,6 +21,9 @@ pub enum Step {
     /// Check this access token, ask message-svc whether the device it names may connect,
     /// then call [`Session::identified`] or close.
     Identify(String),
+    /// Check this access token, which must name the connection's user and device, and
+    /// ask message-svc again: the connection continues on the new token.
+    ReAuth(String),
     /// Forward a send to message-svc; answer with its `SendAck` or an error.
     Send(Send),
     /// Forward an ack to message-svc; answer only if it fails. If it moved the position,
@@ -95,7 +98,7 @@ impl Session {
             (Body::Identify(_), State::Ready { .. }) => {
                 reply_error(ErrorCode::BadFrame, "already identified")
             }
-
+            (Body::ReAuth(reauth), State::Ready { .. }) => Step::ReAuth(reauth.token),
             (Body::Send(send), State::Ready { .. }) => Step::Send(send),
             (Body::Ack(ack), State::Ready { .. }) => Step::Ack(ack),
             (Body::Ping(_), State::Ready { .. }) => Step::Reply(Body::Pong(Pong {})),
@@ -212,7 +215,7 @@ fn reply_error(code: ErrorCode, message: &str) -> Step {
 
 #[cfg(test)]
 mod tests {
-    use push_proto::v1::{Identify, Ping};
+    use push_proto::v1::{Identify, Ping, ReAuth};
     use push_proto::{MAX_FRAME_BYTES, encode_frame};
 
     use super::*;
@@ -322,6 +325,19 @@ mod tests {
             );
             assert_eq!(session.device(), None);
         }
+    }
+
+    #[test]
+    fn reauth_hands_over_its_token_once_ready_only() {
+        let reauth = encode_frame(Body::ReAuth(ReAuth {
+            token: "fresh".to_owned(),
+        }));
+        assert_eq!(
+            Session::new().on_binary(&reauth),
+            Step::Close(1002, "the first frame must be Identify")
+        );
+        let (mut session, _) = ready_session();
+        assert_eq!(session.on_binary(&reauth), Step::ReAuth("fresh".to_owned()));
     }
 
     #[test]

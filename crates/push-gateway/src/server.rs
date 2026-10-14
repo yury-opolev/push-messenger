@@ -2,7 +2,7 @@
 //! the health endpoints and graceful shutdown.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::Router;
 use axum::extract::State;
@@ -12,8 +12,8 @@ use axum::response::Response;
 use axum::routing::get;
 use push_proto::internal::v1::messaging_client::MessagingClient;
 use push_proto::internal::v1::{AckRequest, IdentifyRequest, SendRequest, SyncRequest};
-use push_proto::v1::ErrorCode;
 use push_proto::v1::frame::Body;
+use push_proto::v1::{AuthExpiring, Error, ErrorCode};
 use push_proto::{MAX_FRAME_BYTES, close, encode_frame, error_from_status, id_bytes};
 use tokio::net::TcpListener;
 use tokio::time::Instant;
@@ -31,7 +31,11 @@ use crate::tokens::{Claims, TokenError, Verifier};
 const IDENTIFY_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long shutdown waits for connections to close.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
-
+/// `AuthExpiring` comes this long before the token expires (spec §7.3).
+const EXPIRY_WARNING: Duration = Duration::from_secs(60);
+/// A connection must send a valid `ReAuth` by this long after its token expired, or it is
+/// closed with 4002 (spec §7.3).
+const REAUTH_GRACE: Duration = Duration::from_secs(30);
 /// How often the token keys are fetched again: auth-svc lets clients cache them 5 minutes.
 const KEYS_REFRESH: Duration = Duration::from_secs(300);
 /// How soon to fetch the keys again after a failed fetch.
@@ -178,8 +182,10 @@ async fn connection(mut socket: WebSocket, app: App) {
         socket,
         session,
         messaging: app.messaging.clone(),
+        verifier: app.verifier.clone(),
         user: claims.user,
         device: claims.device,
+        expiry: Expiry::new(claims.expires_at),
         retry: RetryDelay::default(),
         retry_at: None,
     };
@@ -188,6 +194,11 @@ async fn connection(mut socket: WebSocket, app: App) {
     }
     loop {
         let retry_at = connected.retry_at;
+        let (warn_at, warned, deadline) = (
+            connected.expiry.warn_at,
+            connected.expiry.warned,
+            connected.expiry.deadline,
+        );
         tokio::select! {
             () = app.shutdown.cancelled() => {
                 close_with(&mut connected.socket, close::SHUTTING_DOWN, "server shutting down").await;
@@ -204,7 +215,15 @@ async fn connection(mut socket: WebSocket, app: App) {
                     return;
                 }
             }
-
+            () = tokio::time::sleep_until(warn_at), if !warned => {
+                if connected.warn_expiry().await.is_err() {
+                    return;
+                }
+            }
+            () = tokio::time::sleep_until(deadline) => {
+                close_with(&mut connected.socket, close::REAUTH_REQUIRED, "the access token expired; send ReAuth in time").await;
+                return;
+            }
             message = connected.socket.recv() => {
                 let step = match message {
                     Some(Ok(Message::Binary(bytes))) => connected.session.on_binary(&bytes),
@@ -265,7 +284,7 @@ async fn identify(socket: &mut WebSocket, session: &mut Session, app: &App) -> O
             return None;
         }
     };
-    let claims = match app.verifier.verify(&token).await {
+    let claims = match verify(&app.verifier, &token).await {
         Ok(claims) => claims,
         Err(error) => {
             let (code, reason) = token_refusal(error);
@@ -284,6 +303,17 @@ async fn identify(socket: &mut WebSocket, session: &mut Session, app: &App) -> O
             None
         }
     }
+}
+
+/// The claims of `token` if it passes and its 4002 deadline (`exp` + [`REAUTH_GRACE`]) is
+/// still ahead. A token past the deadline but inside the leeway would be admitted only to
+/// be closed with 4002 at once, so it is `Expired` here.
+async fn verify(verifier: &Verifier, token: &str) -> Result<Claims, TokenError> {
+    let claims = verifier.verify(token).await?;
+    if unix_now() >= claims.expires_at + REAUTH_GRACE.as_secs() as i64 {
+        return Err(TokenError::Expired);
+    }
+    Ok(claims)
 }
 
 /// The close code and reason for a token that did not pass.
@@ -350,13 +380,53 @@ async fn admit(messaging: &mut MessagingClient<Channel>, claims: &Claims) -> Res
     }
 }
 
+/// When the connection's token expires, and what to do about it.
+#[derive(Debug, Clone, Copy)]
+struct Expiry {
+    /// The token's `exp`, in seconds since the Unix epoch.
+    expires_at: i64,
+    /// When to send `AuthExpiring`.
+    warn_at: Instant,
+    warned: bool,
+    /// When to close with 4002 unless a `ReAuth` came.
+    deadline: Instant,
+}
+
+impl Expiry {
+    fn new(expires_at: i64) -> Self {
+        let left = expires_at - unix_now();
+        let at = |offset: i64| {
+            Instant::now() + Duration::from_secs(u64::try_from(left + offset).unwrap_or(0))
+        };
+        Self {
+            expires_at,
+            warn_at: at(-(EXPIRY_WARNING.as_secs() as i64)),
+            warned: false,
+            deadline: at(REAUTH_GRACE.as_secs() as i64),
+        }
+    }
+
+    /// Seconds until the token expires; 0 once it has.
+    fn expires_in_s(&self) -> u32 {
+        u32::try_from((self.expires_at - unix_now()).max(0)).unwrap_or(u32::MAX)
+    }
+}
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs() as i64)
+}
+
 /// An identified connection.
 struct Connected {
     socket: WebSocket,
     session: Session,
     messaging: MessagingClient<Channel>,
+    verifier: Verifier,
     user: Uuid,
     device: Uuid,
+    expiry: Expiry,
     retry: RetryDelay,
     /// When to retry a failed sync; `None` while the last sync succeeded.
     retry_at: Option<Instant>,
@@ -367,6 +437,7 @@ impl Connected {
     async fn run(&mut self, step: Step) -> Result<(), Closed> {
         match step {
             Step::Reply(body) => send(&mut self.socket, body).await,
+            Step::ReAuth(token) => self.reauth(&token).await,
             Step::Send(frame) => {
                 let client_msg_id = frame.client_msg_id.clone();
                 let request = SendRequest {
@@ -411,6 +482,63 @@ impl Connected {
                 send(&mut self.socket, error).await
             }
         }
+    }
+
+    /// Tells the client its token expires soon, once per token.
+    async fn warn_expiry(&mut self) -> Result<(), Closed> {
+        self.expiry.warned = true;
+        let warning = AuthExpiring {
+            expires_in_s: self.expiry.expires_in_s(),
+        };
+        send(&mut self.socket, Body::AuthExpiring(warning)).await
+    }
+
+    /// A fresh token for the connection: it must pass, name the same user and device, and
+    /// be newer than the user's last password reset. Nothing answers a good one. When the
+    /// keys or message-svc cannot be reached, a retryable error asks the client to send it
+    /// again; the 4002 deadline still applies.
+    async fn reauth(&mut self, token: &str) -> Result<(), Closed> {
+        let claims = match verify(&self.verifier, token).await {
+            Ok(claims) => claims,
+            Err(TokenError::KeysUnavailable) => return self.retry_reauth().await,
+            Err(error) => {
+                let (code, reason) = token_refusal(error);
+                close_with(&mut self.socket, code, reason).await;
+                return Err(Closed);
+            }
+        };
+        if claims.user != self.user || claims.device != self.device {
+            close_with(
+                &mut self.socket,
+                close::INVALID_IDENTITY,
+                "the token names another device",
+            )
+            .await;
+            return Err(Closed);
+        }
+        match admit(&mut self.messaging, &claims).await {
+            Ok(()) => {
+                self.expiry = Expiry::new(claims.expires_at);
+                Ok(())
+            }
+            Err(Refusal::Unavailable) => self.retry_reauth().await,
+            Err(Refusal::Close(code, reason)) => {
+                close_with(&mut self.socket, code, reason).await;
+                Err(Closed)
+            }
+        }
+    }
+
+    async fn retry_reauth(&mut self) -> Result<(), Closed> {
+        let error = Error {
+            code: ErrorCode::Unavailable.into(),
+            message: "the token could not be checked now; send ReAuth again".to_owned(),
+            retryable: true,
+            client_msg_id: None,
+            request_id: None,
+            retry_after_s: Some(1),
+        };
+        send(&mut self.socket, Body::Error(error)).await
     }
 
     /// Pushes every entry the device has not been sent yet. A failed sync is retried

@@ -17,7 +17,7 @@ use push_proto::internal::v1::{
     ReadUpToRequest, ReadUpToResponse, RequestCall, SendRequest, SyncRequest, SyncResponse,
 };
 use push_proto::v1::frame::Body;
-use push_proto::v1::{Ack, ContentType, Identify, Ping, Pong, Send, SendAck};
+use push_proto::v1::{Ack, AuthExpiring, ContentType, Identify, Ping, Pong, ReAuth, Send, SendAck};
 use push_proto::{decode_frame, encode_frame, id_bytes};
 use testcontainers_modules::redis::Redis;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
@@ -354,13 +354,23 @@ async fn an_invalid_token_is_closed_with_4001_and_an_expired_one_with_4002() {
     send(&mut socket, Body::Identify(Identify { token })).await;
     assert_eq!(close_code(&mut socket).await, 4002);
     // Expired 90 s ago: past the 60 s leeway. The client refreshes, then reconnects.
-    let mut socket = connect(&stack).await;
-    send(
-        &mut socket,
-        identify_issued(&stack, user, device, now() - 900 - 90),
-    )
-    .await;
-    assert_eq!(close_code(&mut socket).await, 4002);
+    // Expired 45 s ago: inside the leeway, but past the 30 s a connection has to send
+    // ReAuth, so refused at once rather than closed right after Ready.
+    for expired in [90, 45] {
+        let mut socket = connect(&stack).await;
+        send(
+            &mut socket,
+            identify_issued(&stack, user, device, now() - 900 - expired),
+        )
+        .await;
+        let first = tokio::time::timeout(Duration::from_secs(10), socket.next())
+            .await
+            .expect("a message within 10 s");
+        assert!(
+            matches!(&first, Some(Ok(Message::Close(Some(frame)))) if u16::from(frame.code) == 4002),
+            "{first:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -428,6 +438,35 @@ async fn shutdown_closes_connections_with_4005() {
         .expect("a clean stop");
 }
 
+/// Spec §12 test 7: ReAuth keeps a connection whose token expires open; without it, 4002.
+#[tokio::test]
+async fn an_expiring_token_is_announced_and_renewed_by_reauth() {
+    let stack = stack().await;
+    let (user, device) = person(&stack).await;
+    // Expired 25 s ago, within the leeway: 5 s left to send ReAuth.
+    let issued_at = now() - 900 - 25;
+    let mut renewed = connect(&stack).await;
+    let mut lapsed = connect(&stack).await;
+    for socket in [&mut renewed, &mut lapsed] {
+        send(socket, identify_issued(&stack, user, device, issued_at)).await;
+        assert!(matches!(next(socket).await, Body::Ready(_)));
+        assert_eq!(
+            next(socket).await,
+            Body::AuthExpiring(AuthExpiring { expires_in_s: 0 })
+        );
+    }
+    let (token, _) = stack.issuer.issue(user, device, now());
+    send(&mut renewed, Body::ReAuth(ReAuth { token })).await;
+    assert_eq!(close_code(&mut lapsed).await, 4002);
+    send(&mut renewed, Body::Ping(Ping {})).await;
+    assert_eq!(next(&mut renewed).await, Body::Pong(Pong {}));
+
+    // A token of another device cannot renew the connection.
+    let (_, other_device) = person(&stack).await;
+    let (token, _) = stack.issuer.issue(user, other_device, now());
+    send(&mut renewed, Body::ReAuth(ReAuth { token })).await;
+    assert_eq!(close_code(&mut renewed).await, 4001);
+}
 /// Alice and Bob, one device each, as contacts with a direct conversation; and `count`
 /// messages from Alice in it, sent through message-svc before anyone connects.
 async fn chat_with_backlog(stack: &Stack, count: u32) -> ((Uuid, Uuid), (Uuid, Uuid), Vec<u8>) {
