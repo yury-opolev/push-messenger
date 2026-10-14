@@ -102,6 +102,7 @@ pub fn error_from_status(status: &tonic::Status) -> Error {
             message: "the message service is unavailable".to_owned(),
             retryable: true,
             client_msg_id: None,
+            request_id: None,
         },
     }
 }
@@ -203,6 +204,7 @@ mod tests {
             message: "the users are not accepted contacts".to_owned(),
             retryable: false,
             client_msg_id: Some(id_bytes(Uuid::now_v7())),
+            request_id: Some(7),
         };
         let status = error_status(tonic::Code::FailedPrecondition, error.clone());
         assert_eq!(status.code(), tonic::Code::FailedPrecondition);
@@ -224,6 +226,7 @@ mod tests {
             message: "not a member of this conversation".to_owned(),
             retryable: false,
             client_msg_id: None,
+            request_id: None,
         };
         let status = error_status(tonic::Code::FailedPrecondition, error.clone());
         let rich = RpcStatus::decode(status.details()).unwrap();

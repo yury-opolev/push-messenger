@@ -9,17 +9,19 @@ use push_domain::{
 };
 use push_proto::id_bytes;
 use push_proto::internal::v1::{
-    AccountDevice, AccountUser, AccountsResponse, AckRequest, AckResponse, IdentifyRequest,
-    IdentifyResponse, MakeContactsRequest, MakeContactsResponse, OpenDirectRequest,
-    OpenDirectResponse, RegisterDeviceRequest, RegisterDeviceResponse, RegisterUserRequest,
-    RegisterUserResponse, SendRequest, SyncRequest, SyncResponse, accounts_server,
-    dev_setup_server, messaging_server,
+    AccountDevice, AccountUser, AccountsResponse, AckRequest, AckResponse, DeleteRequest,
+    EditRequest, IdentifyRequest, IdentifyResponse, MakeContactsRequest, MakeContactsResponse,
+    OpenDirectRequest, OpenDirectResponse, ReadUpToRequest, ReadUpToResponse,
+    RegisterDeviceRequest, RegisterDeviceResponse, RegisterUserRequest, RegisterUserResponse,
+    RequestCall, SendRequest, SyncRequest, SyncResponse, accounts_server, dev_setup_server,
+    messaging_server,
 };
 use push_proto::v1::{ContentType, SendAck};
 use tonic::service::Interceptor;
 use tonic::{Request, Response, Status};
 
 use crate::convert::{deliver, domain_error, from_micros, invalid, parse_id, send_ack};
+use crate::requests;
 
 /// The `Messaging` service: what the gateway calls for a connected device. The gateway
 /// passes the user and device it verified.
@@ -107,6 +109,36 @@ where
             .await
             .map_err(domain_error)?;
         Ok(Response::new(AckResponse { moved }))
+    }
+
+    async fn edit(&self, request: Request<EditRequest>) -> Result<Response<SendAck>, Status> {
+        requests::edit(&self.messaging, request.into_inner())
+            .await
+            .map(Response::new)
+    }
+
+    async fn delete(&self, request: Request<DeleteRequest>) -> Result<Response<SendAck>, Status> {
+        requests::delete(&self.messaging, request.into_inner())
+            .await
+            .map(Response::new)
+    }
+
+    async fn read_up_to(
+        &self,
+        request: Request<ReadUpToRequest>,
+    ) -> Result<Response<ReadUpToResponse>, Status> {
+        requests::read_up_to(&self.messaging, request.into_inner())
+            .await
+            .map(Response::new)
+    }
+
+    async fn request(
+        &self,
+        request: Request<RequestCall>,
+    ) -> Result<Response<push_proto::v1::Response>, Status> {
+        requests::request(&self.messaging, request.into_inner())
+            .await
+            .map(Response::new)
     }
 }
 

@@ -14,8 +14,9 @@ use push_proto::internal::v1::dev_setup_server::DevSetupServer;
 use push_proto::internal::v1::messaging_client::MessagingClient;
 use push_proto::internal::v1::messaging_server::{self, MessagingServer};
 use push_proto::internal::v1::{
-    AckRequest, AckResponse, IdentifyRequest, IdentifyResponse, MakeContactsRequest,
-    OpenDirectRequest, RegisterDeviceRequest, RegisterUserRequest, SendRequest, SyncRequest,
+    AckRequest, AckResponse, DeleteRequest, EditRequest, IdentifyRequest, IdentifyResponse,
+    MakeContactsRequest, OpenDirectRequest, ReadUpToRequest, ReadUpToResponse,
+    RegisterDeviceRequest, RegisterUserRequest, RequestCall, SendRequest, SyncRequest,
     SyncResponse,
 };
 use push_proto::v1::frame::Body;
@@ -71,6 +72,28 @@ impl messaging_server::Messaging for FlakySync {
 
     async fn ack(&self, request: Request<AckRequest>) -> Result<Response<AckResponse>, Status> {
         self.api.ack(request).await
+    }
+
+    async fn edit(&self, request: Request<EditRequest>) -> Result<Response<SendAck>, Status> {
+        self.api.edit(request).await
+    }
+
+    async fn delete(&self, request: Request<DeleteRequest>) -> Result<Response<SendAck>, Status> {
+        self.api.delete(request).await
+    }
+
+    async fn read_up_to(
+        &self,
+        request: Request<ReadUpToRequest>,
+    ) -> Result<Response<ReadUpToResponse>, Status> {
+        self.api.read_up_to(request).await
+    }
+
+    async fn request(
+        &self,
+        request: Request<RequestCall>,
+    ) -> Result<Response<push_proto::v1::Response>, Status> {
+        self.api.request(request).await
     }
 }
 

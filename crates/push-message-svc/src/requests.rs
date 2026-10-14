@@ -1,0 +1,209 @@
+//! The client's frames beyond Send and Ack (spec §7.1): Edit, Delete, ReadUpTo and the
+//! request frames, from protobuf to the domain and back. The gateway calls them on behalf
+//! of the user and device it verified.
+
+use push_domain::{
+    ClientMsgId, Clock, ConversationId, ConversationKind, ConversationSummary, DeleteMessage,
+    DeviceId, EditText, MAX_HISTORY_PAGE, MessageId, MessageRef, Messaging, Notifier, Receipts,
+    Store, UserId,
+};
+use push_proto::internal::v1::{
+    DeleteRequest, EditRequest, ReadUpToRequest, ReadUpToResponse, RequestCall,
+};
+use push_proto::v1::{
+    self, ConversationList, DirectReceipts, GroupReceipts, HistoryPage, SendAck,
+    conversation_summary, delete, edit, request, response,
+};
+use push_proto::{error_from_status, error_status, id_bytes};
+use tonic::Status;
+
+use crate::convert::{deliver, domain_error, from_micros, invalid, micros, parse_id, send_ack};
+
+/// `Edit`: the edit entry's receipt, after commit.
+pub(crate) async fn edit<S: Store, C: Clock, N: Notifier>(
+    messaging: &Messaging<S, C, N>,
+    call: EditRequest,
+) -> Result<SendAck, Status> {
+    let sender = parse_id(&call.user_id, "user_id", UserId)?;
+    let device = parse_id(&call.device_id, "device_id", DeviceId)?;
+    let edit = call.edit.ok_or_else(|| invalid("edit is required"))?;
+    let target = match edit.target {
+        Some(edit::Target::TargetMessageId(id)) => by_message_id(&id)?,
+        Some(edit::Target::TargetClientMsgId(id)) => by_client_msg_id(&id)?,
+        None => return Err(invalid("target is required")),
+    };
+    let command = EditText {
+        sender,
+        device,
+        conversation: parse_id(&edit.conversation_id, "conversation_id", ConversationId)?,
+        client_msg_id: parse_id(&edit.client_msg_id, "client_msg_id", ClientMsgId)?,
+        target,
+        body: edit.body,
+        client_ts: edit.client_ts.map(from_micros).transpose()?,
+    };
+    let receipt = messaging.edit_text(command).await.map_err(domain_error)?;
+    Ok(send_ack(&receipt))
+}
+
+/// `Delete`: the delete entry's receipt, after commit.
+pub(crate) async fn delete<S: Store, C: Clock, N: Notifier>(
+    messaging: &Messaging<S, C, N>,
+    call: DeleteRequest,
+) -> Result<SendAck, Status> {
+    let sender = parse_id(&call.user_id, "user_id", UserId)?;
+    let device = parse_id(&call.device_id, "device_id", DeviceId)?;
+    let delete = call.delete.ok_or_else(|| invalid("delete is required"))?;
+    let target = match delete.target {
+        Some(delete::Target::TargetMessageId(id)) => by_message_id(&id)?,
+        Some(delete::Target::TargetClientMsgId(id)) => by_client_msg_id(&id)?,
+        None => return Err(invalid("target is required")),
+    };
+    let command = DeleteMessage {
+        sender,
+        device,
+        conversation: parse_id(&delete.conversation_id, "conversation_id", ConversationId)?,
+        client_msg_id: parse_id(&delete.client_msg_id, "client_msg_id", ClientMsgId)?,
+        target,
+    };
+    let receipt = messaging
+        .delete_message(command)
+        .await
+        .map_err(domain_error)?;
+    Ok(send_ack(&receipt))
+}
+
+fn by_message_id(id: &[u8]) -> Result<MessageRef, Status> {
+    Ok(MessageRef::Id(parse_id(
+        id,
+        "target_message_id",
+        MessageId,
+    )?))
+}
+
+fn by_client_msg_id(id: &[u8]) -> Result<MessageRef, Status> {
+    Ok(MessageRef::ClientId(parse_id(
+        id,
+        "target_client_msg_id",
+        ClientMsgId,
+    )?))
+}
+
+/// `ReadUpTo`: whether the user's read position moved.
+pub(crate) async fn read_up_to<S: Store, C: Clock, N: Notifier>(
+    messaging: &Messaging<S, C, N>,
+    call: ReadUpToRequest,
+) -> Result<ReadUpToResponse, Status> {
+    let user = parse_id(&call.user_id, "user_id", UserId)?;
+    let read = call.read.ok_or_else(|| invalid("read is required"))?;
+    let conversation = parse_id(&read.conversation_id, "conversation_id", ConversationId)?;
+    let moved = messaging
+        .read_up_to(user, conversation, read.seq)
+        .await
+        .map_err(domain_error)?;
+    Ok(ReadUpToResponse { moved })
+}
+
+/// A request frame: its `Response`, or a status whose error carries its `request_id`.
+pub(crate) async fn request<S: Store, C: Clock, N: Notifier>(
+    messaging: &Messaging<S, C, N>,
+    call: RequestCall,
+) -> Result<v1::Response, Status> {
+    let request = call.request.ok_or_else(|| invalid("request is required"))?;
+    let request_id = request.request_id;
+    let answered = async {
+        let user = parse_id(&call.user_id, "user_id", UserId)?;
+        let body = request
+            .body
+            .ok_or_else(|| invalid("the request has no body"))?;
+        answer(messaging, user, body).await
+    }
+    .await;
+    match answered {
+        Ok(body) => Ok(v1::Response {
+            request_id,
+            body: Some(body),
+        }),
+        Err(status) => {
+            let mut error = error_from_status(&status);
+            error.request_id = Some(request_id);
+            Err(error_status(status.code(), error))
+        }
+    }
+}
+
+/// What the domain answers to one request.
+async fn answer<S: Store, C: Clock, N: Notifier>(
+    messaging: &Messaging<S, C, N>,
+    user: UserId,
+    body: request::Body,
+) -> Result<response::Body, Status> {
+    Ok(match body {
+        request::Body::ListConversations(list) => {
+            let since = list.changed_since.map(from_micros).transpose()?;
+            let summaries = messaging
+                .list_conversations(user, since)
+                .await
+                .map_err(domain_error)?;
+            response::Body::Conversations(ConversationList {
+                conversations: summaries.into_iter().map(summary).collect(),
+            })
+        }
+        request::Body::FetchHistory(fetch) => {
+            let conversation = parse_id(&fetch.conversation_id, "conversation_id", ConversationId)?;
+            let limit = match fetch.limit {
+                0 => MAX_HISTORY_PAGE,
+                limit => limit,
+            };
+            let page = messaging
+                .history(user, conversation, fetch.before_seq, limit)
+                .await
+                .map_err(domain_error)?;
+            response::Body::History(HistoryPage {
+                entries: page.entries.into_iter().map(deliver).collect(),
+                has_more: page.has_more,
+            })
+        }
+    })
+}
+
+fn summary(summary: ConversationSummary) -> v1::ConversationSummary {
+    let receipts = match summary.receipts {
+        Receipts::Direct {
+            peer_delivered_seq,
+            peer_read_seq,
+        } => conversation_summary::Receipts::Direct(DirectReceipts {
+            peer_delivered_seq,
+            peer_read_seq,
+        }),
+        Receipts::Group {
+            all_delivered_seq,
+            all_read_seq,
+        } => conversation_summary::Receipts::Group(GroupReceipts {
+            all_delivered_seq,
+            all_read_seq,
+        }),
+    };
+    let kind = match summary.kind {
+        ConversationKind::Direct => v1::ConversationKind::Direct,
+        ConversationKind::Group => v1::ConversationKind::Group,
+    };
+    v1::ConversationSummary {
+        conversation_id: id_bytes(summary.conversation_id.0),
+        kind: kind.into(),
+        title: summary.title,
+        last_seq: summary.last_seq,
+        read_seq: summary.read_seq,
+        unread: summary.unread,
+        receipts: Some(receipts),
+        updated_at: micros(summary.updated_at),
+        members: users(&summary.members),
+        admins: users(&summary.admins),
+    }
+}
+
+fn users(users: &[UserId]) -> Vec<Vec<u8>> {
+    users.iter().map(|user| id_bytes(user.0)).collect()
+}
+
+#[cfg(test)]
+mod tests;

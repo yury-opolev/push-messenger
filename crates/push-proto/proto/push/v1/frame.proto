@@ -30,7 +30,9 @@ message Frame {
     Pong pong = 36;
   }
   // 5-31: the other client frames of spec §7.1 (ReAuth, Edit, Delete, ReadUpTo and the
-  // request frames); 37-63: the other server frames of §7.2. Assigned as they are added.
+  // request frames); 37-63: the other server frames of §7.2. Assigned as they are added:
+  // Edit, Delete, ReadUpTo, Request and Response are defined below and message-svc serves
+  // them over gRPC (Plan 7); the gateway carries them in a Frame from Plan 8.
 }
 
 // Must be the first frame, within 5 seconds of connecting.
@@ -80,7 +82,7 @@ message Send {
   reserved "ephemeral", "urgent", "attachments";
 }
 
-// The entry is durably stored. Also the answer to Edit and Delete (later plans).
+// The entry is durably stored. Also the answer to Edit and Delete.
 message SendAck {
   bytes client_msg_id = 1;
   bytes message_id = 2;
@@ -115,6 +117,132 @@ message Deliver {
 message Ack {
   bytes conversation_id = 1;
   int64 seq = 2;
+}
+
+// Changes the text of one of the sender's own messages (spec §4.6), within 48 hours of
+// sending it. Answered with the edit entry's SendAck.
+message Edit {
+  // The edit's own UUIDv7, chosen before the first attempt and reused on every retry.
+  bytes client_msg_id = 1;
+  bytes conversation_id = 2;
+  // The message to change: its server id, or the client_msg_id it was sent with when the
+  // client has not learned the server id yet.
+  oneof target {
+    bytes target_message_id = 3;
+    bytes target_client_msg_id = 4;
+  }
+  bytes body = 5;
+  optional int64 client_ts = 6;
+}
+
+// Erases one of the sender's own messages (spec §4.6), within 48 hours of sending it.
+// Answered with the delete entry's SendAck.
+message Delete {
+  bytes client_msg_id = 1;
+  bytes conversation_id = 2;
+  oneof target {
+    bytes target_message_id = 3;
+    bytes target_client_msg_id = 4;
+  }
+}
+
+// "I have read everything up to seq in this conversation." Positions only move forward.
+message ReadUpTo {
+  bytes conversation_id = 1;
+  int64 seq = 2;
+}
+
+// A request (spec §7.1). It is answered by a Response, or an Error, with its request_id.
+message Request {
+  // Chosen by the client.
+  uint64 request_id = 1;
+  oneof body {
+    ListConversations list_conversations = 2;
+    FetchHistory fetch_history = 3;
+  }
+}
+
+// The answer to a Request.
+message Response {
+  uint64 request_id = 1;
+  oneof body {
+    ConversationList conversations = 2;
+    HistoryPage history = 3;
+  }
+}
+
+// The caller's conversations, current and left, sorted by id, with positions, unread
+// counts and receipt positions. A direct conversation with a user the caller has blocked
+// is left out.
+message ListConversations {
+  // Only conversations created or appended to after this time. Pass the time of the
+  // previous listing minus a safety window of a few seconds; leave it out to refresh every
+  // conversation's receipt positions, which do not count as changes.
+  optional int64 changed_since = 1;
+}
+
+enum ConversationKind {
+  CONVERSATION_KIND_UNSPECIFIED = 0;
+  CONVERSATION_KIND_DIRECT = 1;
+  CONVERSATION_KIND_GROUP = 2;
+}
+
+message ConversationList {
+  repeated ConversationSummary conversations = 1;
+}
+
+message ConversationSummary {
+  bytes conversation_id = 1;
+  ConversationKind kind = 2;
+  // Groups only.
+  optional string title = 3;
+  // The highest seq the caller may see: the end of the log, or where the caller left.
+  int64 last_seq = 4;
+  // The caller's own read position.
+  int64 read_seq = 5;
+  // Messages from others after read_seq, at most 100 ("99+").
+  uint32 unread = 6;
+  oneof receipts {
+    DirectReceipts direct = 7;
+    GroupReceipts group = 8;
+  }
+  // When the conversation was created or last appended to (as the caller last saw it, for
+  // a group they left).
+  int64 updated_at = 9;
+  // Current members, sorted; empty for a group the caller left.
+  repeated bytes members = 10;
+  // Current admins of a group, sorted.
+  repeated bytes admins = 11;
+}
+
+// The other member's positions; delivered is never below read.
+message DirectReceipts {
+  int64 peer_delivered_seq = 1;
+  int64 peer_read_seq = 2;
+}
+
+// Every message up to these positions has been delivered to (read by) every current
+// member other than its sender; never per-member positions.
+message GroupReceipts {
+  int64 all_delivered_seq = 1;
+  int64 all_read_seq = 2;
+}
+
+// Older messages and system entries of a conversation, in their current state: never
+// edit or delete entries. Limited to what the caller may see.
+message FetchHistory {
+  bytes conversation_id = 1;
+  // Exclusive; leave it out for the newest page.
+  optional int64 before_seq = 2;
+  // At most 100; 0 means 100.
+  uint32 limit = 3;
+}
+
+message HistoryPage {
+  // Oldest first.
+  repeated Deliver entries = 1;
+  // Older entries exist before this page.
+  bool has_more = 2;
 }
 
 message Ping {}
@@ -165,6 +293,8 @@ message Error {
   string message = 2;
   // Whether the same frame may succeed if sent again unchanged.
   bool retryable = 3;
-  // Set when the error answers a Send.
+  // Set when the error answers a Send, Edit or Delete.
   optional bytes client_msg_id = 4;
+  // Set when the error answers a Request.
+  optional uint64 request_id = 5;
 }

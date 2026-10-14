@@ -28,6 +28,17 @@ service Messaging {
   rpc Sync(SyncRequest) returns (SyncResponse);
   // Records that the device holds everything up to a seq.
   rpc Ack(AckRequest) returns (AckResponse);
+  // Changes the text of one of the user's messages; answers after commit with the edit
+  // entry's SendAck.
+  rpc Edit(EditRequest) returns (push.v1.SendAck);
+  // Erases one of the user's messages; answers after commit with the delete entry's
+  // SendAck.
+  rpc Delete(DeleteRequest) returns (push.v1.SendAck);
+  // Moves the user's read position in a conversation.
+  rpc ReadUpTo(ReadUpToRequest) returns (ReadUpToResponse);
+  // Any request frame (spec §7.1), on behalf of the user. The Response carries the
+  // request's request_id, and so does the Error of a failed call.
+  rpc Request(RequestCall) returns (push.v1.Response);
 }
 
 // DEV ONLY: setup calls for local clusters and the smoke test, registered only by a
@@ -95,6 +106,33 @@ message AckRequest {
 message AckResponse {
   // Whether the device's position moved.
   bool moved = 1;
+}
+
+message EditRequest {
+  bytes user_id = 1;
+  bytes device_id = 2;
+  push.v1.Edit edit = 3;
+}
+
+message DeleteRequest {
+  bytes user_id = 1;
+  bytes device_id = 2;
+  push.v1.Delete delete = 3;
+}
+
+message ReadUpToRequest {
+  bytes user_id = 1;
+  push.v1.ReadUpTo read = 2;
+}
+
+message ReadUpToResponse {
+  // Whether the user's read position moved.
+  bool moved = 1;
+}
+
+message RequestCall {
+  bytes user_id = 1;
+  push.v1.Request request = 2;
 }
 
 // Published on the Redis channel `notify:{user_id}` after a commit (spec §4.3). Never
