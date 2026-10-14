@@ -6,13 +6,13 @@ use chrono::TimeDelta;
 use push_domain::{
     ClientMsgId, Clock, ConversationId, ConversationKind, ConversationSummary, DeleteMessage,
     DeviceId, DomainResult, EditText, MAX_HISTORY_PAGE, MessageId, MessageRef, Messaging, Notifier,
-    Receipts, Store, UserId,
+    Receipts, Role, Store, UserId,
 };
 use push_proto::internal::v1::{
     DeleteRequest, EditRequest, ReadUpToRequest, ReadUpToResponse, RequestCall,
 };
 use push_proto::v1::{
-    self, Contact, ContactList, ConversationList, DirectOpened, DirectReceipts, Done,
+    self, Contact, ContactList, ConversationList, DirectOpened, DirectReceipts, Done, GroupCreated,
     GroupReceipts, HistoryPage, Invite, InviteRedeemed, ListContacts, SendAck,
     conversation_summary, delete, edit, request, response,
 };
@@ -244,7 +244,62 @@ async fn answer<S: Store, C: Clock, N: Notifier>(
         request::Body::RevokeInvite(revoke) => {
             done(messaging.revoke_invite(user, &revoke.code).await)?
         }
+        request::Body::CreateGroup(create) => {
+            let members = user_ids(&create.member_ids, "member_ids")?;
+            let conversation = messaging
+                .create_group(user, &create.title, &members)
+                .await
+                .map_err(domain_error)?;
+            response::Body::GroupCreated(GroupCreated {
+                conversation_id: id_bytes(conversation.0),
+            })
+        }
+        request::Body::AddMembers(add) => {
+            let group = group(&add.conversation_id)?;
+            let users = user_ids(&add.user_ids, "user_ids")?;
+            done(messaging.add_members(user, group, &users).await)?
+        }
+        request::Body::RemoveMember(remove) => {
+            let group = group(&remove.conversation_id)?;
+            done(
+                messaging
+                    .remove_member(user, group, other(&remove.user_id)?)
+                    .await,
+            )?
+        }
+        request::Body::LeaveGroup(leave) => done(
+            messaging
+                .leave_group(user, group(&leave.conversation_id)?)
+                .await,
+        )?,
+        request::Body::RenameGroup(rename) => {
+            let group = group(&rename.conversation_id)?;
+            done(messaging.rename_group(user, group, &rename.title).await)?
+        }
+        request::Body::SetRole(set) => {
+            let group = group(&set.conversation_id)?;
+            let role = match set.role() {
+                v1::Role::Admin => Role::Admin,
+                v1::Role::Member => Role::Member,
+                v1::Role::Unspecified => return Err(invalid("role must be admin or member")),
+            };
+            done(
+                messaging
+                    .set_role(user, group, other(&set.user_id)?, role)
+                    .await,
+            )?
+        }
     })
+}
+
+/// The group a request names.
+fn group(conversation_id: &[u8]) -> Result<ConversationId, Status> {
+    parse_id(conversation_id, "conversation_id", ConversationId)
+}
+
+/// A list of user ids; any malformed one is `INVALID_ARGUMENT` naming `field`.
+fn user_ids(ids: &[Vec<u8>], field: &str) -> Result<Vec<UserId>, Status> {
+    ids.iter().map(|id| parse_id(id, field, UserId)).collect()
 }
 
 /// The other user a contact request names.

@@ -169,6 +169,12 @@ message Request {
     CreateInvite create_invite = 11;
     RedeemInvite redeem_invite = 12;
     RevokeInvite revoke_invite = 13;
+    CreateGroup create_group = 14;
+    AddMembers add_members = 15;
+    RemoveMember remove_member = 16;
+    LeaveGroup leave_group = 17;
+    RenameGroup rename_group = 18;
+    SetRole set_role = 19;
   }
 }
 
@@ -186,6 +192,7 @@ message Response {
     InviteRedeemed invite_redeemed = 8;
     // A request that answers nothing but success.
     Done done = 9;
+    GroupCreated group_created = 10;
   }
 }
 
@@ -355,6 +362,55 @@ message InviteRedeemed {
 // Revokes one of the caller's invites. Revoking again does nothing.
 message RevokeInvite {
   string code = 1;
+}
+
+// A group (spec §6) with the caller as its admin. Every other member must be an accepted
+// contact of the caller; a group has at most 100 members.
+message CreateGroup {
+  // 1 to 100 characters after trimming.
+  string title = 1;
+  repeated bytes member_ids = 2;
+}
+
+message GroupCreated {
+  bytes conversation_id = 1;
+}
+
+// Admins only. The new members must be accepted contacts of the admin; they see the log
+// from the entry that adds them.
+message AddMembers {
+  bytes conversation_id = 1;
+  repeated bytes user_ids = 2;
+}
+
+// Admins only; an admin who wants to go leaves instead.
+message RemoveMember {
+  bytes conversation_id = 1;
+  bytes user_id = 2;
+}
+
+// When the last admin leaves, the member who joined first becomes admin.
+message LeaveGroup {
+  bytes conversation_id = 1;
+}
+
+// Admins only.
+message RenameGroup {
+  bytes conversation_id = 1;
+  string title = 2;
+}
+
+enum Role {
+  ROLE_UNSPECIFIED = 0;
+  ROLE_ADMIN = 1;
+  ROLE_MEMBER = 2;
+}
+
+// Admins only. A group keeps at least one admin: the last one cannot be demoted.
+message SetRole {
+  bytes conversation_id = 1;
+  bytes user_id = 2;
+  Role role = 3;
 }
 
 message Ping {}

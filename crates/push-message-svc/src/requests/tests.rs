@@ -13,11 +13,11 @@ use push_proto::internal::v1::{
     DeleteRequest, EditRequest, ReadUpToRequest, RequestCall, SendRequest,
 };
 use push_proto::v1::{
-    self, Contact, ContactAccept, ContactBlock, ContactRequest, ContactState, ContactUnblock,
-    ContentType, ConversationKind, CreateInvite, Delete, Deliver, DirectReceipts, Done, Edit,
-    EntryKind, ErrorCode, FetchHistory, InviteRedeemed, ListContacts, ListConversations,
-    OpenDirect, ReadUpTo, RedeemInvite, RevokeInvite, SendAck, conversation_summary, delete, edit,
-    request, response,
+    self, AddMembers, Contact, ContactAccept, ContactBlock, ContactRequest, ContactState,
+    ContactUnblock, ContentType, ConversationKind, CreateGroup, CreateInvite, Delete, Deliver,
+    DirectReceipts, Done, Edit, EntryKind, ErrorCode, FetchHistory, InviteRedeemed, LeaveGroup,
+    ListContacts, ListConversations, OpenDirect, ReadUpTo, RedeemInvite, RemoveMember, RenameGroup,
+    RevokeInvite, Role, SendAck, SetRole, conversation_summary, delete, edit, request, response,
 };
 use push_proto::{error_from_status, id_bytes};
 use tonic::{Code, Request, Status};
@@ -573,4 +573,139 @@ async fn an_invite_makes_contacts_until_it_is_revoked_and_never_reveals_a_block(
     });
     let status = world.request(&alice, too_many).await.unwrap_err();
     assert_eq!(failure(&status).0, ErrorCode::Invalid);
+}
+
+#[tokio::test]
+async fn a_group_is_created_changed_and_handed_over_by_its_admins() {
+    let world = world();
+    let (alice, bob, carol, dave) = (
+        world.person().await,
+        world.person().await,
+        world.person().await,
+        world.person().await,
+    );
+    for other in [&bob, &carol, &dave] {
+        world.befriend(&alice, other).await;
+    }
+    let create = request::Body::CreateGroup(CreateGroup {
+        title: " Trip ".to_owned(),
+        member_ids: vec![id_bytes(bob.user.0), id_bytes(carol.user.0)],
+    });
+    let response::Body::GroupCreated(created) = world.request(&alice, create).await.unwrap() else {
+        panic!("not a created group");
+    };
+    let group = created.conversation_id;
+
+    // Only admins change the group, and add only their own contacts.
+    let rename = |title: &str| {
+        request::Body::RenameGroup(RenameGroup {
+            conversation_id: group.clone(),
+            title: title.to_owned(),
+        })
+    };
+    let status = world.request(&bob, rename("Bob's")).await.unwrap_err();
+    assert_eq!(failure(&status), (ErrorCode::NotAdmin, true));
+    world.request(&alice, rename("Holiday")).await.unwrap();
+    let add = |person: &Person| {
+        request::Body::AddMembers(AddMembers {
+            conversation_id: group.clone(),
+            user_ids: vec![id_bytes(person.user.0)],
+        })
+    };
+    assert_eq!(
+        world.request(&alice, add(&dave)).await.unwrap(),
+        response::Body::Done(Done {})
+    );
+    let stranger = world.person().await;
+    let status = world.request(&alice, add(&stranger)).await.unwrap_err();
+    assert_eq!(failure(&status).0, ErrorCode::NotContact);
+
+    // Several admins; the last one cannot step down.
+    let set_role = |person: &Person, role: Role| {
+        request::Body::SetRole(SetRole {
+            conversation_id: group.clone(),
+            user_id: id_bytes(person.user.0),
+            role: role.into(),
+        })
+    };
+    world
+        .request(&alice, set_role(&bob, Role::Admin))
+        .await
+        .unwrap();
+    world
+        .request(&alice, set_role(&alice, Role::Member))
+        .await
+        .unwrap();
+    let status = world
+        .request(&bob, set_role(&bob, Role::Member))
+        .await
+        .unwrap_err();
+    assert_eq!(failure(&status).0, ErrorCode::LastAdmin);
+    let remove = request::Body::RemoveMember(RemoveMember {
+        conversation_id: group.clone(),
+        user_id: id_bytes(carol.user.0),
+    });
+    let status = world.request(&alice, remove.clone()).await.unwrap_err();
+    assert_eq!(failure(&status).0, ErrorCode::NotAdmin);
+    world.request(&bob, remove).await.unwrap();
+
+    // The last admin leaves: the member who joined first, Alice, takes over.
+    let leave = request::Body::LeaveGroup(LeaveGroup {
+        conversation_id: group.clone(),
+    });
+    world.request(&bob, leave).await.unwrap();
+    let response::Body::Conversations(listed) = world
+        .request(&dave, list_conversations(None))
+        .await
+        .unwrap()
+    else {
+        panic!("not a conversation list");
+    };
+    let summary = &listed.conversations[0];
+    assert_eq!(summary.kind(), ConversationKind::Group);
+    assert_eq!(summary.title.as_deref(), Some("Holiday"));
+    assert_eq!(summary.admins, [id_bytes(alice.user.0)]);
+    let mut members = vec![id_bytes(alice.user.0), id_bytes(dave.user.0)];
+    members.sort();
+    assert_eq!(summary.members, members);
+    assert!(matches!(
+        summary.receipts,
+        Some(conversation_summary::Receipts::Group(_))
+    ));
+}
+
+#[tokio::test]
+async fn group_requests_refuse_what_the_rules_forbid() {
+    let world = world();
+    let (alice, _bob, chat) = world.chat().await;
+    let crowd = request::Body::CreateGroup(CreateGroup {
+        title: "Crowd".to_owned(),
+        member_ids: (0..100).map(|_| id_bytes(UserId::new().0)).collect(),
+    });
+    let status = world.request(&alice, crowd).await.unwrap_err();
+    assert_eq!(failure(&status).0, ErrorCode::GroupFull);
+
+    let malformed = request::Body::CreateGroup(CreateGroup {
+        title: "Odd".to_owned(),
+        member_ids: vec![vec![1, 2, 3]],
+    });
+    let status = world.request(&alice, malformed).await.unwrap_err();
+    let error = error_from_status(&status);
+    assert_eq!(error.code(), ErrorCode::Invalid);
+    assert!(error.message.starts_with("member_ids"), "{}", error.message);
+
+    let rename = request::Body::RenameGroup(RenameGroup {
+        conversation_id: id_bytes(chat.0),
+        title: "Not a group".to_owned(),
+    });
+    let status = world.request(&alice, rename).await.unwrap_err();
+    assert_eq!(failure(&status).0, ErrorCode::NotAGroup);
+
+    let unspecified = request::Body::SetRole(SetRole {
+        conversation_id: id_bytes(chat.0),
+        user_id: id_bytes(alice.user.0),
+        role: Role::Unspecified.into(),
+    });
+    let status = world.request(&alice, unspecified).await.unwrap_err();
+    assert_eq!(failure(&status), (ErrorCode::Invalid, true));
 }
