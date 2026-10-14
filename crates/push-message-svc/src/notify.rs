@@ -126,6 +126,7 @@ pub(crate) fn notifications(events: &[Event]) -> Vec<(String, Vec<u8>)> {
                 let kick = Kick {
                     reason: kick_reason(*reason).into(),
                     reset_at,
+                    connection_id: Vec::new(),
                 };
                 for device in devices {
                     messages.push((kick_channel(device.0), kick.encode_to_vec()));

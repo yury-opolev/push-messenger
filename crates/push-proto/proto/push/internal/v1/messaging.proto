@@ -189,22 +189,30 @@ message ReadPositionChanged {
   int64 read_seq = 2;
 }
 
-// Published on the Redis channel `kick:{device_id}` (spec §5.3, §5.4): the gateway holding
-// the device closes its socket at once (Plan 8). Never carries anything but the reason and
-// the reset time.
+// Published on the Redis channel `kick:{device_id}` (spec §5.3, §5.4, §7.3): every gateway
+// holding a connection of the device closes it at once, but for the exceptions below.
+// Never carries anything but the reason, the reset time and, for a takeover, the new
+// connection.
 message Kick {
   KickReason reason = 1;
   // PASSWORD_RESET: the reset, in seconds since the Unix epoch. A connection whose token
   // was issued after that second signed in after the reset and stays open.
   int64 reset_at = 2;
+  // TAKEN_OVER: the id the gateway gave the connection that takes over (a UUIDv7, so ids
+  // sort by time). Only older connections close; the newcomer and newer ones stay open.
+  bytes connection_id = 3;
 }
 
 enum KickReason {
   KICK_REASON_UNSPECIFIED = 0;
-  // The device was revoked: the client stops (close code 4003).
+  // The device was revoked: the client stops (close code 4003). From message-svc.
   KICK_REASON_DEVICE_REVOKED = 1;
-  // The user's password was reset: the client signs in again (close code 4001).
+  // The user's password was reset: the client signs in again (close code 4001). From
+  // message-svc.
   KICK_REASON_PASSWORD_RESET = 2;
+  // A newer connection of the device identified, on this or another gateway: the older
+  // one stops (close code 4003). From the gateway.
+  KICK_REASON_TAKEN_OVER = 3;
 }
 
 message AccountUser {

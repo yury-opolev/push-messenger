@@ -9,7 +9,7 @@ mod session;
 mod tokens;
 
 pub use config::{Config, ConfigError};
-pub use hub::{Hub, Membership};
+pub use hub::{Hub, Membership, Signal};
 pub use server::{init_logging, serve, terminated};
 pub use session::{RetryDelay, Session, Step};
 pub use tokens::{Claims, LEEWAY, REFETCH_INTERVAL, TokenError, Verifier};

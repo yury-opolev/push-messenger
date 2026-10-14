@@ -7,7 +7,9 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use push_auth::tokens::AccessTokens;
-use push_domain::{DeviceId, InMemoryStore, MAX_SYNC_BATCH, Messaging, SystemClock, UserId};
+use push_domain::{
+    ConversationId, DeviceId, InMemoryStore, MAX_SYNC_BATCH, Messaging, SystemClock, UserId,
+};
 use push_gateway::{Config, serve};
 use push_message_svc::{MessagingApi, RedisNotifier};
 use push_proto::internal::v1::messaging_client::MessagingClient;
@@ -17,8 +19,11 @@ use push_proto::internal::v1::{
     ReadUpToRequest, ReadUpToResponse, RequestCall, SendRequest, SyncRequest, SyncResponse,
 };
 use push_proto::v1::frame::Body;
-use push_proto::v1::{Ack, AuthExpiring, ContentType, Identify, Ping, Pong, ReAuth, Send, SendAck};
-use push_proto::{decode_frame, encode_frame, id_bytes};
+use push_proto::v1::{
+    Ack, AuthExpiring, ContactEvent, ContactState, ContentType, DirectReceipt, Identify, Ping,
+    Pong, ReAuth, ReadPosition, Receipt, Send, SendAck, receipt,
+};
+use push_proto::{decode_frame, encode_frame, id, id_bytes};
 use testcontainers_modules::redis::Redis;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::{ContainerAsync, ImageExt};
@@ -443,11 +448,15 @@ async fn shutdown_closes_connections_with_4005() {
 async fn an_expiring_token_is_announced_and_renewed_by_reauth() {
     let stack = stack().await;
     let (user, device) = person(&stack).await;
+    let (other, other_device) = person(&stack).await;
     // Expired 25 s ago, within the leeway: 5 s left to send ReAuth.
     let issued_at = now() - 900 - 25;
     let mut renewed = connect(&stack).await;
     let mut lapsed = connect(&stack).await;
-    for socket in [&mut renewed, &mut lapsed] {
+    for (socket, user, device) in [
+        (&mut renewed, user, device),
+        (&mut lapsed, other, other_device),
+    ] {
         send(socket, identify_issued(&stack, user, device, issued_at)).await;
         assert!(matches!(next(socket).await, Body::Ready(_)));
         assert_eq!(
@@ -462,11 +471,171 @@ async fn an_expiring_token_is_announced_and_renewed_by_reauth() {
     assert_eq!(next(&mut renewed).await, Body::Pong(Pong {}));
 
     // A token of another device cannot renew the connection.
-    let (_, other_device) = person(&stack).await;
-    let (token, _) = stack.issuer.issue(user, other_device, now());
+    let (token, _) = stack.issuer.issue(user, Uuid::now_v7(), now());
     send(&mut renewed, Body::ReAuth(ReAuth { token })).await;
     assert_eq!(close_code(&mut renewed).await, 4001);
 }
+
+/// The first frame `wanted` accepts, skipping others, within 5 s each.
+async fn wait_for(socket: &mut Socket, wanted: impl Fn(&Body) -> bool) -> Body {
+    loop {
+        let frame = next(socket).await;
+        if wanted(&frame) {
+            return frame;
+        }
+    }
+}
+
+/// Spec §12 test 6 and the owner's close codes: a revoked device is told to stop (4003),
+/// a password reset to sign in again (4001).
+#[tokio::test]
+async fn a_revocation_and_a_password_reset_close_the_socket_at_once() {
+    let stack = stack().await;
+    let (alice, alice_device) = person(&stack).await;
+    let (bob, bob_device) = person(&stack).await;
+    let mut alice_socket = ready(&stack, alice, alice_device).await;
+    let mut bob_socket = ready(&stack, bob, bob_device).await;
+    stack
+        .messaging
+        .device_revoked(DeviceId(alice_device), UserId(alice))
+        .await
+        .unwrap();
+    assert_eq!(close_code(&mut alice_socket).await, 4003);
+
+    // Bob's laptop signed in after the reset, which reaches the gateway later: its newer
+    // token keeps it open, while the phone's session from before closes.
+    let laptop = Uuid::now_v7();
+    stack
+        .messaging
+        .device_registered(DeviceId(laptop), UserId(bob))
+        .await
+        .unwrap();
+    let mut laptop_socket = connect(&stack).await;
+    send(
+        &mut laptop_socket,
+        identify_issued(&stack, bob, laptop, now() + 2),
+    )
+    .await;
+    assert!(matches!(next(&mut laptop_socket).await, Body::Ready(_)));
+    stack
+        .messaging
+        .password_reset(UserId(bob), None)
+        .await
+        .unwrap();
+    assert_eq!(close_code(&mut bob_socket).await, 4001);
+    send(&mut laptop_socket, Body::Ping(Ping {})).await;
+    assert_eq!(next(&mut laptop_socket).await, Body::Pong(Pong {}));
+}
+
+/// Spec §7.3: the newest connection of a device wins; the older one is told to stop.
+#[tokio::test]
+async fn a_newer_connection_of_the_device_takes_over() {
+    let stack = stack().await;
+    let (user, device) = person(&stack).await;
+    let mut first = ready(&stack, user, device).await;
+    let mut second = ready(&stack, user, device).await;
+    assert_eq!(close_code(&mut first).await, 4003);
+    send(&mut second, Body::Ping(Ping {})).await;
+    assert_eq!(next(&mut second).await, Body::Pong(Pong {}));
+}
+
+#[tokio::test]
+async fn contact_events_receipts_and_read_positions_reach_the_sockets() {
+    let stack = stack().await;
+    let (alice, alice_device) = person(&stack).await;
+    let (bob, bob_device) = person(&stack).await;
+    let mut alice_socket = ready(&stack, alice, alice_device).await;
+    let mut bob_socket = ready(&stack, bob, bob_device).await;
+
+    stack
+        .messaging
+        .contact_request(UserId(alice), UserId(bob))
+        .await
+        .unwrap();
+    let event = |user: Uuid, state: ContactState| {
+        Body::ContactEvent(ContactEvent {
+            user_id: id_bytes(user),
+            state: state.into(),
+        })
+    };
+    assert_eq!(
+        next(&mut bob_socket).await,
+        event(alice, ContactState::RequestedIn)
+    );
+    assert_eq!(
+        next(&mut alice_socket).await,
+        event(bob, ContactState::RequestedOut)
+    );
+    stack
+        .messaging
+        .contact_accept(UserId(bob), UserId(alice))
+        .await
+        .unwrap();
+    assert_eq!(
+        next(&mut bob_socket).await,
+        event(alice, ContactState::Accepted)
+    );
+    let conversation = stack
+        .messaging
+        .open_direct(UserId(alice), UserId(bob))
+        .await
+        .unwrap();
+    let conversation = id_bytes(conversation.0);
+
+    send(
+        &mut alice_socket,
+        Body::Send(Send {
+            client_msg_id: id_bytes(Uuid::now_v7()),
+            conversation_id: conversation.clone(),
+            content_type: ContentType::Text.into(),
+            body: b"hello".to_vec(),
+            client_ts: None,
+        }),
+    )
+    .await;
+    wait_for(&mut bob_socket, |frame| matches!(frame, Body::Deliver(_))).await;
+    send(
+        &mut bob_socket,
+        Body::Ack(Ack {
+            conversation_id: conversation.clone(),
+            seq: 1,
+        }),
+    )
+    .await;
+    let receipt = |delivered_seq, read_seq| {
+        Body::Receipt(Receipt {
+            conversation_id: conversation.clone(),
+            positions: Some(receipt::Positions::Direct(DirectReceipt {
+                user_id: id_bytes(bob),
+                delivered_seq,
+                read_seq,
+            })),
+        })
+    };
+    let delivered = receipt(1, 0);
+    let got = wait_for(&mut alice_socket, |frame| matches!(frame, Body::Receipt(_))).await;
+    assert_eq!(got, delivered);
+
+    stack
+        .messaging
+        .read_up_to(UserId(bob), ConversationId(id(&conversation).unwrap()), 1)
+        .await
+        .unwrap();
+    let position = wait_for(&mut bob_socket, |frame| {
+        matches!(frame, Body::ReadPosition(_))
+    })
+    .await;
+    assert_eq!(
+        position,
+        Body::ReadPosition(ReadPosition {
+            conversation_id: conversation.clone(),
+            read_seq: 1,
+        })
+    );
+    let got = wait_for(&mut alice_socket, |frame| matches!(frame, Body::Receipt(_))).await;
+    assert_eq!(got, receipt(1, 1));
+}
+
 /// Alice and Bob, one device each, as contacts with a direct conversation; and `count`
 /// messages from Alice in it, sent through message-svc before anyone connects.
 async fn chat_with_backlog(stack: &Stack, count: u32) -> ((Uuid, Uuid), (Uuid, Uuid), Vec<u8>) {

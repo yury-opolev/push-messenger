@@ -35,28 +35,35 @@ impl Kicks {
         Ok(Self { pubsub })
     }
 
-    /// Waits for `device` to be kicked for `reason`; how long that took.
+    /// Waits for `device` to be kicked for `reason`; how long that took. The takeovers
+    /// a gateway announces whenever a device connects are skipped.
     pub async fn kicked(&mut self, device: Uuid, reason: KickReason) -> anyhow::Result<Duration> {
         let started = Instant::now();
+        let deadline = tokio::time::Instant::now() + WORKER_TIMEOUT;
         let channel = kick_channel(device);
         let mut messages = self.pubsub.on_message();
-        let Ok(message) = tokio::time::timeout(WORKER_TIMEOUT, messages.next()).await else {
-            bail!("{device} was not kicked within {WORKER_TIMEOUT:?}");
-        };
-        let message = message.ok_or_else(|| anyhow!("the Redis subscription ended"))?;
-        if message.get_channel_name() != channel {
-            bail!(
-                "waiting for {device} to be kicked, but {} was kicked instead",
-                message.get_channel_name()
-            );
+        loop {
+            let Ok(message) = tokio::time::timeout_at(deadline, messages.next()).await else {
+                bail!("{device} was not kicked within {WORKER_TIMEOUT:?}");
+            };
+            let message = message.ok_or_else(|| anyhow!("the Redis subscription ended"))?;
+            let kick = Kick::decode(message.get_payload_bytes()).context("decode a kick")?;
+            if kick.reason() == KickReason::TakenOver {
+                continue;
+            }
+            if message.get_channel_name() != channel {
+                bail!(
+                    "waiting for {device} to be kicked, but {} was kicked instead",
+                    message.get_channel_name()
+                );
+            }
+            if kick.reason() != reason {
+                bail!(
+                    "{device} was kicked for {:?}, not {reason:?}",
+                    kick.reason()
+                );
+            }
+            return Ok(started.elapsed());
         }
-        let kick = Kick::decode(message.get_payload_bytes()).context("decode a kick")?;
-        if kick.reason() != reason {
-            bail!(
-                "{device} was kicked for {:?}, not {reason:?}",
-                kick.reason()
-            );
-        }
-        Ok(started.elapsed())
     }
 }

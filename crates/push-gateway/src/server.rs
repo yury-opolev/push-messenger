@@ -10,11 +10,15 @@ use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::http::StatusCode;
 use axum::response::Response;
 use axum::routing::get;
+use prost::Message as _;
 use push_proto::internal::v1::messaging_client::MessagingClient;
-use push_proto::internal::v1::{AckRequest, IdentifyRequest, SendRequest, SyncRequest};
+use push_proto::internal::v1::{
+    AckRequest, IdentifyRequest, Kick, KickReason, SendRequest, SyncRequest,
+};
 use push_proto::v1::frame::Body;
 use push_proto::v1::{AuthExpiring, Error, ErrorCode};
-use push_proto::{MAX_FRAME_BYTES, close, encode_frame, error_from_status, id_bytes};
+use push_proto::{MAX_FRAME_BYTES, close, encode_frame, error_from_status, id_bytes, kick_channel};
+use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 use tokio::net::TcpListener;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -23,7 +27,7 @@ use tonic::transport::{Channel, Endpoint};
 use uuid::Uuid;
 
 use crate::config::Config;
-use crate::hub::Hub;
+use crate::hub::{Hub, Membership, Signal};
 use crate::session::{RetryDelay, Session, Step, error_frame};
 use crate::tokens::{Claims, TokenError, Verifier};
 
@@ -40,6 +44,8 @@ const REAUTH_GRACE: Duration = Duration::from_secs(30);
 const KEYS_REFRESH: Duration = Duration::from_secs(300);
 /// How soon to fetch the keys again after a failed fetch.
 const KEYS_RETRY: Duration = Duration::from_secs(2);
+/// How long a Redis command (other than the subscriber's) may take.
+const REDIS_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[derive(Clone)]
 struct App {
@@ -47,6 +53,8 @@ struct App {
     messaging: MessagingClient<Channel>,
     verifier: Verifier,
     hub: Hub,
+    /// Publishes takeovers on `kick:{device_id}`.
+    redis: ConnectionManager,
     sessions: TaskTracker,
     shutdown: CancellationToken,
 }
@@ -69,6 +77,13 @@ pub async fn serve(
     // The error is not passed on: the URL carries the Redis password.
     let redis = redis::Client::open(config.redis_url.as_str())
         .map_err(|_| anyhow::anyhow!("PUSH_REDIS_URL is not a valid Redis URL"))?;
+    let commands = ConnectionManagerConfig::new()
+        .set_connection_timeout(Some(REDIS_TIMEOUT))
+        .set_response_timeout(Some(REDIS_TIMEOUT))
+        .set_number_of_retries(1);
+    let publisher = redis
+        .get_connection_manager_lazy(commands)
+        .map_err(|_| anyhow::anyhow!("PUSH_REDIS_URL is not a valid Redis URL"))?;
     let (hub, subscriber) = Hub::start(redis, shutdown.clone());
     let verifier = Verifier::new(config.jwks_url(), &config.token_audience);
     let keys = tokio::spawn(refresh_keys(verifier.clone(), shutdown.clone()));
@@ -79,6 +94,7 @@ pub async fn serve(
         messaging,
         verifier: verifier.clone(),
         hub: hub.clone(),
+        redis: publisher,
         sessions: sessions.clone(),
         shutdown: shutdown.clone(),
     };
@@ -171,13 +187,14 @@ async fn upgrade(upgrade: WebSocketUpgrade, State(app): State<App>) -> Response 
 /// One client connection, from `Identify` to close.
 async fn connection(mut socket: WebSocket, app: App) {
     let mut session = Session::new();
-    let Some(claims) = identify(&mut socket, &mut session, &app).await else {
+    let Some((claims, mut membership)) = identify(&mut socket, &mut session, &app).await else {
         return;
     };
-    let mut membership = app.hub.join(claims.user).await;
+    membership.join_user(claims.user).await;
     let Some(ready) = session.identified(&claims, app.config.heartbeat) else {
         return;
     };
+    take_over(&app, claims.device, membership.connection()).await;
     let mut connected = Connected {
         socket,
         session,
@@ -186,6 +203,7 @@ async fn connection(mut socket: WebSocket, app: App) {
         user: claims.user,
         device: claims.device,
         expiry: Expiry::new(claims.expires_at),
+        issued_at: claims.issued_at,
         retry: RetryDelay::default(),
         retry_at: None,
     };
@@ -204,8 +222,18 @@ async fn connection(mut socket: WebSocket, app: App) {
                 close_with(&mut connected.socket, close::SHUTTING_DOWN, "server shutting down").await;
                 return;
             }
-            () = membership.rung() => {
-                if connected.deliver().await.is_err() {
+            signal = membership.next() => {
+                let done = match signal {
+                    Signal::Ring => connected.deliver().await,
+                    Signal::Frame(frame) => send(&mut connected.socket, *frame).await,
+                    Signal::Kick(reason) => {
+                        let (code, why) = kick_close(reason);
+                        tracing::info!(device = %connected.device, ?reason, "connection kicked");
+                        close_with(&mut connected.socket, code, why).await;
+                        Err(Closed)
+                    }
+                };
+                if done.is_err() {
                     return;
                 }
             }
@@ -235,6 +263,7 @@ async fn connection(mut socket: WebSocket, app: App) {
                 if connected.run(step).await.is_err() {
                     return;
                 }
+                membership.renewed(connected.issued_at);
             }
         }
     }
@@ -245,8 +274,14 @@ fn far_future() -> Instant {
 }
 
 /// Waits for the first frame, checks its token and asks message-svc whether the device it
-/// names may connect. `None` once the connection is closed.
-async fn identify(socket: &mut WebSocket, session: &mut Session, app: &App) -> Option<Claims> {
+/// names may connect. The connection watches the device's kicks before message-svc
+/// answers, so a revocation or password reset committed after the answer still reaches
+/// it. `None` once the connection is closed.
+async fn identify(
+    socket: &mut WebSocket,
+    session: &mut Session,
+    app: &App,
+) -> Option<(Claims, Membership)> {
     let deadline = tokio::time::sleep(IDENTIFY_TIMEOUT);
     tokio::pin!(deadline);
     let step = loop {
@@ -292,10 +327,17 @@ async fn identify(socket: &mut WebSocket, session: &mut Session, app: &App) -> O
             return None;
         }
     };
+    // Taken now, not when the socket opened: a connection that starts watching later is the
+    // newer one, so its takeover wins even if it opened first and its token check stalled.
+    let connection_id = Uuid::now_v7();
+    let membership = app
+        .hub
+        .watch_device(claims.device, connection_id, claims.issued_at)
+        .await;
     match admit(&mut app.messaging.clone(), &claims).await {
         Ok(()) => {
             tracing::info!(user = %claims.user, device = %claims.device, "device connected");
-            Some(claims)
+            Some((claims, membership))
         }
         Err(refusal) => {
             let (code, reason) = refusal.close();
@@ -314,6 +356,44 @@ async fn verify(verifier: &Verifier, token: &str) -> Result<Claims, TokenError> 
         return Err(TokenError::Expired);
     }
     Ok(claims)
+}
+
+/// Tells any other connection of the device, on any gateway, to close: the newest
+/// connection wins (spec §7.3). Best effort: without Redis two connections may coexist
+/// for a while, which the client tolerates.
+async fn take_over(app: &App, device: Uuid, connection_id: Uuid) {
+    let kick = Kick {
+        reason: KickReason::TakenOver.into(),
+        connection_id: id_bytes(connection_id),
+        ..Kick::default()
+    };
+    let mut redis = app.redis.clone();
+    let mut command = redis::cmd("PUBLISH");
+    command.arg(kick_channel(device)).arg(kick.encode_to_vec());
+    let publish = command.exec_async(&mut redis);
+    tokio::select! {
+        () = app.shutdown.cancelled() => {}
+        published = tokio::time::timeout(REDIS_TIMEOUT, publish) => {
+            if !matches!(published, Ok(Ok(()))) {
+                tracing::warn!(%device, "could not announce the connection to other gateways");
+            }
+        }
+    }
+}
+
+/// The close code and reason for a kick.
+fn kick_close(reason: KickReason) -> (u16, &'static str) {
+    match reason {
+        KickReason::PasswordReset => (
+            close::INVALID_IDENTITY,
+            "the password was changed; sign in again",
+        ),
+        KickReason::DeviceRevoked => (close::TAKEN_OVER, "the device was revoked"),
+        KickReason::TakenOver | KickReason::Unspecified => (
+            close::TAKEN_OVER,
+            "another connection of this device took over",
+        ),
+    }
 }
 
 /// The close code and reason for a token that did not pass.
@@ -427,6 +507,8 @@ struct Connected {
     user: Uuid,
     device: Uuid,
     expiry: Expiry,
+    /// The `iat` of the current token: a password-reset kick spares a newer one.
+    issued_at: i64,
     retry: RetryDelay,
     /// When to retry a failed sync; `None` while the last sync succeeded.
     retry_at: Option<Instant>,
@@ -519,6 +601,7 @@ impl Connected {
         match admit(&mut self.messaging, &claims).await {
             Ok(()) => {
                 self.expiry = Expiry::new(claims.expires_at);
+                self.issued_at = claims.issued_at;
                 Ok(())
             }
             Err(Refusal::Unavailable) => self.retry_reauth().await,
