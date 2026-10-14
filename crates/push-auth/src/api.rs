@@ -1,4 +1,4 @@
-//! The public HTTP API (spec §2, §5): `/v1/auth/*`, `/v1/devices/*` and `/v1/users/*`,
+//! The public HTTP API (spec §2, §5): `/v1/auth/*`, `/v1/devices/*` and `/v1/users*`,
 //! JSON in and out, plus the two small pages that email links open.
 //!
 //! Errors are `{"error": {"code", "message", "retryable"}}` with the status of
@@ -9,6 +9,7 @@
 //! `POST` their button sends, so a mail scanner that opens links does nothing.
 
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 
 use axum::extract::{ConnectInfo, FromRequest, FromRequestParts, Path, Query, Request, State};
 use axum::http::StatusCode;
@@ -27,9 +28,10 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::devices::{Caller, Tokens};
+use crate::directory::Directory;
 use crate::error::AuthError;
 use crate::limits::{Action, Limits};
-use crate::rules::Invalid;
+use crate::rules::{self, Invalid};
 use crate::service::{Auth, Signup};
 
 /// Largest request body accepted.
@@ -44,6 +46,8 @@ pub struct Api {
     /// (`x-real-ip`); without it, the peer address. Only trust a header the proxy in front
     /// always overwrites (or, for `X-Forwarded-For`, appends to): its last entry is used.
     pub client_ip_header: Option<HeaderName>,
+    /// Who may see whose profile: message-svc's `Directory` API.
+    pub directory: Arc<dyn Directory>,
 }
 
 /// The router of the public API.
@@ -59,6 +63,7 @@ pub fn router(api: Api) -> Router {
         .route("/v1/auth/jwks", get(jwks))
         .route("/v1/devices", post(register_device).get(list_devices))
         .route("/v1/devices/{device_id}", delete(revoke_device))
+        .route("/v1/users", get(profiles))
         .route("/v1/users/me", get(own_profile).patch(set_display_name))
         .route("/v1/users/lookup", get(lookup))
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
@@ -530,6 +535,39 @@ async fn lookup(
         "display_name": profile.display_name,
     }))
     .into_response())
+}
+
+#[derive(Deserialize)]
+struct IdsQuery {
+    #[serde(default)]
+    ids: String,
+}
+
+/// `GET /v1/users?ids=…`: the profiles of the listed users that the caller shares a
+/// contact or a conversation with (message-svc decides), and the caller's own. Others are
+/// left out, as are unknown ids: the answer never tells which ids exist.
+async fn profiles(
+    State(api): State<Api>,
+    headers: HeaderMap,
+    Query(query): Query<IdsQuery>,
+) -> Result<Response, AuthError> {
+    let caller = caller(&api, &headers).await?;
+    let ids = rules::user_ids(&query.ids)?;
+    let mut visible = api.directory.visible_users(caller.user_id, &ids).await?;
+    // Defence in depth: never show a profile that was not asked for, whatever the answer.
+    visible.retain(|user| ids.binary_search(user).is_ok());
+    let profiles = api.auth.profiles(&visible).await?;
+    let users: Vec<Value> = profiles
+        .iter()
+        .map(|profile| {
+            json!({
+                "user_id": profile.user_id,
+                "handle": profile.handle,
+                "display_name": profile.display_name,
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "users": users })).into_response())
 }
 
 /// A small HTML page with the headers every link page needs.

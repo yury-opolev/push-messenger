@@ -26,6 +26,8 @@ use crate::db::is_role_name;
 /// | `PUSH_HEALTH_ADDR` | address of `/healthz` and `/readyz` | `0.0.0.0:8081` |
 /// | `PUSH_DB_MAX_CONNECTIONS` | pool size, at least 1 | `10` |
 /// | `PUSH_AUTH_WORKER_ROLE` | role the worker connects as: granted the outbox and the cleanups at start-up | none |
+/// | `PUSH_MESSAGE_SVC_URL` | gRPC URL of message-svc, `http://host:50051` (plain `http://` only), asked whose profiles a caller may see; without it `GET /v1/users` answers 503 | none |
+/// | `PUSH_DIRECTORY_TOKEN` | the token message-svc requires for its `Directory` API, 32 to 256 visible ASCII characters; required with `PUSH_MESSAGE_SVC_URL` | none |
 ///
 /// `http://` public URLs and `ws://` audiences are accepted only for local hosts
 /// (`localhost`, `127.0.0.1`, `*.local`, `*.localhost`, `*.test`), like the chart's guard.
@@ -44,6 +46,8 @@ pub struct Config {
     pub health_addr: SocketAddr,
     pub store: StoreOptions,
     pub worker_role: Option<String>,
+    pub message_svc_url: Option<String>,
+    pub directory_token: Option<String>,
 }
 
 impl std::fmt::Debug for Config {
@@ -63,6 +67,11 @@ impl std::fmt::Debug for Config {
             .field("health_addr", &self.health_addr)
             .field("store", &self.store)
             .field("worker_role", &self.worker_role)
+            .field("message_svc_url", &self.message_svc_url)
+            .field(
+                "directory_token",
+                &self.directory_token.as_ref().map(|_| "<redacted>"),
+            )
             .finish()
     }
 }
@@ -169,6 +178,32 @@ impl Config {
                 });
             }
         };
+        let message_svc_url = lookup("PUSH_MESSAGE_SVC_URL").filter(|v| !v.is_empty());
+        if let Some(url) = &message_svc_url {
+            if !url.starts_with("http://") {
+                return Err(ConfigError::Invalid {
+                    name: "PUSH_MESSAGE_SVC_URL",
+                    value: url.clone(),
+                    reason: "must start with http:// (auth-svc speaks plain gRPC to \
+                             message-svc inside the cluster and is built without TLS)"
+                        .to_owned(),
+                });
+            }
+        }
+        let directory_token = lookup("PUSH_DIRECTORY_TOKEN").filter(|v| !v.is_empty());
+        match (&message_svc_url, &directory_token) {
+            (Some(_), None) => return Err(ConfigError::Missing("PUSH_DIRECTORY_TOKEN")),
+            (None, Some(_)) => return Err(ConfigError::Missing("PUSH_MESSAGE_SVC_URL")),
+            _ => {}
+        }
+        if let Some(token) = &directory_token {
+            if !((32..=256).contains(&token.len()) && token.bytes().all(|b| b.is_ascii_graphic())) {
+                return Err(redacted(
+                    "PUSH_DIRECTORY_TOKEN",
+                    "use 32 to 256 visible ASCII characters".to_owned(),
+                ));
+            }
+        }
         Ok(Self {
             database_url,
             redis_url,
@@ -183,6 +218,8 @@ impl Config {
             health_addr: parsed(&lookup, "PUSH_HEALTH_ADDR", ([0, 0, 0, 0], 8081).into())?,
             store,
             worker_role,
+            message_svc_url,
+            directory_token,
         })
     }
 }
@@ -313,6 +350,8 @@ mod tests {
         assert_eq!(config.client_ip_header, None);
         assert_eq!(config.store, StoreOptions::default());
         assert_eq!(config.worker_role, None);
+        assert_eq!(config.message_svc_url, None);
+        assert_eq!(config.directory_token, None);
     }
 
     #[test]
@@ -422,6 +461,44 @@ mod tests {
                 "{role}"
             );
         }
+    }
+
+    #[test]
+    fn message_svc_comes_with_its_directory_token_and_plain_http() {
+        let token = "d1rectory-d1rectory-d1rectory-d1rectory-";
+        let mut variables = REQUIRED.to_vec();
+        variables.push(("PUSH_MESSAGE_SVC_URL", "http://message-svc:50051"));
+        variables.push(("PUSH_DIRECTORY_TOKEN", token));
+        let configured = config(&variables).unwrap();
+        assert_eq!(
+            configured.message_svc_url.as_deref(),
+            Some("http://message-svc:50051")
+        );
+        assert_eq!(configured.directory_token.as_deref(), Some(token));
+        assert!(!format!("{configured:?}").contains(token));
+
+        assert_eq!(
+            config(&with("PUSH_MESSAGE_SVC_URL", "http://message-svc:50051")),
+            Err(ConfigError::Missing("PUSH_DIRECTORY_TOKEN"))
+        );
+        assert_eq!(
+            config(&with("PUSH_DIRECTORY_TOKEN", token)),
+            Err(ConfigError::Missing("PUSH_MESSAGE_SVC_URL"))
+        );
+        let mut tls = variables.clone();
+        tls[REQUIRED.len()] = ("PUSH_MESSAGE_SVC_URL", "https://message-svc:50051");
+        assert!(matches!(
+            config(&tls),
+            Err(ConfigError::Invalid {
+                name: "PUSH_MESSAGE_SVC_URL",
+                ..
+            })
+        ));
+        let mut short = variables;
+        short[REQUIRED.len() + 1] = ("PUSH_DIRECTORY_TOKEN", "too-short");
+        let message = config(&short).unwrap_err().to_string();
+        assert!(message.contains("PUSH_DIRECTORY_TOKEN"), "{message}");
+        assert!(!message.contains("too-short"), "{message}");
     }
 
     #[test]

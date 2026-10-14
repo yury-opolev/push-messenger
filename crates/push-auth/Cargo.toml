@@ -17,6 +17,7 @@ base64.workspace = true
 chrono.workspace = true
 hmac.workspace = true
 jsonwebtoken.workspace = true
+push-proto.workspace = true
 push-store.workspace = true
 rand.workspace = true
 redis.workspace = true
@@ -28,6 +29,7 @@ sqlx.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
 tokio-util.workspace = true
+tonic.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
@@ -36,6 +38,7 @@ uuid.workspace = true
 http-body-util.workspace = true
 testcontainers-modules.workspace = true
 tokio = { workspace = true, features = ["io-util"] }
+tokio-stream.workspace = true
 tower.workspace = true
 
 [lints]

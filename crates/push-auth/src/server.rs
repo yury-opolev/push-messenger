@@ -16,6 +16,7 @@ use tokio_util::sync::CancellationToken;
 use crate::api::{Api, router};
 use crate::config::Config;
 use crate::db::{grant_worker_access, migrate_database};
+use crate::directory::{Directory, GrpcDirectory, NoDirectory};
 use crate::limits::{Limits, RedisCounter};
 use crate::links::LinkSigner;
 use crate::password::Passwords;
@@ -42,6 +43,18 @@ pub async fn serve(
     let tokens = AccessTokens::from_seed(&config.signing_key, config.token_audience.clone())
         .map_err(anyhow::Error::msg)?;
     let links = LinkSigner::new(config.link_key.clone()).map_err(anyhow::Error::msg)?;
+    let directory: Arc<dyn Directory> = match (&config.message_svc_url, &config.directory_token) {
+        (Some(url), Some(token)) => {
+            Arc::new(GrpcDirectory::new(url, token).map_err(anyhow::Error::msg)?)
+        }
+        _ => {
+            tracing::warn!(
+                "PUSH_MESSAGE_SVC_URL is not set: GET /v1/users answers 503, since only \
+                 message-svc knows whose profiles a user may see"
+            );
+            Arc::new(NoDirectory)
+        }
+    };
     let ready = Health {
         pool: Arc::new(OnceLock::new()),
         shutdown: shutdown.clone(),
@@ -92,6 +105,7 @@ pub async fn serve(
         auth,
         limits: Limits::new(Arc::new(counter)),
         client_ip_header: config.client_ip_header.clone(),
+        directory,
     });
     tracing::info!(addr = %config.http_addr, "serving HTTP");
     let result = axum::serve(

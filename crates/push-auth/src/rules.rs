@@ -1,9 +1,10 @@
-//! What the API accepts: emails, handles, display names, passwords and devices.
+//! What the API accepts: emails, handles, display names, passwords, devices and user ids.
 //!
 //! Each function trims and normalises its input and returns what is stored, or the
 //! reason it is refused.
 
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 /// An input the API refuses: which field and why.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,6 +23,8 @@ pub const MAX_PASSWORD_CHARS: usize = 128;
 pub const MIN_PASSWORD_CHARS: usize = 8;
 /// Most characters of a display name or device name.
 pub const MAX_NAME_CHARS: usize = 64;
+/// Most user ids one `GET /v1/users?ids=…` may ask for.
+pub const MAX_PROFILE_IDS: usize = 100;
 
 /// An email address: trimmed, with the domain in lower case. Matching ignores case
 /// anyway (the column is citext); the local part keeps the case the user typed.
@@ -97,6 +100,22 @@ pub fn password(raw: &str) -> Result<(), Invalid> {
     Ok(())
 }
 
+/// The ids of `GET /v1/users?ids=…`: 1 to 100 UUIDs, separated by commas, sorted and
+/// without duplicates.
+pub fn user_ids(raw: &str) -> Result<Vec<Uuid>, Invalid> {
+    let mut ids = raw
+        .split(',')
+        .map(|id| Uuid::parse_str(id.trim()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| invalid("ids", "use user ids separated by commas"))?;
+    ids.sort();
+    ids.dedup();
+    if ids.len() > MAX_PROFILE_IDS {
+        return Err(invalid("ids", "ask for at most 100 users at once"));
+    }
+    Ok(ids)
+}
+
 /// What kind of device a client runs on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -141,6 +160,23 @@ impl Platform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn user_ids_are_a_comma_separated_list_of_at_most_100() {
+        let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+        assert_eq!(user_ids(&format!("{b}, {a},{b}")), Ok(vec![a, b]));
+        for bad in ["", "not-a-uuid", &format!("{a},,{b}")] {
+            assert_eq!(user_ids(bad).unwrap_err().field, "ids", "{bad:?}");
+        }
+        let many: Vec<String> = (0..=MAX_PROFILE_IDS)
+            .map(|_| Uuid::now_v7().to_string())
+            .collect();
+        assert_eq!(
+            user_ids(&many.join(",")).unwrap_err().reason,
+            "ask for at most 100 users at once"
+        );
+        assert_eq!(user_ids(&many[1..].join(",")).map(|ids| ids.len()), Ok(100));
+    }
 
     #[test]
     fn emails_are_trimmed_and_their_domain_lower_cased() {
