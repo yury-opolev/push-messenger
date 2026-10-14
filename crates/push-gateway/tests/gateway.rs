@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
+use push_auth::tokens::AccessTokens;
 use push_domain::{DeviceId, InMemoryStore, MAX_SYNC_BATCH, Messaging, SystemClock, UserId};
 use push_gateway::{Config, serve};
 use push_message_svc::{MessagingApi, RedisNotifier};
@@ -98,18 +99,24 @@ struct Stack {
     /// message-svc's domain, to set up users, contacts and conversations directly.
     messaging: Arc<Messaging<InMemoryStore, SystemClock, RedisNotifier>>,
     message_svc: String,
+    /// auth-svc's token issuer, whose key set the gateway fetches.
+    issuer: AccessTokens,
     gateway: SocketAddr,
     shutdown: CancellationToken,
     server: JoinHandle<anyhow::Result<()>>,
 }
 
-/// Redis, message-svc's API on the in-memory store, and the gateway, on free ports.
-async fn stack(dev_auth: bool) -> Stack {
-    stack_with(dev_auth, 0).await
+/// The URL the gateway names itself by: the audience of its tokens.
+const AUDIENCE: &str = "ws://push.test/v1/socket";
+
+/// Redis, message-svc's API on the in-memory store, auth-svc's key set, and the gateway,
+/// on free ports.
+async fn stack() -> Stack {
+    stack_with(0).await
 }
 
 /// As [`stack`], with message-svc failing its first `sync_failures` syncs.
-async fn stack_with(dev_auth: bool, sync_failures: u32) -> Stack {
+async fn stack_with(sync_failures: u32) -> Stack {
     let redis = Redis::default()
         .with_tag("7-alpine")
         .start()
@@ -137,16 +144,28 @@ async fn stack_with(dev_auth: bool, sync_failures: u32) -> Stack {
             .serve_with_incoming(TcpListenerStream::new(grpc)),
     );
 
+    // auth-svc's key set, as `GET /v1/auth/jwks` serves it.
+    let issuer = AccessTokens::from_seed(&[7; 32], AUDIENCE).unwrap();
+    let jwks = issuer.jwks();
+    let keys = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let auth_url = format!("http://{}", keys.local_addr().unwrap());
+    let routes = axum::Router::new().route(
+        "/v1/auth/jwks",
+        axum::routing::get(move || async move { axum::Json(jwks) }),
+    );
+    tokio::spawn(axum::serve(keys, routes).into_future());
+
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let health = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let gateway = listener.local_addr().unwrap();
     let config = Config {
         message_svc_url: message_svc.clone(),
         redis_url,
+        auth_url,
+        token_audience: AUDIENCE.to_owned(),
         listen_addr: gateway,
         health_addr: health.local_addr().unwrap(),
         heartbeat: Duration::from_secs(30),
-        dev_auth,
     };
     let shutdown = CancellationToken::new();
     let server = tokio::spawn(serve(config, listener, health, shutdown.clone()));
@@ -154,10 +173,18 @@ async fn stack_with(dev_auth: bool, sync_failures: u32) -> Stack {
         _redis: redis,
         messaging,
         message_svc,
+        issuer,
         gateway,
         shutdown,
         server,
     }
+}
+
+fn now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
 }
 
 /// A user with one device, relayed to message-svc as the worker relays them.
@@ -194,12 +221,24 @@ async fn send(socket: &mut Socket, body: Body) {
         .unwrap();
 }
 
-fn identify(user: Uuid, device: Uuid) -> Body {
-    Body::Identify(Identify {
-        token: String::new(),
-        dev_user_id: id_bytes(user),
-        dev_device_id: id_bytes(device),
-    })
+/// An `Identify` with an access token issued now.
+fn identify(stack: &Stack, user: Uuid, device: Uuid) -> Body {
+    identify_issued(stack, user, device, now())
+}
+
+/// An `Identify` with an access token issued at `issued_at` (seconds); it expires 15
+/// minutes later.
+fn identify_issued(stack: &Stack, user: Uuid, device: Uuid, issued_at: i64) -> Body {
+    let (token, _) = stack.issuer.issue(user, device, issued_at);
+    Body::Identify(Identify { token })
+}
+
+/// Connects and identifies with a token issued now; returns once `Ready` arrived.
+async fn ready(stack: &Stack, user: Uuid, device: Uuid) -> Socket {
+    let mut socket = connect(stack).await;
+    send(&mut socket, identify(stack, user, device)).await;
+    assert!(matches!(next(&mut socket).await, Body::Ready(_)));
+    socket
 }
 
 /// The next frame, within 5 s.
@@ -234,23 +273,21 @@ async fn close_code(socket: &mut Socket) -> u16 {
 
 #[tokio::test]
 async fn a_message_reaches_the_other_device_and_the_sender_gets_its_ack() {
-    let stack = stack(true).await;
+    let stack = stack().await;
     let (alice, alice_device) = person(&stack).await;
     let (bob, bob_device) = person(&stack).await;
     let conversation = direct_chat(&stack, alice, bob).await;
 
     let mut bob_socket = connect(&stack).await;
-    send(&mut bob_socket, identify(bob, bob_device)).await;
-    let Body::Ready(ready) = next(&mut bob_socket).await else {
+    send(&mut bob_socket, identify(&stack, bob, bob_device)).await;
+    let Body::Ready(ready_frame) = next(&mut bob_socket).await else {
         panic!("expected Ready");
     };
-    assert_eq!(ready.user_id, id_bytes(bob));
-    assert_eq!(ready.device_id, id_bytes(bob_device));
-    assert_eq!(ready.heartbeat_ms, 30_000);
+    assert_eq!(ready_frame.user_id, id_bytes(bob));
+    assert_eq!(ready_frame.device_id, id_bytes(bob_device));
+    assert_eq!(ready_frame.heartbeat_ms, 30_000);
 
-    let mut alice_socket = connect(&stack).await;
-    send(&mut alice_socket, identify(alice, alice_device)).await;
-    assert!(matches!(next(&mut alice_socket).await, Body::Ready(_)));
+    let mut alice_socket = ready(&stack, alice, alice_device).await;
     let client_msg_id = id_bytes(Uuid::now_v7());
     send(
         &mut alice_socket,
@@ -296,44 +333,91 @@ async fn a_message_reaches_the_other_device_and_the_sender_gets_its_ack() {
 }
 
 #[tokio::test]
-async fn without_dev_auth_identify_is_closed_with_4001() {
-    let stack = stack(false).await;
+async fn an_invalid_token_is_closed_with_4001_and_an_expired_one_with_4002() {
+    let stack = stack().await;
     let (user, device) = person(&stack).await;
+    let elsewhere = AccessTokens::from_seed(&[7; 32], "wss://elsewhere.test/v1/socket").unwrap();
+    let stranger = AccessTokens::from_seed(&[8; 32], AUDIENCE).unwrap();
+    for token in [
+        "not a token".to_owned(),
+        String::new(),
+        elsewhere.issue(user, device, now()).0,
+    ] {
+        let mut socket = connect(&stack).await;
+        send(&mut socket, Body::Identify(Identify { token })).await;
+        assert_eq!(close_code(&mut socket).await, 4001);
+    }
+    // A key the gateway does not hold even after fetching the set again, such as one
+    // retired before it started: refresh, never a sign-out.
     let mut socket = connect(&stack).await;
-    send(&mut socket, identify(user, device)).await;
-    assert_eq!(close_code(&mut socket).await, 4001);
+    let token = stranger.issue(user, device, now()).0;
+    send(&mut socket, Body::Identify(Identify { token })).await;
+    assert_eq!(close_code(&mut socket).await, 4002);
+    // Expired 90 s ago: past the 60 s leeway. The client refreshes, then reconnects.
+    let mut socket = connect(&stack).await;
+    send(
+        &mut socket,
+        identify_issued(&stack, user, device, now() - 900 - 90),
+    )
+    .await;
+    assert_eq!(close_code(&mut socket).await, 4002);
 }
 
 #[tokio::test]
-async fn a_device_of_another_user_is_closed_with_4001() {
-    let stack = stack(true).await;
-    let (alice, _) = person(&stack).await;
-    let (_, bob_device) = person(&stack).await;
-    let mut socket = connect(&stack).await;
-    send(&mut socket, identify(alice, bob_device)).await;
-    assert_eq!(close_code(&mut socket).await, 4001);
+async fn message_svc_decides_whether_the_tokens_device_may_connect() {
+    let stack = stack().await;
+    let (user, device) = person(&stack).await;
 
-    // A device message-svc has not heard of yet (not relayed) is not refused for good:
-    // message-svc answers UNAVAILABLE, and the client retries (Plan 8 gives it its own code).
+    // Registered moments ago and not relayed yet: retry shortly, never a sign-out.
     let mut socket = connect(&stack).await;
-    send(&mut socket, identify(alice, Uuid::now_v7())).await;
-    assert_eq!(close_code(&mut socket).await, 1011);
+    send(&mut socket, identify(&stack, user, Uuid::now_v7())).await;
+    assert_eq!(close_code(&mut socket).await, 4006);
+
+    // A token issued before the password reset: sign in again.
+    let before = now() - 60;
+    stack
+        .messaging
+        .password_reset(UserId(user), None)
+        .await
+        .unwrap();
+    let mut socket = connect(&stack).await;
+    send(&mut socket, identify_issued(&stack, user, device, before)).await;
+    assert_eq!(close_code(&mut socket).await, 4001);
+    let mut socket = connect(&stack).await;
+    send(
+        &mut socket,
+        identify_issued(&stack, user, device, now() + 1),
+    )
+    .await;
+    assert!(matches!(next(&mut socket).await, Body::Ready(_)));
+
+    // A revoked device: stop.
+    stack
+        .messaging
+        .device_revoked(DeviceId(device), UserId(user))
+        .await
+        .unwrap();
+    let mut socket = connect(&stack).await;
+    send(
+        &mut socket,
+        identify_issued(&stack, user, device, now() + 1),
+    )
+    .await;
+    assert_eq!(close_code(&mut socket).await, 4003);
 }
 
 #[tokio::test]
 async fn a_connection_that_never_identifies_is_closed_after_5_seconds() {
-    let stack = stack(true).await;
+    let stack = stack().await;
     let mut socket = connect(&stack).await;
-    assert_eq!(close_code(&mut socket).await, 4001);
+    assert_eq!(close_code(&mut socket).await, 1002);
 }
 
 #[tokio::test]
 async fn shutdown_closes_connections_with_4005() {
-    let stack = stack(true).await;
+    let stack = stack().await;
     let (user, device) = person(&stack).await;
-    let mut socket = connect(&stack).await;
-    send(&mut socket, identify(user, device)).await;
-    assert!(matches!(next(&mut socket).await, Body::Ready(_)));
+    let mut socket = ready(&stack, user, device).await;
 
     stack.shutdown.cancel();
     assert_eq!(close_code(&mut socket).await, 4005);
@@ -375,12 +459,12 @@ async fn chat_with_backlog(stack: &Stack, count: u32) -> ((Uuid, Uuid), (Uuid, U
 
 #[tokio::test]
 async fn a_backlog_larger_than_one_sync_batch_is_delivered_as_the_device_acks() {
-    let stack = stack(true).await;
+    let stack = stack().await;
     let backlog = MAX_SYNC_BATCH + 1;
     let (_alice, (bob, bob_device), conversation) = chat_with_backlog(&stack, backlog).await;
 
     let mut socket = connect(&stack).await;
-    send(&mut socket, identify(bob, bob_device)).await;
+    send(&mut socket, identify(&stack, bob, bob_device)).await;
     assert!(matches!(next(&mut socket).await, Body::Ready(_)));
     for expected in 1..=i64::from(MAX_SYNC_BATCH) {
         let Body::Deliver(entry) = next(&mut socket).await else {
@@ -406,11 +490,11 @@ async fn a_backlog_larger_than_one_sync_batch_is_delivered_as_the_device_acks() 
 
 #[tokio::test]
 async fn a_failed_sync_is_retried() {
-    let stack = stack_with(true, 1).await;
+    let stack = stack_with(1).await;
     let (_alice, (bob, bob_device), _conversation) = chat_with_backlog(&stack, 1).await;
 
     let mut socket = connect(&stack).await;
-    send(&mut socket, identify(bob, bob_device)).await;
+    send(&mut socket, identify(&stack, bob, bob_device)).await;
     assert!(matches!(next(&mut socket).await, Body::Ready(_)));
     // The sync after Ready fails; nothing rings Bob's channel, so only a retry delivers.
     let Body::Deliver(entry) = next(&mut socket).await else {

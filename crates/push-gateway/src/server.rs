@@ -1,5 +1,5 @@
-//! Running the gateway: the WebSocket endpoint, one task per connection, the health
-//! endpoints and graceful shutdown.
+//! Running the gateway: the WebSocket endpoint, one task per connection, the token keys,
+//! the health endpoints and graceful shutdown.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,18 +25,23 @@ use uuid::Uuid;
 use crate::config::Config;
 use crate::hub::Hub;
 use crate::session::{RetryDelay, Session, Step, error_frame};
+use crate::tokens::{Claims, TokenError, Verifier};
 
 /// The first frame must be `Identify`, within this time (spec §7.1).
 const IDENTIFY_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long shutdown waits for connections to close.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
-/// Close code for "the server cannot serve this connection now" (RFC 6455).
-const INTERNAL_ERROR: u16 = 1011;
+
+/// How often the token keys are fetched again: auth-svc lets clients cache them 5 minutes.
+const KEYS_REFRESH: Duration = Duration::from_secs(300);
+/// How soon to fetch the keys again after a failed fetch.
+const KEYS_RETRY: Duration = Duration::from_secs(2);
 
 #[derive(Clone)]
 struct App {
     config: Arc<Config>,
     messaging: MessagingClient<Channel>,
+    verifier: Verifier,
     hub: Hub,
     sessions: TaskTracker,
     shutdown: CancellationToken,
@@ -53,13 +58,6 @@ pub async fn serve(
     health: TcpListener,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
-    if config.dev_auth {
-        tracing::warn!(
-            "DEV ONLY: PUSH_DEV_AUTH=1 accepts any user and device id in Identify without a \
-             token. Anyone who can reach this gateway can act as any user. Never enable it \
-             outside a local cluster."
-        );
-    }
     let endpoint = Endpoint::from_shared(config.message_svc_url.clone())?
         .connect_timeout(Duration::from_secs(2))
         .timeout(Duration::from_secs(10));
@@ -68,18 +66,21 @@ pub async fn serve(
     let redis = redis::Client::open(config.redis_url.as_str())
         .map_err(|_| anyhow::anyhow!("PUSH_REDIS_URL is not a valid Redis URL"))?;
     let (hub, subscriber) = Hub::start(redis, shutdown.clone());
+    let verifier = Verifier::new(config.jwks_url(), &config.token_audience);
+    let keys = tokio::spawn(refresh_keys(verifier.clone(), shutdown.clone()));
     let sessions = TaskTracker::new();
     let listen_addr = config.listen_addr;
     let app = App {
         config: Arc::new(config),
         messaging,
+        verifier: verifier.clone(),
         hub: hub.clone(),
         sessions: sessions.clone(),
         shutdown: shutdown.clone(),
     };
 
     let health_server = tokio::spawn(
-        axum::serve(health, health_router(shutdown.clone()))
+        axum::serve(health, health_router(verifier, shutdown.clone()))
             .with_graceful_shutdown(shutdown.clone().cancelled_owned())
             .into_future(),
     );
@@ -100,16 +101,45 @@ pub async fn serve(
         tracing::warn!(open = sessions.len(), "connections still open after 10 s");
     }
     subscriber.await?;
+    keys.await?;
     health_server.await??;
     tracing::info!("stopped");
     Ok(())
 }
 
-/// `/healthz` always answers; `/readyz` answers until shutdown begins. Readiness does not
-/// depend on Redis: without it devices still get their entries, only later (after
-/// `Ready`, after acks and on retries), while an unready gateway would refuse every
-/// client. The subscriber reconnects by itself, so liveness does not depend on it either.
-fn health_router(shutdown: CancellationToken) -> Router {
+/// Keeps the token keys fresh: fetches them every 2 s until it has them, then every
+/// 5 minutes (a token naming a new key fetches them at once, see [`Verifier`]). A failed
+/// fetch keeps the keys it had.
+async fn refresh_keys(verifier: Verifier, shutdown: CancellationToken) {
+    loop {
+        let fetched = tokio::select! {
+            () = shutdown.cancelled() => return,
+            fetched = verifier.fetch() => fetched,
+        };
+        let wait = match fetched {
+            Ok(()) => KEYS_REFRESH,
+            Err(error) => {
+                tracing::warn!(%error, "could not fetch the token keys; retrying");
+                if verifier.is_ready() {
+                    KEYS_REFRESH / 10
+                } else {
+                    KEYS_RETRY
+                }
+            }
+        };
+        tokio::select! {
+            () = shutdown.cancelled() => return,
+            () = tokio::time::sleep(wait) => {}
+        }
+    }
+}
+
+/// `/healthz` always answers; `/readyz` answers once the token keys are loaded, until
+/// shutdown begins. Readiness does not depend on Redis: without it devices still get
+/// their entries, only later (after `Ready`, after acks and on retries), while an unready
+/// gateway would refuse every client. The subscriber reconnects by itself, so liveness
+/// does not depend on it either.
+fn health_router(verifier: Verifier, shutdown: CancellationToken) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route(
@@ -117,6 +147,8 @@ fn health_router(shutdown: CancellationToken) -> Router {
             get(move || async move {
                 if shutdown.is_cancelled() {
                     (StatusCode::SERVICE_UNAVAILABLE, "shutting down")
+                } else if !verifier.is_ready() {
+                    (StatusCode::SERVICE_UNAVAILABLE, "loading the token keys")
                 } else {
                     (StatusCode::OK, "ready")
                 }
@@ -134,20 +166,20 @@ async fn upgrade(upgrade: WebSocketUpgrade, State(app): State<App>) -> Response 
 
 /// One client connection, from `Identify` to close.
 async fn connection(mut socket: WebSocket, app: App) {
-    let mut session = Session::new(app.config.dev_auth);
-    let Some((user, device)) = identify(&mut socket, &mut session, &app).await else {
+    let mut session = Session::new();
+    let Some(claims) = identify(&mut socket, &mut session, &app).await else {
         return;
     };
-    let mut membership = app.hub.join(user).await;
-    let Some(ready) = session.identified(app.config.heartbeat) else {
+    let mut membership = app.hub.join(claims.user).await;
+    let Some(ready) = session.identified(&claims, app.config.heartbeat) else {
         return;
     };
     let mut connected = Connected {
         socket,
         session,
         messaging: app.messaging.clone(),
-        user,
-        device,
+        user: claims.user,
+        device: claims.device,
         retry: RetryDelay::default(),
         retry_at: None,
     };
@@ -172,6 +204,7 @@ async fn connection(mut socket: WebSocket, app: App) {
                     return;
                 }
             }
+
             message = connected.socket.recv() => {
                 let step = match message {
                     Some(Ok(Message::Binary(bytes))) => connected.session.on_binary(&bytes),
@@ -192,19 +225,15 @@ fn far_future() -> Instant {
     Instant::now() + Duration::from_secs(24 * 60 * 60)
 }
 
-/// Waits for the first frame and checks the identity with message-svc. `None` once the
-/// connection is closed.
-async fn identify(
-    socket: &mut WebSocket,
-    session: &mut Session,
-    app: &App,
-) -> Option<(Uuid, Uuid)> {
+/// Waits for the first frame, checks its token and asks message-svc whether the device it
+/// names may connect. `None` once the connection is closed.
+async fn identify(socket: &mut WebSocket, session: &mut Session, app: &App) -> Option<Claims> {
     let deadline = tokio::time::sleep(IDENTIFY_TIMEOUT);
     tokio::pin!(deadline);
     let step = loop {
         tokio::select! {
             () = &mut deadline => {
-                close_with(socket, close::INVALID_IDENTITY, "Identify must come within 5 s").await;
+                close_with(socket, close::PROTOCOL_ERROR, "Identify must come within 5 s").await;
                 return None;
             }
             () = app.shutdown.cancelled() => {
@@ -219,50 +248,104 @@ async fn identify(
             },
         }
     };
-    let (user, device) = match step {
-        Step::Identify { user, device } => (user, device),
+    let token = match step {
+        Step::Identify(token) => token,
         Step::Close(code, reason) => {
             close_with(socket, code, reason).await;
             return None;
         }
         // Before Ready the session only asks to identify or to close.
-        Step::Reply(_) | Step::Send(_) | Step::Ack(_) => {
+        _ => {
             close_with(
                 socket,
-                close::INVALID_IDENTITY,
+                close::PROTOCOL_ERROR,
                 "the first frame must be Identify",
             )
             .await;
             return None;
         }
     };
-    // DEV ONLY identities carry no token; they count as issued now.
-    let issued_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |since| since.as_secs() as i64);
-    let request = IdentifyRequest {
-        user_id: id_bytes(user),
-        device_id: id_bytes(device),
-        issued_at,
+    let claims = match app.verifier.verify(&token).await {
+        Ok(claims) => claims,
+        Err(error) => {
+            let (code, reason) = token_refusal(error);
+            close_with(socket, code, reason).await;
+            return None;
+        }
     };
-    match app.messaging.clone().identify(request).await {
-        Ok(_) => {
-            tracing::info!(%user, %device, dev_identity = true, "device connected");
-            Some((user, device))
+    match admit(&mut app.messaging.clone(), &claims).await {
+        Ok(()) => {
+            tracing::info!(user = %claims.user, device = %claims.device, "device connected");
+            Some(claims)
         }
-        Err(status)
-            if matches!(
-                status.code(),
-                tonic::Code::PermissionDenied | tonic::Code::InvalidArgument
-            ) =>
-        {
-            close_with(socket, close::INVALID_IDENTITY, "unknown or revoked device").await;
+        Err(refusal) => {
+            let (code, reason) = refusal.close();
+            close_with(socket, code, reason).await;
             None
         }
-        Err(status) => {
+    }
+}
+
+/// The close code and reason for a token that did not pass.
+fn token_refusal(error: TokenError) -> (u16, &'static str) {
+    match error {
+        TokenError::Invalid => (close::INVALID_IDENTITY, "the access token is not valid"),
+        TokenError::Expired => (close::REAUTH_REQUIRED, "the access token has expired"),
+        TokenError::KeysUnavailable => (
+            close::INTERNAL_ERROR,
+            "access tokens cannot be checked now; retry",
+        ),
+    }
+}
+
+/// Why message-svc did not admit a device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Refusal {
+    /// Close with this code and reason.
+    Close(u16, &'static str),
+    /// message-svc could not answer: retry later.
+    Unavailable,
+}
+
+impl Refusal {
+    fn close(self) -> (u16, &'static str) {
+        match self {
+            Self::Close(code, reason) => (code, reason),
+            Self::Unavailable => (close::INTERNAL_ERROR, "the message service is unavailable"),
+        }
+    }
+}
+
+/// Asks message-svc whether the device of a valid token may connect: it is active and the
+/// user's, and the token is newer than the user's last password reset.
+async fn admit(messaging: &mut MessagingClient<Channel>, claims: &Claims) -> Result<(), Refusal> {
+    let request = IdentifyRequest {
+        user_id: id_bytes(claims.user),
+        device_id: id_bytes(claims.device),
+        issued_at: claims.issued_at,
+    };
+    let Err(status) = messaging.identify(request).await else {
+        return Ok(());
+    };
+    match error_from_status(&status).code() {
+        ErrorCode::PasswordChanged => Err(Refusal::Close(
+            close::INVALID_IDENTITY,
+            "the password was changed; sign in again",
+        )),
+        ErrorCode::UnknownDevice => {
+            Err(Refusal::Close(close::TAKEN_OVER, "the device was revoked"))
+        }
+        ErrorCode::DeviceNotReady => {
+            // Normal for a second after a device registers: the worker has not relayed it.
+            tracing::debug!(device = %claims.device, "device not relayed yet");
+            Err(Refusal::Close(
+                close::NOT_READY_YET,
+                "the device is not ready yet; retry shortly",
+            ))
+        }
+        _ => {
             tracing::warn!(code = ?status.code(), message = status.message(), "identify failed");
-            close_with(socket, INTERNAL_ERROR, "the message service is unavailable").await;
-            None
+            Err(Refusal::Unavailable)
         }
     }
 }
@@ -323,7 +406,7 @@ impl Connected {
                 close_with(&mut self.socket, code, reason).await;
                 Err(Closed)
             }
-            Step::Identify { .. } => {
+            Step::Identify(_) => {
                 let error = error_frame(ErrorCode::BadFrame, "already identified");
                 send(&mut self.socket, error).await
             }

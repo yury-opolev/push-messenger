@@ -8,17 +8,19 @@ use std::time::Duration;
 use push_proto::close;
 use push_proto::v1::frame::Body;
 use push_proto::v1::{Ack, Deliver, Error, ErrorCode, Pong, Ready, Send};
-use push_proto::{FrameError, decode_frame, id, id_bytes};
+use push_proto::{FrameError, decode_frame, id_bytes};
 use uuid::Uuid;
+
+use crate::tokens::Claims;
 
 /// What the gateway must do for a frame the client sent.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Step {
     /// Send this frame to the client.
     Reply(Body),
-    /// Ask message-svc whether `device` is an active device of `user`, then call
-    /// [`Session::identified`] or close with [`close::INVALID_IDENTITY`].
-    Identify { user: Uuid, device: Uuid },
+    /// Check this access token, ask message-svc whether the device it names may connect,
+    /// then call [`Session::identified`] or close.
+    Identify(String),
     /// Forward a send to message-svc; answer with its `SendAck` or an error.
     Send(Send),
     /// Forward an ack to message-svc; answer only if it fails. If it moved the position,
@@ -32,11 +34,8 @@ pub enum Step {
 enum State {
     /// Connected; the first frame must be `Identify`.
     New,
-    /// `Identify` is being checked.
-    Identifying {
-        user: Uuid,
-        device: Uuid,
-    },
+    /// The token of `Identify` is being checked.
+    Identifying,
     Ready {
         device: Uuid,
     },
@@ -44,7 +43,6 @@ enum State {
 
 #[derive(Debug)]
 pub struct Session {
-    dev_auth: bool,
     state: State,
     /// The highest `seq` sent to the client per conversation, so a sync that repeats
     /// entries the client has not acked yet does not send them twice.
@@ -55,10 +53,9 @@ pub struct Session {
 }
 
 impl Session {
-    /// A new connection. `dev_auth` is whether DEV ONLY identities are accepted.
-    pub fn new(dev_auth: bool) -> Self {
+    /// A new connection.
+    pub fn new() -> Self {
         Self {
-            dev_auth,
             state: State::New,
             sent: HashMap::new(),
             more_waiting: false,
@@ -69,7 +66,7 @@ impl Session {
     pub fn device(&self) -> Option<Uuid> {
         match self.state {
             State::Ready { device } => Some(device),
-            State::New | State::Identifying { .. } => None,
+            State::New | State::Identifying => None,
         }
     }
 
@@ -77,8 +74,8 @@ impl Session {
     pub fn on_binary(&mut self, bytes: &[u8]) -> Step {
         let body = match (decode_frame(bytes), self.state) {
             (Ok(body), _) => body,
-            (Err(_), State::New | State::Identifying { .. }) => {
-                return Step::Close(close::INVALID_IDENTITY, "the first frame must be Identify");
+            (Err(_), State::New | State::Identifying) => {
+                return Step::Close(close::PROTOCOL_ERROR, "the first frame must be Identify");
             }
             (Err(FrameError::TooLarge { .. }), State::Ready { .. }) => {
                 return reply_error(ErrorCode::BadFrame, "the frame is too large");
@@ -89,26 +86,16 @@ impl Session {
         };
         match (body, self.state) {
             (Body::Identify(identify), State::New) => {
-                if !self.dev_auth {
-                    return Step::Close(
-                        close::INVALID_IDENTITY,
-                        "token sign-in is not available yet",
-                    );
-                }
-                match (id(&identify.dev_user_id), id(&identify.dev_device_id)) {
-                    (Ok(user), Ok(device)) => {
-                        self.state = State::Identifying { user, device };
-                        Step::Identify { user, device }
-                    }
-                    _ => Step::Close(close::INVALID_IDENTITY, "invalid dev identity"),
-                }
+                self.state = State::Identifying;
+                Step::Identify(identify.token)
             }
-            (_, State::New | State::Identifying { .. }) => {
-                Step::Close(close::INVALID_IDENTITY, "the first frame must be Identify")
+            (_, State::New | State::Identifying) => {
+                Step::Close(close::PROTOCOL_ERROR, "the first frame must be Identify")
             }
             (Body::Identify(_), State::Ready { .. }) => {
                 reply_error(ErrorCode::BadFrame, "already identified")
             }
+
             (Body::Send(send), State::Ready { .. }) => Step::Send(send),
             (Body::Ack(ack), State::Ready { .. }) => Step::Ack(ack),
             (Body::Ping(_), State::Ready { .. }) => Step::Reply(Body::Pong(Pong {})),
@@ -120,22 +107,24 @@ impl Session {
     pub fn on_text(&mut self) -> Step {
         match self.state {
             State::Ready { .. } => reply_error(ErrorCode::BadFrame, "frames must be binary"),
-            State::New | State::Identifying { .. } => {
-                Step::Close(close::INVALID_IDENTITY, "the first frame must be Identify")
+            State::New | State::Identifying => {
+                Step::Close(close::PROTOCOL_ERROR, "the first frame must be Identify")
             }
         }
     }
 
-    /// message-svc confirmed the identity that [`Step::Identify`] asked about: the
-    /// `Ready` frame to send. `None` if no identity is being checked.
-    pub fn identified(&mut self, heartbeat: Duration) -> Option<Body> {
-        let State::Identifying { user, device } = self.state else {
+    /// The token of [`Step::Identify`] passed and message-svc accepted the device it
+    /// names: the `Ready` frame to send. `None` if no identity is being checked.
+    pub fn identified(&mut self, claims: &Claims, heartbeat: Duration) -> Option<Body> {
+        if self.state != State::Identifying {
             return None;
+        }
+        self.state = State::Ready {
+            device: claims.device,
         };
-        self.state = State::Ready { device };
         Some(Body::Ready(Ready {
-            user_id: id_bytes(user),
-            device_id: id_bytes(device),
+            user_id: id_bytes(claims.user),
+            device_id: id_bytes(claims.device),
             heartbeat_ms: u32::try_from(heartbeat.as_millis()).unwrap_or(u32::MAX),
         }))
     }
@@ -166,6 +155,12 @@ impl Session {
     /// and the last sync left entries behind. Then the next sync returns them.
     pub fn sync_after_ack(&self, moved: bool) -> bool {
         moved && self.more_waiting
+    }
+}
+
+impl Default for Session {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -222,23 +217,32 @@ mod tests {
 
     use super::*;
 
-    fn identify(user: Uuid, device: Uuid) -> Vec<u8> {
+    fn identify(token: &str) -> Vec<u8> {
         encode_frame(Body::Identify(Identify {
-            token: String::new(),
-            dev_user_id: id_bytes(user),
-            dev_device_id: id_bytes(device),
+            token: token.to_owned(),
         }))
     }
 
+    fn claims() -> Claims {
+        Claims {
+            user: Uuid::now_v7(),
+            device: Uuid::now_v7(),
+            issued_at: 1_700_000_000,
+            expires_at: 1_700_000_900,
+        }
+    }
+
     fn ready_session() -> (Session, Uuid) {
-        let mut session = Session::new(true);
-        let (user, device) = (Uuid::now_v7(), Uuid::now_v7());
+        let mut session = Session::new();
         assert_eq!(
-            session.on_binary(&identify(user, device)),
-            Step::Identify { user, device }
+            session.on_binary(&identify("token")),
+            Step::Identify("token".to_owned())
         );
-        session.identified(Duration::from_secs(30)).unwrap();
-        (session, device)
+        let claims = claims();
+        session
+            .identified(&claims, Duration::from_secs(30))
+            .unwrap();
+        (session, claims.device)
     }
 
     fn error_code(step: Step) -> ErrorCode {
@@ -257,87 +261,64 @@ mod tests {
     }
 
     #[test]
-    fn a_dev_identity_is_checked_then_ready() {
-        let mut session = Session::new(true);
-        let (user, device) = (Uuid::now_v7(), Uuid::now_v7());
+    fn identify_hands_over_its_token_and_ready_names_the_tokens_device() {
+        let mut session = Session::new();
         assert_eq!(
-            session.on_binary(&identify(user, device)),
-            Step::Identify { user, device }
+            session.on_binary(&identify("a.b.c")),
+            Step::Identify("a.b.c".to_owned())
         );
         assert_eq!(session.device(), None);
-        let ready = session.identified(Duration::from_secs(30));
+        let claims = claims();
+        let ready = session.identified(&claims, Duration::from_secs(30));
         assert_eq!(
             ready,
             Some(Body::Ready(Ready {
-                user_id: id_bytes(user),
-                device_id: id_bytes(device),
+                user_id: id_bytes(claims.user),
+                device_id: id_bytes(claims.device),
                 heartbeat_ms: 30_000,
             }))
         );
-        assert_eq!(session.device(), Some(device));
-        assert_eq!(session.identified(Duration::from_secs(30)), None);
+        assert_eq!(session.device(), Some(claims.device));
+        assert_eq!(session.identified(&claims, Duration::from_secs(30)), None);
     }
 
     #[test]
     fn identified_without_a_pending_identity_does_nothing() {
-        let mut session = Session::new(true);
-        assert_eq!(session.identified(Duration::from_secs(30)), None);
+        let mut session = Session::new();
+        assert_eq!(session.identified(&claims(), Duration::from_secs(30)), None);
         assert_eq!(session.device(), None);
     }
 
+    /// A protocol mistake before Ready is no reason to sign out: 1002, not 4001.
     #[test]
-    fn without_dev_auth_identify_closes_with_4001() {
-        let mut session = Session::new(false);
-        assert_eq!(
-            session.on_binary(&identify(Uuid::now_v7(), Uuid::now_v7())),
-            Step::Close(4001, "token sign-in is not available yet")
-        );
-    }
-
-    #[test]
-    fn anything_but_identify_first_closes_with_4001() {
+    fn anything_but_identify_first_is_a_protocol_error() {
         let ping = encode_frame(Body::Ping(Ping {}));
         for bytes in [ping.as_slice(), &[0xff, 0xff], &[]] {
-            let mut session = Session::new(true);
+            let mut session = Session::new();
             assert_eq!(
                 session.on_binary(bytes),
-                Step::Close(4001, "the first frame must be Identify")
+                Step::Close(1002, "the first frame must be Identify")
             );
         }
         assert_eq!(
-            Session::new(true).on_text(),
-            Step::Close(4001, "the first frame must be Identify")
+            Session::new().on_text(),
+            Step::Close(1002, "the first frame must be Identify")
         );
     }
 
     #[test]
-    fn a_dev_identity_with_malformed_ids_closes_with_4001() {
-        let mut session = Session::new(true);
-        let bytes = encode_frame(Body::Identify(Identify {
-            token: String::new(),
-            dev_user_id: vec![1, 2, 3],
-            dev_device_id: id_bytes(Uuid::now_v7()),
-        }));
-        assert_eq!(
-            session.on_binary(&bytes),
-            Step::Close(4001, "invalid dev identity")
-        );
-    }
-
-    #[test]
-    fn while_identifying_any_other_frame_or_a_second_identify_closes_with_4001() {
+    fn while_identifying_any_other_frame_or_a_second_identify_is_a_protocol_error() {
         let ping = encode_frame(Body::Ping(Ping {}));
-        let second = identify(Uuid::now_v7(), Uuid::now_v7());
+        let second = identify("another");
         for bytes in [ping.as_slice(), second.as_slice()] {
-            let mut session = Session::new(true);
-            let (user, device) = (Uuid::now_v7(), Uuid::now_v7());
+            let mut session = Session::new();
             assert_eq!(
-                session.on_binary(&identify(user, device)),
-                Step::Identify { user, device }
+                session.on_binary(&identify("token")),
+                Step::Identify("token".to_owned())
             );
             assert_eq!(
                 session.on_binary(bytes),
-                Step::Close(4001, "the first frame must be Identify")
+                Step::Close(1002, "the first frame must be Identify")
             );
             assert_eq!(session.device(), None);
         }
@@ -347,8 +328,8 @@ mod tests {
     fn an_oversized_frame_closes_before_identify_and_errors_once_ready() {
         let oversized = vec![0u8; MAX_FRAME_BYTES + 1];
         assert_eq!(
-            Session::new(true).on_binary(&oversized),
-            Step::Close(4001, "the first frame must be Identify")
+            Session::new().on_binary(&oversized),
+            Step::Close(1002, "the first frame must be Identify")
         );
         let (mut session, _) = ready_session();
         assert_eq!(
@@ -357,7 +338,6 @@ mod tests {
         );
         assert!(session.device().is_some());
     }
-
     #[test]
     fn once_ready_frames_become_steps() {
         let (mut session, _) = ready_session();
@@ -386,7 +366,7 @@ mod tests {
     #[test]
     fn once_ready_bad_frames_get_errors_but_keep_the_connection() {
         let (mut session, _) = ready_session();
-        let again = identify(Uuid::now_v7(), Uuid::now_v7());
+        let again = identify("again");
         assert_eq!(error_code(session.on_binary(&again)), ErrorCode::BadFrame);
         assert_eq!(
             error_code(session.on_binary(&[0xff, 0xff])),

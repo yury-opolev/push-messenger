@@ -125,10 +125,11 @@ async fn the_smoke_test_passes_against_the_whole_stack() {
         push_gateway::Config {
             message_svc_url: message_svc_url.clone(),
             redis_url: redis_url.clone(),
+            auth_url: auth_url.clone(),
+            token_audience: socket_url.clone(),
             listen_addr: listener.local_addr().unwrap(),
             health_addr: gateway_health.local_addr().unwrap(),
             heartbeat: Duration::from_secs(30),
-            dev_auth: true,
         },
         listener,
         gateway_health,

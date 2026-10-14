@@ -24,10 +24,9 @@ images:
 # stay the same (the bring-up script sets it after rebuilding the images).
 buildId: ""
 
-# DEV ONLY switches: the gateway accepts identities without a token (PUSH_DEV_AUTH=1), the
-# worker shows the emails its log sender delivered at /dev/mailbox (PUSH_DEV_MAILBOX=1), a
-# webhook secret is generated when none is set, and `helm test` runs the smoke test. Never
-# enable outside a local cluster.
+# DEV ONLY switches: the worker shows the emails its log sender delivered at /dev/mailbox
+# (PUSH_DEV_MAILBOX=1), a webhook secret is generated when none is set, and `helm test`
+# runs the smoke test. Never enable outside a local cluster.
 devMode:
   enabled: false
   # Must be exactly "insecure-local-only" when enabled.

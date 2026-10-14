@@ -52,7 +52,7 @@ local, so dev mode cannot reach a real deployment by accident.
 {{- define "push.devMode" -}}
 {{- if .Values.devMode.enabled -}}
 {{- if ne .Values.devMode.acknowledge "insecure-local-only" -}}
-{{- fail "devMode.enabled switches authentication off: set devMode.acknowledge to \"insecure-local-only\", and only in a local values file" -}}
+{{- fail "devMode.enabled serves every email the worker sends, links and all, without authentication: set devMode.acknowledge to \"insecure-local-only\", and only in a local values file" -}}
 {{- end -}}
 {{- $host := .Values.ingress.host -}}
 {{- if not (or (hasSuffix ".local" $host) (hasSuffix ".localhost" $host) (hasSuffix ".test" $host)) -}}
@@ -62,7 +62,7 @@ true
 {{- end -}}
 {{- end -}}
 
-{{/* "1" or "0" for the PUSH_DEV_AUTH and PUSH_DEV_MAILBOX variables. */}}
+{{/* "1" or "0" for the PUSH_DEV_MAILBOX variable. */}}
 {{- define "push.devFlag" -}}
 {{- if include "push.devMode" . -}}1{{- else -}}0{{- end -}}
 {{- end -}}

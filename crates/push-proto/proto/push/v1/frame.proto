@@ -42,18 +42,15 @@ message Frame {
   // 10-31 are free for later client frames, 42-63 for later server frames.
 }
 
-// Must be the first frame, within 5 seconds of connecting.
+// Must be the first frame, within 5 seconds of connecting. The gateway learns the user
+// and the device only from the token (spec §5.3).
 message Identify {
-  // The access token (a JWT, Plan 5). Not checked yet.
+  // The access token auth-svc issued for this device (a JWT, spec §5.1).
   string token = 1;
-  // DEV ONLY: accepted only by a gateway started with PUSH_DEV_AUTH=1, which trusts
-  // these ids without any proof. Removed when real tokens arrive (Plan 8); when
-  // removing them, reserve their field numbers (14, 15) and names.
-  bytes dev_user_id = 14;
-  bytes dev_device_id = 15;
-  // private_reads: the device does not reveal reads to others.
-  reserved 16;
-  reserved "private_reads";
+  // 14 and 15 held the DEV ONLY ids that let a local gateway skip the token (Plans 4 to
+  // 7); 16 is private_reads: the device does not reveal reads to others.
+  reserved 14, 15, 16;
+  reserved "dev_user_id", "dev_device_id", "private_reads";
 }
 
 message Ready {

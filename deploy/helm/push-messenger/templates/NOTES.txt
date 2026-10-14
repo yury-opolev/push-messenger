@@ -12,9 +12,8 @@ the released volumes and the provisioner's data directory, which deleting the na
 alone can leave behind.
 {{- if include "push.devMode" . }}
 
-DEV MODE IS ON: the gateway accepts identities without a token and the worker shows the
-emails its log sender delivered at /dev/mailbox (not routed by the ingress). This is for a
-local cluster only.
+DEV MODE IS ON: the worker shows the emails its log sender delivered at /dev/mailbox (not
+routed by the ingress). This is for a local cluster only.
 
 Run the end-to-end smoke test:
   helm test {{ .Release.Name }} --namespace {{ .Release.Namespace }} --logs

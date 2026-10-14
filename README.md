@@ -93,8 +93,9 @@ at start-up.
 | `PUSH_REDIS_URL` | Redis URL, `redis://:password@host:6379` | required |
 | `PUSH_LISTEN_ADDR` | address of the WebSocket endpoint `/v1/socket` | `0.0.0.0:8080` |
 | `PUSH_HEALTH_ADDR` | address of `/healthz` and `/readyz` | `0.0.0.0:8081` |
+| `PUSH_AUTH_URL` | base URL of auth-svc (`http://push-auth:8080`); the token keys come from its `/v1/auth/jwks` | required |
+| `PUSH_TOKEN_AUDIENCE` | the gateway's public URL (`wss://…/v1/socket`), the `aud` access tokens must name | required |
 | `PUSH_HEARTBEAT_MS` | client ping interval announced in `Ready`, 1000 to 600000 | `30000` |
-| `PUSH_DEV_AUTH` | `1` accepts DEV ONLY identities without a token | off |
 
 `push-auth`:
 

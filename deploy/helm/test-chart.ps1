@@ -33,7 +33,12 @@ Check 'lint with the default values' { helm lint $chart --strict | Out-Null; $LA
 Check 'lint with values-minikube.yaml' { helm lint $chart --strict -f $minikube | Out-Null; $LASTEXITCODE -eq 0 }
 
 $default = helm template push $chart | Out-String
-Check 'default: the gateway refuses dev identities' { $default -match 'name: PUSH_DEV_AUTH\s+value: "0"' }
+Check 'default: the gateway checks tokens with auth-svc''s keys, for its own URL, and has no dev identities' {
+    $gateway = Doc $default 'Deployment' 'push-gateway'
+    $gateway -match 'name: PUSH_AUTH_URL\s+value: "http://push-auth:8080"' -and
+        $gateway -match 'name: PUSH_TOKEN_AUDIENCE\s+value: "wss://push.example.com/v1/socket"' -and
+        $default -notmatch 'PUSH_DEV_AUTH'
+}
 Check 'default: the DevSetup switch is gone' { $default -notmatch 'PUSH_DEV_SETUP' }
 Check 'default: no smoke test' { $default -notmatch 'helm.sh/hook: test' }
 Check 'default: the worker has no dev mailbox and logs email; auth-svc has no mailbox at all' {
@@ -123,7 +128,10 @@ Check 'resend: the worker sends through Resend with the key from the Secret' {
 }
 
 $dev = helm template push $chart -f $minikube | Out-String
-Check 'minikube: dev identities on' { $dev -match 'name: PUSH_DEV_AUTH\s+value: "1"' }
+Check 'minikube: no dev identities either; tokens name ws://push.local/v1/socket' {
+    $dev -notmatch 'PUSH_DEV_AUTH' -and
+        (Doc $dev 'Deployment' 'push-gateway') -match 'name: PUSH_TOKEN_AUDIENCE\s+value: "ws://push.local/v1/socket"'
+}
 Check 'minikube: the smoke test calls message-svc and reads the Redis URL from the Secret' {
     $smoke = Doc $dev 'Pod' 'push-smoke'
     $smoke -match '- --message-svc\s+- "http://push-message-svc:50051"' -and
