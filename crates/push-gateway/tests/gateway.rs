@@ -453,8 +453,9 @@ async fn an_expiring_token_is_announced_and_renewed_by_reauth() {
     let stack = stack().await;
     let (user, device) = person(&stack).await;
     let (other, other_device) = person(&stack).await;
-    // Expired 25 s ago, within the leeway: 5 s left to send ReAuth.
-    let issued_at = now() - 900 - 25;
+    // Expired 22 s ago, within the leeway: 8 s left to send ReAuth (the lapsed socket's
+    // close then comes inside close_code's 10 s wait).
+    let issued_at = now() - 900 - 22;
     let mut renewed = connect(&stack).await;
     let mut lapsed = connect(&stack).await;
     for (socket, user, device) in [
