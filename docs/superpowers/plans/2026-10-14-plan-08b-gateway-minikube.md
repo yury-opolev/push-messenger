@@ -2780,8 +2780,58 @@ controller merges after the final review.
 | §12 end-to-end through the full stack; tests 6 (revoked while connected) and 7 (expired token) on a cluster | 1, 3 |
 | §13 groups not exposed to apps: the smoke test sees a group request refused | 1 |
 
+## Verified on minikube
+
+Run on 2026-10-14 (profile `push`, Kubernetes 1.31). The smoke test's output, device ids
+replaced by `…`:
+
+```
+smoke: alice connected with the access token (Ready, heartbeat 30000 ms) once the worker had relayed device …: 0 "not ready yet" closes (4006) in 45 ms
+smoke: bob connected with the access token (Ready, heartbeat 30000 ms) once the worker had relayed device …: 0 "not ready yet" closes (4006) in 4 ms
+smoke: carol connected with the access token (Ready, heartbeat 30000 ms) once the worker had relayed device …: 3 "not ready yet" closes (4006) in 1772 ms
+smoke: alice asked bob to be a contact; bob's socket heard it (ContactEvent), bob accepted and alice's socket heard that
+smoke: carol redeemed alice's invite: they are contacts
+smoke: alice opened the direct conversation with bob
+smoke: auth-svc shows alice the profiles of her contacts bob and carol, and bob none of carol's
+smoke: alice got SendAck seq=1 after 10 ms
+smoke: bob got Deliver seq=1 after 57 ms
+smoke: bob acked; the gateway answered the following Ping
+smoke: alice edited her message; bob's socket delivered the edit (seq 2)
+smoke: bob read the message; his socket heard his ReadPosition, alice's the Receipt, and her listing shows it read
+smoke: alice's group request was refused (NOT_AVAILABLE): groups are not offered to apps
+smoke: alice deleted her message; bob's socket delivered the delete (seq 3) and his history holds it erased
+smoke: the gateway refused a token that had expired (4002) and one for another audience (4001), both signed with auth-svc's key
+smoke: carol revoked her device; after the worker relayed it the gateway closed her socket with 4003 (660 ms) and refuses her token
+smoke: bob reset his password; after the worker relayed it the gateway closed his socket with 4001 (2009 ms) and refuses his token from before the reset
+smoke: PASS in 8125 ms
+```
+
+Also verified:
+
+- An upgrade rerun passed in 7249 ms and kept the messaging token.
+- The gateway's logs had no tokens.
+- The smoke Pod has no `redis://`, and the signing key reaches it only through
+  `secretKeyRef`.
+
+## Review fixes made after the plan was written
+
+The code blocks above come from the verified commits and stay as they are; these review
+fixes changed the result afterwards.
+
+- README: the paragraph describing the smoke test was adapted by hand where the patch did
+  not apply to the line as it stood.
+- `test-chart.ps1`: the default render must not contain `PUSH_SMOKE_SIGNING_KEY`, and the
+  messaging token must differ from the Directory token as well (all three differ).
+- `smoke.yaml`: a blank argument line was removed.
+
 ## Deferred to later plans
 
+- **`socket.rs` identify read loop:** a per-message timeout rather than a single deadline.
+- **The wrong-audience check** proves the forged key only indirectly: a token with the
+  wrong `aud` is refused, which shows auth-svc's key was accepted only by the refusal's
+  reason (4001), not by a separate success case.
+- **During an upgrade**, old gateway pods lack the messaging token, so message-svc briefly
+  refuses their calls.
 - **A NetworkPolicy** so only the gateway reaches `Messaging`, only the worker `Accounts`
   and only auth-svc `Directory` (Plan 11); until then the tokens are the only fence.
 - **Rotating the internal tokens and auth-svc's signing key** without a restart (Plan 11,

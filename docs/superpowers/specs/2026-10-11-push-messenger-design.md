@@ -984,7 +984,9 @@ Implementation notes (push-proto, Plan 4A):
 - `crates/push-proto/proto/push/v1/frame.proto` holds the client frames,
   `push/internal/v1/messaging.proto` the gateway's gRPC calls to message-svc. Rust code is
   generated at build time with a vendored `protoc`, so building needs no system protoc.
-- Identifiers are 16-byte UUIDs; times are microseconds since the Unix epoch, UTC.
+- Identifiers are 16-byte UUIDs; times are microseconds since the Unix epoch, UTC. The exceptions are the access
+  token's `iat` and `exp` and the `issued_at` and `reset_at` that compare with them, which
+  are in seconds.
 - Frame field numbers: client frames 1–31, server frames 32–63. Reserved field numbers:
   `ephemeral` 16, `urgent` 17 and media `attachments` 18 on `Send` and `Deliver`;
   `private_reads` 16 on `Identify`.
