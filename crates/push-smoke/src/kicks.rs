@@ -4,7 +4,7 @@
 
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, bail};
+use anyhow::{Context, anyhow, bail};
 use futures_util::StreamExt;
 use prost::Message;
 use push_proto::internal::v1::{Kick, KickReason};
@@ -40,23 +40,23 @@ impl Kicks {
         let started = Instant::now();
         let channel = kick_channel(device);
         let mut messages = self.pubsub.on_message();
-        loop {
-            let left = WORKER_TIMEOUT.saturating_sub(started.elapsed());
-            let Ok(message) = tokio::time::timeout(left, messages.next()).await else {
-                bail!("{device} was not kicked within {WORKER_TIMEOUT:?}");
-            };
-            let message = message.ok_or_else(|| anyhow!("the Redis subscription ended"))?;
-            if message.get_channel_name() != channel {
-                continue;
-            }
-            let kick = Kick::decode(message.get_payload_bytes())?;
-            if kick.reason() != reason {
-                bail!(
-                    "{device} was kicked for {:?}, not {reason:?}",
-                    kick.reason()
-                );
-            }
-            return Ok(started.elapsed());
+        let Ok(message) = tokio::time::timeout(WORKER_TIMEOUT, messages.next()).await else {
+            bail!("{device} was not kicked within {WORKER_TIMEOUT:?}");
+        };
+        let message = message.ok_or_else(|| anyhow!("the Redis subscription ended"))?;
+        if message.get_channel_name() != channel {
+            bail!(
+                "waiting for {device} to be kicked, but {} was kicked instead",
+                message.get_channel_name()
+            );
         }
+        let kick = Kick::decode(message.get_payload_bytes()).context("decode a kick")?;
+        if kick.reason() != reason {
+            bail!(
+                "{device} was kicked for {:?}, not {reason:?}",
+                kick.reason()
+            );
+        }
+        Ok(started.elapsed())
     }
 }

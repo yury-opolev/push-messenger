@@ -195,8 +195,12 @@ pub async fn run(target: &Target) -> anyhow::Result<()> {
         carol: Client::relayed("carol", carol, &channel).await?,
     };
     // Listening before anything can kick them.
-    let mut kicks =
-        Kicks::subscribe(&target.redis_url, &[people.bob.device, people.carol.device]).await?;
+    let mut kicks = tokio::time::timeout(
+        STEP_TIMEOUT,
+        Kicks::subscribe(&target.redis_url, &[people.bob.device, people.carol.device]),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("Redis: no answer within {STEP_TIMEOUT:?}"))??;
     let mut api = Messaging::new(channel.clone());
     let conversation = connect(&mut api, &auth, &people).await?;
 
@@ -243,7 +247,7 @@ async fn connect(
         state: ContactState::RequestedOut.into(),
     };
     if asked != response::Body::Contact(pending) {
-        bail!("alice's contact request answered {asked:?}");
+        bail!("alice's contact request was answered with something else");
     }
     let accept = request::Body::ContactAccept(ContactAccept {
         user_id: id_bytes(alice.user),
@@ -265,7 +269,7 @@ async fn connect(
         user_id: id_bytes(alice.user),
     };
     if redeemed != response::Body::InviteRedeemed(creator) {
-        bail!("carol's redeem answered {redeemed:?}");
+        bail!("carol's redeem was answered with something else");
     }
     step("carol redeemed alice's invite: they are contacts");
 
@@ -340,7 +344,7 @@ async fn chat(
 
     let entry = delivered(bob_socket, conversation, ack.seq, "bob's Deliver").await?;
     if entry.body.as_deref() != Some(text.as_bytes()) || entry.sender_id != id_bytes(alice.user) {
-        bail!("bob received the wrong message: {entry:?}");
+        bail!("bob received the wrong message: {}", describe(&entry));
     }
     step(&format!(
         "bob got Deliver seq={} after {} ms",
@@ -399,9 +403,15 @@ async fn change_messages(
             "hello, edited",
         )
         .await?;
+    if edited.seq != sent.seq + 1 {
+        bail!("the edit got seq {}, not {}", edited.seq, sent.seq + 1);
+    }
     let entry = delivered(bob_socket, conversation, edited.seq, "the edit").await?;
     if entry.kind() != EntryKind::Edit || entry.target_seq != Some(sent.seq) {
-        bail!("bob's socket delivered {entry:?} instead of the edit");
+        bail!(
+            "bob's socket delivered {} instead of the edit",
+            describe(&entry)
+        );
     }
     step(&format!(
         "alice edited her message; bob's socket delivered the edit (seq {})",
@@ -444,7 +454,10 @@ async fn change_messages(
     };
     let entry = delivered(bob_socket, &group.conversation_id, 1, "the group").await?;
     if entry.kind() != EntryKind::System {
-        bail!("the group's first entry is {entry:?}, not a system entry");
+        bail!(
+            "the group's first entry is {}, not a system entry",
+            describe(&entry)
+        );
     }
     if auth.profiles(&bob.access_token, &[carol.user]).await? != [carol.user] {
         bail!("auth-svc does not show bob carol's profile, though they share a group");
@@ -456,9 +469,15 @@ async fn change_messages(
     let deleted = api
         .delete(alice.user, alice.device, conversation, client_msg_id)
         .await?;
+    if deleted.seq != edited.seq + 1 {
+        bail!("the delete got seq {}, not {}", deleted.seq, edited.seq + 1);
+    }
     let entry = delivered(bob_socket, conversation, deleted.seq, "the delete").await?;
-    if entry.kind() != EntryKind::Delete {
-        bail!("bob's socket delivered {entry:?} instead of the delete");
+    if entry.kind() != EntryKind::Delete || entry.target_seq != Some(sent.seq) {
+        bail!(
+            "bob's socket delivered {} instead of the delete",
+            describe(&entry)
+        );
     }
     let fetch = request::Body::FetchHistory(FetchHistory {
         conversation_id: conversation.to_vec(),
@@ -641,7 +660,7 @@ impl Client {
                 ));
                 Ok(socket)
             }
-            other => bail!("{} expected Ready, got {other:?}", self.name),
+            _ => bail!("{} expected Ready, got another frame", self.name),
         }
     }
 }
@@ -667,6 +686,16 @@ async fn next(socket: &mut Socket, waiting_for: &str) -> anyhow::Result<Body> {
             _ => {}
         }
     }
+}
+
+/// An entry without its body, which may be a message.
+fn describe(entry: &Deliver) -> String {
+    format!(
+        "an entry of kind {:?} (seq {}, target_seq {:?})",
+        entry.kind(),
+        entry.seq,
+        entry.target_seq
+    )
 }
 
 fn step(message: &str) {
