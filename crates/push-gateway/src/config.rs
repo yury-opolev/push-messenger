@@ -16,7 +16,7 @@ use axum::http::HeaderName;
 /// | `PUSH_LISTEN_ADDR` | address of the WebSocket endpoint `/v1/socket` | `0.0.0.0:8080` |
 /// | `PUSH_HEALTH_ADDR` | address of `/healthz` and `/readyz` | `0.0.0.0:8081` |
 /// | `PUSH_HEARTBEAT_MS` | client ping interval announced in `Ready` | `30000` |
-/// | `PUSH_GROUPS` | `1` serves group requests; `0` refuses them with `NOT_AVAILABLE` (groups are not offered to apps in the first release) | `0` |
+/// | `PUSH_GROUPS` | `1` serves group requests; `0` refuses only the six group-management requests (create, add and remove members, leave, rename, set role) with `NOT_AVAILABLE`; groups that already exist still reach clients | `0` |
 /// | `PUSH_CLIENT_IP_HEADER` | header with the client's IP, set by the ingress (`x-real-ip`); its last line, then last entry is used | the peer address |
 ///
 /// `PUSH_DEV_AUTH=1` (the DEV ONLY identities without a token, removed in Plan 8) is

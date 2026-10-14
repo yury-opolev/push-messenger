@@ -194,9 +194,11 @@ impl Session {
 }
 
 /// The requests about groups, which apps cannot use in the first release (owner
-/// decision): message-svc keeps serving them, the gateway refuses them unless
-/// `PUSH_GROUPS=1`. No group can be created otherwise, so no group entries, receipts or
-/// listings reach clients either.
+/// decision): message-svc keeps serving them, the gateway refuses these six
+/// group-management requests unless `PUSH_GROUPS=1`. It refuses nothing else: groups that
+/// already exist (made while the switch was on, or directly through message-svc) still
+/// reach clients through `Deliver` and `Sync`, listings, history, group receipts, and
+/// `Send`, `Edit`, `Delete` and `ReadUpTo`.
 fn is_group_request(body: &request::Body) -> bool {
     matches!(
         body,

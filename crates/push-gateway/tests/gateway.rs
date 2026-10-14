@@ -520,7 +520,7 @@ async fn a_revocation_and_a_password_reset_close_the_socket_at_once() {
     let mut laptop_socket = connect(&stack).await;
     send(
         &mut laptop_socket,
-        identify_issued(&stack, bob, laptop, now() + 2),
+        identify_issued(&stack, bob, laptop, now() + 10),
     )
     .await;
     assert!(matches!(next(&mut laptop_socket).await, Body::Ready(_)));
