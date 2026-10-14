@@ -11,7 +11,7 @@ use push_domain::{
     ConversationId, DeviceId, InMemoryStore, MAX_SYNC_BATCH, Messaging, SystemClock, UserId,
 };
 use push_gateway::{Config, serve};
-use push_message_svc::{MessagingApi, RedisNotifier};
+use push_message_svc::{InternalToken, MessagingApi, RedisNotifier};
 use push_proto::internal::v1::messaging_client::MessagingClient;
 use push_proto::internal::v1::messaging_server::{self, MessagingServer};
 use push_proto::internal::v1::{
@@ -116,6 +116,8 @@ struct Stack {
 
 /// The URL the gateway names itself by: the audience of its tokens.
 const AUDIENCE: &str = "ws://push.test/v1/socket";
+/// The gateway's token for message-svc's `Messaging` API.
+const MESSAGING_TOKEN: &str = "messaging-token-for-the-gateway-tests";
 
 /// Redis, message-svc's API on the in-memory store, auth-svc's key set, and the gateway,
 /// on free ports.
@@ -146,10 +148,13 @@ async fn stack_with(sync_failures: u32, heartbeat: Duration) -> Stack {
     let message_svc = format!("http://{}", grpc.local_addr().unwrap());
     tokio::spawn(
         tonic::transport::Server::builder()
-            .add_service(MessagingServer::new(FlakySync {
-                api: MessagingApi::new(Arc::clone(&messaging)),
-                sync_failures: Mutex::new(sync_failures),
-            }))
+            .add_service(MessagingServer::with_interceptor(
+                FlakySync {
+                    api: MessagingApi::new(Arc::clone(&messaging)),
+                    sync_failures: Mutex::new(sync_failures),
+                },
+                InternalToken::messaging(Some(MESSAGING_TOKEN.to_owned())),
+            ))
             .serve_with_incoming(TcpListenerStream::new(grpc)),
     );
 
@@ -169,6 +174,7 @@ async fn stack_with(sync_failures: u32, heartbeat: Duration) -> Stack {
     let gateway = listener.local_addr().unwrap();
     let config = Config {
         message_svc_url: message_svc.clone(),
+        messaging_token: MESSAGING_TOKEN.to_owned(),
         redis_url,
         auth_url,
         token_audience: AUDIENCE.to_owned(),
@@ -885,9 +891,21 @@ async fn chat_with_backlog(stack: &Stack, count: u32) -> ((Uuid, Uuid), (Uuid, U
     let (bob, bob_device) = person(stack).await;
     let conversation = direct_chat(stack, alice, bob).await;
 
-    let mut messaging = MessagingClient::connect(stack.message_svc.clone())
+    // As the gateway calls it: with its internal token.
+    let channel = tonic::transport::Channel::from_shared(stack.message_svc.clone())
+        .unwrap()
+        .connect()
         .await
         .unwrap();
+    let bearer: tonic::metadata::MetadataValue<_> =
+        format!("Bearer {MESSAGING_TOKEN}").parse().unwrap();
+    let mut messaging =
+        MessagingClient::with_interceptor(channel, move |mut request: Request<()>| {
+            request
+                .metadata_mut()
+                .insert("authorization", bearer.clone());
+            Ok(request)
+        });
     for n in 0..count {
         messaging
             .send(SendRequest {

@@ -1,7 +1,7 @@
 //! The whole system on this machine: Postgres and Redis in containers (Docker must be
 //! running), auth-svc, the worker, message-svc and the gateway in this process, wired as
 //! the chart wires them (each internal API behind its own token), and the smoke test
-//! against them over real HTTP, gRPC, WebSockets and Redis.
+//! against them as a client sees them: auth-svc's HTTP API and the gateway's WebSocket.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -37,7 +37,7 @@ async fn the_smoke_test_passes_against_the_whole_stack() {
         "redis://127.0.0.1:{}",
         redis.get_host_port_ipv4(6379).await.unwrap()
     );
-    let redis_url_for_smoke = redis_url.clone();
+
     let shutdown = CancellationToken::new();
 
     // auth-svc and the worker have databases of their own in the same server, as in the
@@ -68,16 +68,18 @@ async fn the_smoke_test_passes_against_the_whole_stack() {
     // auth-svc's token for message-svc's Directory API, as the chart's Secret holds it.
     // message-svc refuses it equal to the Accounts token.
     let directory_token = "directory-token-for-the-local-smoke-test";
+    // The gateway's token for message-svc's Messaging API.
+    let messaging_token = "messaging-token-for-the-local-smoke-test";
+    // base64 of 32 bytes of 0x07: auth-svc's signing key, which the smoke test also gets
+    // to sign tokens the gateway must refuse.
+    let signing_key = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=";
     let auth_variables = [
         ("PUSH_DATABASE_URL", auth_database_url.as_str()),
         ("PUSH_REDIS_URL", redis_url.as_str()),
         ("PUSH_AUTH_PUBLIC_URL", "http://push.local"),
         ("PUSH_AUTH_TOKEN_AUDIENCE", socket_url.as_str()),
-        // base64 of 32 bytes of 0x07 and of 0x09.
-        (
-            "PUSH_AUTH_SIGNING_KEY",
-            "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=",
-        ),
+        ("PUSH_AUTH_SIGNING_KEY", signing_key),
+        // base64 of 32 bytes of 0x09.
         (
             "PUSH_AUTH_LINK_KEY",
             "CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk=",
@@ -113,6 +115,7 @@ async fn the_smoke_test_passes_against_the_whole_stack() {
             store: StoreOptions::default(),
             accounts_token: Some(accounts_token.clone()),
             directory_token: Some(directory_token.to_owned()),
+            messaging_token: Some(messaging_token.to_owned()),
         },
         grpc,
         message_svc_health,
@@ -124,6 +127,7 @@ async fn the_smoke_test_passes_against_the_whole_stack() {
     let gateway = tokio::spawn(push_gateway::serve(
         push_gateway::Config {
             message_svc_url: message_svc_url.clone(),
+            messaging_token: messaging_token.to_owned(),
             redis_url: redis_url.clone(),
             auth_url: auth_url.clone(),
             token_audience: socket_url.clone(),
@@ -173,10 +177,9 @@ async fn the_smoke_test_passes_against_the_whole_stack() {
     let target = Target {
         mailbox_url: worker_url,
         auth_url,
-        message_svc_url,
-        redis_url: redis_url_for_smoke,
         socket_url,
         host: None,
+        signing_key: signing_key.to_owned(),
     };
     tokio::time::timeout(Duration::from_secs(180), run(&target))
         .await

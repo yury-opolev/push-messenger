@@ -2166,16 +2166,15 @@ name = "push-smoke"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "futures-util",
  "jsonwebtoken",
- "prost 0.14.4",
  "push-auth",
  "push-gateway",
  "push-message-svc",
  "push-proto",
  "push-store",
  "push-worker",
- "redis",
  "reqwest",
  "serde",
  "serde_json",
@@ -2184,7 +2183,6 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "tokio-util",
- "tonic 0.14.5",
  "uuid",
 ]
 

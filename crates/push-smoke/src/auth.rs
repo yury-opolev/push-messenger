@@ -82,7 +82,7 @@ impl<'a> Auth<'a> {
 
     /// The `aud` the gateway expects: the socket URL, with the authority of the `Host`
     /// override when there is one.
-    fn expected_audience(&self) -> String {
+    pub fn expected_audience(&self) -> String {
         audience(&self.target.socket_url, self.target.host.as_deref())
     }
 

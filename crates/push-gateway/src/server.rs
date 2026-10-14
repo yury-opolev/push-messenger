@@ -25,6 +25,9 @@ use tokio::net::TcpListener;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
+use tonic::metadata::{Ascii, MetadataValue};
+use tonic::service::Interceptor;
+use tonic::service::interceptor::InterceptedService;
 use tonic::transport::{Channel, Endpoint};
 use uuid::Uuid;
 
@@ -58,10 +61,30 @@ const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 /// is lost or a notification was (spec §12, test 4).
 const SWEEP_INTERVAL: Duration = Duration::from_secs(300);
 
+/// message-svc's `Messaging` API, every call carrying the gateway's internal token.
+type MessagingApi = MessagingClient<InterceptedService<Channel, BearerToken>>;
+
+/// Puts `authorization: Bearer <token>` on every call. message-svc compares it in
+/// constant time and refuses `Messaging` calls without it: they act as any user.
+#[derive(Clone)]
+struct BearerToken(MetadataValue<Ascii>);
+
+impl Interceptor for BearerToken {
+    fn call(
+        &mut self,
+        mut request: tonic::Request<()>,
+    ) -> Result<tonic::Request<()>, tonic::Status> {
+        request
+            .metadata_mut()
+            .insert("authorization", self.0.clone());
+        Ok(request)
+    }
+}
+
 #[derive(Clone)]
 struct App {
     config: Arc<Config>,
-    messaging: MessagingClient<Channel>,
+    messaging: MessagingApi,
     verifier: Verifier,
     hub: Hub,
     /// Publishes takeovers on `kick:{device_id}`.
@@ -92,7 +115,11 @@ pub async fn serve(
         .keep_alive_timeout(Duration::from_secs(10))
         .keep_alive_while_idle(true)
         .tcp_keepalive(Some(Duration::from_secs(60)));
-    let messaging = MessagingClient::new(endpoint.connect_lazy());
+    let mut bearer: MetadataValue<Ascii> = format!("Bearer {}", config.messaging_token)
+        .parse()
+        .map_err(|_| anyhow::anyhow!("PUSH_MESSAGING_TOKEN is not fit for a header"))?;
+    bearer.set_sensitive(true);
+    let messaging = MessagingClient::with_interceptor(endpoint.connect_lazy(), BearerToken(bearer));
     // The error is not passed on: the URL carries the Redis password.
     let redis = redis::Client::open(config.redis_url.as_str())
         .map_err(|_| anyhow::anyhow!("PUSH_REDIS_URL is not a valid Redis URL"))?;
@@ -576,7 +603,7 @@ impl Refusal {
 
 /// Asks message-svc whether the device of a valid token may connect: it is active and the
 /// user's, and the token is newer than the user's last password reset.
-async fn admit(messaging: &mut MessagingClient<Channel>, claims: &Claims) -> Result<(), Refusal> {
+async fn admit(messaging: &mut MessagingApi, claims: &Claims) -> Result<(), Refusal> {
     let request = IdentifyRequest {
         user_id: id_bytes(claims.user),
         device_id: id_bytes(claims.device),
@@ -650,7 +677,7 @@ fn unix_now() -> i64 {
 struct Connected {
     socket: WebSocket,
     session: Session,
-    messaging: MessagingClient<Channel>,
+    messaging: MessagingApi,
     verifier: Verifier,
     limits: Limits,
     ip: IpAddr,
