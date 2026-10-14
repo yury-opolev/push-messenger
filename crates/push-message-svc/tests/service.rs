@@ -1,6 +1,7 @@
 //! The whole service on real Postgres and Redis (Docker must be running): readiness, the
-//! dev setup calls, the worker's account events (a revocation kicks the device on Redis),
-//! a send that rings the recipient's Redis channel, sync, ack, and graceful shutdown.
+//! worker's account events (a revocation kicks the device on Redis), a send that rings the
+//! recipient's Redis channel, sync, ack, the client's requests, auth-svc's Directory, and
+//! graceful shutdown.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -8,17 +9,16 @@ use std::time::Duration;
 use prost::Message;
 use push_message_svc::{Config, serve};
 use push_proto::internal::v1::accounts_client::AccountsClient;
-use push_proto::internal::v1::dev_setup_client::DevSetupClient;
 use push_proto::internal::v1::directory_client::DirectoryClient;
 use push_proto::internal::v1::messaging_client::MessagingClient;
 use push_proto::internal::v1::{
-    AccountDevice, AckRequest, EditRequest, IdentifyRequest, Kick, KickReason, MakeContactsRequest,
-    Notification, OpenDirectRequest, ReadUpToRequest, RegisterDeviceRequest, RegisterUserRequest,
-    RequestCall, SendRequest, SyncRequest, VisibleUsersRequest, notification::Kind,
+    AccountDevice, AckRequest, EditRequest, IdentifyRequest, Kick, KickReason, Notification,
+    ReadUpToRequest, RequestCall, SendRequest, SyncRequest, VisibleUsersRequest,
+    notification::Kind,
 };
 use push_proto::v1::{
     self, Ack, ContactAccept, ContactRequest, ContentType, CreateGroup, CreateInvite, Edit,
-    FetchHistory, GroupReceipts, ListConversations, ReadUpTo, RedeemInvite, Send,
+    FetchHistory, GroupReceipts, ListConversations, OpenDirect, ReadUpTo, RedeemInvite, Send,
     conversation_summary, edit, request, response,
 };
 use push_proto::{id_bytes, kick_channel, notify_channel};
@@ -55,7 +55,7 @@ struct Running {
 }
 
 /// Starts Postgres, Redis and the service on free local ports.
-async fn start(dev_setup: bool) -> Running {
+async fn start() -> Running {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
     let postgres = Postgres::default()
         .with_tag("17-alpine")
@@ -85,7 +85,6 @@ async fn start(dev_setup: bool) -> Running {
         store: StoreOptions::default(),
         accounts_token: Some(ACCOUNTS_TOKEN.to_owned()),
         directory_token: Some(DIRECTORY_TOKEN.to_owned()),
-        dev_setup,
     };
     let shutdown = CancellationToken::new();
     let server = tokio::spawn(serve(
@@ -130,7 +129,6 @@ async fn shutdown_is_honoured_while_the_database_is_unreachable() {
         store: StoreOptions::default(),
         accounts_token: None,
         directory_token: None,
-        dev_setup: false,
     };
     let shutdown = CancellationToken::new();
     let server = tokio::spawn(serve(config, grpc, health, shutdown.clone()));
@@ -166,7 +164,7 @@ async fn get(addr: SocketAddr, path: &str) -> (u16, String) {
 
 #[tokio::test]
 async fn a_message_goes_from_send_to_ack_and_rings_the_recipient() {
-    let running = start(true).await;
+    let running = start().await;
     assert_eq!(
         get(running.health, "/healthz").await,
         (200, "ok".to_owned())
@@ -177,41 +175,35 @@ async fn a_message_goes_from_send_to_ack_and_rings_the_recipient() {
     );
 
     let url = format!("http://{}", running.grpc);
-    let mut setup = DevSetupClient::connect(url.clone()).await.unwrap();
+    let mut accounts = accounts_client(url.clone()).await;
     let mut messaging = MessagingClient::connect(url).await.unwrap();
     let (alice, bob) = (Uuid::now_v7(), Uuid::now_v7());
     let (alice_device, bob_device) = (Uuid::now_v7(), Uuid::now_v7());
     for (user, device) in [(alice, alice_device), (bob, bob_device)] {
-        setup
-            .register_user(RegisterUserRequest {
-                user_id: id_bytes(user),
-            })
-            .await
-            .unwrap();
-        setup
-            .register_device(RegisterDeviceRequest {
+        accounts
+            .device_registered(AccountDevice {
                 user_id: id_bytes(user),
                 device_id: id_bytes(device),
             })
             .await
             .unwrap();
     }
-    setup
-        .make_contacts(MakeContactsRequest {
-            user_id: id_bytes(alice),
-            peer_id: id_bytes(bob),
-        })
-        .await
-        .unwrap();
-    let conversation = setup
-        .open_direct(OpenDirectRequest {
-            user_id: id_bytes(alice),
-            peer_id: id_bytes(bob),
-        })
-        .await
-        .unwrap()
-        .into_inner()
-        .conversation_id;
+    let ask = request::Body::ContactRequest(ContactRequest {
+        user_id: id_bytes(bob),
+    });
+    messaging.request(call(alice, ask)).await.unwrap();
+    let accept = request::Body::ContactAccept(ContactAccept {
+        user_id: id_bytes(alice),
+    });
+    messaging.request(call(bob, accept)).await.unwrap();
+    let open = request::Body::OpenDirect(OpenDirect {
+        peer_user_id: id_bytes(bob),
+    });
+    let opened = messaging.request(call(alice, open)).await.unwrap();
+    let Some(response::Body::DirectOpened(opened)) = opened.into_inner().body else {
+        panic!("not an opened conversation");
+    };
+    let conversation = opened.conversation_id;
 
     let mut bell = redis::Client::open(running.redis_url.as_str())
         .unwrap()
@@ -276,15 +268,15 @@ async fn a_message_goes_from_send_to_ack_and_rings_the_recipient() {
 }
 
 #[tokio::test]
-async fn accounts_are_served_and_dev_setup_is_absent_unless_enabled() {
-    let running = start(false).await;
+async fn accounts_are_served_only_with_the_workers_token() {
+    let running = start().await;
     let url = format!("http://{}", running.grpc);
     let channel = Channel::from_shared(url.clone())
         .unwrap()
         .connect()
         .await
         .unwrap();
-    let mut messaging = MessagingClient::connect(url.clone()).await.unwrap();
+    let mut messaging = MessagingClient::connect(url).await.unwrap();
     let (user, device) = (Uuid::now_v7(), Uuid::now_v7());
     let event = AccountDevice {
         user_id: id_bytes(user),
@@ -329,15 +321,6 @@ async fn accounts_are_served_and_dev_setup_is_absent_unless_enabled() {
     assert_eq!(kick.reason(), KickReason::DeviceRevoked);
     let status = messaging.identify(identify).await.unwrap_err();
     assert_eq!(status.code(), tonic::Code::PermissionDenied);
-
-    let mut setup = DevSetupClient::connect(url).await.unwrap();
-    let status = setup
-        .register_user(RegisterUserRequest {
-            user_id: id_bytes(Uuid::now_v7()),
-        })
-        .await
-        .unwrap_err();
-    assert_eq!(status.code(), tonic::Code::Unimplemented);
     running.shutdown.cancel();
     running.server.await.unwrap().unwrap();
 }
@@ -369,7 +352,7 @@ fn call(user: Uuid, body: request::Body) -> RequestCall {
 
 #[tokio::test]
 async fn the_client_requests_and_the_directory_run_on_postgres() {
-    let running = start(false).await;
+    let running = start().await;
     let url = format!("http://{}", running.grpc);
     let mut accounts = accounts_client(url.clone()).await;
     let mut messaging = MessagingClient::connect(url).await.unwrap();

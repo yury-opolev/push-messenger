@@ -13,8 +13,6 @@ mod requests;
 mod server;
 
 pub use config::{Config, ConfigError};
-pub use grpc::{
-    AccountsApi, DevSetupApi, DirectoryApi, InternalToken, MAX_VISIBLE_USERS, MessagingApi,
-};
+pub use grpc::{AccountsApi, DirectoryApi, InternalToken, MAX_VISIBLE_USERS, MessagingApi};
 pub use notify::RedisNotifier;
 pub use server::{init_logging, serve, terminated};

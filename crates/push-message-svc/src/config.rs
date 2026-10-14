@@ -15,7 +15,6 @@ use push_store::{StoreOptions, check_database_url};
 /// | `PUSH_DB_MAX_CONNECTIONS` | pool size, at least 1 | `10` |
 /// | `PUSH_ACCOUNTS_TOKEN` | the worker's token for the `Accounts` API, 32 to 256 visible ASCII characters; without it `Accounts` refuses every call | none |
 /// | `PUSH_DIRECTORY_TOKEN` | auth-svc's token for the `Directory` API, 32 to 256 visible ASCII characters and different from `PUSH_ACCOUNTS_TOKEN`; without it `Directory` refuses every call | none |
-/// | `PUSH_DEV_SETUP` | `1` registers the DEV ONLY `DevSetup` service | off |
 #[derive(Clone, PartialEq, Eq)]
 pub struct Config {
     pub database_url: String,
@@ -25,7 +24,6 @@ pub struct Config {
     pub store: StoreOptions,
     pub accounts_token: Option<String>,
     pub directory_token: Option<String>,
-    pub dev_setup: bool,
 }
 
 impl std::fmt::Debug for Config {
@@ -45,7 +43,6 @@ impl std::fmt::Debug for Config {
                 "directory_token",
                 &self.directory_token.as_ref().map(|_| "<redacted>"),
             )
-            .field("dev_setup", &self.dev_setup)
             .finish()
     }
 }
@@ -111,7 +108,6 @@ impl Config {
             store,
             accounts_token,
             directory_token,
-            dev_setup: dev_flag(&lookup, "PUSH_DEV_SETUP")?,
         })
     }
 }
@@ -166,23 +162,6 @@ where
     }
 }
 
-/// A DEV ONLY switch: on only for exactly `1`; off when unset, empty or `0`. Anything
-/// else (`true`, `yes`) is refused, so a typo can never switch it on or leave it in doubt.
-fn dev_flag(
-    lookup: &impl Fn(&str) -> Option<String>,
-    name: &'static str,
-) -> Result<bool, ConfigError> {
-    match lookup(name).as_deref() {
-        None | Some("") | Some("0") => Ok(false),
-        Some("1") => Ok(true),
-        Some(other) => Err(ConfigError::Invalid {
-            name,
-            value: other.to_owned(),
-            reason: "use 1 to enable or 0 to disable".to_owned(),
-        }),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -218,7 +197,6 @@ mod tests {
         assert_eq!(config.store, StoreOptions::default());
         assert_eq!(config.accounts_token, None);
         assert_eq!(config.directory_token, None);
-        assert!(!config.dev_setup);
     }
 
     #[test]
@@ -285,29 +263,6 @@ mod tests {
         assert_eq!(config.grpc_addr, "127.0.0.1:6000".parse().unwrap());
         assert_eq!(config.health_addr, "127.0.0.1:6001".parse().unwrap());
         assert_eq!(config.store.max_connections, 3);
-    }
-
-    #[test]
-    fn dev_setup_is_on_only_for_exactly_1() {
-        for (value, expected) in [("1", true), ("0", false), ("", false)] {
-            let mut variables = REQUIRED.to_vec();
-            variables.push(("PUSH_DEV_SETUP", value));
-            assert_eq!(config(&variables).unwrap().dev_setup, expected, "{value:?}");
-        }
-        for value in ["true", "yes", " 1"] {
-            let mut variables = REQUIRED.to_vec();
-            variables.push(("PUSH_DEV_SETUP", value));
-            assert!(
-                matches!(
-                    config(&variables),
-                    Err(ConfigError::Invalid {
-                        name: "PUSH_DEV_SETUP",
-                        ..
-                    })
-                ),
-                "{value:?}"
-            );
-        }
     }
 
     #[test]

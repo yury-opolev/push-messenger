@@ -42,17 +42,6 @@ service Messaging {
   rpc Request(RequestCall) returns (push.v1.Response);
 }
 
-// DEV ONLY: setup calls for local clusters and the smoke test, registered only by a
-// message-svc started with PUSH_DEV_SETUP=1. Plans 5-7 replace them with auth-svc events
-// and the real contact and conversation requests.
-service DevSetup {
-  rpc RegisterUser(RegisterUserRequest) returns (RegisterUserResponse);
-  rpc RegisterDevice(RegisterDeviceRequest) returns (RegisterDeviceResponse);
-  // Makes two users accepted contacts: a request from `user_id`, accepted by `peer_id`.
-  rpc MakeContacts(MakeContactsRequest) returns (MakeContactsResponse);
-  rpc OpenDirect(OpenDirectRequest) returns (OpenDirectResponse);
-}
-
 // auth-svc's user and device events, relayed by the worker from auth-svc's outbox
 // (spec §2, §5.3). Delivery is at least once and in no particular order, so every call is
 // idempotent and any order of calls ends in the same state. A device id that belongs to
@@ -206,35 +195,6 @@ enum KickReason {
   KICK_REASON_DEVICE_REVOKED = 1;
   // The user's password was reset: the client signs in again (close code 4001).
   KICK_REASON_PASSWORD_RESET = 2;
-}
-
-message RegisterUserRequest {
-  bytes user_id = 1;
-}
-
-message RegisterUserResponse {}
-
-message RegisterDeviceRequest {
-  bytes user_id = 1;
-  bytes device_id = 2;
-}
-
-message RegisterDeviceResponse {}
-
-message MakeContactsRequest {
-  bytes user_id = 1;
-  bytes peer_id = 2;
-}
-
-message MakeContactsResponse {}
-
-message OpenDirectRequest {
-  bytes user_id = 1;
-  bytes peer_id = 2;
-}
-
-message OpenDirectResponse {
-  bytes conversation_id = 1;
 }
 
 message AccountUser {

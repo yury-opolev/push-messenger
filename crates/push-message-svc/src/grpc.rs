@@ -1,20 +1,18 @@
-//! The gRPC services: `Messaging` for the gateway, `Accounts` for the worker, `Directory`
-//! for auth-svc and the DEV ONLY `DevSetup`.
+//! The gRPC services: `Messaging` for the gateway, `Accounts` for the worker and
+//! `Directory` for auth-svc.
 
 use std::sync::Arc;
 
 use push_domain::{
-    ClientMsgId, Clock, ContactState, ConversationId, DeviceId, MAX_SYNC_BATCH, Messaging,
-    Notifier, SendText, Store, UserId,
+    ClientMsgId, Clock, ConversationId, DeviceId, MAX_SYNC_BATCH, Messaging, Notifier, SendText,
+    Store, UserId,
 };
 use push_proto::id_bytes;
 use push_proto::internal::v1::{
     AccountDevice, AccountUser, AccountsResponse, AckRequest, AckResponse, DeleteRequest,
-    EditRequest, IdentifyRequest, IdentifyResponse, MakeContactsRequest, MakeContactsResponse,
-    OpenDirectRequest, OpenDirectResponse, ReadUpToRequest, ReadUpToResponse,
-    RegisterDeviceRequest, RegisterDeviceResponse, RegisterUserRequest, RegisterUserResponse,
-    RequestCall, SendRequest, SyncRequest, SyncResponse, VisibleUsersRequest, VisibleUsersResponse,
-    accounts_server, dev_setup_server, directory_server, messaging_server,
+    EditRequest, IdentifyRequest, IdentifyResponse, ReadUpToRequest, ReadUpToResponse, RequestCall,
+    SendRequest, SyncRequest, SyncResponse, VisibleUsersRequest, VisibleUsersResponse,
+    accounts_server, directory_server, messaging_server,
 };
 use push_proto::v1::{ContentType, SendAck};
 use tonic::service::Interceptor;
@@ -336,98 +334,15 @@ fn same(presented: &[u8], expected: &[u8]) -> bool {
             == 0
 }
 
-/// DEV ONLY: sets up users, devices, contacts and direct conversations without auth-svc.
-/// `serve` registers it only when the configuration enables it (`PUSH_DEV_SETUP=1`).
-pub struct DevSetupApi<S, C, N> {
-    messaging: Arc<Messaging<S, C, N>>,
-}
-
-impl<S, C, N> DevSetupApi<S, C, N> {
-    pub fn new(messaging: Arc<Messaging<S, C, N>>) -> Self {
-        Self { messaging }
-    }
-}
-
-#[tonic::async_trait]
-impl<S, C, N> dev_setup_server::DevSetup for DevSetupApi<S, C, N>
-where
-    S: Store + 'static,
-    C: Clock + 'static,
-    N: Notifier + 'static,
-{
-    async fn register_user(
-        &self,
-        request: Request<RegisterUserRequest>,
-    ) -> Result<Response<RegisterUserResponse>, Status> {
-        let user = parse_id(&request.into_inner().user_id, "user_id", UserId)?;
-        self.messaging
-            .register_user(user)
-            .await
-            .map_err(domain_error)?;
-        Ok(Response::new(RegisterUserResponse {}))
-    }
-
-    async fn register_device(
-        &self,
-        request: Request<RegisterDeviceRequest>,
-    ) -> Result<Response<RegisterDeviceResponse>, Status> {
-        let request = request.into_inner();
-        let user = parse_id(&request.user_id, "user_id", UserId)?;
-        let device = parse_id(&request.device_id, "device_id", DeviceId)?;
-        self.messaging
-            .register_device(device, user)
-            .await
-            .map_err(domain_error)?;
-        Ok(Response::new(RegisterDeviceResponse {}))
-    }
-
-    async fn make_contacts(
-        &self,
-        request: Request<MakeContactsRequest>,
-    ) -> Result<Response<MakeContactsResponse>, Status> {
-        let request = request.into_inner();
-        let user = parse_id(&request.user_id, "user_id", UserId)?;
-        let peer = parse_id(&request.peer_id, "peer_id", UserId)?;
-        let state = self
-            .messaging
-            .contact_request(user, peer)
-            .await
-            .map_err(domain_error)?;
-        if state != ContactState::Accepted {
-            self.messaging
-                .contact_accept(peer, user)
-                .await
-                .map_err(domain_error)?;
-        }
-        Ok(Response::new(MakeContactsResponse {}))
-    }
-
-    async fn open_direct(
-        &self,
-        request: Request<OpenDirectRequest>,
-    ) -> Result<Response<OpenDirectResponse>, Status> {
-        let request = request.into_inner();
-        let user = parse_id(&request.user_id, "user_id", UserId)?;
-        let peer = parse_id(&request.peer_id, "peer_id", UserId)?;
-        let conversation = self
-            .messaging
-            .open_direct(user, peer)
-            .await
-            .map_err(domain_error)?;
-        Ok(Response::new(OpenDirectResponse {
-            conversation_id: id_bytes(conversation.0),
-        }))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use push_domain::{Event, InMemoryStore, KickReason, RecordingNotifier, SystemClock};
     use push_proto::internal::v1::accounts_server::Accounts as AccountsRpc;
-    use push_proto::internal::v1::dev_setup_server::DevSetup;
     use push_proto::internal::v1::directory_server::Directory as DirectoryRpc;
     use push_proto::internal::v1::messaging_server::Messaging as MessagingRpc;
-    use push_proto::v1::{Ack, ErrorCode, Send};
+    use push_proto::v1::{
+        Ack, ContactAccept, ContactRequest, ErrorCode, OpenDirect, Send, request, response,
+    };
     use push_proto::{error_from_status, id};
     use tonic::Code;
 
@@ -435,13 +350,11 @@ mod tests {
 
     type Api = MessagingApi<InMemoryStore, SystemClock, Arc<RecordingNotifier>>;
     type Accounts = AccountsApi<InMemoryStore, SystemClock, Arc<RecordingNotifier>>;
-    type Setup = DevSetupApi<InMemoryStore, SystemClock, Arc<RecordingNotifier>>;
     type Directory = DirectoryApi<InMemoryStore, SystemClock, Arc<RecordingNotifier>>;
 
     struct World {
         api: Api,
         accounts: Accounts,
-        setup: Setup,
         directory: Directory,
         notifier: Arc<RecordingNotifier>,
     }
@@ -456,7 +369,6 @@ mod tests {
         World {
             api: MessagingApi::new(Arc::clone(&messaging)),
             accounts: AccountsApi::new(Arc::clone(&messaging)),
-            setup: DevSetupApi::new(Arc::clone(&messaging)),
             directory: DirectoryApi::new(messaging),
             notifier,
         }
@@ -468,49 +380,47 @@ mod tests {
         device: DeviceId,
     }
 
+    /// A user with one device, relayed as the worker relays them.
     async fn person(world: &World) -> Person {
         let person = Person {
             user: UserId::new(),
             device: DeviceId::new(),
         };
         world
-            .setup
-            .register_user(Request::new(RegisterUserRequest {
-                user_id: id_bytes(person.user.0),
-            }))
-            .await
-            .unwrap();
-        world
-            .setup
-            .register_device(Request::new(RegisterDeviceRequest {
-                user_id: id_bytes(person.user.0),
-                device_id: id_bytes(person.device.0),
-            }))
+            .accounts
+            .device_registered(account_device(person.user, person.device))
             .await
             .unwrap();
         person
     }
 
-    /// Alice and Bob as contacts with a direct conversation.
+    /// Alice and Bob as contacts with a direct conversation, through request frames.
     async fn chat(world: &World) -> (Person, Person, ConversationId) {
         let (alice, bob) = (person(world).await, person(world).await);
-        world
-            .setup
-            .make_contacts(Request::new(MakeContactsRequest {
-                user_id: id_bytes(alice.user.0),
-                peer_id: id_bytes(bob.user.0),
-            }))
-            .await
-            .unwrap();
-        let opened = world
-            .setup
-            .open_direct(Request::new(OpenDirectRequest {
-                user_id: id_bytes(alice.user.0),
-                peer_id: id_bytes(bob.user.0),
-            }))
-            .await
-            .unwrap()
-            .into_inner();
+        let call = |from: &Person, body: request::Body| {
+            Request::new(RequestCall {
+                user_id: id_bytes(from.user.0),
+                request: Some(push_proto::v1::Request {
+                    request_id: 1,
+                    body: Some(body),
+                }),
+            })
+        };
+        let ask = request::Body::ContactRequest(ContactRequest {
+            user_id: id_bytes(bob.user.0),
+        });
+        world.api.request(call(&alice, ask)).await.unwrap();
+        let accept = request::Body::ContactAccept(ContactAccept {
+            user_id: id_bytes(alice.user.0),
+        });
+        world.api.request(call(&bob, accept)).await.unwrap();
+        let open = request::Body::OpenDirect(OpenDirect {
+            peer_user_id: id_bytes(bob.user.0),
+        });
+        let opened = world.api.request(call(&alice, open)).await.unwrap();
+        let Some(response::Body::DirectOpened(opened)) = opened.into_inner().body else {
+            panic!("not an opened conversation");
+        };
         let conversation = ConversationId(id(&opened.conversation_id).unwrap());
         (alice, bob, conversation)
     }

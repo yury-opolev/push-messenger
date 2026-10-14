@@ -113,7 +113,6 @@ async fn the_smoke_test_passes_against_the_whole_stack() {
             store: StoreOptions::default(),
             accounts_token: Some(accounts_token.clone()),
             directory_token: Some(directory_token.to_owned()),
-            dev_setup: false,
         },
         grpc,
         message_svc_health,

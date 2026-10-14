@@ -10,7 +10,6 @@ use axum::http::StatusCode;
 use axum::routing::get;
 use push_domain::{Messaging, SystemClock};
 use push_proto::internal::v1::accounts_server::AccountsServer;
-use push_proto::internal::v1::dev_setup_server::DevSetupServer;
 use push_proto::internal::v1::directory_server::DirectoryServer;
 use push_proto::internal::v1::messaging_server::MessagingServer;
 use push_store::{PgStore, migrate_database};
@@ -19,7 +18,7 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
-use crate::grpc::{AccountsApi, DevSetupApi, DirectoryApi, InternalToken, MessagingApi};
+use crate::grpc::{AccountsApi, DirectoryApi, InternalToken, MessagingApi};
 use crate::notify::RedisNotifier;
 
 /// How long to wait before trying an unreachable dependency again.
@@ -48,13 +47,6 @@ pub async fn serve(
             .into_future(),
     );
 
-    if config.dev_setup {
-        tracing::warn!(
-            "DEV ONLY: PUSH_DEV_SETUP=1 registers the DevSetup service, which creates users, \
-             devices, contacts and conversations without authentication. Never enable it \
-             outside a local cluster."
-        );
-    }
     if config.accounts_token.is_none() {
         tracing::warn!(
             "PUSH_ACCOUNTS_TOKEN is not set: the Accounts API refuses every call, so the \
@@ -93,9 +85,7 @@ pub async fn serve(
     // listening (the caller binds it, as `main` does), so a client that connects as soon as
     // /readyz answers waits in the listen backlog until the server accepts, a moment later.
     let messaging = Arc::new(Messaging::new(store.clone(), SystemClock, notifier));
-    let dev_setup = config
-        .dev_setup
-        .then(|| DevSetupServer::new(DevSetupApi::new(Arc::clone(&messaging))));
+
     tracing::info!(addr = %config.grpc_addr, "serving gRPC");
     let result = tonic::transport::Server::builder()
         .add_service(MessagingServer::new(MessagingApi::new(Arc::clone(
@@ -109,7 +99,6 @@ pub async fn serve(
             DirectoryApi::new(messaging),
             InternalToken::directory(config.directory_token.clone()),
         ))
-        .add_optional_service(dev_setup)
         .serve_with_incoming_shutdown(
             TcpListenerStream::new(grpc),
             shutdown.clone().cancelled_owned(),
