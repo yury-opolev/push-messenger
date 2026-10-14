@@ -62,8 +62,12 @@ spec:
                 secretKeyRef:
                   name: {{ include "push.secretName" . }}
                   key: accounts-token
-            - name: PUSH_DEV_SETUP
-              value: {{ include "push.devFlag" . | quote }}
+            # Only auth-svc has this one: the Directory API refuses calls without it.
+            - name: PUSH_DIRECTORY_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "push.secretName" . }}
+                  key: directory-token
           ports:
             - name: grpc
               containerPort: 50051

@@ -6,18 +6,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use push_domain::{InMemoryStore, MAX_SYNC_BATCH, Messaging, SystemClock};
+use push_domain::{DeviceId, InMemoryStore, MAX_SYNC_BATCH, Messaging, SystemClock, UserId};
 use push_gateway::{Config, serve};
-use push_message_svc::{DevSetupApi, MessagingApi, RedisNotifier};
-use push_proto::internal::v1::dev_setup_client::DevSetupClient;
-use push_proto::internal::v1::dev_setup_server::DevSetupServer;
+use push_message_svc::{MessagingApi, RedisNotifier};
 use push_proto::internal::v1::messaging_client::MessagingClient;
 use push_proto::internal::v1::messaging_server::{self, MessagingServer};
 use push_proto::internal::v1::{
     AckRequest, AckResponse, DeleteRequest, EditRequest, IdentifyRequest, IdentifyResponse,
-    MakeContactsRequest, OpenDirectRequest, ReadUpToRequest, ReadUpToResponse,
-    RegisterDeviceRequest, RegisterUserRequest, RequestCall, SendRequest, SyncRequest,
-    SyncResponse,
+    ReadUpToRequest, ReadUpToResponse, RequestCall, SendRequest, SyncRequest, SyncResponse,
 };
 use push_proto::v1::frame::Body;
 use push_proto::v1::{Ack, ContentType, Identify, Ping, Pong, Send, SendAck};
@@ -99,6 +95,8 @@ impl messaging_server::Messaging for FlakySync {
 
 struct Stack {
     _redis: ContainerAsync<Redis>,
+    /// message-svc's domain, to set up users, contacts and conversations directly.
+    messaging: Arc<Messaging<InMemoryStore, SystemClock, RedisNotifier>>,
     message_svc: String,
     gateway: SocketAddr,
     shutdown: CancellationToken,
@@ -136,7 +134,6 @@ async fn stack_with(dev_auth: bool, sync_failures: u32) -> Stack {
                 api: MessagingApi::new(Arc::clone(&messaging)),
                 sync_failures: Mutex::new(sync_failures),
             }))
-            .add_service(DevSetupServer::new(DevSetupApi::new(messaging)))
             .serve_with_incoming(TcpListenerStream::new(grpc)),
     );
 
@@ -155,6 +152,7 @@ async fn stack_with(dev_auth: bool, sync_failures: u32) -> Stack {
     let server = tokio::spawn(serve(config, listener, health, shutdown.clone()));
     Stack {
         _redis: redis,
+        messaging,
         message_svc,
         gateway,
         shutdown,
@@ -162,26 +160,24 @@ async fn stack_with(dev_auth: bool, sync_failures: u32) -> Stack {
     }
 }
 
-/// A user with one device, registered through the dev setup API.
+/// A user with one device, relayed to message-svc as the worker relays them.
 async fn person(stack: &Stack) -> (Uuid, Uuid) {
-    let mut setup = DevSetupClient::connect(stack.message_svc.clone())
-        .await
-        .unwrap();
     let (user, device) = (Uuid::now_v7(), Uuid::now_v7());
-    setup
-        .register_user(RegisterUserRequest {
-            user_id: id_bytes(user),
-        })
-        .await
-        .unwrap();
-    setup
-        .register_device(RegisterDeviceRequest {
-            user_id: id_bytes(user),
-            device_id: id_bytes(device),
-        })
+    stack
+        .messaging
+        .device_registered(DeviceId(device), UserId(user))
         .await
         .unwrap();
     (user, device)
+}
+
+/// Makes two users contacts and opens their direct conversation.
+async fn direct_chat(stack: &Stack, alice: Uuid, bob: Uuid) -> Vec<u8> {
+    let (alice, bob) = (UserId(alice), UserId(bob));
+    stack.messaging.contact_request(alice, bob).await.unwrap();
+    stack.messaging.contact_accept(bob, alice).await.unwrap();
+    let conversation = stack.messaging.open_direct(alice, bob).await.unwrap();
+    id_bytes(conversation.0)
 }
 
 async fn connect(stack: &Stack) -> Socket {
@@ -241,25 +237,7 @@ async fn a_message_reaches_the_other_device_and_the_sender_gets_its_ack() {
     let stack = stack(true).await;
     let (alice, alice_device) = person(&stack).await;
     let (bob, bob_device) = person(&stack).await;
-    let mut setup = DevSetupClient::connect(stack.message_svc.clone())
-        .await
-        .unwrap();
-    setup
-        .make_contacts(MakeContactsRequest {
-            user_id: id_bytes(alice),
-            peer_id: id_bytes(bob),
-        })
-        .await
-        .unwrap();
-    let conversation = setup
-        .open_direct(OpenDirectRequest {
-            user_id: id_bytes(alice),
-            peer_id: id_bytes(bob),
-        })
-        .await
-        .unwrap()
-        .into_inner()
-        .conversation_id;
+    let conversation = direct_chat(&stack, alice, bob).await;
 
     let mut bob_socket = connect(&stack).await;
     send(&mut bob_socket, identify(bob, bob_device)).await;
@@ -371,25 +349,8 @@ async fn shutdown_closes_connections_with_4005() {
 async fn chat_with_backlog(stack: &Stack, count: u32) -> ((Uuid, Uuid), (Uuid, Uuid), Vec<u8>) {
     let (alice, alice_device) = person(stack).await;
     let (bob, bob_device) = person(stack).await;
-    let mut setup = DevSetupClient::connect(stack.message_svc.clone())
-        .await
-        .unwrap();
-    setup
-        .make_contacts(MakeContactsRequest {
-            user_id: id_bytes(alice),
-            peer_id: id_bytes(bob),
-        })
-        .await
-        .unwrap();
-    let conversation = setup
-        .open_direct(OpenDirectRequest {
-            user_id: id_bytes(alice),
-            peer_id: id_bytes(bob),
-        })
-        .await
-        .unwrap()
-        .into_inner()
-        .conversation_id;
+    let conversation = direct_chat(stack, alice, bob).await;
+
     let mut messaging = MessagingClient::connect(stack.message_svc.clone())
         .await
         .unwrap();

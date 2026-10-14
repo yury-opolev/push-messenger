@@ -884,13 +884,13 @@ Implementation notes (push-proto, Plan 4A):
   gateway subscribes to the channels of the users it holds and syncs their devices; it
   does not send an entry twice on one connection, so repeated syncs without acks are
   harmless.
-- **DEV ONLY identity, until real tokens (Plans 5 and 8).** A gateway started with
+- **DEV ONLY identity, until real tokens (Plan 8).** A gateway started with
   `PUSH_DEV_AUTH=1` accepts `Identify{dev_user_id, dev_device_id}` without a token;
-  otherwise `Identify` closes with 4001. message-svc started with `PUSH_DEV_SETUP=1`
-  serves the `DevSetup` gRPC service (register users and devices, make contacts, open a
-  direct conversation). Both variables accept only `1` or `0`, and both services log a
-  warning at start-up when enabled. When the dev fields are removed (Plan 8), their field
-  numbers (14, 15) and names are reserved.
+  otherwise `Identify` closes with 4001. The variable accepts only `1` or `0`, and the
+  gateway logs a warning at start-up when it is enabled. When the dev fields are removed
+  (Plan 8), their field numbers (14, 15) and names are reserved. message-svc's DEV ONLY
+  `DevSetup` service and `PUSH_DEV_SETUP` were removed in Plan 7B: users and devices come
+  from the worker's `Accounts` calls, contacts and conversations from the request frames.
 - **Start-up and runtime behaviour (message-svc).** It fails at start-up, without
   retrying, on an invalid database or Redis URL and on `PUSH_DB_MAX_CONNECTIONS=0`; error
   messages never echo URLs. Store timeouts must be between 1 ms and `i32::MAX` ms.
@@ -1095,6 +1095,10 @@ Implementation notes (local minikube, Plan 4B):
   Resend's API key and webhook secret when set. Its only Ingress routes `Exact`
   `/v1/webhooks/resend`; its DEV ONLY mailbox is not routed, and dev mode allows one worker
   only. It has a 5 s preStop sleep and a 30 s grace period.
+- Plan 7B: the Secret also holds `directory-token`, auth-svc's token for message-svc's
+  `Directory` API (generated and kept; auth-svc and message-svc read it, the worker and the
+  gateway do not), and auth-svc gets `PUSH_MESSAGE_SVC_URL`. `PUSH_DEV_SETUP` is gone.
+  The smoke Pod reads the Redis URL from the Secret (`PUSH_SMOKE_REDIS_URL`) to hear kicks.
 - The smoke client verifies the access token's audience (`socket_url` with its authority
   replaced by the Host override, `ws://push.local/v1/socket` on minikube) and the
   refreshed token's `sub` and `device_id`. It never prints response bodies, tokens or
@@ -1114,10 +1118,15 @@ Implementation notes (local minikube, Plan 4B):
 - `deploy/minikube/up.ps1` (and `up.sh`) wait for ingress-nginx, stop at once with
   "run down.ps1 first" when an existing PostgreSQL volume lacks the `push_auth` or
   `push_worker` database (or the kept Secret their passwords), retry
-  `helm upgrade --install` up to 5 times, and bring it up on minikube; `helm test` runs
-  `push-smoke` inside the cluster through the ingress controller: two users sign up, verify
-  with the emails the worker's log sender delivered to the DEV ONLY mailbox, register
-  devices, wait for the worker to relay them to message-svc, and chat. The Azure plan
+  `helm upgrade --install` up to 5 times, and bring it up on minikube; with `--smoke` they
+  then wait until the old worker pod is gone (exactly one worker pod remains, so the DEV
+  ONLY mailbox is the new worker's), and `helm test` runs
+  `push-smoke` inside the cluster through the ingress controller: three users sign up,
+  verify with the emails the worker's log sender delivered to the DEV ONLY mailbox,
+  register devices and wait for the worker to relay them to message-svc; they become
+  contacts by request and invite, see only allowed profiles, chat, edit, read, form a group
+  and delete over message-svc's API and the gateway, and a revoked device and a password
+  reset are kicked on Redis (Plan 7B). The Azure plan
   replaces the in-chart secrets with Key Vault and adds TLS, and may replace the in-chart
   PostgreSQL and Redis.
 

@@ -27,12 +27,16 @@ installed:
 
 starts (or reuses) the minikube profile `push`, enables its ingress addon, builds the
 images into the cluster, installs the chart (`deploy/helm/push-messenger`) with
-`values-minikube.yaml`, and runs the end-to-end smoke test: two users sign up, verify their
-email (the worker's log sender delivers it), register a device, wait for the worker to
-relay it to message-svc, and chat through the ingress; the DEV ONLY mailbox and the setup
-calls go to the services directly. `deploy/minikube/up.sh --smoke` does the same on Linux
-and macOS. Both wait for ingress-nginx and retry
-`helm upgrade --install` up to 5 times while its admission webhook comes up.
+`values-minikube.yaml`, and runs the end-to-end smoke test: three users sign up, verify
+their email (the worker's log sender delivers it), register a device and wait for the worker
+to relay it to message-svc; they become contacts by request and by invite, see only each
+other's allowed profiles, chat through the ingress, edit, read, form a group and delete,
+and finally a revoked device and a password reset are kicked on Redis. The DEV ONLY mailbox
+and the calls to message-svc's API (the gateway carries them from Plan 8) go to the
+services directly. `deploy/minikube/up.sh --smoke` does the same on Linux
+and macOS. Both wait for ingress-nginx, retry
+`helm upgrade --install` up to 5 times while its admission webhook comes up, and
+(with `--smoke`) wait until only one worker pod is left before the smoke test.
 `deploy/minikube/down.ps1` removes everything again: namespace, the
 Secret, the PostgreSQL volume and its data directory (`-Delete` deletes the profile).
 `helm uninstall` alone keeps the Secret (`helm.sh/resource-policy: keep`) and the volume,
@@ -40,9 +44,9 @@ so a later install reuses both and the passwords keep matching. Every pull reque
 verified this way before it is merged.
 
 The minikube values switch on DEV ONLY shortcuts: the gateway accepts any user and device
-id without a token (until it checks access tokens, Plan 8), message-svc serves a setup API
-for contacts and conversations (until Plan 7), and the worker, which logs emails instead of
-sending them, shows them at `/dev/mailbox`; none of these is routed by the ingress, which
+id without a token (until it checks access tokens, Plan 8), and the worker, which logs
+emails instead of sending them, shows them at `/dev/mailbox`; neither is routed by the
+ingress, which
 reaches the worker only at `/v1/webhooks/resend`. The chart refuses that mode unless the
 values also say `devMode.acknowledge: insecure-local-only` and the ingress host is local
 (`*.local`, `*.localhost` or `*.test`), and refuses it with the Resend sender.
@@ -51,8 +55,8 @@ values also say `devMode.acknowledge: insecure-local-only` and the ingress host 
 auth-svc and the worker have databases and roles of their own, `push_auth` and
 `push_worker`, which PostgreSQL's init scripts create when it initialises an empty volume;
 the worker's role may also drain auth-svc's outbox, which auth-svc grants at start-up.
-message-svc and the worker share a generated Accounts token from the same Secret, which
-the gateway does not get. A
+message-svc and the worker share a generated Accounts token from the same Secret, and
+message-svc and auth-svc a Directory token; the gateway gets neither. A
 cluster whose Postgres volume predates them (Plans 4B and 5B) lacks a database. `up` stops
 when the kept Secret `push-secrets` (it survives a plain `helm uninstall`) has no
 `auth-db-password` or `worker-db-password`, or when the running Postgres lacks `push_auth`
@@ -80,7 +84,6 @@ at start-up.
 | `PUSH_DB_MAX_CONNECTIONS` | pool size, at least 1 | `10` |
 | `PUSH_ACCOUNTS_TOKEN` | the worker's token for the `Accounts` API, 32 to 256 visible ASCII characters; without it `Accounts` refuses every call | none |
 | `PUSH_DIRECTORY_TOKEN` | auth-svc's token for the `Directory` API, 32 to 256 visible ASCII characters and different from `PUSH_ACCOUNTS_TOKEN`; without it `Directory` refuses every call | none |
-| `PUSH_DEV_SETUP` | `1` registers the DEV ONLY `DevSetup` service | off |
 
 `push-gateway`:
 

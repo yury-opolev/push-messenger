@@ -178,6 +178,26 @@ Write-Host "Smoke test: deploy/minikube/up.ps1 -Cluster $Cluster -SkipBuild -Smo
 Write-Host "Tear down:  deploy/minikube/down.ps1 -Cluster $Cluster"
 
 if ($Smoke) {
+    # The DEV ONLY mailbox is in the worker's memory. `helm upgrade --wait` returns once the new
+    # worker is ready, but the old pod can still claim and deliver the verification email into
+    # its own mailbox; wait until only the new one remains (terminating pods count).
+    $workerSelector = "app.kubernetes.io/name=worker,app.kubernetes.io/instance=$release"
+    Write-Host '==> wait for the old worker pod to go away' -ForegroundColor Cyan
+    $deadline = (Get-Date).AddSeconds(90)
+    while ($true) {
+        $workerPods = @(kubectl --context $Cluster -n $namespace get pods -l $workerSelector -o name)
+        Write-Host "worker pods: $($workerPods.Count) ($($workerPods -join ', '))"
+        if ($workerPods.Count -eq 1) {
+            break
+        }
+        if ((Get-Date) -gt $deadline) {
+            throw "timed out after 90 s: expected exactly one worker pod (found $($workerPods.Count))"
+        }
+        Start-Sleep -Seconds 2
+    }
+    Invoke-Step 'wait for the worker pod to be Ready' {
+        kubectl --context $Cluster -n $namespace wait --for=condition=Ready pod -l $workerSelector --timeout=90s
+    }
     Invoke-Step 'run the smoke test' {
         helm test $release --kube-context $Cluster --namespace $namespace --logs --timeout 5m
     }

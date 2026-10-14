@@ -158,20 +158,14 @@ where
     /// `UnknownDevice`.
     pub async fn identify(&self, device: DeviceId, user: UserId) -> DomainResult<()> {
         let mut tx = self.store.begin().await?;
-        let Some(owner) = tx.device_owner(device).await? else {
-            let known = tx.device_user(device).await?.is_some();
-            tx.rollback().await?;
-            return Err(if known {
-                DomainError::UnknownDevice
-            } else {
-                DomainError::DeviceNotKnownYet
-            });
-        };
+        // One statement: reading the owner and the revocation separately could straddle
+        // the worker's commit and refuse a device that is merely not relayed yet.
+        let state = tx.device_state(device).await?;
         tx.rollback().await?;
-        if owner == user {
-            Ok(())
-        } else {
-            Err(DomainError::UnknownDevice)
+        match state {
+            None => Err(DomainError::DeviceNotKnownYet),
+            Some((owner, is_active)) if owner == user && is_active => Ok(()),
+            Some(_) => Err(DomainError::UnknownDevice),
         }
     }
 }

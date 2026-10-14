@@ -2304,6 +2304,415 @@ git commit -m "test(smoke): edits, reads, a group, a delete and kicks end to end
 
 Expected: 808 tests pass, no warnings, no diff.
 
+- [ ] **Step 5: Review fixes (made after the first minikube run)**
+
+The review of this task changed the smoke test as follows; the replace blocks below are
+copied from the committed files and apply on top of Steps 1 to 3.
+
+- Bob's profile read asks for alice and carol and requires exactly alice, so carol's absence
+  means something.
+- The Redis subscribe has a 10 s deadline.
+- Bodies and invite codes are never printed: a `describe(&Deliver)` helper reports ids and
+  seqs only.
+- The delete check asserts `target_seq` and that seqs 2 and 3 are consecutive.
+- An unexpected kick fails the run, and the run is capped at 180 s.
+
+In `crates/push-smoke/src/lib.rs`:
+
+Replace
+
+```rust
+    };
+    // Listening before anything can kick them.
+    let mut kicks =
+        Kicks::subscribe(&target.redis_url, &[people.bob.device, people.carol.device]).await?;
+    let mut api = Messaging::new(channel.clone());
+    let conversation = connect(&mut api, &auth, &people).await?;
+```
+
+with
+
+```rust
+    };
+    // Listening before anything can kick them.
+    let mut kicks = tokio::time::timeout(
+        STEP_TIMEOUT,
+        Kicks::subscribe(&target.redis_url, &[people.bob.device, people.carol.device]),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("Redis: no answer within {STEP_TIMEOUT:?}"))??;
+    let mut api = Messaging::new(channel.clone());
+    let conversation = connect(&mut api, &auth, &people).await?;
+```
+
+Replace
+
+```rust
+    };
+    if asked != response::Body::Contact(pending) {
+        bail!("alice's contact request answered {asked:?}");
+    }
+    let accept = request::Body::ContactAccept(ContactAccept {
+```
+
+with
+
+```rust
+    };
+    if asked != response::Body::Contact(pending) {
+        bail!("alice's contact request was answered with something else");
+    }
+    let accept = request::Body::ContactAccept(ContactAccept {
+```
+
+Replace
+
+```rust
+    };
+    if redeemed != response::Body::InviteRedeemed(creator) {
+        bail!("carol's redeem answered {redeemed:?}");
+    }
+    step("carol redeemed alice's invite: they are contacts");
+```
+
+with
+
+```rust
+    };
+    if redeemed != response::Body::InviteRedeemed(creator) {
+        bail!("carol's redeem was answered with something else");
+    }
+    step("carol redeemed alice's invite: they are contacts");
+```
+
+Replace
+
+```rust
+        bail!("auth-svc showed alice the profiles of {seen:?}, not bob's and carol's");
+    }
+    if !auth
+        .profiles(&bob.access_token, &[carol.user])
+        .await?
+        .is_empty()
+    {
+        bail!("auth-svc showed bob carol's profile, though they share nothing");
+    }
+    step(
+```
+
+with
+
+```rust
+        bail!("auth-svc showed alice the profiles of {seen:?}, not bob's and carol's");
+    }
+    // Asking for alice too proves the endpoint answers bob at all.
+    if auth
+        .profiles(&bob.access_token, &[alice.user, carol.user])
+        .await?
+        != [alice.user]
+    {
+        bail!("auth-svc did not show bob exactly alice's profile; carol shares nothing with him");
+    }
+    step(
+```
+
+Replace
+
+```rust
+    let entry = delivered(bob_socket, conversation, ack.seq, "bob's Deliver").await?;
+    if entry.body.as_deref() != Some(text.as_bytes()) || entry.sender_id != id_bytes(alice.user) {
+        bail!("bob received the wrong message: {entry:?}");
+    }
+    step(&format!(
+```
+
+with
+
+```rust
+    let entry = delivered(bob_socket, conversation, ack.seq, "bob's Deliver").await?;
+    if entry.body.as_deref() != Some(text.as_bytes()) || entry.sender_id != id_bytes(alice.user) {
+        bail!("bob received the wrong message: {}", describe(&entry));
+    }
+    step(&format!(
+```
+
+Replace
+
+```rust
+        )
+        .await?;
+    let entry = delivered(bob_socket, conversation, edited.seq, "the edit").await?;
+    if entry.kind() != EntryKind::Edit || entry.target_seq != Some(sent.seq) {
+        bail!("bob's socket delivered {entry:?} instead of the edit");
+    }
+    step(&format!(
+```
+
+with
+
+```rust
+        )
+        .await?;
+    if edited.seq != sent.seq + 1 {
+        bail!("the edit got seq {}, not {}", edited.seq, sent.seq + 1);
+    }
+    let entry = delivered(bob_socket, conversation, edited.seq, "the edit").await?;
+    if entry.kind() != EntryKind::Edit || entry.target_seq != Some(sent.seq) {
+        bail!(
+            "bob's socket delivered {} instead of the edit",
+            describe(&entry)
+        );
+    }
+    step(&format!(
+```
+
+Replace
+
+```rust
+    let entry = delivered(bob_socket, &group.conversation_id, 1, "the group").await?;
+    if entry.kind() != EntryKind::System {
+        bail!("the group's first entry is {entry:?}, not a system entry");
+    }
+    if auth.profiles(&bob.access_token, &[carol.user]).await? != [carol.user] {
+```
+
+with
+
+```rust
+    let entry = delivered(bob_socket, &group.conversation_id, 1, "the group").await?;
+    if entry.kind() != EntryKind::System {
+        bail!(
+            "the group's first entry is {}, not a system entry",
+            describe(&entry)
+        );
+    }
+    if auth.profiles(&bob.access_token, &[carol.user]).await? != [carol.user] {
+```
+
+Replace
+
+```rust
+        .delete(alice.user, alice.device, conversation, client_msg_id)
+        .await?;
+    let entry = delivered(bob_socket, conversation, deleted.seq, "the delete").await?;
+    if entry.kind() != EntryKind::Delete {
+        bail!("bob's socket delivered {entry:?} instead of the delete");
+    }
+    let fetch = request::Body::FetchHistory(FetchHistory {
+```
+
+with
+
+```rust
+        .delete(alice.user, alice.device, conversation, client_msg_id)
+        .await?;
+    if deleted.seq != edited.seq + 1 {
+        bail!("the delete got seq {}, not {}", deleted.seq, edited.seq + 1);
+    }
+    let entry = delivered(bob_socket, conversation, deleted.seq, "the delete").await?;
+    if entry.kind() != EntryKind::Delete || entry.target_seq != Some(sent.seq) {
+        bail!(
+            "bob's socket delivered {} instead of the delete",
+            describe(&entry)
+        );
+    }
+    let fetch = request::Body::FetchHistory(FetchHistory {
+```
+
+Replace
+
+```rust
+                Ok(socket)
+            }
+            other => bail!("{} expected Ready, got {other:?}", self.name),
+        }
+    }
+```
+
+with
+
+```rust
+                Ok(socket)
+            }
+            _ => bail!("{} expected Ready, got another frame", self.name),
+        }
+    }
+```
+
+Replace
+
+```rust
+}
+
+fn step(message: &str) {
+    println!("smoke: {message}");
+```
+
+with
+
+```rust
+}
+
+/// An entry without its body, which may be a message.
+fn describe(entry: &Deliver) -> String {
+    format!(
+        "an entry of kind {:?} (seq {}, target_seq {:?})",
+        entry.kind(),
+        entry.seq,
+        entry.target_seq
+    )
+}
+
+fn step(message: &str) {
+    println!("smoke: {message}");
+```
+
+In `crates/push-smoke/src/kicks.rs`:
+
+Replace
+
+```rust
+use std::time::{Duration, Instant};
+
+use anyhow::{anyhow, bail};
+use futures_util::StreamExt;
+use prost::Message;
+```
+
+with
+
+```rust
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, anyhow, bail};
+use futures_util::StreamExt;
+use prost::Message;
+```
+
+Replace
+
+```rust
+        let channel = kick_channel(device);
+        let mut messages = self.pubsub.on_message();
+        loop {
+            let left = WORKER_TIMEOUT.saturating_sub(started.elapsed());
+            let Ok(message) = tokio::time::timeout(left, messages.next()).await else {
+                bail!("{device} was not kicked within {WORKER_TIMEOUT:?}");
+            };
+            let message = message.ok_or_else(|| anyhow!("the Redis subscription ended"))?;
+            if message.get_channel_name() != channel {
+                continue;
+            }
+            let kick = Kick::decode(message.get_payload_bytes())?;
+            if kick.reason() != reason {
+                bail!(
+                    "{device} was kicked for {:?}, not {reason:?}",
+                    kick.reason()
+                );
+            }
+            return Ok(started.elapsed());
+        }
+    }
+}
+```
+
+with
+
+```rust
+        let channel = kick_channel(device);
+        let mut messages = self.pubsub.on_message();
+        let Ok(message) = tokio::time::timeout(WORKER_TIMEOUT, messages.next()).await else {
+            bail!("{device} was not kicked within {WORKER_TIMEOUT:?}");
+        };
+        let message = message.ok_or_else(|| anyhow!("the Redis subscription ended"))?;
+        if message.get_channel_name() != channel {
+            bail!(
+                "waiting for {device} to be kicked, but {} was kicked instead",
+                message.get_channel_name()
+            );
+        }
+        let kick = Kick::decode(message.get_payload_bytes()).context("decode a kick")?;
+        if kick.reason() != reason {
+            bail!(
+                "{device} was kicked for {:?}, not {reason:?}",
+                kick.reason()
+            );
+        }
+        Ok(started.elapsed())
+    }
+}
+```
+
+In `crates/push-smoke/src/main.rs`:
+
+Replace
+
+```rust
+
+/// The whole run, so that a hung deployment fails a helm test instead of hanging it.
+const TOTAL_TIMEOUT: Duration = Duration::from_secs(120);
+
+#[tokio::main]
+```
+
+with
+
+```rust
+
+/// The whole run, so that a hung deployment fails a helm test instead of hanging it.
+const TOTAL_TIMEOUT: Duration = Duration::from_secs(180);
+
+#[tokio::main]
+```
+
+In `crates/push-smoke/tests/local.rs`:
+
+Replace
+
+```rust
+            accounts_token: Some(accounts_token.clone()),
+            directory_token: Some(directory_token.to_owned()),
+            dev_setup: false,
+        },
+        grpc,
+```
+
+with
+
+```rust
+            accounts_token: Some(accounts_token.clone()),
+            directory_token: Some(directory_token.to_owned()),
+        },
+        grpc,
+```
+
+Replace
+
+```rust
+        host: None,
+    };
+    tokio::time::timeout(Duration::from_secs(120), run(&target))
+        .await
+        .expect("the smoke test finishes within 120 s")
+```
+
+with
+
+```rust
+        host: None,
+    };
+    tokio::time::timeout(Duration::from_secs(180), run(&target))
+        .await
+        .expect("the smoke test finishes within 120 s")
+```
+
+Run the gates again and commit:
+
+```powershell
+git add crates
+git commit -m "fix(smoke): bound the Redis subscribe, keep bodies out of failures and tighten the kick and delete checks"
+```
+
 ---
 
 ### Task 3: The DEV ONLY `DevSetup` API goes
@@ -3625,7 +4034,7 @@ git add crates
 git commit -m "refactor(message-svc): remove the DEV ONLY DevSetup API"
 ```
 
-Expected: 807 tests pass (the `PUSH_DEV_SETUP` configuration test is gone), no warnings,
+Expected: 822 tests pass (the `PUSH_DEV_SETUP` configuration test is gone), no warnings,
 no diff.
 
 ---
@@ -3989,7 +4398,7 @@ git add deploy
 git commit -m "feat(chart): the Directory token, auth-svc's message-svc URL and the smoke test's Redis URL"
 ```
 
-Expected: 807 tests pass, no warnings, no diff.
+Expected: 822 tests pass, no warnings, no diff.
 
 ---
 
@@ -4016,7 +4425,7 @@ deploy/minikube/down.ps1 -Cluster push first" (a volume from before Plan 6B, or 
 cluster restart left behind; it happened while this plan was verified), run
 `deploy/minikube/down.ps1` and then `deploy/minikube/up.ps1 -Smoke` again.
 
-Expected (verified 2026-10-14; ids and timings differ): the five images build, the release
+Expected (verified 2026-10-14, ids shown as `…`; timings differ): the five images build, the release
 installs, and `helm test` ends `Phase: Succeeded` with these pod logs:
 
 ```
@@ -4032,36 +4441,34 @@ STATUS: deployed
 TEST SUITE:     push-smoke
 Phase:          Succeeded
 POD LOGS: push-smoke
-smoke: auth-svc answers 503 Service Unavailable yet; retrying
-smoke: auth-svc answers 503 Service Unavailable yet; retrying
-smoke: alice signed up; the worker's log sender delivered the verification email after 759 ms
-smoke: alice verified the email, signed in and registered device 01a13798-a47b-722b-b43d-34f6044b6c4c (a retry returned the same device) in 833 ms
+smoke: alice signed up; the worker's log sender delivered the verification email after 755 ms
+smoke: alice verified the email, signed in and registered device … (a retry returned the same device) in 802 ms
 smoke: alice's access token verifies against the JWKS (EdDSA, aud ws://push.local/v1/socket); refresh rotated it
 smoke: bob signed up; the worker's log sender delivered the verification email after 1008 ms
-smoke: bob verified the email, signed in and registered device 01a13798-a8a3-73e3-a658-ef606634797d (a retry returned the same device) in 1059 ms
+smoke: bob verified the email, signed in and registered device … (a retry returned the same device) in 1057 ms
 smoke: bob's access token verifies against the JWKS (EdDSA, aud ws://push.local/v1/socket); refresh rotated it
-smoke: carol signed up; the worker's log sender delivered the verification email after 1013 ms
-smoke: carol verified the email, signed in and registered device 01a13798-accf-7018-94d9-c0ff2611b5ce (a retry returned the same device) in 1065 ms
+smoke: carol signed up; the worker's log sender delivered the verification email after 757 ms
+smoke: carol verified the email, signed in and registered device … (a retry returned the same device) in 805 ms
 smoke: carol's access token verifies against the JWKS (EdDSA, aud ws://push.local/v1/socket); refresh rotated it
-smoke: the worker relayed alice's account and device 01a13798-a47b-722b-b43d-34f6044b6c4c to message-svc (waited 0 ms)
-smoke: the worker relayed bob's account and device 01a13798-a8a3-73e3-a658-ef606634797d to message-svc (waited 0 ms)
-smoke: the worker relayed carol's account and device 01a13798-accf-7018-94d9-c0ff2611b5ce to message-svc (waited 1022 ms)
+smoke: the worker relayed alice's account and device … to message-svc (waited 0 ms)
+smoke: the worker relayed bob's account and device … to message-svc (waited 0 ms)
+smoke: the worker relayed carol's account and device … to message-svc (waited 1012 ms)
 smoke: alice asked bob to be a contact and bob accepted
 smoke: carol redeemed alice's invite: they are contacts
 smoke: alice opened the direct conversation with bob
 smoke: auth-svc shows alice the profiles of her contacts bob and carol, and bob none of carol's
 smoke: bob connected (Ready, heartbeat 30000 ms)
 smoke: alice connected (Ready, heartbeat 30000 ms)
-smoke: alice got SendAck seq=1 after 23 ms
-smoke: bob got Deliver seq=1 after 36 ms
+smoke: alice got SendAck seq=1 after 3 ms
+smoke: bob got Deliver seq=1 after 39 ms
 smoke: bob acked; the gateway answered the following Ping
 smoke: alice edited her message; bob's socket delivered the edit (seq 2)
 smoke: bob read the message; alice's listing shows it read
 smoke: alice created a group with bob and carol; bob's socket delivered its first entry and auth-svc now shows bob carol's profile
 smoke: alice deleted her message; bob's socket delivered the delete (seq 3) and his history holds it erased
-smoke: carol revoked her device; the worker relayed it and message-svc kicked it on Redis after 386 ms, and refuses it now
-smoke: bob reset his password; the worker relayed it and message-svc kicked his device on Redis after 725 ms
-smoke: PASS in 10868 ms
+smoke: carol revoked her device; the worker relayed it and message-svc kicked it on Redis after 722 ms, and refuses it now
+smoke: bob reset his password; the worker relayed it and message-svc kicked his device on Redis after 969 ms
+smoke: PASS in 6653 ms
 ```
 
 - [ ] **Step 3: An upgrade keeps the Directory token**
@@ -4075,6 +4482,105 @@ $after = kubectl --context push -n push get secret push-secrets -o jsonpath='{.d
 
 Expected: `REVISION: 2`, `Phase: Succeeded`, `smoke: PASS in 6212 ms` (or similar) and
 `directory-token kept: True`.
+
+- [ ] **Step 3a: Wait for the old worker pod (review fix)**
+
+The first upgrade run showed a dev-mailbox race: the smoke test could read the mailbox of
+the old worker pod while it was still terminating. `up.ps1` and `up.sh` now wait for the old
+worker pod to go away before the smoke test. The replace blocks are copied from the
+committed files:
+
+In `deploy/minikube/up.ps1`:
+
+Replace
+
+```powershell
+
+if ($Smoke) {
+    Invoke-Step 'run the smoke test' {
+        helm test $release --kube-context $Cluster --namespace $namespace --logs --timeout 5m
+```
+
+with
+
+```powershell
+
+if ($Smoke) {
+    # The DEV ONLY mailbox is in the worker's memory. `helm upgrade --wait` returns once the new
+    # worker is ready, but the old pod can still claim and deliver the verification email into
+    # its own mailbox; wait until only the new one remains (terminating pods count).
+    $workerSelector = "app.kubernetes.io/name=worker,app.kubernetes.io/instance=$release"
+    Write-Host '==> wait for the old worker pod to go away' -ForegroundColor Cyan
+    $deadline = (Get-Date).AddSeconds(90)
+    while ($true) {
+        $workerPods = @(kubectl --context $Cluster -n $namespace get pods -l $workerSelector -o name)
+        Write-Host "worker pods: $($workerPods.Count) ($($workerPods -join ', '))"
+        if ($workerPods.Count -eq 1) {
+            break
+        }
+        if ((Get-Date) -gt $deadline) {
+            throw "more than one worker pod ($($workerPods.Count)) after 90 s; the smoke test needs exactly one"
+        }
+        Start-Sleep -Seconds 2
+    }
+    Invoke-Step 'wait for the worker pod to be Ready' {
+        kubectl --context $Cluster -n $namespace wait --for=condition=Ready pod -l $workerSelector --timeout=90s
+    }
+    Invoke-Step 'run the smoke test' {
+        helm test $release --kube-context $Cluster --namespace $namespace --logs --timeout 5m
+```
+
+In `deploy/minikube/up.sh`:
+
+Replace
+
+```bash
+
+if [[ "$smoke" == true ]]; then
+  step 'run the smoke test'
+  helm test "$release" --kube-context "$cluster" --namespace "$namespace" --logs --timeout 5m
+```
+
+with
+
+```bash
+
+if [[ "$smoke" == true ]]; then
+  # The DEV ONLY mailbox is in the worker's memory. `helm upgrade --wait` returns once the new
+  # worker is ready, but the old pod can still claim and deliver the verification email into
+  # its own mailbox; wait until only the new one remains (terminating pods count).
+  worker_selector="app.kubernetes.io/name=worker,app.kubernetes.io/instance=$release"
+  step 'wait for the old worker pod to go away'
+  deadline=$((SECONDS + 90))
+  while true; do
+    mapfile -t worker_pods < <(kubectl --context "$cluster" -n "$namespace" get pods -l "$worker_selector" -o name)
+    echo "worker pods: ${#worker_pods[@]} (${worker_pods[*]})"
+    if [[ "${#worker_pods[@]}" -eq 1 ]]; then
+      break
+    fi
+    if [[ "$SECONDS" -gt "$deadline" ]]; then
+      echo "more than one worker pod (${#worker_pods[@]}) after 90 s; the smoke test needs exactly one" >&2
+      exit 1
+    fi
+    sleep 2
+  done
+  step 'wait for the worker pod to be Ready'
+  kubectl --context "$cluster" -n "$namespace" wait --for=condition=Ready pod -l "$worker_selector" --timeout=90s
+  step 'run the smoke test'
+  helm test "$release" --kube-context "$cluster" --namespace "$namespace" --logs --timeout 5m
+```
+
+Verified: a forced worker roll passed with the wait step exercised, and `up.sh` passed under
+Git Bash.
+
+- [ ] **Step 3b: What was verified (2026-10-14)**
+
+- The smoke test printed the output above (`smoke: PASS in 6653 ms`).
+- `PUSH_DEV_SETUP` is gone from message-svc.
+- The smoke pod spec has no `redis://` literal; it reads the Redis URL from a `secretKeyRef`.
+- An upgrade rerun keeps both internal tokens.
+- The up scripts wait for the old worker pod to go away before the smoke test.
+- `up.sh` passed under Git Bash.
 
 - [ ] **Step 4: If anything fails**
 
@@ -4220,7 +4726,7 @@ cargo +1.85 test --workspace --locked
 pwsh deploy/helm/test-chart.ps1
 ```
 
-Expected: no diff, no warnings, 807 tests on both toolchains, 29 chart checks.
+Expected: no diff, no warnings, 822 tests on both toolchains, 29 chart checks.
 
 - [ ] **Step 5: Commit and push**
 
@@ -4234,7 +4740,7 @@ git push -u origin feature/plan-07b-message-minikube
 
 ```powershell
 $body = @'
-Implements docs/superpowers/plans/2026-10-13-plan-07b-message-minikube.md: the smoke test drives Plan 7A's API end to end — contacts by request and by invite, the direct conversation, profiles only for related users through auth-svc's GET /v1/users?ids=, edit, read, a group and a delete delivered to Bob's open WebSocket, history with the message erased, and kicks on Redis after a device revocation and a password reset relayed by the worker. The DEV ONLY DevSetup API is removed. The chart generates and keeps a Directory token for auth-svc and message-svc only, gives auth-svc message-svc's URL, and gives the smoke Pod the Redis URL from the Secret; test-chart.ps1 has 29 checks. Verified on minikube (profile push, Kubernetes 1.31): smoke PASS, and an upgrade keeps the token. 807 tests.
+Implements docs/superpowers/plans/2026-10-13-plan-07b-message-minikube.md: the smoke test drives Plan 7A's API end to end — contacts by request and by invite, the direct conversation, profiles only for related users through auth-svc's GET /v1/users?ids=, edit, read, a group and a delete delivered to Bob's open WebSocket, history with the message erased, and kicks on Redis after a device revocation and a password reset relayed by the worker. The DEV ONLY DevSetup API is removed. The chart generates and keeps a Directory token for auth-svc and message-svc only, gives auth-svc message-svc's URL, and gives the smoke Pod the Redis URL from the Secret; test-chart.ps1 has 29 checks. Verified on minikube (profile push, Kubernetes 1.31): smoke PASS, and an upgrade keeps the token. 822 tests.
 '@
 gh pr create --base main --title "Plan 7B: the message service on minikube" --body $body
 gh pr checks --watch
@@ -4267,3 +4773,11 @@ controller merges after the final review.
 - **A NetworkPolicy** (Plan 11): only auth-svc may reach `Directory`, only the worker
   `Accounts`, only the gateway `Messaging`, and the smoke Pod only in dev mode.
 - **Per-IP rate limits on `RedeemInvite`** (Plan 8, at the gateway).
+- **`register_device` in push-domain has no production caller now** that `DevSetup` is gone;
+  remove it or give it a caller later.
+- **A blank line is left in message-svc's `server.rs`** where the `DevSetup` wiring was.
+
+## Review fixes
+
+- **identify reads a device once.** It read the owner of an active device and then, in a second statement, the owner of any device, so a worker commit of `device_registered` between the two made a legitimate new device `UnknownDevice` instead of the retryable `DeviceNotKnownYet` (the flaky local smoke test). `Tx::device_state` now returns the owner and whether the device is active from one statement (Postgres: `SELECT user_id, revoked_at IS NULL`), and `identify` maps absent to `DeviceNotKnownYet`, another user's or revoked to `UnknownDevice`, active to `Ok`. `require_device` makes one read and `device_registered`/`device_revoked` read after their own insert, so they needed no change. A contract case pins the mapping on both stores.
+- **`up.sh` counts worker pods without `mapfile`** (macOS bash 3.2 has none): `pods=$(kubectl ... -o name)` and `grep -c .` with `|| true`. Both scripts time out with "expected exactly one worker pod (found N)".

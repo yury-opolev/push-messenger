@@ -93,6 +93,9 @@ pub trait Tx: Send {
     async fn revoke_device(&mut self, device: DeviceId) -> DomainResult<()>;
     /// The owner of a device, active or revoked; `None` if the device is unknown.
     async fn device_user(&mut self, device: DeviceId) -> DomainResult<Option<UserId>>;
+    /// The owner of a device and whether the device is still active, read in one
+    /// statement so the two cannot disagree; `None` if the device is unknown.
+    async fn device_state(&mut self, device: DeviceId) -> DomainResult<Option<(UserId, bool)>>;
     /// The owner of an active device; `None` if the device is unknown or revoked.
     async fn device_owner(&mut self, device: DeviceId) -> DomainResult<Option<UserId>>;
     /// The user's active devices.

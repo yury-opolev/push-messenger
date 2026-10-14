@@ -62,7 +62,7 @@ true
 {{- end -}}
 {{- end -}}
 
-{{/* "1" or "0" for the PUSH_DEV_AUTH, PUSH_DEV_SETUP and PUSH_DEV_MAILBOX variables. */}}
+{{/* "1" or "0" for the PUSH_DEV_AUTH and PUSH_DEV_MAILBOX variables. */}}
 {{- define "push.devFlag" -}}
 {{- if include "push.devMode" . -}}1{{- else -}}0{{- end -}}
 {{- end -}}
