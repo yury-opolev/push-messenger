@@ -133,6 +133,17 @@ pub trait Tx: Send {
     /// The order of the result is unspecified.
     async fn contacts_of(&mut self, owner: UserId) -> DomainResult<Vec<(UserId, ContactState)>>;
 
+    /// The users among `candidates`, other than `user`, whom `user` has a contact row for
+    /// in any state but `RequestedOut` (the user's own pending request grants nothing), or
+    /// who are or were members of a conversation `user` is or was a member of. Duplicates
+    /// in `candidates` are ignored. One statement on Postgres. The order of the result is
+    /// unspecified.
+    async fn related_users(
+        &mut self,
+        user: UserId,
+        candidates: &[UserId],
+    ) -> DomainResult<Vec<UserId>>;
+
     // --- Invites -----------------------------------------------------------------------
 
     /// Stores a new invite. Returns `Duplicate`, writing nothing, if an invite with the same

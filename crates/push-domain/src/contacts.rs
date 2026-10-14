@@ -137,6 +137,29 @@ where
         Ok(contacts)
     }
 
+    /// The users among `candidates` whose profiles `user` may see (spec §5.5): `user`
+    /// themselves, everyone they have a relationship with as they see it (requests they
+    /// received, accepted contacts, users they blocked), and everyone they share or shared
+    /// a conversation with. Their own pending request to someone grants nothing: someone
+    /// they blocked would otherwise regain sight of the blocker by asking again. Sorted,
+    /// without duplicates. Someone who blocked `user` stays hidden unless they share a
+    /// conversation, so nobody learns of a block through it.
+    pub async fn visible_users(
+        &self,
+        user: UserId,
+        candidates: &[UserId],
+    ) -> DomainResult<Vec<UserId>> {
+        let mut tx = self.store.begin().await?;
+        let mut visible = tx.related_users(user, candidates).await?;
+        tx.rollback().await?;
+        if candidates.contains(&user) {
+            visible.push(user);
+        }
+        visible.sort();
+        visible.dedup();
+        Ok(visible)
+    }
+
     /// Begins a transaction for an operation between two distinct, known users.
     async fn begin_pair(&self, a: UserId, b: UserId) -> DomainResult<S::Tx> {
         if a == b {

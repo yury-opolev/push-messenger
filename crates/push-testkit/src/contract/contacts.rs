@@ -1,6 +1,6 @@
 use push_domain::{ContactState, DomainError, InsertOutcome, Store, Tx, UserId};
 
-use super::{add_users, invite, start};
+use super::{add_users, conversation, invite, member, start, store_with};
 use crate::{Backend, Case, case_list};
 
 async fn contact_rows_are_per_direction_and_replaced_by_put<B: Backend>(backend: &B) {
@@ -132,6 +132,69 @@ async fn update_invite_changes_only_uses_and_revocation<B: Backend>(backend: &B)
     ));
 }
 
+async fn related_users_have_a_contact_row_of_the_user_or_share_a_conversation<B: Backend>(
+    backend: &B,
+) {
+    let chat = conversation();
+    let store = store_with(backend, chat.clone()).await;
+    let [alice, bob, carol, dave, erin] = [(); 5].map(|()| UserId::new());
+    add_users(&store, &[alice, bob, carol, dave, erin]).await;
+    let mut tx = store.begin().await.unwrap();
+    tx.put_contact(alice, bob, ContactState::RequestedIn)
+        .await
+        .unwrap();
+    // Only Carol's row names Alice.
+    tx.put_contact(carol, alice, ContactState::Blocked)
+        .await
+        .unwrap();
+    tx.insert_member(member(chat.id, alice)).await.unwrap();
+    let mut former = member(chat.id, dave);
+    former.left_at_seq = Some(0);
+    tx.insert_member(former).await.unwrap();
+
+    let stranger = UserId::new();
+    let candidates = [bob, carol, dave, erin, stranger, alice, bob];
+    let mut related = tx.related_users(alice, &candidates).await.unwrap();
+    related.sort();
+    let mut expected = vec![bob, dave];
+    expected.sort();
+    assert_eq!(related, expected);
+    assert_eq!(tx.related_users(carol, &[alice]).await, Ok(vec![alice]));
+    assert_eq!(tx.related_users(erin, &[alice, bob]).await, Ok(vec![]));
+    assert_eq!(tx.related_users(alice, &[]).await, Ok(vec![]));
+}
+
+async fn an_outgoing_request_alone_makes_nobody_related<B: Backend>(backend: &B) {
+    let chat = conversation();
+    let store = store_with(backend, chat.clone()).await;
+    let [alice, bob, carol, dave, erin] = [(); 5].map(|()| UserId::new());
+    add_users(&store, &[alice, bob, carol, dave, erin]).await;
+    let mut tx = store.begin().await.unwrap();
+    for peer in [bob, carol, dave] {
+        tx.put_contact(alice, peer, ContactState::RequestedOut)
+            .await
+            .unwrap();
+    }
+    tx.put_contact(alice, erin, ContactState::Accepted)
+        .await
+        .unwrap();
+    // Carol shares a conversation with Alice besides the request; Dave left it.
+    tx.insert_member(member(chat.id, alice)).await.unwrap();
+    tx.insert_member(member(chat.id, carol)).await.unwrap();
+    let mut former = member(chat.id, dave);
+    former.left_at_seq = Some(0);
+    tx.insert_member(former).await.unwrap();
+
+    let mut related = tx
+        .related_users(alice, &[bob, carol, dave, erin])
+        .await
+        .unwrap();
+    related.sort();
+    let mut expected = vec![carol, dave, erin];
+    expected.sort();
+    assert_eq!(related, expected, "Bob is only asked, never seen");
+}
+
 pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
     case_list![
         contact_rows_are_per_direction_and_replaced_by_put,
@@ -140,5 +203,7 @@ pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
         an_invite_code_is_stored_once,
         an_invite_of_an_unknown_user_is_refused,
         update_invite_changes_only_uses_and_revocation,
+        related_users_have_a_contact_row_of_the_user_or_share_a_conversation,
+        an_outgoing_request_alone_makes_nobody_related,
     ]
 }

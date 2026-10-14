@@ -282,6 +282,30 @@ impl Tx for PgTx {
             .collect()
     }
 
+    async fn related_users(
+        &mut self,
+        user: UserId,
+        candidates: &[UserId],
+    ) -> DomainResult<Vec<UserId>> {
+        let candidates: Vec<Uuid> = candidates.iter().map(|candidate| candidate.0).collect();
+        // State 1 is requested_out: the user's own pending request grants nothing.
+        let related: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT DISTINCT candidate FROM unnest($2::uuid[]) AS candidate \
+             WHERE candidate <> $1 AND ( \
+               EXISTS (SELECT 1 FROM messaging.contact \
+                       WHERE owner_id = $1 AND peer_id = candidate AND state <> 1) \
+               OR EXISTS (SELECT 1 FROM messaging.conversation_member mine \
+                          JOIN messaging.conversation_member theirs USING (conversation_id) \
+                          WHERE mine.user_id = $1 AND theirs.user_id = candidate))",
+        )
+        .bind(user.0)
+        .bind(candidates)
+        .fetch_all(self.conn())
+        .await
+        .map_err(store_error)?;
+        Ok(related.into_iter().map(UserId).collect())
+    }
+
     async fn insert_invite(&mut self, invite: InviteRecord) -> DomainResult<InsertOutcome> {
         let inserted = sqlx::query(
             "INSERT INTO messaging.invite \

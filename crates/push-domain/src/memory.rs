@@ -329,6 +329,36 @@ impl Tx for InMemoryTx {
             .collect())
     }
 
+    async fn related_users(
+        &mut self,
+        user: UserId,
+        candidates: &[UserId],
+    ) -> DomainResult<Vec<UserId>> {
+        let shared: HashSet<ConversationId> = self
+            .work
+            .members
+            .keys()
+            .filter(|(_, member)| *member == user)
+            .map(|(conversation, _)| *conversation)
+            .collect();
+        let mut related: Vec<UserId> = candidates
+            .iter()
+            .copied()
+            .filter(|candidate| *candidate != user)
+            .filter(|candidate| {
+                matches!(
+                    self.work.contacts.get(&(user, *candidate)),
+                    Some(state) if *state != ContactState::RequestedOut
+                ) || self.work.members.keys().any(|(conversation, member)| {
+                    member == candidate && shared.contains(conversation)
+                })
+            })
+            .collect();
+        related.sort();
+        related.dedup();
+        Ok(related)
+    }
+
     async fn insert_invite(&mut self, invite: InviteRecord) -> DomainResult<InsertOutcome> {
         if !self.work.users.contains(&invite.user_id) {
             return Err(missing("user"));

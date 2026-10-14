@@ -9,11 +9,12 @@ use prost::Message;
 use push_message_svc::{Config, serve};
 use push_proto::internal::v1::accounts_client::AccountsClient;
 use push_proto::internal::v1::dev_setup_client::DevSetupClient;
+use push_proto::internal::v1::directory_client::DirectoryClient;
 use push_proto::internal::v1::messaging_client::MessagingClient;
 use push_proto::internal::v1::{
     AccountDevice, AckRequest, EditRequest, IdentifyRequest, Kick, KickReason, MakeContactsRequest,
     Notification, OpenDirectRequest, ReadUpToRequest, RegisterDeviceRequest, RegisterUserRequest,
-    RequestCall, SendRequest, SyncRequest, notification::Kind,
+    RequestCall, SendRequest, SyncRequest, VisibleUsersRequest, notification::Kind,
 };
 use push_proto::v1::{
     self, Ack, ContactAccept, ContactRequest, ContentType, CreateGroup, CreateInvite, Edit,
@@ -40,6 +41,8 @@ use uuid::Uuid;
 
 /// The worker's token for the `Accounts` API.
 const ACCOUNTS_TOKEN: &str = "accounts-token-for-the-service-tests";
+/// auth-svc's token for the `Directory` API.
+const DIRECTORY_TOKEN: &str = "directory-token-for-the-service-tests";
 
 struct Running {
     _postgres: ContainerAsync<Postgres>,
@@ -81,6 +84,7 @@ async fn start(dev_setup: bool) -> Running {
         health_addr: health,
         store: StoreOptions::default(),
         accounts_token: Some(ACCOUNTS_TOKEN.to_owned()),
+        directory_token: Some(DIRECTORY_TOKEN.to_owned()),
         dev_setup,
     };
     let shutdown = CancellationToken::new();
@@ -125,6 +129,7 @@ async fn shutdown_is_honoured_while_the_database_is_unreachable() {
         health_addr: health.local_addr().unwrap(),
         store: StoreOptions::default(),
         accounts_token: None,
+        directory_token: None,
         dev_setup: false,
     };
     let shutdown = CancellationToken::new();
@@ -363,7 +368,7 @@ fn call(user: Uuid, body: request::Body) -> RequestCall {
 }
 
 #[tokio::test]
-async fn the_client_requests_run_on_postgres() {
+async fn the_client_requests_and_the_directory_run_on_postgres() {
     let running = start(false).await;
     let url = format!("http://{}", running.grpc);
     let mut accounts = accounts_client(url.clone()).await;
@@ -502,6 +507,35 @@ async fn the_client_requests_run_on_postgres() {
         })),
         "Bob read the message, Carol did not: only the created entry counts as read by all"
     );
+
+    // auth-svc asks whose profiles Carol may see: her contact Alice and Bob, from the
+    // group, but not a stranger.
+    let channel = Channel::from_shared(format!("http://{}", running.grpc))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let ask = VisibleUsersRequest {
+        user_id: id_bytes(carol),
+        user_ids: vec![id_bytes(Uuid::now_v7()), id_bytes(bob), id_bytes(alice)],
+    };
+    let status = DirectoryClient::new(channel.clone())
+        .visible_users(ask.clone())
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::Unauthenticated);
+    let bearer: MetadataValue<_> = format!("Bearer {DIRECTORY_TOKEN}").parse().unwrap();
+    let mut directory =
+        DirectoryClient::with_interceptor(channel, move |mut request: Request<()>| {
+            request
+                .metadata_mut()
+                .insert("authorization", bearer.clone());
+            Ok(request)
+        });
+    let visible = directory.visible_users(ask).await.unwrap().into_inner();
+    let mut expected = vec![id_bytes(alice), id_bytes(bob)];
+    expected.sort();
+    assert_eq!(visible.user_ids, expected);
 
     running.shutdown.cancel();
     running.server.await.unwrap().unwrap();

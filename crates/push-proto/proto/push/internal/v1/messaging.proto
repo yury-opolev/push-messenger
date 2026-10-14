@@ -1,6 +1,7 @@
-// The internal API of message-svc, called by the gateway (Messaging) and the worker
-// (Accounts) (spec §2). Never exposed outside the cluster. Callers pass the user and
-// device the gateway verified, or auth-svc announced; message-svc trusts them.
+// The internal API of message-svc, called by the gateway (Messaging), the worker
+// (Accounts) and auth-svc (Directory) (spec §2). Never exposed outside the cluster.
+// Callers pass the user and device the gateway verified, or auth-svc announced;
+// message-svc trusts them.
 //
 // Errors are gRPC statuses whose details (`grpc-status-details-bin`) follow gRPC's rich
 // error model: a `google.rpc.Status` with the client's `push.v1.Error` packed as a
@@ -71,6 +72,19 @@ service Accounts {
   // (`kick:{device_id}`), to sign in again. The gateway closes kicked sockets and refuses
   // tokens older than the reset in Plan 8.
   rpc PasswordReset(AccountUser) returns (AccountsResponse);
+}
+
+// Whose profile a user may see (spec §5.5), for auth-svc's `GET /v1/users?ids=…`: auth-svc
+// owns the profiles, message-svc the contacts and conversations. Every call carries
+// auth-svc's own internal token as `authorization: Bearer <token>` metadata (not the
+// worker's); without it the call is UNAUTHENTICATED.
+service Directory {
+  // The users among user_ids whose profile user_id may see: user_id itself, the users it
+  // has a relationship with as it sees it (requests it received, accepted contacts, users
+  // it blocked) and everyone it shares or shared a conversation with. A request user_id
+  // sent itself grants nothing, so someone it blocked cannot regain sight of its profile
+  // by asking again. At most 100 ids; malformed ids are INVALID_ARGUMENT.
+  rpc VisibleUsers(VisibleUsersRequest) returns (VisibleUsersResponse);
 }
 
 message IdentifyRequest {
@@ -231,3 +245,13 @@ message AccountDevice {
 }
 
 message AccountsResponse {}
+
+message VisibleUsersRequest {
+  bytes user_id = 1;
+  repeated bytes user_ids = 2;
+}
+
+message VisibleUsersResponse {
+  // Sorted, without duplicates.
+  repeated bytes user_ids = 1;
+}
