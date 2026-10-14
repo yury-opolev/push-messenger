@@ -565,6 +565,11 @@ async fn a_blocked_user_who_sends_a_new_request_still_cannot_see_the_blocker<B: 
     let (alice, xavier) = (world.person().await, world.person().await);
     world
         .svc
+        .contact_request(xavier.user, alice.user)
+        .await
+        .unwrap();
+    world
+        .svc
         .contact_block(alice.user, xavier.user)
         .await
         .unwrap();
@@ -581,6 +586,121 @@ async fn a_blocked_user_who_sends_a_new_request_still_cannot_see_the_blocker<B: 
     assert_eq!(seen_by_xavier, Ok(vec![]), "the new request grants nothing");
     let seen_by_alice = world.svc.visible_users(alice.user, &[xavier.user]).await;
     assert_eq!(seen_by_alice, Ok(vec![xavier.user]), "Alice blocked Xavier");
+}
+
+async fn blocking_someone_gives_no_sight_of_a_peer_the_blocker_never_saw<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
+    let (alice, xavier, stranger) = (
+        world.person().await,
+        world.person().await,
+        world.person().await,
+    );
+    let visible = |user: &Person, other: &Person| {
+        let (svc, user, other) = (&world.svc, user.user, other.user);
+        async move { svc.visible_users(user, &[other]).await.unwrap() }
+    };
+    world
+        .svc
+        .contact_block(alice.user, xavier.user)
+        .await
+        .unwrap();
+    world
+        .svc
+        .contact_block(xavier.user, alice.user)
+        .await
+        .unwrap();
+    assert!(
+        visible(&xavier, &alice).await.is_empty(),
+        "Xavier's own block on a stranger grants nothing"
+    );
+    assert!(
+        visible(&alice, &xavier).await.is_empty(),
+        "Alice never saw Xavier before blocking him"
+    );
+    world
+        .svc
+        .contact_block(stranger.user, alice.user)
+        .await
+        .unwrap();
+    assert!(visible(&stranger, &alice).await.is_empty());
+    // Asking first and then blocking is no better: the pending request granted nothing.
+    world
+        .svc
+        .contact_request(alice.user, stranger.user)
+        .await
+        .unwrap();
+    world
+        .svc
+        .contact_block(alice.user, stranger.user)
+        .await
+        .unwrap();
+    assert!(visible(&alice, &stranger).await.is_empty());
+}
+
+async fn a_block_keeps_the_sight_the_blocker_had<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
+    let (alice, bob, carol, dave) = (
+        world.person().await,
+        world.person().await,
+        world.person().await,
+        world.person().await,
+    );
+    let visible = |user: &Person, other: &Person| {
+        let (svc, user, other) = (&world.svc, user.user, other.user);
+        async move { svc.visible_users(user, &[other]).await.unwrap() }
+    };
+    // Accepted, then blocked.
+    world
+        .svc
+        .contact_request(alice.user, bob.user)
+        .await
+        .unwrap();
+    world
+        .svc
+        .contact_accept(bob.user, alice.user)
+        .await
+        .unwrap();
+    world.svc.contact_block(alice.user, bob.user).await.unwrap();
+    assert_eq!(visible(&alice, &bob).await, [bob.user]);
+    assert!(visible(&bob, &alice).await.is_empty());
+    // Blocking again changes nothing.
+    world.svc.contact_block(alice.user, bob.user).await.unwrap();
+    assert_eq!(visible(&alice, &bob).await, [bob.user]);
+    // Carol's block back grants nothing: the row of her request vanished when Alice blocked.
+    world
+        .svc
+        .contact_request(carol.user, alice.user)
+        .await
+        .unwrap();
+    world
+        .svc
+        .contact_block(alice.user, carol.user)
+        .await
+        .unwrap();
+    world
+        .svc
+        .contact_block(carol.user, alice.user)
+        .await
+        .unwrap();
+    assert!(visible(&carol, &alice).await.is_empty());
+    assert_eq!(visible(&alice, &carol).await, [carol.user]);
+    // A shared conversation still shows names, block or no block.
+    world.group(&alice, &[&dave]).await;
+    world
+        .svc
+        .contact_block(dave.user, alice.user)
+        .await
+        .unwrap();
+    assert_eq!(visible(&dave, &alice).await, [alice.user]);
+    // Unblocking forgets the sight: a fresh block of a stranger grants nothing.
+    world
+        .svc
+        .contact_unblock(alice.user, bob.user)
+        .await
+        .unwrap();
+    assert!(visible(&alice, &bob).await.is_empty());
+    world.svc.contact_block(alice.user, bob.user).await.unwrap();
+    assert!(visible(&alice, &bob).await.is_empty());
 }
 
 pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
@@ -611,5 +731,7 @@ pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
         contacts_are_listed_from_the_owners_side_only,
         profiles_are_visible_to_relations_and_conversation_members,
         a_blocked_user_who_sends_a_new_request_still_cannot_see_the_blocker,
+        blocking_someone_gives_no_sight_of_a_peer_the_blocker_never_saw,
+        a_block_keeps_the_sight_the_blocker_had,
     ]
 }

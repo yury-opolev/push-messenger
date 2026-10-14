@@ -126,6 +126,11 @@ pub trait Tx: Send {
         peer: UserId,
         state: ContactState,
     ) -> DomainResult<()>;
+    /// Inserts or replaces the row with a `Blocked` one, recording whether `owner` could see
+    /// `peer` when blocking (`related_users` counts the row only then). `put_contact`
+    /// records `false`.
+    async fn put_block(&mut self, owner: UserId, peer: UserId, sees_peer: bool)
+    -> DomainResult<()>;
     /// A no-op if the row is absent.
     async fn delete_contact(&mut self, owner: UserId, peer: UserId) -> DomainResult<()>;
 
@@ -134,7 +139,8 @@ pub trait Tx: Send {
     async fn contacts_of(&mut self, owner: UserId) -> DomainResult<Vec<(UserId, ContactState)>>;
 
     /// The users among `candidates`, other than `user`, whom `user` has a contact row for
-    /// in any state but `RequestedOut` (the user's own pending request grants nothing), or
+    /// in any state but `RequestedOut` (the user's own pending request grants nothing),
+    /// except a `Blocked` row written without sight of the peer (see `put_block`), or
     /// who are or were members of a conversation `user` is or was a member of. Duplicates
     /// in `candidates` are ignored. One statement on Postgres. The order of the result is
     /// unspecified.

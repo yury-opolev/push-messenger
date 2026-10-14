@@ -144,9 +144,7 @@ async fn related_users_have_a_contact_row_of_the_user_or_share_a_conversation<B:
         .await
         .unwrap();
     // Only Carol's row names Alice.
-    tx.put_contact(carol, alice, ContactState::Blocked)
-        .await
-        .unwrap();
+    tx.put_block(carol, alice, true).await.unwrap();
     tx.insert_member(member(chat.id, alice)).await.unwrap();
     let mut former = member(chat.id, dave);
     former.left_at_seq = Some(0);
@@ -195,6 +193,31 @@ async fn an_outgoing_request_alone_makes_nobody_related<B: Backend>(backend: &B)
     assert_eq!(related, expected, "Bob is only asked, never seen");
 }
 
+async fn a_block_without_sight_of_the_peer_makes_nobody_related<B: Backend>(backend: &B) {
+    let store = store_with(backend, conversation()).await;
+    let [alice, bob, carol] = [(); 3].map(|()| UserId::new());
+    add_users(&store, &[alice, bob, carol]).await;
+    let mut tx = store.begin().await.unwrap();
+    tx.put_block(alice, bob, false).await.unwrap();
+    tx.put_block(alice, carol, true).await.unwrap();
+    assert_eq!(
+        tx.related_users(alice, &[bob, carol]).await,
+        Ok(vec![carol])
+    );
+    // Replacing the row forgets the record; so does blocking again without sight.
+    tx.put_contact(alice, carol, ContactState::Blocked)
+        .await
+        .unwrap();
+    assert_eq!(tx.related_users(alice, &[bob, carol]).await, Ok(vec![]));
+    tx.put_block(alice, carol, true).await.unwrap();
+    tx.put_block(alice, carol, false).await.unwrap();
+    assert_eq!(tx.related_users(alice, &[carol]).await, Ok(vec![]));
+    assert_eq!(
+        tx.get_contact(alice, carol).await,
+        Ok(Some(ContactState::Blocked))
+    );
+}
+
 pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
     case_list![
         contact_rows_are_per_direction_and_replaced_by_put,
@@ -205,5 +228,6 @@ pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
         update_invite_changes_only_uses_and_revocation,
         related_users_have_a_contact_row_of_the_user_or_share_a_conversation,
         an_outgoing_request_alone_makes_nobody_related,
+        a_block_without_sight_of_the_peer_makes_nobody_related,
     ]
 }

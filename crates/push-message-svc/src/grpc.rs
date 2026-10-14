@@ -931,15 +931,18 @@ mod tests {
             .await
             .unwrap_err();
         assert_invalid(status, "user_ids");
-        let too_many = (0..=MAX_VISIBLE_USERS)
-            .map(|_| id_bytes(UserId::new().0))
-            .collect();
+        // Malformed ids would fail the parse; the limit must be checked first.
+        let too_many = vec![vec![1, 2, 3]; MAX_VISIBLE_USERS + 1];
         let status = world
             .directory
             .visible_users(ask(&alice, too_many))
             .await
             .unwrap_err();
-        assert_invalid(status, "user_ids");
+        assert_invalid(status.clone(), "user_ids");
+        assert!(
+            error_from_status(&status).message.contains("at most 100"),
+            "{status:?}"
+        );
     }
 
     #[test]

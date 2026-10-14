@@ -249,11 +249,34 @@ impl Tx for PgTx {
         sqlx::query(
             "INSERT INTO messaging.contact (owner_id, peer_id, state) VALUES ($1, $2, $3) \
              ON CONFLICT (owner_id, peer_id) \
-             DO UPDATE SET state = excluded.state, updated_at = now()",
+             DO UPDATE SET state = excluded.state, sees_peer = false, updated_at = now()",
         )
         .bind(owner.0)
         .bind(peer.0)
         .bind(encode(state))
+        .execute(self.conn())
+        .await
+        .map_err(store_error)?;
+        Ok(())
+    }
+
+    async fn put_block(
+        &mut self,
+        owner: UserId,
+        peer: UserId,
+        sees_peer: bool,
+    ) -> DomainResult<()> {
+        sqlx::query(
+            "INSERT INTO messaging.contact (owner_id, peer_id, state, sees_peer) \
+             VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (owner_id, peer_id) \
+             DO UPDATE SET state = excluded.state, sees_peer = excluded.sees_peer, \
+                           updated_at = now()",
+        )
+        .bind(owner.0)
+        .bind(peer.0)
+        .bind(encode(ContactState::Blocked))
+        .bind(sees_peer)
         .execute(self.conn())
         .await
         .map_err(store_error)?;
@@ -288,12 +311,14 @@ impl Tx for PgTx {
         candidates: &[UserId],
     ) -> DomainResult<Vec<UserId>> {
         let candidates: Vec<Uuid> = candidates.iter().map(|candidate| candidate.0).collect();
-        // State 1 is requested_out: the user's own pending request grants nothing.
+        // State 1 is requested_out: the user's own pending request grants nothing. State 4
+        // is blocked: it counts only if the user could see the peer when blocking.
         let related: Vec<Uuid> = sqlx::query_scalar(
             "SELECT DISTINCT candidate FROM unnest($2::uuid[]) AS candidate \
              WHERE candidate <> $1 AND ( \
                EXISTS (SELECT 1 FROM messaging.contact \
-                       WHERE owner_id = $1 AND peer_id = candidate AND state <> 1) \
+                       WHERE owner_id = $1 AND peer_id = candidate AND state <> 1 \
+                         AND (state <> 4 OR sees_peer)) \
                OR EXISTS (SELECT 1 FROM messaging.conversation_member mine \
                           JOIN messaging.conversation_member theirs USING (conversation_id) \
                           WHERE mine.user_id = $1 AND theirs.user_id = candidate))",

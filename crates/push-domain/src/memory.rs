@@ -28,6 +28,8 @@ struct State {
     users: HashSet<UserId>,
     devices: HashMap<DeviceId, DeviceRow>,
     contacts: HashMap<(UserId, UserId), ContactState>,
+    /// Blocked rows whose owner could see the peer when blocking.
+    sighted_blocks: HashSet<(UserId, UserId)>,
     invites: HashMap<String, InviteRecord>,
     conversations: HashMap<ConversationId, Conversation>,
     direct_index: HashMap<[u8; 32], ConversationId>,
@@ -311,11 +313,26 @@ impl Tx for InMemoryTx {
             return Err(missing("user"));
         }
         self.work.contacts.insert((owner, peer), state);
+        self.work.sighted_blocks.remove(&(owner, peer));
+        Ok(())
+    }
+
+    async fn put_block(
+        &mut self,
+        owner: UserId,
+        peer: UserId,
+        sees_peer: bool,
+    ) -> DomainResult<()> {
+        self.put_contact(owner, peer, ContactState::Blocked).await?;
+        if sees_peer {
+            self.work.sighted_blocks.insert((owner, peer));
+        }
         Ok(())
     }
 
     async fn delete_contact(&mut self, owner: UserId, peer: UserId) -> DomainResult<()> {
         self.work.contacts.remove(&(owner, peer));
+        self.work.sighted_blocks.remove(&(owner, peer));
         Ok(())
     }
 
@@ -349,6 +366,8 @@ impl Tx for InMemoryTx {
                 matches!(
                     self.work.contacts.get(&(user, *candidate)),
                     Some(state) if *state != ContactState::RequestedOut
+                        && (*state != ContactState::Blocked
+                            || self.work.sighted_blocks.contains(&(user, *candidate)))
                 ) || self.work.members.keys().any(|(conversation, member)| {
                     member == candidate && shared.contains(conversation)
                 })

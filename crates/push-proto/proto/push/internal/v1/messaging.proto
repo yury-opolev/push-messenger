@@ -79,11 +79,13 @@ service Accounts {
 // auth-svc's own internal token as `authorization: Bearer <token>` metadata (not the
 // worker's); without it the call is UNAUTHENTICATED.
 service Directory {
-  // The users among user_ids whose profile user_id may see: user_id itself, the users it
-  // has a relationship with as it sees it (requests it received, accepted contacts, users
-  // it blocked) and everyone it shares or shared a conversation with. A request user_id
-  // sent itself grants nothing, so someone it blocked cannot regain sight of its profile
-  // by asking again. At most 100 ids; malformed ids are INVALID_ARGUMENT.
+  // The users among user_ids whose profile user_id may see: user_id itself, everyone it
+  // shares or shared a conversation with, and the users it has a contact row for as it
+  // sees them: requests it received, accepted contacts, and users it blocked, but only
+  // those it could already see when it blocked them (blocking a stranger grants nothing).
+  // A request user_id sent itself grants nothing, so someone it blocked cannot regain
+  // sight of its profile by asking again. At most 100 ids; malformed ids are
+  // INVALID_ARGUMENT.
   rpc VisibleUsers(VisibleUsersRequest) returns (VisibleUsersResponse);
 }
 
