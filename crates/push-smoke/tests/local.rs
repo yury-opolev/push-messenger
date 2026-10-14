@@ -1,7 +1,7 @@
 //! The whole system on this machine: Postgres and Redis in containers (Docker must be
 //! running), auth-svc, the worker, message-svc and the gateway in this process, wired as
 //! the chart wires them (each internal API behind its own token), and the smoke test
-//! against them over real HTTP, gRPC and WebSockets.
+//! against them over real HTTP, gRPC, WebSockets and Redis.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -37,6 +37,7 @@ async fn the_smoke_test_passes_against_the_whole_stack() {
         "redis://127.0.0.1:{}",
         redis.get_host_port_ipv4(6379).await.unwrap()
     );
+    let redis_url_for_smoke = redis_url.clone();
     let shutdown = CancellationToken::new();
 
     // auth-svc and the worker have databases of their own in the same server, as in the
@@ -124,7 +125,7 @@ async fn the_smoke_test_passes_against_the_whole_stack() {
     let gateway = tokio::spawn(push_gateway::serve(
         push_gateway::Config {
             message_svc_url: message_svc_url.clone(),
-            redis_url,
+            redis_url: redis_url.clone(),
             listen_addr: listener.local_addr().unwrap(),
             health_addr: gateway_health.local_addr().unwrap(),
             heartbeat: Duration::from_secs(30),
@@ -171,6 +172,7 @@ async fn the_smoke_test_passes_against_the_whole_stack() {
         mailbox_url: worker_url,
         auth_url,
         message_svc_url,
+        redis_url: redis_url_for_smoke,
         socket_url,
         host: None,
     };

@@ -2,7 +2,7 @@
 //! worker's log sender delivered to the DEV ONLY mailbox, signs in, registers a device (and
 //! retries the registration, which must find the same device) and refreshes its tokens, all
 //! over auth-svc's public HTTP API, and checks the access token against the JWKS. Later the
-//! users read each other's profiles there too.
+//! users read each other's profiles, revoke a device and reset a password there too.
 
 use std::time::{Duration, Instant};
 
@@ -20,6 +20,7 @@ use crate::{CONNECT_TIMEOUT, Target, WORKER_TIMEOUT, step};
 pub(crate) struct Enrolled {
     pub user: Uuid,
     pub device: Uuid,
+    pub email: String,
     /// The device's current access token. Never printed.
     pub access_token: String,
 }
@@ -229,6 +230,7 @@ impl<'a> Auth<'a> {
         Ok(Enrolled {
             user,
             device: device_id,
+            email,
             access_token: field(&refreshed, "access_token")?,
         })
     }
@@ -255,6 +257,43 @@ impl<'a> Auth<'a> {
                 Ok(field(user, "user_id")?.parse()?)
             })
             .collect()
+    }
+
+    /// Revokes `device` with its own access token, as a user signing a device out does.
+    pub async fn revoke_device(&self, access_token: &str, device: Uuid) -> anyhow::Result<()> {
+        let path = format!("/v1/devices/{device}");
+        let response = public(&self.http, self.target, reqwest::Method::DELETE, &path)
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .map_err(|error| error.without_url())
+            .context("revoke a device: request failed")?;
+        if response.status() != StatusCode::NO_CONTENT {
+            bail!("revoke a device: answered {}", response.status());
+        }
+        Ok(())
+    }
+
+    /// Resets the password of `email` through the link the worker delivers.
+    pub async fn reset_password(&self, email: &str) -> anyhow::Result<()> {
+        expect(
+            self.post("/v1/auth/password/forgot", json!({"email": email})),
+            StatusCode::ACCEPTED,
+            "ask for a password reset",
+        )
+        .await?;
+        let (token, _) = self.mailbox_token(email, "reset_password").await?;
+        let password = format!("smoke-{}", Uuid::now_v7());
+        expect(
+            self.post(
+                "/v1/auth/password/reset",
+                json!({"token": token, "password": password}),
+            ),
+            StatusCode::OK,
+            "reset the password",
+        )
+        .await?;
+        Ok(())
     }
 
     /// The token of the link in the newest `template` email to `email`, and how long it
