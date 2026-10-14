@@ -53,6 +53,9 @@ const SUBSCRIBE_WAIT: Duration = Duration::from_secs(2);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long to wait before reconnecting to Redis.
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
+/// How often the subscriber pings Redis: a connection that died without a word (a
+/// half-open TCP connection) would otherwise look idle forever.
+const PING_INTERVAL: Duration = Duration::from_secs(30);
 /// Server frames waiting for a busy connection; more are dropped (the client recovers
 /// them with `ListConversations` and `ListContacts`).
 const EVENT_BACKLOG: usize = 64;
@@ -104,13 +107,27 @@ pub enum Signal {
 impl Hub {
     /// A hub whose subscriber task listens on Redis through `client` until `shutdown`.
     pub fn start(client: redis::Client, shutdown: CancellationToken) -> (Self, JoinHandle<()>) {
+        Self::start_with(client, shutdown, PING_INTERVAL)
+    }
+
+    fn start_with(
+        client: redis::Client,
+        shutdown: CancellationToken,
+        ping_interval: Duration,
+    ) -> (Self, JoinHandle<()>) {
         let (commands, receiver) = mpsc::unbounded_channel();
         let hub = Self {
             members: Arc::default(),
             commands,
             connected: Arc::default(),
         };
-        let subscriber = tokio::spawn(subscribe(client, hub.clone(), receiver, shutdown));
+        let subscriber = tokio::spawn(subscribe(
+            client,
+            hub.clone(),
+            receiver,
+            shutdown,
+            ping_interval,
+        ));
         (hub, subscriber)
     }
 
@@ -409,7 +426,7 @@ async fn bounded(
         result = tokio::time::timeout(COMMAND_TIMEOUT, command) => match result {
             Ok(result) => Some(result.is_ok()),
             Err(_) => {
-                tracing::warn!("Redis did not answer a subscription command in time");
+                tracing::warn!("Redis did not answer the subscriber in time");
                 Some(false)
             }
         },
@@ -417,8 +434,9 @@ async fn bounded(
 }
 
 /// The subscriber task: keeps one Redis pub/sub connection, follows the hub's subscribe
-/// and unsubscribe commands, and dispatches what arrives. Reconnects after a break,
-/// subscribes again to every channel with a member and rings every connection.
+/// and unsubscribe commands, and dispatches what arrives. Pings Redis every
+/// `ping_interval` and reconnects when it does not answer within 5 s, as after any break:
+/// it subscribes again to every channel with a member and rings every connection.
 /// Connecting is retried while Redis is unavailable, and `shutdown` interrupts both the
 /// connection attempt and the wait between attempts at once.
 async fn subscribe(
@@ -426,6 +444,7 @@ async fn subscribe(
     hub: Hub,
     mut commands: mpsc::UnboundedReceiver<Command>,
     shutdown: CancellationToken,
+    ping_interval: Duration,
 ) {
     loop {
         let connection = tokio::select! {
@@ -450,9 +469,20 @@ async fn subscribe(
                     hub.connected.store(true, Ordering::SeqCst);
                     tracing::info!("subscribed to Redis");
                     hub.ring_all();
+                    let mut ping_at = tokio::time::Instant::now() + ping_interval;
                     loop {
                         tokio::select! {
                             () = shutdown.cancelled() => return,
+                            () = tokio::time::sleep_until(ping_at) => {
+                                let ping = async { sink.ping::<redis::Value>().await.map(|_| ()) };
+                                let Some(alive) = bounded(&shutdown, ping).await else {
+                                    return;
+                                };
+                                if !alive {
+                                    break;
+                                }
+                                ping_at = tokio::time::Instant::now() + ping_interval;
+                            }
                             command = commands.recv() => {
                                 let succeeded = match command {
                                     None => return,
@@ -770,6 +800,50 @@ mod tests {
         hub.dispatch(&kick_channel(device), &[0xff, 0xff]);
         hub.dispatch(&kick_channel(device), &Kick::default().encode_to_vec());
         assert_eq!(pending(&mut session), None);
+    }
+
+    /// A Redis that keeps the connection but stops answering, as behind a half-open TCP
+    /// connection, is given up after one unanswered PING; the hub connects again and
+    /// rings everyone, since notifications may have been lost meanwhile.
+    #[tokio::test]
+    async fn a_redis_that_stops_answering_is_left_and_everyone_rung() {
+        use testcontainers_modules::redis::Redis;
+        use testcontainers_modules::testcontainers::ImageExt;
+        use testcontainers_modules::testcontainers::runners::AsyncRunner;
+
+        let container = Redis::default()
+            .with_tag("7-alpine")
+            .start()
+            .await
+            .expect("start Redis (is Docker running?)");
+        let port = container.get_host_port_ipv4(6379).await.unwrap();
+        let client = redis::Client::open(format!("redis://127.0.0.1:{port}")).unwrap();
+        let shutdown = CancellationToken::new();
+        let (hub, subscriber) =
+            Hub::start_with(client.clone(), shutdown.clone(), Duration::from_millis(500));
+        for _ in 0..100 {
+            if hub.is_connected() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(hub.is_connected());
+        let (mut session, _, _) = connection(&hub, Uuid::now_v7()).await;
+
+        let mut admin = client.get_multiplexed_async_connection().await.unwrap();
+        let () = redis::cmd("CLIENT")
+            .arg("PAUSE")
+            .arg(8000)
+            .arg("ALL")
+            .query_async(&mut admin)
+            .await
+            .unwrap();
+        let signal = tokio::time::timeout(Duration::from_secs(20), session.next())
+            .await
+            .expect("rung after the reconnect");
+        assert_eq!(signal, Signal::Ring);
+        shutdown.cancel();
+        subscriber.await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]

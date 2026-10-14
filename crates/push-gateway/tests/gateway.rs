@@ -120,11 +120,12 @@ const AUDIENCE: &str = "ws://push.test/v1/socket";
 /// Redis, message-svc's API on the in-memory store, auth-svc's key set, and the gateway,
 /// on free ports.
 async fn stack() -> Stack {
-    stack_with(0).await
+    stack_with(0, Duration::from_secs(30)).await
 }
 
-/// As [`stack`], with message-svc failing its first `sync_failures` syncs.
-async fn stack_with(sync_failures: u32) -> Stack {
+/// As [`stack`], with message-svc failing its first `sync_failures` syncs, and the
+/// gateway announcing `heartbeat`.
+async fn stack_with(sync_failures: u32, heartbeat: Duration) -> Stack {
     let redis = Redis::default()
         .with_tag("7-alpine")
         .start()
@@ -173,7 +174,7 @@ async fn stack_with(sync_failures: u32) -> Stack {
         token_audience: AUDIENCE.to_owned(),
         listen_addr: gateway,
         health_addr: health.local_addr().unwrap(),
-        heartbeat: Duration::from_secs(30),
+        heartbeat,
         groups: false,
         client_ip_header: None,
     };
@@ -850,6 +851,20 @@ async fn too_many_frames_close_the_connection_with_4004() {
     assert_eq!(close_code(&mut socket).await, 4004);
 }
 
+/// A client that stops sending frames is gone (or behind a half-open connection): it is
+/// closed after two and a half heartbeats without a frame.
+#[tokio::test]
+async fn a_silent_client_is_closed_after_two_and_a_half_heartbeats() {
+    let stack = stack_with(0, Duration::from_secs(1)).await;
+    let (user, device) = person(&stack).await;
+    let mut socket = ready(&stack, user, device).await;
+    let started = std::time::Instant::now();
+    send(&mut socket, Body::Ping(Ping {})).await;
+    assert_eq!(next(&mut socket).await, Body::Pong(Pong {}));
+    assert_eq!(close_code(&mut socket).await, 1008);
+    assert!(started.elapsed() >= Duration::from_millis(2500));
+}
+
 /// A message over the 128 KiB limit ends the connection with 1009 (message too big).
 #[tokio::test]
 async fn an_oversized_frame_is_closed_with_1009() {
@@ -925,7 +940,7 @@ async fn a_backlog_larger_than_one_sync_batch_is_delivered_as_the_device_acks() 
 
 #[tokio::test]
 async fn a_failed_sync_is_retried() {
-    let stack = stack_with(1).await;
+    let stack = stack_with(1, Duration::from_secs(30)).await;
     let (_alice, (bob, bob_device), _conversation) = chat_with_backlog(&stack, 1).await;
 
     let mut socket = connect(&stack).await;

@@ -3,6 +3,7 @@
 //! their user's channel. It holds no database credentials and no business rules.
 
 mod config;
+mod drain;
 mod hub;
 mod limits;
 mod server;

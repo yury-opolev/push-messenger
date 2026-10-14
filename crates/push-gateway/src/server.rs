@@ -29,6 +29,7 @@ use tonic::transport::{Channel, Endpoint};
 use uuid::Uuid;
 
 use crate::config::Config;
+use crate::drain::Drain;
 use crate::hub::{Hub, Membership, Signal};
 use crate::limits::{Action, FrameBudget, Limits, RedisCounter, Refused, Subject};
 use crate::session::{RetryDelay, Session, Step, error_frame};
@@ -49,6 +50,13 @@ const KEYS_REFRESH: Duration = Duration::from_secs(300);
 const KEYS_RETRY: Duration = Duration::from_secs(2);
 /// How long a Redis command (other than the subscriber's) may take.
 const REDIS_TIMEOUT: Duration = Duration::from_millis(500);
+/// How long sending one frame may take; a client that does not read is cut off.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long sending a close frame may take.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Every connection syncs this often even without a ring, so entries arrive while Redis
+/// is lost or a notification was (spec §12, test 4).
+const SWEEP_INTERVAL: Duration = Duration::from_secs(300);
 
 #[derive(Clone)]
 struct App {
@@ -60,6 +68,7 @@ struct App {
     redis: ConnectionManager,
     limits: Limits,
     sessions: TaskTracker,
+    drain: Arc<Drain>,
     shutdown: CancellationToken,
 }
 
@@ -74,9 +83,15 @@ pub async fn serve(
     health: TcpListener,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
+    // HTTP/2 pings find a message-svc connection that died without a word (a half-open
+    // TCP connection), so calls do not wait for a peer that is gone.
     let endpoint = Endpoint::from_shared(config.message_svc_url.clone())?
         .connect_timeout(Duration::from_secs(2))
-        .timeout(Duration::from_secs(10));
+        .timeout(Duration::from_secs(10))
+        .http2_keep_alive_interval(Duration::from_secs(30))
+        .keep_alive_timeout(Duration::from_secs(10))
+        .keep_alive_while_idle(true)
+        .tcp_keepalive(Some(Duration::from_secs(60)));
     let messaging = MessagingClient::new(endpoint.connect_lazy());
     // The error is not passed on: the URL carries the Redis password.
     let redis = redis::Client::open(config.redis_url.as_str())
@@ -104,6 +119,7 @@ pub async fn serve(
         ))),
         redis: publisher,
         sessions: sessions.clone(),
+        drain: Arc::default(),
         shutdown: shutdown.clone(),
     };
 
@@ -123,7 +139,8 @@ pub async fn serve(
     .with_graceful_shutdown(shutdown.clone().cancelled_owned())
     .await?;
 
-    // Upgraded connections outlive the HTTP server; each closes itself with 4005.
+    // Upgraded connections outlive the HTTP server; each closes itself with 4005, a
+    // hundred every 50 ms.
     sessions.close();
     if tokio::time::timeout(DRAIN_TIMEOUT, sessions.wait())
         .await
@@ -251,6 +268,10 @@ async fn connection(mut socket: WebSocket, app: App, ip: IpAddr) {
     if send(&mut connected.socket, ready).await.is_err() || connected.deliver().await.is_err() {
         return;
     }
+    // Clients ping every heartbeat; one silent for two and a half is gone.
+    let idle = app.config.heartbeat * 5 / 2;
+    let mut idle_at = Instant::now() + idle;
+    let mut sweep_at = Instant::now() + first_sweep(membership.connection());
     loop {
         let retry_at = connected.retry_at;
         let (warn_at, warned, deadline) = (
@@ -260,8 +281,19 @@ async fn connection(mut socket: WebSocket, app: App, ip: IpAddr) {
         );
         tokio::select! {
             () = app.shutdown.cancelled() => {
+                tokio::time::sleep(app.drain.next_delay()).await;
                 close_with(&mut connected.socket, close::SHUTTING_DOWN, "server shutting down").await;
                 return;
+            }
+            () = tokio::time::sleep_until(idle_at) => {
+                close_with(&mut connected.socket, close::POLICY_VIOLATION, "no frame within two and a half heartbeats").await;
+                return;
+            }
+            () = tokio::time::sleep_until(sweep_at) => {
+                sweep_at = Instant::now() + SWEEP_INTERVAL;
+                if connected.deliver().await.is_err() {
+                    return;
+                }
             }
             signal = membership.next() => {
                 let done = match signal {
@@ -294,6 +326,7 @@ async fn connection(mut socket: WebSocket, app: App, ip: IpAddr) {
                 return;
             }
             message = connected.socket.recv() => {
+                idle_at = Instant::now() + idle;
                 if matches!(message, Some(Ok(Message::Binary(_) | Message::Text(_))))
                     && !connected.budget.spend()
                 {
@@ -332,6 +365,13 @@ async fn refuse_oversized(socket: &mut WebSocket, error: axum::Error) {
     if oversized {
         close_with(socket, close::MESSAGE_TOO_BIG, "a frame is at most 128 KiB").await;
     }
+}
+
+/// When a connection first sweeps: somewhere in the first five minutes, from its id, so
+/// connections that came together do not sweep together.
+fn first_sweep(connection_id: Uuid) -> Duration {
+    let spread = u64::from(connection_id.as_bytes()[15]) * SWEEP_INTERVAL.as_secs() / 256;
+    Duration::from_secs(spread.max(1))
 }
 
 fn far_future() -> Instant {
@@ -851,11 +891,13 @@ impl Connected {
     }
 }
 
+/// Sends one frame. A client that does not take it within 10 s is cut off.
 async fn send(socket: &mut WebSocket, body: Body) -> Result<(), Closed> {
-    socket
-        .send(Message::Binary(encode_frame(body).into()))
-        .await
-        .map_err(|_| Closed)
+    let message = Message::Binary(encode_frame(body).into());
+    match tokio::time::timeout(WRITE_TIMEOUT, socket.send(message)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) | Err(_) => Err(Closed),
+    }
 }
 
 async fn close_with(socket: &mut WebSocket, code: u16, reason: &'static str) {
@@ -863,7 +905,7 @@ async fn close_with(socket: &mut WebSocket, code: u16, reason: &'static str) {
         code,
         reason: reason.into(),
     };
-    let _ = socket.send(Message::Close(Some(frame))).await;
+    let _ = tokio::time::timeout(CLOSE_TIMEOUT, socket.send(Message::Close(Some(frame)))).await;
 }
 
 /// Structured JSON logs on stdout. The level comes from `RUST_LOG` (default `info`).
