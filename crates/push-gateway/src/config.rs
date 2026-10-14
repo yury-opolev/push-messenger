@@ -3,6 +3,8 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use axum::http::HeaderName;
+
 /// How the gateway runs. Read from the environment by [`Config::from_env`]:
 ///
 /// | Variable | Meaning | Default |
@@ -15,6 +17,7 @@ use std::time::Duration;
 /// | `PUSH_HEALTH_ADDR` | address of `/healthz` and `/readyz` | `0.0.0.0:8081` |
 /// | `PUSH_HEARTBEAT_MS` | client ping interval announced in `Ready` | `30000` |
 /// | `PUSH_GROUPS` | `1` serves group requests; `0` refuses them with `NOT_AVAILABLE` (groups are not offered to apps in the first release) | `0` |
+/// | `PUSH_CLIENT_IP_HEADER` | header with the client's IP, set by the ingress (`x-real-ip`); its last line, then last entry is used | the peer address |
 ///
 /// `PUSH_DEV_AUTH=1` (the DEV ONLY identities without a token, removed in Plan 8) is
 /// refused, so a deployment that still expects it fails at start-up.
@@ -29,6 +32,9 @@ pub struct Config {
     pub heartbeat: Duration,
     /// Whether group requests are served.
     pub groups: bool,
+    /// Where the ingress puts the client's IP, for the per-IP rate limits; without it the
+    /// peer address counts. Only trust a header the proxy in front overwrites.
+    pub client_ip_header: Option<HeaderName>,
 }
 
 // The Redis URL carries a password, so it never appears in debug output.
@@ -44,6 +50,7 @@ impl std::fmt::Debug for Config {
             .field("health_addr", &self.health_addr)
             .field("heartbeat", &self.heartbeat)
             .field("groups", &self.groups)
+            .field("client_ip_header", &self.client_ip_header)
             .finish()
     }
 }
@@ -93,6 +100,17 @@ impl Config {
                 });
             }
         }
+        let client_ip_header =
+            match lookup("PUSH_CLIENT_IP_HEADER").filter(|v| !v.is_empty()) {
+                None => None,
+                Some(value) => Some(HeaderName::try_from(value.as_str()).map_err(|_| {
+                    ConfigError::Invalid {
+                        name: "PUSH_CLIENT_IP_HEADER",
+                        value: value.clone(),
+                        reason: "not a header name".to_owned(),
+                    }
+                })?),
+            };
         let auth_url = required("PUSH_AUTH_URL")?;
         if !(auth_url.starts_with("http://") || auth_url.starts_with("https://")) {
             return Err(ConfigError::Invalid {
@@ -110,6 +128,7 @@ impl Config {
             health_addr: parsed(&lookup, "PUSH_HEALTH_ADDR", ([0, 0, 0, 0], 8081).into())?,
             heartbeat: Duration::from_millis(heartbeat_ms),
             groups: flag(&lookup, "PUSH_GROUPS")?,
+            client_ip_header,
         })
     }
 
@@ -185,6 +204,20 @@ mod tests {
         assert_eq!(config.health_addr, "0.0.0.0:8081".parse().unwrap());
         assert_eq!(config.heartbeat, Duration::from_secs(30));
         assert!(!config.groups, "groups are off unless switched on");
+        assert_eq!(config.client_ip_header, None);
+    }
+
+    #[test]
+    fn the_client_ip_header_is_a_header_name() {
+        let mut variables = REQUIRED.to_vec();
+        variables.push(("PUSH_CLIENT_IP_HEADER", "X-Real-IP"));
+        assert_eq!(
+            config(&variables).unwrap().client_ip_header,
+            Some(HeaderName::from_static("x-real-ip"))
+        );
+        variables.pop();
+        variables.push(("PUSH_CLIENT_IP_HEADER", "not a header"));
+        assert!(config(&variables).is_err());
     }
 
     #[test]

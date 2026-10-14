@@ -37,6 +37,7 @@ Check 'default: the gateway checks tokens with auth-svc''s keys, for its own URL
     $gateway = Doc $default 'Deployment' 'push-gateway'
     $gateway -match 'name: PUSH_AUTH_URL\s+value: "http://push-auth:8080"' -and
         $gateway -match 'name: PUSH_TOKEN_AUDIENCE\s+value: "wss://push.example.com/v1/socket"' -and
+        $gateway -match 'name: PUSH_CLIENT_IP_HEADER\s+value: x-real-ip' -and
         $default -notmatch 'PUSH_DEV_AUTH'
 }
 Check 'default: groups are refused; one switch serves them' {

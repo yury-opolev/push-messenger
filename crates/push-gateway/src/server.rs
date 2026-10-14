@@ -1,13 +1,14 @@
 //! Running the gateway: the WebSocket endpoint, one task per connection, the token keys,
 //! the health endpoints and graceful shutdown.
 
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::Router;
-use axum::extract::State;
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
-use axum::http::StatusCode;
+use axum::extract::{ConnectInfo, State};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use axum::routing::get;
 use prost::Message as _;
@@ -29,6 +30,7 @@ use uuid::Uuid;
 
 use crate::config::Config;
 use crate::hub::{Hub, Membership, Signal};
+use crate::limits::{Action, FrameBudget, Limits, RedisCounter, Refused, Subject};
 use crate::session::{RetryDelay, Session, Step, error_frame};
 use crate::tokens::{Claims, TokenError, Verifier};
 
@@ -56,6 +58,7 @@ struct App {
     hub: Hub,
     /// Publishes takeovers on `kick:{device_id}`.
     redis: ConnectionManager,
+    limits: Limits,
     sessions: TaskTracker,
     shutdown: CancellationToken,
 }
@@ -95,6 +98,10 @@ pub async fn serve(
         messaging,
         verifier: verifier.clone(),
         hub: hub.clone(),
+        limits: Limits::new(Arc::new(RedisCounter::new(
+            publisher.clone(),
+            shutdown.clone(),
+        ))),
         redis: publisher,
         sessions: sessions.clone(),
         shutdown: shutdown.clone(),
@@ -109,9 +116,12 @@ pub async fn serve(
         .route("/v1/socket", get(upgrade))
         .with_state(app);
     tracing::info!(addr = %listen_addr, "serving WebSockets");
-    axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown.clone().cancelled_owned())
-        .await?;
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown.clone().cancelled_owned())
+    .await?;
 
     // Upgraded connections outlive the HTTP server; each closes itself with 4005.
     sessions.close();
@@ -183,16 +193,37 @@ fn health_router(verifier: Verifier, shutdown: CancellationToken) -> Router {
 /// its payload is buffered, and the client may only see the connection drop.
 const MAX_WEBSOCKET_FRAME: usize = 4 * MAX_FRAME_BYTES;
 
-async fn upgrade(upgrade: WebSocketUpgrade, State(app): State<App>) -> Response {
+async fn upgrade(
+    upgrade: WebSocketUpgrade,
+    State(app): State<App>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Response {
+    let ip = client_ip(&headers, app.config.client_ip_header.as_ref(), peer);
     let sessions = app.sessions.clone();
     upgrade
         .max_message_size(MAX_FRAME_BYTES)
         .max_frame_size(MAX_WEBSOCKET_FRAME)
-        .on_upgrade(move |socket| sessions.track_future(connection(socket, app)))
+        .on_upgrade(move |socket| sessions.track_future(connection(socket, app, ip)))
+}
+
+/// The client's IP: the last entry of the last line of the configured header, which the
+/// proxy in front overwrites or appends to (`X-Real-IP` on ingress-nginx); else the peer.
+fn client_ip(
+    headers: &HeaderMap,
+    header: Option<&axum::http::HeaderName>,
+    peer: SocketAddr,
+) -> IpAddr {
+    header
+        .and_then(|name| headers.get_all(name).iter().next_back())
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.rsplit(',').next())
+        .and_then(|last| last.trim().parse().ok())
+        .unwrap_or(peer.ip())
 }
 
 /// One client connection, from `Identify` to close.
-async fn connection(mut socket: WebSocket, app: App) {
+async fn connection(mut socket: WebSocket, app: App, ip: IpAddr) {
     let mut session = Session::new(app.config.groups);
     let Some((claims, mut membership)) = identify(&mut socket, &mut session, &app).await else {
         return;
@@ -207,6 +238,9 @@ async fn connection(mut socket: WebSocket, app: App) {
         session,
         messaging: app.messaging.clone(),
         verifier: app.verifier.clone(),
+        limits: app.limits.clone(),
+        ip,
+        budget: FrameBudget::new(),
         user: claims.user,
         device: claims.device,
         expiry: Expiry::new(claims.expires_at),
@@ -260,6 +294,13 @@ async fn connection(mut socket: WebSocket, app: App) {
                 return;
             }
             message = connected.socket.recv() => {
+                if matches!(message, Some(Ok(Message::Binary(_) | Message::Text(_))))
+                    && !connected.budget.spend()
+                {
+                    tracing::info!(device = %connected.device, "too many frames");
+                    close_with(&mut connected.socket, close::RATE_LIMITED, "too many frames; slow down").await;
+                    return;
+                }
                 let step = match message {
                     Some(Ok(Message::Binary(bytes))) => connected.session.on_binary(&bytes),
                     Some(Ok(Message::Text(_))) => connected.session.on_text(),
@@ -355,6 +396,20 @@ async fn identify(
             return None;
         }
     };
+    let device = Subject {
+        device: Some(claims.device),
+        ..Subject::default()
+    };
+    // Fails open: devices keep connecting while Redis is down.
+    if let Err(Refused::Limited { .. }) = app.limits.check(Action::Identify, device).await {
+        close_with(
+            socket,
+            close::RATE_LIMITED,
+            "too many connections; back off",
+        )
+        .await;
+        return None;
+    }
     // Taken now, not when the socket opened: a connection that starts watching later is the
     // newer one, so its takeover wins even if it opened first and its token check stalled.
     let connection_id = Uuid::now_v7();
@@ -384,6 +439,31 @@ async fn verify(verifier: &Verifier, token: &str) -> Result<Claims, TokenError> 
         return Err(TokenError::Expired);
     }
     Ok(claims)
+}
+
+/// The error for a request a rate limit refused: retryable either way, after the window
+/// ends or once the counters answer again (fail closed).
+fn limited(refused: Refused, request_id: u64) -> Error {
+    let (code, message, retry_after_s) = match refused {
+        Refused::Limited { retry_after_s } => (
+            ErrorCode::RateLimited,
+            "too many requests of this kind; retry later",
+            retry_after_s,
+        ),
+        Refused::Unavailable => (
+            ErrorCode::Unavailable,
+            "the rate limits cannot be checked now; retry",
+            1,
+        ),
+    };
+    Error {
+        code: code.into(),
+        message: message.to_owned(),
+        retryable: true,
+        client_msg_id: None,
+        request_id: Some(request_id),
+        retry_after_s: Some(retry_after_s),
+    }
 }
 
 /// Tells any other connection of the device, on any gateway, to close: the newest
@@ -532,6 +612,9 @@ struct Connected {
     session: Session,
     messaging: MessagingClient<Channel>,
     verifier: Verifier,
+    limits: Limits,
+    ip: IpAddr,
+    budget: FrameBudget,
     user: Uuid,
     device: Uuid,
     expiry: Expiry,
@@ -618,6 +701,17 @@ impl Connected {
             }
             Step::Request(request) => {
                 let request_id = request.request_id;
+                if let Some(action) = request.body.as_ref().and_then(Action::of) {
+                    let who = Subject {
+                        ip: Some(self.ip),
+                        user: Some(self.user),
+                        device: None,
+                    };
+                    if let Err(refused) = self.limits.check(action, who).await {
+                        let error = limited(refused, request_id);
+                        return send(&mut self.socket, Body::Error(error)).await;
+                    }
+                }
                 let call = RequestCall {
                     user_id: id_bytes(self.user),
                     request: Some(request),

@@ -22,9 +22,9 @@ use push_proto::v1;
 use push_proto::v1::frame::Body;
 use push_proto::v1::{
     Ack, AuthExpiring, Contact, ContactAccept, ContactEvent, ContactRequest, ContactState,
-    ContentType, CreateGroup, Delete, DirectReceipt, Edit, ErrorCode, Identify, ListConversations,
-    OpenDirect, Ping, Pong, ReAuth, ReadPosition, ReadUpTo, Receipt, Send, SendAck, delete, edit,
-    receipt, request, response,
+    ContentType, CreateGroup, Delete, DirectReceipt, Edit, ErrorCode, Identify, ListContacts,
+    ListConversations, OpenDirect, Ping, Pong, ReAuth, ReadPosition, ReadUpTo, Receipt,
+    RedeemInvite, Send, SendAck, delete, edit, receipt, request, response,
 };
 use push_proto::{MAX_FRAME_BYTES, decode_frame, encode_frame, id, id_bytes};
 use testcontainers_modules::redis::Redis;
@@ -175,6 +175,7 @@ async fn stack_with(sync_failures: u32) -> Stack {
         health_addr: health.local_addr().unwrap(),
         heartbeat: Duration::from_secs(30),
         groups: false,
+        client_ip_header: None,
     };
     let shutdown = CancellationToken::new();
     let server = tokio::spawn(serve(config, listener, health, shutdown.clone()));
@@ -802,6 +803,51 @@ async fn requests_edits_deletes_and_reads_go_through_and_group_requests_are_refu
         1,
         "only the direct conversation"
     );
+}
+
+/// Invite codes cannot be guessed at speed: after 20 redeems in an hour a user is told to
+/// wait, whatever the codes (spec §5.5).
+#[tokio::test]
+async fn redeeming_invites_is_rate_limited() {
+    let stack = stack().await;
+    let (user, device) = person(&stack).await;
+    let mut socket = ready(&stack, user, device).await;
+    for attempt in 1..=20 {
+        let guess = request::Body::RedeemInvite(RedeemInvite {
+            code: "0000000000".to_owned(),
+        });
+        let Body::Error(error) = request(&mut socket, attempt, guess).await else {
+            panic!("a made-up code was redeemed");
+        };
+        assert_eq!(error.code(), ErrorCode::InviteNotFound);
+    }
+    let guess = request::Body::RedeemInvite(RedeemInvite {
+        code: "0000000000".to_owned(),
+    });
+    let Body::Error(error) = request(&mut socket, 21, guess).await else {
+        panic!("a made-up code was redeemed");
+    };
+    assert_eq!(error.code(), ErrorCode::RateLimited);
+    assert!(error.retryable);
+    assert!(error.retry_after_s.is_some_and(|seconds| seconds > 3000));
+    // Other requests still work.
+    let list = request::Body::ListContacts(ListContacts {});
+    assert!(matches!(
+        request(&mut socket, 22, list).await,
+        Body::Response(_)
+    ));
+}
+
+/// A connection that floods the gateway with frames is closed with 4004.
+#[tokio::test]
+async fn too_many_frames_close_the_connection_with_4004() {
+    let stack = stack().await;
+    let (user, device) = person(&stack).await;
+    let mut socket = ready(&stack, user, device).await;
+    for _ in 0..150 {
+        send(&mut socket, Body::Ping(Ping {})).await;
+    }
+    assert_eq!(close_code(&mut socket).await, 4004);
 }
 
 /// A message over the 128 KiB limit ends the connection with 1009 (message too big).

@@ -2098,6 +2098,7 @@ name = "push-gateway"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "futures-util",
  "jsonwebtoken",
@@ -2110,6 +2111,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "testcontainers-modules",
  "thiserror",
  "tokio",

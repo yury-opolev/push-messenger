@@ -131,6 +131,7 @@ async fn the_smoke_test_passes_against_the_whole_stack() {
             health_addr: gateway_health.local_addr().unwrap(),
             heartbeat: Duration::from_secs(30),
             groups: false,
+            client_ip_header: None,
         },
         listener,
         gateway_health,
