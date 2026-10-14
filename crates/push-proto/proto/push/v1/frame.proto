@@ -350,6 +350,7 @@ message Invite {
 
 // Read case-insensitively; dashes and spaces are ignored. An unknown, revoked, expired or
 // used-up code, and one whose creator has blocked the caller, are all INVITE_NOT_FOUND.
+// Redeeming your own code is INVALID; redeeming the code of someone you blocked is BLOCKED.
 message RedeemInvite {
   string code = 1;
 }
