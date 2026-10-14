@@ -141,6 +141,26 @@ echo '  auth-svc answers on the same port: http://127.0.0.1:8080/v1/auth/..., /v
 echo '  the worker takes signed Resend webhooks at http://127.0.0.1:8080/v1/webhooks/resend.'
 
 if [[ "$smoke" == true ]]; then
+  # The DEV ONLY mailbox is in the worker's memory. `helm upgrade --wait` returns once the new
+  # worker is ready, but the old pod can still claim and deliver the verification email into
+  # its own mailbox; wait until only the new one remains (terminating pods count).
+  worker_selector="app.kubernetes.io/name=worker,app.kubernetes.io/instance=$release"
+  step 'wait for the old worker pod to go away'
+  deadline=$((SECONDS + 90))
+  while true; do
+    mapfile -t worker_pods < <(kubectl --context "$cluster" -n "$namespace" get pods -l "$worker_selector" -o name)
+    echo "worker pods: ${#worker_pods[@]} (${worker_pods[*]})"
+    if [[ "${#worker_pods[@]}" -eq 1 ]]; then
+      break
+    fi
+    if [[ "$SECONDS" -gt "$deadline" ]]; then
+      echo "more than one worker pod (${#worker_pods[@]}) after 90 s; the smoke test needs exactly one" >&2
+      exit 1
+    fi
+    sleep 2
+  done
+  step 'wait for the worker pod to be Ready'
+  kubectl --context "$cluster" -n "$namespace" wait --for=condition=Ready pod -l "$worker_selector" --timeout=90s
   step 'run the smoke test'
   helm test "$release" --kube-context "$cluster" --namespace "$namespace" --logs --timeout 5m
 fi
