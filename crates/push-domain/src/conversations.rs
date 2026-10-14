@@ -62,6 +62,7 @@ where
             return Ok(existing);
         }
 
+        tx.lock_users(&[me, peer]).await?;
         for user in [me, peer] {
             tx.insert_member(Member {
                 conversation_id: id,

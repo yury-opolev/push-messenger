@@ -74,6 +74,7 @@ where
         if !tx.user_exists(user).await? {
             return Err(DomainError::UnknownUser);
         }
+        tx.lock_users(&[user]).await?;
         if !tx.insert_device(device, user).await? {
             return Err(DomainError::UnknownDevice);
         }
@@ -95,6 +96,7 @@ where
     pub async fn device_registered(&self, device: DeviceId, user: UserId) -> DomainResult<()> {
         let mut tx = self.store.begin().await?;
         tx.insert_user(user).await?;
+        tx.lock_users(&[user]).await?;
         if tx.insert_device(device, user).await? {
             create_cursors(&mut tx, device, user).await?;
         } else if tx.device_user(device).await? != Some(user) {
@@ -149,7 +151,9 @@ where
 }
 
 /// Starts a new device up to date in every conversation of its user, including ones the
-/// user has left (up to where they left).
+/// user has left (up to where they left). The caller holds the user's lock
+/// ([`Tx::lock_users`]), so no membership of the user is being created meanwhile: every
+/// membership gets a position, here or by the join.
 async fn create_cursors<T: Tx>(tx: &mut T, device: DeviceId, user: UserId) -> DomainResult<()> {
     for (conversation, member) in tx.memberships(user).await? {
         let position = member.visible_upper(conversation.last_seq);

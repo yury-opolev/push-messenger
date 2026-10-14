@@ -210,6 +210,18 @@ impl Tx for PgTx {
         Ok(())
     }
 
+    async fn lock_users(&mut self, users: &[UserId]) -> DomainResult<()> {
+        let keys = locks::users(users);
+        // A function scan over the array yields its elements in order, so the locks are
+        // taken in the sorted order of their keys.
+        sqlx::query("SELECT pg_advisory_xact_lock(key) FROM unnest($1::bigint[]) AS key")
+            .bind(keys)
+            .execute(self.conn())
+            .await
+            .map_err(store_error)?;
+        Ok(())
+    }
+
     async fn get_contact(
         &mut self,
         owner: UserId,

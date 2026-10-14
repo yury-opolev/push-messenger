@@ -288,6 +288,11 @@ impl Tx for InMemoryTx {
         Ok(())
     }
 
+    async fn lock_users(&mut self, _users: &[UserId]) -> DomainResult<()> {
+        // Every in-memory transaction already holds the store-wide lock.
+        Ok(())
+    }
+
     async fn get_contact(
         &mut self,
         owner: UserId,

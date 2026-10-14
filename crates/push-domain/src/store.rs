@@ -30,13 +30,21 @@
 //! conversation lock: appends and group changes take the conversation lock through
 //! [`Tx::next_seq`] first, acks and reads take only the positions lock.
 //!
+//! User locks ([`Tx::lock_users`]) come last. The global order is: contact pair (`open_direct`)
+//! → conversation row ([`Tx::next_seq`]) → conversation positions → users. `add_members`
+//! takes the positions lock while it reads the group's positions, before it locks the
+//! users it adds, so never take user locks before the positions lock in a path that also
+//! takes positions. A device registration takes only its user's lock. A transaction takes
+//! its user locks in one call, so no two transactions wait for each other's user locks in
+//! a cycle.
+//!
 //! # Delivery positions
 //!
-//! Positions are created eagerly, so a device normally has one for every membership of its
-//! user. One can still be missing: a device registered concurrently with a membership
-//! change reads the memberships before the new member row commits. Readers fall back to
-//! `visible_from_seq - 1`, so [`Tx::sync_positions`] starts from the memberships and
-//! joins the positions to them, never the other way round.
+//! Positions are created eagerly, so a device has one for every membership of its user:
+//! registrations and joins of the same user are serialised by [`Tx::lock_users`]. Readers
+//! still treat a missing position as `visible_from_seq - 1`, so [`Tx::sync_positions`]
+//! starts from the memberships and joins the positions to them, never the other way
+//! round.
 //!
 //! [`DomainError::Conflict`]: crate::error::DomainError::Conflict
 
@@ -90,6 +98,14 @@ pub trait Tx: Send {
     /// The user's active devices.
     /// The order of the result is unspecified.
     async fn devices_of_user(&mut self, user: UserId) -> DomainResult<Vec<DeviceId>>;
+    /// Serialises, until the transaction ends, every operation that pairs these users'
+    /// devices with their conversations: registering a device of one of them, and making
+    /// one of them a member of a conversation. Each such transaction calls it once, before
+    /// it reads the devices or the memberships, so a registration and a join of the same
+    /// user never miss each other's uncommitted rows. The locks are taken in one fixed
+    /// order, whatever the order of `users`; duplicates are ignored.
+    /// Postgres: transaction-scoped advisory locks on a namespaced hash of each user id.
+    async fn lock_users(&mut self, users: &[UserId]) -> DomainResult<()>;
 
     // --- Contacts: one row per direction -----------------------------------------------
 
@@ -161,8 +177,6 @@ pub trait Tx: Send {
     /// The order of the result is unspecified.
     async fn members(&mut self, conversation: ConversationId) -> DomainResult<Vec<Member>>;
     /// Every conversation the user is, or was, a member of.
-    /// A device registered concurrently with a membership change may lack a delivery
-    /// position; callers treat a missing position as `visible_from_seq - 1`.
     /// Each returned `Conversation` (including `last_seq`) must be read in the same
     /// statement as its `Member` row, so `last_seq` is consistent with the membership.
     /// The order of the result is unspecified.
