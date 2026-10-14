@@ -9,11 +9,11 @@
 //! | `email.send` | `{user_id, to, template, params}` |
 //! | `user.verified` | `{user_id}` |
 //! | `user.password_reset` | `{user_id, reset_at}`: every device of the user is to be kicked |
+//! | `device.registered` | `{user_id, device_id}` |
+//! | `device.revoked` | `{user_id, device_id}` |
 //!
 //! `reset_at` is in seconds since the Unix epoch, from the clock that sets the access
 //! tokens' `iat`: message-svc refuses the tokens issued no later than that second.
-//! | `device.registered` | `{user_id, device_id}` |
-//! | `device.revoked` | `{user_id, device_id}` |
 
 use serde_json::{Value, json};
 use sqlx::PgConnection;

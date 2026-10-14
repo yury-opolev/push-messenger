@@ -62,7 +62,8 @@ service Accounts {
   // user.password_reset: every active device of the user is kicked
   // (`kick:{device_id}`), to sign in again, and Identify refuses the access tokens issued
   // no later than the second of `reset_at` (message-svc's own clock when it is 0). The
-  // latest reset counts: a repeated or an older event moves nothing.
+  // latest reset counts: a repeated or an older event moves nothing, except one without
+  // `reset_at`, which takes message-svc's clock again on every delivery.
   rpc PasswordReset(AccountUser) returns (AccountsResponse);
 }
 

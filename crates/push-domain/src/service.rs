@@ -135,7 +135,8 @@ where
     ///
     /// The devices stay registered. Idempotent and correct in any order: the user is
     /// recorded if message-svc has not heard of them yet, the latest reset is kept, so a
-    /// redelivered or older event moves nothing, and the kick carries the latest reset,
+    /// redelivered or older event moves nothing (except one without `reset_at`, which
+    /// takes message-svc's clock again on every delivery), and the kick carries the latest reset,
     /// so it spares a session that signed in after it.
     pub async fn password_reset(
         &self,
