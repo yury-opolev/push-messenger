@@ -213,7 +213,7 @@ for 1 and 3, what Plan 8 builds), not this plan's code.
 
 ## Review fixes made after the plan was written
 
-Task 1, 2, 5, 6 and 7 code blocks below were synced to the committed files.
+Task 1, 2, 5, 6, 7 and 8 code blocks below were synced to the committed files.
 
 - **Lock order.** The comment in push-domain `store.rs` and decision 3 read: contact pair /
   conversation row → positions → users.
@@ -7634,6 +7634,8 @@ with
 struct Relations {
     pairs: Mutex<Vec<(Uuid, Uuid)>>,
     down: AtomicBool,
+    /// Ids the answer contains although nobody asked for them.
+    extra: Mutex<Vec<Uuid>>,
 }
 
 impl Relations {
@@ -7654,11 +7656,13 @@ impl Directory for Relations {
             return Err(AuthError::Unavailable);
         }
         let pairs = self.pairs.lock().unwrap();
-        Ok(candidates
+        let mut visible: Vec<Uuid> = candidates
             .iter()
             .copied()
             .filter(|user| *user == caller || pairs.contains(&(caller, *user)))
-            .collect())
+            .collect();
+        visible.extend(self.extra.lock().unwrap().iter().copied());
+        Ok(visible)
     }
 }
 ```
@@ -7761,6 +7765,27 @@ async fn profiles_are_shown_only_to_related_users() {
     let answer = call(&world, Method::GET, &ask(&[id(&bob)]), Some(access), None).await;
     assert_eq!(answer.status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(answer.json()["error"]["retryable"], true);
+}
+
+#[tokio::test]
+async fn a_profile_nobody_asked_for_is_never_returned() {
+    let world = world().await;
+    let alice = with_device(&world, "alice").await;
+    let bob = with_device(&world, "bob").await;
+    let carol = with_device(&world, "carol").await;
+    let id = |tokens: &Value| Uuid::parse_str(tokens["user_id"].as_str().unwrap()).unwrap();
+    world.directory.relate(id(&alice), id(&bob));
+    // message-svc's answer wrongly contains Carol, whom Alice did not ask for.
+    world.directory.extra.lock().unwrap().push(id(&carol));
+    let access = alice["access_token"].as_str().unwrap();
+
+    let uri = format!("/v1/users?ids={}", id(&bob));
+    let answer = call(&world, Method::GET, &uri, Some(access), None).await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.text);
+    let users = answer.json()["users"].as_array().unwrap().clone();
+    assert_eq!(users.len(), 1, "{}", answer.text);
+    assert_eq!(users[0]["handle"], "bob");
+    assert!(!answer.text.contains("carol"), "{}", answer.text);
 }
 ```
 
@@ -8012,7 +8037,9 @@ async fn profiles(
 ) -> Result<Response, AuthError> {
     let caller = caller(&api, &headers).await?;
     let ids = rules::user_ids(&query.ids)?;
-    let visible = api.directory.visible_users(caller.user_id, &ids).await?;
+    let mut visible = api.directory.visible_users(caller.user_id, &ids).await?;
+    // Defence in depth: never show a profile that was not asked for, whatever the answer.
+    visible.retain(|user| ids.binary_search(user).is_ok());
     let profiles = api.auth.profiles(&visible).await?;
     let users: Vec<Value> = profiles
         .iter()
@@ -8325,7 +8352,7 @@ git add Cargo.lock crates
 git commit -m "feat(auth): GET /v1/users?ids= shows profiles message-svc allows"
 ```
 
-Expected: 808 tests pass, no warnings, no diff.
+Expected: 821 tests pass, no warnings, no diff.
 
 ---
 
@@ -8464,7 +8491,7 @@ cargo test --workspace --locked
 cargo +1.85 test --workspace --locked
 ```
 
-Expected: no diff, no warnings, 808 tests on both toolchains.
+Expected: no diff, no warnings, 821 tests on both toolchains.
 
 - [ ] **Step 5: Commit and push**
 
@@ -8478,7 +8505,7 @@ git push -u origin feature/plan-07a-message-service
 
 ```powershell
 $body = @'
-Implements docs/superpowers/plans/2026-10-13-plan-07a-message-service.md: message-svc serves the whole messaging core over gRPC for the gateway to call on behalf of an identified device. New client frames Edit, Delete, ReadUpTo, Request and Response (frame.proto; the gateway carries them in Plan 8) and Messaging RPCs Edit, Delete, ReadUpTo and Request cover contacts, invites, direct conversations, groups of up to 100 with admins, read positions, 48-hour edits and deletes, history and listings with unread counts and receipts. Relayed revocations and password resets kick devices on kick:{device_id}. A Directory API behind auth-svc's own token says whose profiles a user may see, and auth-svc serves GET /v1/users?ids= from it. Review fixes: a per-user advisory lock serialises device registrations with joins (a repeated device.registered could start a device past messages it never received; proven by a Postgres concurrency case), every domain error has its own code, error details are a google.rpc.Status with the client error as an Any, sync is documented as a read, and /readyz is checked against the pre-bound listener. 808 tests.
+Implements docs/superpowers/plans/2026-10-13-plan-07a-message-service.md: message-svc serves the whole messaging core over gRPC for the gateway to call on behalf of an identified device. New client frames Edit, Delete, ReadUpTo, Request and Response (frame.proto; the gateway carries them in Plan 8) and Messaging RPCs Edit, Delete, ReadUpTo and Request cover contacts, invites, direct conversations, groups of up to 100 with admins, read positions, 48-hour edits and deletes, history and listings with unread counts and receipts. Relayed revocations and password resets kick devices on kick:{device_id}. A Directory API behind auth-svc's own token says whose profiles a user may see, and auth-svc serves GET /v1/users?ids= from it. Review fixes: a per-user advisory lock serialises device registrations with joins (a repeated device.registered could start a device past messages it never received; proven by a Postgres concurrency case), every domain error has its own code, error details are a google.rpc.Status with the client error as an Any, sync is documented as a read, and /readyz is checked against the pre-bound listener. 821 tests.
 
 Plan 7B moves the smoke test onto the new API, removes DevSetup and verifies it on minikube.
 '@

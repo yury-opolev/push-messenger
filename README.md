@@ -111,7 +111,7 @@ at start-up.
 | `PUSH_DB_MAX_CONNECTIONS` | pool size, at least 1 | `10` |
 | `PUSH_AUTH_WORKER_ROLE` | the worker's role: granted `auth.outbox` and the two cleanup functions at start-up | none |
 | `PUSH_MESSAGE_SVC_URL` | gRPC URL of message-svc, `http://host:50051` (plain `http://` only), asked whose profiles a caller may see; without it `GET /v1/users` answers 503 | none |
-| `PUSH_DIRECTORY_TOKEN` | message-svc's token for its `Directory` API, the same value as message-svc's; required with `PUSH_MESSAGE_SVC_URL` | none |
+| `PUSH_DIRECTORY_TOKEN` | message-svc's token for its `Directory` API, the same value as message-svc's, 32 to 256 visible ASCII characters; required with `PUSH_MESSAGE_SVC_URL` | none |
 
 `push-worker`:
 
