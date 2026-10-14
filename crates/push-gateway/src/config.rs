@@ -10,6 +10,7 @@ use axum::http::HeaderName;
 /// | Variable | Meaning | Default |
 /// |---|---|---|
 /// | `PUSH_MESSAGE_SVC_URL` | gRPC URL of message-svc | required |
+/// | `PUSH_MESSAGING_TOKEN` | message-svc's token for its `Messaging` API, the same value as message-svc's: 32 to 256 visible ASCII characters | required |
 /// | `PUSH_REDIS_URL` | Redis URL, `redis://:password@host:6379` | required |
 /// | `PUSH_AUTH_URL` | base URL of auth-svc, whose `/v1/auth/jwks` holds the token keys | required |
 /// | `PUSH_TOKEN_AUDIENCE` | the gateway's public URL (`wss://…/v1/socket`): the `aud` of the access tokens it accepts | required |
@@ -24,6 +25,8 @@ use axum::http::HeaderName;
 #[derive(Clone, PartialEq, Eq)]
 pub struct Config {
     pub message_svc_url: String,
+    /// The gateway's token for message-svc's `Messaging` API. Never shown.
+    pub messaging_token: String,
     pub redis_url: String,
     pub auth_url: String,
     pub token_audience: String,
@@ -37,12 +40,14 @@ pub struct Config {
     pub client_ip_header: Option<HeaderName>,
 }
 
-// The Redis URL carries a password, so it never appears in debug output.
+// The Redis URL carries a password and the token is a secret, so neither appears in debug
+// output.
 impl std::fmt::Debug for Config {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("Config")
             .field("message_svc_url", &self.message_svc_url)
+            .field("messaging_token", &"<redacted>")
             .field("redis_url", &"<redacted>")
             .field("auth_url", &self.auth_url)
             .field("token_audience", &self.token_audience)
@@ -119,8 +124,19 @@ impl Config {
                 reason: "use an http:// or https:// URL".to_owned(),
             });
         }
+        let messaging_token = required("PUSH_MESSAGING_TOKEN")?;
+        if !((32..=256).contains(&messaging_token.len())
+            && messaging_token.bytes().all(|byte| byte.is_ascii_graphic()))
+        {
+            return Err(ConfigError::Invalid {
+                name: "PUSH_MESSAGING_TOKEN",
+                value: "<redacted>".to_owned(),
+                reason: "use 32 to 256 visible ASCII characters".to_owned(),
+            });
+        }
         Ok(Self {
             message_svc_url: required("PUSH_MESSAGE_SVC_URL")?,
+            messaging_token,
             redis_url: required("PUSH_REDIS_URL")?,
             auth_url,
             token_audience: required("PUSH_TOKEN_AUDIENCE")?,
@@ -186,8 +202,12 @@ mod tests {
         Config::from_lookup(|name| variables.get(name).cloned())
     }
 
-    const REQUIRED: [(&str, &str); 4] = [
+    const REQUIRED: [(&str, &str); 5] = [
         ("PUSH_MESSAGE_SVC_URL", "http://message-svc:50051"),
+        (
+            "PUSH_MESSAGING_TOKEN",
+            "messaging-token-of-the-config-tests",
+        ),
         ("PUSH_REDIS_URL", "redis://:secret@redis:6379"),
         ("PUSH_AUTH_URL", "http://auth:8080/"),
         ("PUSH_TOKEN_AUDIENCE", "wss://push.example.com/v1/socket"),
@@ -235,10 +255,22 @@ mod tests {
     }
 
     #[test]
-    fn debug_output_redacts_the_redis_url() {
+    fn debug_output_redacts_the_redis_url_and_the_token() {
         let output = format!("{:?}", config(&REQUIRED).unwrap());
         assert!(!output.contains("secret"), "{output}");
+        assert!(!output.contains("messaging-token"), "{output}");
         assert!(output.contains("<redacted>"), "{output}");
+    }
+
+    #[test]
+    fn the_messaging_token_must_be_fit_for_a_header_and_is_never_echoed() {
+        for bad in ["too-short", "with a space but long enough to pass the 32"] {
+            let mut variables = REQUIRED.to_vec();
+            variables[1] = ("PUSH_MESSAGING_TOKEN", bad);
+            let message = config(&variables).unwrap_err().to_string();
+            assert!(message.contains("PUSH_MESSAGING_TOKEN"), "{message}");
+            assert!(!message.contains(bad), "{message}");
+        }
     }
 
     #[test]
@@ -253,7 +285,7 @@ mod tests {
             );
         }
         let mut variables = REQUIRED.to_vec();
-        variables[2] = ("PUSH_AUTH_URL", "auth:8080");
+        variables[3] = ("PUSH_AUTH_URL", "auth:8080");
         assert!(matches!(
             config(&variables),
             Err(ConfigError::Invalid {

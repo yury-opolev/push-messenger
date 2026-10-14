@@ -68,6 +68,12 @@ spec:
                 secretKeyRef:
                   name: {{ include "push.secretName" . }}
                   key: directory-token
+            # Only the gateway has this one: the Messaging API refuses calls without it.
+            - name: PUSH_MESSAGING_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "push.secretName" . }}
+                  key: messaging-token
           ports:
             - name: grpc
               containerPort: 50051

@@ -56,8 +56,9 @@ values also say `devMode.acknowledge: insecure-local-only` and the ingress host 
 auth-svc and the worker have databases and roles of their own, `push_auth` and
 `push_worker`, which PostgreSQL's init scripts create when it initialises an empty volume;
 the worker's role may also drain auth-svc's outbox, which auth-svc grants at start-up.
-message-svc and the worker share a generated Accounts token from the same Secret, and
-message-svc and auth-svc a Directory token; the gateway gets neither. A
+message-svc and the worker share a generated Accounts token from the same Secret,
+message-svc and auth-svc a Directory token, and message-svc and the gateway a Messaging
+token; each internal API takes only its own. A
 cluster whose Postgres volume predates them (Plans 4B and 5B) lacks a database. `up` stops
 when the kept Secret `push-secrets` (it survives a plain `helm uninstall`) has no
 `auth-db-password` or `worker-db-password`, or when the running Postgres lacks `push_auth`
@@ -85,12 +86,14 @@ at start-up.
 | `PUSH_DB_MAX_CONNECTIONS` | pool size, at least 1 | `10` |
 | `PUSH_ACCOUNTS_TOKEN` | the worker's token for the `Accounts` API, 32 to 256 visible ASCII characters; without it `Accounts` refuses every call | none |
 | `PUSH_DIRECTORY_TOKEN` | auth-svc's token for the `Directory` API, 32 to 256 visible ASCII characters and different from `PUSH_ACCOUNTS_TOKEN`; without it `Directory` refuses every call | none |
+| `PUSH_MESSAGING_TOKEN` | the gateway's token for the `Messaging` API, 32 to 256 visible ASCII characters and different from the other two; without it `Messaging` refuses every call | none |
 
 `push-gateway`:
 
 | Variable | Meaning | Default |
 |----------|---------|---------|
 | `PUSH_MESSAGE_SVC_URL` | gRPC URL of message-svc | required |
+| `PUSH_MESSAGING_TOKEN` | message-svc's token for its `Messaging` API, the same value as message-svc's | required |
 | `PUSH_REDIS_URL` | Redis URL, `redis://:password@host:6379` | required |
 | `PUSH_LISTEN_ADDR` | address of the WebSocket endpoint `/v1/socket` | `0.0.0.0:8080` |
 | `PUSH_HEALTH_ADDR` | address of `/healthz` and `/readyz` | `0.0.0.0:8081` |

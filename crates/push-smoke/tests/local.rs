@@ -68,6 +68,8 @@ async fn the_smoke_test_passes_against_the_whole_stack() {
     // auth-svc's token for message-svc's Directory API, as the chart's Secret holds it.
     // message-svc refuses it equal to the Accounts token.
     let directory_token = "directory-token-for-the-local-smoke-test";
+    // The gateway's token for message-svc's Messaging API.
+    let messaging_token = "messaging-token-for-the-local-smoke-test";
     // base64 of 32 bytes of 0x07: auth-svc's signing key, which the smoke test also gets
     // to sign tokens the gateway must refuse.
     let signing_key = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=";
@@ -113,6 +115,7 @@ async fn the_smoke_test_passes_against_the_whole_stack() {
             store: StoreOptions::default(),
             accounts_token: Some(accounts_token.clone()),
             directory_token: Some(directory_token.to_owned()),
+            messaging_token: Some(messaging_token.to_owned()),
         },
         grpc,
         message_svc_health,
@@ -124,6 +127,7 @@ async fn the_smoke_test_passes_against_the_whole_stack() {
     let gateway = tokio::spawn(push_gateway::serve(
         push_gateway::Config {
             message_svc_url: message_svc_url.clone(),
+            messaging_token: messaging_token.to_owned(),
             redis_url: redis_url.clone(),
             auth_url: auth_url.clone(),
             token_audience: socket_url.clone(),

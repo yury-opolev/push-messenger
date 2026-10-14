@@ -100,6 +100,18 @@ Check 'default: auth-svc and message-svc share the Directory token from the Secr
         (Doc $default 'Deployment' 'push-gateway') -notmatch 'directory-token' -and
         -not $auth.Contains($token) -and -not $messageSvc.Contains($token)
 }
+Check 'default: the gateway and message-svc share the Messaging token from the Secret, nobody else has it' {
+    $gateway = Doc $default 'Deployment' 'push-gateway'
+    $messageSvc = Doc $default 'Deployment' 'push-message-svc'
+    $token = [regex]::Match($default, 'messaging-token: "([^"]+)"').Groups[1].Value
+    $accounts = [regex]::Match($default, 'accounts-token: "([^"]+)"').Groups[1].Value
+    $token.Length -eq 48 -and $token -ne $accounts -and
+        $gateway -match 'name: PUSH_MESSAGING_TOKEN\s+valueFrom:\s+secretKeyRef:\s+name: push-secrets\s+key: messaging-token' -and
+        $messageSvc -match 'name: PUSH_MESSAGING_TOKEN\s+valueFrom:\s+secretKeyRef:\s+name: push-secrets\s+key: messaging-token' -and
+        (Doc $default 'Deployment' 'push-auth') -notmatch 'messaging-token' -and
+        (Doc $default 'Deployment' 'push-worker') -notmatch 'messaging-token' -and
+        -not $gateway.Contains($token) -and -not $messageSvc.Contains($token)
+}
 Check 'default: auth-svc and the worker drain like the gateway (preStop sleep, grace period)' {
     $auth = Doc $default 'Deployment' 'push-auth'
     $worker = Doc $default 'Deployment' 'push-worker'

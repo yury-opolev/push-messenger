@@ -43,6 +43,8 @@ use uuid::Uuid;
 const ACCOUNTS_TOKEN: &str = "accounts-token-for-the-service-tests";
 /// auth-svc's token for the `Directory` API.
 const DIRECTORY_TOKEN: &str = "directory-token-for-the-service-tests";
+/// The gateway's token for the `Messaging` API.
+const MESSAGING_TOKEN: &str = "messaging-token-for-the-service-tests";
 
 struct Running {
     _postgres: ContainerAsync<Postgres>,
@@ -85,6 +87,7 @@ async fn start() -> Running {
         store: StoreOptions::default(),
         accounts_token: Some(ACCOUNTS_TOKEN.to_owned()),
         directory_token: Some(DIRECTORY_TOKEN.to_owned()),
+        messaging_token: Some(MESSAGING_TOKEN.to_owned()),
     };
     let shutdown = CancellationToken::new();
     let server = tokio::spawn(serve(
@@ -129,6 +132,7 @@ async fn shutdown_is_honoured_while_the_database_is_unreachable() {
         store: StoreOptions::default(),
         accounts_token: None,
         directory_token: None,
+        messaging_token: None,
     };
     let shutdown = CancellationToken::new();
     let server = tokio::spawn(serve(config, grpc, health, shutdown.clone()));
@@ -176,7 +180,7 @@ async fn a_message_goes_from_send_to_ack_and_rings_the_recipient() {
 
     let url = format!("http://{}", running.grpc);
     let mut accounts = accounts_client(url.clone()).await;
-    let mut messaging = MessagingClient::connect(url).await.unwrap();
+    let mut messaging = messaging_client(url).await;
     let (alice, bob) = (Uuid::now_v7(), Uuid::now_v7());
     let (alice_device, bob_device) = (Uuid::now_v7(), Uuid::now_v7());
     for (user, device) in [(alice, alice_device), (bob, bob_device)] {
@@ -276,7 +280,7 @@ async fn accounts_are_served_only_with_the_workers_token() {
         .connect()
         .await
         .unwrap();
-    let mut messaging = MessagingClient::connect(url).await.unwrap();
+    let mut messaging = messaging_client(url).await;
     let (user, device) = (Uuid::now_v7(), Uuid::now_v7());
     let event = AccountDevice {
         user_id: id_bytes(user),
@@ -295,6 +299,12 @@ async fn accounts_are_served_only_with_the_workers_token() {
     // Without the worker's token (the gateway has none) the API refuses.
     let mut stranger = AccountsClient::new(channel.clone());
     let status = stranger.device_registered(event.clone()).await.unwrap_err();
+    assert_eq!(status.code(), tonic::Code::Unauthenticated);
+    // And Messaging, which trusts the ids it is given, refuses anyone but the gateway.
+    let status = MessagingClient::new(channel.clone())
+        .identify(identify.clone())
+        .await
+        .unwrap_err();
     assert_eq!(status.code(), tonic::Code::Unauthenticated);
 
     let bearer: MetadataValue<_> = format!("Bearer {ACCOUNTS_TOKEN}").parse().unwrap();
@@ -341,6 +351,20 @@ async fn accounts_client(
     })
 }
 
+/// The Messaging client the gateway uses, with its internal token.
+async fn messaging_client(
+    url: String,
+) -> MessagingClient<InterceptedService<Channel, impl Interceptor>> {
+    let channel = Channel::from_shared(url).unwrap().connect().await.unwrap();
+    let bearer: MetadataValue<_> = format!("Bearer {MESSAGING_TOKEN}").parse().unwrap();
+    MessagingClient::with_interceptor(channel, move |mut request: Request<()>| {
+        request
+            .metadata_mut()
+            .insert("authorization", bearer.clone());
+        Ok(request)
+    })
+}
+
 /// A request frame as `user`.
 fn call(user: Uuid, body: request::Body) -> RequestCall {
     RequestCall {
@@ -357,7 +381,7 @@ async fn the_client_requests_and_the_directory_run_on_postgres() {
     let running = start().await;
     let url = format!("http://{}", running.grpc);
     let mut accounts = accounts_client(url.clone()).await;
-    let mut messaging = MessagingClient::connect(url).await.unwrap();
+    let mut messaging = messaging_client(url).await;
     let (alice, bob, carol) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
     let devices = [Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7()];
     for (user, device) in [alice, bob, carol].into_iter().zip(devices) {

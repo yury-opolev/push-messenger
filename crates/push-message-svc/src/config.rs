@@ -15,6 +15,7 @@ use push_store::{StoreOptions, check_database_url};
 /// | `PUSH_DB_MAX_CONNECTIONS` | pool size, at least 1 | `10` |
 /// | `PUSH_ACCOUNTS_TOKEN` | the worker's token for the `Accounts` API, 32 to 256 visible ASCII characters; without it `Accounts` refuses every call | none |
 /// | `PUSH_DIRECTORY_TOKEN` | auth-svc's token for the `Directory` API, 32 to 256 visible ASCII characters and different from `PUSH_ACCOUNTS_TOKEN`; without it `Directory` refuses every call | none |
+/// | `PUSH_MESSAGING_TOKEN` | the gateway's token for the `Messaging` API, 32 to 256 visible ASCII characters and different from the other two; without it `Messaging` refuses every call | none |
 #[derive(Clone, PartialEq, Eq)]
 pub struct Config {
     pub database_url: String,
@@ -24,6 +25,7 @@ pub struct Config {
     pub store: StoreOptions,
     pub accounts_token: Option<String>,
     pub directory_token: Option<String>,
+    pub messaging_token: Option<String>,
 }
 
 impl std::fmt::Debug for Config {
@@ -42,6 +44,10 @@ impl std::fmt::Debug for Config {
             .field(
                 "directory_token",
                 &self.directory_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "messaging_token",
+                &self.messaging_token.as_ref().map(|_| "<redacted>"),
             )
             .finish()
     }
@@ -100,6 +106,17 @@ impl Config {
                     .to_owned(),
             ));
         }
+        let messaging_token = token(&lookup, "PUSH_MESSAGING_TOKEN")?;
+        if messaging_token.is_some()
+            && (messaging_token == accounts_token || messaging_token == directory_token)
+        {
+            return Err(redacted(
+                "PUSH_MESSAGING_TOKEN",
+                "must differ from PUSH_ACCOUNTS_TOKEN and PUSH_DIRECTORY_TOKEN: each internal \
+                 API has a token of its own"
+                    .to_owned(),
+            ));
+        }
         Ok(Self {
             database_url,
             redis_url,
@@ -108,6 +125,7 @@ impl Config {
             store,
             accounts_token,
             directory_token,
+            messaging_token,
         })
     }
 }
@@ -197,6 +215,7 @@ mod tests {
         assert_eq!(config.store, StoreOptions::default());
         assert_eq!(config.accounts_token, None);
         assert_eq!(config.directory_token, None);
+        assert_eq!(config.messaging_token, None);
     }
 
     #[test]
@@ -237,6 +256,37 @@ mod tests {
         assert!(message.contains("PUSH_ACCOUNTS_TOKEN"), "{message}");
         assert!(message.contains("PUSH_DIRECTORY_TOKEN"), "{message}");
         assert!(!message.contains(&shared), "{message}");
+    }
+
+    #[test]
+    fn the_gateways_messaging_token_is_checked_and_differs_from_the_others() {
+        let (accounts, directory, messaging) = (
+            "t0ken-".repeat(6),
+            "d1rectory-".repeat(4),
+            "m3ssaging-".repeat(4),
+        );
+        let mut variables = REQUIRED.to_vec();
+        variables.push(("PUSH_ACCOUNTS_TOKEN", &accounts));
+        variables.push(("PUSH_DIRECTORY_TOKEN", &directory));
+        variables.push(("PUSH_MESSAGING_TOKEN", &messaging));
+        let configured = config(&variables).unwrap();
+        assert_eq!(
+            configured.messaging_token.as_deref(),
+            Some(messaging.as_str())
+        );
+        assert!(!format!("{configured:?}").contains(&messaging));
+        for shared in [&accounts, &directory] {
+            let mut variables = REQUIRED.to_vec();
+            variables.push(("PUSH_ACCOUNTS_TOKEN", &accounts));
+            variables.push(("PUSH_DIRECTORY_TOKEN", &directory));
+            variables.push(("PUSH_MESSAGING_TOKEN", shared));
+            let message = config(&variables).unwrap_err().to_string();
+            assert!(message.contains("PUSH_MESSAGING_TOKEN"), "{message}");
+            assert!(!message.contains(shared.as_str()), "{message}");
+        }
+        let mut variables = REQUIRED.to_vec();
+        variables.push(("PUSH_MESSAGING_TOKEN", "too-short"));
+        assert!(config(&variables).is_err());
     }
 
     #[test]

@@ -53,6 +53,12 @@ pub async fn serve(
              worker cannot relay users and devices"
         );
     }
+    if config.messaging_token.is_none() {
+        tracing::warn!(
+            "PUSH_MESSAGING_TOKEN is not set: the Messaging API refuses every call, so the \
+             gateway cannot serve clients"
+        );
+    }
     if config.directory_token.is_none() {
         tracing::warn!(
             "PUSH_DIRECTORY_TOKEN is not set: the Directory API refuses every call, so \
@@ -88,9 +94,10 @@ pub async fn serve(
 
     tracing::info!(addr = %config.grpc_addr, "serving gRPC");
     let result = tonic::transport::Server::builder()
-        .add_service(MessagingServer::new(MessagingApi::new(Arc::clone(
-            &messaging,
-        ))))
+        .add_service(MessagingServer::with_interceptor(
+            MessagingApi::new(Arc::clone(&messaging)),
+            InternalToken::messaging(config.messaging_token.clone()),
+        ))
         .add_service(AccountsServer::with_interceptor(
             AccountsApi::new(Arc::clone(&messaging)),
             InternalToken::accounts(config.accounts_token.clone()),

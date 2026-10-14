@@ -52,6 +52,12 @@ spec:
           env:
             - name: PUSH_MESSAGE_SVC_URL
               value: {{ printf "http://%s:50051" (include "push.name" (dict "root" . "component" "message-svc")) | quote }}
+            # message-svc's Messaging API takes calls only with this token.
+            - name: PUSH_MESSAGING_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "push.secretName" . }}
+                  key: messaging-token
             - name: PUSH_REDIS_URL
               valueFrom:
                 secretKeyRef:

@@ -277,9 +277,10 @@ where
 /// Guards an internal service: a call passes only with its shared internal token in its
 /// metadata, `authorization: Bearer <token>`, compared in constant time. Each service
 /// has a token of its own, given only to its caller: the worker's for `Accounts`,
-/// auth-svc's for `Directory`. The gateway has neither, so it cannot register devices or
-/// read relationships even though it can reach message-svc. Without a configured token
-/// every call is refused.
+/// auth-svc's for `Directory`, the gateway's for `Messaging`. So the gateway cannot
+/// register devices or read relationships, and nobody but the gateway can act as a user,
+/// even though they can all reach message-svc. Without a configured token every call is
+/// refused.
 #[derive(Clone)]
 pub struct InternalToken {
     expected: Option<Arc<str>>,
@@ -305,6 +306,17 @@ impl InternalToken {
             expected: expected.map(Arc::from),
             off: "the Directory API is off: PUSH_DIRECTORY_TOKEN is not set",
             refused: "the Directory API needs the internal token",
+        }
+    }
+
+    /// The gateway's token for `Messaging` (`PUSH_MESSAGING_TOKEN`): `Messaging` trusts
+    /// the user and device ids it is given, so only the gateway, which checked the access
+    /// token, may call it.
+    pub fn messaging(expected: Option<String>) -> Self {
+        Self {
+            expected: expected.map(Arc::from),
+            off: "the Messaging API is off: PUSH_MESSAGING_TOKEN is not set",
+            refused: "the Messaging API needs the internal token",
         }
     }
 }
@@ -954,6 +966,28 @@ mod tests {
         assert!(
             error_from_status(&status).message.contains("at most 100"),
             "{status:?}"
+        );
+    }
+
+    #[test]
+    fn the_messaging_api_takes_only_the_gateways_token() {
+        let (messaging_token, accounts_token) = ("m".repeat(32), "a".repeat(32));
+        let mut messaging = InternalToken::messaging(Some(messaging_token.clone()));
+        let bearer = |token: &str| with_authorization(&format!("Bearer {token}"));
+        assert!(messaging.call(bearer(&messaging_token)).is_ok());
+        let status = messaging.call(bearer(&accounts_token)).unwrap_err();
+        assert_eq!(status.code(), Code::Unauthenticated);
+        assert_eq!(
+            status.message(),
+            "the Messaging API needs the internal token"
+        );
+        assert!(messaging.call(Request::new(())).is_err());
+        let status = InternalToken::messaging(None)
+            .call(bearer(&messaging_token))
+            .unwrap_err();
+        assert_eq!(
+            status.message(),
+            "the Messaging API is off: PUSH_MESSAGING_TOKEN is not set"
         );
     }
 
