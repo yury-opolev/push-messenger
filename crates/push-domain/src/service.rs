@@ -145,7 +145,7 @@ where
         Ok(())
     }
 
-    /// Publishes events after a commit. Publishes nothing when there is nothing to say. Publishes nothing when there is nothing to say.
+    /// Publishes events after a commit. Publishes nothing when there is nothing to say.
     pub(crate) async fn publish(&self, events: Vec<Event>) {
         if !events.is_empty() {
             self.notifier.publish(&events).await;

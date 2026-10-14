@@ -196,7 +196,7 @@ enum KickReason {
   KICK_REASON_UNSPECIFIED = 0;
   // The device was revoked: the client stops (close code 4003).
   KICK_REASON_DEVICE_REVOKED = 1;
-  // The user's password was reset: the client signs in again.
+  // The user's password was reset: the client signs in again (close code 4001).
   KICK_REASON_PASSWORD_RESET = 2;
 }
 
