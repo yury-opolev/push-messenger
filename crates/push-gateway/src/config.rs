@@ -14,6 +14,7 @@ use std::time::Duration;
 /// | `PUSH_LISTEN_ADDR` | address of the WebSocket endpoint `/v1/socket` | `0.0.0.0:8080` |
 /// | `PUSH_HEALTH_ADDR` | address of `/healthz` and `/readyz` | `0.0.0.0:8081` |
 /// | `PUSH_HEARTBEAT_MS` | client ping interval announced in `Ready` | `30000` |
+/// | `PUSH_GROUPS` | `1` serves group requests; `0` refuses them with `NOT_AVAILABLE` (groups are not offered to apps in the first release) | `0` |
 ///
 /// `PUSH_DEV_AUTH=1` (the DEV ONLY identities without a token, removed in Plan 8) is
 /// refused, so a deployment that still expects it fails at start-up.
@@ -26,6 +27,8 @@ pub struct Config {
     pub listen_addr: SocketAddr,
     pub health_addr: SocketAddr,
     pub heartbeat: Duration,
+    /// Whether group requests are served.
+    pub groups: bool,
 }
 
 // The Redis URL carries a password, so it never appears in debug output.
@@ -40,6 +43,7 @@ impl std::fmt::Debug for Config {
             .field("listen_addr", &self.listen_addr)
             .field("health_addr", &self.health_addr)
             .field("heartbeat", &self.heartbeat)
+            .field("groups", &self.groups)
             .finish()
     }
 }
@@ -105,6 +109,7 @@ impl Config {
             listen_addr: parsed(&lookup, "PUSH_LISTEN_ADDR", ([0, 0, 0, 0], 8080).into())?,
             health_addr: parsed(&lookup, "PUSH_HEALTH_ADDR", ([0, 0, 0, 0], 8081).into())?,
             heartbeat: Duration::from_millis(heartbeat_ms),
+            groups: flag(&lookup, "PUSH_GROUPS")?,
         })
     }
 
@@ -130,6 +135,20 @@ where
             name,
             reason: error.to_string(),
             value,
+        }),
+    }
+}
+
+/// A switch: on only for exactly `1`; off when unset, empty or `0`. Anything else
+/// (`true`, `yes`) is refused, so a typo can never leave it in doubt.
+fn flag(lookup: &impl Fn(&str) -> Option<String>, name: &'static str) -> Result<bool, ConfigError> {
+    match lookup(name).as_deref() {
+        None | Some("") | Some("0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(other) => Err(ConfigError::Invalid {
+            name,
+            value: other.to_owned(),
+            reason: "use 1 to enable or 0 to disable".to_owned(),
         }),
     }
 }
@@ -165,6 +184,21 @@ mod tests {
         assert_eq!(config.listen_addr, "0.0.0.0:8080".parse().unwrap());
         assert_eq!(config.health_addr, "0.0.0.0:8081".parse().unwrap());
         assert_eq!(config.heartbeat, Duration::from_secs(30));
+        assert!(!config.groups, "groups are off unless switched on");
+    }
+
+    #[test]
+    fn groups_are_on_only_for_exactly_1() {
+        for (value, expected) in [("1", true), ("0", false), ("", false)] {
+            let mut variables = REQUIRED.to_vec();
+            variables.push(("PUSH_GROUPS", value));
+            assert_eq!(config(&variables).unwrap().groups, expected, "{value:?}");
+        }
+        for value in ["true", "yes", " 1"] {
+            let mut variables = REQUIRED.to_vec();
+            variables.push(("PUSH_GROUPS", value));
+            assert!(config(&variables).is_err(), "{value:?}");
+        }
     }
 
     #[test]

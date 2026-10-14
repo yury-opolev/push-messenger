@@ -7,7 +7,9 @@ use std::time::Duration;
 
 use push_proto::close;
 use push_proto::v1::frame::Body;
-use push_proto::v1::{Ack, Deliver, Error, ErrorCode, Pong, Ready, Send};
+use push_proto::v1::{
+    Ack, Delete, Deliver, Edit, Error, ErrorCode, Pong, ReadUpTo, Ready, Request, Send, request,
+};
 use push_proto::{FrameError, decode_frame, id_bytes};
 use uuid::Uuid;
 
@@ -29,6 +31,16 @@ pub enum Step {
     /// Forward an ack to message-svc; answer only if it fails. If it moved the position,
     /// ask [`Session::sync_after_ack`] whether to sync again.
     Ack(Ack),
+    /// Forward an edit to message-svc; answer with its `SendAck` or an error.
+    Edit(Edit),
+    /// Forward a delete to message-svc; answer with its `SendAck` or an error.
+    Delete(Delete),
+    /// Forward a read position to message-svc; answer only if it fails (the user's
+    /// devices hear the new position as `ReadPosition`).
+    ReadUpTo(ReadUpTo),
+    /// Forward a request to message-svc; answer with its `Response` or an error, both
+    /// carrying the request's `request_id`.
+    Request(Request),
     /// Close the connection with this code and reason.
     Close(u16, &'static str),
 }
@@ -46,6 +58,9 @@ enum State {
 
 #[derive(Debug)]
 pub struct Session {
+    /// Whether group requests are served (`PUSH_GROUPS`); refused with `NOT_AVAILABLE`
+    /// otherwise.
+    groups: bool,
     state: State,
     /// The highest `seq` sent to the client per conversation, so a sync that repeats
     /// entries the client has not acked yet does not send them twice.
@@ -56,9 +71,10 @@ pub struct Session {
 }
 
 impl Session {
-    /// A new connection.
-    pub fn new() -> Self {
+    /// A new connection. `groups`: whether group requests are served.
+    pub fn new(groups: bool) -> Self {
         Self {
+            groups,
             state: State::New,
             sent: HashMap::new(),
             more_waiting: false,
@@ -101,6 +117,22 @@ impl Session {
             (Body::ReAuth(reauth), State::Ready { .. }) => Step::ReAuth(reauth.token),
             (Body::Send(send), State::Ready { .. }) => Step::Send(send),
             (Body::Ack(ack), State::Ready { .. }) => Step::Ack(ack),
+            (Body::Edit(edit), State::Ready { .. }) => Step::Edit(edit),
+            (Body::Delete(delete), State::Ready { .. }) => Step::Delete(delete),
+            (Body::ReadUpTo(read), State::Ready { .. }) => Step::ReadUpTo(read),
+            (Body::Request(request), State::Ready { .. }) => {
+                if !self.groups && request.body.as_ref().is_some_and(is_group_request) {
+                    return Step::Reply(Body::Error(Error {
+                        code: ErrorCode::NotAvailable.into(),
+                        message: "groups are not available".to_owned(),
+                        retryable: false,
+                        client_msg_id: None,
+                        request_id: Some(request.request_id),
+                        retry_after_s: None,
+                    }));
+                }
+                Step::Request(request)
+            }
             (Body::Ping(_), State::Ready { .. }) => Step::Reply(Body::Pong(Pong {})),
             (_, State::Ready { .. }) => reply_error(ErrorCode::BadFrame, "not a client frame"),
         }
@@ -161,10 +193,20 @@ impl Session {
     }
 }
 
-impl Default for Session {
-    fn default() -> Self {
-        Self::new()
-    }
+/// The requests about groups, which apps cannot use in the first release (owner
+/// decision): message-svc keeps serving them, the gateway refuses them unless
+/// `PUSH_GROUPS=1`. No group can be created otherwise, so no group entries, receipts or
+/// listings reach clients either.
+fn is_group_request(body: &request::Body) -> bool {
+    matches!(
+        body,
+        request::Body::CreateGroup(_)
+            | request::Body::AddMembers(_)
+            | request::Body::RemoveMember(_)
+            | request::Body::LeaveGroup(_)
+            | request::Body::RenameGroup(_)
+            | request::Body::SetRole(_)
+    )
 }
 
 /// When to retry a failed sync: after 1 s, doubling up to 30 s, and from 1 s again once a
@@ -215,7 +257,10 @@ fn reply_error(code: ErrorCode, message: &str) -> Step {
 
 #[cfg(test)]
 mod tests {
-    use push_proto::v1::{Identify, Ping, ReAuth};
+    use push_proto::v1::{
+        AddMembers, CreateGroup, Identify, LeaveGroup, ListContacts, Ping, ReAuth, RemoveMember,
+        RenameGroup, SetRole,
+    };
     use push_proto::{MAX_FRAME_BYTES, encode_frame};
 
     use super::*;
@@ -236,7 +281,7 @@ mod tests {
     }
 
     fn ready_session() -> (Session, Uuid) {
-        let mut session = Session::new();
+        let mut session = Session::new(false);
         assert_eq!(
             session.on_binary(&identify("token")),
             Step::Identify("token".to_owned())
@@ -265,7 +310,7 @@ mod tests {
 
     #[test]
     fn identify_hands_over_its_token_and_ready_names_the_tokens_device() {
-        let mut session = Session::new();
+        let mut session = Session::new(false);
         assert_eq!(
             session.on_binary(&identify("a.b.c")),
             Step::Identify("a.b.c".to_owned())
@@ -287,7 +332,7 @@ mod tests {
 
     #[test]
     fn identified_without_a_pending_identity_does_nothing() {
-        let mut session = Session::new();
+        let mut session = Session::new(false);
         assert_eq!(session.identified(&claims(), Duration::from_secs(30)), None);
         assert_eq!(session.device(), None);
     }
@@ -297,14 +342,14 @@ mod tests {
     fn anything_but_identify_first_is_a_protocol_error() {
         let ping = encode_frame(Body::Ping(Ping {}));
         for bytes in [ping.as_slice(), &[0xff, 0xff], &[]] {
-            let mut session = Session::new();
+            let mut session = Session::new(false);
             assert_eq!(
                 session.on_binary(bytes),
                 Step::Close(1002, "the first frame must be Identify")
             );
         }
         assert_eq!(
-            Session::new().on_text(),
+            Session::new(false).on_text(),
             Step::Close(1002, "the first frame must be Identify")
         );
     }
@@ -314,7 +359,7 @@ mod tests {
         let ping = encode_frame(Body::Ping(Ping {}));
         let second = identify("another");
         for bytes in [ping.as_slice(), second.as_slice()] {
-            let mut session = Session::new();
+            let mut session = Session::new(false);
             assert_eq!(
                 session.on_binary(&identify("token")),
                 Step::Identify("token".to_owned())
@@ -333,7 +378,7 @@ mod tests {
             token: "fresh".to_owned(),
         }));
         assert_eq!(
-            Session::new().on_binary(&reauth),
+            Session::new(false).on_binary(&reauth),
             Step::Close(1002, "the first frame must be Identify")
         );
         let (mut session, _) = ready_session();
@@ -344,7 +389,7 @@ mod tests {
     fn an_oversized_frame_closes_before_identify_and_errors_once_ready() {
         let oversized = vec![0u8; MAX_FRAME_BYTES + 1];
         assert_eq!(
-            Session::new().on_binary(&oversized),
+            Session::new(false).on_binary(&oversized),
             Step::Close(1002, "the first frame must be Identify")
         );
         let (mut session, _) = ready_session();
@@ -392,6 +437,88 @@ mod tests {
         assert_eq!(error_code(session.on_binary(&pong)), ErrorCode::BadFrame);
         assert_eq!(error_code(session.on_text()), ErrorCode::BadFrame);
         assert!(session.device().is_some());
+    }
+
+    #[test]
+    fn edits_deletes_reads_and_requests_become_steps() {
+        let (mut session, _) = ready_session();
+        let edit = Edit {
+            client_msg_id: id_bytes(Uuid::now_v7()),
+            ..Edit::default()
+        };
+        assert_eq!(
+            session.on_binary(&encode_frame(Body::Edit(edit.clone()))),
+            Step::Edit(edit)
+        );
+        let delete = Delete {
+            client_msg_id: id_bytes(Uuid::now_v7()),
+            ..Delete::default()
+        };
+        assert_eq!(
+            session.on_binary(&encode_frame(Body::Delete(delete.clone()))),
+            Step::Delete(delete)
+        );
+        let read = ReadUpTo {
+            conversation_id: id_bytes(Uuid::now_v7()),
+            seq: 4,
+        };
+        assert_eq!(
+            session.on_binary(&encode_frame(Body::ReadUpTo(read.clone()))),
+            Step::ReadUpTo(read)
+        );
+        let list = Request {
+            request_id: 7,
+            body: Some(request::Body::ListContacts(ListContacts {})),
+        };
+        assert_eq!(
+            session.on_binary(&encode_frame(Body::Request(list.clone()))),
+            Step::Request(list)
+        );
+    }
+
+    fn group_requests() -> Vec<request::Body> {
+        let conversation_id = id_bytes(Uuid::now_v7());
+        vec![
+            request::Body::CreateGroup(CreateGroup::default()),
+            request::Body::AddMembers(AddMembers::default()),
+            request::Body::RemoveMember(RemoveMember::default()),
+            request::Body::LeaveGroup(LeaveGroup { conversation_id }),
+            request::Body::RenameGroup(RenameGroup::default()),
+            request::Body::SetRole(SetRole::default()),
+        ]
+    }
+
+    #[test]
+    fn group_requests_are_refused_unless_groups_are_switched_on() {
+        let (mut session, _) = ready_session();
+        for (number, body) in (1..).zip(group_requests()) {
+            let request = Request {
+                request_id: number,
+                body: Some(body),
+            };
+            let Step::Reply(Body::Error(error)) =
+                session.on_binary(&encode_frame(Body::Request(request)))
+            else {
+                panic!("a group request was not refused");
+            };
+            assert_eq!(error.code(), ErrorCode::NotAvailable);
+            assert_eq!(error.request_id, Some(number));
+            assert!(!error.retryable);
+        }
+
+        let mut session = Session::new(true);
+        session.on_binary(&identify("token"));
+        session.identified(&claims(), Duration::from_secs(30));
+        for body in group_requests() {
+            let request = Request {
+                request_id: 1,
+                body: Some(body),
+            };
+            assert_eq!(
+                session.on_binary(&encode_frame(Body::Request(request.clone()))),
+                Step::Request(request)
+            );
+        }
     }
 
     #[test]

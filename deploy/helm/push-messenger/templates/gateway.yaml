@@ -65,6 +65,8 @@ spec:
               value: {{ printf "http://%s:8080" (include "push.name" (dict "root" . "component" "auth")) | quote }}
             - name: PUSH_TOKEN_AUDIENCE
               value: {{ include "push.socketUrl" . | quote }}
+            - name: PUSH_GROUPS
+              value: {{ ternary "1" "0" (eq (toString .Values.gateway.groups) "true") | quote }}
           ports:
             - name: http
               containerPort: 8080

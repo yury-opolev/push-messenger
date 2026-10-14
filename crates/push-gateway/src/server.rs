@@ -13,10 +13,11 @@ use axum::routing::get;
 use prost::Message as _;
 use push_proto::internal::v1::messaging_client::MessagingClient;
 use push_proto::internal::v1::{
-    AckRequest, IdentifyRequest, Kick, KickReason, SendRequest, SyncRequest,
+    AckRequest, DeleteRequest, EditRequest, IdentifyRequest, Kick, KickReason, ReadUpToRequest,
+    RequestCall, SendRequest, SyncRequest,
 };
 use push_proto::v1::frame::Body;
-use push_proto::v1::{AuthExpiring, Error, ErrorCode};
+use push_proto::v1::{AuthExpiring, Error, ErrorCode, SendAck};
 use push_proto::{MAX_FRAME_BYTES, close, encode_frame, error_from_status, id_bytes, kick_channel};
 use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 use tokio::net::TcpListener;
@@ -176,17 +177,23 @@ fn health_router(verifier: Verifier, shutdown: CancellationToken) -> Router {
         )
 }
 
+/// A message is at most [`MAX_FRAME_BYTES`]. A WebSocket frame may be bigger, up to
+/// 512 KiB, so that a message over the limit is read whole and refused with a close frame
+/// (1009) the client can read; a frame above 512 KiB is refused from its header, before
+/// its payload is buffered, and the client may only see the connection drop.
+const MAX_WEBSOCKET_FRAME: usize = 4 * MAX_FRAME_BYTES;
+
 async fn upgrade(upgrade: WebSocketUpgrade, State(app): State<App>) -> Response {
     let sessions = app.sessions.clone();
     upgrade
         .max_message_size(MAX_FRAME_BYTES)
-        .max_frame_size(MAX_FRAME_BYTES)
+        .max_frame_size(MAX_WEBSOCKET_FRAME)
         .on_upgrade(move |socket| sessions.track_future(connection(socket, app)))
 }
 
 /// One client connection, from `Identify` to close.
 async fn connection(mut socket: WebSocket, app: App) {
-    let mut session = Session::new();
+    let mut session = Session::new(app.config.groups);
     let Some((claims, mut membership)) = identify(&mut socket, &mut session, &app).await else {
         return;
     };
@@ -258,7 +265,11 @@ async fn connection(mut socket: WebSocket, app: App) {
                     Some(Ok(Message::Text(_))) => connected.session.on_text(),
                     // WebSocket pings are answered by the library.
                     Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
-                    Some(Ok(Message::Close(_)) | Err(_)) | None => return,
+                    Some(Err(error)) => {
+                        refuse_oversized(&mut connected.socket, error).await;
+                        return;
+                    }
+                    Some(Ok(Message::Close(_))) | None => return,
                 };
                 if connected.run(step).await.is_err() {
                     return;
@@ -266,6 +277,19 @@ async fn connection(mut socket: WebSocket, app: App) {
                 membership.renewed(connected.issued_at);
             }
         }
+    }
+}
+
+/// A message over the WebSocket limit ([`MAX_FRAME_BYTES`]) ends the connection with 1009
+/// (RFC 6455: message too big); other read errors end it without a word, the peer being
+/// gone or broken.
+async fn refuse_oversized(socket: &mut WebSocket, error: axum::Error) {
+    let oversized = error
+        .into_inner()
+        .downcast::<tokio_tungstenite::tungstenite::Error>()
+        .is_ok_and(|error| matches!(*error, tokio_tungstenite::tungstenite::Error::Capacity(_)));
+    if oversized {
+        close_with(socket, close::MESSAGE_TOO_BIG, "a frame is at most 128 KiB").await;
     }
 }
 
@@ -298,7 +322,11 @@ async fn identify(
                 Some(Ok(Message::Binary(bytes))) => break session.on_binary(&bytes),
                 Some(Ok(Message::Text(_))) => break session.on_text(),
                 Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
-                Some(Ok(Message::Close(_)) | Err(_)) | None => return None,
+                Some(Err(error)) => {
+                    refuse_oversized(socket, error).await;
+                    return None;
+                }
+                Some(Ok(Message::Close(_))) | None => return None,
             },
         }
     };
@@ -555,6 +583,55 @@ impl Connected {
                     }
                 }
             }
+            Step::Edit(edit) => {
+                let client_msg_id = edit.client_msg_id.clone();
+                let request = EditRequest {
+                    user_id: id_bytes(self.user),
+                    device_id: id_bytes(self.device),
+                    edit: Some(edit),
+                };
+                let answer = self.messaging.edit(request).await;
+                self.acknowledge(answer, client_msg_id).await
+            }
+            Step::Delete(delete) => {
+                let client_msg_id = delete.client_msg_id.clone();
+                let request = DeleteRequest {
+                    user_id: id_bytes(self.user),
+                    device_id: id_bytes(self.device),
+                    delete: Some(delete),
+                };
+                let answer = self.messaging.delete(request).await;
+                self.acknowledge(answer, client_msg_id).await
+            }
+            Step::ReadUpTo(read) => {
+                let request = ReadUpToRequest {
+                    user_id: id_bytes(self.user),
+                    read: Some(read),
+                };
+                match self.messaging.read_up_to(request).await {
+                    Ok(_) => Ok(()),
+                    Err(status) => {
+                        let error = Body::Error(error_from_status(&status));
+                        send(&mut self.socket, error).await
+                    }
+                }
+            }
+            Step::Request(request) => {
+                let request_id = request.request_id;
+                let call = RequestCall {
+                    user_id: id_bytes(self.user),
+                    request: Some(request),
+                };
+                let body = match self.messaging.request(call).await {
+                    Ok(response) => Body::Response(response.into_inner()),
+                    Err(status) => {
+                        let mut error = error_from_status(&status);
+                        error.request_id = Some(request_id);
+                        Body::Error(error)
+                    }
+                };
+                send(&mut self.socket, body).await
+            }
             Step::Close(code, reason) => {
                 close_with(&mut self.socket, code, reason).await;
                 Err(Closed)
@@ -564,6 +641,23 @@ impl Connected {
                 send(&mut self.socket, error).await
             }
         }
+    }
+
+    /// Answers an edit or a delete: its `SendAck`, or the error with its `client_msg_id`.
+    async fn acknowledge(
+        &mut self,
+        answer: Result<tonic::Response<SendAck>, tonic::Status>,
+        client_msg_id: Vec<u8>,
+    ) -> Result<(), Closed> {
+        let body = match answer {
+            Ok(ack) => Body::SendAck(ack.into_inner()),
+            Err(status) => {
+                let mut error = error_from_status(&status);
+                error.client_msg_id = Some(client_msg_id);
+                Body::Error(error)
+            }
+        };
+        send(&mut self.socket, body).await
     }
 
     /// Tells the client its token expires soon, once per token.

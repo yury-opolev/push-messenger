@@ -21,6 +21,8 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
 tokio-stream.workspace = true
+# Only to recognise axum's WebSocket errors: the same version axum 0.8 uses.
+tokio-tungstenite.workspace = true
 tokio-util.workspace = true
 tonic.workspace = true
 tracing.workspace = true
@@ -34,7 +36,6 @@ push-domain.workspace = true
 push-message-svc.workspace = true
 testcontainers-modules.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
-tokio-tungstenite.workspace = true
 
 [lints]
 workspace = true

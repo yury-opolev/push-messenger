@@ -18,12 +18,15 @@ use push_proto::internal::v1::{
     AckRequest, AckResponse, DeleteRequest, EditRequest, IdentifyRequest, IdentifyResponse,
     ReadUpToRequest, ReadUpToResponse, RequestCall, SendRequest, SyncRequest, SyncResponse,
 };
+use push_proto::v1;
 use push_proto::v1::frame::Body;
 use push_proto::v1::{
-    Ack, AuthExpiring, ContactEvent, ContactState, ContentType, DirectReceipt, Identify, Ping,
-    Pong, ReAuth, ReadPosition, Receipt, Send, SendAck, receipt,
+    Ack, AuthExpiring, Contact, ContactAccept, ContactEvent, ContactRequest, ContactState,
+    ContentType, CreateGroup, Delete, DirectReceipt, Edit, ErrorCode, Identify, ListConversations,
+    OpenDirect, Ping, Pong, ReAuth, ReadPosition, ReadUpTo, Receipt, Send, SendAck, delete, edit,
+    receipt, request, response,
 };
-use push_proto::{decode_frame, encode_frame, id, id_bytes};
+use push_proto::{MAX_FRAME_BYTES, decode_frame, encode_frame, id, id_bytes};
 use testcontainers_modules::redis::Redis;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::{ContainerAsync, ImageExt};
@@ -171,6 +174,7 @@ async fn stack_with(sync_failures: u32) -> Stack {
         listen_addr: gateway,
         health_addr: health.local_addr().unwrap(),
         heartbeat: Duration::from_secs(30),
+        groups: false,
     };
     let shutdown = CancellationToken::new();
     let server = tokio::spawn(serve(config, listener, health, shutdown.clone()));
@@ -634,6 +638,182 @@ async fn contact_events_receipts_and_read_positions_reach_the_sockets() {
     );
     let got = wait_for(&mut alice_socket, |frame| matches!(frame, Body::Receipt(_))).await;
     assert_eq!(got, receipt(1, 1));
+}
+
+/// Sends a request and waits for its answer, skipping other frames.
+async fn request(socket: &mut Socket, request_id: u64, body: request::Body) -> Body {
+    send(
+        socket,
+        Body::Request(v1::Request {
+            request_id,
+            body: Some(body),
+        }),
+    )
+    .await;
+    wait_for(socket, |frame| match frame {
+        Body::Response(response) => response.request_id == request_id,
+        Body::Error(error) => error.request_id == Some(request_id),
+        _ => false,
+    })
+    .await
+}
+
+/// Every client frame of spec §7.1 travels to message-svc and back; group requests are
+/// refused (groups are not offered to apps in the first release).
+#[tokio::test]
+async fn requests_edits_deletes_and_reads_go_through_and_group_requests_are_refused() {
+    let stack = stack().await;
+    let (alice, alice_device) = person(&stack).await;
+    let (bob, bob_device) = person(&stack).await;
+    let mut alice_socket = ready(&stack, alice, alice_device).await;
+    let mut bob_socket = ready(&stack, bob, bob_device).await;
+
+    let ask = request::Body::ContactRequest(ContactRequest {
+        user_id: id_bytes(bob),
+    });
+    let Body::Response(answer) = request(&mut alice_socket, 1, ask).await else {
+        panic!("the contact request failed");
+    };
+    assert_eq!(
+        answer.body,
+        Some(response::Body::Contact(Contact {
+            user_id: id_bytes(bob),
+            state: ContactState::RequestedOut.into(),
+        }))
+    );
+    let accept = request::Body::ContactAccept(ContactAccept {
+        user_id: id_bytes(alice),
+    });
+    assert!(matches!(
+        request(&mut bob_socket, 2, accept).await,
+        Body::Response(_)
+    ));
+    let open = request::Body::OpenDirect(OpenDirect {
+        peer_user_id: id_bytes(bob),
+    });
+    let Body::Response(v1::Response {
+        body: Some(response::Body::DirectOpened(opened)),
+        ..
+    }) = request(&mut alice_socket, 3, open).await
+    else {
+        panic!("opening the conversation failed");
+    };
+    let conversation = opened.conversation_id;
+
+    let client_msg_id = id_bytes(Uuid::now_v7());
+    send(
+        &mut alice_socket,
+        Body::Send(Send {
+            client_msg_id: client_msg_id.clone(),
+            conversation_id: conversation.clone(),
+            content_type: ContentType::Text.into(),
+            body: b"hello".to_vec(),
+            client_ts: None,
+        }),
+    )
+    .await;
+    let edit_id = id_bytes(Uuid::now_v7());
+    send(
+        &mut alice_socket,
+        Body::Edit(Edit {
+            client_msg_id: edit_id.clone(),
+            conversation_id: conversation.clone(),
+            target: Some(edit::Target::TargetClientMsgId(client_msg_id.clone())),
+            body: b"hello, edited".to_vec(),
+            client_ts: None,
+        }),
+    )
+    .await;
+    let Body::SendAck(edited) = wait_for(
+        &mut alice_socket,
+        |frame| matches!(frame, Body::SendAck(ack) if ack.client_msg_id == edit_id),
+    )
+    .await
+    else {
+        unreachable!();
+    };
+    assert_eq!(edited.seq, 2);
+    let delete_id = id_bytes(Uuid::now_v7());
+    send(
+        &mut alice_socket,
+        Body::Delete(Delete {
+            client_msg_id: delete_id.clone(),
+            conversation_id: conversation.clone(),
+            target: Some(delete::Target::TargetClientMsgId(client_msg_id)),
+        }),
+    )
+    .await;
+    let deleted = wait_for(
+        &mut alice_socket,
+        |frame| matches!(frame, Body::SendAck(ack) if ack.client_msg_id == delete_id),
+    )
+    .await;
+    assert!(matches!(deleted, Body::SendAck(ack) if ack.seq == 3));
+    for seq in 1..=3 {
+        let Body::Deliver(entry) =
+            wait_for(&mut bob_socket, |frame| matches!(frame, Body::Deliver(_))).await
+        else {
+            unreachable!();
+        };
+        assert_eq!(entry.seq, seq);
+    }
+    send(
+        &mut bob_socket,
+        Body::ReadUpTo(ReadUpTo {
+            conversation_id: conversation.clone(),
+            seq: 1,
+        }),
+    )
+    .await;
+    let position = wait_for(&mut bob_socket, |frame| {
+        matches!(frame, Body::ReadPosition(_))
+    })
+    .await;
+    assert!(matches!(position, Body::ReadPosition(read) if read.read_seq == 1));
+
+    // An error answers the request it belongs to.
+    let stranger = request::Body::ContactAccept(ContactAccept {
+        user_id: id_bytes(Uuid::now_v7()),
+    });
+    let Body::Error(refused) = request(&mut alice_socket, 4, stranger).await else {
+        panic!("accepting a stranger succeeded");
+    };
+    assert_eq!(refused.code(), ErrorCode::NoPendingRequest);
+
+    let group = request::Body::CreateGroup(CreateGroup {
+        title: "Friends".to_owned(),
+        member_ids: vec![id_bytes(bob)],
+    });
+    let Body::Error(refused) = request(&mut alice_socket, 5, group).await else {
+        panic!("a group was created");
+    };
+    assert_eq!(refused.code(), ErrorCode::NotAvailable);
+    let list = request::Body::ListConversations(ListConversations::default());
+    let Body::Response(v1::Response {
+        body: Some(response::Body::Conversations(listed)),
+        ..
+    }) = request(&mut alice_socket, 6, list).await
+    else {
+        panic!("listing failed");
+    };
+    assert_eq!(
+        listed.conversations.len(),
+        1,
+        "only the direct conversation"
+    );
+}
+
+/// A message over the 128 KiB limit ends the connection with 1009 (message too big).
+#[tokio::test]
+async fn an_oversized_frame_is_closed_with_1009() {
+    let stack = stack().await;
+    let (user, device) = person(&stack).await;
+    let mut socket = ready(&stack, user, device).await;
+    socket
+        .send(Message::Binary(vec![0u8; MAX_FRAME_BYTES + 1].into()))
+        .await
+        .unwrap();
+    assert_eq!(close_code(&mut socket).await, 1009);
 }
 
 /// Alice and Bob, one device each, as contacts with a direct conversation; and `count`

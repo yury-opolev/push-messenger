@@ -96,6 +96,7 @@ at start-up.
 | `PUSH_AUTH_URL` | base URL of auth-svc (`http://push-auth:8080`); the token keys come from its `/v1/auth/jwks` | required |
 | `PUSH_TOKEN_AUDIENCE` | the gateway's public URL (`wss://…/v1/socket`), the `aud` access tokens must name | required |
 | `PUSH_HEARTBEAT_MS` | client ping interval announced in `Ready`, 1000 to 600000 | `30000` |
+| `PUSH_GROUPS` | `1` serves group requests; `0` refuses them with `NOT_AVAILABLE` (groups are not offered to apps in the first release; message-svc keeps them) | `0` |
 
 `push-auth`:
 

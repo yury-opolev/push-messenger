@@ -36,6 +36,10 @@ gateway:
   replicas: 1
   # Client ping interval announced in Ready, in milliseconds.
   heartbeatMs: 30000
+  # Groups are not offered to apps in the first release (owner decision): the gateway
+  # refuses group requests with NOT_AVAILABLE. message-svc keeps full group support;
+  # true serves them.
+  groups: false
   # 5 s preStop sleep + the gateway's own 10 s drain + margin.
   terminationGracePeriodSeconds: 30
   resources:

@@ -39,6 +39,11 @@ Check 'default: the gateway checks tokens with auth-svc''s keys, for its own URL
         $gateway -match 'name: PUSH_TOKEN_AUDIENCE\s+value: "wss://push.example.com/v1/socket"' -and
         $default -notmatch 'PUSH_DEV_AUTH'
 }
+Check 'default: groups are refused; one switch serves them' {
+    $on = helm template push $chart --set gateway.groups=true | Out-String
+    (Doc $default 'Deployment' 'push-gateway') -match 'name: PUSH_GROUPS\s+value: "0"' -and
+        (Doc $on 'Deployment' 'push-gateway') -match 'name: PUSH_GROUPS\s+value: "1"'
+}
 Check 'default: the DevSetup switch is gone' { $default -notmatch 'PUSH_DEV_SETUP' }
 Check 'default: no smoke test' { $default -notmatch 'helm.sh/hook: test' }
 Check 'default: the worker has no dev mailbox and logs email; auth-svc has no mailbox at all' {
