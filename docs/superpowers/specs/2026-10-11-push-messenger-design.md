@@ -68,7 +68,9 @@ rules stay with the data and the worker never reads it. Only the worker may call
 message-svc's `Accounts` API, which records the users and devices auth-svc announces:
 each call carries a shared internal token from the cluster's Secret, which the gateway
 does not get, so a compromised gateway cannot register devices (a NetworkPolicy adds a
-second fence with the Azure plan).
+second fence with the Azure plan). Likewise only auth-svc may call `Directory`, and only
+the gateway may call `Messaging`, which acts for whatever user and device it is given:
+each internal API takes a token of its own (Plans 7A, 8B).
 
 **Public endpoints:** `wss://api.<domain>/v1/socket` (gateway) and
 `https://api.<domain>/v1/auth/*`, `/v1/devices/*`, `/v1/users/*` (auth-svc).
@@ -137,7 +139,9 @@ Implementation notes (push-auth, migration `0001_auth.sql`, Plan 5A):
 - Outbox payloads are JSON: `email.send {user_id, to, template, params}` (templates
   `verify_email {link, handle, expires_in_minutes}`, `account_exists {handle}`,
   `reset_password {link, expires_in_minutes}`); `user.verified {user_id}`;
-  `user.password_reset {user_id}`, on which every device of the user is kicked (§5.4);
+  `user.password_reset {user_id, reset_at}`, on which every device of the user is kicked
+  and access tokens issued no later than `reset_at` (seconds since the Unix epoch, the
+  clock of the tokens' `iat`) are refused (§5.3, §5.4; `reset_at` since Plan 8);
   `device.registered` and `device.revoked {user_id, device_id}`. New ids are UUIDv7.
 
 ### 3.2 messaging schema (message-svc)
@@ -556,10 +560,12 @@ Access-token claims: `sub`, `device_id`, `email_verified`, `exp`, `iat`, `jti`, 
    `Identify` for a device that is not active in `member_device`.
    - A device message-svc has **not heard of yet** is not rejected for good: the worker
      relays `device.registered` about a second after the registration, and until then
-     `Identify` answers `UNAVAILABLE` (retryable), unlike a revoked device or one of
-     another user (`PERMISSION_DENIED`, `UNKNOWN_DEVICE`). The gateway (Plan 8) must
-     pass this on as "try again shortly", and the SDK must reconnect after a short
-     backoff — never treat it as a revocation or sign the user out.
+     `Identify` answers `UNAVAILABLE` (`DEVICE_NOT_READY`, retryable), unlike a revoked
+     device or one of another user (`PERMISSION_DENIED`, `UNKNOWN_DEVICE`). The gateway
+     closes the socket with 4006 ("try again shortly"), and the SDK must reconnect after
+     a short backoff — never treat it as a revocation or sign the user out. Since the
+     device id comes from the verified token, the difference tells a client only about
+     its own device: no oracle for other ids.
 
 Implementation notes (Plans 6A and 7A): message-svc's internal `Accounts` gRPC API takes the
 relayed `user.verified`, `device.registered`, `device.revoked` and `user.password_reset`.
@@ -569,12 +575,23 @@ revoked, so the registration cannot revive it. Every call needs the worker's int
 (`authorization: Bearer <PUSH_ACCOUNTS_TOKEN>`, compared in constant time); without it, or when
 message-svc has none, the call is `UNAUTHENTICATED`. A revoked device is refused by
 `Identify` at once (`PERMISSION_DENIED`); a device not relayed yet is `UNAVAILABLE`
-(`retryable`), which the gateway closes with 1011 until Plan 8 gives it a code of its own.
+(`DEVICE_NOT_READY`, retryable), which the gateway closes with 4006 (Plan 8).
 After committing a revocation message-svc publishes `Kick{reason: DEVICE_REVOKED}` on
 `kick:{device_id}`, every time it is relayed; after a relayed password reset it publishes
 `Kick{reason: PASSWORD_RESET}` for every active device of the user, which stay registered.
-The gateway closes kicked sockets with Plan 8: 4003 for a revocation, 4001 ("sign in
-again") for a password reset (owner decision), and refuses tokens older than a reset.
+The gateway closes kicked sockets: 4003 for a revocation, 4001 ("sign in again") for a
+password reset (owner decision). A relayed reset also records `password_reset_at` on
+`known_user` (Plan 8): the time auth-svc reset the password, from the clock that sets the
+tokens' `iat` (`reset_at` in the `user.password_reset` payload, relayed in
+`AccountUser.reset_at`; message-svc's own clock only for an event written before auth-svc
+sent it). The latest reset is kept, so a redelivered or older event moves nothing.
+`Identify` refuses (`UNAUTHENTICATED`, `PASSWORD_CHANGED`) any access token whose `iat` is
+no later than that second: a token that outlives the reset (up to 15 minutes) or a kick
+lost on Redis cannot keep or bring back a session, while a sign-in after the reset passes
+even if the worker relays the reset later. The gateway passes the token's `iat` with
+every `Identify`, also on `ReAuth`. The `PASSWORD_RESET` kick carries the reset time, and
+the gateway leaves open a connection whose token was issued after it, so neither a slow
+relay nor a redelivered event closes a session that signed in after the reset.
 
 ### 5.4 Password reset
 
@@ -596,11 +613,21 @@ again") for a password reset (owner decision), and refuses tokens older than a r
   who declined; to the requester it looks the same as a block. There is no "remove
   contact" operation in v1, so an accepted contact can end only through a block; a
   remove/unfriend operation is a candidate for a later version.
+  No answer reveals which ids exist (Plan 8): a request to an id that is not a verified
+  user is answered `REQUESTED_OUT` like one nobody has answered yet, and stores and
+  announces nothing; `Accept` and `Decline` answer it `NO_PENDING_REQUEST`, `Block` and
+  `Unblock` succeed and store nothing. The requester's `ListContacts` shows no such
+  request (there is no row to show), so someone who already holds an id can tell with two
+  calls whether it is a user; the owner accepted this (Plan 8): user ids carry 74 random
+  bits (UUIDv7) and are learnt only from someone who has them, handle lookup already
+  tells whether a handle exists, and requests are limited to 30 an hour per user, so it
+  cannot be used to search for ids.
 - **Invite link / QR code.** `CreateInvite{expires_in, max_uses}` returns a short code,
   shown as a link or QR code. `RedeemInvite{code}` makes both users accepted contacts
   immediately: sharing the link is the consent. Codes expire (1 minute to 30 days), have a
   use limit (1 to 100) and can be revoked. A code is 10 characters of Crockford base32
-  (50 random bits, enough because redeeming is rate limited), read case-insensitively. An
+  (50 random bits, enough because redeeming is rate limited: 20 an hour per user and 60
+  per IP, §7.3), read case-insensitively. An
   unknown, revoked, expired or used-up code, and a code whose creator has blocked the
   redeemer, all give the same "invite not found", so redeeming reveals nothing. Users who
   are already contacts use nothing up; a pending request between the two becomes
@@ -738,7 +765,9 @@ Implementation notes (push-auth, Plan 5A):
   logs (Plan 5B; the nginx error log is Plan 11). A password reset revokes refresh tokens but leaves devices active, so an
   access token issued before the reset keeps working for up to 15 minutes; later, a
   `password_changed_at` stamp should make `authenticate` and the gateway reject older
-  tokens.
+  tokens. Plan 8 does it for the gateway (message-svc's `password_reset_at`, §5.3);
+  auth-svc's own API (`/v1/devices`, `/v1/users`) still accepts such a token until it
+  expires.
 
 ## 6. Groups (up to 100 members)
 
@@ -818,8 +847,14 @@ Request frames carry a client-chosen `request_id`, echoed in the response:
 | ContactEvent | `user_id, state` |
 | Response | `request_id` and the request-specific result |
 | AuthExpiring | `expires_in_s` |
-| Error | `code, message, retryable`, plus `client_msg_id` or `request_id` |
+| Error | `code, message, retryable`, plus `client_msg_id` or `request_id`, and `retry_after_s` when rate limited |
 | Pong | — |
+
+Receipts and read positions are signals published after each commit. Two acks committed
+at the same moment (transactions run at READ COMMITTED) can publish their receipts in
+either order, so a client keeps the highest `delivered_seq`, `read_seq`,
+`all_delivered_seq` and `all_read_seq` it has seen per conversation and ignores a lower
+one; `ListConversations` gives the current values.
 
 ### 7.3 Sessions
 
@@ -837,15 +872,97 @@ Request frames carry a client-chosen `request_id`, echoed in the response:
 - Because takeover depends on Redis, two sockets for one device can briefly coexist. The
   SDK ignores a `Deliver` it already has, keyed by `(conversation_id, seq)`.
 
+Implementation notes (gateway, Plan 8):
+
+- **Checking the token** happens in the gateway, without calling auth-svc: an EdDSA JWT
+  whose header names a key (`kid`) from auth-svc's JWKS (`GET /v1/auth/jwks`, fetched at
+  start-up, every 5 minutes, and at once when a token names an unknown `kid`, at most every
+  30 s, so a key rotation needs no restart); the algorithm is pinned to EdDSA; `exp`,
+  `sub` and `aud` are required, `aud` must be the gateway's public URL, `device_id` and
+  `iat` must be present and `email_verified` true; `exp` has 60 s of leeway, but a token
+  already past `exp + 30 s` (the `ReAuth` deadline below) closes with 4002 at once rather
+  than after `Ready`. `/readyz` waits for the keys. An invalid token closes with 4001, an
+  expired one with 4002; when the keys cannot be fetched the close is 1011, never a
+  sign-out. The key set is read up to 64 KiB.
+- **Key rotation signs nobody out.** auth-svc publishes only its current key, so a key
+  that leaves the set stays usable for 16 minutes (a token's 15 minutes plus the leeway)
+  after the first fetch that missed it. A token naming a key the gateway does not hold
+  even after fetching the set for it (one retired before this gateway started, or a
+  made-up `kid`) closes with 4002: a refresh gets a token signed with the current key.
+  Retiring a compromised key at once takes a restart of the gateways.
+- **Identify**, in order: the token is checked; `Identify` is limited to 30 a minute per
+  device (in Redis, failing open: devices keep connecting while Redis is down); the
+  connection subscribes to `kick:{device_id}` and waits up to 2 s for the subscription,
+  **before** message-svc is asked, so a revocation or reset committed after message-svc's
+  answer still reaches it; message-svc's `Identify` checks the device and the token's
+  `iat` against the last password reset (§5.3); then `notify:{user_id}`, the takeover
+  (`Kick{TAKEN_OVER, connection_id}` on `kick:{device_id}`, which closes every older
+  connection of the device on any gateway with 4003), `Ready` and a sync. A connection's
+  id is a UUIDv7 taken when it starts watching `kick:{device_id}`, so ids sort by time,
+  and a takeover is obeyed only from a strictly newer id: an abandoned slow `Identify`
+  that announces itself after a newer connection closes nobody.
+- **ReAuth** carries a fresh token for the same user and device; the gateway checks it and
+  asks message-svc again. Nothing answers a good one. `AuthExpiring` comes 60 s before
+  `exp`; without a good `ReAuth` the connection closes with 4002 at `exp + 30 s`. A token
+  of another device closes with 4001; when the keys or message-svc cannot be reached a
+  retryable `Error` asks for the `ReAuth` again. A kick lost on Redis is thus caught
+  within one token lifetime: the owner accepted that a device revoked while Redis is down
+  may stay connected up to 15 minutes, until its next `ReAuth` is refused, rather than
+  re-checking every connection when the subscription returns (to revisit with the load
+  test of Plan 11).
+- **Kicks** close the socket: `DEVICE_REVOKED` and `TAKEN_OVER` with 4003,
+  `PASSWORD_RESET` with 4001 unless the connection's token (after any `ReAuth`) was
+  issued after the reset the kick carries.
+- **Server frames.** `EntriesAvailable` makes every connection of the user sync; receipt,
+  read-position and contact notifications become `Receipt`, `ReadPosition` and
+  `ContactEvent` frames for every connection of the user (at most 64 waiting per
+  connection; the client recovers dropped ones by listing). Every connection also syncs
+  every 5 minutes (its first sweep spread over 5 minutes by its id), so entries arrive
+  while Redis is lost. Delivery positions move only on `Ack`; whether entries are waiting
+  is always asked of `Sync` (`entries_after`, limit + 1), never decided by comparing
+  positions, since edit and delete entries a member may not see can end a log and park
+  the position before them.
+- **Groups are not offered to apps in the first release** (owner decision): unless
+  `PUSH_GROUPS=1` (chart `gateway.groups`), `CreateGroup`, `AddMembers`, `RemoveMember`,
+  `LeaveGroup`, `RenameGroup` and `SetRole` are answered `NOT_AVAILABLE` with their
+  `request_id`; message-svc keeps full group support. No group can be created through the
+  gateway, so no group entries, receipts or listings reach clients either.
+- **Rate limits** (fixed windows in Redis across every gateway, keyed by a SHA-256 of the
+  subject; the client IP from `X-Real-IP` as in auth-svc): `RedeemInvite` 60 an hour per
+  IP and 20 per user, `ContactRequest` 120 per IP and 30 per user, `CreateInvite` 20 per
+  user. Over a limit a request gets `RATE_LIMITED` with `retry_after_s`; when Redis does
+  not answer within 500 ms it gets a retryable `UNAVAILABLE` (fail closed). The owner
+  kept these numbers for the first release, to revisit with real usage. Each connection
+  may send 100 frames at once and 20 a second after that; beyond, it is closed with 4004.
+  A client therefore acks only the highest `seq` it holds while a backlog arrives: one
+  `Ack` per `Sync` batch of up to 500 entries, far inside the budget.
+- **Liveness.** Sending a frame may take 10 s; a client silent for two and a half
+  heartbeats (75 s) is closed with 1008. The hub pings Redis every 30 s and reconnects
+  when it gets no answer within 5 s, as after any break (subscribing again and ringing
+  every connection); the gRPC channel to message-svc sends HTTP/2 pings every 30 s
+  (10 s timeout) and uses TCP keepalive.
+- **Shutdown**: `/readyz` turns unready, the listener stops, and open connections close
+  with 4005, a hundred every 50 ms (at most 5 s), so clients do not all reconnect at once;
+  the gateway waits up to 10 s for them.
+
 ### 7.4 Close codes
 
 | Code | Meaning | Client action |
 |---|---|---|
-| 4001 | Invalid token, unverified email, or unknown/revoked device | stop; sign in again |
-| 4002 | Re-authentication required | refresh, then reconnect |
-| 4003 | Another connection took over, or device revoked | stop |
-| 4004 | Rate limited | back off, then reconnect |
+| 4001 | Invalid token (signature, audience, unverified email), or the password was reset after it was issued | stop; sign in again |
+| 4002 | The token expired, names a key the gateway does not hold, or no `ReAuth` came by `exp + 30 s` | refresh, then reconnect |
+| 4003 | Another connection of the device took over, or the device was revoked | stop |
+| 4004 | Rate limited (too many frames or `Identify`s) | back off, then reconnect |
 | 4005 | Server shutting down | back off with jitter, then reconnect |
+| 4006 | The device was registered moments ago and is not ready yet | reconnect after a short backoff; never sign out |
+| 1002 | A protocol mistake before `Ready`: no `Identify` within 5 s, or another frame first | back off, then reconnect |
+| 1008 | No frame for two and a half heartbeats | reconnect |
+| 1009 | A message over 128 KiB | fix the client; reconnect |
+| 1011 | The server cannot serve the connection now (message-svc or the token keys unreachable) | back off, then reconnect |
+
+Only 4001 signs the user out, and only 4003 stops reconnecting (owner decisions: a
+revoked device stops, a password reset signs in again). A protocol mistake before `Ready`
+is 1002, not 4001: a client bug is no reason to sign out.
 
 ### 7.5 Timeouts
 
@@ -854,6 +971,11 @@ Request frames carry a client-chosen `request_id`, echoed in the response:
 | Azure Load Balancer idle timeout | 4 min | 30 min, with TCP reset |
 | nginx `proxy_read_timeout` / `proxy_send_timeout` | 60 s | 120 s |
 | Client ping interval | — | 30 s |
+| Gateway: first frame (`Identify`) | — | 5 s |
+| Gateway: silent client closed (two and a half heartbeats) | — | 75 s |
+| Gateway: sending one frame | — | 10 s |
+| Gateway to Redis: subscriber PING, answer within | — | 30 s, 5 s |
+| Gateway to message-svc: HTTP/2 PING, answer within | — | 30 s, 10 s |
 
 ### 7.6 Encoding and the internal API
 
@@ -877,20 +999,26 @@ Implementation notes (push-proto, Plan 4A):
 - The client frames `Edit`, `Delete`, `ReadUpTo`, `Request` (a `request_id` and a `oneof`
   of the 18 request bodies of §7.1) and `Response` are defined in `frame.proto` (Plan 7A);
   message-svc's `Messaging` service serves them as `Edit`, `Delete`, `ReadUpTo` and
-  `Request`, whose `Response` and `Error` carry the request's `request_id`. They join
-  `Frame` with Plan 8.
+  `Request`, whose `Response` and `Error` carry the request's `request_id`. Plan 8 puts
+  them in `Frame` (client frames 5–9: `ReAuth`, `Edit`, `Delete`, `ReadUpTo`, `Request`;
+  server frames 37–41: `Response`, `Receipt`, `ReadPosition`, `ContactEvent`,
+  `AuthExpiring`); the gateway forwards them as they are and adds the `client_msg_id` of
+  an `Edit` or `Delete` to its error, as for `Send`.
+- A WebSocket message is at most 128 KiB (`MAX_FRAME_BYTES`); a bigger one closes the
+  connection with 1009. WebSocket frames may be up to 512 KiB, so a message just over the
+  limit is read whole and the close frame reaches the client; a bigger frame is refused
+  from its header and the client may only see the connection drop.
 - message-svc publishes a small `Notification` (entries available, receipt, contact
   change, read position; never a body) on `notify:{user_id}` after every commit. The
   gateway subscribes to the channels of the users it holds and syncs their devices; it
   does not send an entry twice on one connection, so repeated syncs without acks are
   harmless.
-- **DEV ONLY identity, until real tokens (Plan 8).** A gateway started with
-  `PUSH_DEV_AUTH=1` accepts `Identify{dev_user_id, dev_device_id}` without a token;
-  otherwise `Identify` closes with 4001. The variable accepts only `1` or `0`, and the
-  gateway logs a warning at start-up when it is enabled. When the dev fields are removed
-  (Plan 8), their field numbers (14, 15) and names are reserved. message-svc's DEV ONLY
-  `DevSetup` service and `PUSH_DEV_SETUP` were removed in Plan 7B: users and devices come
-  from the worker's `Accounts` calls, contacts and conversations from the request frames.
+- **No DEV ONLY identity.** Until Plan 8 a gateway started with `PUSH_DEV_AUTH=1`
+  accepted `Identify{dev_user_id, dev_device_id}` without a token; Plan 8 removed it, and
+  `frame.proto` reserves the field numbers 14 and 15 and their names. A gateway given
+  `PUSH_DEV_AUTH=1` refuses to start. message-svc's DEV ONLY `DevSetup` service and
+  `PUSH_DEV_SETUP` were removed in Plan 7B: users and devices come from the worker's
+  `Accounts` calls, contacts and conversations from the request frames.
 - **Start-up and runtime behaviour (message-svc).** It fails at start-up, without
   retrying, on an invalid database or Redis URL and on `PUSH_DB_MAX_CONNECTIONS=0`; error
   messages never echo URLs. Store timeouts must be between 1 ms and `i32::MAX` ms.
@@ -1099,6 +1227,15 @@ Implementation notes (local minikube, Plan 4B):
   `Directory` API (generated and kept; auth-svc and message-svc read it, the worker and the
   gateway do not), and auth-svc gets `PUSH_MESSAGE_SVC_URL`. `PUSH_DEV_SETUP` is gone.
   The smoke Pod reads the Redis URL from the Secret (`PUSH_SMOKE_REDIS_URL`) to hear kicks.
+- Plan 8B: the Secret also holds `messaging-token`, the gateway's token for message-svc's
+  `Messaging` API (generated and kept; the gateway and message-svc read it, auth-svc and
+  the worker do not). The gateway gets auth-svc's URL for the JWKS (`PUSH_AUTH_URL`), the
+  token audience (`PUSH_TOKEN_AUDIENCE`, the socket URL), `PUSH_CLIENT_IP_HEADER` and
+  `PUSH_GROUPS` (`gateway.groups`, off); dev mode no longer touches the gateway, which has
+  no DEV ONLY identity. The smoke Pod reaches only the ingress and the worker's mailbox: it
+  no longer gets the Redis URL or message-svc's address, and it reads auth-svc's signing
+  key from the Secret (`PUSH_SMOKE_SIGNING_KEY`) to sign an expired token and one for
+  another audience that the gateway must refuse.
 - The smoke client verifies the access token's audience (`socket_url` with its authority
   replaced by the Host override, `ws://push.local/v1/socket` on minikube) and the
   refreshed token's `sub` and `device_id`. It never prints response bodies, tokens or
@@ -1106,7 +1243,11 @@ Implementation notes (local minikube, Plan 4B):
   `HTTP_PROXY`. The per-IP signup limit (20/h) caps smoke runs to about 10 per hour on a
   long-lived cluster.
 - Deferred to Plan 11: validate hand-set auth keys at render time; `x-real-ip` on Azure
-  needs `externalTrafficPolicy: Local` or the PROXY protocol; nginx error-log token exposure.
+  needs `externalTrafficPolicy: Local` or the PROXY protocol (behind an SNAT load balancer
+  every client arrives with the balancer's address, collapsing the per-IP limits of
+  auth-svc and the gateway into one bucket); nginx error-log token exposure; the gateway
+  fetches the JWKS over plain http inside the cluster, and an https JWKS URL needs TLS
+  turned on in its reqwest (built without TLS today).
 - Shutdown: the gateway has a `lifecycle.preStop.sleep.seconds: 5` (ingress-nginx stops
   routing to it before SIGTERM) and all three Deployments (gateway,
   message-svc, auth-svc) set `terminationGracePeriodSeconds: 30`.
@@ -1123,10 +1264,12 @@ Implementation notes (local minikube, Plan 4B):
   ONLY mailbox is the new worker's), and `helm test` runs
   `push-smoke` inside the cluster through the ingress controller: three users sign up,
   verify with the emails the worker's log sender delivered to the DEV ONLY mailbox,
-  register devices and wait for the worker to relay them to message-svc; they become
-  contacts by request and invite, see only allowed profiles, chat, edit, read, form a group
-  and delete over message-svc's API and the gateway, and a revoked device and a password
-  reset are kicked on Redis (Plan 7B). The Azure plan
+  register devices and connect their WebSockets with their access tokens (the gateway
+  answers 4006 until the worker has relayed a device); over the WebSocket they become
+  contacts by request and invite, chat, edit, read and delete, a group request is refused,
+  they see only allowed profiles, the gateway refuses an expired token and one for another
+  audience, and a revoked device and a password reset close their sockets with 4003 and
+  4001 and their old tokens are refused (Plan 8B). The Azure plan
   replaces the in-chart secrets with Key Vault and adds TLS, and may replace the in-chart
   PostgreSQL and Redis.
 
@@ -1165,4 +1308,6 @@ Required adverse-condition tests:
   (SPF, DKIM, DMARC) and Resend's domain setup come with Plan 11.
 - Calibrate Argon2id on the chosen VM size.
 - Groups: message-svc serves them in full from Plan 7A, but they are not exposed to apps in
-  the first release (owner decision): the Plan 8 gateway hides group frames.
+  the first release (owner decision): the gateway refuses the group requests with
+  `NOT_AVAILABLE` unless `PUSH_GROUPS=1` (chart `gateway.groups`), one switch to turn
+  them on later (Plan 8).
