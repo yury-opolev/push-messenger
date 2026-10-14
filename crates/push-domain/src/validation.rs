@@ -39,6 +39,8 @@ pub enum ValidationError {
     EmptyTitle,
     #[error("a group title is {actual} characters; the limit is {limit}")]
     TitleTooLong { actual: usize, limit: usize },
+    #[error("a group title cannot contain control characters")]
+    TitleControl,
 }
 
 /// Checks a text message body.
@@ -80,9 +82,13 @@ pub fn validate_invite(expires_in: TimeDelta, max_uses: u32) -> Result<(), Valid
 }
 
 /// Checks a group title and returns it without leading and trailing whitespace. It must
-/// keep 1 to `MAX_TITLE_CHARS` characters.
+/// keep 1 to `MAX_TITLE_CHARS` characters and no control characters (PostgreSQL text
+/// refuses NUL, and line breaks have no place in a title).
 pub fn validate_title(title: &str) -> Result<String, ValidationError> {
     let title = title.trim();
+    if title.chars().any(char::is_control) {
+        return Err(ValidationError::TitleControl);
+    }
     let chars = title.chars().count();
     if chars == 0 {
         return Err(ValidationError::EmptyTitle);
@@ -180,5 +186,17 @@ mod tests {
                 limit: MAX_TITLE_CHARS,
             })
         );
+    }
+
+    #[test]
+    fn rejects_control_characters_inside_titles() {
+        for title in ["a\u{0}b", "line\nbreak", "tab\there", "del\u{7f}"] {
+            assert_eq!(
+                validate_title(title),
+                Err(ValidationError::TitleControl),
+                "{title:?}"
+            );
+        }
+        assert_eq!(validate_title("  Ærø team  "), Ok("Ærø team".to_owned()));
     }
 }

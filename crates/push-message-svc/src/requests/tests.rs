@@ -708,4 +708,14 @@ async fn group_requests_refuse_what_the_rules_forbid() {
     });
     let status = world.request(&alice, unspecified).await.unwrap_err();
     assert_eq!(failure(&status), (ErrorCode::Invalid, true));
+
+    // A title PostgreSQL could not store is refused as invalid, not retried as a store error.
+    for title in ["a\u{0}b", "", &"t".repeat(101)] {
+        let bad_title = request::Body::CreateGroup(CreateGroup {
+            title: title.to_owned(),
+            member_ids: vec![],
+        });
+        let status = world.request(&alice, bad_title).await.unwrap_err();
+        assert_eq!(failure(&status).0, ErrorCode::Invalid, "{title:?}");
+    }
 }
