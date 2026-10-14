@@ -87,11 +87,13 @@ impl Action {
     /// The limits of the action, in the order they are counted. A request refused by one
     /// is not counted by the later ones.
     pub fn limits(self) -> &'static [(Scope, Limit)] {
-        // 50-bit codes: 20 guesses an hour per user and 60 per address.
+        // 50-bit codes: 20 guesses an hour per user and 60 per address. The user is
+        // counted first, so a user over their own limit does not use up the quota of an
+        // address shared behind NAT.
         const REDEEM: &[(Scope, Limit)] =
-            &[(Scope::Ip, per(60, HOUR)), (Scope::User, per(20, HOUR))];
+            &[(Scope::User, per(20, HOUR)), (Scope::Ip, per(60, HOUR))];
         const CONTACT: &[(Scope, Limit)] =
-            &[(Scope::Ip, per(120, HOUR)), (Scope::User, per(30, HOUR))];
+            &[(Scope::User, per(30, HOUR)), (Scope::Ip, per(120, HOUR))];
         const INVITE: &[(Scope, Limit)] = &[(Scope::User, per(20, HOUR))];
         const IDENTIFY: &[(Scope, Limit)] = &[(Scope::Device, per(30, MINUTE))];
         match self {
@@ -419,6 +421,40 @@ mod tests {
                 .check(Action::RedeemInvite, from(99, alice))
                 .await
                 .is_ok()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_user_over_their_limit_does_not_use_up_the_shared_address() {
+        let limits = memory();
+        let noisy = Uuid::now_v7();
+        for _ in 0..20 {
+            limits
+                .check(Action::RedeemInvite, from(7, noisy))
+                .await
+                .unwrap();
+        }
+        // Refused by their own limit: these must not count against the address.
+        for _ in 0..100 {
+            assert!(
+                limits
+                    .check(Action::RedeemInvite, from(7, noisy))
+                    .await
+                    .is_err()
+            );
+        }
+        // The address has used 20 of its 60; 40 other users still fit.
+        for _ in 0..40 {
+            limits
+                .check(Action::RedeemInvite, from(7, Uuid::now_v7()))
+                .await
+                .unwrap();
+        }
+        assert!(
+            limits
+                .check(Action::RedeemInvite, from(7, Uuid::now_v7()))
+                .await
+                .is_err()
         );
     }
 

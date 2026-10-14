@@ -943,3 +943,88 @@ pub async fn terminated() {
         () = terminate => {}
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use axum::http::{HeaderName, HeaderValue};
+
+    use super::*;
+
+    const PEER: &str = "192.0.2.1:4000";
+
+    fn peer() -> SocketAddr {
+        PEER.parse().unwrap()
+    }
+
+    fn headers(name: &str, lines: &[&str]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for line in lines {
+            headers.append(
+                HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_str(line).unwrap(),
+            );
+        }
+        headers
+    }
+
+    fn forwarded() -> HeaderName {
+        HeaderName::from_static("x-forwarded-for")
+    }
+
+    #[test]
+    fn the_last_entry_of_forwarded_for_is_used() {
+        let headers = headers("x-forwarded-for", &["203.0.113.9, 198.51.100.7,  10.1.1.1"]);
+        assert_eq!(
+            client_ip(&headers, Some(&forwarded()), peer()),
+            "10.1.1.1".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn the_last_line_wins_over_earlier_lines() {
+        let headers = headers(
+            "x-forwarded-for",
+            &["203.0.113.9, 198.51.100.7", "10.1.1.1, 10.2.2.2"],
+        );
+        assert_eq!(
+            client_ip(&headers, Some(&forwarded()), peer()),
+            "10.2.2.2".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn an_invalid_value_falls_back_to_the_peer() {
+        let headers = headers("x-forwarded-for", &["203.0.113.9, not-an-ip"]);
+        assert_eq!(client_ip(&headers, Some(&forwarded()), peer()), peer().ip());
+    }
+
+    #[test]
+    fn a_missing_header_or_no_configured_header_falls_back_to_the_peer() {
+        assert_eq!(
+            client_ip(&HeaderMap::new(), Some(&forwarded()), peer()),
+            peer().ip()
+        );
+        let headers = headers("x-forwarded-for", &["10.1.1.1"]);
+        assert_eq!(client_ip(&headers, None, peer()), peer().ip());
+    }
+
+    #[test]
+    fn an_ipv6_address_is_accepted() {
+        let headers = headers("x-forwarded-for", &["203.0.113.9, 2001:db8::1"]);
+        assert_eq!(
+            client_ip(&headers, Some(&forwarded()), peer()),
+            "2001:db8::1".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn x_real_ip_works_when_configured() {
+        let headers = headers("x-real-ip", &["198.51.100.20"]);
+        let name = HeaderName::from_static("x-real-ip");
+        assert_eq!(
+            client_ip(&headers, Some(&name), peer()),
+            "198.51.100.20".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(client_ip(&headers, Some(&forwarded()), peer()), peer().ip());
+    }
+}
