@@ -1,8 +1,9 @@
 //! Invite links and QR codes (spec §5.5).
 //!
 //! A code is ten characters of Crockford base32: 50 random bits. That is plenty because
-//! redeeming is rate limited per account and per IP at the transport layer (spec §5.6):
-//! guessing one live code among a million would take about a billion attempts.
+//! the gateway limits `RedeemInvite` to 20 an hour per user and 60 per IP, in Redis
+//! across every gateway, and refuses it while Redis cannot count (spec §5.5): guessing one
+//! live code among a million would take about a billion attempts.
 
 use chrono::TimeDelta;
 use uuid::Uuid;

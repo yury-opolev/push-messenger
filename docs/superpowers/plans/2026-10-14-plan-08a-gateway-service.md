@@ -9309,8 +9309,44 @@ controller merges after the final review.
 | §12 tests 4 (Redis down: sweep, reconnect), 6 (revoked while connected), 7 (`ReAuth` or 4002) | 10, 7, 6 |
 | §13 groups not exposed to apps in the first release | 8 |
 
+## Review fixes made after the plan was written
+
+The code blocks above come from the verified commits and stay as they are; these review
+fixes changed the result afterwards.
+
+- Doc comments: `REAUTH_REQUIRED` and `POLICY_VIOLATION` now list every reason. The
+  `PasswordReset` doc notes the exception for an event without `reset_at`. The auth outbox
+  table is kept whole.
+- The ReAuth test has 8 s of margin.
+- Hub: every joiner waits for its channel's subscription (a per-channel watch signal,
+  false while Redis is reconnecting). On reconnect the hub drains queued commands and
+  replays from `hub.channels()`.
+- `PUSH_GROUPS` docs: the switch refuses only the six group-management requests. Groups
+  that already exist still reach clients.
+- The takeover test's laptop token uses `now()+10`.
+- Rate limits count a user's own limit before the shared IP's. `client_ip` has unit tests.
+
 ## Deferred to later plans
 
+- **Review leftovers:**
+  - auth-svc rate-limit order: per-user before per-IP, the same CGNAT issue.
+  - A kick buffered before Ready is handled only after the first deliver.
+  - Clock skew across gateways can affect takeover ids.
+  - A reset kick that queues behind a pending takeover gets 4003 instead of 4001.
+  - Warnings logged for dropped frames.
+  - No real-Redis reconnect test for the hub signal.
+  - Groups that existed before the switch was turned off are not filtered.
+  - Unbiased select: the idle timer against a queued Ping.
+  - A slow client may miss the 4005 drain.
+  - `REDIS_TIMEOUT` is defined twice.
+  - The unknown kid within 30 s of a successful fetch gives 1011.
+  - No test for concurrent unknown kids.
+  - Retired keys are dropped only on a fetch.
+  - An NTP note for multiple auth replicas.
+  - The test for the wrong user on the same device in ReAuth.
+  - A biased select for ReAuth against the deadline.
+  - Clamp a huge `exp`.
+  - The unknown-id ContactRequest timing.
 - **The smoke test over the WebSocket only, the Messaging token, minikube** (Plan 8B):
   until then message-svc's `Messaging` API trusts any `user_id` from anyone who can reach
   it, and the smoke test still calls message-svc and hears kicks on Redis.

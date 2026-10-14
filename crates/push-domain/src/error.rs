@@ -12,6 +12,10 @@ pub enum DomainError {
     /// has not relayed it (that takes about a second). Unlike `UnknownDevice`, it passes.
     #[error("the device is not known yet; retry shortly")]
     DeviceNotKnownYet,
+    /// The access token was issued no later than the user's last password reset that
+    /// message-svc heard of: the device must sign in again.
+    #[error("the password was changed after this sign-in; sign in again")]
+    PasswordChanged,
     #[error("conversation not found")]
     ConversationNotFound,
     #[error("not a member of this conversation")]

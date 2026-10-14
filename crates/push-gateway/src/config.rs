@@ -3,24 +3,38 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use axum::http::HeaderName;
+
 /// How the gateway runs. Read from the environment by [`Config::from_env`]:
 ///
 /// | Variable | Meaning | Default |
 /// |---|---|---|
 /// | `PUSH_MESSAGE_SVC_URL` | gRPC URL of message-svc | required |
 /// | `PUSH_REDIS_URL` | Redis URL, `redis://:password@host:6379` | required |
+/// | `PUSH_AUTH_URL` | base URL of auth-svc, whose `/v1/auth/jwks` holds the token keys | required |
+/// | `PUSH_TOKEN_AUDIENCE` | the gateway's public URL (`wss://…/v1/socket`): the `aud` of the access tokens it accepts | required |
 /// | `PUSH_LISTEN_ADDR` | address of the WebSocket endpoint `/v1/socket` | `0.0.0.0:8080` |
 /// | `PUSH_HEALTH_ADDR` | address of `/healthz` and `/readyz` | `0.0.0.0:8081` |
 /// | `PUSH_HEARTBEAT_MS` | client ping interval announced in `Ready` | `30000` |
-/// | `PUSH_DEV_AUTH` | `1` accepts DEV ONLY identities without a token | off |
+/// | `PUSH_GROUPS` | `1` serves group requests; `0` refuses only the six group-management requests (create, add and remove members, leave, rename, set role) with `NOT_AVAILABLE`; groups that already exist still reach clients | `0` |
+/// | `PUSH_CLIENT_IP_HEADER` | header with the client's IP, set by the ingress (`x-real-ip`); its last line, then last entry is used | the peer address |
+///
+/// `PUSH_DEV_AUTH=1` (the DEV ONLY identities without a token, removed in Plan 8) is
+/// refused, so a deployment that still expects it fails at start-up.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Config {
     pub message_svc_url: String,
     pub redis_url: String,
+    pub auth_url: String,
+    pub token_audience: String,
     pub listen_addr: SocketAddr,
     pub health_addr: SocketAddr,
     pub heartbeat: Duration,
-    pub dev_auth: bool,
+    /// Whether group requests are served.
+    pub groups: bool,
+    /// Where the ingress puts the client's IP, for the per-IP rate limits; without it the
+    /// peer address counts. Only trust a header the proxy in front overwrites.
+    pub client_ip_header: Option<HeaderName>,
 }
 
 // The Redis URL carries a password, so it never appears in debug output.
@@ -30,10 +44,13 @@ impl std::fmt::Debug for Config {
             .debug_struct("Config")
             .field("message_svc_url", &self.message_svc_url)
             .field("redis_url", &"<redacted>")
+            .field("auth_url", &self.auth_url)
+            .field("token_audience", &self.token_audience)
             .field("listen_addr", &self.listen_addr)
             .field("health_addr", &self.health_addr)
             .field("heartbeat", &self.heartbeat)
-            .field("dev_auth", &self.dev_auth)
+            .field("groups", &self.groups)
+            .field("client_ip_header", &self.client_ip_header)
             .finish()
     }
 }
@@ -71,14 +88,53 @@ impl Config {
                 reason: "use 1000 to 600000 milliseconds".to_owned(),
             });
         }
+        match lookup("PUSH_DEV_AUTH").as_deref() {
+            None | Some("") | Some("0") => {}
+            Some(other) => {
+                return Err(ConfigError::Invalid {
+                    name: "PUSH_DEV_AUTH",
+                    value: other.to_owned(),
+                    reason: "DEV ONLY identities were removed: clients identify with access \
+                             tokens"
+                        .to_owned(),
+                });
+            }
+        }
+        let client_ip_header =
+            match lookup("PUSH_CLIENT_IP_HEADER").filter(|v| !v.is_empty()) {
+                None => None,
+                Some(value) => Some(HeaderName::try_from(value.as_str()).map_err(|_| {
+                    ConfigError::Invalid {
+                        name: "PUSH_CLIENT_IP_HEADER",
+                        value: value.clone(),
+                        reason: "not a header name".to_owned(),
+                    }
+                })?),
+            };
+        let auth_url = required("PUSH_AUTH_URL")?;
+        if !(auth_url.starts_with("http://") || auth_url.starts_with("https://")) {
+            return Err(ConfigError::Invalid {
+                name: "PUSH_AUTH_URL",
+                value: auth_url,
+                reason: "use an http:// or https:// URL".to_owned(),
+            });
+        }
         Ok(Self {
             message_svc_url: required("PUSH_MESSAGE_SVC_URL")?,
             redis_url: required("PUSH_REDIS_URL")?,
+            auth_url,
+            token_audience: required("PUSH_TOKEN_AUDIENCE")?,
             listen_addr: parsed(&lookup, "PUSH_LISTEN_ADDR", ([0, 0, 0, 0], 8080).into())?,
             health_addr: parsed(&lookup, "PUSH_HEALTH_ADDR", ([0, 0, 0, 0], 8081).into())?,
             heartbeat: Duration::from_millis(heartbeat_ms),
-            dev_auth: dev_flag(&lookup, "PUSH_DEV_AUTH")?,
+            groups: flag(&lookup, "PUSH_GROUPS")?,
+            client_ip_header,
         })
+    }
+
+    /// auth-svc's JSON Web Key Set: the keys that sign access tokens.
+    pub fn jwks_url(&self) -> String {
+        format!("{}/v1/auth/jwks", self.auth_url.trim_end_matches('/'))
     }
 }
 
@@ -102,12 +158,9 @@ where
     }
 }
 
-/// A DEV ONLY switch: on only for exactly `1`; off when unset, empty or `0`. Anything
-/// else (`true`, `yes`) is refused, so a typo can never switch it on or leave it in doubt.
-fn dev_flag(
-    lookup: &impl Fn(&str) -> Option<String>,
-    name: &'static str,
-) -> Result<bool, ConfigError> {
+/// A switch: on only for exactly `1`; off when unset, empty or `0`. Anything else
+/// (`true`, `yes`) is refused, so a typo can never leave it in doubt.
+fn flag(lookup: &impl Fn(&str) -> Option<String>, name: &'static str) -> Result<bool, ConfigError> {
     match lookup(name).as_deref() {
         None | Some("") | Some("0") => Ok(false),
         Some("1") => Ok(true),
@@ -133,9 +186,11 @@ mod tests {
         Config::from_lookup(|name| variables.get(name).cloned())
     }
 
-    const REQUIRED: [(&str, &str); 2] = [
+    const REQUIRED: [(&str, &str); 4] = [
         ("PUSH_MESSAGE_SVC_URL", "http://message-svc:50051"),
         ("PUSH_REDIS_URL", "redis://:secret@redis:6379"),
+        ("PUSH_AUTH_URL", "http://auth:8080/"),
+        ("PUSH_TOKEN_AUDIENCE", "wss://push.example.com/v1/socket"),
     ];
 
     #[test]
@@ -143,10 +198,40 @@ mod tests {
         let config = config(&REQUIRED).unwrap();
         assert_eq!(config.message_svc_url, "http://message-svc:50051");
         assert_eq!(config.redis_url, "redis://:secret@redis:6379");
+        assert_eq!(config.jwks_url(), "http://auth:8080/v1/auth/jwks");
+        assert_eq!(config.token_audience, "wss://push.example.com/v1/socket");
         assert_eq!(config.listen_addr, "0.0.0.0:8080".parse().unwrap());
         assert_eq!(config.health_addr, "0.0.0.0:8081".parse().unwrap());
         assert_eq!(config.heartbeat, Duration::from_secs(30));
-        assert!(!config.dev_auth);
+        assert!(!config.groups, "groups are off unless switched on");
+        assert_eq!(config.client_ip_header, None);
+    }
+
+    #[test]
+    fn the_client_ip_header_is_a_header_name() {
+        let mut variables = REQUIRED.to_vec();
+        variables.push(("PUSH_CLIENT_IP_HEADER", "X-Real-IP"));
+        assert_eq!(
+            config(&variables).unwrap().client_ip_header,
+            Some(HeaderName::from_static("x-real-ip"))
+        );
+        variables.pop();
+        variables.push(("PUSH_CLIENT_IP_HEADER", "not a header"));
+        assert!(config(&variables).is_err());
+    }
+
+    #[test]
+    fn groups_are_on_only_for_exactly_1() {
+        for (value, expected) in [("1", true), ("0", false), ("", false)] {
+            let mut variables = REQUIRED.to_vec();
+            variables.push(("PUSH_GROUPS", value));
+            assert_eq!(config(&variables).unwrap().groups, expected, "{value:?}");
+        }
+        for value in ["true", "yes", " 1"] {
+            let mut variables = REQUIRED.to_vec();
+            variables.push(("PUSH_GROUPS", value));
+            assert!(config(&variables).is_err(), "{value:?}");
+        }
     }
 
     #[test]
@@ -157,15 +242,25 @@ mod tests {
     }
 
     #[test]
-    fn the_urls_are_required() {
-        assert_eq!(
-            config(&REQUIRED[1..]),
-            Err(ConfigError::Missing("PUSH_MESSAGE_SVC_URL"))
-        );
-        assert_eq!(
-            config(&REQUIRED[..1]),
-            Err(ConfigError::Missing("PUSH_REDIS_URL"))
-        );
+    fn the_urls_and_the_audience_are_required() {
+        for (index, (name, _)) in REQUIRED.iter().enumerate() {
+            let mut variables = REQUIRED.to_vec();
+            variables.remove(index);
+            assert_eq!(
+                config(&variables),
+                Err(ConfigError::Missing(name)),
+                "{name}"
+            );
+        }
+        let mut variables = REQUIRED.to_vec();
+        variables[2] = ("PUSH_AUTH_URL", "auth:8080");
+        assert!(matches!(
+            config(&variables),
+            Err(ConfigError::Invalid {
+                name: "PUSH_AUTH_URL",
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -183,13 +278,13 @@ mod tests {
     }
 
     #[test]
-    fn dev_auth_is_on_only_for_exactly_1() {
-        for (value, expected) in [("1", true), ("0", false), ("", false)] {
+    fn dev_identities_are_gone_and_asking_for_them_is_refused() {
+        for value in ["0", ""] {
             let mut variables = REQUIRED.to_vec();
             variables.push(("PUSH_DEV_AUTH", value));
-            assert_eq!(config(&variables).unwrap().dev_auth, expected, "{value:?}");
+            assert!(config(&variables).is_ok(), "{value:?}");
         }
-        for value in ["true", "yes", "on", " 1"] {
+        for value in ["1", "true", "yes"] {
             let mut variables = REQUIRED.to_vec();
             variables.push(("PUSH_DEV_AUTH", value));
             assert!(

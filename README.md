@@ -32,7 +32,7 @@ their email (the worker's log sender delivers it), register a device and wait fo
 to relay it to message-svc; they become contacts by request and by invite, see only each
 other's allowed profiles, chat through the ingress, edit, read, form a group and delete,
 and finally a revoked device and a password reset are kicked on Redis. The DEV ONLY mailbox
-and the calls to message-svc's API (the gateway carries them from Plan 8) go to the
+and the calls to message-svc's API (the smoke test moves onto the gateway in Plan 8B) go to the
 services directly. `deploy/minikube/up.sh --smoke` does the same on Linux
 and macOS. Both wait for ingress-nginx, retry
 `helm upgrade --install` up to 5 times while its admission webhook comes up, and
@@ -43,11 +43,10 @@ Secret, the PostgreSQL volume and its data directory (`-Delete` deletes the prof
 so a later install reuses both and the passwords keep matching. Every pull request is
 verified this way before it is merged.
 
-The minikube values switch on DEV ONLY shortcuts: the gateway accepts any user and device
-id without a token (until it checks access tokens, Plan 8), and the worker, which logs
-emails instead of sending them, shows them at `/dev/mailbox`; neither is routed by the
-ingress, which
-reaches the worker only at `/v1/webhooks/resend`. The chart refuses that mode unless the
+The minikube values switch on a DEV ONLY shortcut: the worker, which logs emails instead
+of sending them, shows them at `/dev/mailbox`, which the ingress does not route (it
+reaches the worker only at `/v1/webhooks/resend`). Clients, the smoke test included,
+always identify with real access tokens. The chart refuses that mode unless the
 values also say `devMode.acknowledge: insecure-local-only` and the ingress host is local
 (`*.local`, `*.localhost` or `*.test`), and refuses it with the Resend sender.
 `pwsh deploy/helm/test-chart.ps1` checks the chart without a cluster.
@@ -93,8 +92,11 @@ at start-up.
 | `PUSH_REDIS_URL` | Redis URL, `redis://:password@host:6379` | required |
 | `PUSH_LISTEN_ADDR` | address of the WebSocket endpoint `/v1/socket` | `0.0.0.0:8080` |
 | `PUSH_HEALTH_ADDR` | address of `/healthz` and `/readyz` | `0.0.0.0:8081` |
+| `PUSH_AUTH_URL` | base URL of auth-svc (`http://push-auth:8080`); the token keys come from its `/v1/auth/jwks` | required |
+| `PUSH_TOKEN_AUDIENCE` | the gateway's public URL (`wss://…/v1/socket`), the `aud` access tokens must name | required |
 | `PUSH_HEARTBEAT_MS` | client ping interval announced in `Ready`, 1000 to 600000 | `30000` |
-| `PUSH_DEV_AUTH` | `1` accepts DEV ONLY identities without a token | off |
+| `PUSH_GROUPS` | `1` serves group requests; `0` refuses only the six group-management requests (create, add and remove members, leave, rename, set role) with `NOT_AVAILABLE`; groups that already exist (made while it was `1`, or directly through message-svc) still reach clients, and message-svc keeps serving them | `0` |
+| `PUSH_CLIENT_IP_HEADER` | header with the client's IP, set by the ingress (`x-real-ip`), for the per-IP limits on redeeming invites and contact requests; same trust assumption as auth-svc's | the peer address |
 
 `push-auth`:
 

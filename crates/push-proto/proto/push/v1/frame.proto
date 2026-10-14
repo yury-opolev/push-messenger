@@ -16,37 +16,41 @@ package push.v1;
 
 message Frame {
   oneof body {
-    // Client to server.
+    // Client to server (spec §7.1).
     Identify identify = 1;
     Send send = 2;
     Ack ack = 3;
     Ping ping = 4;
+    ReAuth re_auth = 5;
+    Edit edit = 6;
+    Delete delete = 7;
+    ReadUpTo read_up_to = 8;
+    Request request = 9;
 
-    // Server to client.
+    // Server to client (spec §7.2).
     Ready ready = 32;
     SendAck send_ack = 33;
     Deliver deliver = 34;
     Error error = 35;
     Pong pong = 36;
+    Response response = 37;
+    Receipt receipt = 38;
+    ReadPosition read_position = 39;
+    ContactEvent contact_event = 40;
+    AuthExpiring auth_expiring = 41;
   }
-  // 5-31: the other client frames of spec §7.1 (ReAuth, Edit, Delete, ReadUpTo and the
-  // request frames); 37-63: the other server frames of §7.2. Assigned as they are added:
-  // Edit, Delete, ReadUpTo, Request and Response are defined below and message-svc serves
-  // them over gRPC (Plan 7); the gateway carries them in a Frame from Plan 8.
+  // 10-31 are free for later client frames, 42-63 for later server frames.
 }
 
-// Must be the first frame, within 5 seconds of connecting.
+// Must be the first frame, within 5 seconds of connecting. The gateway learns the user
+// and the device only from the token (spec §5.3).
 message Identify {
-  // The access token (a JWT, Plan 5). Not checked yet.
+  // The access token auth-svc issued for this device (a JWT, spec §5.1).
   string token = 1;
-  // DEV ONLY: accepted only by a gateway started with PUSH_DEV_AUTH=1, which trusts
-  // these ids without any proof. Removed when real tokens arrive (Plan 8); when
-  // removing them, reserve their field numbers (14, 15) and names.
-  bytes dev_user_id = 14;
-  bytes dev_device_id = 15;
-  // private_reads: the device does not reveal reads to others.
-  reserved 16;
-  reserved "private_reads";
+  // 14 and 15 held the DEV ONLY ids that let a local gateway skip the token (Plans 4 to
+  // 7); 16 is private_reads: the device does not reveal reads to others.
+  reserved 14, 15, 16;
+  reserved "dev_user_id", "dev_device_id", "private_reads";
 }
 
 message Ready {
@@ -54,6 +58,50 @@ message Ready {
   bytes device_id = 2;
   // How often the client should send Ping.
   uint32 heartbeat_ms = 3;
+}
+
+// A fresh access token for an identified connection (spec §7.3), sent after
+// AuthExpiring. It must name the same user and device. Nothing answers a good one; a bad
+// one closes the connection (4001, or 4002 when it has expired too).
+message ReAuth {
+  string token = 1;
+}
+
+// The access token of the connection expires in expires_in_s seconds: refresh it over
+// HTTPS and send ReAuth. Without a valid ReAuth by 30 seconds after the expiry, the
+// connection is closed with 4002.
+message AuthExpiring {
+  uint32 expires_in_s = 1;
+}
+
+// A receipt position moved in one of the user's conversations (spec §4.5). Under
+// concurrent acks two receipts can arrive in either order: keep the highest position.
+message Receipt {
+  bytes conversation_id = 1;
+  oneof positions {
+    DirectReceipt direct = 2;
+    GroupReceipts group = 3;
+  }
+}
+
+// The other member of a direct conversation: everything up to delivered_seq reached one
+// of their devices, everything up to read_seq was read.
+message DirectReceipt {
+  bytes user_id = 1;
+  int64 delivered_seq = 2;
+  int64 read_seq = 3;
+}
+
+// The user's own read position moved, from this or another of their devices.
+message ReadPosition {
+  bytes conversation_id = 1;
+  int64 read_seq = 2;
+}
+
+// The user's relationship with another user changed, as the user sees it.
+message ContactEvent {
+  bytes user_id = 1;
+  ContactState state = 2;
 }
 
 enum ContentType {
@@ -282,7 +330,9 @@ message DirectOpened {
 }
 
 // Asks another user to become a contact (spec §5.5). If they already asked the caller,
-// both become accepted contacts at once.
+// both become accepted contacts at once. An id that is not a verified user is answered
+// REQUESTED_OUT and nothing is stored, so requests never reveal which ids exist; Accept
+// and Decline answer it NO_PENDING_REQUEST, Block and Unblock succeed.
 message ContactRequest {
   bytes user_id = 1;
 }
@@ -434,7 +484,8 @@ enum ErrorCode {
   ERROR_CODE_UNAVAILABLE = 9;
   // Any other rejection; `message` says which.
   ERROR_CODE_REJECTED = 10;
-  // The other user does not exist (or has not verified their email yet).
+  // The caller is not a known user. Never answers about another user's id: requests
+  // name unknown ids as strangers, so no answer reveals which ids exist.
   ERROR_CODE_USER_NOT_FOUND = 11;
   // Accept or Decline without a request from that user.
   ERROR_CODE_NO_PENDING_REQUEST = 12;
@@ -455,6 +506,14 @@ enum ErrorCode {
   ERROR_CODE_NOT_ADMIN = 21;
   // A group must keep at least one admin.
   ERROR_CODE_LAST_ADMIN = 22;
+  // Too many requests of this kind; retry after retry_after_s seconds.
+  ERROR_CODE_RATE_LIMITED = 23;
+  // This server does not offer the feature (groups, in the first release).
+  ERROR_CODE_NOT_AVAILABLE = 24;
+  // The password was reset after the access token was issued: sign in again.
+  ERROR_CODE_PASSWORD_CHANGED = 25;
+  // The device was registered moments ago and is not ready yet: retry shortly.
+  ERROR_CODE_DEVICE_NOT_READY = 26;
 }
 
 message Error {
@@ -466,4 +525,6 @@ message Error {
   optional bytes client_msg_id = 4;
   // Set when the error answers a Request.
   optional uint64 request_id = 5;
+  // RATE_LIMITED: when the same frame may succeed again.
+  optional uint32 retry_after_s = 6;
 }

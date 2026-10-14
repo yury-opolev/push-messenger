@@ -5,9 +5,9 @@ use std::sync::Arc;
 
 use chrono::{TimeZone, Utc};
 use push_domain::{
-    ClientMsgId, Conversation, ConversationId, DeleteMessage, DeviceId, EditText, Entry, Event,
-    ManualClock, Member, MessageRef, Messaging, Policy, RecordingNotifier, SendReceipt, SendText,
-    Store, SystemEvent, Tx, UserId,
+    ClientMsgId, Clock, Conversation, ConversationId, DeleteMessage, DeviceId, DomainResult,
+    EditText, Entry, Event, ManualClock, Member, MessageRef, Messaging, Policy, RecordingNotifier,
+    SendReceipt, SendText, Store, SystemEvent, Tx, UserId,
 };
 
 use crate::Backend;
@@ -52,6 +52,11 @@ impl<S: Store + Clone> World<S> {
             clock,
             notifier,
         }
+    }
+
+    /// Identifies `device` of `user` with an access token issued now.
+    pub async fn identify(&self, device: DeviceId, user: UserId) -> DomainResult<()> {
+        self.svc.identify(device, user, self.clock.now()).await
     }
 
     /// The delivery position of a device, read straight from the store.

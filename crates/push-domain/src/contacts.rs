@@ -13,9 +13,13 @@ where
     C: Clock,
     N: Notifier,
 {
-    /// Sends a contact request. Returns the requester's resulting state.
+    /// Sends a contact request. Returns the requester's resulting state. A request to an
+    /// id that is not a verified user looks like a request nobody answered yet: it stores
+    /// nothing and answers `RequestedOut`, so requests never reveal which ids exist.
     pub async fn contact_request(&self, from: UserId, to: UserId) -> DomainResult<ContactState> {
-        let mut tx = self.begin_pair(from, to).await?;
+        let Some(mut tx) = self.begin_pair(from, to).await? else {
+            return Ok(ContactState::RequestedOut);
+        };
         let mine = tx.get_contact(from, to).await?;
         let theirs = tx.get_contact(to, from).await?;
         let (result, their_new) = match (mine, theirs) {
@@ -43,7 +47,9 @@ where
 
     /// Accepts a request that `peer` sent to `me`.
     pub async fn contact_accept(&self, me: UserId, peer: UserId) -> DomainResult<()> {
-        let mut tx = self.begin_pair(me, peer).await?;
+        let Some(mut tx) = self.begin_pair(me, peer).await? else {
+            return Err(DomainError::NoPendingRequest);
+        };
         if tx.get_contact(me, peer).await? != Some(ContactState::RequestedIn) {
             return Err(DomainError::NoPendingRequest);
         }
@@ -64,7 +70,9 @@ where
     /// The requester's pending request disappears without an event: a decline must look
     /// the same to them as a block.
     pub async fn contact_decline(&self, me: UserId, peer: UserId) -> DomainResult<()> {
-        let mut tx = self.begin_pair(me, peer).await?;
+        let Some(mut tx) = self.begin_pair(me, peer).await? else {
+            return Err(DomainError::NoPendingRequest);
+        };
         if tx.get_contact(me, peer).await? != Some(ContactState::RequestedIn) {
             return Err(DomainError::NoPendingRequest);
         }
@@ -78,9 +86,11 @@ where
     }
 
     /// Blocks `peer`. Ends any contact; `peer`'s side is removed unless they also block.
-    /// `peer` is never told.
+    /// `peer` is never told. Blocking an id that is not a verified user stores nothing.
     pub async fn contact_block(&self, me: UserId, peer: UserId) -> DomainResult<()> {
-        let mut tx = self.begin_pair(me, peer).await?;
+        let Some(mut tx) = self.begin_pair(me, peer).await? else {
+            return Ok(());
+        };
         let blocked = Some(ContactState::Blocked);
         let mut events = Vec::new();
         // The block records whether `me` could see `peer` until now, so that blocking a
@@ -104,7 +114,9 @@ where
 
     /// Removes a block. A request the block had hidden becomes an ordinary pending request.
     pub async fn contact_unblock(&self, me: UserId, peer: UserId) -> DomainResult<()> {
-        let mut tx = self.begin_pair(me, peer).await?;
+        let Some(mut tx) = self.begin_pair(me, peer).await? else {
+            return Ok(());
+        };
         let mut events = Vec::new();
         if tx.get_contact(me, peer).await? == Some(ContactState::Blocked) {
             let restored = match tx.get_contact(peer, me).await? {
@@ -170,17 +182,24 @@ where
         Ok(visible)
     }
 
-    /// Begins a transaction for an operation between two distinct, known users.
-    async fn begin_pair(&self, a: UserId, b: UserId) -> DomainResult<S::Tx> {
-        if a == b {
+    /// Begins a transaction for an operation of `me` on `peer`, two distinct users. `None`
+    /// when `peer` is not a verified user: the operation then answers as it would for a
+    /// user `me` has no relationship with, so no answer reveals which ids exist (spec
+    /// §5.5). An unknown `me` is `UnknownUser`: the gateway only acts for known devices.
+    async fn begin_pair(&self, me: UserId, peer: UserId) -> DomainResult<Option<S::Tx>> {
+        if me == peer {
             return Err(ValidationError::SelfTarget.into());
         }
         let mut tx = self.store.begin().await?;
-        if !tx.user_exists(a).await? || !tx.user_exists(b).await? {
+        if !tx.user_exists(me).await? {
             return Err(DomainError::UnknownUser);
         }
-        tx.lock_contact_pair(a, b).await?;
-        Ok(tx)
+        if !tx.user_exists(peer).await? {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+        tx.lock_contact_pair(me, peer).await?;
+        Ok(Some(tx))
     }
 }
 

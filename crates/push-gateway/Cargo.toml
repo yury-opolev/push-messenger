@@ -10,13 +10,21 @@ repository.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
 axum = { workspace = true, features = ["ws"] }
+jsonwebtoken.workspace = true
 prost.workspace = true
 push-proto.workspace = true
 redis.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
 tokio-stream.workspace = true
+# Only to recognise axum's WebSocket errors: the same version axum 0.8 uses.
+tokio-tungstenite.workspace = true
 tokio-util.workspace = true
 tonic.workspace = true
 tracing.workspace = true
@@ -25,11 +33,11 @@ uuid.workspace = true
 
 [dev-dependencies]
 futures-util.workspace = true
+push-auth.workspace = true
 push-domain.workspace = true
 push-message-svc.workspace = true
 testcontainers-modules.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
-tokio-tungstenite.workspace = true
 
 [lints]
 workspace = true

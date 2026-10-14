@@ -1,4 +1,4 @@
-use chrono::TimeDelta;
+use chrono::{DateTime, TimeDelta, Utc};
 
 use crate::clock::Clock;
 use crate::error::{DomainError, DomainResult};
@@ -126,19 +126,34 @@ where
         Ok(())
     }
 
-    /// auth-svc reset `user`'s password (`user.password_reset`, relayed by the worker):
-    /// every active device of the user is kicked, to sign in again with the new password.
-    /// The devices stay registered. Changes nothing, so a repeated event only kicks again;
-    /// a user message-svc has not heard of has no devices to kick.
-    pub async fn password_reset(&self, user: UserId) -> DomainResult<()> {
+    /// auth-svc reset `user`'s password at `reset_at` (`user.password_reset`, relayed by
+    /// the worker): every active device of the user is kicked, to sign in again with the
+    /// new password, and [`Self::identify`] refuses access tokens issued no later than that
+    /// second, so a token that outlives the reset (up to 15 minutes) or a lost kick cannot
+    /// keep a device signed in. `reset_at` is auth-svc's time, the clock of the tokens'
+    /// `iat`; an event from before auth-svc sent it (`None`) takes message-svc's clock.
+    ///
+    /// The devices stay registered. Idempotent and correct in any order: the user is
+    /// recorded if message-svc has not heard of them yet, the latest reset is kept, so a
+    /// redelivered or older event moves nothing (except one without `reset_at`, which
+    /// takes message-svc's clock again on every delivery), and the kick carries the latest reset,
+    /// so it spares a session that signed in after it.
+    pub async fn password_reset(
+        &self,
+        user: UserId,
+        reset_at: Option<DateTime<Utc>>,
+    ) -> DomainResult<()> {
+        let reset_at = reset_at.unwrap_or_else(|| self.clock.now());
         let mut tx = self.store.begin().await?;
+        tx.insert_user(user).await?;
+        let reset_at = tx.record_password_reset(user, reset_at).await?;
         let mut devices = tx.devices_of_user(user).await?;
-        tx.rollback().await?;
+        tx.commit().await?;
         if !devices.is_empty() {
             devices.sort();
             self.publish(vec![Event::Kick {
                 devices,
-                reason: KickReason::PasswordReset,
+                reason: KickReason::PasswordReset { reset_at },
             }])
             .await;
         }
@@ -152,20 +167,35 @@ where
         }
     }
 
-    /// Confirms that a connecting device is active and belongs to the user in its token.
-    /// A device never heard of is `DeviceNotKnownYet` (retryable): auth-svc registered it
-    /// and the worker has not relayed it yet. A revoked device, or one of another user, is
-    /// `UnknownDevice`.
-    pub async fn identify(&self, device: DeviceId, user: UserId) -> DomainResult<()> {
+    /// Confirms that a connecting device is active and belongs to the user in its token,
+    /// a token issued at `issued_at` (its `iat`, whole seconds). A device never heard of is
+    /// `DeviceNotKnownYet` (retryable): auth-svc registered it and the worker has not
+    /// relayed it yet. A revoked device, or one of another user, is `UnknownDevice`. A
+    /// token issued no later than the second of the user's last password reset is
+    /// `PasswordChanged`: within that second the order is unknown, and refusing a token
+    /// minted just after the reset only asks for one more sign-in.
+    pub async fn identify(
+        &self,
+        device: DeviceId,
+        user: UserId,
+        issued_at: DateTime<Utc>,
+    ) -> DomainResult<()> {
         let mut tx = self.store.begin().await?;
         // One statement: reading the owner and the revocation separately could straddle
         // the worker's commit and refuse a device that is merely not relayed yet.
         let state = tx.device_state(device).await?;
         tx.rollback().await?;
-        match state {
-            None => Err(DomainError::DeviceNotKnownYet),
-            Some((owner, is_active)) if owner == user && is_active => Ok(()),
-            Some(_) => Err(DomainError::UnknownDevice),
+        let Some(state) = state else {
+            return Err(DomainError::DeviceNotKnownYet);
+        };
+        if state.user != user || !state.active {
+            return Err(DomainError::UnknownDevice);
+        }
+        match state.password_reset_at {
+            Some(reset) if issued_at.timestamp() <= reset.timestamp() => {
+                Err(DomainError::PasswordChanged)
+            }
+            _ => Ok(()),
         }
     }
 }

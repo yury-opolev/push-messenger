@@ -160,13 +160,18 @@ async fn a_user_cannot_request_themselves<B: Backend>(backend: &B) {
     );
 }
 
-async fn requesting_an_unknown_user_fails<B: Backend>(backend: &B) {
+/// Spec §5.5: no answer reveals which ids exist. A request to an id that is not a verified
+/// user is answered like one nobody has answered yet, and stores and announces nothing.
+async fn a_request_to_an_unknown_id_looks_pending_and_stores_nothing<B: Backend>(backend: &B) {
     let world = World::new(backend).await;
     let alice = world.person().await;
+    world.notifier.take();
     assert_eq!(
         world.svc.contact_request(alice.user, UserId::new()).await,
-        Err(DomainError::UnknownUser)
+        Ok(ContactState::RequestedOut)
     );
+    assert_eq!(world.svc.list_contacts(alice.user).await, Ok(Vec::new()));
+    assert_eq!(world.notifier.take(), []);
 }
 
 async fn a_hidden_request_arrives_when_the_block_is_lifted<B: Backend>(backend: &B) {
@@ -279,7 +284,9 @@ async fn a_request_to_an_accepted_contact_stays_accepted<B: Backend>(backend: &B
     );
 }
 
-async fn contact_operations_reject_self_and_unknown_users<B: Backend>(backend: &B) {
+async fn contact_operations_reject_self_and_treat_unknown_ids_as_strangers<B: Backend>(
+    backend: &B,
+) {
     let world = World::new(backend).await;
     let alice = world.person().await;
     let selfish = Err(DomainError::Invalid(ValidationError::SelfTarget));
@@ -295,19 +302,21 @@ async fn contact_operations_reject_self_and_unknown_users<B: Backend>(backend: &
         world.svc.contact_block(alice.user, alice.user).await,
         selfish
     );
-    let stranger = UserId::new();
-    assert_eq!(
-        world.svc.contact_accept(alice.user, stranger).await,
-        Err(DomainError::UnknownUser)
-    );
-    assert_eq!(
-        world.svc.contact_decline(alice.user, stranger).await,
-        Err(DomainError::UnknownUser)
-    );
-    assert_eq!(
-        world.svc.contact_block(alice.user, stranger).await,
-        Err(DomainError::UnknownUser)
-    );
+    // The same answers as for a verified user Alice has no relationship with.
+    let (unknown, stranger) = (UserId::new(), world.person().await);
+    for peer in [unknown, stranger.user] {
+        assert_eq!(
+            world.svc.contact_accept(alice.user, peer).await,
+            Err(DomainError::NoPendingRequest)
+        );
+        assert_eq!(
+            world.svc.contact_decline(alice.user, peer).await,
+            Err(DomainError::NoPendingRequest)
+        );
+        assert_eq!(world.svc.contact_unblock(alice.user, peer).await, Ok(()));
+    }
+    assert_eq!(world.svc.contact_block(alice.user, unknown).await, Ok(()));
+    assert_eq!(world.svc.contact_state(alice.user, unknown).await, Ok(None));
 }
 
 async fn a_request_and_its_acceptance_are_announced_to_both_users<B: Backend>(backend: &B) {
@@ -714,13 +723,13 @@ pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
         blocking_ends_an_accepted_contact,
         unblocking_allows_a_fresh_request,
         a_user_cannot_request_themselves,
-        requesting_an_unknown_user_fails,
+        a_request_to_an_unknown_id_looks_pending_and_stores_nothing,
         a_hidden_request_arrives_when_the_block_is_lifted,
         the_sender_cannot_decline_their_own_request,
         blocking_cancels_a_pending_request_in_either_direction,
         a_repeated_request_changes_nothing,
         a_request_to_an_accepted_contact_stays_accepted,
-        contact_operations_reject_self_and_unknown_users,
+        contact_operations_reject_self_and_treat_unknown_ids_as_strangers,
         a_request_and_its_acceptance_are_announced_to_both_users,
         crossing_requests_announce_acceptance_to_both_users,
         a_request_that_changes_nothing_publishes_nothing,

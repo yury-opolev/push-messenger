@@ -54,7 +54,8 @@ use chrono::{DateTime, Utc};
 use crate::error::DomainResult;
 use crate::ids::{ClientMsgId, ConversationId, DeviceId, MessageId, UserId};
 use crate::model::{
-    ContactState, Conversation, ConversationOverview, Entry, GroupPositions, InviteRecord, Member,
+    ContactState, Conversation, ConversationOverview, DeviceState, Entry, GroupPositions,
+    InviteRecord, Member,
 };
 
 /// Result of an insert guarded by a uniqueness rule.
@@ -82,6 +83,13 @@ pub trait Tx: Send {
     /// Records a verified user. Idempotent.
     async fn insert_user(&mut self, user: UserId) -> DomainResult<()>;
     async fn user_exists(&mut self, user: UserId) -> DomainResult<bool>;
+    /// Records that `user`'s password was reset at `at`, keeping the latest time, and
+    /// returns the time kept. The user must exist.
+    async fn record_password_reset(
+        &mut self,
+        user: UserId,
+        at: DateTime<Utc>,
+    ) -> DomainResult<DateTime<Utc>>;
     /// Records an active device of `user` unless a device with this id exists (any owner,
     /// active or revoked), and returns whether the device is now an active device of
     /// `user`. Postgres checks after `INSERT … ON CONFLICT DO NOTHING`, which waits for a
@@ -93,9 +101,10 @@ pub trait Tx: Send {
     async fn revoke_device(&mut self, device: DeviceId) -> DomainResult<()>;
     /// The owner of a device, active or revoked; `None` if the device is unknown.
     async fn device_user(&mut self, device: DeviceId) -> DomainResult<Option<UserId>>;
-    /// The owner of a device and whether the device is still active, read in one
-    /// statement so the two cannot disagree; `None` if the device is unknown.
-    async fn device_state(&mut self, device: DeviceId) -> DomainResult<Option<(UserId, bool)>>;
+    /// The owner of a device, whether the device is still active and the owner's last
+    /// password reset, read in one statement so they cannot disagree; `None` if the device
+    /// is unknown.
+    async fn device_state(&mut self, device: DeviceId) -> DomainResult<Option<DeviceState>>;
     /// The owner of an active device; `None` if the device is unknown or revoked.
     async fn device_owner(&mut self, device: DeviceId) -> DomainResult<Option<UserId>>;
     /// The user's active devices.

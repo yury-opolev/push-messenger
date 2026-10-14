@@ -13,8 +13,8 @@
 //!    contact and Bob accepts, Carol redeems Alice's invite, Alice opens the direct
 //!    conversation with Bob; auth-svc shows Alice the profiles of Bob and Carol, and Bob
 //!    none of Carol's;
-//! 4. connects Bob's WebSocket and then Alice's, each with a DEV ONLY `Identify` naming
-//!    the device auth-svc registered, and waits for `Ready`;
+//! 4. connects Bob's WebSocket and then Alice's, each identifying with the access token
+//!    auth-svc issued for its device, and waits for `Ready`;
 //! 5. sends a message from Alice and waits for her `SendAck` and Bob's `Deliver`; acks it
 //!    from Bob, then pings: the `Pong` proves the ack went through, since the gateway
 //!    handles a connection's frames in order and answers a failed ack with an `Error`;
@@ -27,8 +27,7 @@
 //!    relays both, message-svc kicks Carol's device (revoked) and Bob's (password reset) on
 //!    their Redis channels, where the smoke test listens, and refuses Carol's device.
 //!
-//! The deployment must run the worker with the log sender and `PUSH_DEV_MAILBOX=1`, and
-//! the gateway with `PUSH_DEV_AUTH=1`.
+//! The deployment must run the worker with the log sender and `PUSH_DEV_MAILBOX=1`.
 
 mod auth;
 mod kicks;
@@ -519,6 +518,8 @@ async fn kick(
         .identify(IdentifyRequest {
             user_id: id_bytes(carol.user),
             device_id: id_bytes(carol.device),
+            // Carol never reset her password.
+            issued_at: 0,
         })
         .await;
     match identified {
@@ -577,6 +578,8 @@ impl Client {
                 .identify(IdentifyRequest {
                     user_id: id_bytes(user),
                     device_id: id_bytes(device),
+                    // New users: no password reset yet.
+                    issued_at: 0,
                 })
                 .await;
             match identified {
@@ -646,9 +649,7 @@ impl Client {
         send(
             &mut socket,
             Body::Identify(Identify {
-                token: String::new(),
-                dev_user_id: id_bytes(self.user),
-                dev_device_id: id_bytes(self.device),
+                token: self.access_token.clone(),
             }),
         )
         .await?;

@@ -103,6 +103,7 @@ pub fn error_from_status(status: &tonic::Status) -> Error {
             retryable: true,
             client_msg_id: None,
             request_id: None,
+            retry_after_s: None,
         },
     }
 }
@@ -149,6 +150,47 @@ mod tests {
             decode_frame(&encode_frame(Body::Ping(Ping {}))),
             Ok(Body::Ping(Ping {}))
         );
+    }
+
+    #[test]
+    fn the_request_and_server_frames_survive_encoding() {
+        use crate::v1::{
+            ContactEvent, ContactState, DirectReceipt, ListContacts, ReAuth, ReadPosition, Receipt,
+            Request, Response, receipt, request, response,
+        };
+        let conversation = id_bytes(Uuid::now_v7());
+        let frames = [
+            Body::ReAuth(ReAuth {
+                token: "a.b.c".to_owned(),
+            }),
+            Body::Request(Request {
+                request_id: 7,
+                body: Some(request::Body::ListContacts(ListContacts {})),
+            }),
+            Body::Response(Response {
+                request_id: 7,
+                body: Some(response::Body::Done(crate::v1::Done {})),
+            }),
+            Body::Receipt(Receipt {
+                conversation_id: conversation.clone(),
+                positions: Some(receipt::Positions::Direct(DirectReceipt {
+                    user_id: id_bytes(Uuid::now_v7()),
+                    delivered_seq: 4,
+                    read_seq: 3,
+                })),
+            }),
+            Body::ReadPosition(ReadPosition {
+                conversation_id: conversation,
+                read_seq: 3,
+            }),
+            Body::ContactEvent(ContactEvent {
+                user_id: id_bytes(Uuid::now_v7()),
+                state: ContactState::Accepted.into(),
+            }),
+        ];
+        for frame in frames {
+            assert_eq!(decode_frame(&encode_frame(frame.clone())), Ok(frame));
+        }
     }
 
     #[test]
@@ -205,6 +247,7 @@ mod tests {
             retryable: false,
             client_msg_id: Some(id_bytes(Uuid::now_v7())),
             request_id: Some(7),
+            retry_after_s: None,
         };
         let status = error_status(tonic::Code::FailedPrecondition, error.clone());
         assert_eq!(status.code(), tonic::Code::FailedPrecondition);
@@ -227,6 +270,7 @@ mod tests {
             retryable: false,
             client_msg_id: None,
             request_id: None,
+            retry_after_s: None,
         };
         let status = error_status(tonic::Code::FailedPrecondition, error.clone());
         let rich = RpcStatus::decode(status.details()).unwrap();

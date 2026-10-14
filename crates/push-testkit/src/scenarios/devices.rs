@@ -1,5 +1,7 @@
+use chrono::TimeDelta;
+use push_domain::{Clock, DeviceId, DomainError, Event, KickReason, UserId};
+
 use crate::{Backend, Case, World, bodies, case_list};
-use push_domain::{DeviceId, DomainError, Event, KickReason, UserId};
 
 async fn registering_a_device_for_an_unknown_user_fails<B: Backend>(backend: &B) {
     let world = World::new(backend).await;
@@ -13,7 +15,7 @@ async fn registering_a_device_for_an_unknown_user_fails<B: Backend>(backend: &B)
 async fn identify_accepts_the_users_own_active_device<B: Backend>(backend: &B) {
     let world = World::new(backend).await;
     let alice = world.person().await;
-    assert_eq!(world.svc.identify(alice.device, alice.user).await, Ok(()));
+    assert_eq!(world.identify(alice.device, alice.user).await, Ok(()));
 }
 
 async fn identify_rejects_a_device_of_another_user<B: Backend>(backend: &B) {
@@ -21,7 +23,7 @@ async fn identify_rejects_a_device_of_another_user<B: Backend>(backend: &B) {
     let alice = world.person().await;
     let bob = world.person().await;
     assert_eq!(
-        world.svc.identify(bob.device, alice.user).await,
+        world.identify(bob.device, alice.user).await,
         Err(DomainError::UnknownDevice)
     );
 }
@@ -31,7 +33,7 @@ async fn identify_rejects_a_revoked_device<B: Backend>(backend: &B) {
     let alice = world.person().await;
     world.svc.revoke_device(alice.device).await.unwrap();
     assert_eq!(
-        world.svc.identify(alice.device, alice.user).await,
+        world.identify(alice.device, alice.user).await,
         Err(DomainError::UnknownDevice)
     );
 }
@@ -39,11 +41,11 @@ async fn identify_rejects_a_revoked_device<B: Backend>(backend: &B) {
 async fn identify_asks_to_retry_a_device_not_relayed_yet<B: Backend>(backend: &B) {
     let world = World::new(backend).await;
     let (user, device) = (UserId::new(), DeviceId::new());
-    let refused = world.svc.identify(device, user).await.unwrap_err();
+    let refused = world.identify(device, user).await.unwrap_err();
     assert_eq!(refused, DomainError::DeviceNotKnownYet);
     assert!(refused.is_retryable());
     world.svc.device_registered(device, user).await.unwrap();
-    assert_eq!(world.svc.identify(device, user).await, Ok(()));
+    assert_eq!(world.identify(device, user).await, Ok(()));
 }
 
 async fn a_device_id_of_another_user_cannot_be_registered<B: Backend>(backend: &B) {
@@ -75,7 +77,7 @@ async fn registering_the_same_user_and_device_twice_is_harmless<B: Backend>(back
         .register_device(alice.device, alice.user)
         .await
         .unwrap();
-    assert_eq!(world.svc.identify(alice.device, alice.user).await, Ok(()));
+    assert_eq!(world.identify(alice.device, alice.user).await, Ok(()));
 }
 
 async fn a_relayed_registration_records_the_user_too<B: Backend>(backend: &B) {
@@ -84,7 +86,7 @@ async fn a_relayed_registration_records_the_user_too<B: Backend>(backend: &B) {
     world.svc.device_registered(device, user).await.unwrap();
     world.svc.device_registered(device, user).await.unwrap();
     world.svc.register_user(user).await.unwrap();
-    assert_eq!(world.svc.identify(device, user).await, Ok(()));
+    assert_eq!(world.identify(device, user).await, Ok(()));
 }
 
 async fn a_relayed_registration_starts_up_to_date<B: Backend>(backend: &B) {
@@ -116,7 +118,7 @@ async fn a_revocation_relayed_before_the_registration_wins<B: Backend>(backend: 
     world.svc.device_registered(device, user).await.unwrap();
     world.svc.device_revoked(device, user).await.unwrap();
     assert_eq!(
-        world.svc.identify(device, user).await,
+        world.identify(device, user).await,
         Err(DomainError::UnknownDevice)
     );
 }
@@ -127,10 +129,10 @@ async fn a_relayed_revocation_closes_an_active_device<B: Backend>(backend: &B) {
     let tablet = world.add_device(&alice).await;
     world.svc.device_revoked(tablet, alice.user).await.unwrap();
     assert_eq!(
-        world.svc.identify(tablet, alice.user).await,
+        world.identify(tablet, alice.user).await,
         Err(DomainError::UnknownDevice)
     );
-    assert_eq!(world.svc.identify(alice.device, alice.user).await, Ok(()));
+    assert_eq!(world.identify(alice.device, alice.user).await, Ok(()));
 }
 
 async fn relayed_events_for_another_users_device_are_refused<B: Backend>(backend: &B) {
@@ -144,7 +146,7 @@ async fn relayed_events_for_another_users_device_are_refused<B: Backend>(backend
         world.svc.device_revoked(alice.device, bob.user).await,
         Err(DomainError::UnknownDevice)
     );
-    assert_eq!(world.svc.identify(alice.device, alice.user).await, Ok(()));
+    assert_eq!(world.identify(alice.device, alice.user).await, Ok(()));
 }
 
 async fn a_relayed_revocation_kicks_the_device<B: Backend>(backend: &B) {
@@ -183,23 +185,126 @@ async fn a_password_reset_kicks_every_active_device_of_the_user<B: Backend>(back
     world.svc.device_revoked(revoked, alice.user).await.unwrap();
     world.notifier.take();
 
-    world.svc.password_reset(alice.user).await.unwrap();
+    let reset_at = world.clock.now();
+    world
+        .svc
+        .password_reset(alice.user, Some(reset_at))
+        .await
+        .unwrap();
     let mut devices = vec![alice.device, laptop];
     devices.sort();
     assert_eq!(
         world.notifier.take(),
         [Event::Kick {
             devices,
-            reason: KickReason::PasswordReset,
+            reason: KickReason::PasswordReset { reset_at },
         }]
     );
     // The devices stay registered: a new sign-in on them works.
-    assert_eq!(world.svc.identify(laptop, alice.user).await, Ok(()));
-    assert_eq!(world.svc.identify(bob.device, bob.user).await, Ok(()));
+    world.clock.advance(TimeDelta::seconds(1));
+    assert_eq!(world.identify(laptop, alice.user).await, Ok(()));
+    assert_eq!(world.identify(bob.device, bob.user).await, Ok(()));
 
     // A user message-svc has not heard of has nothing to kick.
-    world.svc.password_reset(UserId::new()).await.unwrap();
+    world
+        .svc
+        .password_reset(UserId::new(), Some(reset_at))
+        .await
+        .unwrap();
     assert_eq!(world.notifier.take(), []);
+}
+
+/// A token that outlives the reset (up to 15 minutes), on a device whose kick was lost,
+/// cannot sign in again. The reset's time is auth-svc's: a token issued after it passes
+/// even when the worker relays the reset later.
+async fn identify_refuses_tokens_issued_until_the_password_reset<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
+    let (alice, bob) = (world.person().await, world.person().await);
+    // auth-svc reset the password half a minute before the worker relayed it.
+    let reset_at = world.clock.now() - TimeDelta::seconds(30);
+    world
+        .svc
+        .password_reset(alice.user, Some(reset_at))
+        .await
+        .unwrap();
+    let before = reset_at - TimeDelta::minutes(10);
+    let refused = world.svc.identify(alice.device, alice.user, before).await;
+    assert_eq!(refused, Err(DomainError::PasswordChanged));
+    assert!(!DomainError::PasswordChanged.is_retryable());
+    // Within the second of the reset the order is unknown: refused too.
+    assert_eq!(
+        world.svc.identify(alice.device, alice.user, reset_at).await,
+        Err(DomainError::PasswordChanged)
+    );
+    // Signed in after the reset, before the relay.
+    let after = reset_at + TimeDelta::seconds(1);
+    assert_eq!(
+        world.svc.identify(alice.device, alice.user, after).await,
+        Ok(())
+    );
+    // Other users are not affected.
+    assert_eq!(
+        world.svc.identify(bob.device, bob.user, before).await,
+        Ok(())
+    );
+}
+
+/// The reset can be relayed before the user's device. A redelivered or an older reset
+/// moves nothing, so a session that signed in after the latest reset stays; a newer one
+/// ends it. An event without a time takes message-svc's clock.
+async fn a_redelivered_or_older_reset_signs_out_no_newer_session<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
+    let (user, device) = (UserId::new(), DeviceId::new());
+    let reset_at = world.clock.now();
+    world
+        .svc
+        .password_reset(user, Some(reset_at))
+        .await
+        .unwrap();
+    world.svc.device_registered(device, user).await.unwrap();
+    assert_eq!(
+        world.svc.identify(device, user, reset_at).await,
+        Err(DomainError::PasswordChanged)
+    );
+    world.clock.advance(TimeDelta::minutes(1));
+    let signed_in = world.clock.now();
+    assert_eq!(world.identify(device, user).await, Ok(()));
+
+    // At-least-once: the same event again, a minute later; then an older reset.
+    world.clock.advance(TimeDelta::minutes(1));
+    world.notifier.take();
+    world
+        .svc
+        .password_reset(user, Some(reset_at))
+        .await
+        .unwrap();
+    let older = reset_at - TimeDelta::hours(1);
+    world.svc.password_reset(user, Some(older)).await.unwrap();
+    assert_eq!(world.svc.identify(device, user, signed_in).await, Ok(()));
+    // The kicks carry the latest reset, which the newer session postdates.
+    let kick = Event::Kick {
+        devices: vec![device],
+        reason: KickReason::PasswordReset { reset_at },
+    };
+    assert_eq!(world.notifier.take(), [kick.clone(), kick]);
+
+    // A newer reset ends it.
+    let newer = signed_in + TimeDelta::seconds(30);
+    world.svc.password_reset(user, Some(newer)).await.unwrap();
+    assert_eq!(
+        world.svc.identify(device, user, signed_in).await,
+        Err(DomainError::PasswordChanged)
+    );
+
+    // Without a time, now.
+    world.clock.advance(TimeDelta::minutes(1));
+    world.svc.password_reset(user, None).await.unwrap();
+    assert_eq!(
+        world.identify(device, user).await,
+        Err(DomainError::PasswordChanged)
+    );
+    world.clock.advance(TimeDelta::seconds(1));
+    assert_eq!(world.identify(device, user).await, Ok(()));
 }
 
 pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
@@ -219,5 +324,7 @@ pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
         relayed_events_for_another_users_device_are_refused,
         a_relayed_revocation_kicks_the_device,
         a_password_reset_kicks_every_active_device_of_the_user,
+        identify_refuses_tokens_issued_until_the_password_reset,
+        a_redelivered_or_older_reset_signs_out_no_newer_session,
     ]
 }

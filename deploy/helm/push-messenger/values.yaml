@@ -24,10 +24,9 @@ images:
 # stay the same (the bring-up script sets it after rebuilding the images).
 buildId: ""
 
-# DEV ONLY switches: the gateway accepts identities without a token (PUSH_DEV_AUTH=1), the
-# worker shows the emails its log sender delivered at /dev/mailbox (PUSH_DEV_MAILBOX=1), a
-# webhook secret is generated when none is set, and `helm test` runs the smoke test. Never
-# enable outside a local cluster.
+# DEV ONLY switches: the worker shows the emails its log sender delivered at /dev/mailbox
+# (PUSH_DEV_MAILBOX=1), a webhook secret is generated when none is set, and `helm test`
+# runs the smoke test. Never enable outside a local cluster.
 devMode:
   enabled: false
   # Must be exactly "insecure-local-only" when enabled.
@@ -37,6 +36,10 @@ gateway:
   replicas: 1
   # Client ping interval announced in Ready, in milliseconds.
   heartbeatMs: 30000
+  # Groups are not offered to apps in the first release (owner decision): the gateway
+  # refuses group requests with NOT_AVAILABLE. message-svc keeps full group support;
+  # true serves them.
+  groups: false
   # 5 s preStop sleep + the gateway's own 10 s drain + margin.
   terminationGracePeriodSeconds: 30
   resources:

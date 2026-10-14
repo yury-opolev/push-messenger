@@ -151,13 +151,29 @@ async fn run(world: &World, jobs: &[Job]) -> Vec<Outcome> {
     outcomes
 }
 
+/// Seconds since the Unix epoch.
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+/// Whether message-svc accepts the device, with an access token issued a second from now:
+/// after any password reset relayed so far.
 async fn identifies(world: &World, user: Uuid, device: Uuid) -> bool {
+    identifies_at(world, user, device, unix_now() + 1).await
+}
+
+/// Whether message-svc accepts the device with an access token issued at `issued_at`.
+async fn identifies_at(world: &World, user: Uuid, device: Uuid, issued_at: i64) -> bool {
     world
         .messaging
         .clone()
         .identify(IdentifyRequest {
             user_id: id_bytes(user),
             device_id: id_bytes(device),
+            issued_at,
         })
         .await
         .is_ok()
@@ -168,7 +184,14 @@ async fn events_move_from_the_outbox_to_the_queue_once() {
     let world = world().await;
     let user = Uuid::now_v7();
     let first = write(&world.auth, &Event::UserVerified { user_id: user }).await;
-    let second = write(&world.auth, &Event::UserPasswordReset { user_id: user }).await;
+    let second = write(
+        &world.auth,
+        &Event::UserPasswordReset {
+            user_id: user,
+            reset_at: unix_now(),
+        },
+    )
+    .await;
     // A worker that died after queueing the first event, before deleting it.
     world
         .queue
@@ -198,6 +221,8 @@ async fn events_move_from_the_outbox_to_the_queue_once() {
 async fn relayed_events_register_and_revoke_devices_in_message_svc_in_any_order() {
     let world = world().await;
     let (user, phone, tablet) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+    // auth-svc reset the password a minute before the relay.
+    let reset_at = unix_now() - 60;
     for event in [
         Event::UserVerified { user_id: user },
         Event::DeviceRegistered {
@@ -212,7 +237,10 @@ async fn relayed_events_register_and_revoke_devices_in_message_svc_in_any_order(
             user_id: user,
             device_id: tablet,
         },
-        Event::UserPasswordReset { user_id: user },
+        Event::UserPasswordReset {
+            user_id: user,
+            reset_at,
+        },
     ] {
         write(&world.auth, &event).await;
     }
@@ -224,6 +252,9 @@ async fn relayed_events_register_and_revoke_devices_in_message_svc_in_any_order(
     assert_eq!(outcomes, vec![Outcome::Done; 5]);
     assert!(identifies(&world, user, phone).await);
     assert!(!identifies(&world, user, tablet).await);
+    // The reset counts from auth-svc's time, not the relay's.
+    assert!(!identifies_at(&world, user, phone, reset_at).await);
+    assert!(identifies_at(&world, user, phone, reset_at + 1).await);
 
     // Delivered again (at least once): nothing changes.
     for event in [

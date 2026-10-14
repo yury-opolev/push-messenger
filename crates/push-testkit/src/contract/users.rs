@@ -1,4 +1,5 @@
-use push_domain::{DeviceId, DomainError, Store, Tx, UserId};
+use chrono::{TimeZone, Utc};
+use push_domain::{DeviceId, DeviceState, DomainError, Store, Tx, UserId};
 
 use super::add_users;
 use crate::{Backend, Case, case_list};
@@ -79,22 +80,64 @@ async fn device_user_names_the_owner_of_revoked_devices_too<B: Backend>(backend:
     assert_eq!(tx.device_user(DeviceId::new()).await.unwrap(), None);
 }
 
-async fn device_state_reads_owner_and_activity_together<B: Backend>(backend: &B) {
+async fn device_state_reads_owner_activity_and_reset_together<B: Backend>(backend: &B) {
     let store = backend.store().await;
     let (user, other) = (UserId::new(), UserId::new());
     add_users(&store, &[user, other]).await;
     let (active, revoked) = (DeviceId::new(), DeviceId::new());
+    let reset = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
     let mut tx = store.begin().await.unwrap();
     tx.insert_device(active, user).await.unwrap();
     tx.insert_device(revoked, other).await.unwrap();
     tx.revoke_device(revoked).await.unwrap();
+    tx.record_password_reset(user, reset).await.unwrap();
 
-    assert_eq!(tx.device_state(active).await.unwrap(), Some((user, true)));
+    let state = |user, active, password_reset_at| {
+        Some(DeviceState {
+            user,
+            active,
+            password_reset_at,
+        })
+    };
+    assert_eq!(
+        tx.device_state(active).await.unwrap(),
+        state(user, true, Some(reset))
+    );
     assert_eq!(
         tx.device_state(revoked).await.unwrap(),
-        Some((other, false))
+        state(other, false, None)
     );
     assert_eq!(tx.device_state(DeviceId::new()).await.unwrap(), None);
+}
+
+async fn a_password_reset_keeps_the_latest_time_and_needs_the_user<B: Backend>(backend: &B) {
+    let store = backend.store().await;
+    let user = UserId::new();
+    add_users(&store, &[user]).await;
+    let device = DeviceId::new();
+    let (earlier, later) = (
+        Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap(),
+        Utc.with_ymd_and_hms(2026, 1, 2, 12, 0, 0).unwrap(),
+    );
+    let mut tx = store.begin().await.unwrap();
+    tx.insert_device(device, user).await.unwrap();
+    // The time kept comes back.
+    assert_eq!(tx.record_password_reset(user, later).await.unwrap(), later);
+    assert_eq!(
+        tx.record_password_reset(user, earlier).await.unwrap(),
+        later
+    );
+    let reset = tx
+        .device_state(device)
+        .await
+        .unwrap()
+        .unwrap()
+        .password_reset_at;
+    assert_eq!(reset, Some(later));
+    assert!(matches!(
+        tx.record_password_reset(UserId::new(), later).await,
+        Err(DomainError::Store(_))
+    ));
 }
 
 pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
@@ -105,6 +148,7 @@ pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
         a_device_of_an_unknown_user_is_refused,
         revoking_an_unknown_device_does_nothing,
         device_user_names_the_owner_of_revoked_devices_too,
-        device_state_reads_owner_and_activity_together,
+        device_state_reads_owner_activity_and_reset_together,
+        a_password_reset_keeps_the_latest_time_and_needs_the_user,
     ]
 }
