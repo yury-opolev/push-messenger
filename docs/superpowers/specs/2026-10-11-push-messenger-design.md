@@ -1041,15 +1041,27 @@ Implementation notes (push-proto, Plan 4A):
 
 ### 8.2 Public surface
 
-- `Client` — sign-up, verification resend, login, device registration, connect,
-  disconnect; `send`, `edit`, `delete`, `mark_read`, `fetch_history`,
-  `list_conversations`; contacts, invites and groups. On creation it rescans the outbox
-  and resumes sending.
-- `SendHandle` — returned by `send`, `edit` and `delete`; exposes `client_msg_id` and
-  `cancel()` (works only before the server has acknowledged).
-- `SdkEvent` — one stream: `LocalEcho`, `Sent`, `Received`, `Edited`, `Deleted`,
-  `Delivered`, `Read`, `SendFailed{client_msg_id, reason}`, `ContactChanged`,
-  `ConversationChanged`, `ConnectionState`.
+- `Client` — sign-up, verification resend, password-reset request, sign-in (which
+  registers the device, or signs the device it registered before in again), sign-out,
+  connect, disconnect; `send`, `edit`, `delete`, `cancel`, `mark_read`, `fetch_history`,
+  `list_conversations`, the local conversations, messages and contacts; contacts,
+  invites, `open_direct`; profiles, handle lookup, devices and revocation. Groups are
+  not offered in the first release (owner decision), so there are no group calls yet.
+  Once connected it sends whatever the outbox holds, also after a restart.
+- `send` returns the local echo; its `client_msg_id` is the handle: `edit` and `delete`
+  name a message by it, and `cancel(conversation, client_msg_id)` takes back a message
+  never sent (once an attempt was made the server may have stored it, and `cancel`
+  refuses). Plan 9 chose an id over a `SendHandle` object, which is harder to carry across
+  the FFI.
+- `Events` — one ordered stream: `ConnectionStateChanged` (`Offline`, `Connecting`,
+  `Connected`, `Reconnecting{attempt, retry_in_ms}`, `SignedOut`, `DeviceRemoved`),
+  `MessageAdded` (the local echo, or a message received), `MessageSent`, `MessageEdited`,
+  `MessageDeleted`, `SendFailed{conversation_id, client_msg_id, kind, error}`,
+  `ReceiptChanged{conversation_id, peer_delivered_seq, peer_read_seq}`,
+  `ConversationChanged`, `ContactChanged`, `SignedOut`, `DeviceRemoved`. A message's
+  status (pending, sent, delivered, read; received for others' messages) is computed from
+  the conversation's receipt positions when it is read, so one `ReceiptChanged` moves
+  every tick at once.
 
 ### 8.3 Validation before queuing
 
@@ -1063,20 +1075,22 @@ server checks everything again.
 
 ```sql
 outbox (
-  client_msg_id   blob primary key,   -- UUIDv7; stable across retries and restarts
-  conversation_id blob not null,
-  kind            integer not null,   -- message | edit | delete
-  target          blob,               -- edit/delete: message_id or client_msg_id
-  content_type    integer,
-  body            blob,
-  state           integer not null,   -- queued | in_flight
-  enqueued_at     integer not null,
-  attempts        integer not null default 0,
-  parent_id       blob                -- send only after this row is acknowledged
+  client_msg_id        blob primary key,  -- UUIDv7; stable across retries and restarts
+  conversation_id      blob not null,
+  kind                 integer not null,  -- message | edit | delete
+  target_message_id    blob,              -- edit/delete: the server id, when known
+  target_client_msg_id blob,              -- edit/delete: the target's client_msg_id
+  content_type         integer,
+  body                 blob,
+  state                integer not null,  -- queued | in_flight
+  enqueued_at          integer not null,
+  attempts             integer not null default 0,
+  next_attempt_at      integer not null default 0,  -- a retry waits until then (ms)
+  parent_id            blob               -- send only after this row is acknowledged
 )
 ```
 
-- Rows are sent in `enqueued_at` order per conversation, one in flight at a time.
+- Rows are sent in the order they were queued, per conversation, one in flight at a time.
 - **Transient failures** (network, server errors, rate limits) are retried with backoff
   and jitter, 1 s up to 60 s.
 - **Rejections** (not a contact, not a member, window expired) remove the row, emit
@@ -1097,6 +1111,57 @@ outbox (
   an SDK thread. This is documented.
 - Every returned allocation has a matching `*_free`.
 - Node receives events through a `ThreadsafeFunction`.
+
+Implementation notes (push-sdk, Plan 9A):
+
+- **Layers.** `auth.rs` (auth-svc's HTTP API), `credentials.rs` (refreshes serialised, so
+  one client never presents a rotated refresh token twice; new tokens saved before use),
+  `store.rs` and `store/outbox.rs` (SQLite through `rusqlite` 0.32 with its bundled SQLite,
+  WAL; 0.32 because its `libsqlite3-sys` must match the one sqlx 0.8 puts in the
+  lockfile), `policy.rs` (close codes, backoff, frame budget, acks; no I/O), `engine.rs`
+  (what rides on a connection, without the socket), `connection.rs` (the socket and the
+  reconnect loop) and `client.rs`. The client owns a two-worker tokio runtime, dropped
+  with `shutdown_background`; its async methods can be awaited from any executor.
+- **Credentials** live only in a `SecretStore` the app provides: three blocking calls
+  (`load`, `save`, `delete` of bytes under `push.session`, `push.device`,
+  `push.registration`), so a keychain or a binding's callback can implement it. The SDK
+  never logs tokens and redacts them from `Debug`. The `registration_id` is saved before
+  the first registration attempt and forgotten once answered; the device id is kept after
+  a sign-out by the server, so signing in again uses `login` with `device_id` and keeps
+  the device. Safe calls (refresh within the 30 s grace, registration, reads, revocation)
+  are retried three times within 3.5 s; sign-up, sign-in and email requests never are.
+- **The connection.** Only 4001 signs out (the credentials are forgotten; local data and
+  the outbox stay for the same user) and only 4003 stops (`DeviceRemoved`, credentials
+  kept; the app may `connect()` again). 4002 refreshes and reconnects at once (a second
+  4002 in a row backs off). 4006 retries 500 ms doubling to 5 s and never signs out.
+  Everything else reconnects 1 s doubling to 60 s, each delay drawn between half and all
+  of it; 10 s of `Ready` resets the backoff. The access token is refreshed before a
+  connection when under 90 s remain; `AuthExpiring` refreshes in the background and sends
+  `ReAuth`; an anonymous retryable `Error` sends the `ReAuth` again after 1 s. Pings follow
+  the heartbeat from `Ready`, the first at a random point of the first one; no `Pong`
+  within 15 s ends the connection. Each `Ready` lists conversations (without
+  `changed_since`) and contacts and sends unconfirmed read positions; a `ContactEvent`
+  lists the conversations again.
+- **Frames and acks.** The client sends at most 50 frames at once and 10 a second after
+  that (the gateway allows 100 and 20) and at most 20 outbox rows per wake. A delivery is
+  acked only after it is stored, and acks wait until deliveries pause for 50 ms (at most
+  250 ms): one `Ack` per conversation naming its highest stored `seq`, so a `Sync` batch
+  of 500 entries costs one frame.
+- **The store.** A database belongs to one user (another user's sign-in erases it; an
+  explicit `sign_out()` revokes the device and erases it). Entries at or below a
+  conversation's received position are replays and change nothing (but are acked again);
+  edits and deletes apply only above the target's `edit_seq` and only to held messages;
+  receipt, read and listing positions only move forward. A delivery that cannot be stored
+  is not acked. Edits and deletes of sent messages are applied locally on their `SendAck`
+  or delivery, never before.
+- **Requests** wait for the connection up to the request timeout (15 s) and for the answer
+  as long again; they fail at once while the app has not asked to connect (`offline`),
+  after a sign-out (`not_signed_in`) or a removal (`device_removed`), and with
+  `disconnected` when the connection drops before the answer. The SDK never repeats a
+  request. Errors carry a stable string code: the server's own for refusals.
+- **Not yet:** an OS keychain store, local encryption, proxies, and TLS against a real
+  certificate (compiled in, first used in Plan 11) are open (Plan 9A's owner decisions
+  needed and deferred items).
 
 ## 9. Email
 
@@ -1238,12 +1303,17 @@ Implementation notes (local minikube, Plan 4B):
   no longer gets the Redis URL or message-svc's address, and it reads auth-svc's signing
   key from the Secret (`PUSH_SMOKE_SIGNING_KEY`) to sign an expired token and one for
   another audience that the gateway must refuse.
+- Plan 9B: after the raw protocol, the smoke test runs two apps built on `push-sdk`
+  through the same ingress. Their SQLite files live in an `emptyDir` at `/data`
+  (`--data-dir`; the root filesystem stays read-only), the Pod's memory limit is 128 MiB,
+  and the whole run may take 300 s. A run signs up five users, so the per-IP signup limit
+  allows about four runs an hour on one cluster.
 - The smoke client verifies the access token's audience (`socket_url` with its authority
   replaced by the Host override, `ws://push.local/v1/socket` on minikube) and the
   refreshed token's `sub` and `device_id`. It never prints response bodies, tokens or
   token-bearing URLs, retries only on 502, 503, 504 and transport errors, and ignores
-  `HTTP_PROXY`. The per-IP signup limit (20/h) caps smoke runs to about 10 per hour on a
-  long-lived cluster.
+  `HTTP_PROXY`. The per-IP signup limit (20/h) caps smoke runs on a long-lived
+  cluster (about four an hour since Plan 9B's five signups a run).
 - Deferred to Plan 11: validate hand-set auth keys at render time; `x-real-ip` on Azure
   needs `externalTrafficPolicy: Local` or the PROXY protocol (behind an SNAT load balancer
   every client arrives with the balancer's address, collapsing the per-IP limits of
@@ -1282,7 +1352,7 @@ Implementation notes (local minikube, Plan 4B):
 | Unit | `push-domain` with in-memory repositories: seq allocation, retry replay, positions, receipts, edit/delete rules, contacts, group membership, validation. The scenarios and the storage contract live in `push-testkit` and are written once: every store runs all of them |
 | Integration | Real Postgres and Redis via testcontainers: the whole `push-testkit` suite against Postgres, transaction order, gapless `seq` under concurrent retries, outbox relay, `SKIP LOCKED` |
 | Protocol | Raw-frame harness: malformed frames, out-of-order acks, replayed `client_msg_id`, unverified email, revoked device, non-contact send |
-| End-to-end | SDK clients through the full stack: register, verify, connect via invite, chat, receipts, edit, delete, group of 100, new device loading history |
+| End-to-end | SDK clients through the full stack: register, verify, connect via invite, chat, receipts, edit, delete, group of 100, new device loading history. Plan 9B: two `push-sdk` apps in the smoke test (locally and on minikube) — invite, chat, receipts, edit, delete, an outbox surviving restarts, a cut-off send stored once, `DeviceRemoved` and `SignedOut` |
 | Load | 10,000 concurrent sockets: memory per connection, latency, recovery from a reconnect storm, 100-member group throughput |
 
 Required adverse-condition tests:
