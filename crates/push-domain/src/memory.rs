@@ -14,8 +14,8 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 use crate::error::{DomainError, DomainResult};
 use crate::ids::{ClientMsgId, ConversationId, DeviceId, MessageId, UserId};
 use crate::model::{
-    ContactState, Conversation, ConversationKind, ConversationOverview, Entry, EntryKind,
-    GroupPositions, InviteRecord, Member, Role,
+    ContactState, Conversation, ConversationKind, ConversationOverview, DeviceState, Entry,
+    EntryKind, GroupPositions, InviteRecord, Member, Role,
 };
 use crate::store::{InsertOutcome, Store, Tx};
 
@@ -26,6 +26,8 @@ fn missing(what: &str) -> DomainError {
 #[derive(Debug, Clone, Default)]
 struct State {
     users: HashSet<UserId>,
+    /// The last password reset message-svc heard of, per user.
+    password_resets: HashMap<UserId, DateTime<Utc>>,
     devices: HashMap<DeviceId, DeviceRow>,
     contacts: HashMap<(UserId, UserId), ContactState>,
     /// Blocked rows whose owner could see the peer when blocking.
@@ -236,6 +238,19 @@ impl Tx for InMemoryTx {
         Ok(self.work.users.contains(&user))
     }
 
+    async fn record_password_reset(
+        &mut self,
+        user: UserId,
+        at: DateTime<Utc>,
+    ) -> DomainResult<DateTime<Utc>> {
+        if !self.work.users.contains(&user) {
+            return Err(missing("user"));
+        }
+        let latest = self.work.password_resets.entry(user).or_insert(at);
+        *latest = (*latest).max(at);
+        Ok(*latest)
+    }
+
     async fn insert_device(&mut self, device: DeviceId, user: UserId) -> DomainResult<bool> {
         if let Some(row) = self.work.devices.get(&device) {
             return Ok(row.user == user && !row.revoked);
@@ -264,12 +279,12 @@ impl Tx for InMemoryTx {
         Ok(self.work.devices.get(&device).map(|row| row.user))
     }
 
-    async fn device_state(&mut self, device: DeviceId) -> DomainResult<Option<(UserId, bool)>> {
-        Ok(self
-            .work
-            .devices
-            .get(&device)
-            .map(|row| (row.user, !row.revoked)))
+    async fn device_state(&mut self, device: DeviceId) -> DomainResult<Option<DeviceState>> {
+        Ok(self.work.devices.get(&device).map(|row| DeviceState {
+            user: row.user,
+            active: !row.revoked,
+            password_reset_at: self.work.password_resets.get(&row.user).copied(),
+        }))
     }
 
     async fn device_owner(&mut self, device: DeviceId) -> DomainResult<Option<UserId>> {

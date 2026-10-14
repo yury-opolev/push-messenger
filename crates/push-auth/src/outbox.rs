@@ -8,7 +8,10 @@
 //! |---|---|
 //! | `email.send` | `{user_id, to, template, params}` |
 //! | `user.verified` | `{user_id}` |
-//! | `user.password_reset` | `{user_id}`: every device of the user is to be kicked |
+//! | `user.password_reset` | `{user_id, reset_at}`: every device of the user is to be kicked |
+//!
+//! `reset_at` is in seconds since the Unix epoch, from the clock that sets the access
+//! tokens' `iat`: message-svc refuses the tokens issued no later than that second.
 //! | `device.registered` | `{user_id, device_id}` |
 //! | `device.revoked` | `{user_id, device_id}` |
 
@@ -65,6 +68,9 @@ pub enum Event {
     },
     UserPasswordReset {
         user_id: Uuid,
+        /// When the password was reset, in seconds since the Unix epoch: the clock that
+        /// sets the access tokens' `iat`.
+        reset_at: i64,
     },
     DeviceRegistered {
         user_id: Uuid,
@@ -97,8 +103,9 @@ impl Event {
                 "template": email.template(),
                 "params": email.params(),
             }),
-            Self::UserVerified { user_id } | Self::UserPasswordReset { user_id } => {
-                json!({"user_id": user_id})
+            Self::UserVerified { user_id } => json!({"user_id": user_id}),
+            Self::UserPasswordReset { user_id, reset_at } => {
+                json!({"user_id": user_id, "reset_at": reset_at})
             }
             Self::DeviceRegistered { user_id, device_id }
             | Self::DeviceRevoked { user_id, device_id } => {
@@ -155,7 +162,13 @@ mod tests {
         let (user_id, device_id) = (Uuid::now_v7(), Uuid::now_v7());
         let cases = [
             (Event::UserVerified { user_id }, "user.verified"),
-            (Event::UserPasswordReset { user_id }, "user.password_reset"),
+            (
+                Event::UserPasswordReset {
+                    user_id,
+                    reset_at: 1_760_000_000,
+                },
+                "user.password_reset",
+            ),
             (
                 Event::DeviceRegistered { user_id, device_id },
                 "device.registered",
@@ -172,6 +185,14 @@ mod tests {
         assert_eq!(
             Event::DeviceRevoked { user_id, device_id }.payload()["device_id"],
             json!(device_id)
+        );
+        assert_eq!(
+            Event::UserPasswordReset {
+                user_id,
+                reset_at: 1_760_000_000
+            }
+            .payload()["reset_at"],
+            json!(1_760_000_000)
         );
     }
 }

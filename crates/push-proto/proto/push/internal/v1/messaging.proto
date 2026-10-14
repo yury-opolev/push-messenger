@@ -15,10 +15,12 @@ package push.internal.v1;
 import "push/v1/frame.proto";
 
 service Messaging {
-  // Confirms that the device is active and belongs to the user. A revoked device, or one
-  // of another user, is PERMISSION_DENIED (UNKNOWN_DEVICE); a device message-svc has never
-  // heard of is UNAVAILABLE (retryable): auth-svc registered it and the worker has not
-  // relayed it yet, which takes about a second.
+  // Confirms that the device is active and belongs to the user, and that the access token
+  // is newer than the user's last password reset. A revoked device, or one of another
+  // user, is PERMISSION_DENIED (UNKNOWN_DEVICE); a token issued no later than the second
+  // of the last reset message-svc heard of is UNAUTHENTICATED (PASSWORD_CHANGED); a device
+  // message-svc has never heard of is UNAVAILABLE (DEVICE_NOT_READY, retryable): auth-svc
+  // registered it and the worker has not relayed it yet, which takes about a second.
   rpc Identify(IdentifyRequest) returns (IdentifyResponse);
   // Appends a text message; answers after commit.
   rpc Send(SendRequest) returns (push.v1.SendAck);
@@ -58,8 +60,9 @@ service Accounts {
   // before the registration; the device is kicked (`kick:{device_id}`).
   rpc DeviceRevoked(AccountDevice) returns (AccountsResponse);
   // user.password_reset: every active device of the user is kicked
-  // (`kick:{device_id}`), to sign in again. The gateway closes kicked sockets and refuses
-  // tokens older than the reset in Plan 8.
+  // (`kick:{device_id}`), to sign in again, and Identify refuses the access tokens issued
+  // no later than the second of `reset_at` (message-svc's own clock when it is 0). The
+  // latest reset counts: a repeated or an older event moves nothing.
   rpc PasswordReset(AccountUser) returns (AccountsResponse);
 }
 
@@ -81,6 +84,8 @@ service Directory {
 message IdentifyRequest {
   bytes user_id = 1;
   bytes device_id = 2;
+  // The access token's `iat`, in seconds since the Unix epoch.
+  int64 issued_at = 3;
 }
 
 message IdentifyResponse {}
@@ -184,9 +189,13 @@ message ReadPositionChanged {
 }
 
 // Published on the Redis channel `kick:{device_id}` (spec §5.3, §5.4): the gateway holding
-// the device closes its socket at once (Plan 8). Never carries anything but the reason.
+// the device closes its socket at once (Plan 8). Never carries anything but the reason and
+// the reset time.
 message Kick {
   KickReason reason = 1;
+  // PASSWORD_RESET: the reset, in seconds since the Unix epoch. A connection whose token
+  // was issued after that second signed in after the reset and stays open.
+  int64 reset_at = 2;
 }
 
 enum KickReason {
@@ -199,6 +208,9 @@ enum KickReason {
 
 message AccountUser {
   bytes user_id = 1;
+  // PasswordReset only: auth-svc's time of the reset, in seconds since the Unix epoch (the
+  // clock of the tokens' `iat`); 0 for an event written before auth-svc sent it.
+  int64 reset_at = 2;
 }
 
 message AccountDevice {

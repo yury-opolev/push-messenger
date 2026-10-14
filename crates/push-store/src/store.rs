@@ -4,8 +4,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use push_domain::{
     ClientMsgId, ContactState, Conversation, ConversationId, ConversationOverview, DeviceId,
-    DomainError, DomainResult, Entry, EntryKind, GroupPositions, InsertOutcome, InviteRecord,
-    Member, MessageId, Store, Tx, UserId,
+    DeviceState, DomainError, DomainResult, Entry, EntryKind, GroupPositions, InsertOutcome,
+    InviteRecord, Member, MessageId, Store, Tx, UserId,
 };
 use sqlx::postgres::{PgPool, PgRow};
 use sqlx::{PgConnection, Postgres, Row, Transaction};
@@ -132,6 +132,27 @@ impl Tx for PgTx {
             .map_err(store_error)
     }
 
+    async fn record_password_reset(
+        &mut self,
+        user: UserId,
+        at: DateTime<Utc>,
+    ) -> DomainResult<DateTime<Utc>> {
+        // greatest() skips a NULL, so the first reset is recorded as is.
+        let kept: Option<DateTime<Utc>> = sqlx::query_scalar(
+            "UPDATE messaging.known_user \
+             SET password_reset_at = greatest(password_reset_at, $2) WHERE user_id = $1 \
+             RETURNING password_reset_at",
+        )
+        .bind(user.0)
+        .bind(at)
+        .fetch_optional(self.conn())
+        .await
+        .map_err(store_error)?;
+        kept.ok_or_else(|| {
+            DomainError::Store("foreign key violation: user does not exist".to_owned())
+        })
+    }
+
     async fn insert_device(&mut self, device: DeviceId, user: UserId) -> DomainResult<bool> {
         // A concurrent insert of the same id makes this wait for its outcome, so the check
         // below sees whichever row won.
@@ -177,16 +198,21 @@ impl Tx for PgTx {
         Ok(owner.map(UserId))
     }
 
-    async fn device_state(&mut self, device: DeviceId) -> DomainResult<Option<(UserId, bool)>> {
-        let row: Option<(Uuid, bool)> = sqlx::query_as(
-            "SELECT user_id, revoked_at IS NULL FROM messaging.member_device \
-             WHERE device_id = $1",
+    async fn device_state(&mut self, device: DeviceId) -> DomainResult<Option<DeviceState>> {
+        let row: Option<(Uuid, bool, Option<DateTime<Utc>>)> = sqlx::query_as(
+            "SELECT d.user_id, d.revoked_at IS NULL, u.password_reset_at \
+             FROM messaging.member_device d JOIN messaging.known_user u USING (user_id) \
+             WHERE d.device_id = $1",
         )
         .bind(device.0)
         .fetch_optional(self.conn())
         .await
         .map_err(store_error)?;
-        Ok(row.map(|(owner, is_active)| (UserId(owner), is_active)))
+        Ok(row.map(|(owner, active, password_reset_at)| DeviceState {
+            user: UserId(owner),
+            active,
+            password_reset_at,
+        }))
     }
 
     async fn device_owner(&mut self, device: DeviceId) -> DomainResult<Option<UserId>> {

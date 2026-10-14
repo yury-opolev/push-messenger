@@ -236,9 +236,14 @@ async fn identify(
             return None;
         }
     };
+    // DEV ONLY identities carry no token; they count as issued now.
+    let issued_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs() as i64);
     let request = IdentifyRequest {
         user_id: id_bytes(user),
         device_id: id_bytes(device),
+        issued_at,
     };
     match app.messaging.clone().identify(request).await {
         Ok(_) => {

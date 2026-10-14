@@ -519,6 +519,8 @@ async fn kick(
         .identify(IdentifyRequest {
             user_id: id_bytes(carol.user),
             device_id: id_bytes(carol.device),
+            // Carol never reset her password.
+            issued_at: 0,
         })
         .await;
     match identified {
@@ -577,6 +579,8 @@ impl Client {
                 .identify(IdentifyRequest {
                     user_id: id_bytes(user),
                     device_id: id_bytes(device),
+                    // New users: no password reset yet.
+                    issued_at: 0,
                 })
                 .await;
             match identified {

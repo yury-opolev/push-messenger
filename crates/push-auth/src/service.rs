@@ -496,10 +496,13 @@ impl Auth {
             )
             .await?;
         }
+        // The clock that sets the access tokens' `iat`: message-svc refuses every token
+        // issued no later than this second, and only those.
         outbox::write(
             &mut tx,
             &Event::UserPasswordReset {
                 user_id: claims.sub,
+                reset_at: unix_now(),
             },
         )
         .await?;

@@ -246,9 +246,9 @@ async fn concurrent_registrations_of_one_device_give_it_one_owner<B: Backend>(ba
             .expect("one registration succeeds");
         let loser = 1 - winner;
         assert_eq!(results[loser], Err(DomainError::UnknownDevice));
-        assert_eq!(world.svc.identify(device, users[winner]).await, Ok(()));
+        assert_eq!(world.identify(device, users[winner]).await, Ok(()));
         assert_eq!(
-            world.svc.identify(device, users[loser]).await,
+            world.identify(device, users[loser]).await,
             Err(DomainError::UnknownDevice)
         );
         assert!(world.position(device, chats[winner]).await.is_some());

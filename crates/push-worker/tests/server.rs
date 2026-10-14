@@ -191,6 +191,8 @@ async fn the_worker_relays_sends_takes_webhooks_and_stops_cleanly() {
                 .identify(IdentifyRequest {
                     user_id: id_bytes(user),
                     device_id: id_bytes(device),
+                    // No password reset in this test: any issue time passes.
+                    issued_at: 0,
                 })
                 .await
                 .is_ok()

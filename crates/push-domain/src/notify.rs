@@ -20,6 +20,7 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 
 use crate::ids::{ConversationId, DeviceId, UserId};
 use crate::model::ContactState;
@@ -62,9 +63,10 @@ pub enum Event {
 pub enum KickReason {
     /// The device was revoked: it must stop.
     DeviceRevoked,
-    /// The user's password was reset: every refresh token is revoked, so the device must
-    /// sign in again.
-    PasswordReset,
+    /// The user's password was reset at `reset_at`: every refresh token is revoked, so the
+    /// device must sign in again. A connection whose access token was issued after the
+    /// second of `reset_at` signed in after the reset and is not closed.
+    PasswordReset { reset_at: DateTime<Utc> },
 }
 
 /// The positions a receipt reports.

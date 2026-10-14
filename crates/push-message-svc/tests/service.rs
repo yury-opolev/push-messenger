@@ -282,9 +282,11 @@ async fn accounts_are_served_only_with_the_workers_token() {
         user_id: id_bytes(user),
         device_id: id_bytes(device),
     };
+    // No password reset in this test: any issue time passes.
     let identify = IdentifyRequest {
         user_id: id_bytes(user),
         device_id: id_bytes(device),
+        issued_at: 0,
     };
     // Not relayed yet: worth retrying, unlike a revoked device.
     let status = messaging.identify(identify.clone()).await.unwrap_err();

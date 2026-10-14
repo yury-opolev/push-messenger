@@ -49,7 +49,8 @@ pub(crate) fn domain_error(error: DomainError) -> Status {
         DomainError::Invalid(_) => (Code::InvalidArgument, ErrorCode::Invalid),
         DomainError::UnknownUser => (Code::NotFound, ErrorCode::UserNotFound),
         DomainError::UnknownDevice => (Code::PermissionDenied, ErrorCode::UnknownDevice),
-        DomainError::DeviceNotKnownYet => (Code::Unavailable, ErrorCode::Unavailable),
+        DomainError::DeviceNotKnownYet => (Code::Unavailable, ErrorCode::DeviceNotReady),
+        DomainError::PasswordChanged => (Code::Unauthenticated, ErrorCode::PasswordChanged),
         DomainError::ConversationNotFound => (Code::NotFound, ErrorCode::ConversationNotFound),
         DomainError::NotMember => (Code::FailedPrecondition, ErrorCode::NotMember),
         DomainError::NotContact => (Code::FailedPrecondition, ErrorCode::NotContact),
@@ -261,7 +262,12 @@ mod tests {
             (
                 DomainError::DeviceNotKnownYet,
                 Code::Unavailable,
-                ErrorCode::Unavailable,
+                ErrorCode::DeviceNotReady,
+            ),
+            (
+                DomainError::PasswordChanged,
+                Code::Unauthenticated,
+                ErrorCode::PasswordChanged,
             ),
             (
                 DomainError::ConversationNotFound,
@@ -365,7 +371,7 @@ mod tests {
             client_codes.insert(error_code);
         }
         // Only the retryable errors share a client code.
-        assert_eq!(client_codes.len(), 20);
+        assert_eq!(client_codes.len(), 22);
 
         let store = error_from_status(&domain_error(DomainError::Store("relation".into())));
         assert!(!store.message.contains("relation"), "{}", store.message);

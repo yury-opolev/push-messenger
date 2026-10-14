@@ -23,10 +23,23 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 /// One of auth-svc's user and device events (spec §3.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccountEvent {
-    UserVerified { user: Uuid },
-    DeviceRegistered { user: Uuid, device: Uuid },
-    DeviceRevoked { user: Uuid, device: Uuid },
-    PasswordReset { user: Uuid },
+    UserVerified {
+        user: Uuid,
+    },
+    DeviceRegistered {
+        user: Uuid,
+        device: Uuid,
+    },
+    DeviceRevoked {
+        user: Uuid,
+        device: Uuid,
+    },
+    /// `reset_at`: auth-svc's time of the reset, in seconds since the Unix epoch; `None` in
+    /// an event written before auth-svc sent it.
+    PasswordReset {
+        user: Uuid,
+        reset_at: Option<i64>,
+    },
 }
 
 impl AccountEvent {
@@ -42,7 +55,22 @@ impl AccountEvent {
         let device = || -> Result<(Uuid, Uuid), String> { Ok((id("user_id")?, id("device_id")?)) };
         Some(match kind {
             "user.verified" => id("user_id").map(|user| Self::UserVerified { user }),
-            "user.password_reset" => id("user_id").map(|user| Self::PasswordReset { user }),
+            "user.password_reset" => {
+                let reset_at = match &payload["reset_at"] {
+                    Value::Null => Ok(None),
+                    value => value
+                        .as_i64()
+                        .filter(|seconds| *seconds > 0)
+                        .map(Some)
+                        .ok_or_else(|| format!("{kind}: the payload has no valid reset_at")),
+                };
+                id("user_id").and_then(|user| {
+                    Ok(Self::PasswordReset {
+                        user,
+                        reset_at: reset_at?,
+                    })
+                })
+            }
             "device.registered" => {
                 device().map(|(user, device)| Self::DeviceRegistered { user, device })
             }
@@ -84,20 +112,23 @@ impl Accounts {
     /// another user) is poison; anything else is retried.
     pub async fn apply(&self, event: AccountEvent) -> Outcome {
         let mut client = self.client.clone();
-        let user_message = |user: Uuid| AccountUser {
+        let user_message = |user: Uuid, reset_at: Option<i64>| AccountUser {
             user_id: id_bytes(user),
+            reset_at: reset_at.unwrap_or(0),
         };
         let device_message = |user: Uuid, device: Uuid| AccountDevice {
             user_id: id_bytes(user),
             device_id: id_bytes(device),
         };
         let result = match event {
-            AccountEvent::UserVerified { user } => {
-                client.user_verified(user_message(user)).await.map(|_| ())
-            }
-            AccountEvent::PasswordReset { user } => {
-                client.password_reset(user_message(user)).await.map(|_| ())
-            }
+            AccountEvent::UserVerified { user } => client
+                .user_verified(user_message(user, None))
+                .await
+                .map(|_| ()),
+            AccountEvent::PasswordReset { user, reset_at } => client
+                .password_reset(user_message(user, reset_at))
+                .await
+                .map(|_| ()),
             AccountEvent::DeviceRegistered { user, device } => client
                 .device_registered(device_message(user, device))
                 .await
@@ -168,9 +199,32 @@ mod tests {
             Some(Ok(AccountEvent::DeviceRevoked { user, device }))
         );
         assert_eq!(
-            AccountEvent::parse("user.password_reset", &json!({"user_id": user})),
-            Some(Ok(AccountEvent::PasswordReset { user }))
+            AccountEvent::parse(
+                "user.password_reset",
+                &json!({"user_id": user, "reset_at": 1_760_000_000})
+            ),
+            Some(Ok(AccountEvent::PasswordReset {
+                user,
+                reset_at: Some(1_760_000_000)
+            }))
         );
+        // An event written before auth-svc sent the time.
+        assert_eq!(
+            AccountEvent::parse("user.password_reset", &json!({"user_id": user})),
+            Some(Ok(AccountEvent::PasswordReset {
+                user,
+                reset_at: None
+            }))
+        );
+        for reset_at in [json!("soon"), json!(-5), json!(0)] {
+            assert!(matches!(
+                AccountEvent::parse(
+                    "user.password_reset",
+                    &json!({"user_id": user, "reset_at": reset_at})
+                ),
+                Some(Err(_))
+            ));
+        }
         assert_eq!(AccountEvent::parse("email.send", &both), None);
         assert!(matches!(
             AccountEvent::parse("device.registered", &json!({"user_id": user})),

@@ -119,8 +119,13 @@ pub(crate) fn notifications(events: &[Event]) -> Vec<(String, Vec<u8>)> {
                 messages.push(message(user.0, kind));
             }
             Event::Kick { devices, reason } => {
+                let reset_at = match reason {
+                    KickReason::PasswordReset { reset_at } => reset_at.timestamp(),
+                    KickReason::DeviceRevoked => 0,
+                };
                 let kick = Kick {
                     reason: kick_reason(*reason).into(),
+                    reset_at,
                 };
                 for device in devices {
                     messages.push((kick_channel(device.0), kick.encode_to_vec()));
@@ -135,7 +140,7 @@ pub(crate) fn notifications(events: &[Event]) -> Vec<(String, Vec<u8>)> {
 fn kick_reason(reason: KickReason) -> internal::KickReason {
     match reason {
         KickReason::DeviceRevoked => internal::KickReason::DeviceRevoked,
-        KickReason::PasswordReset => internal::KickReason::PasswordReset,
+        KickReason::PasswordReset { .. } => internal::KickReason::PasswordReset,
     }
 }
 
@@ -283,29 +288,35 @@ mod tests {
     #[test]
     fn a_kick_goes_to_each_device_with_its_reason() {
         let (phone, laptop) = (DeviceId::new(), DeviceId::new());
+        let reset_at = chrono::DateTime::from_timestamp(1_760_000_000, 0).unwrap();
         let messages = notifications(&[
             Event::Kick {
                 devices: vec![phone, laptop],
-                reason: KickReason::PasswordReset,
+                reason: KickReason::PasswordReset { reset_at },
             },
             Event::Kick {
                 devices: vec![phone],
                 reason: KickReason::DeviceRevoked,
             },
         ]);
-        let decoded: Vec<(String, internal::KickReason)> = messages
+        let decoded: Vec<(String, internal::KickReason, i64)> = messages
             .iter()
             .map(|(channel, payload)| {
                 let kick = Kick::decode(payload.as_slice()).unwrap();
-                (channel.clone(), kick.reason())
+                (channel.clone(), kick.reason(), kick.reset_at)
             })
             .collect();
+        let reset = internal::KickReason::PasswordReset;
         assert_eq!(
             decoded,
             vec![
-                (kick_channel(phone.0), internal::KickReason::PasswordReset),
-                (kick_channel(laptop.0), internal::KickReason::PasswordReset),
-                (kick_channel(phone.0), internal::KickReason::DeviceRevoked),
+                (kick_channel(phone.0), reset, 1_760_000_000),
+                (kick_channel(laptop.0), reset, 1_760_000_000),
+                (
+                    kick_channel(phone.0),
+                    internal::KickReason::DeviceRevoked,
+                    0
+                ),
             ]
         );
     }

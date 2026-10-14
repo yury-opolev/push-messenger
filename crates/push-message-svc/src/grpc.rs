@@ -47,8 +47,10 @@ where
         let request = request.into_inner();
         let user = parse_id(&request.user_id, "user_id", UserId)?;
         let device = parse_id(&request.device_id, "device_id", DeviceId)?;
+        let issued_at = chrono::DateTime::from_timestamp(request.issued_at, 0)
+            .ok_or_else(|| invalid("issued_at is out of range"))?;
         self.messaging
-            .identify(device, user)
+            .identify(device, user, issued_at)
             .await
             .map_err(domain_error)?;
         Ok(Response::new(IdentifyResponse {}))
@@ -204,9 +206,19 @@ where
         &self,
         request: Request<AccountUser>,
     ) -> Result<Response<AccountsResponse>, Status> {
-        let user = parse_id(&request.into_inner().user_id, "user_id", UserId)?;
+        let request = request.into_inner();
+        let user = parse_id(&request.user_id, "user_id", UserId)?;
+        // 0: an outbox row written before auth-svc sent the time; message-svc's clock then.
+        let reset_at = match request.reset_at {
+            0 => None,
+            seconds if seconds > 0 => Some(
+                chrono::DateTime::from_timestamp(seconds, 0)
+                    .ok_or_else(|| invalid("reset_at is out of range"))?,
+            ),
+            _ => return Err(invalid("reset_at is out of range")),
+        };
         self.messaging
-            .password_reset(user)
+            .password_reset(user, reset_at)
             .await
             .map_err(domain_error)?;
         Ok(Response::new(AccountsResponse {}))
@@ -526,6 +538,7 @@ mod tests {
             .identify(Request::new(IdentifyRequest {
                 user_id: id_bytes(alice.user.0),
                 device_id: id_bytes(alice.device.0),
+                issued_at: now(),
             }))
             .await;
         assert!(own.is_ok());
@@ -534,6 +547,7 @@ mod tests {
             .identify(Request::new(IdentifyRequest {
                 user_id: id_bytes(alice.user.0),
                 device_id: id_bytes(bob.device.0),
+                issued_at: now(),
             }))
             .await
             .unwrap_err();
@@ -596,7 +610,11 @@ mod tests {
         let short = vec![1, 2, 3];
 
         let identify = |user_id: Vec<u8>, device_id: Vec<u8>| {
-            Request::new(IdentifyRequest { user_id, device_id })
+            Request::new(IdentifyRequest {
+                user_id,
+                device_id,
+                issued_at: now(),
+            })
         };
         let status = world
             .api
@@ -673,12 +691,29 @@ mod tests {
         })
     }
 
+    /// Seconds since the Unix epoch, as an access token's `iat`.
+    fn now() -> i64 {
+        chrono::Utc::now().timestamp()
+    }
+
     async fn identify(world: &World, user: UserId, device: DeviceId) -> Result<(), Code> {
+        identify_at(world, user, device, now()).await
+    }
+
+    /// Identify with a token issued at `issued_at` (seconds); the client error code of a
+    /// refusal.
+    async fn identify_at(
+        world: &World,
+        user: UserId,
+        device: DeviceId,
+        issued_at: i64,
+    ) -> Result<(), Code> {
         world
             .api
             .identify(Request::new(IdentifyRequest {
                 user_id: id_bytes(user.0),
                 device_id: id_bytes(device.0),
+                issued_at,
             }))
             .await
             .map(|_| ())
@@ -691,6 +726,7 @@ mod tests {
         let (user, phone, tablet) = (UserId::new(), DeviceId::new(), DeviceId::new());
         let verified = AccountUser {
             user_id: id_bytes(user.0),
+            reset_at: 0,
         };
         world
             .accounts
@@ -711,7 +747,19 @@ mod tests {
         }
         assert_eq!(identify(&world, user, phone).await, Ok(()));
         // A device not relayed yet is worth retrying, unlike a revoked one.
-        assert_eq!(identify(&world, user, tablet).await, Err(Code::Unavailable));
+        let status = world
+            .api
+            .identify(Request::new(IdentifyRequest {
+                user_id: id_bytes(user.0),
+                device_id: id_bytes(tablet.0),
+                issued_at: now(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), Code::Unavailable);
+        let error = error_from_status(&status);
+        assert_eq!(error.code(), ErrorCode::DeviceNotReady);
+        assert!(error.retryable);
 
         // The revocation of the tablet overtakes its registration.
         world
@@ -729,22 +777,76 @@ mod tests {
             Err(Code::PermissionDenied)
         );
         world.notifier.take();
+        // auth-svc reset the password a minute before the worker relayed it.
+        let reset_at = now() - 60;
+        let reset = AccountUser {
+            user_id: id_bytes(user.0),
+            reset_at,
+        };
         world
             .accounts
-            .password_reset(Request::new(AccountUser {
-                user_id: id_bytes(user.0),
-            }))
+            .password_reset(Request::new(reset.clone()))
             .await
             .unwrap();
-        // The phone is kicked, to sign in again; the revoked tablet is not active.
+        // The phone is kicked, to sign in again; the revoked tablet is not active. The kick
+        // carries auth-svc's time of the reset.
         assert_eq!(
             world.notifier.take(),
             [Event::Kick {
                 devices: vec![phone],
-                reason: KickReason::PasswordReset,
+                reason: KickReason::PasswordReset {
+                    reset_at: chrono::DateTime::from_timestamp(reset_at, 0).unwrap(),
+                },
             }]
         );
-        assert_eq!(identify(&world, user, phone).await, Ok(()));
+        // Tokens issued until the reset's second sign in no more. The phone stays
+        // registered, and a token from after the reset passes, even one issued before the
+        // relay.
+        let status = world
+            .api
+            .identify(Request::new(IdentifyRequest {
+                user_id: id_bytes(user.0),
+                device_id: id_bytes(phone.0),
+                issued_at: reset_at,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), Code::Unauthenticated);
+        let error = error_from_status(&status);
+        assert_eq!(error.code(), ErrorCode::PasswordChanged);
+        assert!(!error.retryable);
+        assert_eq!(identify_at(&world, user, phone, reset_at + 1).await, Ok(()));
+
+        // A redelivered event changes nothing for the session that signed in after it.
+        world
+            .accounts
+            .password_reset(Request::new(reset))
+            .await
+            .unwrap();
+        assert_eq!(identify_at(&world, user, phone, reset_at + 1).await, Ok(()));
+
+        // An event from before auth-svc sent the time takes message-svc's clock.
+        world
+            .accounts
+            .password_reset(Request::new(AccountUser {
+                user_id: id_bytes(user.0),
+                reset_at: 0,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(
+            identify_at(&world, user, phone, now() - 1).await,
+            Err(Code::Unauthenticated)
+        );
+        let status = world
+            .accounts
+            .password_reset(Request::new(AccountUser {
+                user_id: id_bytes(user.0),
+                reset_at: -1,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), Code::InvalidArgument);
     }
 
     #[tokio::test]

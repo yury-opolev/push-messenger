@@ -22,6 +22,17 @@ pub struct ContactSummary {
     pub state: ContactState,
 }
 
+/// What `Identify` reads about a connecting device, in one statement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceState {
+    /// The owner.
+    pub user: UserId,
+    /// Not revoked.
+    pub active: bool,
+    /// When message-svc last heard that the owner's password was reset, if ever.
+    pub password_reset_at: Option<DateTime<Utc>>,
+}
+
 /// A stored invite (spec §5.5). Redeeming it makes the redeemer an accepted contact of
 /// its creator.
 #[derive(Debug, Clone, PartialEq, Eq)]

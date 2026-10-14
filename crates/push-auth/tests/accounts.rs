@@ -461,11 +461,13 @@ async fn a_reset_link_sets_the_password_once_and_announces_it() {
         world.auth.reset_password(&reset, "short").await,
         Err(AuthError::Invalid(_))
     ));
+    let before = unix_seconds();
     world
         .auth
         .reset_password(&reset, "battery staple")
         .await
         .unwrap();
+    let after = unix_seconds();
     assert_eq!(
         world.auth.reset_password(&reset, "another password").await,
         Err(AuthError::LinkInvalid),
@@ -480,8 +482,18 @@ async fn a_reset_link_sets_the_password_once_and_announces_it() {
         .login("alice@example.com", "battery staple")
         .await
         .unwrap();
-    let (kind, _) = outbox(&world.pool).await.pop().unwrap();
+    let (kind, payload) = outbox(&world.pool).await.pop().unwrap();
     assert_eq!(kind, "user.password_reset");
+    // The reset time comes from the clock of the tokens' `iat`.
+    let reset_at = payload["reset_at"].as_i64().unwrap();
+    assert!((before..=after).contains(&reset_at), "{reset_at}");
+}
+
+fn unix_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
 }
 
 #[tokio::test]
