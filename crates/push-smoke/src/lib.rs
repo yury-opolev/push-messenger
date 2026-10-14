@@ -288,12 +288,13 @@ async fn connect(
     if seen != contacts {
         bail!("auth-svc showed alice the profiles of {seen:?}, not bob's and carol's");
     }
-    if !auth
-        .profiles(&bob.access_token, &[carol.user])
+    // Asking for alice too proves the endpoint answers bob at all.
+    if auth
+        .profiles(&bob.access_token, &[alice.user, carol.user])
         .await?
-        .is_empty()
+        != [alice.user]
     {
-        bail!("auth-svc showed bob carol's profile, though they share nothing");
+        bail!("auth-svc did not show bob exactly alice's profile; carol shares nothing with him");
     }
     step(
         "auth-svc shows alice the profiles of her contacts bob and carol, and bob none of carol's",
