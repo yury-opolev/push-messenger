@@ -138,11 +138,12 @@ Check 'minikube: no dev identities either; tokens name ws://push.local/v1/socket
     $dev -notmatch 'PUSH_DEV_AUTH' -and
         (Doc $dev 'Deployment' 'push-gateway') -match 'name: PUSH_TOKEN_AUDIENCE\s+value: "ws://push.local/v1/socket"'
 }
-Check 'minikube: the smoke test calls message-svc and reads the Redis URL from the Secret' {
+Check 'minikube: the smoke test reaches only the ingress and the mailbox, with auth-svc''s key from the Secret' {
     $smoke = Doc $dev 'Pod' 'push-smoke'
-    $smoke -match '- --message-svc\s+- "http://push-message-svc:50051"' -and
-        $smoke -match 'name: PUSH_SMOKE_REDIS_URL\s+valueFrom:\s+secretKeyRef:\s+name: push-secrets\s+key: redis-url' -and
-        $smoke -notmatch 'redis://' -and $dev -notmatch 'PUSH_DEV_SETUP'
+    $key = [regex]::Match($dev, 'auth-signing-key: "([^"]+)"').Groups[1].Value
+    $smoke -notmatch 'message-svc' -and $smoke -notmatch 'redis' -and
+        $smoke -match 'name: PUSH_SMOKE_SIGNING_KEY\s+valueFrom:\s+secretKeyRef:\s+name: push-secrets\s+key: auth-signing-key' -and
+        $key -and -not $smoke.Contains($key) -and $dev -notmatch 'PUSH_DEV_SETUP'
 }
 Check 'minikube: the worker''s dev mailbox on' {
     (Doc $dev 'Deployment' 'push-worker') -match 'name: PUSH_DEV_MAILBOX\s+value: "1"'

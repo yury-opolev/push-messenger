@@ -1,9 +1,9 @@
 {{- if include "push.devMode" . -}}
 # `helm test <release>` runs the end-to-end smoke test inside the cluster: auth-svc's public
 # API and the WebSockets go through the ingress controller with the ingress host as the
-# Host header, as a client's would; the DEV ONLY mailbox and the calls to message-svc go
-# straight to the worker and message-svc, which the ingress does not expose. It listens on
-# Redis for the kicks message-svc publishes, with the Redis URL from the Secret.
+# Host header, as a client's would; only the DEV ONLY mailbox is read straight from the
+# worker, which the ingress does not route. It gets auth-svc's signing key from the Secret,
+# to sign an expired token and one for another audience that the gateway must refuse.
 apiVersion: v1
 kind: Pod
 metadata:
@@ -26,18 +26,17 @@ spec:
         - {{ .Values.smoke.authUrl | quote }}
         - --mailbox
         - {{ printf "http://%s:8080" (include "push.name" (dict "root" . "component" "worker")) | quote }}
-        - --message-svc
-        - {{ printf "http://%s:50051" (include "push.name" (dict "root" . "component" "message-svc")) | quote }}
+
         - --socket
         - {{ .Values.smoke.socketUrl | quote }}
         - --host
         - {{ .Values.ingress.host | quote }}
       env:
-        - name: PUSH_SMOKE_REDIS_URL
+        - name: PUSH_SMOKE_SIGNING_KEY
           valueFrom:
             secretKeyRef:
               name: {{ include "push.secretName" . }}
-              key: redis-url
+              key: auth-signing-key
       resources:
         requests:
           cpu: 10m

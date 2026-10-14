@@ -27,13 +27,15 @@ installed:
 
 starts (or reuses) the minikube profile `push`, enables its ingress addon, builds the
 images into the cluster, installs the chart (`deploy/helm/push-messenger`) with
-`values-minikube.yaml`, and runs the end-to-end smoke test: three users sign up, verify
-their email (the worker's log sender delivers it), register a device and wait for the worker
-to relay it to message-svc; they become contacts by request and by invite, see only each
-other's allowed profiles, chat through the ingress, edit, read, form a group and delete,
-and finally a revoked device and a password reset are kicked on Redis. The DEV ONLY mailbox
-and the calls to message-svc's API (the smoke test moves onto the gateway in Plan 8B) go to the
-services directly. `deploy/minikube/up.sh --smoke` does the same on Linux
+`values-minikube.yaml`, and runs the end-to-end smoke test, as a client app through the
+ingress: three users sign up, verify their email (the worker's log sender delivers it),
+register a device and connect its WebSocket with the access token (the gateway answers
+4006, "not ready yet", until the worker has relayed the device); over the WebSocket they
+become contacts by request and by invite, chat, edit, read and delete, see a group request
+refused, and see their allowed profiles from auth-svc; the gateway refuses an expired token
+and one for another audience; finally a revoked device and a password reset close their
+sockets with 4003 and 4001. Only the DEV ONLY mailbox is read from the worker directly.
+`deploy/minikube/up.sh --smoke` does the same on Linux
 and macOS. Both wait for ingress-nginx, retry
 `helm upgrade --install` up to 5 times while its admission webhook comes up, and
 (with `--smoke`) wait until only one worker pod is left before the smoke test.
