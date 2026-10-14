@@ -3,7 +3,8 @@
 //!
 //! Every connection joins the hub under its device as soon as its token passed, before
 //! message-svc is asked about the device: the first connection of a device makes the
-//! subscriber subscribe to `kick:{device_id}`, so a revocation or password reset that
+//! subscriber subscribe to `kick:{device_id}`, and every connection waits (up to 2 s)
+//! for that subscription to be confirmed, so a revocation or password reset that
 //! message-svc commits after admitting the device cannot be missed. Once admitted, the
 //! connection joins its user too (`notify:{user_id}`). The last connection to leave a
 //! channel unsubscribes it.
@@ -41,7 +42,7 @@ use push_proto::internal::v1::{
 use push_proto::v1::frame::Body;
 use push_proto::v1::{self, ContactEvent, GroupReceipts, ReadPosition, Receipt, receipt};
 use push_proto::{id, kick_channel, notify_channel};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
@@ -73,8 +74,15 @@ pub struct Hub {
 struct Members {
     next_key: u64,
     by_key: HashMap<u64, Member>,
-    /// The members of each channel, `notify:{user}` or `kick:{device}`.
-    channels: HashMap<String, HashSet<u64>>,
+    /// Each channel, `notify:{user}` or `kick:{device}`, with at least one member.
+    channels: HashMap<String, Channel>,
+}
+
+struct Channel {
+    members: HashSet<u64>,
+    /// Whether Redis is subscribed to the channel right now. Joiners wait for it; the
+    /// subscriber sets it after subscribing and clears it when the connection breaks.
+    active: watch::Sender<bool>,
 }
 
 struct Member {
@@ -88,7 +96,7 @@ struct Member {
 }
 
 enum Command {
-    Subscribe(String, oneshot::Sender<()>),
+    Subscribe(String),
     Unsubscribe(String),
 }
 
@@ -151,14 +159,14 @@ impl Hub {
             events,
             kicks,
         };
-        let (key, subscribed) = {
+        let (key, active) = {
             let mut members = lock(&self.members);
             let key = members.next_key;
             members.next_key += 1;
             members.by_key.insert(key, member);
             (key, self.enter(&mut members, kick_channel(device), key))
         };
-        wait(subscribed).await;
+        wait(active).await;
         Membership {
             key,
             connection,
@@ -172,22 +180,23 @@ impl Hub {
     }
 
     /// Adds `key` to `channel`, asking the subscriber to subscribe if it is the first.
-    /// Sent under the lock, so the commands for a channel reach the subscriber in the
-    /// order its members joined and left.
-    fn enter(
-        &self,
-        members: &mut Members,
-        channel: String,
-        key: u64,
-    ) -> Option<oneshot::Receiver<()>> {
-        let keys = members.channels.entry(channel.clone()).or_default();
-        let first = keys.is_empty();
-        keys.insert(key);
-        first.then(|| {
-            let (done, subscribed) = oneshot::channel();
-            let _ = self.commands.send(Command::Subscribe(channel, done));
-            subscribed
-        })
+    /// Returns the channel's active signal, which every joiner waits on, not only the
+    /// first: a later one must not be admitted while the subscription is pending or being
+    /// restored after a break. Commands are sent under the lock, so the commands for a
+    /// channel reach the subscriber in the order its members joined and left.
+    fn enter(&self, members: &mut Members, channel: String, key: u64) -> watch::Receiver<bool> {
+        let entry = members.channels.entry(channel.clone());
+        let first = matches!(entry, std::collections::hash_map::Entry::Vacant(_));
+        let joined = entry.or_insert_with(|| Channel {
+            members: HashSet::new(),
+            active: watch::channel(false).0,
+        });
+        joined.members.insert(key);
+        let active = joined.active.subscribe();
+        if first {
+            let _ = self.commands.send(Command::Subscribe(channel));
+        }
+        active
     }
 
     /// The members of `channel`.
@@ -196,7 +205,7 @@ impl Hub {
             .channels
             .get(channel)
             .into_iter()
-            .flatten()
+            .flat_map(|channel| &channel.members)
             .filter_map(|key| members.by_key.get(key))
     }
 
@@ -248,6 +257,24 @@ impl Hub {
     /// The channels with at least one member.
     fn channels(&self) -> Vec<String> {
         lock(&self.members).channels.keys().cloned().collect()
+    }
+
+    /// Marks `channels` as subscribed (or not) in Redis. Channels nobody listens to any
+    /// more are skipped.
+    fn set_active<'a>(&self, channels: impl IntoIterator<Item = &'a String>, active: bool) {
+        let members = lock(&self.members);
+        for channel in channels {
+            if let Some(channel) = members.channels.get(channel) {
+                channel.active.send_replace(active);
+            }
+        }
+    }
+
+    /// Marks every channel as not subscribed: the Redis connection broke.
+    fn deactivate_all(&self) {
+        for channel in lock(&self.members).channels.values() {
+            channel.active.send_replace(false);
+        }
     }
 
     /// Acts on a message from Redis. Malformed ones are logged and dropped.
@@ -333,11 +360,12 @@ fn lock(members: &Mutex<Members>) -> MutexGuard<'_, Members> {
     members.lock().expect("hub lock poisoned")
 }
 
-/// Waits up to [`SUBSCRIBE_WAIT`] for a subscription to become active.
-async fn wait(subscribed: Option<oneshot::Receiver<()>>) {
-    if let Some(subscribed) = subscribed {
-        let _ = tokio::time::timeout(SUBSCRIBE_WAIT, subscribed).await;
-    }
+/// Waits up to [`SUBSCRIBE_WAIT`] for a channel's subscription to become active.
+async fn wait(mut active: watch::Receiver<bool>) {
+    let _ = tokio::time::timeout(SUBSCRIBE_WAIT, async {
+        let _ = active.wait_for(|active| *active).await;
+    })
+    .await;
 }
 
 /// One connection's place in the hub. Dropping it leaves every channel it joined.
@@ -375,12 +403,12 @@ impl Membership {
     /// covers whatever a late subscription misses.
     pub async fn join_user(&mut self, user: Uuid) {
         let channel = notify_channel(user);
-        let subscribed = {
+        let active = {
             let mut members = lock(&self.hub.members);
             self.hub.enter(&mut members, channel.clone(), self.key)
         };
         self.channels.push(channel);
-        wait(subscribed).await;
+        wait(active).await;
     }
 
     /// The next thing to do: a kick first, then a server frame, then a ring.
@@ -401,9 +429,9 @@ impl Drop for Membership {
         let mut members = lock(&self.hub.members);
         members.by_key.remove(&self.key);
         for channel in &self.channels {
-            if let Some(keys) = members.channels.get_mut(channel) {
-                keys.remove(&self.key);
-                if keys.is_empty() {
+            if let Some(entry) = members.channels.get_mut(channel) {
+                entry.members.remove(&self.key);
+                if entry.members.is_empty() {
                     members.channels.remove(channel);
                     let _ = self
                         .hub
@@ -454,8 +482,15 @@ async fn subscribe(
         match connection {
             Ok(pubsub) => {
                 let (mut sink, mut messages) = pubsub.split();
+                // Commands queued while Redis was away (a join and a leave of the same
+                // channel, over and over) are stale: the hub's channels are the truth.
+                // Commands that arrive after this drain but before the snapshot are
+                // harmless: they are replayed in order and subscribing or unsubscribing
+                // twice changes nothing.
+                while commands.try_recv().is_ok() {}
+                let wanted = hub.channels();
                 let mut resubscribed = true;
-                for channel in hub.channels() {
+                for channel in &wanted {
                     match bounded(&shutdown, sink.subscribe(&channel)).await {
                         None => return,
                         Some(true) => {}
@@ -466,6 +501,7 @@ async fn subscribe(
                     }
                 }
                 if resubscribed {
+                    hub.set_active(&wanted, true);
                     hub.connected.store(true, Ordering::SeqCst);
                     tracing::info!("subscribed to Redis");
                     hub.ring_all();
@@ -486,16 +522,15 @@ async fn subscribe(
                             command = commands.recv() => {
                                 let succeeded = match command {
                                     None => return,
-                                    Some(Command::Subscribe(channel, done)) => {
+                                    Some(Command::Subscribe(channel)) => {
                                         let Some(succeeded) =
                                             bounded(&shutdown, sink.subscribe(&channel)).await
                                         else {
                                             return;
                                         };
-                                        // Sent even when the subscribe failed: the reconnect path
-                                        // subscribes every channel again and calls `ring_all`, so
-                                        // the joining connection does not need to wait any longer.
-                                        let _ = done.send(());
+                                        if succeeded {
+                                            hub.set_active([&channel], true);
+                                        }
                                         succeeded
                                     }
                                     Some(Command::Unsubscribe(channel)) => {
@@ -521,6 +556,7 @@ async fn subscribe(
                     }
                 }
                 hub.connected.store(false, Ordering::SeqCst);
+                hub.deactivate_all();
                 tracing::warn!("lost the Redis subscription; reconnecting");
             }
             Err(error) => tracing::warn!(%error, "cannot reach Redis; retrying"),
@@ -579,7 +615,7 @@ mod tests {
         let mut channels = Vec::new();
         while let Ok(command) = commands.try_recv() {
             match command {
-                Command::Subscribe(channel, _) => channels.push(format!("+{channel}")),
+                Command::Subscribe(channel) => channels.push(format!("+{channel}")),
                 Command::Unsubscribe(channel) => channels.push(format!("-{channel}")),
             }
         }
@@ -619,6 +655,63 @@ mod tests {
         expected.sort();
         assert_eq!(left, expected);
         assert!(hub.channels().is_empty());
+    }
+
+    /// Starts `watch_device` in a task and lets it run until it waits.
+    async fn joining(hub: &Hub, device: Uuid) -> JoinHandle<Membership> {
+        let hub = hub.clone();
+        let joiner = tokio::spawn(async move { hub.watch_device(device, Uuid::now_v7(), 0).await });
+        tokio::task::yield_now().await;
+        joiner
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_second_joiner_waits_for_the_pending_subscription_too() {
+        let (hub, mut commands) = hub();
+        let device = Uuid::now_v7();
+        let first = joining(&hub, device).await;
+        let second = joining(&hub, device).await;
+        assert_eq!(
+            subscribed(&mut commands),
+            [format!("+{}", kick_channel(device))],
+            "one subscribe for both"
+        );
+        tokio::time::advance(Duration::from_millis(1500)).await;
+        tokio::task::yield_now().await;
+        assert!(!first.is_finished());
+        assert!(!second.is_finished(), "admitted before the subscribe");
+
+        hub.set_active(&[kick_channel(device)], true);
+        tokio::time::advance(Duration::from_millis(10)).await;
+        let _ = (first.await.unwrap(), second.await.unwrap());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_joiner_during_a_reconnect_waits_until_the_resubscribe() {
+        let (hub, _commands) = hub();
+        let device = Uuid::now_v7();
+        let first = joining(&hub, device).await;
+        hub.set_active(&[kick_channel(device)], true);
+        let _first = first.await.unwrap();
+
+        // The Redis connection broke.
+        hub.deactivate_all();
+        let late = joining(&hub, device).await;
+        tokio::time::advance(Duration::from_millis(1500)).await;
+        tokio::task::yield_now().await;
+        assert!(!late.is_finished(), "admitted while Redis was away");
+
+        hub.set_active(&[kick_channel(device)], true);
+        tokio::time::advance(Duration::from_millis(10)).await;
+        let _ = late.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_joiner_gives_up_waiting_after_two_seconds() {
+        let (hub, _commands) = hub();
+        let joiner = joining(&hub, Uuid::now_v7()).await;
+        tokio::time::advance(SUBSCRIBE_WAIT + Duration::from_millis(10)).await;
+        let _ = joiner.await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]
