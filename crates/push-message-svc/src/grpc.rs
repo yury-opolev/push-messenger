@@ -568,6 +568,92 @@ mod tests {
         }
     }
 
+    /// The error a call answered with, which must be `INVALID_ARGUMENT` naming `field`.
+    fn assert_invalid(status: Status, field: &str) {
+        assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+        let error = error_from_status(&status);
+        assert_eq!(error.code(), ErrorCode::Invalid);
+        assert!(!error.retryable);
+        assert!(error.message.starts_with(field), "{}", error.message);
+    }
+
+    #[tokio::test]
+    async fn malformed_ids_on_identify_sync_and_ack_are_invalid() {
+        let world = world();
+        let (_alice, bob, conversation) = chat(&world).await;
+        let short = vec![1, 2, 3];
+
+        let identify = |user_id: Vec<u8>, device_id: Vec<u8>| {
+            Request::new(IdentifyRequest { user_id, device_id })
+        };
+        let status = world
+            .api
+            .identify(identify(short.clone(), id_bytes(bob.device.0)))
+            .await
+            .unwrap_err();
+        assert_invalid(status, "user_id");
+        let status = world
+            .api
+            .identify(identify(id_bytes(bob.user.0), Vec::new()))
+            .await
+            .unwrap_err();
+        assert_invalid(status, "device_id");
+
+        let status = world
+            .api
+            .sync(Request::new(SyncRequest {
+                device_id: short.clone(),
+                limit: 0,
+            }))
+            .await
+            .unwrap_err();
+        assert_invalid(status, "device_id");
+
+        let ack = |device_id: Vec<u8>, conversation_id: Vec<u8>| {
+            Request::new(AckRequest {
+                device_id,
+                ack: Some(Ack {
+                    conversation_id,
+                    seq: 0,
+                }),
+            })
+        };
+        let status = world
+            .api
+            .ack(ack(short.clone(), id_bytes(conversation.0)))
+            .await
+            .unwrap_err();
+        assert_invalid(status, "device_id");
+        let status = world
+            .api
+            .ack(ack(id_bytes(bob.device.0), short))
+            .await
+            .unwrap_err();
+        assert_invalid(status, "conversation_id");
+        let status = world
+            .api
+            .ack(Request::new(AckRequest {
+                device_id: id_bytes(bob.device.0),
+                ack: None,
+            }))
+            .await
+            .unwrap_err();
+        assert_invalid(status, "ack");
+    }
+
+    #[tokio::test]
+    async fn a_sync_without_an_ack_returns_the_same_entries() {
+        let world = world();
+        let (alice, bob, conversation) = chat(&world).await;
+        for body in ["one", "two"] {
+            let request = send_request(&alice, conversation, body);
+            world.api.send(Request::new(request)).await.unwrap();
+        }
+        let first = sync(&world, bob.device, 0).await;
+        assert_eq!(first.entries.len(), 2);
+        assert_eq!(sync(&world, bob.device, 0).await, first);
+    }
+
     fn account_device(user: UserId, device: DeviceId) -> Request<AccountDevice> {
         Request::new(AccountDevice {
             user_id: id_bytes(user.0),

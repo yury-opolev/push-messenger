@@ -137,6 +137,27 @@ enum ErrorCode {
   ERROR_CODE_UNAVAILABLE = 9;
   // Any other rejection; `message` says which.
   ERROR_CODE_REJECTED = 10;
+  // The other user does not exist (or has not verified their email yet).
+  ERROR_CODE_USER_NOT_FOUND = 11;
+  // Accept or Decline without a request from that user.
+  ERROR_CODE_NO_PENDING_REQUEST = 12;
+  // The caller has blocked the other user.
+  ERROR_CODE_BLOCKED = 13;
+  // Edit or Delete: no such message in the conversation.
+  ERROR_CODE_TARGET_NOT_FOUND = 14;
+  // Edit or Delete of someone else's message.
+  ERROR_CODE_NOT_SENDER = 15;
+  ERROR_CODE_ALREADY_DELETED = 16;
+  // Edit or Delete after the allowed time (48 hours by default).
+  ERROR_CODE_WINDOW_EXPIRED = 17;
+  // Unknown, revoked, expired or used up: one answer for all, so redeeming reveals nothing.
+  ERROR_CODE_INVITE_NOT_FOUND = 18;
+  // A group has at most 100 members.
+  ERROR_CODE_GROUP_FULL = 19;
+  ERROR_CODE_NOT_A_GROUP = 20;
+  ERROR_CODE_NOT_ADMIN = 21;
+  // A group must keep at least one admin.
+  ERROR_CODE_LAST_ADMIN = 22;
 }
 
 message Error {

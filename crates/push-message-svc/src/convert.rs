@@ -38,23 +38,34 @@ pub(crate) fn invalid(message: impl Into<String>) -> Status {
     )
 }
 
-/// The status for a failed domain operation. Storage problems are reported without their
-/// details, which the store has already logged.
+/// The status for a failed domain operation: every [`DomainError`] has a gRPC code and a
+/// client error code of its own (this match has no catch-all, so a new error must be
+/// mapped). Storage problems are reported without their details, which the store has
+/// already logged.
 pub(crate) fn domain_error(error: DomainError) -> Status {
     let (code, error_code) = match &error {
         DomainError::Invalid(_) => (Code::InvalidArgument, ErrorCode::Invalid),
-        DomainError::UnknownUser | DomainError::UnknownDevice => {
-            (Code::PermissionDenied, ErrorCode::UnknownDevice)
-        }
+        DomainError::UnknownUser => (Code::NotFound, ErrorCode::UserNotFound),
+        DomainError::UnknownDevice => (Code::PermissionDenied, ErrorCode::UnknownDevice),
         DomainError::DeviceNotKnownYet => (Code::Unavailable, ErrorCode::Unavailable),
         DomainError::ConversationNotFound => (Code::NotFound, ErrorCode::ConversationNotFound),
         DomainError::NotMember => (Code::FailedPrecondition, ErrorCode::NotMember),
         DomainError::NotContact => (Code::FailedPrecondition, ErrorCode::NotContact),
+        DomainError::NoPendingRequest => (Code::FailedPrecondition, ErrorCode::NoPendingRequest),
+        DomainError::Blocked => (Code::FailedPrecondition, ErrorCode::Blocked),
         DomainError::ClientIdConflict => (Code::AlreadyExists, ErrorCode::ClientIdConflict),
         DomainError::SeqOutOfRange => (Code::OutOfRange, ErrorCode::SeqOutOfRange),
+        DomainError::TargetNotFound => (Code::NotFound, ErrorCode::TargetNotFound),
+        DomainError::NotSender => (Code::PermissionDenied, ErrorCode::NotSender),
+        DomainError::AlreadyDeleted => (Code::FailedPrecondition, ErrorCode::AlreadyDeleted),
+        DomainError::WindowExpired => (Code::FailedPrecondition, ErrorCode::WindowExpired),
+        DomainError::InviteNotFound => (Code::NotFound, ErrorCode::InviteNotFound),
+        DomainError::GroupFull => (Code::FailedPrecondition, ErrorCode::GroupFull),
+        DomainError::NotAGroup => (Code::FailedPrecondition, ErrorCode::NotAGroup),
+        DomainError::NotAdmin => (Code::PermissionDenied, ErrorCode::NotAdmin),
+        DomainError::LastAdmin => (Code::FailedPrecondition, ErrorCode::LastAdmin),
         DomainError::Conflict => (Code::Aborted, ErrorCode::Unavailable),
         DomainError::Store(_) => (Code::Unavailable, ErrorCode::Unavailable),
-        _ => (Code::FailedPrecondition, ErrorCode::Rejected),
     };
     let message = match &error {
         DomainError::Store(_) => "a temporary storage problem; retry".to_owned(),
@@ -213,32 +224,137 @@ mod tests {
     }
 
     #[test]
-    fn domain_errors_become_client_errors() {
-        let status = domain_error(DomainError::NotContact);
-        assert_eq!(status.code(), Code::FailedPrecondition);
-        let error = error_from_status(&status);
-        assert_eq!(error.code(), ErrorCode::NotContact);
-        assert_eq!(error.message, "the users are not accepted contacts");
-        assert!(!error.retryable);
+    fn every_domain_error_has_its_own_status_and_client_error() {
+        use push_domain::ValidationError;
 
-        let conflict = error_from_status(&domain_error(DomainError::Conflict));
-        assert_eq!(conflict.code(), ErrorCode::Unavailable);
-        assert!(conflict.retryable);
+        let cases = [
+            (
+                DomainError::Invalid(ValidationError::EmptyBody),
+                Code::InvalidArgument,
+                ErrorCode::Invalid,
+            ),
+            (
+                DomainError::UnknownUser,
+                Code::NotFound,
+                ErrorCode::UserNotFound,
+            ),
+            (
+                DomainError::UnknownDevice,
+                Code::PermissionDenied,
+                ErrorCode::UnknownDevice,
+            ),
+            (
+                DomainError::DeviceNotKnownYet,
+                Code::Unavailable,
+                ErrorCode::Unavailable,
+            ),
+            (
+                DomainError::ConversationNotFound,
+                Code::NotFound,
+                ErrorCode::ConversationNotFound,
+            ),
+            (
+                DomainError::NotMember,
+                Code::FailedPrecondition,
+                ErrorCode::NotMember,
+            ),
+            (
+                DomainError::NotContact,
+                Code::FailedPrecondition,
+                ErrorCode::NotContact,
+            ),
+            (
+                DomainError::NoPendingRequest,
+                Code::FailedPrecondition,
+                ErrorCode::NoPendingRequest,
+            ),
+            (
+                DomainError::Blocked,
+                Code::FailedPrecondition,
+                ErrorCode::Blocked,
+            ),
+            (
+                DomainError::ClientIdConflict,
+                Code::AlreadyExists,
+                ErrorCode::ClientIdConflict,
+            ),
+            (
+                DomainError::SeqOutOfRange,
+                Code::OutOfRange,
+                ErrorCode::SeqOutOfRange,
+            ),
+            (
+                DomainError::TargetNotFound,
+                Code::NotFound,
+                ErrorCode::TargetNotFound,
+            ),
+            (
+                DomainError::NotSender,
+                Code::PermissionDenied,
+                ErrorCode::NotSender,
+            ),
+            (
+                DomainError::AlreadyDeleted,
+                Code::FailedPrecondition,
+                ErrorCode::AlreadyDeleted,
+            ),
+            (
+                DomainError::WindowExpired,
+                Code::FailedPrecondition,
+                ErrorCode::WindowExpired,
+            ),
+            (
+                DomainError::InviteNotFound,
+                Code::NotFound,
+                ErrorCode::InviteNotFound,
+            ),
+            (
+                DomainError::GroupFull,
+                Code::FailedPrecondition,
+                ErrorCode::GroupFull,
+            ),
+            (
+                DomainError::NotAGroup,
+                Code::FailedPrecondition,
+                ErrorCode::NotAGroup,
+            ),
+            (
+                DomainError::NotAdmin,
+                Code::PermissionDenied,
+                ErrorCode::NotAdmin,
+            ),
+            (
+                DomainError::LastAdmin,
+                Code::FailedPrecondition,
+                ErrorCode::LastAdmin,
+            ),
+            (DomainError::Conflict, Code::Aborted, ErrorCode::Unavailable),
+            (
+                DomainError::Store("relation missing".into()),
+                Code::Unavailable,
+                ErrorCode::Unavailable,
+            ),
+        ];
+        let mut client_codes = std::collections::HashSet::new();
+        for (domain, code, error_code) in cases {
+            let retryable = matches!(
+                domain,
+                DomainError::DeviceNotKnownYet | DomainError::Conflict | DomainError::Store(_)
+            );
+            let message = domain.to_string();
+            let status = domain_error(domain);
+            assert_eq!(status.code(), code, "{message}");
+            let error = error_from_status(&status);
+            assert_eq!(error.code(), error_code, "{message}");
+            assert_eq!(error.retryable, retryable, "{message}");
+            client_codes.insert(error_code);
+        }
+        // Only the retryable errors share a client code.
+        assert_eq!(client_codes.len(), 20);
 
-        let store = domain_error(DomainError::Store("relation missing".into()));
-        assert_eq!(store.code(), Code::Unavailable);
-        let store = error_from_status(&store);
-        assert!(store.retryable);
+        let store = error_from_status(&domain_error(DomainError::Store("relation".into())));
         assert!(!store.message.contains("relation"), "{}", store.message);
-
-        let device = domain_error(DomainError::UnknownDevice);
-        assert_eq!(device.code(), Code::PermissionDenied);
-        assert_eq!(error_from_status(&device).code(), ErrorCode::UnknownDevice);
-
-        let not_yet = domain_error(DomainError::DeviceNotKnownYet);
-        assert_eq!(not_yet.code(), Code::Unavailable);
-        let not_yet = error_from_status(&not_yet);
-        assert_eq!(not_yet.code(), ErrorCode::Unavailable);
-        assert!(not_yet.retryable);
+        let contact = error_from_status(&domain_error(DomainError::NotContact));
+        assert_eq!(contact.message, "the users are not accepted contacts");
     }
 }

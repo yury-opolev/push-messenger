@@ -2,8 +2,10 @@
 // (Accounts) (spec §2). Never exposed outside the cluster. Callers pass the user and
 // device the gateway verified, or auth-svc announced; message-svc trusts them.
 //
-// Errors are gRPC statuses whose `details` hold an encoded `push.v1.Error`, which the
-// gateway forwards to the client.
+// Errors are gRPC statuses whose details (`grpc-status-details-bin`) follow gRPC's rich
+// error model: a `google.rpc.Status` with the client's `push.v1.Error` packed as a
+// `google.protobuf.Any` (type URL `type.googleapis.com/push.v1.Error`). The gateway
+// forwards that error to the client.
 
 syntax = "proto3";
 
@@ -19,7 +21,10 @@ service Messaging {
   rpc Identify(IdentifyRequest) returns (IdentifyResponse);
   // Appends a text message; answers after commit.
   rpc Send(SendRequest) returns (push.v1.SendAck);
-  // Entries after the device's delivery positions, oldest first per conversation.
+  // Entries after the device's delivery positions, oldest first per conversation. A read:
+  // it never moves a position. Positions move only on Ack (spec §4.7), so a Sync repeated
+  // before the client acks returns the same entries again; a caller that syncs on every
+  // notification skips the entries it already sent on the connection (the gateway does).
   rpc Sync(SyncRequest) returns (SyncResponse);
   // Records that the device holds everything up to a seq.
   rpc Ack(AckRequest) returns (AckResponse);

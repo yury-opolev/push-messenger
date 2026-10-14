@@ -25,11 +25,12 @@ use crate::notify::RedisNotifier;
 const RETRY_DELAY: Duration = Duration::from_secs(2);
 
 /// Runs the service until `shutdown` is cancelled, then finishes the calls in progress
-/// and closes the database pool.
+/// and closes the database pool. `grpc` and `health` must be bound already.
 ///
 /// The health endpoints answer at once: `/healthz` always, `/readyz` only once the
-/// database is migrated and answers a ping, and never after shutdown began. Postgres and
-/// Redis are retried until they answer, so the service may start before them.
+/// database is migrated and answers a ping and Redis is connected, and never after
+/// shutdown began. Postgres and Redis are retried until they answer, so the service may
+/// start before them.
 pub async fn serve(
     config: Config,
     grpc: TcpListener,
@@ -81,6 +82,9 @@ pub async fn serve(
     };
     let _ = ready.store.set(store.clone());
 
+    // Ready before `serve` is called: `grpc` is already bound and listening (the caller
+    // binds it, as `main` does), so a client that connects as soon as /readyz answers
+    // waits in the listen backlog until the server accepts, a moment later.
     let messaging = Arc::new(Messaging::new(store.clone(), SystemClock, notifier));
     let dev_setup = config
         .dev_setup
