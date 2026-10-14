@@ -35,6 +35,7 @@ pub(crate) fn invalid(message: impl Into<String>) -> Status {
             retryable: false,
             client_msg_id: None,
             request_id: None,
+            retry_after_s: None,
         },
     )
 }
@@ -80,6 +81,7 @@ pub(crate) fn domain_error(error: DomainError) -> Status {
             retryable: error.is_retryable() || matches!(error, DomainError::Store(_)),
             client_msg_id: None,
             request_id: None,
+            retry_after_s: None,
         },
     )
 }

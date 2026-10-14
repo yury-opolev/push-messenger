@@ -207,6 +207,7 @@ pub(crate) fn error_frame(code: ErrorCode, message: &str) -> Body {
         retryable: false,
         client_msg_id: None,
         request_id: None,
+        retry_after_s: None,
     })
 }
 
