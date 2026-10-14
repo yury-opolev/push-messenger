@@ -26,7 +26,6 @@ spec:
         - {{ .Values.smoke.authUrl | quote }}
         - --mailbox
         - {{ printf "http://%s:8080" (include "push.name" (dict "root" . "component" "worker")) | quote }}
-
         - --socket
         - {{ .Values.smoke.socketUrl | quote }}
         - --host

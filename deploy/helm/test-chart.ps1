@@ -46,7 +46,7 @@ Check 'default: groups are refused; one switch serves them' {
         (Doc $on 'Deployment' 'push-gateway') -match 'name: PUSH_GROUPS\s+value: "1"'
 }
 Check 'default: the DevSetup switch is gone' { $default -notmatch 'PUSH_DEV_SETUP' }
-Check 'default: no smoke test' { $default -notmatch 'helm.sh/hook: test' }
+Check 'default: no smoke test' { $default -notmatch 'helm.sh/hook: test' -and $default -notmatch 'PUSH_SMOKE_SIGNING_KEY' }
 Check 'default: the worker has no dev mailbox and logs email; auth-svc has no mailbox at all' {
     $worker = Doc $default 'Deployment' 'push-worker'
     $auth = Doc $default 'Deployment' 'push-auth'
@@ -105,7 +105,8 @@ Check 'default: the gateway and message-svc share the Messaging token from the S
     $messageSvc = Doc $default 'Deployment' 'push-message-svc'
     $token = [regex]::Match($default, 'messaging-token: "([^"]+)"').Groups[1].Value
     $accounts = [regex]::Match($default, 'accounts-token: "([^"]+)"').Groups[1].Value
-    $token.Length -eq 48 -and $token -ne $accounts -and
+    $directory = [regex]::Match($default, 'directory-token: "([^"]+)"').Groups[1].Value
+    $token.Length -eq 48 -and $token -ne $accounts -and $token -ne $directory -and
         $gateway -match 'name: PUSH_MESSAGING_TOKEN\s+valueFrom:\s+secretKeyRef:\s+name: push-secrets\s+key: messaging-token' -and
         $messageSvc -match 'name: PUSH_MESSAGING_TOKEN\s+valueFrom:\s+secretKeyRef:\s+name: push-secrets\s+key: messaging-token' -and
         (Doc $default 'Deployment' 'push-auth') -notmatch 'messaging-token' -and
