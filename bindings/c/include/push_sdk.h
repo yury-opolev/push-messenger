@@ -226,6 +226,158 @@ int32_t push_client_change_database_key(const PushClient *client,
                                         size_t database_key_len,
                                         PushError **error);
 
+// Every conversation this device knows, as a JSON array, most recently changed first.
+int32_t push_client_conversations(const PushClient *client,
+                                  char **conversations_json,
+                                  PushError **error);
+
+// One conversation as JSON, or `null` if this device does not know it.
+int32_t push_client_conversation(const PushClient *client,
+                                 const char *conversation_id_text,
+                                 char **conversation_json,
+                                 PushError **error);
+
+// Up to `limit` stored messages before `*before_seq` (NULL: the newest, then those still
+// in the outbox), oldest first, as a JSON array.
+int32_t push_client_messages(const PushClient *client,
+                             const char *conversation_id_text,
+                             const int64_t *before_seq,
+                             uint32_t limit,
+                             char **messages_json,
+                             PushError **error);
+
+// The user's relationships as this device knows them, as a JSON array.
+int32_t push_client_contacts(const PushClient *client, char **contacts_json, PushError **error);
+
+// Queues a text message; `*message_json` gets the local echo (its `clientMsgId` is the
+// handle for edit, delete and cancel). Sent once connected, in order.
+int32_t push_client_send(const PushClient *client,
+                         const char *conversation_id_text,
+                         const char *message_text,
+                         char **message_json,
+                         PushError **error);
+
+// Changes the text of one of the user's messages; `*change_id` gets the id of the change.
+int32_t push_client_edit(const PushClient *client,
+                         const char *conversation_id_text,
+                         const char *target_client_msg_id,
+                         const char *message_text,
+                         char **change_id,
+                         PushError **error);
+
+// Deletes one of the user's messages; `*change_id` gets the id of the change.
+int32_t push_client_delete(const PushClient *client,
+                           const char *conversation_id_text,
+                           const char *target_client_msg_id,
+                           char **change_id,
+                           PushError **error);
+
+// Takes back a message never sent; `*cancelled` says whether it was.
+int32_t push_client_cancel(const PushClient *client,
+                           const char *conversation_id_text,
+                           const char *message_client_msg_id,
+                           bool *cancelled,
+                           PushError **error);
+
+// Marks the conversation read up to `seq`.
+int32_t push_client_mark_read(const PushClient *client,
+                              const char *conversation_id_text,
+                              int64_t seq,
+                              PushError **error);
+
+// Lists the conversations from the server, stores what changed and returns all, as a
+// JSON array.
+int32_t push_client_list_conversations(const PushClient *client,
+                                       char **conversations_json,
+                                       PushError **error);
+
+// Loads up to `limit` older messages before `*before_seq` (NULL: the newest) from the
+// server and stores them; oldest first, as a JSON array.
+int32_t push_client_fetch_history(const PushClient *client,
+                                  const char *conversation_id_text,
+                                  const int64_t *before_seq,
+                                  uint32_t limit,
+                                  char **messages_json,
+                                  PushError **error);
+
+// The direct conversation with an accepted contact, created the first time, as JSON.
+int32_t push_client_open_direct(const PushClient *client,
+                                const char *peer_user_id,
+                                char **conversation_json,
+                                PushError **error);
+
+// Lists the user's relationships from the server, as a JSON array.
+int32_t push_client_list_contacts(const PushClient *client,
+                                  char **contacts_json,
+                                  PushError **error);
+
+// Asks another user to become a contact; `*contact_json` gets the relationship now.
+int32_t push_client_request_contact(const PushClient *client,
+                                    const char *user,
+                                    char **contact_json,
+                                    PushError **error);
+
+// Accepts a contact request.
+int32_t push_client_accept_contact(const PushClient *client,
+                                   const char *user,
+                                   char **contact_json,
+                                   PushError **error);
+
+// Declines a contact request.
+int32_t push_client_decline_contact(const PushClient *client,
+                                    const char *user,
+                                    char **contact_json,
+                                    PushError **error);
+
+// Blocks a user.
+int32_t push_client_block(const PushClient *client,
+                          const char *user,
+                          char **contact_json,
+                          PushError **error);
+
+// Unblocks a user.
+int32_t push_client_unblock(const PushClient *client,
+                            const char *user,
+                            char **contact_json,
+                            PushError **error);
+
+// Creates an invite code valid for `expires_in_s` seconds and `max_uses` uses, as JSON.
+int32_t push_client_create_invite(const PushClient *client,
+                                  uint32_t expires_in_s,
+                                  uint32_t max_uses,
+                                  char **invite_json,
+                                  PushError **error);
+
+// Redeems an invite code; `*inviter_user_id` gets its creator, now a contact.
+int32_t push_client_redeem_invite(const PushClient *client,
+                                  const char *code,
+                                  char **inviter_user_id,
+                                  PushError **error);
+
+// Revokes one of the user's invites.
+int32_t push_client_revoke_invite(const PushClient *client, const char *code, PushError **error);
+
+// The profiles among `count` user ids the user may see, as a JSON array.
+int32_t push_client_profiles(const PushClient *client,
+                             const char *const *user_ids,
+                             size_t count,
+                             char **profiles_json,
+                             PushError **error);
+
+// The profile with a handle, as JSON.
+int32_t push_client_lookup(const PushClient *client,
+                           const char *handle_name,
+                           char **profile_json,
+                           PushError **error);
+
+// The account's devices, as a JSON array.
+int32_t push_client_devices(const PushClient *client, char **devices_json, PushError **error);
+
+// Revokes one of the account's devices.
+int32_t push_client_revoke_device(const PushClient *client,
+                                  const char *device_id,
+                                  PushError **error);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif  // __cplusplus

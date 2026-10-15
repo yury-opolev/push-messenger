@@ -2251,6 +2251,7 @@ name = "push-sdk-c"
 version = "0.1.0"
 dependencies = [
  "cbindgen",
+ "cc",
  "push-sdk",
  "push-sdk-ffi",
  "serde_json",

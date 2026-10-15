@@ -22,6 +22,8 @@ tokio = { workspace = true, features = ["sync", "time"] }
 [dev-dependencies]
 # Generates include/push_sdk.h; tests/header.rs fails when the checked-in header is stale.
 cbindgen = { version = "0.29", default-features = false }
+# Compiles and links the C test program (MSVC on Windows, cc elsewhere).
+cc = "1"
 push-sdk = { workspace = true, features = ["testing"] }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 
