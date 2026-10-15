@@ -15,8 +15,9 @@ use std::time::Duration;
 
 use push_domain::{ClientMsgId, ConversationId, MAX_UNREAD, MessageId, UserId};
 use push_proto::v1::{self, ContentType, Deliver, EntryKind};
-use rusqlite::{Connection, OptionalExtension, Row, params};
+use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use crate::SdkError;
 use crate::key::DatabaseKey;
@@ -26,9 +27,11 @@ use crate::model::{
 
 pub(crate) mod outbox;
 
-const SCHEMA_VERSION: i64 = 1;
+/// The schema steps: `SCHEMA_STEPS[n]` brings a database from version `n` to `n + 1`.
+/// Each runs in one transaction with the version bump, so a crash leaves the old version.
+const SCHEMA_STEPS: &[&str] = &[SCHEMA_V1];
 
-const SCHEMA: &str = "
+const SCHEMA_V1: &str = "
 CREATE TABLE meta (
     key   TEXT PRIMARY KEY,
     value BLOB NOT NULL
@@ -90,6 +93,44 @@ CREATE TABLE outbox (
 CREATE INDEX outbox_order ON outbox (conversation_id);
 ";
 
+/// Refuses to go on with a key unless the linked SQLite is SQLite3 Multiple Ciphers: on a
+/// plain SQLite `PRAGMA hexkey` is ignored and the data would be written in plaintext.
+/// Probed on a scratch in-memory connection: asking the database itself would read its
+/// header, which fails while an encrypted file has no key yet.
+fn require_encryption() -> Result<(), SdkError> {
+    let probe = Connection::open_in_memory()
+        .and_then(|conn| conn.query_row("SELECT sqlite3mc_version()", [], |row| row.get(0)));
+    check_encryption(probe)
+}
+
+fn check_encryption(probe: rusqlite::Result<String>) -> Result<(), SdkError> {
+    probe.map(drop).map_err(|_| SdkError::EncryptionUnavailable)
+}
+
+/// Brings the database to the last version, one step at a time. Each step and its
+/// version bump are one transaction: a failed or interrupted step changes nothing.
+fn migrate(conn: &mut Connection, steps: &[&str]) -> Result<(), SdkError> {
+    loop {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Read under the write lock: another opener may have migrated meanwhile.
+        let version: i64 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        let step = usize::try_from(version).ok().filter(|v| *v <= steps.len());
+        match step {
+            Some(done) if done == steps.len() => return Ok(()),
+            Some(done) => {
+                tx.execute_batch(steps[done])?;
+                tx.pragma_update(None, "user_version", version + 1)?;
+                tx.commit()?;
+            }
+            None => {
+                return Err(SdkError::Storage(format!(
+                    "the database is from a newer SDK (schema {version})"
+                )));
+            }
+        }
+    }
+}
+
 /// What a delivered entry changed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Applied {
@@ -113,12 +154,15 @@ pub(crate) struct Store {
 impl Store {
     /// Opens (or creates) the database at `path`; `:memory:` keeps it in memory. With a
     /// key the file is encrypted; [`SdkError::WrongKey`] if the key does not open it (or a
-    /// database that has one is opened without, or one without with a key).
+    /// database that has one is opened without, or one without with a key), and
+    /// [`SdkError::EncryptionUnavailable`] if the linked SQLite cannot encrypt.
     pub fn open(path: &str, key: Option<&DatabaseKey>) -> Result<Self, SdkError> {
-        let conn = Connection::open(path)?;
+        let mut conn = Connection::open(path)?;
         conn.busy_timeout(Duration::from_secs(5))?;
         if let Some(key) = key {
-            conn.execute_batch(&format!("PRAGMA hexkey = '{}'", key.hex().as_str()))?;
+            require_encryption()?;
+            let pragma = Zeroizing::new(format!("PRAGMA hexkey = '{}'", key.hex().as_str()));
+            conn.execute_batch(&pragma)?;
         }
         // The first read of the file: it fails with "not a database" when the key does
         // not fit, before anything is written.
@@ -135,37 +179,51 @@ impl Store {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         // Deleted content is overwritten, not left in free space (see `wipe`).
         conn.pragma_update(None, "secure_delete", "ON")?;
-        let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version > SCHEMA_VERSION {
-            return Err(SdkError::Storage(format!(
-                "the database is from a newer SDK (schema {version})"
-            )));
-        }
-        if version < SCHEMA_VERSION {
-            conn.execute_batch(SCHEMA)?;
-            conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-        }
+        migrate(&mut conn, SCHEMA_STEPS)?;
         Ok(Self { conn })
     }
 
     /// Encrypts the database with `key`, re-encrypts it with a new one, or with `None`
     /// decrypts it. Every page is rewritten in one transaction: a crash leaves the old key
     /// or the new one, never a mix. The next [`Store::open`] needs the new key.
+    ///
+    /// After a crash during this call the app cannot know which key applies: it should
+    /// try the other key when [`Store::open`] answers [`SdkError::WrongKey`].
+    ///
+    /// If the rekey succeeded but switching back to WAL did not, this returns `Ok`: the
+    /// NEW key applies (the next open restores WAL). An `Err` means the key did not change.
+    ///
+    /// Rewrites the whole file while holding the connection: call it from
+    /// `tokio::task::spawn_blocking`, never on an async worker thread.
     pub fn change_key(&mut self, key: Option<&DatabaseKey>) -> Result<(), SdkError> {
+        require_encryption()?;
         // SQLite3 Multiple Ciphers changes keys only outside WAL mode.
-        let _mode: String = self
+        let mode: String = self
             .conn
             .query_row("PRAGMA journal_mode = DELETE", [], |row| row.get(0))?;
+        if !mode.eq_ignore_ascii_case("delete") {
+            return Err(SdkError::Storage(format!(
+                "the key cannot change in journal mode {mode}"
+            )));
+        }
         let changed = match key {
-            Some(key) => self
-                .conn
-                .execute_batch(&format!("PRAGMA hexrekey = '{}'", key.hex().as_str())),
+            Some(key) => {
+                let pragma = Zeroizing::new(format!("PRAGMA hexrekey = '{}'", key.hex().as_str()));
+                self.conn.execute_batch(&pragma)
+            }
             None => self.conn.execute_batch("PRAGMA rekey = ''"),
         };
-        let _mode: String = self
-            .conn
-            .query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
-        Ok(changed?)
+        let restored = self.conn.query_row("PRAGMA journal_mode = WAL", [], |row| {
+            row.get::<_, String>(0)
+        });
+        changed?;
+        if !matches!(&restored, Ok(mode) if mode.eq_ignore_ascii_case("wal")) {
+            tracing::warn!(
+                ?restored,
+                "the database key changed, but write-ahead logging was not restored"
+            );
+        }
+        Ok(())
     }
 
     /// The user the database belongs to.
@@ -190,7 +248,8 @@ impl Store {
         Ok(owner.is_some())
     }
 
-    /// Erases everything: the user signed this device out.
+    /// Erases everything: the user signed this device out. Whole-file work behind the
+    /// connection: call it from `tokio::task::spawn_blocking`, not on an async worker.
     pub fn erase_all(&mut self) -> Result<(), SdkError> {
         self.wipe(None)
     }
@@ -210,8 +269,15 @@ impl Store {
             )?;
         }
         tx.commit()?;
-        self.conn
-            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
+        // (busy, log frames, checkpointed): busy = 1 means a reader kept the log.
+        let busy: i64 = self
+            .conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
+        if busy != 0 {
+            return Err(SdkError::Storage(
+                "the old data may remain in the write-ahead log: a reader is busy".to_owned(),
+            ));
+        }
         Ok(())
     }
 
@@ -466,9 +532,11 @@ impl Store {
         let body = entry.body.as_deref();
         match existing {
             Some(held) => {
+                // The position of the entry is always taken; the content only if the
+                // message is not deleted and the entry is not older than what is held:
+                // a stale page never brings a body back or replaces a newer edit.
                 self.conn.execute(
-                    "UPDATE message SET seq = ?3, message_id = ?4, server_ts = ?5, body = ?6,
-                         edited_at = ?7, edit_seq = MAX(edit_seq, ?8), deleted = ?9
+                    "UPDATE message SET seq = ?3, message_id = ?4, server_ts = ?5
                      WHERE conversation_id = ?1 AND client_msg_id = ?2",
                     params![
                         bytes(id.0),
@@ -476,6 +544,16 @@ impl Store {
                         entry.seq,
                         entry.message_id,
                         entry.server_ts,
+                    ],
+                )?;
+                self.conn.execute(
+                    "UPDATE message SET body = ?3, edited_at = ?4, edit_seq = MAX(edit_seq, ?5),
+                         deleted = ?6
+                     WHERE conversation_id = ?1 AND client_msg_id = ?2 AND deleted = 0
+                         AND (?6 = 1 OR ?5 >= edit_seq)",
+                    params![
+                        bytes(id.0),
+                        bytes(client_msg_id.0),
                         if entry.deleted { None } else { body },
                         entry.edited_at,
                         entry.edit_seq.unwrap_or(0),
@@ -914,6 +992,45 @@ pub(crate) mod tests {
         assert_eq!(f.store.received(f.conversation).unwrap(), 4);
     }
 
+    #[test]
+    fn a_stale_history_page_never_brings_back_a_deleted_body() {
+        let mut f = fixture();
+        let original = entry(f.conversation, f.peer, 1, EntryKind::Message);
+        f.store.apply_deliver(&original).unwrap();
+        let mut delete = entry(f.conversation, f.peer, 3, EntryKind::Delete);
+        delete.target_seq = Some(1);
+        delete.body = None;
+        f.store.apply_deliver(&delete).unwrap();
+
+        f.store.store_history(&[original]).unwrap();
+        let held = message_at(&f, 1);
+        assert!(held.deleted);
+        assert_eq!(held.body, None);
+    }
+
+    #[test]
+    fn a_stale_history_page_never_replaces_a_newer_edit() {
+        let mut f = fixture();
+        let original = entry(f.conversation, f.peer, 1, EntryKind::Message);
+        f.store.apply_deliver(&original).unwrap();
+        let mut edit = entry(f.conversation, f.peer, 2, EntryKind::Edit);
+        edit.target_seq = Some(1);
+        edit.body = Some(b"newer".to_vec());
+        f.store.apply_deliver(&edit).unwrap();
+        assert_eq!(message_at(&f, 1).body.as_deref(), Some("newer"));
+
+        f.store
+            .store_history(std::slice::from_ref(&original))
+            .unwrap();
+        assert_eq!(message_at(&f, 1).body.as_deref(), Some("newer"));
+
+        let mut current = original;
+        current.body = Some(b"newest".to_vec());
+        current.edit_seq = Some(5);
+        f.store.store_history(&[current]).unwrap();
+        assert_eq!(message_at(&f, 1).body.as_deref(), Some("newest"));
+    }
+
     fn message_at(f: &Fixture, seq: i64) -> Message {
         f.store
             .messages(f.conversation, None, 100)
@@ -1103,6 +1220,71 @@ pub(crate) mod tests {
         let store = Store::open(&scratch.database(), None).unwrap();
         assert_eq!(store.messages(conversation, None, 10).unwrap().len(), 2);
         assert!(scratch.holds(&marker), "decrypted again");
+    }
+
+    #[test]
+    fn a_key_is_refused_when_the_linked_sqlite_cannot_encrypt() {
+        let missing = Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+            Some("no such function: sqlite3mc_version".to_owned()),
+        ));
+        let error = check_encryption(missing).unwrap_err();
+        assert_eq!(error, SdkError::EncryptionUnavailable);
+        assert_eq!(error.code(), "encryption_unavailable");
+        assert!(check_encryption(Ok("SQLite3 Multiple Ciphers".to_owned())).is_ok());
+        assert_eq!(require_encryption(), Ok(()), "this build links SQLite3MC");
+    }
+
+    #[test]
+    fn an_erase_that_cannot_truncate_the_log_is_an_error() {
+        let scratch = Scratch::new();
+        let mut store = Store::open(&scratch.database(), None).unwrap();
+        store.bind_owner(UserId::new()).unwrap();
+        let reader = Connection::open(scratch.database()).unwrap();
+        reader
+            .execute_batch("BEGIN; SELECT count(*) FROM meta;")
+            .unwrap();
+        assert!(matches!(store.erase_all(), Err(SdkError::Storage(_))));
+        reader.execute_batch("COMMIT").unwrap();
+        store.erase_all().unwrap();
+    }
+
+    #[test]
+    fn an_interrupted_migration_leaves_version_zero_and_the_next_open_works() {
+        let scratch = Scratch::new();
+        let mut conn = Connection::open(scratch.database()).unwrap();
+        let broken = "CREATE TABLE meta (key TEXT); CREATE TABLE half (x); CREATE TABLE half (x);";
+        assert!(migrate(&mut conn, &[broken]).is_err());
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        let tables: i64 = conn
+            .query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!((version, tables), (0, 0));
+        drop(conn);
+
+        let mut store = Store::open(&scratch.database(), None).unwrap();
+        let me = UserId::new();
+        store.bind_owner(me).unwrap();
+        assert_eq!(store.owner().unwrap(), Some(me));
+    }
+
+    #[test]
+    fn migrations_build_on_the_previous_version() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        let steps = ["CREATE TABLE one (x)", "ALTER TABLE one ADD COLUMN y"];
+        migrate(&mut conn, &steps[..1]).unwrap();
+        migrate(&mut conn, &steps).unwrap();
+        migrate(&mut conn, &steps).unwrap();
+        conn.execute_batch("INSERT INTO one (x, y) VALUES (1, 2)")
+            .unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 2);
+        let error = migrate(&mut conn, &steps[..1]).unwrap_err();
+        assert!(matches!(error, SdkError::Storage(_)), "{error}");
     }
 
     #[test]

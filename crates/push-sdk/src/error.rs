@@ -54,6 +54,13 @@ pub enum SdkError {
     /// (or a key was given for a database that is not encrypted). Nothing was changed.
     #[error("the database key is wrong or missing")]
     WrongKey,
+    /// A key was given, but the SQLite linked into the program cannot encrypt (another
+    /// crate brought a plain SQLite): the key would be ignored and the data written in
+    /// plaintext, so nothing was opened or changed.
+    #[error(
+        "database encryption is unavailable: the linked SQLite is not SQLite3 Multiple Ciphers"
+    )]
+    EncryptionUnavailable,
     /// The app's secret store failed.
     #[error("secret store: {0}")]
     Secrets(String),
@@ -77,6 +84,7 @@ impl SdkError {
             Self::Network(_) => "network",
             Self::Storage(_) => "storage",
             Self::WrongKey => "wrong_key",
+            Self::EncryptionUnavailable => "encryption_unavailable",
             Self::Secrets(_) => "secrets",
             Self::Closed => "closed",
         }

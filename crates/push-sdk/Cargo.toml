@@ -9,7 +9,7 @@ repository.workspace = true
 
 [dependencies]
 # Argon2id for `DatabaseKey::derive`, as auth-svc hashes passwords.
-argon2.workspace = true
+argon2 = { workspace = true, features = ["zeroize"] }
 futures-util.workspace = true
 push-domain.workspace = true
 push-proto.workspace = true
