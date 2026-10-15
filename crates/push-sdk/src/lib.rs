@@ -19,8 +19,11 @@ mod credentials;
 mod error;
 mod key;
 mod model;
+mod policy;
 mod secrets;
 mod store;
+#[cfg(test)]
+mod testing;
 
 pub use auth::{Device, Platform, Profile};
 pub use error::SdkError;
