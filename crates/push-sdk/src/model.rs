@@ -58,7 +58,7 @@ impl std::fmt::Debug for Redacted {
     }
 }
 
-fn redacted(text: &Option<String>) -> Option<Redacted> {
+pub(crate) fn redacted(text: &Option<String>) -> Option<Redacted> {
     text.as_ref().map(|text| Redacted(text.len()))
 }
 

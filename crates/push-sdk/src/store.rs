@@ -19,6 +19,8 @@ use crate::model::{
     Contact, ContactState, Conversation, ConversationKind, Message, MessageKind, MessageStatus,
 };
 
+pub(crate) mod outbox;
+
 const SCHEMA_VERSION: i64 = 1;
 
 const SCHEMA: &str = "
