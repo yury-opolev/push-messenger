@@ -40,8 +40,10 @@ without it nobody can read the history, not even the app. The encryption is SQLi
 Multiple Ciphers, whose amalgamation is vendored in `crates/push-sdk/vendor/sqlite3mc`
 byte for byte as released; every build checks it against the SHA-256s in its `VERSION`
 file, and `scripts/update-sqlite3mc.ps1 -Version <x.y.z>` (or `.sh`) replaces it after
-verifying the release's Sigstore signatures. Groups are not offered to apps in the first
-release, so the SDK has no group calls yet.
+verifying the release's Sigstore signatures. The SDK ships no keychain store and never
+stores the key: [docs/sdk-secure-storage.md](docs/sdk-secure-storage.md) shows how to keep
+the credentials in the platform's keychain and how to derive and change the key. Groups
+are not offered to apps in the first release, so the SDK has no group calls yet.
 
 ## Run it on minikube
 

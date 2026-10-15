@@ -151,6 +151,15 @@ mod tests {
         assert_eq!(Session::load(&store), Ok(None));
     }
 
+    /// docs/sdk-secure-storage.md tells app developers which keys to expect.
+    #[test]
+    fn the_guide_names_every_secret_key() {
+        let guide = include_str!("../../../docs/sdk-secure-storage.md");
+        for key in SECRET_KEYS {
+            assert!(guide.contains(&format!("`{key}`")), "{key}");
+        }
+    }
+
     #[test]
     fn debug_output_never_shows_a_token() {
         let shown = format!("{:?}", session());
