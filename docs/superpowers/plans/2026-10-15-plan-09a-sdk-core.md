@@ -324,17 +324,23 @@ Decisions the owner made on this plan's review (2026-10-15), recorded in the spe
    with `WrongKey`, a change of key, no stored key, a derivation helper, and the guide.
    (Task 2, Task 6, Task 10, Task 13.)
 
+5. **A removed device keeps its data** (decided 2026-10-15; was "owner decision needed 1").
+   On 4003 the SDK reports `DeviceRemoved` and stops, and erases nothing: it never erases
+   on the server's word, like decision 1. The app may call `sign_out()` itself.
+6. **The SQLite3 Multiple Ciphers source is vendored** (decided 2026-10-15; was "owner
+   decision needed 2", option b): `crates/push-sdk/vendor/sqlite3mc`, hashes verified on
+   every build, updated by a script that verifies the release's signatures.
+
 Earlier owner decisions this plan follows: a password reset signs in again (4001) and a
 revoked device stops (4003) (Plan 7); 4006 is retried and never signs out (Plan 8); groups
 are not offered to apps in the first release (Plan 7); device registration is idempotent
 with a client-chosen `registration_id` and refresh has a 30 s grace (Plan 5).
 
-## Owner decisions needed
+## Owner questions raised on this plan (both decided: Owner decisions 5 and 6)
 
-The plan works as written; these choose a default the owner may want otherwise. Neither
-changes the wire protocol.
+None is open. The discussion is kept for the record.
 
-1. **Should a revoked device erase its local data?**
+1. **Should a revoked device erase its local data?** *Decided: no (Owner decision 5).*
    When a user removes a device from another one ("sign out my old phone"), the gateway
    closes that device's connection with 4003 and the SDK reports `DeviceRemoved` and stops.
    The device can no longer send or receive anything. The question is what happens to the
@@ -9728,14 +9734,14 @@ the branch; the guide (Task 13) and the docs describe the code as it is now.
   the socket are served between them.
 - **Stop acknowledgement before a wipe or a rebind:** `sign_out` and `sign_in` stop the
   connection first (5 s bound) and wait for it; `sign_out` always wipes, even if the
-  keychain delete fails, and returns `connection_busy` without erasing anything if the stop
-  is not confirmed.
+  keychain delete fails, and returns `connection_busy` without erasing the data if the stop
+  is not confirmed (credentials already forgotten, revocation still attempted).
 - **`timeout` and `unexpected_answer` are not retryable;** `connection_busy` is.
 - **`Client::close`** waits until the connection has stopped and the database is closed;
   `change_database_key` is async.
 - **Vendored sqlite3mc:** the amalgamation lives in `crates/push-sdk/vendor/sqlite3mc`,
   checked against pinned SHA-256s on every build, with an update script that verifies the
-  release's signatures (the choice of Owner decision needed 2, taken as option b).
+  release's signatures (Owner decision 6).
 
 ## Deferred to later plans
 
@@ -9748,8 +9754,9 @@ the branch; the guide (Task 13) and the docs describe the code as it is now.
 - **Unchecked empty or limit inputs:** some calls do not refuse an empty or out-of-range
   input before asking the server.
 - **`connect` state is not atomic:** its check of the state and its change are two steps.
-- **A `sign_out` whose stop times out skips revocation:** it returns `connection_busy`,
-  erasing nothing, and the call is repeated by the app.
+- **A `sign_out` whose stop times out leaves the local data:** it returns
+  `connection_busy` after forgetting the credentials and trying the revocation; the app
+  repeats the call or wipes on the next open.
 - **A `SendAck` the store cannot take stalls the outbox** until the next connection.
 - **A malformed delivery is never acked** and comes again on every connection.
 - **`apply_deliver` is not one transaction.**
@@ -9789,5 +9796,3 @@ the branch; the guide (Task 13) and the docs describe the code as it is now.
   that chance. Inherent to rotation.
 - **Groups** (owner decision): the store and the types already carry group kinds and
   group receipts; group calls come when the owner turns groups on.
-- **Owner decisions needed 1–2** above (erasing on a revocation, where the SQLite3 Multiple
-  Ciphers source comes from).

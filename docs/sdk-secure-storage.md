@@ -359,11 +359,16 @@ messages, so the same person finds them when signing in again; 4007 means the da
 "opened elsewhere" and also keeps everything. The data is erased only when a different
 person signs in on that database, or when the user signs out in the app:
 
-- `Client::sign_out` first stops the connection (waiting up to 5 seconds), then always
-  wipes: the credentials, the device and the database with its outbox, also offline, and
-  even if the keychain delete fails (the first error is returned). Only then does it ask
-  auth-svc to revoke the device. If the connection does not stop in time it returns
-  `connection_busy` (retryable) and erases nothing: call it again.
+- `Client::sign_out` works in this order: (1) it forgets the credentials and the device
+  (so no connection can start again); (2) it stops the connection, waiting up to 5
+  seconds; (3) it erases the local database with its outbox; (4) it asks auth-svc to
+  revoke the device. It does this also offline. The credentials are wiped unless the
+  keychain delete itself fails: both deletes are tried, the first error is returned, and
+  the erase and the revocation still happen.
+- `connection_busy` (retryable) means the stop could not be confirmed. The credentials are
+  already gone, but the local data was **not** erased (the connection might still write
+  to it); the revocation is still attempted. Call `sign_out` again later, or wipe the
+  database on the next open.
 - `Client::sign_in` also stops any existing connection first, so a connection of an earlier
   user never writes into the new user's data. Call `connect()` again afterwards.
 

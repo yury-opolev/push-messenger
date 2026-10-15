@@ -1202,11 +1202,17 @@ Implementation notes (push-sdk, Plan 9A):
   Errors carry a stable string code: the server's own for refusals. A request sent but not
   answered in time is `timeout` (not retryable: it may have been carried out); an answer of
   the wrong kind is `unexpected_answer` (not retryable); `connection_busy` (retryable) means
-  a sign-out or sign-in could not stop the connection in time and changed nothing.
-- **Sign-out and sign-in stop the connection first.** `sign_out` forgets the credentials,
-  waits (up to 5 s) until the connection task confirms it stopped and will not touch the
-  store again, then erases the local data; the erase happens even if the keychain delete
-  failed, and the first error is reported. `sign_in` does the same wait before it binds the
+  a sign-out or sign-in could not stop the connection in time: the store was not changed
+  (a sign-out has forgotten the credentials by then and still tries the revocation);
+  `encryption_unavailable` (fatal: do not retry) means a key was given but the linked
+  SQLite is not SQLite3 Multiple Ciphers, so database encryption is unavailable.
+- **Sign-out and sign-in stop the connection first.** `sign_out` forgets the credentials
+  and the device (both deletes are tried), waits (up to 5 s) until the connection task
+  confirms it stopped and will not touch the store again, then erases the local data, and
+  finally asks auth-svc to revoke the device; the erase and the revocation happen even if
+  the keychain delete failed, and the first error is reported. A sign-in waits for a
+  refresh in flight before it saves its tokens, so a refresh of the earlier session
+  cannot overwrite them. `sign_in` does the same wait before it binds the
   store to the user, so a connection of an earlier user cannot write into the new user's
   data; the app calls `connect()` again afterwards. `Client::close()` stops the connection,
   the runtime and the store, for apps that need the database file closed at once.
@@ -1228,8 +1234,8 @@ Implementation notes (push-sdk, Plan 9A):
   commit the attestation names. Vendored now: 2.5.1 (SQLite 3.53.4), the same bytes the
   `sqlite3mc-src` crate 205.1.0 shipped.
 - **Not yet:** proxies, and TLS against a real certificate (compiled in, first used in
-  Plan 11). Open owner question (Plan 9A): whether a revoked device (4003) should erase
-  its data.
+  Plan 11). Decided (owner, Plan 9A): a revoked device (4003) keeps its data, like every
+  server-side sign-out; the app may still call `sign_out()` itself.
 
 ## 9. Email
 
