@@ -57,6 +57,12 @@ impl DatabaseKey {
         Ok(Self { bytes })
     }
 
+    /// The key's 32 bytes, for an app that keeps a derived key itself (in a hardware
+    /// keystore, say) and for the bindings, which hand it to the app. Never log them.
+    pub fn as_bytes(&self) -> &[u8; Self::LEN] {
+        &self.bytes
+    }
+
     /// A new random salt for [`DatabaseKey::derive`].
     pub fn new_salt() -> [u8; Self::SALT_LEN] {
         let mut salt = [0; Self::SALT_LEN];
@@ -105,6 +111,7 @@ mod tests {
         assert_eq!(format!("{key:?}"), "DatabaseKey(<redacted>)");
         assert!(DatabaseKey::derive(b"1234", &[0; 8]).is_err());
         assert!(DatabaseKey::from_bytes(&[1; 31]).is_err());
+        assert_eq!(DatabaseKey::from_bytes(key.as_bytes()).unwrap(), key);
         assert_eq!(
             DatabaseKey::from_bytes(&[0xab; 32]).unwrap().hex().as_str(),
             "ab".repeat(32)

@@ -21,8 +21,9 @@ mod model;
 mod policy;
 mod secrets;
 mod store;
-#[cfg(test)]
-mod testing;
+#[cfg(any(test, feature = "testing"))]
+#[doc(hidden)]
+pub mod testing;
 
 pub use auth::{Device, Platform, Profile};
 pub use client::{Account, Client, Config, EDIT_WINDOW, Events};

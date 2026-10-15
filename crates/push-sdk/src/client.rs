@@ -246,6 +246,19 @@ impl Client {
         runtime.spawn(future).await.unwrap_or(Err(SdkError::Closed))
     }
 
+    /// Starts `future` on the client's runtime and returns at once: for the bindings,
+    /// which settle a promise or call back when it ends, so they need no runtime of their
+    /// own (spec §8.5). A future still running when the client closes is dropped
+    /// unfinished. The returned handle aborts it early (a binding aborts its pending calls
+    /// when the app closes the client). [`SdkError::Closed`] once the client is closed.
+    pub fn spawn(
+        &self,
+        future: impl Future<Output = ()> + Send + 'static,
+    ) -> Result<tokio::task::AbortHandle, SdkError> {
+        let runtime = self.inner.runtime.as_ref().ok_or(SdkError::Closed)?;
+        Ok(runtime.spawn(future).abort_handle())
+    }
+
     fn command(&self, command: Command) -> Result<(), SdkError> {
         self.inner
             .commands
@@ -903,6 +916,92 @@ mod tests {
         assert!(matches!(error, SdkError::Secrets(_)));
         assert!(is_empty(&client));
         assert_eq!(auth.revocations.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn spawned_work_runs_on_the_client_runtime() {
+        let f = Fixture::new().await;
+        let (done, ran) = oneshot::channel();
+        f.client
+            .spawn(async move {
+                let _ = done.send(std::thread::current().name().map(str::to_owned));
+            })
+            .unwrap();
+        assert_eq!(ran.await.unwrap().as_deref(), Some("push-sdk"));
+    }
+
+    #[tokio::test]
+    async fn spawned_work_can_be_aborted_through_its_handle() {
+        let f = Fixture::new().await;
+        let (held, dropped) = oneshot::channel::<()>();
+        let handle = f
+            .client
+            .spawn(async move {
+                let _held = held;
+                std::future::pending::<()>().await;
+            })
+            .unwrap();
+        handle.abort();
+        let outcome = tokio::time::timeout(Duration::from_secs(5), dropped)
+            .await
+            .expect("the aborted future is dropped");
+        assert!(outcome.is_err());
+    }
+
+    /// The bindings' tests talk to these doubles from outside Rust.
+    #[tokio::test]
+    async fn the_automatic_gateway_stores_sends_and_answers_them() {
+        let auth = FakeAuth::start().await;
+        let gateway = crate::testing::AutoGateway::start(auth.identity.clone()).await;
+        let database = format!("file:client-{}?mode=memory&cache=shared", Uuid::now_v7());
+        let config = Config::new(&auth.url, &gateway.url, &database);
+        let (client, mut events) =
+            Client::open(config, Arc::new(MemorySecretStore::new())).unwrap();
+        let wrong = client
+            .sign_in(
+                "a@example.com",
+                crate::testing::WRONG_PASSWORD,
+                "phone",
+                Platform::Web,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(wrong.code(), "invalid_credentials");
+        client
+            .sign_in("a@example.com", "password", "phone", Platform::Web)
+            .await
+            .unwrap();
+        client.connect().unwrap();
+        let conversation = client.open_direct(UserId::new()).await.unwrap();
+        let sent = client.send(conversation.id, "hello").unwrap();
+        let (mut stored, mut answered) = (None, None);
+        while stored.is_none() || answered.is_none() {
+            let event = tokio::time::timeout(Duration::from_secs(10), events.next())
+                .await
+                .expect("an event within 10 s")
+                .unwrap();
+            match event {
+                Event::MessageSent(message) if message.client_msg_id == sent.client_msg_id => {
+                    stored = message.seq;
+                }
+                Event::MessageAdded(message) if message.sender_id != auth.user => {
+                    answered = Some((message.seq, message.body));
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(stored, Some(1));
+        assert_eq!(answered, Some((Some(2), Some("hello".to_owned()))));
+        let unknown = client
+            .redeem_invite(crate::testing::UNKNOWN_INVITE)
+            .await
+            .unwrap_err();
+        assert_eq!(unknown.code(), "invite_not_found");
+        assert_eq!(client.list_contacts().await, Ok(Vec::new()));
+        assert_eq!(
+            client.revoke_invite("ABCDEFGHJK").await.unwrap_err().code(),
+            "rejected"
+        );
     }
 
     #[tokio::test]
