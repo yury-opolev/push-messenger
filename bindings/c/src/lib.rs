@@ -24,7 +24,9 @@ use std::cell::Cell;
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use push_sdk::{Client, DatabaseKey, Events, SdkError, SecretError, SecretStore};
@@ -129,6 +131,15 @@ thread_local! {
     static IN_STORE: Cell<bool> = const { Cell::new(false) };
 }
 
+/// Puts `IN_STORE` back to what it was, also when the app's function panics.
+struct StoreMark(bool);
+
+impl Drop for StoreMark {
+    fn drop(&mut self) {
+        IN_STORE.with(|flag| flag.set(self.0));
+    }
+}
+
 /// The app's store, as the SDK sees it.
 struct CStore(PushSecretStore);
 
@@ -140,10 +151,8 @@ impl CStore {
     /// Runs one of the app's functions, marked so that a call back into the SDK from it is
     /// refused.
     fn call<T>(&self, call: impl FnOnce() -> T) -> T {
-        IN_STORE.with(|flag| flag.set(true));
-        let result = call();
-        IN_STORE.with(|flag| flag.set(false));
-        result
+        let _restore = StoreMark(IN_STORE.with(|flag| flag.replace(true)));
+        call()
     }
 
     fn key(key: &str) -> Result<CString, SecretError> {
@@ -218,28 +227,38 @@ impl SecretStore for CStore {
 impl Drop for CStore {
     fn drop(&mut self) {
         if let Some(release) = self.0.release {
-            unsafe { release(self.0.context) };
+            self.call(|| unsafe { release(self.0.context) });
         }
     }
 }
 
 /// Called with each event as UTF-8 JSON (`{"type": …}`), borrowed for the call, on an SDK
 /// thread of its own, one event at a time and in order. It may call the SDK, including
-/// blocking calls and `push_client_destroy`.
+/// blocking calls and `push_client_destroy`. No callback starts after `push_client_destroy`
+/// has been called.
 pub type PushEventCallback =
     Option<unsafe extern "C" fn(context: *mut c_void, event_json: *const c_char)>;
 
 /// Called once, on the events thread, after the last event: only now may the context be
-/// freed. `push_client_destroy` does not wait for it: events already queued can still reach
-/// the event callback after `push_client_destroy` returns, so `context` must stay valid
-/// until this is called.
+/// freed. When `push_client_destroy` returns, no callback runs any more and this has been
+/// called, unless `push_client_destroy` was called from inside the event callback: then
+/// this is called after that callback returns.
 pub type PushReleaseCallback = Option<unsafe extern "C" fn(context: *mut c_void)>;
+
+/// The events thread of a client whose events go to a callback.
+struct Delivering {
+    /// Set by `push_client_destroy`: no callback starts once it is set.
+    stopped: Arc<AtomicBool>,
+    thread: JoinHandle<()>,
+}
 
 /// How the app takes the events: not yet, by polling, or through a callback.
 enum Delivery {
     Waiting(Events),
     Polled(Arc<tokio::sync::Mutex<Events>>),
-    Called,
+    Called(Delivering),
+    /// While the events move from one state to the next.
+    Taken,
 }
 
 /// A client: opaque to C.
@@ -294,12 +313,17 @@ unsafe fn text<'a>(value: *const c_char, what: &str) -> Result<&'a str, SdkError
         .map_err(|_| SdkError::Invalid(format!("{what} is not UTF-8")))
 }
 
-/// Bytes an argument points to; none for NULL.
-unsafe fn bytes<'a>(value: *const u8, len: usize) -> Option<&'a [u8]> {
+/// Bytes an argument points to; none for NULL with length 0, invalid for NULL with a length.
+unsafe fn bytes<'a>(value: *const u8, len: usize) -> Result<Option<&'a [u8]>, SdkError> {
     if value.is_null() {
-        return None;
+        if len != 0 {
+            return Err(SdkError::Invalid(
+                "a length is given for a NULL pointer".to_owned(),
+            ));
+        }
+        return Ok(None);
     }
-    Some(unsafe { std::slice::from_raw_parts(value, len) })
+    Ok(Some(unsafe { std::slice::from_raw_parts(value, len) }))
 }
 
 /// Refuses a call made from inside one of the app's secret store functions: it could wait
@@ -353,42 +377,53 @@ unsafe fn handle<'a>(client: *const PushClient) -> Result<&'a PushClient, SdkErr
     Ok(unsafe { &*client })
 }
 
+/// Runs an accessor at the boundary: a panic gives `fallback`, never unwinds into C.
+fn shield<T>(fallback: T, body: impl FnOnce() -> T) -> T {
+    catch_unwind(AssertUnwindSafe(body)).unwrap_or(fallback)
+}
+
 /// The version of the SDK, as a static string (never freed).
 #[unsafe(no_mangle)]
 pub extern "C" fn push_version() -> *const c_char {
-    concat!(env!("CARGO_PKG_VERSION"), "\0").as_ptr().cast()
+    shield(ptr::null(), || {
+        concat!(env!("CARGO_PKG_VERSION"), "\0").as_ptr().cast()
+    })
 }
 
 /// The error's stable code (`timeout`, `wrong_key`, the server's `not_contact`, …),
 /// valid until `push_error_free`. NULL for a NULL error.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn push_error_code(error: *const PushError) -> *const c_char {
-    match unsafe { error.as_ref() } {
+    shield(ptr::null(), || match unsafe { error.as_ref() } {
         Some(error) => error.code.as_ptr(),
         None => ptr::null(),
-    }
+    })
 }
 
 /// A sentence for logs, never containing a token, a key or a message's text; valid until
 /// `push_error_free`. NULL for a NULL error.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn push_error_message(error: *const PushError) -> *const c_char {
-    match unsafe { error.as_ref() } {
+    shield(ptr::null(), || match unsafe { error.as_ref() } {
         Some(error) => error.message.as_ptr(),
         None => ptr::null(),
-    }
+    })
 }
 
 /// Whether the same call may succeed later, unchanged.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn push_error_retryable(error: *const PushError) -> bool {
-    unsafe { error.as_ref() }.is_some_and(|error| error.retryable)
+    shield(false, || {
+        unsafe { error.as_ref() }.is_some_and(|error| error.retryable)
+    })
 }
 
 /// Rate limited: after how many seconds the same call may succeed; -1 if not said.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn push_error_retry_after_s(error: *const PushError) -> i32 {
-    unsafe { error.as_ref() }.map_or(-1, |error| error.retry_after_s)
+    shield(-1, || {
+        unsafe { error.as_ref() }.map_or(-1, |error| error.retry_after_s)
+    })
 }
 
 /// Frees an error; NULL is ignored.
@@ -414,8 +449,9 @@ pub unsafe extern "C" fn push_string_free(value: *mut c_char) {
 /// `config_json`: `{"authUrl", "socketUrl", "databasePath", "host"?, "requestTimeoutMs"?}`.
 /// `database_key`: NULL for a plain database, or `PUSH_DATABASE_KEY_LEN` bytes that
 /// encrypt the whole file (`wrong_key` if they do not open it); copied, never stored or
-/// logged. `store`: the app's secret store, owned by the client from now on (released
-/// even when this fails). `*client` gets the client.
+/// logged. A non-zero `database_key_len` with a NULL key is `invalid`. `store`: the app's secret store, owned by the client from now on (released
+/// even when this fails); `invalid` if it has `load` but no `free_value`. `*client` gets
+/// the client.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn push_client_open(
     config_json: *const c_char,
@@ -429,10 +465,15 @@ pub unsafe extern "C" fn push_client_open(
     let store = CStore(store);
     guard(error, move || {
         let out = place(client, "client")?;
+        if store.0.load.is_some() && store.0.free_value.is_none() {
+            return Err(SdkError::Invalid(
+                "the secret store has load but no free_value".to_owned(),
+            ));
+        }
         let config = unsafe { text(config_json, "config_json") }?;
         let config: Value = serde_json::from_str(config)
             .map_err(|_| SdkError::Invalid("config_json is not JSON".to_owned()))?;
-        let key = unsafe { bytes(database_key, database_key_len) };
+        let key = unsafe { bytes(database_key, database_key_len) }?;
         let config = json::config(config, key)?;
         let (opened, events) = Client::open(config, Arc::new(store))?;
         let handle = PushClient {
@@ -444,37 +485,59 @@ pub unsafe extern "C" fn push_client_open(
     })
 }
 
-/// Closes the client and frees it: the connection stops, and the database is closed and
-/// the secret store released before this returns (it waits up to a few seconds), so the
-/// file can be opened again at once (also from the event callback). Called on one of the
-/// SDK's runtime threads (from a secret store function) it does not wait. NULL is ignored.
-/// No other call may use the client during or after this. It does not wait for the event
-/// callback: events already queued can still reach it after this returns, until its
-/// `release` is called, so the callback's context must outlive this call.
+/// Closes the client and frees it: the connection stops, the event callback is stopped, and
+/// the database is closed and the secret store released before this returns (it waits up to
+/// a few seconds), so the file can be opened again at once (also from the event callback).
+/// When it returns, no event callback runs and the callback's `release` has been called,
+/// unless this was called from inside the event callback: then it does not wait, and
+/// `release` is called after that callback returns. It waits for a callback running on
+/// another thread, so do not hold a lock that callback needs. Called on one of the SDK's
+/// runtime threads it does not wait. Called from inside a secret store function it does
+/// nothing (the call that runs the store still uses the client). NULL is ignored. No other
+/// call may use the client during or after this.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn push_client_destroy(client: *mut PushClient) {
-    if client.is_null() {
+    if client.is_null() || IN_STORE.with(Cell::get) {
         return;
     }
     let _ = catch_unwind(AssertUnwindSafe(|| {
         let handle = unsafe { Box::from_raw(client) };
         let PushClient { client, events } = *handle;
-        drop(events);
-        if on_sdk_thread() {
+        let delivery = events
+            .into_inner()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let delivering = match delivery {
+            Delivery::Called(delivering) => {
+                delivering.stopped.store(true, Ordering::SeqCst);
+                Some(delivering.thread)
+            }
+            _ => None,
+        };
+        let on_runtime = on_sdk_thread();
+        if on_runtime {
             drop(client);
         } else {
             let _ = block_on(client.close());
+        }
+        // Not from the events thread itself (the callback called this), nor from a runtime
+        // thread, where waiting could hold up the runtime.
+        if let Some(thread) = delivering {
+            if !on_runtime && thread.thread().id() != std::thread::current().id() {
+                let _ = thread.join();
+            }
         }
     }));
 }
 
 /// Delivers every event to `callback` with `context`, on an SDK thread of its own, one at a
-/// time and in order, until the client is destroyed and the events queued by then are
-/// delivered; then `release` (if set) is called once with `context`. The callback can
-/// still run after `push_client_destroy` returns, up to the call of `release`: keep
-/// `context` valid until `release` runs (without a `release`, for as long as the process
-/// lives). Events wait in the SDK (at most 10,000; then one `eventsLost`)
-/// until this is called. Only once per client, and not after `push_client_next_event`.
+/// time and in order, until the client is destroyed; then `release` (if set) is called
+/// once with `context`. `push_client_destroy` stops the delivery: when it returns no
+/// callback runs and `release` has been called (called from inside the callback, it
+/// returns at once and `release` is called after the callback returns). Keep `context`
+/// valid until `release` runs (without a `release`, until `push_client_destroy` returns).
+/// Events wait in the SDK (at most 10,000; then one `eventsLost`) until this is called.
+/// Only once per client, and not after `push_client_next_event`. If it fails, the events
+/// are kept and it may be called again.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn push_client_set_event_callback(
     client: *const PushClient,
@@ -491,24 +554,42 @@ pub unsafe extern "C" fn push_client_set_event_callback(
         let Delivery::Waiting(_) = &*delivery else {
             return Err(SdkError::Invalid("the events are taken already".to_owned()));
         };
-        let Delivery::Waiting(mut events) = std::mem::replace(&mut *delivery, Delivery::Called)
-        else {
-            unreachable!("checked above");
-        };
         let context = Context(context);
-        std::thread::Builder::new()
+        let stopped = Arc::new(AtomicBool::new(false));
+        let (sender, receiver) = std::sync::mpsc::channel::<Events>();
+        let thread = std::thread::Builder::new()
             .name("push-sdk-events".to_owned())
-            .spawn(move || {
-                let context = context;
-                while let Some(event) = block_on(events.next()) {
-                    let shown = CString::new(json::event(&event).to_string()).unwrap_or_default();
-                    unsafe { callback(context.0, shown.as_ptr()) };
-                }
-                if let Some(release) = release {
-                    unsafe { release(context.0) };
+            .spawn({
+                let stopped = stopped.clone();
+                move || {
+                    let context = context;
+                    let Ok(mut events) = receiver.recv() else {
+                        return;
+                    };
+                    // A panic must not skip `release`.
+                    let _ = catch_unwind(AssertUnwindSafe(|| {
+                        while let Some(event) = block_on(events.next()) {
+                            if stopped.load(Ordering::SeqCst) {
+                                break;
+                            }
+                            let shown =
+                                CString::new(json::event(&event).to_string()).unwrap_or_default();
+                            unsafe { callback(context.0, shown.as_ptr()) };
+                        }
+                    }));
+                    if let Some(release) = release {
+                        let _ = catch_unwind(AssertUnwindSafe(|| unsafe { release(context.0) }));
+                    }
                 }
             })
             .map_err(|_| SdkError::Invalid("cannot start the events thread".to_owned()))?;
+        let Delivery::Waiting(events) = std::mem::replace(
+            &mut *delivery,
+            Delivery::Called(Delivering { stopped, thread }),
+        ) else {
+            unreachable!("checked above");
+        };
+        let _ = sender.send(events);
         Ok(())
     })
 }
@@ -534,7 +615,7 @@ pub unsafe extern "C" fn push_client_next_event(
         let events = {
             let mut delivery = handle.events.lock().map_err(|_| SdkError::Closed)?;
             if let Delivery::Waiting(_) = &*delivery {
-                let Delivery::Waiting(events) = std::mem::replace(&mut *delivery, Delivery::Called)
+                let Delivery::Waiting(events) = std::mem::replace(&mut *delivery, Delivery::Taken)
                 else {
                     unreachable!("checked above");
                 };
@@ -579,9 +660,9 @@ pub unsafe extern "C" fn push_derive_database_key(
 ) -> i32 {
     guard(error, || {
         let out = buffer(key, "key")?;
-        let secret = unsafe { bytes(secret, secret_len) }
+        let secret = unsafe { bytes(secret, secret_len) }?
             .ok_or_else(|| SdkError::Invalid("the secret is NULL".to_owned()))?;
-        let salt = unsafe { bytes(salt, salt_len) }
+        let salt = unsafe { bytes(salt, salt_len) }?
             .ok_or_else(|| SdkError::Invalid("the salt is NULL".to_owned()))?;
         let derived = DatabaseKey::derive(secret, salt)?;
         let derived = derived.as_bytes();
@@ -603,7 +684,7 @@ pub unsafe extern "C" fn push_new_salt(salt: *mut u8) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 
     use push_sdk::testing::{AutoGateway, FakeAuth};
 
@@ -738,7 +819,7 @@ mod tests {
             load: Some(empty_load),
             save: Some(reentrant_save),
             remove: Some(removed),
-            free_value: None,
+            free_value: Some(memory_free),
             release: None,
         };
         let (mut client, mut error) = (ptr::null_mut(), ptr::null_mut());
@@ -790,5 +871,361 @@ mod tests {
         assert_eq!(receiver.recv().unwrap(), (PUSH_ERROR, "invalid".to_owned()));
         unsafe { push_client_destroy(client) };
         drop(runtime);
+    }
+
+    unsafe extern "C" fn quiet_save(
+        _context: *mut c_void,
+        _key: *const c_char,
+        _value: *const u8,
+        _len: usize,
+    ) -> i32 {
+        PUSH_OK
+    }
+
+    fn store_with(
+        save: unsafe extern "C" fn(*mut c_void, *const c_char, *const u8, usize) -> i32,
+        release: Option<unsafe extern "C" fn(*mut c_void)>,
+    ) -> PushSecretStore {
+        PushSecretStore {
+            context: ptr::null_mut(),
+            load: Some(empty_load),
+            save: Some(save),
+            remove: Some(removed),
+            free_value: Some(memory_free),
+            release,
+        }
+    }
+
+    type Memory = Mutex<std::collections::HashMap<String, Vec<u8>>>;
+
+    unsafe extern "C" fn memory_load(
+        context: *mut c_void,
+        key: *const c_char,
+        value: *mut *mut u8,
+        len: *mut usize,
+    ) -> i32 {
+        let memory = unsafe { &*context.cast::<Memory>() };
+        let key = unsafe { CStr::from_ptr(key) }.to_str().unwrap();
+        match memory.lock().unwrap().get(key) {
+            None => PUSH_NOT_FOUND,
+            Some(stored) => {
+                let copy = stored.clone().into_boxed_slice();
+                unsafe { *len = copy.len() };
+                unsafe { *value = Box::into_raw(copy).cast::<u8>() };
+                PUSH_OK
+            }
+        }
+    }
+
+    unsafe extern "C" fn memory_free(_context: *mut c_void, value: *mut u8, len: usize) {
+        drop(unsafe { Box::from_raw(ptr::slice_from_raw_parts_mut(value, len)) });
+    }
+
+    unsafe extern "C" fn memory_save(
+        context: *mut c_void,
+        key: *const c_char,
+        value: *const u8,
+        len: usize,
+    ) -> i32 {
+        let memory = unsafe { &*context.cast::<Memory>() };
+        let key = unsafe { CStr::from_ptr(key) }.to_str().unwrap().to_owned();
+        let value = unsafe { std::slice::from_raw_parts(value, len) }.to_vec();
+        memory.lock().unwrap().insert(key, value);
+        PUSH_OK
+    }
+
+    unsafe extern "C" fn memory_remove(context: *mut c_void, key: *const c_char) -> i32 {
+        let memory = unsafe { &*context.cast::<Memory>() };
+        let key = unsafe { CStr::from_ptr(key) }.to_str().unwrap();
+        memory.lock().unwrap().remove(key);
+        PUSH_OK
+    }
+
+    /// A store that keeps what is saved, so a client can sign in and connect (leaked: tests).
+    fn memory_store() -> PushSecretStore {
+        PushSecretStore {
+            context: Box::into_raw(Box::new(Memory::default())).cast(),
+            load: Some(memory_load),
+            save: Some(memory_save),
+            remove: Some(memory_remove),
+            free_value: Some(memory_free),
+            release: None,
+        }
+    }
+
+    struct Servers {
+        runtime: tokio::runtime::Runtime,
+        _auth: FakeAuth,
+        _gateway: AutoGateway,
+        config: CString,
+    }
+
+    fn servers() -> Servers {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (auth, gateway) = runtime.block_on(async {
+            let auth = FakeAuth::start().await;
+            let gateway = AutoGateway::start(auth.identity.clone()).await;
+            (auth, gateway)
+        });
+        let config = CString::new(format!(
+            r#"{{"authUrl":"{}","socketUrl":"{}","databasePath":":memory:"}}"#,
+            auth.url, gateway.url
+        ))
+        .unwrap();
+        Servers {
+            runtime,
+            _auth: auth,
+            _gateway: gateway,
+            config,
+        }
+    }
+
+    fn open(servers: &Servers, store: PushSecretStore) -> *mut PushClient {
+        let (mut client, mut error) = (ptr::null_mut(), ptr::null_mut());
+        let opened = unsafe {
+            push_client_open(
+                servers.config.as_ptr(),
+                ptr::null(),
+                0,
+                store,
+                &mut client,
+                &mut error,
+            )
+        };
+        assert_eq!(opened, PUSH_OK);
+        client
+    }
+
+    fn sign_in(client: *mut PushClient) {
+        let (mut account, mut error) = (ptr::null_mut(), ptr::null_mut());
+        let status = unsafe {
+            push_client_sign_in(
+                client,
+                c"c@example.com".as_ptr(),
+                c"password".as_ptr(),
+                c"c app".as_ptr(),
+                c"desktop".as_ptr(),
+                &mut account,
+                &mut error,
+            )
+        };
+        assert_eq!(status, PUSH_OK);
+        unsafe { push_string_free(account) };
+    }
+
+    static DESTROY_CLIENT: AtomicPtr<PushClient> = AtomicPtr::new(ptr::null_mut());
+    static DESTROY_RELEASED: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" fn destroying_save(
+        _context: *mut c_void,
+        _key: *const c_char,
+        _value: *const u8,
+        _len: usize,
+    ) -> i32 {
+        unsafe { push_client_destroy(DESTROY_CLIENT.load(Ordering::SeqCst)) };
+        PUSH_OK
+    }
+
+    unsafe extern "C" fn count_destroy_release(_context: *mut c_void) {
+        DESTROY_RELEASED.fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn destroy_from_a_store_function_does_nothing() {
+        let servers = servers();
+        let client = open(
+            &servers,
+            store_with(destroying_save, Some(count_destroy_release)),
+        );
+        DESTROY_CLIENT.store(client, Ordering::SeqCst);
+        sign_in(client);
+        assert_eq!(DESTROY_RELEASED.load(Ordering::SeqCst), 0);
+        let (mut account, mut error) = (ptr::null_mut(), ptr::null_mut());
+        let status = unsafe { push_client_account(client, &mut account, &mut error) };
+        assert_eq!(status, PUSH_OK, "the client is still alive");
+        unsafe { push_string_free(account) };
+        unsafe { push_client_destroy(client) };
+        assert_eq!(DESTROY_RELEASED.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_key_length_without_a_key_is_invalid() {
+        let servers = servers();
+        let (mut client, mut error) = (ptr::null_mut(), ptr::null_mut());
+        let status = unsafe {
+            push_client_open(
+                servers.config.as_ptr(),
+                ptr::null(),
+                5,
+                store_with(quiet_save, None),
+                &mut client,
+                &mut error,
+            )
+        };
+        assert_eq!((status, code(error)), (PUSH_ERROR, "invalid".to_owned()));
+        assert!(client.is_null());
+
+        let client = open(&servers, store_with(quiet_save, None));
+        let status = unsafe { push_client_change_database_key(client, ptr::null(), 3, &mut error) };
+        assert_eq!((status, code(error)), (PUSH_ERROR, "invalid".to_owned()));
+        unsafe { push_client_destroy(client) };
+    }
+
+    static LOAD_RELEASED: AtomicUsize = AtomicUsize::new(0);
+    static RELEASE_IN_STORE: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" fn count_load_release(_context: *mut c_void) {
+        LOAD_RELEASED.fetch_add(1, Ordering::SeqCst);
+        if IN_STORE.with(Cell::get) {
+            RELEASE_IN_STORE.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    unsafe extern "C" fn loading(
+        _context: *mut c_void,
+        _key: *const c_char,
+        _value: *mut *mut u8,
+        _len: *mut usize,
+    ) -> i32 {
+        PUSH_NOT_FOUND
+    }
+
+    #[test]
+    fn a_store_with_load_but_no_free_value_is_refused_at_open() {
+        let servers = servers();
+        let store = PushSecretStore {
+            load: Some(loading),
+            free_value: None,
+            ..store_with(quiet_save, Some(count_load_release))
+        };
+        let (mut client, mut error) = (ptr::null_mut(), ptr::null_mut());
+        let status = unsafe {
+            push_client_open(
+                servers.config.as_ptr(),
+                ptr::null(),
+                0,
+                store,
+                &mut client,
+                &mut error,
+            )
+        };
+        assert_eq!((status, code(error)), (PUSH_ERROR, "invalid".to_owned()));
+        assert!(client.is_null());
+        assert_eq!(LOAD_RELEASED.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            RELEASE_IN_STORE.load(Ordering::SeqCst),
+            1,
+            "release runs marked as a store function"
+        );
+    }
+
+    #[test]
+    fn a_store_call_restores_the_previous_mark_also_on_a_panic() {
+        let store = CStore(store_with(quiet_save, None));
+        assert!(!IN_STORE.with(Cell::get));
+        store.call(|| {
+            store.call(|| ());
+            assert!(IN_STORE.with(Cell::get), "the outer call is still marked");
+        });
+        assert!(!IN_STORE.with(Cell::get));
+        let _ = catch_unwind(AssertUnwindSafe(|| store.call(|| panic!("a bug"))));
+        assert!(!IN_STORE.with(Cell::get), "restored after a panic");
+    }
+
+    static EVENT_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static EVENT_RELEASED: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" fn slow_event(_context: *mut c_void, _event: *const c_char) {
+        EVENT_CALLS.fetch_add(1, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    unsafe extern "C" fn count_event_release(_context: *mut c_void) {
+        EVENT_RELEASED.fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn no_callback_runs_after_destroy_returns() {
+        let servers = servers();
+        let client = open(&servers, memory_store());
+        let mut error = ptr::null_mut();
+        let status = unsafe {
+            push_client_set_event_callback(
+                client,
+                Some(slow_event),
+                ptr::null_mut(),
+                Some(count_event_release),
+                &mut error,
+            )
+        };
+        assert_eq!(status, PUSH_OK);
+        sign_in(client);
+        let connected = unsafe { push_client_connect(client, &mut error) };
+        if connected != PUSH_OK {
+            panic!("connect failed: {}", code(error));
+        }
+        let waited = unsafe { push_client_wait_connected(client, 10_000, &mut error) };
+        if waited != PUSH_OK {
+            panic!("wait_connected failed: {}", code(error));
+        }
+        unsafe { push_client_destroy(client) };
+        assert_eq!(EVENT_RELEASED.load(Ordering::SeqCst), 1, "released already");
+        let calls = EVENT_CALLS.load(Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(EVENT_CALLS.load(Ordering::SeqCst), calls);
+        assert_eq!(EVENT_RELEASED.load(Ordering::SeqCst), 1);
+        drop(servers.runtime);
+    }
+
+    static INSIDE_CLIENT: AtomicPtr<PushClient> = AtomicPtr::new(ptr::null_mut());
+    static INSIDE_DESTROYED: AtomicBool = AtomicBool::new(false);
+    static INSIDE_RELEASED: AtomicUsize = AtomicUsize::new(0);
+    static RELEASED_BEFORE_RETURN: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+    unsafe extern "C" fn destroying_event(_context: *mut c_void, event: *const c_char) {
+        let text = unsafe { CStr::from_ptr(event) }.to_str().unwrap();
+        if text.contains(r#""state":"connected""#) && !INSIDE_DESTROYED.swap(true, Ordering::SeqCst)
+        {
+            unsafe { push_client_destroy(INSIDE_CLIENT.load(Ordering::SeqCst)) };
+            RELEASED_BEFORE_RETURN.store(INSIDE_RELEASED.load(Ordering::SeqCst), Ordering::SeqCst);
+        }
+    }
+
+    unsafe extern "C" fn count_inside_release(_context: *mut c_void) {
+        INSIDE_RELEASED.fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn destroy_from_the_callback_releases_once_after_it_returns() {
+        let servers = servers();
+        let client = open(&servers, memory_store());
+        INSIDE_CLIENT.store(client, Ordering::SeqCst);
+        let mut error = ptr::null_mut();
+        let status = unsafe {
+            push_client_set_event_callback(
+                client,
+                Some(destroying_event),
+                ptr::null_mut(),
+                Some(count_inside_release),
+                &mut error,
+            )
+        };
+        assert_eq!(status, PUSH_OK);
+        sign_in(client);
+        assert_eq!(unsafe { push_client_connect(client, &mut error) }, PUSH_OK);
+        for _ in 0..200 {
+            if INSIDE_RELEASED.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(INSIDE_RELEASED.load(Ordering::SeqCst), 1);
+        assert_eq!(RELEASED_BEFORE_RETURN.load(Ordering::SeqCst), 0);
+        drop(servers.runtime);
     }
 }

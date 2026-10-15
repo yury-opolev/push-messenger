@@ -187,15 +187,38 @@ static PushClient *open_client(struct store *store, const char *database, const 
 struct seen {
     lock_t lock;
     int connected;
+    int events;
     int released;
+    /* For a callback that destroys its own client. */
+    PushClient *client;
+    int destroyed;
+    int released_inside;
 };
 
 static void on_event(void *context, const char *event_json) {
     struct seen *seen = context;
     lock_take(&seen->lock);
+    seen->events++;
     if (strstr(event_json, "\"type\":\"connectionStateChanged\"") &&
         strstr(event_json, "\"state\":\"connected\""))
         seen->connected++;
+    lock_give(&seen->lock);
+    /* Slow, so that events are still queued when destroy is called. */
+    pause_ms(100);
+}
+
+/* Destroys the client on the first "connected": destroy must not wait for this callback. */
+static void on_event_destroying(void *context, const char *event_json) {
+    struct seen *seen = context;
+    int destroy;
+    lock_take(&seen->lock);
+    destroy = strstr(event_json, "\"state\":\"connected\"") && !seen->destroyed;
+    if (destroy) seen->destroyed = 1;
+    lock_give(&seen->lock);
+    if (!destroy) return;
+    push_client_destroy(seen->client);
+    lock_take(&seen->lock);
+    seen->released_inside = seen->released;
     lock_give(&seen->lock);
 }
 
@@ -210,6 +233,7 @@ int main(int argc, char **argv) {
     static struct store store;
     static struct store other_store;
     static struct store key_store;
+    static struct store inside_store;
     static struct seen seen;
     PushClient *client;
     PushError *error = NULL;
@@ -233,6 +257,7 @@ int main(int argc, char **argv) {
     lock_init(&store.lock);
     lock_init(&other_store.lock);
     lock_init(&key_store.lock);
+    lock_init(&inside_store.lock);
     lock_init(&seen.lock);
     printf("c flow: push-sdk %s\n", push_version());
 
@@ -327,9 +352,33 @@ int main(int argc, char **argv) {
     }
     if (!seen.connected) fail("the callback heard connected", NULL);
     push_client_destroy(client);
+    /* destroy has stopped the thread: released already, and nothing more is delivered. */
+    if (seen.released != 1) fail("the callback's context is released when destroy returns", NULL);
+    {
+        int events = seen.events;
+        pause_ms(300);
+        if (seen.events != events || seen.released != 1)
+            fail("no callback runs after destroy returned", NULL);
+    }
+    step("the callback heard connected on an SDK thread; destroy returned after release");
+
+    /* A callback that destroys its own client: no deadlock; release comes after it returns. */
+    client = open_client(&inside_store, ":memory:", NULL);
+    seen.released = 0;
+    seen.client = client;
+    if (push_client_set_event_callback(client, on_event_destroying, &seen, on_release, &error) !=
+        PUSH_OK)
+        fail("set the destroying callback", error);
+    if (push_client_sign_in(client, "c@example.com", "password", "c app", "desktop", &text,
+                            &error) != PUSH_OK)
+        fail("sign in for the destroying callback", error);
+    push_string_free(text);
+    if (push_client_connect(client, &error) != PUSH_OK) fail("connect for the destroying callback", error);
     for (waited = 0; waited < 100 && !seen.released; waited++) pause_ms(50);
-    if (seen.released != 1) fail("the callback's context is released after the last event", NULL);
-    step("the callback heard connected on an SDK thread, then its context was released");
+    pause_ms(200);
+    if (seen.released != 1) fail("release is called once after the destroying callback", NULL);
+    if (seen.released_inside != 0) fail("release waits for the destroying callback to return", NULL);
+    step("a callback destroyed its client; release ran once, after it returned");
 
     /* An encrypted database opens only with its key. */
     if (push_new_salt(salt) != PUSH_OK) fail("new salt", NULL);

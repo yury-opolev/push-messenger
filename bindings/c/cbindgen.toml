@@ -23,8 +23,10 @@ header = """
  *   SDK's own time limits): call them off the UI thread, never from a secret store callback.
  * - Events come to one callback on an SDK thread, or from push_client_next_event.
  * - A failed call leaves every output place it was given (a char ** or a PushClient **) NULL, so
- *   freeing it is always safe. Events queued when push_client_destroy returns can still reach
- *   the event callback until its release callback runs: keep the context alive until then.
+ *   freeing it is always safe. When push_client_destroy returns, no event callback runs and its
+ *   release callback has been called, unless push_client_destroy was called from inside the
+ *   event callback: then release is called after that callback returns. Keep the context
+ *   alive until release runs. push_client_destroy from a secret store function does nothing.
  */
 """
 

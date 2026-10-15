@@ -180,7 +180,7 @@ pub unsafe extern "C" fn push_client_wait_connected(
 }
 
 /// Encrypts the local database with a new key of `PUSH_DATABASE_KEY_LEN` bytes, or with
-/// NULL decrypts it. The next open needs the new key.
+/// NULL decrypts it (a non-zero length with a NULL key is `invalid`). The next open needs the new key.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn push_client_change_database_key(
     client: *const PushClient,
@@ -190,7 +190,7 @@ pub unsafe extern "C" fn push_client_change_database_key(
 ) -> i32 {
     guard(error, || {
         let this = unsafe { handle(client) }?;
-        let key = unsafe { bytes(database_key, database_key_len) }
+        let key = unsafe { bytes(database_key, database_key_len) }?
             .map(DatabaseKey::from_bytes)
             .transpose()?;
         wait(this.client.change_database_key(key.as_ref()))
@@ -199,18 +199,18 @@ pub unsafe extern "C" fn push_client_change_database_key(
 
 // ----- local data -----
 
-fn conversation_id(value: *const c_char) -> Result<ConversationId, SdkError> {
+unsafe fn conversation_id(value: *const c_char) -> Result<ConversationId, SdkError> {
     json::id(
         unsafe { text(value, "conversation_id") }?,
         "conversation_id",
     )
 }
 
-fn user_id(value: *const c_char) -> Result<UserId, SdkError> {
+unsafe fn user_id(value: *const c_char) -> Result<UserId, SdkError> {
     json::id(unsafe { text(value, "user_id") }?, "user_id")
 }
 
-fn client_msg_id(value: *const c_char, what: &str) -> Result<ClientMsgId, SdkError> {
+unsafe fn client_msg_id(value: *const c_char, what: &str) -> Result<ClientMsgId, SdkError> {
     json::id(unsafe { text(value, what) }?, what)
 }
 
@@ -241,7 +241,7 @@ pub unsafe extern "C" fn push_client_conversation(
     guard(error, || {
         let out = place(conversation_json, "conversation_json")?;
         let this = unsafe { handle(client) }?;
-        let id = conversation_id(conversation_id_text)?;
+        let id = unsafe { conversation_id(conversation_id_text) }?;
         let found = this.client.conversation(id)?;
         put_json(
             out,
@@ -267,7 +267,7 @@ pub unsafe extern "C" fn push_client_messages(
     guard(error, || {
         let out = place(messages_json, "messages_json")?;
         let this = unsafe { handle(client) }?;
-        let id = conversation_id(conversation_id_text)?;
+        let id = unsafe { conversation_id(conversation_id_text) }?;
         let before = unsafe { before_seq.as_ref() }.copied();
         let messages = this.client.messages(id, before, limit)?;
         put_json(out, &json::list(&messages, json::message));
@@ -306,7 +306,7 @@ pub unsafe extern "C" fn push_client_send(
     guard(error, || {
         let out = place(message_json, "message_json")?;
         let this = unsafe { handle(client) }?;
-        let id = conversation_id(conversation_id_text)?;
+        let id = unsafe { conversation_id(conversation_id_text) }?;
         let body = unsafe { text(message_text, "text") }?;
         let message = this.client.send(id, body)?;
         put_json(out, &json::message(&message));
@@ -327,8 +327,8 @@ pub unsafe extern "C" fn push_client_edit(
     guard(error, || {
         let out = place(change_id, "change_id")?;
         let this = unsafe { handle(client) }?;
-        let id = conversation_id(conversation_id_text)?;
-        let target = client_msg_id(target_client_msg_id, "target_client_msg_id")?;
+        let id = unsafe { conversation_id(conversation_id_text) }?;
+        let target = unsafe { client_msg_id(target_client_msg_id, "target_client_msg_id") }?;
         let body = unsafe { text(message_text, "text") }?;
         let change = this.client.edit(id, target, body)?;
         unsafe { *out = owned(change.to_string()) };
@@ -348,8 +348,8 @@ pub unsafe extern "C" fn push_client_delete(
     guard(error, || {
         let out = place(change_id, "change_id")?;
         let this = unsafe { handle(client) }?;
-        let id = conversation_id(conversation_id_text)?;
-        let target = client_msg_id(target_client_msg_id, "target_client_msg_id")?;
+        let id = unsafe { conversation_id(conversation_id_text) }?;
+        let target = unsafe { client_msg_id(target_client_msg_id, "target_client_msg_id") }?;
         let change = this.client.delete(id, target)?;
         unsafe { *out = owned(change.to_string()) };
         Ok(())
@@ -368,8 +368,8 @@ pub unsafe extern "C" fn push_client_cancel(
     guard(error, || {
         let out = buffer(cancelled, "cancelled")?;
         let this = unsafe { handle(client) }?;
-        let id = conversation_id(conversation_id_text)?;
-        let message = client_msg_id(message_client_msg_id, "client_msg_id")?;
+        let id = unsafe { conversation_id(conversation_id_text) }?;
+        let message = unsafe { client_msg_id(message_client_msg_id, "client_msg_id") }?;
         let taken_back = this.client.cancel(id, message)?;
         unsafe { *out = taken_back };
         Ok(())
@@ -386,7 +386,7 @@ pub unsafe extern "C" fn push_client_mark_read(
 ) -> i32 {
     guard(error, || {
         let this = unsafe { handle(client) }?;
-        let id = conversation_id(conversation_id_text)?;
+        let id = unsafe { conversation_id(conversation_id_text) }?;
         this.client.mark_read(id, seq)
     })
 }
@@ -424,7 +424,7 @@ pub unsafe extern "C" fn push_client_fetch_history(
     guard(error, || {
         let out = place(messages_json, "messages_json")?;
         let this = unsafe { handle(client) }?;
-        let id = conversation_id(conversation_id_text)?;
+        let id = unsafe { conversation_id(conversation_id_text) }?;
         let before = unsafe { before_seq.as_ref() }.copied();
         let messages = wait(this.client.fetch_history(id, before, limit))?;
         put_json(out, &json::list(&messages, json::message));
@@ -443,7 +443,7 @@ pub unsafe extern "C" fn push_client_open_direct(
     guard(error, || {
         let out = place(conversation_json, "conversation_json")?;
         let this = unsafe { handle(client) }?;
-        let peer = user_id(peer_user_id)?;
+        let peer = unsafe { user_id(peer_user_id) }?;
         let conversation = wait(this.client.open_direct(peer))?;
         put_json(out, &json::conversation(&conversation));
         Ok(())
@@ -476,7 +476,7 @@ enum ContactCall {
     Unblock,
 }
 
-fn contact_call(
+unsafe fn contact_call(
     client: *const PushClient,
     call: ContactCall,
     user: *const c_char,
@@ -486,7 +486,7 @@ fn contact_call(
     guard(error, || {
         let out = place(contact_json, "contact_json")?;
         let this = unsafe { handle(client) }?;
-        let user = user_id(user)?;
+        let user = unsafe { user_id(user) }?;
         let client = &this.client;
         let contact = wait(async move {
             match call {
@@ -510,7 +510,7 @@ pub unsafe extern "C" fn push_client_request_contact(
     contact_json: *mut *mut c_char,
     error: *mut *mut PushError,
 ) -> i32 {
-    contact_call(client, ContactCall::Request, user, contact_json, error)
+    unsafe { contact_call(client, ContactCall::Request, user, contact_json, error) }
 }
 
 /// Accepts a contact request.
@@ -521,7 +521,7 @@ pub unsafe extern "C" fn push_client_accept_contact(
     contact_json: *mut *mut c_char,
     error: *mut *mut PushError,
 ) -> i32 {
-    contact_call(client, ContactCall::Accept, user, contact_json, error)
+    unsafe { contact_call(client, ContactCall::Accept, user, contact_json, error) }
 }
 
 /// Declines a contact request.
@@ -532,7 +532,7 @@ pub unsafe extern "C" fn push_client_decline_contact(
     contact_json: *mut *mut c_char,
     error: *mut *mut PushError,
 ) -> i32 {
-    contact_call(client, ContactCall::Decline, user, contact_json, error)
+    unsafe { contact_call(client, ContactCall::Decline, user, contact_json, error) }
 }
 
 /// Blocks a user.
@@ -543,7 +543,7 @@ pub unsafe extern "C" fn push_client_block(
     contact_json: *mut *mut c_char,
     error: *mut *mut PushError,
 ) -> i32 {
-    contact_call(client, ContactCall::Block, user, contact_json, error)
+    unsafe { contact_call(client, ContactCall::Block, user, contact_json, error) }
 }
 
 /// Unblocks a user.
@@ -554,7 +554,7 @@ pub unsafe extern "C" fn push_client_unblock(
     contact_json: *mut *mut c_char,
     error: *mut *mut PushError,
 ) -> i32 {
-    contact_call(client, ContactCall::Unblock, user, contact_json, error)
+    unsafe { contact_call(client, ContactCall::Unblock, user, contact_json, error) }
 }
 
 /// Creates an invite code valid for `expires_in_s` seconds and `max_uses` uses, as JSON.
@@ -628,7 +628,7 @@ pub unsafe extern "C" fn push_client_profiles(
         };
         let ids = ids
             .iter()
-            .map(|id| user_id(*id))
+            .map(|id| unsafe { user_id(*id) })
             .collect::<Result<Vec<_>, _>>()?;
         let profiles = wait(this.client.profiles(ids))?;
         put_json(out, &json::list(&profiles, json::profile));

@@ -13,8 +13,10 @@
  *   SDK's own time limits): call them off the UI thread, never from a secret store callback.
  * - Events come to one callback on an SDK thread, or from push_client_next_event.
  * - A failed call leaves every output place it was given (a char ** or a PushClient **) NULL, so
- *   freeing it is always safe. Events queued when push_client_destroy returns can still reach
- *   the event callback until its release callback runs: keep the context alive until then.
+ *   freeing it is always safe. When push_client_destroy returns, no event callback runs and its
+ *   release callback has been called, unless push_client_destroy was called from inside the
+ *   event callback: then release is called after that callback returns. Keep the context
+ *   alive until release runs. push_client_destroy from a secret store function does nothing.
  */
 
 
@@ -73,13 +75,14 @@ typedef struct {
 
 // Called with each event as UTF-8 JSON (`{"type": …}`), borrowed for the call, on an SDK
 // thread of its own, one event at a time and in order. It may call the SDK, including
-// blocking calls and `push_client_destroy`.
+// blocking calls and `push_client_destroy`. No callback starts after `push_client_destroy`
+// has been called.
 typedef void (*PushEventCallback)(void *context, const char *event_json);
 
 // Called once, on the events thread, after the last event: only now may the context be
-// freed. `push_client_destroy` does not wait for it: events already queued can still reach
-// the event callback after `push_client_destroy` returns, so `context` must stay valid
-// until this is called.
+// freed. When `push_client_destroy` returns, no callback runs any more and this has been
+// called, unless `push_client_destroy` was called from inside the event callback: then
+// this is called after that callback returns.
 typedef void (*PushReleaseCallback)(void *context);
 
 #ifdef __cplusplus
@@ -116,8 +119,9 @@ void push_string_free(char *value);
 // `config_json`: `{"authUrl", "socketUrl", "databasePath", "host"?, "requestTimeoutMs"?}`.
 // `database_key`: NULL for a plain database, or `PUSH_DATABASE_KEY_LEN` bytes that
 // encrypt the whole file (`wrong_key` if they do not open it); copied, never stored or
-// logged. `store`: the app's secret store, owned by the client from now on (released
-// even when this fails). `*client` gets the client.
+// logged. A non-zero `database_key_len` with a NULL key is `invalid`. `store`: the app's secret store, owned by the client from now on (released
+// even when this fails); `invalid` if it has `load` but no `free_value`. `*client` gets
+// the client.
 int32_t push_client_open(const char *config_json,
                          const uint8_t *database_key,
                          size_t database_key_len,
@@ -125,22 +129,27 @@ int32_t push_client_open(const char *config_json,
                          PushClient **client,
                          PushError **error);
 
-// Closes the client and frees it: the connection stops, and the database is closed and
-// the secret store released before this returns (it waits up to a few seconds), so the
-// file can be opened again at once (also from the event callback). Called on one of the
-// SDK's runtime threads (from a secret store function) it does not wait. NULL is ignored.
-// No other call may use the client during or after this. It does not wait for the event
-// callback: events already queued can still reach it after this returns, until its
-// `release` is called, so the callback's context must outlive this call.
+// Closes the client and frees it: the connection stops, the event callback is stopped, and
+// the database is closed and the secret store released before this returns (it waits up to
+// a few seconds), so the file can be opened again at once (also from the event callback).
+// When it returns, no event callback runs and the callback's `release` has been called,
+// unless this was called from inside the event callback: then it does not wait, and
+// `release` is called after that callback returns. It waits for a callback running on
+// another thread, so do not hold a lock that callback needs. Called on one of the SDK's
+// runtime threads it does not wait. Called from inside a secret store function it does
+// nothing (the call that runs the store still uses the client). NULL is ignored. No other
+// call may use the client during or after this.
 void push_client_destroy(PushClient *client);
 
 // Delivers every event to `callback` with `context`, on an SDK thread of its own, one at a
-// time and in order, until the client is destroyed and the events queued by then are
-// delivered; then `release` (if set) is called once with `context`. The callback can
-// still run after `push_client_destroy` returns, up to the call of `release`: keep
-// `context` valid until `release` runs (without a `release`, for as long as the process
-// lives). Events wait in the SDK (at most 10,000; then one `eventsLost`)
-// until this is called. Only once per client, and not after `push_client_next_event`.
+// time and in order, until the client is destroyed; then `release` (if set) is called
+// once with `context`. `push_client_destroy` stops the delivery: when it returns no
+// callback runs and `release` has been called (called from inside the callback, it
+// returns at once and `release` is called after the callback returns). Keep `context`
+// valid until `release` runs (without a `release`, until `push_client_destroy` returns).
+// Events wait in the SDK (at most 10,000; then one `eventsLost`) until this is called.
+// Only once per client, and not after `push_client_next_event`. If it fails, the events
+// are kept and it may be called again.
 int32_t push_client_set_event_callback(const PushClient *client,
                                        PushEventCallback callback,
                                        void *context,
@@ -220,7 +229,7 @@ int32_t push_client_wait_connected(const PushClient *client,
                                    PushError **error);
 
 // Encrypts the local database with a new key of `PUSH_DATABASE_KEY_LEN` bytes, or with
-// NULL decrypts it. The next open needs the new key.
+// NULL decrypts it (a non-zero length with a NULL key is `invalid`). The next open needs the new key.
 int32_t push_client_change_database_key(const PushClient *client,
                                         const uint8_t *database_key,
                                         size_t database_key_len,
