@@ -1407,6 +1407,37 @@ relayed them (4006); the takeover was reported 10–13 ms after the copy connect
 revocation 52–807 ms after the call, and Erin's `SignedOut` 2 s after the reset (the
 worker's relay). Then `minikube stop -p push`, and the kubectl context back to `minikube`.
 
+Final run on 2026-10-15, with the review fixes below: the raw half passed as in Plan 8B,
+and the SDK half printed (device ids shown as `…`):
+
+```
+smoke: sdk: dana signed up and in with push-sdk and connected (device …, 2 reconnects while the device was not relayed yet) in 2176 ms
+smoke: sdk: erin signed up and in with push-sdk and connected (device …, 2 reconnects while the device was not relayed yet) in 2110 ms
+smoke: sdk: erin redeemed dana's invite; dana's app heard the new contact
+smoke: sdk: dana's message was stored (seq 1) and erin's app received it after 7 ms
+smoke: sdk: erin read it; dana's app shows it read
+smoke: sdk: dana edited and deleted it; erin's app applied both and holds no body
+smoke: sdk: erin queued 3 messages offline and restarted her app (her database encrypted: the file holds none of their text); once connected the outbox sent them in order (seq 4..6) and dana's app received each once
+smoke: sdk: a send cut off by a restart was stored once (its first attempt was acknowledged before the app stopped; seq 7, the next took 8)
+smoke: sdk: a copy of dana's app with her credentials connected; her first app reported OpenedElsewhere (4007) after 15 ms and stopped
+smoke: sdk: the copy revoked dana's device; it reported DeviceRemoved (4003) after 203 ms and stopped
+smoke: sdk: erin reset her password; her app reported SignedOut (4001) after 2007 ms, signed the same device in again and kept its 6 messages
+smoke: PASS in 16239 ms
+```
+
+The upgrade rerun passed in 17580 ms. No token appeared in the smoke or gateway logs, and
+there were no 4004 closes.
+
+## Review fixes made after the plan was written
+
+- **The same history after signing in again.** Erin's app counts the messages it holds
+  before her password reset and must hold exactly as many after the same device signs in
+  again; the earlier check (`history == 0`) would have passed with most of it lost.
+- **A positive control for the encrypted-file scan.** After Dana's app has received the
+  queued messages, the same scanner reads Dana's plain database files and must find
+  "queued offline", which proves the scanner can see text, so finding none in Erin's
+  encrypted file means something.
+
 ## Deferred to later plans
 
 - **The SDK scenario with groups on** (`gateway.groups=true`), once the owner offers
@@ -1418,3 +1449,12 @@ worker's relay). Then `minikube stop -p push`, and the kubectl context back to `
 - **The bindings' own smoke tests** (Node and C apps doing the same scenario) with Plan 10.
 - **The signup limit** caps smoke runs to about four an hour on one cluster (five signups a
   run against 20 an hour per IP).
+- **The 4006 reconnects are printed but not asserted**: the SDK does not expose the close
+  code.
+- **The Delivered receipt is not asserted.**
+- **The cut-off-send step message can name the wrong path** (acknowledged before the app
+  stopped, or retried).
+- **An unnecessary `let _ = (…)` tuple** in the SDK scenario.
+- **`SQLITE_TMPDIR=/data`** so SQLite's temporary files work with the read-only root.
+- **`local.rs` leaves its data directory behind on failure.**
+- **A flaky push-auth test**, `a_lost_refresh_answer_can_be_retried_within_the_grace_window`.
