@@ -85,6 +85,11 @@ Secret, the PostgreSQL volume and its data directory (`-Delete` deletes the prof
 so a later install reuses both and the passwords keep matching. Every pull request is
 verified this way before it is merged.
 
+With the cluster up, `deploy/minikube/node-example.ps1` runs the Node.js binding the same
+way: it forwards local ports to the ingress and to the DEV ONLY mailbox, and two Node.js
+apps (`bindings/node/examples/minikube.js`) sign up, verify, sign in, become contacts by
+invite and chat with a read receipt.
+
 The minikube values switch on a DEV ONLY shortcut: the worker, which logs emails instead
 of sending them, shows them at `/dev/mailbox`, which the ingress does not route (it
 reaches the worker only at `/v1/webhooks/resend`). Clients, the smoke test included,
