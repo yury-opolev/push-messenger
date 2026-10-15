@@ -19,6 +19,7 @@ mod credentials;
 mod error;
 mod model;
 mod secrets;
+mod store;
 
 pub use auth::{Device, Platform, Profile};
 pub use error::SdkError;
