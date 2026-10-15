@@ -226,6 +226,14 @@ impl Store {
         Ok(())
     }
 
+    /// Makes every write fail, as a full disk would.
+    #[cfg(test)]
+    pub fn set_read_only(&self, read_only: bool) {
+        self.conn
+            .pragma_update(None, "query_only", read_only)
+            .unwrap();
+    }
+
     /// The user the database belongs to.
     pub fn owner(&self) -> Result<Option<UserId>, SdkError> {
         let value: Option<Vec<u8>> = self

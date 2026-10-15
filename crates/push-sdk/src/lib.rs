@@ -16,6 +16,7 @@
 
 mod auth;
 mod credentials;
+mod engine;
 mod error;
 mod key;
 mod model;
