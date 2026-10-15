@@ -2,17 +2,18 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Prove Plan 9A end to end, the way a third-party app uses the system: two apps built on `push-sdk` run against the whole stack through the ingress, locally (the stack test of `push-smoke`) and on the minikube cluster (the chart's `helm test`). Dana and Erin sign up and in with the SDK (it reconnects by itself while the gateway answers 4006), become contacts by invite, chat with a delivery and a read receipt, edit and delete; Erin queues messages offline and restarts her app, and the outbox sends them after the restart, in order and once; a send cut off by a restart is retried with its `client_msg_id` and stored once; Dana revokes her device and the SDK reports `DeviceRemoved` (4003) and stops; Erin resets her password and the SDK reports `SignedOut` (4001), and she signs the same device in again with her history kept. The raw-protocol smoke test of Plan 8B stays in front of it. `test-chart.ps1` has 32 checks.
+**Goal:** Prove Plan 9A end to end, the way a third-party app uses the system: two apps built on `push-sdk` run against the whole stack through the ingress, locally (the stack test of `push-smoke`) and on the minikube cluster (the chart's `helm test`). Dana and Erin sign up and in with the SDK (it reconnects by itself while the gateway answers 4006), become contacts by invite, chat with a delivery and a read receipt, edit and delete; Erin's database is encrypted with a key derived from a passphrase, she queues messages offline and restarts her app, the file holds none of their text, and the outbox sends them after the restart, in order and once; a send cut off by a restart is retried with its `client_msg_id` and stored once; a copy of Dana's app opened with her credentials takes over her device and her first app reports `OpenedElsewhere` (4007); the copy revokes the device and the SDK reports `DeviceRemoved` (4003) and stops; Erin resets her password and the SDK reports `SignedOut` (4001), and she signs the same device in again with her history kept. The raw-protocol smoke test of Plan 8B stays in front of it. `helm test` waits 6 minutes, longer than the smoke test's own 300 s. `test-chart.ps1` has 33 checks.
 
 **Architecture:** `push-smoke` gains `sdk.rs`, the SDK scenario, run after the raw one by the same binary, in the same helm test Pod; it depends on `push-sdk` and reuses the smoke test's auth helper only for what a user does in a browser (opening the verification and reset links from the DEV ONLY mailbox). Each app has its own SQLite file in a directory the smoke test is given (`--data-dir`, `PUSH_SMOKE_DATA_DIR`): the stack test uses Cargo's target temp directory; the smoke Pod mounts an `emptyDir` at `/data`, its root filesystem staying read-only. Spec: `docs/superpowers/specs/2026-10-11-push-messenger-design.md` §8, §11, §12; roadmap "Running locally on minikube".
 
-**Tech Stack:** Docker (BuildKit), minikube 1.34 (Kubernetes 1.31, docker driver, ingress addon), kubectl, Helm 3.16, PowerShell 7 and bash. The builder image (`rust:1.85-slim-bookworm`) compiles SQLite for `rusqlite` with its gcc; the runtime images stay distroless.
+**Tech Stack:** Docker (BuildKit), minikube 1.34 (Kubernetes 1.31, docker driver, ingress addon), kubectl, Helm 3.16, PowerShell 7 and bash. The builder image (`rust:1.85-slim-bookworm`) compiles SQLite3 Multiple Ciphers for `push-sdk` with its gcc; the runtime images stay distroless.
 
 ---
 
 ## Before you start
 
-- **Plan 9A is merged.** This plan changes the smoke test, the smoke Pod and the README.
+- **Plan 9A is merged.** This plan changes the smoke test, the smoke Pod, the minikube
+  scripts' `helm test` timeout and the README.
 - **The spec is already revised** on `main` for Plan 9 (committed with the plans), so no
   task changes it; Task 3 only marks the roadmap.
 - Work from the repository root: `C:\Users\yurio\Documents\github\push-messenger`. Create
@@ -34,14 +35,14 @@ $env:CARGO_INCREMENTAL = '0'
 kubectl config current-context
 ```
 
-- **No wipe is needed**: no database, Secret or script changes. If `up` stops with "run
+- **No wipe is needed**: no database, Secret or values change. If `up` stops with "run
   down.ps1 first" anyway, run `deploy/minikube/down.ps1` once. Never delete the profile,
   and never touch other Docker containers on this machine.
 - Helm may print `failed to load plugins … helm-diff … unknown field "platformHooks"`
   first: an outdated plugin, harmless.
 - **How the code is given:** as in Plan 9A — new files whole, changes as `git apply`
   patches pasted from the verified commit, files LF.
-- Baseline (after Plan 9A): `cargo test --workspace --locked` passes 927 tests;
+- Baseline (after Plan 9A): `cargo test --workspace --locked` passes 946 tests;
   `deploy/helm/test-chart.ps1` passes 31 checks.
 - **Cargo.lock.** Task 1's patch carries the lockfile change (`push-smoke` depends on
   `push-sdk`); never run `cargo update`.
@@ -50,7 +51,7 @@ kubectl config current-context
   hour.
 - **Every task ends green** with the four gates of Plan 9A plus `pwsh deploy/helm/test-chart.ps1`.
 - **Scope rule:** no change to `push-sdk` or any service; only the smoke test, its Pod, the
-  chart test and the README.
+  minikube scripts' `helm test` timeout, the chart test and the README.
 
 ## Key rules the configuration must preserve
 
@@ -63,7 +64,8 @@ kubectl config current-context
 - **The smoke Pod's root filesystem stays read-only**: the SDK's databases go to an
   `emptyDir` with a size limit.
 - **Every wait is bounded**: 10 s a step, 30 s for what waits for the worker, 300 s for the
-  whole run.
+  whole run, and `helm test` gives the Pod 6 minutes, so the smoke test's own timeout, not
+  Helm's, reports a hang.
 
 ## Decisions made for this plan
 
@@ -76,31 +78,52 @@ kubectl config current-context
    from the host would need port-forwards to the ingress and the worker and could not run
    in `helm test`. One run of `up.ps1 -Smoke` covers both, and CI's stack test
    (`crates/push-smoke/tests/local.rs`) runs both too.
-2. **Restarts are real.** An app restart drops the `Client` (its runtime stops at once) and
-   opens a new one on the same SQLite file and secret store; the outbox is read back from
-   disk. The cut-off send is queued and the client dropped at once, so whether the first
-   attempt reached the server is left to chance; either way the message must be stored
-   once, which the `seq` of the next message proves (no duplicate entry in the log).
-3. **The revocation and the password reset are the SDK's events.** Dana revokes her own
-   device through the SDK (`DELETE /v1/devices/{id}`); the gateway closes with 4003 once
-   the worker relays it, and the SDK reports `DeviceRemoved` and stops. Erin asks for a
-   reset through the SDK, the test opens the link from the mailbox and sets a new
-   password; the gateway closes with 4001 and the SDK reports `SignedOut` and forgets the
-   credentials. Erin signs in again **at least 1.1 s later**: the gateway refuses a token
-   issued in the same second as the reset (spec §5.3, within that second the order is
-   unknown), so a sign-in within that second would be signed out again — found in this
-   plan's verification; a person never signs in that fast. The SDK signs the same device in
-   again (`login` with `device_id`), and the history is still there.
+2. **Restarts are real.** An app restart drops the `Client` and opens a new one on the same
+   SQLite file, secret store and key; the outbox is read back from disk. The cut-off send
+   is queued and the client dropped at once, so whether the first attempt reached the
+   server is left to chance. A dropped client's runtime stops at its tasks' next await, not
+   at once, so an answer that arrives in that moment may still be recorded by the old app:
+   the restarted app then finds the message sent already, and otherwise sends it again with
+   the same `client_msg_id` (the step says which happened). Either way the message must be
+   stored once, which the `seq` of the next message proves (no duplicate entry in the log).
+   The restart opens the new client before the old one is dropped, and Erin's encrypted
+   database makes that open slower (the key is stretched again), so on the smoke Pod's
+   0.2 CPU the old app often has time to record the answer. The first minikube run of this
+   revision failed on exactly that — it waited for a `MessageSent` the old app had
+   consumed — and of the two runs after the fix, one took each path.
+3. **The takeover, the revocation and the password reset are the SDK's events.** A copy of
+   Dana's app is opened with a copy of her secret store (every key of `SECRET_KEYS`) and a
+   database of its own, as a backup restored on a second machine would be; when it
+   connects, the gateway closes the first app's connection with 4007 and the SDK reports
+   `OpenedElsewhere` and stops (owner decision of Plan 9A). The copy then revokes the device
+   through the SDK (`DELETE /v1/devices/{id}`); the gateway closes with 4003 once the
+   worker relays it, and the SDK reports `DeviceRemoved` and stops. Erin asks for a reset
+   through the SDK, the test opens the link from the mailbox and sets a new password; the
+   gateway closes with 4001 and the SDK reports `SignedOut` and forgets the credentials.
+   Erin signs in again **at least 1.1 s later**: the gateway refuses a token issued in the
+   same second as the reset (spec §5.3, within that second the order is unknown), so a
+   sign-in within that second would be signed out again; a person never signs in that
+   fast. The SDK signs the same device in again (`login` with `device_id`), and the
+   history is still there (owner decision: a sign-out by the server keeps the data).
 4. **`--data-dir` is required** (`PUSH_SMOKE_DATA_DIR`), like the other target settings;
    the chart passes `/data`. The smoke Pod's memory limit rises from 64 MiB to 128 MiB
-   (two SDK clients with their runtimes and SQLite), its request from 16 to 32 MiB; the
+   (three SDK clients with their runtimes and SQLite), its request from 16 to 32 MiB; the
    whole run may take 300 s instead of 180 s.
+5. **`helm test` waits 6 minutes** (`--timeout 6m` in `up.ps1` and `up.sh`, was 5m): with
+   5 minutes Helm's timeout and the smoke test's own 300 s ended together, and Helm's
+   message ("timed out waiting for the condition") would hide the smoke test's, which
+   names the step that hung. A chart check keeps the two in step.
+6. **Erin's database is encrypted, Dana's is plain.** Erin's app derives its key from a
+   passphrase with a fresh salt, as an app asking for a PIN would (owner decision of Plan
+   9A); after her restart the test reads her database file and its log and finds none of
+   the queued messages' text. The run exercises SQLite3 Multiple Ciphers as the Docker
+   builder compiled it, on the cluster's filesystem.
 
 ## Owner decisions
 
-None new. Plan 9A's owner decisions needed (data on a server sign-out, takeover versus
-revocation, default secure stores, database encryption) do not change this plan: the
-scenario checks the behaviour as built.
+None new. Plan 9A's owner decisions (data kept on a server sign-out, 4007 for a takeover,
+secure storage left to apps with a guide, optional whole-database encryption) are what the
+scenario checks.
 
 ## File structure
 
@@ -113,7 +136,8 @@ crates/push-smoke/Cargo.toml           + push-sdk
 crates/push-smoke/tests/local.rs       a data directory for the SDK apps
 Cargo.lock                             push-smoke -> push-sdk
 deploy/helm/push-messenger/templates/tests/smoke.yaml   emptyDir at /data, --data-dir, memory
-deploy/helm/test-chart.ps1             32 checks
+deploy/minikube/up.ps1, up.sh          helm test --timeout 6m
+deploy/helm/test-chart.ps1             33 checks
 README.md, roadmap                     docs
 ```
 
@@ -123,17 +147,17 @@ README.md, roadmap                     docs
 
 **Files:**
 - Create: `crates/push-smoke/src/sdk.rs`
-- Modify: `Cargo.lock`, `README.md`, `crates/push-smoke/Cargo.toml`, `crates/push-smoke/src/auth.rs`, `crates/push-smoke/src/lib.rs`, `crates/push-smoke/src/main.rs`, `crates/push-smoke/tests/local.rs`, `deploy/helm/push-messenger/templates/tests/smoke.yaml`, `deploy/helm/test-chart.ps1`
+- Modify: `Cargo.lock`, `README.md`, `crates/push-smoke/Cargo.toml`, `crates/push-smoke/src/auth.rs`, `crates/push-smoke/src/lib.rs`, `crates/push-smoke/src/main.rs`, `crates/push-smoke/tests/local.rs`, `deploy/helm/push-messenger/templates/tests/smoke.yaml`, `deploy/minikube/up.ps1`, `deploy/minikube/up.sh`, `deploy/helm/test-chart.ps1`
 
-Decisions 1–4.
+Decisions 1–6.
 
-- [ ] **Step 1: The chart check first (red)**
+- [ ] **Step 1: The chart checks first (red)**
 
 Change `deploy/helm/test-chart.ps1`:
 
 ```diff
 diff --git a/deploy/helm/test-chart.ps1 b/deploy/helm/test-chart.ps1
-index bbb8e81..34546d5 100644
+index bbb8e81..0fa525d 100644
 --- a/deploy/helm/test-chart.ps1
 +++ b/deploy/helm/test-chart.ps1
 @@ -158,6 +158,13 @@ Check 'minikube: the smoke test reaches only the ingress and the mailbox, with a
@@ -150,14 +174,29 @@ index bbb8e81..34546d5 100644
  Check 'minikube: the worker''s dev mailbox on' {
      (Doc $dev 'Deployment' 'push-worker') -match 'name: PUSH_DEV_MAILBOX\s+value: "1"'
  }
+@@ -169,6 +176,13 @@ Check 'minikube: links use http://push.local, tokens ws://push.local/v1/socket'
+     $dev -match 'name: PUSH_AUTH_TOKEN_AUDIENCE\s+value: "ws://push.local/v1/socket"'
+ }
+ Check 'minikube: the smoke test is a helm test' { $dev -match 'helm.sh/hook: test' }
++Check 'minikube: helm test waits 6 minutes, longer than the smoke run''s 300 s' {
++    $scripts = Join-Path $PSScriptRoot '../minikube'
++    $main = Join-Path $PSScriptRoot '../../crates/push-smoke/src/main.rs'
++    (Get-Content (Join-Path $scripts 'up.ps1') -Raw) -match 'helm test .* --timeout 6m' -and
++        (Get-Content (Join-Path $scripts 'up.sh') -Raw) -match 'helm test .* --timeout 6m' -and
++        (Get-Content $main -Raw) -match 'TOTAL_TIMEOUT: Duration = Duration::from_secs\(300\)'
++}
+ Check 'minikube: ingress timeouts are 120 s' { $dev -match 'proxy-read-timeout: "120"' -and $dev -match 'proxy-send-timeout: "120"' }
+ 
+ Check 'dev mode without the acknowledgement is refused' {
 ```
 
 ```powershell
 pwsh deploy/helm/test-chart.ps1
 ```
 
-Expected: `FAIL minikube: the smoke test keeps the SDK apps' databases in an emptyDir` and
-`1 check(s) failed`.
+Expected: `FAIL minikube: the smoke test keeps the SDK apps' databases in an emptyDir`,
+`FAIL minikube: helm test waits 6 minutes, longer than the smoke run's 300 s` and
+`2 check(s) failed`.
 
 - [ ] **Step 2: Make the changes**
 
@@ -208,14 +247,47 @@ index 1045773..e844a01 100644
  {{- end }}
 ```
 
+Change `deploy/minikube/up.ps1`:
+
+```diff
+diff --git a/deploy/minikube/up.ps1 b/deploy/minikube/up.ps1
+index 97df572..a1648d2 100644
+--- a/deploy/minikube/up.ps1
++++ b/deploy/minikube/up.ps1
+@@ -199,6 +199,6 @@ if ($Smoke) {
+         kubectl --context $Cluster -n $namespace wait --for=condition=Ready pod -l $workerSelector --timeout=90s
+     }
+     Invoke-Step 'run the smoke test' {
+-        helm test $release --kube-context $Cluster --namespace $namespace --logs --timeout 5m
++        helm test $release --kube-context $Cluster --namespace $namespace --logs --timeout 6m
+     }
+ }
+```
+
+Change `deploy/minikube/up.sh`:
+
+```diff
+diff --git a/deploy/minikube/up.sh b/deploy/minikube/up.sh
+index d27683a..3e3e547 100755
+--- a/deploy/minikube/up.sh
++++ b/deploy/minikube/up.sh
+@@ -164,5 +164,5 @@ if [[ "$smoke" == true ]]; then
+   step 'wait for the worker pod to be Ready'
+   kubectl --context "$cluster" -n "$namespace" wait --for=condition=Ready pod -l "$worker_selector" --timeout=90s
+   step 'run the smoke test'
+-  helm test "$release" --kube-context "$cluster" --namespace "$namespace" --logs --timeout 5m
++  helm test "$release" --kube-context "$cluster" --namespace "$namespace" --logs --timeout 6m
+ fi
+```
+
 Change `Cargo.lock`:
 
 ```diff
 diff --git a/Cargo.lock b/Cargo.lock
-index 1878deb..6cdc8ee 100644
+index 9290ddd..03bfa61 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
-@@ -2236,6 +2236,7 @@ dependencies = [
+@@ -2239,6 +2239,7 @@ dependencies = [
   "push-gateway",
   "push-message-svc",
   "push-proto",
@@ -454,9 +526,12 @@ Create `crates/push-smoke/src/sdk.rs`:
 //! relays a device, and the SDK reconnects by itself), become contacts by invite and chat:
 //! a message, its delivery and read receipt, an edit and a delete. Erin queues messages
 //! offline and restarts her app: the outbox sends them after the restart, in order and
-//! once, and a send cut off by a restart is stored once. Finally Dana revokes her own
-//! device and Erin resets her password: the SDK reports `DeviceRemoved` (4003) and
-//! `SignedOut` (4001), and Erin signs in again with the same device and her history.
+//! once, and a send cut off by a restart is stored once; Erin's database is encrypted with
+//! a key derived from a passphrase, and its file holds none of her messages' text. A copy
+//! of Dana's app opened with her credentials takes over her device's connection: the first
+//! app reports `OpenedElsewhere` (4007). Finally the copy revokes the device and Erin
+//! resets her password: the SDK reports `DeviceRemoved` (4003) and `SignedOut` (4001), and
+//! Erin signs in again with the same device and her history.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -464,8 +539,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use push_sdk::{
-    Client, ClientMsgId, Config, ConnectionState, ContactState, ConversationId, Event, Events,
-    MemorySecretStore, MessageStatus, Platform, UserId,
+    Client, ClientMsgId, Config, ConnectionState, ContactState, ConversationId, DatabaseKey, Event,
+    Events, MemorySecretStore, MessageStatus, Platform, SECRET_KEYS, SecretStore, UserId,
 };
 use uuid::Uuid;
 
@@ -489,8 +564,15 @@ struct App {
 
 impl App {
     /// Signs `name` up with the SDK, verifies the address with the link the worker
-    /// delivered, signs in (registering the device) and connects.
-    async fn enroll(target: &Target, auth: &Auth<'_>, name: &'static str) -> anyhow::Result<Self> {
+    /// delivered, signs in (registering the device) and connects. `encrypted`: the
+    /// database is encrypted with a key derived from a passphrase, as an app asking for a
+    /// PIN would.
+    async fn enroll(
+        target: &Target,
+        auth: &Auth<'_>,
+        name: &'static str,
+        encrypted: bool,
+    ) -> anyhow::Result<Self> {
         let started = Instant::now();
         let suffix = Uuid::now_v7().simple().to_string();
         let suffix = &suffix[suffix.len() - 10..];
@@ -502,6 +584,11 @@ impl App {
         );
         let mut config = Config::new(&target.auth_url, &target.socket_url, &database);
         config.host = target.host.clone();
+        if encrypted {
+            let passphrase = format!("{name}'s passphrase {suffix}");
+            let salt = DatabaseKey::new_salt();
+            config.database_key = Some(DatabaseKey::derive(passphrase.as_bytes(), &salt)?);
+        }
         let secrets = Arc::new(MemorySecretStore::new());
         let (client, events) = Client::open(config.clone(), secrets.clone())?;
         client
@@ -545,7 +632,9 @@ impl App {
                 Event::ConnectionStateChanged(ConnectionState::Connected) => return Ok(retries),
                 Event::ConnectionStateChanged(ConnectionState::Reconnecting { .. }) => retries += 1,
                 Event::ConnectionStateChanged(
-                    state @ (ConnectionState::SignedOut | ConnectionState::DeviceRemoved),
+                    state @ (ConnectionState::SignedOut
+                    | ConnectionState::DeviceRemoved
+                    | ConnectionState::OpenedElsewhere),
                 ) => bail!("{}: {state:?} while connecting", self.name),
                 other => self.pending.push_back(other),
             }
@@ -604,8 +693,8 @@ impl App {
 
 /// Runs the SDK scenario.
 pub(crate) async fn run(target: &Target, auth: &Auth<'_>) -> anyhow::Result<()> {
-    let mut dana = App::enroll(target, auth, "dana").await?;
-    let mut erin = App::enroll(target, auth, "erin").await?;
+    let mut dana = App::enroll(target, auth, "dana", false).await?;
+    let mut erin = App::enroll(target, auth, "erin", true).await?;
 
     let invite = dana.client.create_invite(600, 1).await?;
     let creator = erin.client.redeem_invite(&invite.code).await?;
@@ -625,9 +714,27 @@ pub(crate) async fn run(target: &Target, auth: &Auth<'_>) -> anyhow::Result<()> 
     edit_and_delete(&mut dana, &mut erin, chat, sent_id).await?;
     let next = restart_resumes_the_outbox(&mut dana, &mut erin, chat, seq).await?;
     cut_off_send_is_stored_once(&mut dana, &mut erin, chat, next).await?;
-    removed_and_signed_out(auth, &mut dana, &mut erin, chat).await?;
-    let _ = (dana.database, erin.database, dana.password);
+    let mut copy = opened_elsewhere(target, &mut dana).await?;
+    removed_and_signed_out(auth, &mut copy, &mut erin, chat).await?;
+    let _ = (dana.database, erin.database, dana.password, copy.password);
     Ok(())
+}
+
+/// Whether the database file or its write-ahead log holds `text`.
+fn file_holds(database: &str, text: &str) -> anyhow::Result<bool> {
+    let mut found = false;
+    for path in [database.to_owned(), format!("{database}-wal")] {
+        match std::fs::read(&path) {
+            Ok(bytes) => {
+                found |= bytes
+                    .windows(text.len())
+                    .any(|window| window == text.as_bytes());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("read the database file"),
+        }
+    }
+    Ok(found)
 }
 
 /// Dana sends, Erin's app receives and reads, Dana's app shows it read.
@@ -758,6 +865,9 @@ async fn restart_resumes_the_outbox(
     if pending != 3 {
         bail!("after the restart erin's outbox holds {pending} messages, not 3");
     }
+    if file_holds(&erin.database, "queued offline")? {
+        bail!("erin's encrypted database file holds a message's text");
+    }
     erin.connect().await?;
     let mut seqs = Vec::new();
     for id in &queued {
@@ -785,14 +895,15 @@ async fn restart_resumes_the_outbox(
         .await?;
     }
     sdk_step(&format!(
-        "erin queued 3 messages offline and restarted her app; once connected the outbox sent them in order (seq {}..{}) and dana's app received each once",
+        "erin queued 3 messages offline and restarted her app (her database encrypted: the file holds none of their text); once connected the outbox sent them in order (seq {}..{}) and dana's app received each once",
         seqs[0], seqs[2]
     ));
     Ok(first + 3)
 }
 
-/// A send whose app ends at once is retried after the restart with the same
-/// `client_msg_id` and stored once: the following message takes the next `seq`.
+/// A send whose app ends at once is stored once — retried after the restart with the same
+/// `client_msg_id`, or acknowledged before the old app stopped: the following message
+/// takes the next `seq`.
 async fn cut_off_send_is_stored_once(
     dana: &mut App,
     erin: &mut App,
@@ -805,15 +916,33 @@ async fn cut_off_send_is_stored_once(
         .client_msg_id;
     erin.restart()?;
     erin.connect().await?;
-    let Event::MessageSent(sent) = erin
-        .wait_for(
-            "the retried MessageSent",
-            STEP_TIMEOUT,
-            |event| matches!(event, Event::MessageSent(message) if message.client_msg_id == id),
-        )
-        .await?
-    else {
-        unreachable!("the wait accepts only MessageSent");
+    // A dropped client's runtime stops at its next await, not at once: when the first
+    // attempt was answered in that moment, the old app recorded the SendAck and the
+    // restarted one finds the message sent already. Otherwise it sends it again.
+    let held = erin
+        .client
+        .messages(chat, None, 50)?
+        .into_iter()
+        .find(|message| message.client_msg_id == id)
+        .and_then(|message| message.seq);
+    let (sent_seq, how) = match held {
+        Some(seq) => (
+            Some(seq),
+            "its first attempt was acknowledged before the app stopped",
+        ),
+        None => {
+            let Event::MessageSent(sent) = erin
+                .wait_for(
+                    "the retried MessageSent",
+                    STEP_TIMEOUT,
+                    |event| matches!(event, Event::MessageSent(message) if message.client_msg_id == id),
+                )
+                .await?
+            else {
+                unreachable!("the wait accepts only MessageSent");
+            };
+            (sent.seq, "retried with its client_msg_id")
+        }
     };
     let next = erin
         .client
@@ -829,23 +958,68 @@ async fn cut_off_send_is_stored_once(
     else {
         unreachable!("the wait accepts only MessageAdded");
     };
-    if sent.seq != Some(expected) || following.seq != Some(expected + 1) {
+    if sent_seq != Some(expected) || following.seq != Some(expected + 1) {
         bail!(
-            "the cut-off send took {:?} and the next {:?}, not {expected} and {}",
-            sent.seq,
+            "the cut-off send took {sent_seq:?} and the next {:?}, not {expected} and {}",
             following.seq,
             expected + 1
         );
     }
     sdk_step(&format!(
-        "a send cut off by a restart was retried with its client_msg_id and stored once (seq {expected}; the next took {})",
+        "a send cut off by a restart was stored once ({how}; seq {expected}, the next took {})",
         expected + 1
     ));
     Ok(())
 }
 
-/// Dana revokes her device and Erin resets her password: the SDK reports
-/// `DeviceRemoved` and `SignedOut`, and Erin signs in again with the same device.
+/// Dana's credentials are copied into a second app with its own database, as a backup
+/// restored on another machine would: when the copy connects, the gateway lets only the
+/// newer connection stay, and Dana's first app reports `OpenedElsewhere` (4007) and stops.
+/// The copy, which holds the device now.
+async fn opened_elsewhere(target: &Target, dana: &mut App) -> anyhow::Result<App> {
+    let started = Instant::now();
+    let secrets = Arc::new(MemorySecretStore::new());
+    for key in SECRET_KEYS {
+        if let Some(value) = dana.secrets.load(key)? {
+            secrets.save(key, &value)?;
+        }
+    }
+    let database = format!("{}-copy.db", dana.database.trim_end_matches(".db"));
+    let mut config = Config::new(&target.auth_url, &target.socket_url, &database);
+    config.host = target.host.clone();
+    let (client, events) = Client::open(config.clone(), secrets.clone())?;
+    let mut copy = App {
+        name: "dana's copy",
+        email: dana.email.clone(),
+        password: dana.password.clone(),
+        user: dana.user,
+        database,
+        secrets,
+        config,
+        client,
+        events,
+        pending: VecDeque::new(),
+    };
+    copy.connect().await?;
+    dana.wait_for("OpenedElsewhere", STEP_TIMEOUT, |event| {
+        *event == Event::OpenedElsewhere
+    })
+    .await?;
+    if dana.client.connection_state() != ConnectionState::OpenedElsewhere {
+        bail!(
+            "dana's app is {:?}, not OpenedElsewhere",
+            dana.client.connection_state()
+        );
+    }
+    sdk_step(&format!(
+        "a copy of dana's app with her credentials connected; her first app reported OpenedElsewhere (4007) after {} ms and stopped",
+        started.elapsed().as_millis()
+    ));
+    Ok(copy)
+}
+
+/// The copy of Dana's app revokes her device and Erin resets her password: the SDK
+/// reports `DeviceRemoved` and `SignedOut`, and Erin signs in again with the same device.
 async fn removed_and_signed_out(
     auth: &Auth<'_>,
     dana: &mut App,
@@ -865,12 +1039,13 @@ async fn removed_and_signed_out(
     .await?;
     if dana.client.connection_state() != ConnectionState::DeviceRemoved {
         bail!(
-            "dana's app is {:?}, not DeviceRemoved",
+            "{} is {:?}, not DeviceRemoved",
+            dana.name,
             dana.client.connection_state()
         );
     }
     sdk_step(&format!(
-        "dana revoked her device; her app reported DeviceRemoved (4003) after {} ms and stopped",
+        "the copy revoked dana's device; it reported DeviceRemoved (4003) after {} ms and stopped",
         started.elapsed().as_millis()
     ));
 
@@ -964,17 +1139,18 @@ Change `README.md`:
 
 ```diff
 diff --git a/README.md b/README.md
-index ac76fc4..deb6c4d 100644
+index 4ec2662..85ff877 100644
 --- a/README.md
 +++ b/README.md
-@@ -53,7 +53,11 @@ register a device and connect its WebSocket with the access token (the gateway a
+@@ -59,7 +59,12 @@ register a device and connect its WebSocket with the access token (the gateway a
  become contacts by request and by invite, chat, edit, read and delete, see a group request
  refused, and see their allowed profiles from auth-svc; the gateway refuses an expired token
  and one for another audience; finally a revoked device and a password reset close their
 -sockets with 4003 and 4001. Only the DEV ONLY mailbox is read from the worker directly.
 +sockets with 4003 and 4001. Then two apps built on `push-sdk` do the same through the
 +SDK: they sign up and in, chat with receipts, edit and delete, restart with messages in
-+their outbox (sent in order, once), and see `DeviceRemoved` after a revocation and
++their outbox (sent in order, once; one app's database encrypted), and see `OpenedElsewhere`
++when a copy of an app takes over its device, `DeviceRemoved` after a revocation and
 +`SignedOut` after a password reset. Only the DEV ONLY mailbox is read from the worker
 +directly.
  `deploy/minikube/up.sh --smoke` does the same on Linux
@@ -986,7 +1162,7 @@ index ac76fc4..deb6c4d 100644
 pwsh deploy/helm/test-chart.ps1
 ```
 
-Expected: `all chart checks passed` (32 `ok` lines).
+Expected: `all chart checks passed` (33 `ok` lines).
 
 - [ ] **Step 3: Run the whole scenario against the local stack**
 
@@ -994,20 +1170,21 @@ Expected: `all chart checks passed` (32 `ok` lines).
 cargo test -p push-smoke --test local --locked -- --nocapture
 ```
 
-Expected (verified 2026-10-14; ids and timings differ): the raw lines of Plan 8B, then
+Expected (verified 2026-10-15; ids and timings differ): the raw lines of Plan 8B, then
 
 ```
-smoke: sdk: dana signed up and in with push-sdk and connected (device 01a13bb0-727b-7335-be52-e40ffde7b13f, 1 reconnects while the device was not relayed yet) in 883 ms
-smoke: sdk: erin signed up and in with push-sdk and connected (device 01a13bb0-75d8-778b-af41-a6783b8a0a89, 1 reconnects while the device was not relayed yet) in 693 ms
+smoke: sdk: dana signed up and in with push-sdk and connected (device 01a13eb7-5820-7302-8334-53cde8cce86f, 1 reconnects while the device was not relayed yet) in 670 ms
+smoke: sdk: erin signed up and in with push-sdk and connected (device 01a13eb7-5b34-7010-8e0b-10341ad607a3, 1 reconnects while the device was not relayed yet) in 962 ms
 smoke: sdk: erin redeemed dana's invite; dana's app heard the new contact
-smoke: sdk: dana's message was stored (seq 1) and erin's app received it after 16 ms
+smoke: sdk: dana's message was stored (seq 1) and erin's app received it after 13 ms
 smoke: sdk: erin read it; dana's app shows it read
 smoke: sdk: dana edited and deleted it; erin's app applied both and holds no body
-smoke: sdk: erin queued 3 messages offline and restarted her app; once connected the outbox sent them in order (seq 4..6) and dana's app received each once
-smoke: sdk: a send cut off by a restart was retried with its client_msg_id and stored once (seq 7; the next took 8)
-smoke: sdk: dana revoked her device; her app reported DeviceRemoved (4003) after 271 ms and stopped
-smoke: sdk: erin reset her password; her app reported SignedOut (4001) after 792 ms, signed the same device in again and kept its 6 messages
-smoke: PASS in 6344 ms
+smoke: sdk: erin queued 3 messages offline and restarted her app (her database encrypted: the file holds none of their text); once connected the outbox sent them in order (seq 4..6) and dana's app received each once
+smoke: sdk: a send cut off by a restart was stored once (retried with its client_msg_id; seq 7, the next took 8)
+smoke: sdk: a copy of dana's app with her credentials connected; her first app reported OpenedElsewhere (4007) after 35 ms and stopped
+smoke: sdk: the copy revoked dana's device; it reported DeviceRemoved (4003) after 220 ms and stopped
+smoke: sdk: erin reset her password; her app reported SignedOut (4001) after 797 ms, signed the same device in again and kept its 6 messages
+smoke: PASS in 6682 ms
 test the_smoke_test_passes_against_the_whole_stack ... ok
 ```
 
@@ -1023,8 +1200,8 @@ git add -A Cargo.lock README.md crates deploy
 git commit -m "push-smoke: the SDK scenario; the smoke Pod keeps its databases in an emptyDir"
 ```
 
-Expected: 927 tests pass (the stack test is still one test), no warnings, no diff, 32 chart
-checks.
+Expected: 946 tests pass (the stack test is still one test), no warnings, no diff, 33
+chart checks.
 
 ---
 
@@ -1046,13 +1223,14 @@ Expected: `minikube` (restore it in Step 5).
 deploy/minikube/up.ps1 -Smoke
 ```
 
-Expected (verified 2026-10-14 as an upgrade of the stopped `push` profile, revision 15;
-ids and timings differ): the five images build (the builder compiles `rusqlite` and SQLite
-in about 2 minutes the first time), the release upgrades, and `helm test` ends
-`Phase: Succeeded` with these pod logs:
+Expected (verified 2026-10-15 as an upgrade of the `push` profile, revision 18; the profile
+was started by the attempt before it, revision 17, which failed as decision 2 tells; from a
+stopped profile `up` first prints `==> start minikube profile 'push'`; ids and timings
+differ): the five images build (the builder compiles SQLite3 Multiple Ciphers for the smoke
+image), the release upgrades, and `helm test` ends `Phase: Succeeded` with these pod
+logs:
 
 ```
-==> start minikube profile 'push'
 ==> enable the ingress addon
 ==> wait for ingress-nginx
 ==> wait for the ingress-nginx admission jobs
@@ -1065,50 +1243,51 @@ in about 2 minutes the first time), the release upgrades, and `helm test` ends
 ==> install release 'push' in namespace 'push' (attempt 1 of 5)
 Release "push" has been upgraded. Happy Helming!
 STATUS: deployed
-REVISION: 15
+REVISION: 18
 ==> wait for the old worker pod to go away
 ==> wait for the worker pod to be Ready
 ==> run the smoke test
 TEST SUITE:     push-smoke
 Phase:          Succeeded
 POD LOGS: push-smoke
-smoke: alice signed up; the worker's log sender delivered the verification email after 1009 ms
-smoke: alice verified the email, signed in and registered device 01a13baa-edf6-725e-8085-717934122283 (a retry returned the same device) in 1076 ms
+smoke: alice signed up; the worker's log sender delivered the verification email after 502 ms
+smoke: alice verified the email, signed in and registered device 01a13ebd-c2a2-768d-a189-b047c65eda2f (a retry returned the same device) in 560 ms
 smoke: alice's access token verifies against the JWKS (EdDSA, aud ws://push.local/v1/socket); refresh rotated it
-smoke: bob signed up; the worker's log sender delivered the verification email after 1007 ms
-smoke: bob verified the email, signed in and registered device 01a13baa-f224-7671-bb7b-b7c7c4264200 (a retry returned the same device) in 1063 ms
+smoke: bob signed up; the worker's log sender delivered the verification email after 1260 ms
+smoke: bob verified the email, signed in and registered device 01a13ebd-c7d7-750a-bd7f-e922904367f7 (a retry returned the same device) in 1330 ms
 smoke: bob's access token verifies against the JWKS (EdDSA, aud ws://push.local/v1/socket); refresh rotated it
-smoke: carol signed up; the worker's log sender delivered the verification email after 1008 ms
-smoke: carol verified the email, signed in and registered device 01a13baa-f64e-7133-b7f3-074fd100278d (a retry returned the same device) in 1062 ms
+smoke: carol signed up; the worker's log sender delivered the verification email after 755 ms
+smoke: carol verified the email, signed in and registered device 01a13ebd-cb10-7178-9a1a-757a9ae018f1 (a retry returned the same device) in 821 ms
 smoke: carol's access token verifies against the JWKS (EdDSA, aud ws://push.local/v1/socket); refresh rotated it
-smoke: alice connected with the access token (Ready, heartbeat 30000 ms) once the worker had relayed device 01a13baa-edf6-725e-8085-717934122283: 0 "not ready yet" closes (4006) in 48 ms
-smoke: bob connected with the access token (Ready, heartbeat 30000 ms) once the worker had relayed device 01a13baa-f224-7671-bb7b-b7c7c4264200: 0 "not ready yet" closes (4006) in 47 ms
-smoke: carol connected with the access token (Ready, heartbeat 30000 ms) once the worker had relayed device 01a13baa-f64e-7133-b7f3-074fd100278d: 2 "not ready yet" closes (4006) in 766 ms
+smoke: alice connected with the access token (Ready, heartbeat 30000 ms) once the worker had relayed device 01a13ebd-c2a2-768d-a189-b047c65eda2f: 0 "not ready yet" closes (4006) in 47 ms
+smoke: bob connected with the access token (Ready, heartbeat 30000 ms) once the worker had relayed device 01a13ebd-c7d7-750a-bd7f-e922904367f7: 0 "not ready yet" closes (4006) in 4 ms
+smoke: carol connected with the access token (Ready, heartbeat 30000 ms) once the worker had relayed device 01a13ebd-cb10-7178-9a1a-757a9ae018f1: 3 "not ready yet" closes (4006) in 1769 ms
 smoke: alice asked bob to be a contact; bob's socket heard it (ContactEvent), bob accepted and alice's socket heard that
 smoke: carol redeemed alice's invite: they are contacts
 smoke: alice opened the direct conversation with bob
 smoke: auth-svc shows alice the profiles of her contacts bob and carol, and bob none of carol's
-smoke: alice got SendAck seq=1 after 9 ms
-smoke: bob got Deliver seq=1 after 54 ms
+smoke: alice got SendAck seq=1 after 6 ms
+smoke: bob got Deliver seq=1 after 55 ms
 smoke: bob acked; the gateway answered the following Ping
 smoke: alice edited her message; bob's socket delivered the edit (seq 2)
 smoke: bob read the message; his socket heard his ReadPosition, alice's the Receipt, and her listing shows it read
 smoke: alice's group request was refused (NOT_AVAILABLE): groups are not offered to apps
 smoke: alice deleted her message; bob's socket delivered the delete (seq 3) and his history holds it erased
 smoke: the gateway refused a token that had expired (4002) and one for another audience (4001), both signed with auth-svc's key
-smoke: carol revoked her device; after the worker relayed it the gateway closed her socket with 4003 (522 ms) and refuses her token
-smoke: bob reset his password; after the worker relayed it the gateway closed his socket with 4001 (2004 ms) and refuses his token from before the reset
-smoke: sdk: dana signed up and in with push-sdk and connected (device 01a13bab-0921-7024-bc70-bdd70504b1d2, 2 reconnects while the device was not relayed yet) in 2051 ms
-smoke: sdk: erin signed up and in with push-sdk and connected (device 01a13bab-1123-72e8-9034-87330c48e781, 2 reconnects while the device was not relayed yet) in 2302 ms
+smoke: carol revoked her device; after the worker relayed it the gateway closed her socket with 4003 (717 ms) and refuses her token
+smoke: bob reset his password; after the worker relayed it the gateway closed his socket with 4001 (2014 ms) and refuses his token from before the reset
+smoke: sdk: dana signed up and in with push-sdk and connected (device 01a13ebd-e269-761c-a5bf-d38d60e70d6b, 2 reconnects while the device was not relayed yet) in 2400 ms
+smoke: sdk: erin signed up and in with push-sdk and connected (device 01a13ebd-eb0e-7677-943c-5707a92a7f61, 2 reconnects while the device was not relayed yet) in 2114 ms
 smoke: sdk: erin redeemed dana's invite; dana's app heard the new contact
-smoke: sdk: dana's message was stored (seq 1) and erin's app received it after 10 ms
+smoke: sdk: dana's message was stored (seq 1) and erin's app received it after 6 ms
 smoke: sdk: erin read it; dana's app shows it read
 smoke: sdk: dana edited and deleted it; erin's app applied both and holds no body
-smoke: sdk: erin queued 3 messages offline and restarted her app; once connected the outbox sent them in order (seq 4..6) and dana's app received each once
-smoke: sdk: a send cut off by a restart was retried with its client_msg_id and stored once (seq 7; the next took 8)
-smoke: sdk: dana revoked her device; her app reported DeviceRemoved (4003) after 69 ms and stopped
-smoke: sdk: erin reset her password; her app reported SignedOut (4001) after 2010 ms, signed the same device in again and kept its 6 messages
-smoke: PASS in 15143 ms
+smoke: sdk: erin queued 3 messages offline and restarted her app (her database encrypted: the file holds none of their text); once connected the outbox sent them in order (seq 4..6) and dana's app received each once
+smoke: sdk: a send cut off by a restart was stored once (retried with its client_msg_id; seq 7, the next took 8)
+smoke: sdk: a copy of dana's app with her credentials connected; her first app reported OpenedElsewhere (4007) after 10 ms and stopped
+smoke: sdk: the copy revoked dana's device; it reported DeviceRemoved (4003) after 807 ms and stopped
+smoke: sdk: erin reset her password; her app reported SignedOut (4001) after 2017 ms, signed the same device in again and kept its 6 messages
+smoke: PASS in 16841 ms
 ```
 
 - [ ] **Step 3: Again, as an upgrade without building, and no token in the logs**
@@ -1122,11 +1301,13 @@ $gateway = kubectl --context push -n push logs deploy/push-gateway --tail=600
 "kicks: $(($gateway | Select-String 'connection kicked').Count), frame budget closes: $(($gateway | Select-String 'too many frames').Count)"
 ```
 
-Expected (verified 2026-10-14): `REVISION: 16`, `Phase: Succeeded`,
-`smoke: PASS in 15400 ms` (or similar); `smoke pod token-like: 0, bearer: 0`,
-`gateway token-like: 0, bearer: 0`, and `kicks: 8, frame budget closes: 0` after the two
-runs (each run kicks four devices: Carol and Bob over raw frames, Dana and Erin through the
-SDK; the SDK never exceeded the gateway's frame budget).
+Expected (verified 2026-10-15): `REVISION: 19`, `Phase: Succeeded`,
+`smoke: PASS in 17780 ms` (or similar; this run's cut-off send was acknowledged before
+the old app stopped); `smoke pod token-like: 0, bearer: 0`,
+`gateway token-like: 0, bearer: 0`, and `kicks: 10, frame budget closes: 0` after the two
+runs (each run kicks five connections: Carol's and Bob's raw sockets, a revocation and a
+reset; Dana's first app, taken over by the copy; the copy, revoked; Erin's app, reset. The
+SDK never exceeded the gateway's frame budget).
 
 - [ ] **Step 4: If anything fails**
 
@@ -1154,9 +1335,9 @@ Expected: `1 node stopped.` and `minikube`. Never delete the profile.
 - Modify: `docs/superpowers/plans/2026-10-11-roadmap.md`
 
 CI needs no change: the `images` job builds the five images (the smoke image now compiles
-SQLite), the `chart` job runs `test-chart.ps1` with 32 checks, and the `rust` job runs the
-stack test with the SDK half. The minikube run stays the merge gate, recorded in the pull
-request.
+SQLite3 Multiple Ciphers), the `chart` job runs `test-chart.ps1` with 33 checks, and the
+`rust` job runs the stack test with the SDK half. The minikube run stays the merge gate,
+recorded in the pull request.
 
 - [ ] **Step 1: Mark the roadmap**
 
@@ -1175,16 +1356,16 @@ git add -A docs
 git commit -m "docs: mark plan 9B in review"
 ```
 
-Expected: 927 tests pass, no warnings, no diff, `all chart checks passed`.
+Expected: 946 tests pass, no warnings, no diff, `all chart checks passed`.
 
 - [ ] **Step 3: Push, open the pull request and wait for CI**
 
 ```powershell
 git push -u origin feature/plan-09b-sdk-minikube
 $body = @'
-Implements docs/superpowers/plans/2026-10-15-plan-09b-sdk-minikube.md: the SDK end to end. After the raw-protocol smoke test, two apps built on push-sdk run against the whole stack through the ingress: sign-up and sign-in (the SDK rides out 4006 by itself), an invite, a message with delivery and read receipts, an edit and a delete, an outbox that survives an app restart (sent in order, once), a send cut off by a restart stored once, DeviceRemoved after a revocation (4003) and SignedOut after a password reset (4001) with the same device signed in again and its history kept. The smoke Pod keeps the SDK's SQLite files in an emptyDir (root filesystem still read-only). 927 tests; test-chart 32 checks.
+Implements docs/superpowers/plans/2026-10-15-plan-09b-sdk-minikube.md: the SDK end to end. After the raw-protocol smoke test, two apps built on push-sdk run against the whole stack through the ingress: sign-up and sign-in (the SDK rides out 4006 by itself), an invite, a message with delivery and read receipts, an edit and a delete, an outbox that survives an app restart (sent in order, once) on an encrypted database whose file holds none of the text, a send cut off by a restart stored once, OpenedElsewhere (4007) when a copy of an app takes over its device, DeviceRemoved after a revocation (4003) and SignedOut after a password reset (4001) with the same device signed in again and its history kept. The smoke Pod keeps the SDK's SQLite files in an emptyDir (root filesystem still read-only); helm test waits 6 minutes, longer than the smoke run's 300 s. 946 tests; test-chart 33 checks.
 
-Verified on minikube (profile push, Kubernetes 1.31): up.ps1 -Smoke passed as an upgrade (revision 15, PASS in 15143 ms) and again with -SkipBuild (revision 16, PASS in 15400 ms); no token in the smoke Pod's or the gateway's logs; no frame-budget close.
+Verified on minikube (profile push, Kubernetes 1.31): up.ps1 -Smoke passed as an upgrade (revision 18, PASS in 16841 ms) and again with -SkipBuild (revision 19, PASS in 17780 ms); no token in the smoke Pod's or the gateway's logs; ten kicks over the two runs, no frame-budget close.
 '@
 gh pr create --base main --title "Plan 9B: the SDK on minikube" --body $body
 gh pr checks --watch
@@ -1202,20 +1383,29 @@ controller merges after the final review.
 | §12 end to end: SDK clients through the full stack (register, verify, connect via invite, chat, receipts, edit, delete) | 1, 2 |
 | §12 adverse 1 (connection dropped mid-send: stored once) — an app restart mid-send | 1, 2 |
 | §12 adverse 6 (device revoked while connected) and the owner's 4003 → stop, through the SDK | 1, 2 |
-| §5.4 a password reset signs out (4001) and the same device signs in again | 1, 2 |
+| §7.4 4007: a copy of the app takes over and the first reports `OpenedElsewhere` | 1, 2 |
+| §5.4 a password reset signs out (4001), the data stays, and the same device signs in again | 1, 2 |
 | §7.4 4006 retried by the SDK without signing out | 1, 2 |
 | §7.3 the frame budget: no 4004 for the SDK on a cluster | 2 |
 | §8.4 the outbox survives restarts and keeps order | 1, 2 |
+| §8 the database key: an encrypted database holds no text | 1, 2 |
 | §11 the smoke Pod: read-only root filesystem, data in an emptyDir, no secret in arguments, no token in logs | 1, 2 |
 
 ## Verified on minikube
 
-Run on 2026-10-14 (profile `push`, Kubernetes 1.31), as an upgrade of the stopped profile
-(revision 15) and again with `-SkipBuild` (revision 16): both `Phase: Succeeded`
-(`PASS in 15143 ms` and `PASS in 15400 ms`); no token-like string or `Bearer` in the smoke
-Pod's or the gateway's logs; eight `connection kicked` lines and no `too many frames` in
-the gateway's log. The SDK's devices needed two or three reconnects each while the worker
-relayed them (4006), and Erin's `SignedOut` came 2 s after the reset (the worker's relay).
+Run on 2026-10-15 (profile `push`, Kubernetes 1.31) from the verification worktree. The
+first `up.ps1 -Smoke` (revision 17) started the stopped profile, built the five images and
+failed in the SDK half: "erin: no the retried MessageSent in time" (decision 2: the old app
+had recorded the answer). With the fix, `up.ps1 -Smoke` (revision 18, rebuilding the smoke
+image) and `up.ps1 -SkipBuild -Smoke` (revision 19) both ended `Phase: Succeeded`
+(`PASS in 16841 ms` and `PASS in 17780 ms`); the cut-off send was retried in the first and
+had been acknowledged before the old app stopped in the second. No token-like string or
+`Bearer` in the smoke Pod's or the gateway's logs; ten `connection kicked` lines (reasons
+`DeviceRevoked`, `PasswordReset` and `TakenOver`) and no `too many frames` in the
+gateway's log. The SDK's devices needed two or three reconnects each while the worker
+relayed them (4006); the takeover was reported 10–13 ms after the copy connected, the
+revocation 52–807 ms after the call, and Erin's `SignedOut` 2 s after the reset (the
+worker's relay). Then `minikube stop -p push`, and the kubectl context back to `minikube`.
 
 ## Deferred to later plans
 

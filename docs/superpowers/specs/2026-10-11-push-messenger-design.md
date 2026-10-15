@@ -861,8 +861,9 @@ one; `ListConversations` gives the current values.
 - **Identify** is rate limited per device after the token is verified. On success the
   gateway subscribes to `notify:{user_id}` and `kick:{device_id}`, publishes a
   "device connected" signal so any other gateway holding the same device closes it with
-  4003, sends `Ready`, and runs a `Sync`. There is no separate resume step: delivery
-  state lives in Postgres, so reconnecting is just Identify.
+  4007 ("opened elsewhere"; 4003 until Plan 9), sends `Ready`, and runs a `Sync`. There
+  is no separate resume step: delivery state lives in Postgres, so reconnecting is just
+  Identify.
 - **Token expiry.** About 60 s before `exp` the gateway sends `AuthExpiring`. The client
   refreshes over HTTPS and sends `ReAuth`; the connection is not dropped. Without a valid
   `ReAuth` by `exp + 30 s`, the gateway closes with 4002.
@@ -897,7 +898,7 @@ Implementation notes (gateway, Plan 8):
   answer still reaches it; message-svc's `Identify` checks the device and the token's
   `iat` against the last password reset (§5.3); then `notify:{user_id}`, the takeover
   (`Kick{TAKEN_OVER, connection_id}` on `kick:{device_id}`, which closes every older
-  connection of the device on any gateway with 4003), `Ready` and a sync. A connection's
+  connection of the device on any gateway with 4007), `Ready` and a sync. A connection's
   id is a UUIDv7 taken when it starts watching `kick:{device_id}`, so ids sort by time,
   and a takeover is obeyed only from a strictly newer id: an abandoned slow `Identify`
   that announces itself after a newer connection closes nobody.
@@ -910,9 +911,9 @@ Implementation notes (gateway, Plan 8):
   may stay connected up to 15 minutes, until its next `ReAuth` is refused, rather than
   re-checking every connection when the subscription returns (to revisit with the load
   test of Plan 11).
-- **Kicks** close the socket: `DEVICE_REVOKED` and `TAKEN_OVER` with 4003,
-  `PASSWORD_RESET` with 4001 unless the connection's token (after any `ReAuth`) was
-  issued after the reset the kick carries.
+- **Kicks** close the socket: `DEVICE_REVOKED` with 4003, `TAKEN_OVER` (and a kick without
+  a reason) with 4007, `PASSWORD_RESET` with 4001 unless the connection's token (after any
+  `ReAuth`) was issued after the reset the kick carries.
 - **Server frames.** `EntriesAvailable` makes every connection of the user sync; receipt,
   read-position and contact notifications become `Receipt`, `ReadPosition` and
   `ContactEvent` frames for every connection of the user (at most 64 waiting per
@@ -951,18 +952,21 @@ Implementation notes (gateway, Plan 8):
 |---|---|---|
 | 4001 | Invalid token (signature, audience, unverified email), or the password was reset after it was issued | stop; sign in again |
 | 4002 | The token expired, names a key the gateway does not hold, or no `ReAuth` came by `exp + 30 s` | refresh, then reconnect |
-| 4003 | Another connection of the device took over, or the device was revoked | stop |
+| 4003 | The device was revoked | stop |
 | 4004 | Rate limited (too many frames or `Identify`s) | back off, then reconnect |
 | 4005 | Server shutting down | back off with jitter, then reconnect |
 | 4006 | The device was registered moments ago and is not ready yet | reconnect after a short backoff; never sign out |
+| 4007 | Another connection of the same device took over: the same app data was opened elsewhere (a second window, a copy restored on another machine) | stop; the device is still signed in |
 | 1002 | A protocol mistake before `Ready`: no `Identify` within 5 s, or another frame first | back off, then reconnect |
 | 1008 | No frame for two and a half heartbeats | reconnect |
 | 1009 | A message over 128 KiB | fix the client; reconnect |
 | 1011 | The server cannot serve the connection now (message-svc or the token keys unreachable) | back off, then reconnect |
 
-Only 4001 signs the user out, and only 4003 stops reconnecting (owner decisions: a
-revoked device stops, a password reset signs in again). A protocol mistake before `Ready`
-is 1002, not 4001: a client bug is no reason to sign out.
+Only 4001 signs the user out, and only 4003 and 4007 stop reconnecting (owner decisions: a
+revoked device stops, a password reset signs in again; Plan 9: a takeover has its own code,
+4007, so an app can say "opened elsewhere" rather than "device removed"). A protocol mistake
+before `Ready` is 1002, not 4001: a client bug is no reason to sign out. None of these codes
+makes the SDK erase local data (owner decision, Plan 9).
 
 ### 7.5 Timeouts
 
@@ -1054,14 +1058,20 @@ Implementation notes (push-proto, Plan 4A):
   refuses). Plan 9 chose an id over a `SendHandle` object, which is harder to carry across
   the FFI.
 - `Events` — one ordered stream: `ConnectionStateChanged` (`Offline`, `Connecting`,
-  `Connected`, `Reconnecting{attempt, retry_in_ms}`, `SignedOut`, `DeviceRemoved`),
-  `MessageAdded` (the local echo, or a message received), `MessageSent`, `MessageEdited`,
-  `MessageDeleted`, `SendFailed{conversation_id, client_msg_id, kind, error}`,
+  `Connected`, `Reconnecting{attempt, retry_in_ms}`, `SignedOut`, `DeviceRemoved`,
+  `OpenedElsewhere`), `MessageAdded` (the local echo, or a message received),
+  `MessageSent`, `MessageEdited`, `MessageDeleted`,
+  `SendFailed{conversation_id, client_msg_id, kind, error}`,
   `ReceiptChanged{conversation_id, peer_delivered_seq, peer_read_seq}`,
-  `ConversationChanged`, `ContactChanged`, `SignedOut`, `DeviceRemoved`. A message's
-  status (pending, sent, delivered, read; received for others' messages) is computed from
-  the conversation's receipt positions when it is read, so one `ReceiptChanged` moves
-  every tick at once.
+  `ConversationChanged`, `ContactChanged`, `SignedOut`, `DeviceRemoved`,
+  `OpenedElsewhere`, `EventsLost`. A message's status (pending, sent, delivered, read;
+  received for others' messages) is computed from the conversation's receipt positions
+  when it is read, so one `ReceiptChanged` moves every tick at once. The stream is bounded
+  (10,000 events): an app that stops reading gets one `EventsLost` in place of what was
+  dropped and reloads from the local store.
+- `Config::database_key` — optional: the whole local database is encrypted with a key the
+  app provides (owner decision, Plan 9), for example `DatabaseKey::derive(pin, salt)`;
+  `change_database_key` adds, changes or removes it.
 
 ### 8.3 Validation before queuing
 
@@ -1116,52 +1126,83 @@ Implementation notes (push-sdk, Plan 9A):
 
 - **Layers.** `auth.rs` (auth-svc's HTTP API), `credentials.rs` (refreshes serialised, so
   one client never presents a rotated refresh token twice; new tokens saved before use),
-  `store.rs` and `store/outbox.rs` (SQLite through `rusqlite` 0.32 with its bundled SQLite,
-  WAL; 0.32 because its `libsqlite3-sys` must match the one sqlx 0.8 puts in the
-  lockfile), `policy.rs` (close codes, backoff, frame budget, acks; no I/O), `engine.rs`
-  (what rides on a connection, without the socket), `connection.rs` (the socket and the
-  reconnect loop) and `client.rs`. The client owns a two-worker tokio runtime, dropped
-  with `shutdown_background`; its async methods can be awaited from any executor.
+  `store.rs`, `store/outbox.rs` and `key.rs` (SQLite through `rusqlite` 0.32 — its
+  `libsqlite3-sys` must match the one sqlx 0.8 puts in the lockfile — linked to SQLite3
+  Multiple Ciphers, which `push-sdk`'s `build.rs` compiles from the `sqlite3mc-src`
+  amalgamation with `cc`: no system library, no OpenSSL, no Perl; WAL), `policy.rs` (close
+  codes, backoff, frame budget, acks; no I/O), `engine.rs` (what rides on a connection,
+  without the socket), `connection.rs` (the socket and the reconnect loop), `client.rs`
+  and `client/requests.rs`. The client owns a two-worker tokio runtime, dropped with
+  `shutdown_background`; its async methods can be awaited from any executor.
 - **Credentials** live only in a `SecretStore` the app provides: three blocking calls
   (`load`, `save`, `delete` of bytes under `push.session`, `push.device`,
-  `push.registration`), so a keychain or a binding's callback can implement it. The SDK
-  never logs tokens and redacts them from `Debug`. The `registration_id` is saved before
-  the first registration attempt and forgotten once answered; the device id is kept after
-  a sign-out by the server, so signing in again uses `login` with `device_id` and keeps
-  the device. Safe calls (refresh within the 30 s grace, registration, reads, revocation)
-  are retried three times within 3.5 s; sign-up, sign-in and email requests never are.
+  `push.registration`, exported as `SECRET_KEYS`), so a keychain or a binding's callback
+  can implement it. The SDK ships no platform store (owner decision, Plan 9);
+  `docs/sdk-secure-storage.md` shows apps how to use the Windows Credential Manager, the
+  macOS and iOS Keychain, the Android Keystore and libsecret. The SDK never logs tokens and
+  redacts them from `Debug`. The `registration_id` is saved before the first registration
+  attempt and forgotten only after the session it produced is saved; an id auth-svc
+  answers `device_not_found` for is replaced and the registration tried once more. The
+  device id is kept after a sign-out by the server, so signing in again uses `login` with
+  `device_id` and keeps the device. Safe calls (registration, reads, revocation, refresh)
+  are retried up to three times on transport errors and 502–504, after 0.5, 1 and 2 s;
+  each attempt may take 15 s, but a refresh attempt only 8 s, and no refresh attempt starts
+  that could end later than 25 s after the first, inside auth-svc's 30 s grace. A refresh
+  in flight when a connection ends is left to finish, never aborted. Sign-up, sign-in and
+  email requests are never retried.
 - **The connection.** Only 4001 signs out (the credentials are forgotten; local data and
-  the outbox stay for the same user) and only 4003 stops (`DeviceRemoved`, credentials
-  kept; the app may `connect()` again). 4002 refreshes and reconnects at once (a second
-  4002 in a row backs off). 4006 retries 500 ms doubling to 5 s and never signs out.
-  Everything else reconnects 1 s doubling to 60 s, each delay drawn between half and all
-  of it; 10 s of `Ready` resets the backoff. The access token is refreshed before a
-  connection when under 90 s remain; `AuthExpiring` refreshes in the background and sends
-  `ReAuth`; an anonymous retryable `Error` sends the `ReAuth` again after 1 s. Pings follow
-  the heartbeat from `Ready`, the first at a random point of the first one; no `Pong`
-  within 15 s ends the connection. Each `Ready` lists conversations (without
-  `changed_since`) and contacts and sends unconfirmed read positions; a `ContactEvent`
-  lists the conversations again.
+  the outbox stay) and only 4003 and 4007 stop (`DeviceRemoved`, `OpenedElsewhere`;
+  credentials and data kept; the app may `connect()` again). 4002 refreshes and reconnects
+  at once (a second 4002 in a row backs off). 4006 retries 500 ms doubling to 5 s and
+  never signs out. Everything else reconnects 1 s doubling to 60 s, each delay drawn
+  between half and all of it; 10 s of `Ready` resets the backoff. The access token is
+  refreshed before a connection when under 90 s remain; `AuthExpiring` refreshes in the
+  background and sends `ReAuth`; an anonymous retryable `Error` sends the `ReAuth` again
+  after 1 s. Pings follow the heartbeat from `Ready`, the first at a random point of the
+  first one; no `Pong` within 15 s ends the connection. Each `Ready` lists conversations
+  (without `changed_since`) and contacts and sends unconfirmed read positions; a
+  `ContactEvent` lists the conversations again.
 - **Frames and acks.** The client sends at most 50 frames at once and 10 a second after
   that (the gateway allows 100 and 20) and at most 20 outbox rows per wake. A delivery is
   acked only after it is stored, and acks wait until deliveries pause for 50 ms (at most
   250 ms): one `Ack` per conversation naming its highest stored `seq`, so a `Sync` batch
-  of 500 entries costs one frame.
-- **The store.** A database belongs to one user (another user's sign-in erases it; an
-  explicit `sign_out()` revokes the device and erases it). Entries at or below a
-  conversation's received position are replays and change nothing (but are acked again);
-  edits and deletes apply only above the target's `edit_seq` and only to held messages;
-  receipt, read and listing positions only move forward. A delivery that cannot be stored
-  is not acked. Edits and deletes of sent messages are applied locally on their `SendAck`
-  or delivery, never before.
+  of 500 entries costs one frame. Because an `Ack` covers everything below it and the
+  gateway does not send an entry twice on one connection, a delivery the store cannot take
+  ends the connection at once (normal backoff), so no later `Ack` covers it and the next
+  connection syncs again from the last `Ack`. An entry with malformed ids is skipped.
+- **The store.** A database belongs to one user: another user's sign-in erases it, and
+  an explicit `sign_out()` revokes the device and erases it — always, also offline, the
+  failed revocation being the call's error. A sign-out by the server (4001), a removal
+  (4003) and a takeover (4007) keep the history and the outbox (owner decision, Plan 9: a
+  remote wipe is not a security feature, since a thief can keep the device offline).
+  Erasing leaves nothing in the files (`secure_delete`, then the write-ahead log
+  checkpointed and truncated). Entries at or below a conversation's received position are
+  replays and change nothing (but are acked again); edits and deletes apply only above the
+  target's `edit_seq` and only to held messages; receipt, read and listing positions only
+  move forward, and `mark_read` never passes the conversation's last known `seq`. Edits
+  and deletes of sent messages are applied locally on their `SendAck` or delivery, never
+  before. `Debug` of messages, outbox rows and conversations shows bodies and titles only
+  as their length.
+- **The database key** (owner decision, Plan 9). Optional; without it the store is plain.
+  A `DatabaseKey` is 32 bytes, given directly or derived with Argon2id (19 MiB, 2 passes,
+  1 lane) from what the user knows and a salt the app keeps. The whole file and its
+  write-ahead log are encrypted (SQLite3 Multiple Ciphers' default scheme,
+  ChaCha20-Poly1305). The key is checked by the first read, before anything is written: a
+  wrong or missing key is `wrong_key` and changes nothing. `change_database_key` encrypts,
+  re-encrypts or decrypts in one transaction (outside WAL mode, which SQLite3 Multiple
+  Ciphers requires). The SDK never stores the key.
+- **Events** are bounded at 10,000: when only one place is left, newer events are dropped
+  and one `EventsLost` takes the last place.
 - **Requests** wait for the connection up to the request timeout (15 s) and for the answer
   as long again; they fail at once while the app has not asked to connect (`offline`),
-  after a sign-out (`not_signed_in`) or a removal (`device_removed`), and with
-  `disconnected` when the connection drops before the answer. The SDK never repeats a
-  request. Errors carry a stable string code: the server's own for refusals.
-- **Not yet:** an OS keychain store, local encryption, proxies, and TLS against a real
-  certificate (compiled in, first used in Plan 11) are open (Plan 9A's owner decisions
-  needed and deferred items).
+  after a sign-out (`not_signed_in`), a removal (`device_removed`) or a takeover
+  (`opened_elsewhere`), and with `disconnected` when the connection drops before the
+  answer. `connect()` moves a stopped state to `Connecting` before it returns, so a request
+  right after it waits instead of failing as offline. The SDK never repeats a request.
+  Errors carry a stable string code: the server's own for refusals.
+- **Not yet:** proxies, and TLS against a real certificate (compiled in, first used in
+  Plan 11). Open owner questions (Plan 9A): whether a revoked device (4003) should erase
+  its data, and whether to vendor the SQLite3 Multiple Ciphers source.
 
 ## 9. Email
 
@@ -1304,10 +1345,12 @@ Implementation notes (local minikube, Plan 4B):
   key from the Secret (`PUSH_SMOKE_SIGNING_KEY`) to sign an expired token and one for
   another audience that the gateway must refuse.
 - Plan 9B: after the raw protocol, the smoke test runs two apps built on `push-sdk`
-  through the same ingress. Their SQLite files live in an `emptyDir` at `/data`
+  through the same ingress (one with an encrypted database, and a copy of the other that
+  takes over its device: 4007). Their SQLite files live in an `emptyDir` at `/data`
   (`--data-dir`; the root filesystem stays read-only), the Pod's memory limit is 128 MiB,
-  and the whole run may take 300 s. A run signs up five users, so the per-IP signup limit
-  allows about four runs an hour on one cluster.
+  and the whole run may take 300 s; `helm test` waits 6 minutes, so the smoke test's own
+  timeout reports a hang. A run signs up five users, so the per-IP signup limit allows
+  about four runs an hour on one cluster.
 - The smoke client verifies the access token's audience (`socket_url` with its authority
   replaced by the Host override, `ws://push.local/v1/socket` on minikube) and the
   refreshed token's `sub` and `device_id`. It never prints response bodies, tokens or
@@ -1352,7 +1395,7 @@ Implementation notes (local minikube, Plan 4B):
 | Unit | `push-domain` with in-memory repositories: seq allocation, retry replay, positions, receipts, edit/delete rules, contacts, group membership, validation. The scenarios and the storage contract live in `push-testkit` and are written once: every store runs all of them |
 | Integration | Real Postgres and Redis via testcontainers: the whole `push-testkit` suite against Postgres, transaction order, gapless `seq` under concurrent retries, outbox relay, `SKIP LOCKED` |
 | Protocol | Raw-frame harness: malformed frames, out-of-order acks, replayed `client_msg_id`, unverified email, revoked device, non-contact send |
-| End-to-end | SDK clients through the full stack: register, verify, connect via invite, chat, receipts, edit, delete, group of 100, new device loading history. Plan 9B: two `push-sdk` apps in the smoke test (locally and on minikube) — invite, chat, receipts, edit, delete, an outbox surviving restarts, a cut-off send stored once, `DeviceRemoved` and `SignedOut` |
+| End-to-end | SDK clients through the full stack: register, verify, connect via invite, chat, receipts, edit, delete, group of 100, new device loading history. Plan 9B: two `push-sdk` apps in the smoke test (locally and on minikube) — invite, chat, receipts, edit, delete, an outbox surviving restarts on an encrypted database, a cut-off send stored once, `OpenedElsewhere`, `DeviceRemoved` and `SignedOut` |
 | Load | 10,000 concurrent sockets: memory per connection, latency, recovery from a reconnect storm, 100-member group throughput |
 
 Required adverse-condition tests:
