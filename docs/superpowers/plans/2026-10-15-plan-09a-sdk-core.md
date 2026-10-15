@@ -366,6 +366,8 @@ changes the wire protocol.
    (a) it reaches us only if someone runs `cargo update` and misses it in review; with (b)
    only if someone replaces the vendored files.
    *Recommendation:* (a) for now; (b) before the first public release of the SDK.
+   *Decided (owner, 2026-10-15):* (b) at once; see spec §8, "The SQLite3 Multiple Ciphers
+   source is vendored".
 
 ## File structure
 

@@ -1,3 +1,7 @@
 * text=auto eol=lf
 *.png binary
 *.jpg binary
+# Vendored upstream sources: byte for byte as released, pinned by SHA-256 in VERSION, so
+# git must never convert their line endings (and their diffs are not reviewed as text).
+crates/push-sdk/vendor/sqlite3mc/sqlite3mc_amalgamation.* binary
+crates/push-sdk/vendor/sqlite3mc/LICENSE binary

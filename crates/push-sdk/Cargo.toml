@@ -28,9 +28,10 @@ uuid.workspace = true
 zeroize.workspace = true
 
 [build-dependencies]
-# SQLite3 Multiple Ciphers (build.rs): the amalgamation, compiled with `cc`.
+# SQLite3 Multiple Ciphers (build.rs): the vendored amalgamation in vendor/sqlite3mc,
+# checked against the SHA-256s in its VERSION file, then compiled with `cc`.
 cc = "1"
-sqlite3mc-src = "205.1"
+sha2.workspace = true
 
 [dev-dependencies]
 axum.workspace = true

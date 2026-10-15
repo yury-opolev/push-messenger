@@ -2219,7 +2219,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
- "sqlite3mc-src",
+ "sha2",
  "thiserror",
  "tokio",
  "tokio-tungstenite",
@@ -3027,12 +3027,6 @@ dependencies = [
  "base64ct",
  "der",
 ]
-
-[[package]]
-name = "sqlite3mc-src"
-version = "205.1.0+sqlite3mc-2.5.1-sqlite-3.53.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f155b7d3de6d72fb7b7c7affcba3773634c1fb2978b944b425c3d3ed5474448c"
 
 [[package]]
 name = "sqlx"

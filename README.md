@@ -36,8 +36,12 @@ survive a restart and are stored once, and the UI follows one stream of events:
 
 Given a `DatabaseKey` (`Config::database_key`), the client encrypts the whole database;
 an app derives the key from a PIN or password the user enters (`DatabaseKey::derive`), so
-without it nobody can read the history, not even the app. Groups are not offered to apps
-in the first release, so the SDK has no group calls yet.
+without it nobody can read the history, not even the app. The encryption is SQLite3
+Multiple Ciphers, whose amalgamation is vendored in `crates/push-sdk/vendor/sqlite3mc`
+byte for byte as released; every build checks it against the SHA-256s in its `VERSION`
+file, and `scripts/update-sqlite3mc.ps1 -Version <x.y.z>` (or `.sh`) replaces it after
+verifying the release's Sigstore signatures. Groups are not offered to apps in the first
+release, so the SDK has no group calls yet.
 
 ## Run it on minikube
 
