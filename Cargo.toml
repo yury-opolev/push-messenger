@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "bindings/c",
     "bindings/ffi",
+    "bindings/node",
     "crates/push-auth",
     "crates/push-domain",
     "crates/push-email",

@@ -1,0 +1,20 @@
+{
+  "name": "@push-messenger/sdk",
+  "version": "0.1.0",
+  "description": "push-messenger's client SDK for Node.js: a binding of the Rust core (push-sdk).",
+  "private": true,
+  "license": "MIT",
+  "main": "index.js",
+  "files": [
+    "index.js",
+    "push_sdk.node"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "node scripts/build.js",
+    "pretest": "node scripts/build.js --with-fakes",
+    "test": "node --test test/client.test.js"
+  }
+}
