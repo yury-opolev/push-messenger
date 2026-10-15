@@ -3,7 +3,7 @@
 //! The SDK calls its store with blocking calls on its own threads, while the JavaScript
 //! store answers on the JavaScript thread, often asynchronously (a keychain module returns
 //! promises). A blocking call into JavaScript from a thread the JavaScript thread waits for
-//! would deadlock, so the bridge keeps two rules:
+//! would deadlock, so the bridge keeps these rules:
 //!
 //! - **Reads never reach JavaScript.** The three values are loaded once, before the client
 //!   opens (on the opening thread, while the JavaScript thread is free), and kept in a
@@ -16,23 +16,29 @@
 //!   that can write (sign-in, refresh, sign-out) runs on an SDK thread and returns a promise,
 //!   so the JavaScript thread is free to answer. A write on the JavaScript thread itself is
 //!   refused rather than deadlocked.
+//! - **A write answered late still counts.** One the app confirms after the 30 s has
+//!   failed the SDK's call, but the app's store did carry it out, so the cache follows it
+//!   (see [`crate::ledger`]); a late failure changes nothing.
 //!
-//! The app's store must not be changed behind the SDK's back while a client is open.
+//! The app's store must not be changed behind the SDK's back while a client is open, and
+//! its methods must not call the client: the answer waits for the JavaScript thread, which
+//! the client's call would wait for in turn, until the 30 s are over.
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::mpsc::{SyncSender, sync_channel};
-use std::sync::{LazyLock, Mutex};
+use std::sync::Arc;
 use std::thread::ThreadId;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use napi::Status;
 use napi::bindgen_prelude::{Buffer, FnArgs, Function};
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use push_sdk::{SECRET_KEYS, SdkError, SecretError, SecretStore};
 
+use crate::ledger::{Cache, ask};
+
+pub use crate::ledger::complete;
+
 /// How long an SDK thread waits for the app's store to answer a write. A keychain may ask
-/// the user first.
+/// the user first. The loads before the client opens share one such deadline.
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// What JavaScript receives: `(id, operation, key, value)`; it answers with
@@ -47,31 +53,12 @@ pub struct SecretCall {
     value: Option<Vec<u8>>,
 }
 
-type Answer = Result<Option<Vec<u8>>, String>;
-
-/// The SDK threads waiting for an answer, by call id.
-static WAITING: LazyLock<Mutex<HashMap<u32, SyncSender<Answer>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-static NEXT_ID: AtomicU32 = AtomicU32::new(1);
-
-/// Wakes the SDK thread waiting for call `id`; an answer nobody waits for (it timed out) is
-/// dropped.
-pub fn complete(id: u32, error: Option<String>, value: Option<Vec<u8>>) {
-    let waiting = WAITING.lock().map(|mut waiting| waiting.remove(&id));
-    if let Ok(Some(sender)) = waiting {
-        let _ = sender.send(match error {
-            Some(error) => Err(error),
-            None => Ok(value),
-        });
-    }
-}
-
 type Call = ThreadsafeFunction<SecretCall, (), SecretArgs, Status, false, true>;
 
 /// The app's JavaScript store, with the values it holds.
 pub struct SecretBridge {
     call: Call,
-    cache: Mutex<HashMap<String, Vec<u8>>>,
+    cache: Arc<Cache>,
     js_thread: ThreadId,
 }
 
@@ -94,34 +81,31 @@ impl SecretBridge {
             })?;
         Ok(Self {
             call,
-            cache: Mutex::new(HashMap::new()),
+            cache: Arc::default(),
             js_thread: std::thread::current().id(),
         })
     }
 
     /// Loads every value the SDK may read into the cache. Called before the client opens,
-    /// on the opening thread.
+    /// on the opening thread. The three loads share one deadline of 30 s.
     pub fn preload(&self) -> Result<(), SdkError> {
+        let deadline = Instant::now() + ANSWER_TIMEOUT;
         for key in SECRET_KEYS {
+            let left = deadline.saturating_duration_since(Instant::now());
             let value = self
-                .ask("load", key, None)
+                .ask(left, "load", key, None)
                 .map_err(|error| SdkError::Secrets(error.0))?;
             if let Some(value) = value {
-                self.cache().insert(key.to_owned(), value);
+                self.cache.preload(key, value);
             }
         }
         Ok(())
     }
 
-    fn cache(&self) -> std::sync::MutexGuard<'_, HashMap<String, Vec<u8>>> {
-        self.cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
     /// Asks the JavaScript store and waits for its answer, off the JavaScript thread.
     fn ask(
         &self,
+        timeout: Duration,
         operation: &'static str,
         key: &str,
         value: Option<&[u8]>,
@@ -131,66 +115,35 @@ impl SecretBridge {
                 "the secret store was called on the JavaScript thread".to_owned(),
             ));
         }
-        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        let (sender, answer) = sync_channel(1);
-        if let Ok(mut waiting) = WAITING.lock() {
-            waiting.insert(id, sender);
-        }
-        let call = SecretCall {
-            id,
-            operation,
-            key: key.to_owned(),
-            value: value.map(<[u8]>::to_vec),
-        };
-        if self
-            .call
-            .call(call, ThreadsafeFunctionCallMode::NonBlocking)
-            != Status::Ok
-        {
-            complete(id, Some("Node.js is shutting down".to_owned()), None);
-        }
-        // On a runtime worker, the worker's other tasks move elsewhere while it waits.
-        let answer = wait(|| answer.recv_timeout(ANSWER_TIMEOUT));
-        match answer {
-            Ok(Ok(value)) => Ok(value),
-            Ok(Err(error)) => Err(SecretError(format!(
-                "the app's secret store failed: {error}"
-            ))),
-            Err(_) => {
-                complete(id, None, None);
-                Err(SecretError(format!(
-                    "the app's secret store did not answer within {} s",
-                    ANSWER_TIMEOUT.as_secs()
-                )))
+        ask(&self.cache, timeout, operation, key, value, |id| {
+            let call = SecretCall {
+                id,
+                operation,
+                key: key.to_owned(),
+                value: value.map(<[u8]>::to_vec),
+            };
+            match self
+                .call
+                .call(call, ThreadsafeFunctionCallMode::NonBlocking)
+            {
+                Status::Ok => Ok(()),
+                _ => Err("Node.js is shutting down".to_owned()),
             }
-        }
-    }
-}
-
-/// Runs a blocking wait; on a worker of the client's runtime, through `block_in_place`.
-fn wait<T>(blocking: impl FnOnce() -> T) -> T {
-    match tokio::runtime::Handle::try_current() {
-        Ok(runtime) if runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-            tokio::task::block_in_place(blocking)
-        }
-        _ => blocking(),
+        })
     }
 }
 
 impl SecretStore for SecretBridge {
     fn load(&self, key: &str) -> Result<Option<Vec<u8>>, SecretError> {
-        Ok(self.cache().get(key).cloned())
+        Ok(self.cache.get(key))
     }
 
     fn save(&self, key: &str, value: &[u8]) -> Result<(), SecretError> {
-        self.ask("save", key, Some(value))?;
-        self.cache().insert(key.to_owned(), value.to_vec());
-        Ok(())
+        self.ask(ANSWER_TIMEOUT, "save", key, Some(value))
+            .map(|_| ())
     }
 
     fn delete(&self, key: &str) -> Result<(), SecretError> {
-        self.ask("delete", key, None)?;
-        self.cache().remove(key);
-        Ok(())
+        self.ask(ANSWER_TIMEOUT, "delete", key, None).map(|_| ())
     }
 }

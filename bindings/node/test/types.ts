@@ -45,6 +45,8 @@ async function app(): Promise<void> {
     if (error instanceof PushError && error.code === 'invite_not_found') console.log(error.retryable);
   }
   await client.close();
+  const made = new PushError({ code: 'timeout', message: 'no answer' });
+  console.log(made.code, made.retryable, made.retryAfterS, await deriveDatabaseKey('2468', 'a salt'));
 }
 
 void app;

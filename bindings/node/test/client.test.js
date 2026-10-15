@@ -6,6 +6,7 @@
 const { test, before, after } = require('node:test');
 const assert = require('node:assert/strict');
 const { execFileSync } = require('node:child_process');
+const net = require('node:net');
 const path = require('node:path');
 
 const { Client, PushError, deriveDatabaseKey, newSalt, SECRET_KEYS } = require('..');
@@ -159,4 +160,63 @@ test('close() while a call is pending resolves quickly and the call rejects with
   assert.ok(Date.now() - started < 2000, 'close() does not wait for the pending call');
   await rejected;
   await assert.rejects(client.waitConnected(50), code('closed'));
+});
+test('close() while a sign-in waits for a server that never answers resolves, and the database opens again', async (t) => {
+  const sockets = new Set();
+  const silent = net.createServer((socket) => {
+    sockets.add(socket);
+    socket.on('error', () => {});
+    socket.on('close', () => sockets.delete(socket));
+  });
+  await new Promise((resolve) => silent.listen(0, '127.0.0.1', resolve));
+  t.after(() => {
+    for (const socket of sockets) socket.destroy();
+    silent.close();
+  });
+  const databasePath = path.join(scratchDir('close-in-flight'), 'client.db');
+  const stalled = config({ authUrl: `http://127.0.0.1:${silent.address().port}`, databasePath });
+  const client = await Client.open(stalled, memoryStore());
+  const signIn = client.signIn('a@example.com', 'password', 'node test', 'desktop');
+  const rejected = assert.rejects(signIn, code('closed'));
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  assert.equal(sockets.size, 1, 'the request reached the server');
+  const started = Date.now();
+  await client.close();
+  assert.ok(Date.now() - started < 4000, 'close() does not wait for the request');
+  await rejected;
+  const again = await Client.open(config({ databasePath }), memoryStore());
+  await again.close();
+});
+
+test('a store whose load returns something that is not bytes fails the open with secrets', { timeout: 10000 }, async () => {
+  for (const loaded of [42, { not: 'bytes' }, true]) {
+    await assert.rejects(Client.open(config(), memoryStore({ loaded })), code('secrets'));
+  }
+});
+
+test('a store whose load throws or rejects fails the open with secrets', { timeout: 10000 }, async () => {
+  const throwing = memoryStore();
+  throwing.load = () => {
+    throw new Error('the keychain is locked');
+  };
+  await assert.rejects(Client.open(config(), throwing), code('secrets'));
+  const rejecting = memoryStore();
+  rejecting.load = () => Promise.reject(new Error('the keychain is locked'));
+  await assert.rejects(Client.open(config(), rejecting), code('secrets'));
+});
+
+test('close() twice, also at once, gives every caller the same outcome', async () => {
+  const client = await Client.open(config(), memoryStore());
+  const first = client.close();
+  const second = client.close();
+  assert.equal(first, second, 'one promise for every caller');
+  await first;
+  await client.close();
+  await assert.rejects(client.signOut(), code('closed'));
+});
+
+test('onEvent after close() fails with closed', async () => {
+  const client = await Client.open(config(), memoryStore());
+  await client.close();
+  assert.throws(() => client.onEvent(() => {}), code('closed'));
 });

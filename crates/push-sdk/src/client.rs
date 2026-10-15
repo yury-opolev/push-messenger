@@ -76,6 +76,25 @@ async fn blocking<T: Send + 'static>(
         .unwrap_or_else(|_| Err(SdkError::Storage("the store task ended".to_owned())))
 }
 
+/// Aborts a task when dropped; a no-op for a task that ended.
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Runs `future` as a task of its own, from inside a client's task: aborting the caller
+/// does not stop it. For the steps that leave the store and the credentials inconsistent
+/// if cut in half; each is bounded (a local write, or a stop that times out after
+/// [`STOP_TIMEOUT`]).
+async fn shielded<T: Send + 'static>(
+    future: impl Future<Output = Result<T, SdkError>> + Send + 'static,
+) -> Result<T, SdkError> {
+    tokio::spawn(future).await.unwrap_or(Err(SdkError::Closed))
+}
+
 /// How long a sign-out, a sign-in or a close waits for the connection task to confirm it
 /// stopped (closing a socket takes up to 2 s).
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -237,13 +256,18 @@ impl Client {
         ))
     }
 
-    /// Runs `future` on the client's runtime.
+    /// Runs `future` on the client's runtime. The work is aborted when the returned future
+    /// is dropped (a binding that gives up on a call, or a `close` that cancels it), so
+    /// it never outlives its caller holding a clone of the client. What must not be cut
+    /// short runs through [`shielded`].
     async fn run<T: Send + 'static>(
         &self,
         future: impl Future<Output = Result<T, SdkError>> + Send + 'static,
     ) -> Result<T, SdkError> {
         let runtime = self.inner.runtime.as_ref().ok_or(SdkError::Closed)?;
-        runtime.spawn(future).await.unwrap_or(Err(SdkError::Closed))
+        let task = runtime.spawn(future);
+        let _abort = AbortOnDrop(task.abort_handle());
+        task.await.unwrap_or(Err(SdkError::Closed))
     }
 
     /// Starts `future` on the client's runtime and returns at once: for the bindings,
@@ -369,9 +393,16 @@ impl Client {
             let user = session.user_id;
             // A connection of the earlier user may be live (or handshaking): it stops
             // before the store changes hands, and it does not come back as the earlier
-            // user, the session being the new one's now. The app connects again.
-            stop_connection(&inner).await?;
-            blocking(&inner.shared, move |store| store.bind_owner(user)).await?;
+            // user, the session being the new one's now. The app connects again. Not
+            // cut short once the session is saved: a store left with the earlier user's
+            // data under the new session would let a connection write into it.
+            let tail = inner.clone();
+            shielded(async move {
+                stop_connection(&tail).await?;
+                blocking(&tail.shared, move |store| store.bind_owner(user)).await?;
+                Ok(())
+            })
+            .await?;
             Ok(Account {
                 user_id: session.user_id,
                 device_id: session.device_id,
@@ -405,21 +436,29 @@ impl Client {
             // runs is stopped, and only then is the store erased: nothing of it can come
             // after the erase. An explicit sign-out always erases and always tries to
             // revoke: a failed keychain delete does not keep either, and the first error
-            // is reported. If the stop is not confirmed the store is left alone.
-            let (session, forgotten) = inner.credentials.sign_out_for_good().await;
-            let stopped = stop_connection(&inner).await.err();
-            let erased = if stopped.is_none() {
-                blocking(&inner.shared, |store| store.erase_all())
-                    .await
-                    .err()
-            } else {
-                None
-            };
+            // is reported. If the stop is not confirmed the store is left alone. The local
+            // part is not cut short (the session is gone then, and a store left unerased
+            // would keep the user's data); only the revocation, which an app that ends
+            // meanwhile loses just the same, is abandoned when the call is dropped.
+            let local = inner.clone();
+            let (session, local_error) = shielded(async move {
+                let (session, forgotten) = local.credentials.sign_out_for_good().await;
+                let stopped = stop_connection(&local).await.err();
+                let erased = if stopped.is_none() {
+                    blocking(&local.shared, |store| store.erase_all())
+                        .await
+                        .err()
+                } else {
+                    None
+                };
+                Ok((session, forgotten.or(stopped).or(erased)))
+            })
+            .await?;
             let revoked = match session {
                 Some(session) => revoke(&inner, session).await.err(),
                 None => None,
             };
-            match forgotten.or(stopped).or(erased).or(revoked) {
+            match local_error.or(revoked) {
                 Some(error) => Err(error),
                 None => Ok(()),
             }
@@ -461,15 +500,27 @@ impl Client {
     /// or deleted at once. Dropping the client does the same without waiting (it never
     /// blocks); an app that does not need to wait may simply drop it.
     ///
-    /// Only the last handle can close the database: with other clones alive this still
-    /// disconnects, and returns [`SdkError::Invalid`].
+    /// Only the last handle can close the database. Requests running on other clones are
+    /// aborted when their callers drop them; with other clones still alive this waits up
+    /// to 5 s for them to go, and then (the connection is stopped, the database still
+    /// open until they drop) returns [`SdkError::Timeout`].
     pub async fn close(self) -> Result<(), SdkError> {
         let inner = self.inner.clone();
         let stopped = self.run(async move { stop_connection(&inner).await }).await;
-        let Ok(mut inner) = Arc::try_unwrap(self.inner) else {
-            return Err(SdkError::Invalid(
-                "other clones of the client are alive: close the last one".to_owned(),
-            ));
+        let deadline = tokio::time::Instant::now() + STOP_TIMEOUT;
+        let mut shared = self.inner;
+        let mut inner = loop {
+            match Arc::try_unwrap(shared) {
+                Ok(inner) => break inner,
+                Err(still_shared) if tokio::time::Instant::now() >= deadline => {
+                    drop(still_shared);
+                    return Err(SdkError::Timeout);
+                }
+                Err(still_shared) => {
+                    shared = still_shared;
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
         };
         let runtime = inner.runtime.take();
         let (done, finished) = oneshot::channel();
@@ -945,6 +996,22 @@ mod tests {
         let outcome = tokio::time::timeout(Duration::from_secs(5), dropped)
             .await
             .expect("the aborted future is dropped");
+        assert!(outcome.is_err());
+    }
+
+    #[tokio::test]
+    async fn dropping_a_request_aborts_its_work() {
+        let f = Fixture::new().await;
+        let (held, dropped) = oneshot::channel::<()>();
+        let request = f.client.run(async move {
+            let _held = held;
+            std::future::pending::<Result<(), SdkError>>().await
+        });
+        let waited = tokio::time::timeout(Duration::from_millis(100), request).await;
+        assert!(waited.is_err(), "the request never answers");
+        let outcome = tokio::time::timeout(Duration::from_secs(5), dropped)
+            .await
+            .expect("the work of the dropped request is dropped too");
         assert!(outcome.is_err());
     }
 

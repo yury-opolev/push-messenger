@@ -12,6 +12,7 @@
 //!   schema.
 
 mod client;
+mod ledger;
 mod pending;
 mod promise;
 mod secrets;

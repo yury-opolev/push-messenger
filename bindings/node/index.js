@@ -13,12 +13,18 @@
  *   the platform's keychain. The SDK loads the values once when the client opens and writes
  *   through to the store, so the store must not change behind its back while it is open.
  *   A `save` or `delete` that has not answered within 30 s fails the call with `secrets`;
- *   an answer that arrives after that is ignored.
+ *   if the store carries it out after all, the SDK follows it (a newer write still wins), so
+ *   its view of the store stays right; a late failure changes nothing. The store's methods
+ *   must not call the client (`account()`, `signIn()`, anything): the SDK waits for the
+ *   store while the client's call waits for the JavaScript thread, and the two deadlock
+ *   until the 30 s end.
  * - Close the client when done: while it has a listener, Node keeps running. The
  *   connection itself does not keep Node running: without an event listener or another
  *   pending call, Node may exit after `connect()`. An app keeps a listener (`onEvent`) or a
  *   pending call.
- * - `close()` rejects the calls still pending with `closed` and does not wait for them.
+ * - `close()` rejects the calls still pending with `closed` and aborts their work, so the
+ *   database is closed when it resolves. It rejects with `timeout` if that work does not end
+ *   within 5 s; the database closes once it does. Calling it again gives the same promise.
  *
  * docs/sdk-bindings.md describes every call and the shapes of the data.
  */
@@ -82,14 +88,35 @@ function secretBridge(store) {
   return (id, operation, key, value) => {
     Promise.resolve()
       .then(() => operations[operation](key, value))
+      .then((result) => (operation === 'load' ? asBytes(result) : null))
       .then(
-        (result) => {
-          const loaded = operation === 'load' && result != null ? Buffer.from(result) : null;
-          native.completeSecretCall(id, null, loaded);
-        },
+        (loaded) => native.completeSecretCall(id, null, loaded),
         (error) => native.completeSecretCall(id, String((error && error.message) || error), null),
-      );
+      )
+      // Whatever else goes wrong still answers the waiting call, and is never an unhandled
+      // rejection (which ends Node).
+      .catch((error) => {
+        try {
+          native.completeSecretCall(id, String((error && error.message) || error), null);
+        } catch {
+          // The call is answered already or Node is shutting down.
+        }
+      });
   };
+}
+
+/** What `load` returned as a Buffer: null for nothing; anything but bytes is an error. */
+function asBytes(result) {
+  if (result == null) {
+    return null;
+  }
+  if (result instanceof Uint8Array) {
+    return Buffer.from(result.buffer, result.byteOffset, result.byteLength);
+  }
+  if (result instanceof ArrayBuffer) {
+    return Buffer.from(result);
+  }
+  throw new TypeError(`load returned ${typeof result}, not bytes`);
 }
 
 function checkStore(store) {
@@ -106,6 +133,7 @@ function checkStore(store) {
 
 class Client {
   #native;
+  #closing = null;
 
   /** Use `Client.open`. */
   constructor(nativeClient) {
@@ -144,9 +172,10 @@ class Client {
     );
   }
 
-  /** Stops the connection and closes the database; later calls fail with `closed`. */
+  /** Stops the connection and closes the database; later calls fail with `closed`. Every caller gets the same promise. */
   close() {
-    return settled(() => this.#native.close());
+    this.#closing ??= settled(() => this.#native.close());
+    return this.#closing;
   }
 
   // ----- account -----

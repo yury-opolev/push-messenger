@@ -100,6 +100,7 @@ impl NativeClient {
     /// Only one listener per client. While it listens, Node keeps running until `close`.
     #[napi(catch_unwind)]
     pub fn on_event(&self, listener: Function<'_, Value, ()>) -> napi::Result<()> {
+        self.client()?;
         let mut events = self
             .events
             .lock()
@@ -128,7 +129,8 @@ impl NativeClient {
     }
 
     /// Stops the connection, closes the database and ends the client's threads; later calls
-    /// fail with `closed`.
+    /// fail with `closed`. Rejects with `timeout` when calls still running do not end
+    /// within 5 s; the connection is stopped then, and the database closes once they do.
     #[napi(catch_unwind)]
     pub fn close<'env>(&self, env: &'env Env) -> napi::Result<Object<'env>> {
         let client = self.client.lock().ok().and_then(|mut client| client.take());
@@ -146,7 +148,12 @@ impl NativeClient {
                 std::thread::Builder::new()
                     .name("push-sdk-close".to_owned())
                     .spawn(move || {
-                        pending.wait_empty(CLOSE_WAIT);
+                        // Calls that do not end in time keep the database open: `timeout`.
+                        if !pending.wait_empty(CLOSE_WAIT) {
+                            let _ = client.disconnect();
+                            settle.finish(Err(SdkError::Timeout));
+                            return;
+                        }
                         settle.finish(block_on(client.close()).map(|()| Value::Null));
                     })
                     .map_err(|_| invalid("cannot start a thread"))?;

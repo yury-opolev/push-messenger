@@ -68,13 +68,13 @@ impl Pending {
         }
     }
 
-    /// Waits until every task has been dropped, at most `timeout`.
-    pub fn wait_empty(&self, timeout: Duration) {
+    /// Waits until every task has been dropped, at most `timeout`; whether they all were.
+    pub fn wait_empty(&self, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         let mut state = self.lock();
         while !state.tasks.is_empty() {
             let Some(left) = deadline.checked_duration_since(Instant::now()) else {
-                return;
+                return false;
             };
             state = self
                 .emptied
@@ -82,6 +82,7 @@ impl Pending {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .0;
         }
+        true
     }
 }
 

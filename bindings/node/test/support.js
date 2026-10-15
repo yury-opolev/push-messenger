@@ -32,7 +32,7 @@ function startFakes() {
  * does. `failNext` makes the next save of a key throw (synchronously, or with `async: true`
  * reject).
  */
-function memoryStore({ delayMs = 0 } = {}) {
+function memoryStore({ delayMs = 0, loaded } = {}) {
   const store = {
     values: new Map(),
     calls: [],
@@ -41,7 +41,8 @@ function memoryStore({ delayMs = 0 } = {}) {
     async load(key) {
       store.calls.push({ op: 'load', key });
       await store.later();
-      return store.values.get(key) ?? null;
+      // `loaded` makes every load answer with that value, bytes or not.
+      return loaded !== undefined ? loaded : (store.values.get(key) ?? null);
     },
     save(key, value) {
       store.calls.push({ op: 'save', key });

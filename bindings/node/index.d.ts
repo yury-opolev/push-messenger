@@ -20,8 +20,13 @@ export interface Config {
 /**
  * The app's secret store: a few small values under `SECRET_KEYS`. Methods may return
  * promises. Loaded once when the client opens, then written through. A `save` or `delete`
- * that has not answered within 30 s fails the call with `secrets`; an answer that arrives
- * after that is ignored.
+ * that has not answered within 30 s fails the call with `secrets`; if the store carries it
+ * out after all, the SDK follows it (a newer write still wins), and a late failure changes
+ * nothing.
+ *
+ * The methods must not call the client (`account()`, `signIn()`, anything): the SDK waits
+ * for the store while the client's call waits for the JavaScript thread, so the two
+ * deadlock until the 30 s end.
  */
 export interface SecretStore {
   load(key: string): Uint8Array | null | undefined | Promise<Uint8Array | null | undefined>;
@@ -121,6 +126,8 @@ export type PushEvent =
 
 /** A failed call; `code` is the SDK's stable error code, as in Rust and C. */
 export class PushError extends Error {
+  constructor(detail: { code: string; message: string; retryable?: boolean; retryAfterS?: number | null });
+  readonly name: 'PushError';
   readonly code: string;
   readonly retryable: boolean;
   readonly retryAfterS: number | null;
@@ -130,15 +137,18 @@ export class Client {
   private constructor();
   static open(config: Config, secretStore: SecretStore): Promise<Client>;
   /**
-   * Delivers every event, in order, to `listener`; one listener per client. A listener keeps
+   * Delivers every event, in order, to `listener`; one listener per client. Throws `closed`
+   * once the client is closed. A listener keeps
    * Node running until `close()`. The connection alone does not: without an event listener or
    * another pending call, Node may exit after `connect()`, so an app keeps a listener or a
    * pending call.
    */
   onEvent(listener: (event: PushEvent) => void): void;
   /**
-   * Stops the connection and closes the database. Calls still pending reject with `closed`;
-   * `close()` does not wait for them. Later calls fail with `closed`.
+   * Stops the connection and closes the database. Calls still pending reject with `closed`
+   * and their work is aborted, so the database is closed when this resolves. Rejects with
+   * `timeout` if that work does not end within 5 s (the database closes once it does). Later
+   * calls fail with `closed`; calling `close()` again returns the same promise.
    */
   close(): Promise<void>;
 
@@ -184,6 +194,6 @@ export class Client {
   revokeDevice(deviceId: string): Promise<void>;
 }
 
-export function deriveDatabaseKey(secret: Uint8Array | string, salt: Uint8Array): Promise<Uint8Array>;
+export function deriveDatabaseKey(secret: Uint8Array | string, salt: Uint8Array | string): Promise<Uint8Array>;
 export function newSalt(): Uint8Array;
 export const SECRET_KEYS: readonly string[];
