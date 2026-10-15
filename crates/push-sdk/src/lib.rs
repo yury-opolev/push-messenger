@@ -15,6 +15,7 @@
 #![allow(dead_code)]
 
 mod auth;
+mod connection;
 mod credentials;
 mod engine;
 mod error;
