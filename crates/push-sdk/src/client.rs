@@ -24,7 +24,7 @@ use crate::credentials::{Credentials, MIN_ACCESS_LIFETIME_S, is_refused, unix_no
 use crate::engine::{EVENT_QUEUE, Shared};
 use crate::key::DatabaseKey;
 use crate::model::{ConnectionState, Contact, Conversation, Event, Message};
-use crate::secrets::SecretStore;
+use crate::secrets::{SecretStore, Session};
 use crate::store::Store;
 
 /// How long after sending a message its sender may still edit or delete it: the server's
@@ -93,6 +93,29 @@ async fn stop_connection(inner: &Inner) -> Result<(), SdkError> {
         // A dropped acknowledgement means the task itself is gone.
         Ok(_) => Ok(()),
         Err(_) => Err(SdkError::ConnectionBusy),
+    }
+}
+
+/// Asks auth-svc to revoke the device of a session that is no longer stored. An access
+/// token about to expire is refreshed in memory only, for this one call. A refusal means
+/// the device's tokens are dead already.
+async fn revoke(inner: &Inner, session: Session) -> Result<(), SdkError> {
+    let access_token = if session.access_expires_at - unix_now() >= MIN_ACCESS_LIFETIME_S {
+        session.access_token
+    } else {
+        match inner.auth.refresh(&session.refresh_token).await {
+            Ok(tokens) => tokens.access_token,
+            Err(error) if is_refused(&error) => return Ok(()),
+            Err(error) => return Err(error),
+        }
+    };
+    match inner
+        .auth
+        .revoke_device(&access_token, session.device_id)
+        .await
+    {
+        Err(error) if is_refused(&error) => Ok(()),
+        revoked => revoked,
     }
 }
 
@@ -328,7 +351,7 @@ impl Client {
             };
             // Saved before a registration_id is forgotten: if saving fails, a retry finds
             // the same device again.
-            let session = credentials.sign_in(tokens)?;
+            let session = credentials.sign_in(tokens).await?;
             credentials.registration_done()?;
             let user = session.user_id;
             // A connection of the earlier user may be live (or handshaking): it stops
@@ -352,51 +375,40 @@ impl Client {
         }))
     }
 
-    /// Signs this device out for good: the client disconnects, forgets the credentials,
-    /// erases the local store, outbox included, and then asks auth-svc to revoke the
-    /// device. The local part comes first and always happens, also offline (an app that
-    /// ends meanwhile has still signed out); an error says that auth-svc did not confirm
+    /// Signs this device out for good: the credentials are forgotten first, then the
+    /// client disconnects, erases the local store, outbox included, and asks auth-svc to
+    /// revoke the device. The local part always happens, also offline (an app that
+    /// ends meanwhile has still signed out), and a failed keychain delete does not stop
+    /// the erase or the revocation: the first error is returned. An error may say that
+    /// auth-svc did not confirm
     /// the revocation, and the device stays in the account's device list until it is
     /// removed from another device ([`Client::revoke_device`]).
+    /// [`SdkError::ConnectionBusy`]: the connection did not stop in time, so the local
+    /// data was not erased; call again later.
     pub async fn sign_out(&self) -> Result<(), SdkError> {
         let inner = self.inner.clone();
         self.run(async move {
             // The session goes first, so no connection can start again; then the one that
             // runs is stopped, and only then is the store erased: nothing of it can come
-            // after the erase. An explicit sign-out always erases: a failed keychain
-            // delete does not keep the local data, and the first error is reported.
-            let forgotten = inner.credentials.sign_out_for_good().await;
-            let stopped = stop_connection(&inner).await;
-            if let Err(error) = stopped {
-                return Err(forgotten.err().unwrap_or(error));
-            }
-            let erased = blocking(&inner.shared, |store| store.erase_all()).await;
-            let session = match (forgotten, erased) {
-                (Ok(session), Ok(())) => session,
-                (Err(error), _) | (Ok(_), Err(error)) => return Err(error),
-            };
-            let Some(session) = session else {
-                return Ok(());
-            };
-            // The tokens are no longer stored: an access token about to expire is
-            // refreshed in memory only, for this one call.
-            let access_token = if session.access_expires_at - unix_now() >= MIN_ACCESS_LIFETIME_S {
-                session.access_token
+            // after the erase. An explicit sign-out always erases and always tries to
+            // revoke: a failed keychain delete does not keep either, and the first error
+            // is reported. If the stop is not confirmed the store is left alone.
+            let (session, forgotten) = inner.credentials.sign_out_for_good().await;
+            let stopped = stop_connection(&inner).await.err();
+            let erased = if stopped.is_none() {
+                blocking(&inner.shared, |store| store.erase_all())
+                    .await
+                    .err()
             } else {
-                match inner.auth.refresh(&session.refresh_token).await {
-                    Ok(tokens) => tokens.access_token,
-                    // Refused: the device's tokens are dead already.
-                    Err(error) if is_refused(&error) => return Ok(()),
-                    Err(error) => return Err(error),
-                }
+                None
             };
-            match inner
-                .auth
-                .revoke_device(&access_token, session.device_id)
-                .await
-            {
-                Err(error) if is_refused(&error) => Ok(()),
-                revoked => revoked,
+            let revoked = match session {
+                Some(session) => revoke(&inner, session).await.err(),
+                None => None,
+            };
+            match forgotten.or(stopped).or(erased).or(revoked) {
+                Some(error) => Err(error),
+                None => Ok(()),
             }
         })
         .await
@@ -869,7 +881,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn signing_out_erases_even_when_the_keychain_delete_fails() {
+    async fn signing_out_erases_and_revokes_even_when_the_keychain_delete_fails() {
         let (auth, gateway) = (FakeAuth::start().await, FakeGateway::start().await);
         let secrets = Arc::new(Undeletable::default());
         let database = format!("file:client-{}?mode=memory&cache=shared", Uuid::now_v7());
@@ -890,6 +902,7 @@ mod tests {
         let error = client.sign_out().await.unwrap_err();
         assert!(matches!(error, SdkError::Secrets(_)));
         assert!(is_empty(&client));
+        assert_eq!(auth.revocations.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

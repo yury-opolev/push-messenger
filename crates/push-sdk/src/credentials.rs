@@ -48,8 +48,11 @@ impl Credentials {
         self.inner.session()
     }
 
-    /// Keeps the tokens of a fresh sign-in, and remembers the device.
-    pub fn sign_in(&self, tokens: Tokens) -> Result<Session, SdkError> {
+    /// Keeps the tokens of a fresh sign-in, and remembers the device. Waits for a refresh
+    /// in flight (it holds the same lock while it saves), so a refresh of the earlier
+    /// session cannot overwrite this one afterwards.
+    pub async fn sign_in(&self, tokens: Tokens) -> Result<Session, SdkError> {
+        let _refreshing = self.inner.refreshing.lock().await;
         self.inner
             .secrets
             .save(DEVICE_KEY, tokens.device_id.0.as_bytes())
@@ -77,13 +80,18 @@ impl Credentials {
     }
 
     /// Signs the device out for good: forgets the session and the device once no refresh
-    /// is in flight (so none saves them again), and returns the session it forgot.
-    pub async fn sign_out_for_good(&self) -> Result<Option<Session>, SdkError> {
+    /// is in flight (so none saves them again). Both deletes are tried even if the first
+    /// fails. Returns the session it read (so the device can still be revoked) together
+    /// with the first error, if any.
+    pub async fn sign_out_for_good(&self) -> (Option<Session>, Option<SdkError>) {
         let _refreshing = self.inner.refreshing.lock().await;
-        let session = self.inner.session()?;
-        self.inner.forget_session()?;
-        self.forget_device()?;
-        Ok(session)
+        let (session, read) = match self.inner.session() {
+            Ok(session) => (session, None),
+            Err(error) => (None, Some(error)),
+        };
+        let session_deleted = self.inner.forget_session().err();
+        let device_deleted = self.forget_device().err();
+        (session, read.or(session_deleted).or(device_deleted))
     }
 
     /// Forgets the session. Waits for a refresh in flight, so that it cannot save the
@@ -406,6 +414,49 @@ mod tests {
             Err(SdkError::NotSignedIn)
         );
         assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_refresh_in_flight_cannot_overwrite_a_later_sign_in() {
+        let fixture = fixture_slow(30, false, 400).await;
+        let credentials = fixture.credentials.clone();
+        let refreshing = tokio::spawn(async move { credentials.fresh().await });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let user_b = UserId::new();
+        let tokens_b = Tokens {
+            user_id: user_b,
+            device_id: DeviceId::new(),
+            access_token: "access-b".to_owned(),
+            expires_in_s: 900,
+            refresh_token: "refresh-b".to_owned(),
+        };
+        let signed_in = fixture.credentials.sign_in(tokens_b).await.unwrap();
+        refreshing.await.unwrap().unwrap();
+
+        assert_eq!(signed_in.user_id, user_b);
+        let stored = Session::load(fixture.secrets.as_ref()).unwrap();
+        assert_eq!(stored, Some(signed_in.clone()));
+        assert_eq!(fixture.credentials.fresh().await.unwrap(), signed_in);
+        assert_eq!(
+            fixture.credentials.last_device().unwrap(),
+            Some(signed_in.device_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refresh_in_flight_cannot_bring_back_a_signed_out_session() {
+        let fixture = fixture_slow(30, false, 400).await;
+        let credentials = fixture.credentials.clone();
+        let refreshing = tokio::spawn(async move { credentials.fresh().await });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let (session, error) = fixture.credentials.sign_out_for_good().await;
+        refreshing.await.unwrap().unwrap();
+
+        assert_eq!(error, None);
+        assert_eq!(session.unwrap().access_token, "access-1");
+        assert_eq!(Session::load(fixture.secrets.as_ref()), Ok(None));
     }
 
     #[tokio::test]
