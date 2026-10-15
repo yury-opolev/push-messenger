@@ -6,3 +6,6 @@ deploy
 docs
 target
 **/*.md
+# The Node binding's local install and build output.
+**/node_modules
+**/*.node

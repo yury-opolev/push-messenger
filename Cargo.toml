@@ -1,6 +1,9 @@
 [workspace]
 resolver = "3"
 members = [
+    "bindings/c",
+    "bindings/ffi",
+    "bindings/node",
     "crates/push-auth",
     "crates/push-domain",
     "crates/push-email",
@@ -42,6 +45,8 @@ push-gateway = { path = "crates/push-gateway" }
 push-message-svc = { path = "crates/push-message-svc" }
 push-proto = { path = "crates/push-proto" }
 push-sdk = { path = "crates/push-sdk" }
+push-sdk-c = { path = "bindings/c" }
+push-sdk-ffi = { path = "bindings/ffi" }
 push-store = { path = "crates/push-store" }
 push-testkit = { path = "crates/push-testkit" }
 push-worker = { path = "crates/push-worker" }

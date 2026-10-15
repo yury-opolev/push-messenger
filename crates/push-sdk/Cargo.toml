@@ -7,9 +7,19 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# The test doubles (`testing`) and the `push-sdk-fakes` binary, for the bindings' tests.
+# Never for an app.
+testing = ["dep:axum"]
+
+[[bin]]
+name = "push-sdk-fakes"
+required-features = ["testing"]
+
 [dependencies]
 # Argon2id for `DatabaseKey::derive`, as auth-svc hashes passwords.
 argon2 = { workspace = true, features = ["zeroize"] }
+axum = { workspace = true, optional = true }
 futures-util.workspace = true
 push-domain.workspace = true
 push-proto.workspace = true

@@ -1,0 +1,33 @@
+[package]
+name = "push-sdk-node"
+description = "The Node.js binding of push-sdk (napi-rs): promises, events through a threadsafe function, the secret store as JavaScript callbacks (spec §8.5)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+# The addon Node loads (push_sdk.node, copied by scripts/build.js). No Rust tests: its
+# test binary could not resolve Node's symbols; the tests run in Node (npm test).
+crate-type = ["cdylib"]
+test = false
+doctest = false
+
+[dependencies]
+# napi 3.4, napi-derive 3.3 and napi-build 2.2 are the last releases for Rust 1.85 (later
+# ones need 1.88); the lockfile pins them.
+napi = { version = "3.4", default-features = false, features = ["napi4", "serde-json"] }
+napi-derive = "3.3"
+push-sdk.workspace = true
+push-sdk-ffi.workspace = true
+serde_json.workspace = true
+# block_in_place, while an SDK thread waits for the app's secret store.
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+
+[build-dependencies]
+napi-build = "2.2"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

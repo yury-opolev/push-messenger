@@ -6,7 +6,7 @@
 
 **Architecture:** `push-sdk` gains three small things for the bindings and no behaviour: `Client::spawn` (start a future on the client's runtime, so a binding needs no runtime of its own — spec §8.5: one runtime, owned by the client), `DatabaseKey::as_bytes` (to hand a derived key to the app), and its test doubles behind a `testing` feature with a new `AutoGateway` and a `push-sdk-fakes` binary. `bindings/ffi` (`push-sdk-ffi`) holds the JSON shapes of every type, event and error, and `block_on`, a thread-parking wait for the client's futures. `bindings/c` (`push-sdk-c`) is a `cdylib` of `extern "C"` functions, each behind a `catch_unwind` guard; `bindings/node` (`push-sdk-node`) is a napi-rs `cdylib` wrapped by `index.js`. Spec: `docs/superpowers/specs/2026-10-11-push-messenger-design.md` §8, §10, §12.
 
-**Tech Stack:** Rust 2024 (toolchain ≥ 1.85). napi 3.4.0, napi-derive 3.3.0 and napi-build 2.2.4 — the last releases that build with Rust 1.85 (later ones need 1.88); the workspace's resolver 3 is MSRV-aware and picks them, and the lockfile pins them. cbindgen 0.29.4 (Rust 1.74) as a dev-dependency, `cc` 1 to compile the C test program. Node.js 18 or later (verified with 18.20 and 22.14), `node:test`, TypeScript 5.9.3 (dev only, for `tsc`). MSVC on Windows, gcc in CI.
+**Tech Stack:** Rust 2024 (toolchain ≥ 1.85). napi 3.4.0, napi-derive 3.3.0 and napi-build 2.2.4 — the last releases that build with Rust 1.85 (later ones need 1.88); the workspace's resolver 3 is MSRV-aware and picks them, and the lockfile pins them. cbindgen 0.29.4 (Rust 1.74) as a dev-dependency, `cc` 1 to compile the C test program. Node.js 20 or later (verified with 22.14), `node:test`, TypeScript 5.9.3 (dev only, for `tsc`). MSVC on Windows, gcc in CI.
 
 ---
 
