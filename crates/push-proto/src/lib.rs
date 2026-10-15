@@ -27,8 +27,9 @@ pub use codec::{
 };
 
 /// WebSocket close codes (spec §7.4). Codes from 4000 are the protocol's own; the others
-/// are RFC 6455's. A client signs out only on 4001; it never reconnects after 4003; on
-/// every other code it reconnects with backoff (after refreshing its token on 4002).
+/// are RFC 6455's. A client signs out only on 4001; it never reconnects by itself after
+/// 4003 or 4007; on every other code it reconnects with backoff (after refreshing its
+/// token on 4002).
 pub mod close {
     /// The access token is invalid (signature, audience, an unverified email) or older
     /// than the user's last password reset: sign in again.
@@ -36,8 +37,8 @@ pub mod close {
     /// The access token expired, names a key the gateway does not hold, or no `ReAuth`
     /// came by `exp + 30 s`: refresh it, then reconnect.
     pub const REAUTH_REQUIRED: u16 = 4002;
-    /// Another connection of the device took over, or the device was revoked: stop.
-    pub const TAKEN_OVER: u16 = 4003;
+    /// The device was revoked: stop.
+    pub const DEVICE_REMOVED: u16 = 4003;
     /// Rate limited: back off, then reconnect.
     pub const RATE_LIMITED: u16 = 4004;
     /// The server is shutting down: back off with jitter, then reconnect.
@@ -45,6 +46,10 @@ pub mod close {
     /// The device was registered moments ago and the server is not ready for it yet:
     /// reconnect after a short backoff. Never a reason to sign out.
     pub const NOT_READY_YET: u16 = 4006;
+    /// Another connection of the same device took over: the same app data was opened
+    /// elsewhere (a second window, a copy restored on another machine). Stop; the device
+    /// is still signed in.
+    pub const OPENED_ELSEWHERE: u16 = 4007;
     /// A protocol violation before `Ready`: no `Identify` within 5 s, or another frame
     /// first. Reconnect with backoff.
     pub const PROTOCOL_ERROR: u16 = 1002;
