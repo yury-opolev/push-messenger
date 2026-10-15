@@ -1041,7 +1041,8 @@ Implementation notes (push-proto, Plan 4A):
 - **`push-sdk`** (Rust core) owns everything: connection, outbox, local message store,
   retries, positions and acks, reconnect, events.
 - **`bindings/node`** (napi-rs) and **`bindings/c`** (cbindgen) only convert types and
-  adapt async calls and callbacks. They contain no business logic.
+  adapt async calls and callbacks. They contain no business logic; what they share (the
+  JSON shapes of the data and the errors, and waiting on the client) is `bindings/ffi`.
 
 ### 8.2 Public surface
 
@@ -1237,6 +1238,46 @@ Implementation notes (push-sdk, Plan 9A):
   Plan 11). Decided (owner, Plan 9A): a revoked device (4003) keeps its data, like every
   server-side sign-out; the app may still call `sign_out()` itself.
 
+Implementation notes (bindings, Plan 10):
+
+- **Layout.** `bindings/ffi` (`push-sdk-ffi`) is what both bindings share: one function
+  shapes each type, event and error as JSON (camelCase fields and values, ids as UUID
+  strings, times in microseconds, the SDK's snake_case error codes), and `block_on` parks a
+  binding's own thread on the client's futures. `push-sdk` gained only `Client::spawn`
+  (start a future on the client's runtime), `DatabaseKey::as_bytes` and, behind a `testing`
+  feature never meant for apps, its fakes: `FakeAuth`, an `AutoGateway` that answers by
+  itself, and the `push-sdk-fakes` binary. No binding builds a runtime.
+- **Error codes** come from `SdkError::code` and `is_retryable` through one function, so
+  they are identical in Rust, Node (`PushError.code`) and C (`push_error_code`);
+  `docs/sdk-bindings.md` lists them and a test keeps the list complete. The bindings add one
+  code of their own, `panic`, for a bug caught at the boundary.
+- **Node** (`bindings/node`, napi-rs 3.4 for Rust 1.85): calls that reach a server or the
+  database return promises settled from the client's runtime; `account()`,
+  `connectionState()`, `connect()`, `disconnect()` and `onEvent()` answer at once. `open`
+  runs on a thread of its own. The app's secret store is a JavaScript object: its three
+  values are loaded once before the client opens, reads are served from that copy, and
+  writes go to JavaScript through a threadsafe function while an SDK thread waits (up to
+  30 s) for the confirmation, never on the JavaScript thread — so neither thread waits for
+  the other in a circle, and credentials are still saved before use. Events go to one
+  listener through a threadsafe function (1,000 queued calls, then the SDK's own bounded
+  queue); the listener keeps Node running until `close()`. A promise whose call was
+  dropped by `close()` rejects with `closed`.
+- **C** (`bindings/c`, cbindgen): opaque `PushClient` handles (`push_client_open`,
+  `push_client_destroy`), `PUSH_OK`/`PUSH_ERROR` with a `PushError` out-parameter, UTF-8
+  strings in (borrowed) and out (owned, `push_string_free`), JSON for compound results.
+  Calls that reach a server block the calling thread, bounded by the SDK's own limits
+  (chosen over completion callbacks: C apps have threads, ownership stays on the caller's
+  stack, and no context pointer outlives a call); a blocking call on an SDK thread, and
+  any call from inside a secret store function, is refused with `invalid`. Events come to
+  one callback on the binding's own thread (`push-sdk-events`) with a release callback
+  after the last, or from `push_client_next_event`. The secret store is a struct of
+  function pointers with a context, `free_value` for what `load` allocated and `release`.
+  `include/push_sdk.h` is generated and checked in; a test fails when it is stale, and a C
+  program compiled with MSVC or gcc runs a whole flow against the fakes.
+- **Not yet:** published packages and prebuilt binaries, mobile targets (iOS, Android)
+  and Swift or Kotlin packages, typed C structs, non-blocking C calls (see the Plan 10
+  owner questions).
+
 ## 9. Email
 
 - Provider: **Resend**, behind provider-neutral traits:
@@ -1308,6 +1349,7 @@ push-messenger/
 │   ├── push-sdk          client core
 │   └── push-smoke        end-to-end smoke test of a running deployment (not published)
 ├── bindings/
+│   ├── ffi/              what both share: JSON shapes, error codes, waiting
 │   ├── node/             napi-rs
 │   └── c/                cbindgen
 ├── deploy/
@@ -1429,6 +1471,7 @@ Implementation notes (local minikube, Plan 4B):
 | Integration | Real Postgres and Redis via testcontainers: the whole `push-testkit` suite against Postgres, transaction order, gapless `seq` under concurrent retries, outbox relay, `SKIP LOCKED` |
 | Protocol | Raw-frame harness: malformed frames, out-of-order acks, replayed `client_msg_id`, unverified email, revoked device, non-contact send |
 | End-to-end | SDK clients through the full stack: register, verify, connect via invite, chat, receipts, edit, delete, group of 100, new device loading history. Plan 9B: two `push-sdk` apps in the smoke test (locally and on minikube) — invite, chat, receipts, edit, delete, an outbox surviving restarts on an encrypted database, a cut-off send stored once, `OpenedElsewhere`, `DeviceRemoved` and `SignedOut` |
+| Bindings | Plan 10: the C ABI and the Node binding against the SDK's fakes (a C program compiled with MSVC or gcc; `node:test`), the generated header checked for staleness, the typings checked by `tsc`, and a Node example through the minikube ingress |
 | Load | 10,000 concurrent sockets: memory per connection, latency, recovery from a reconnect storm, 100-member group throughput |
 
 Required adverse-condition tests:
