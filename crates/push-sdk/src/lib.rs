@@ -10,10 +10,6 @@
 //! are therefore plain data: identifiers, strings, numbers and enums, with no lifetimes
 //! or generics.
 
-// The parts arrive one task at a time and the `Client` (Task 10) ties them together; until
-// then some crate-private items have no caller outside their tests.
-#![allow(dead_code)]
-
 mod auth;
 mod client;
 mod connection;

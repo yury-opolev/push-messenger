@@ -17,6 +17,28 @@ Docker, so Docker must be running (the first run pulls the images):
 Building needs neither a database nor a system `protoc` (`push-proto` uses a vendored
 one).
 
+## The client SDK
+
+`crates/push-sdk` is the Rust core that apps embed (the Node and C bindings come with
+Plan 10). A `Client` signs up and in through auth-svc, keeps the device's credentials in
+a `SecretStore` the app provides (the platform's keychain), and holds the WebSocket to the
+gateway, reconnecting with backoff; it signs out only when the server says so (4001) and
+stops only when the device is removed (4003) or its data was opened elsewhere (4007).
+Messages, edits and deletes go through an outbox in the client's SQLite database, so they
+survive a restart and are stored once, and the UI follows one stream of events:
+
+    let (client, mut events) = Client::open(Config::new(auth_url, socket_url, "push.db"), secrets)?;
+    client.sign_in(email, password, "Alice's phone", Platform::Ios).await?;
+    client.connect()?;
+    let chat = client.open_direct(bob).await?;
+    client.send(chat.id, "hello")?;
+    while let Some(event) = events.next().await { /* update the UI */ }
+
+Given a `DatabaseKey` (`Config::database_key`), the client encrypts the whole database;
+an app derives the key from a PIN or password the user enters (`DatabaseKey::derive`), so
+without it nobody can read the history, not even the app. Groups are not offered to apps
+in the first release, so the SDK has no group calls yet.
+
 ## Run it on minikube
 
 The whole system runs on a local [minikube](https://minikube.sigs.k8s.io/) cluster with
