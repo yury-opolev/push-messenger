@@ -1,0 +1,39 @@
+[package]
+name = "push-sdk"
+description = "The push-messenger client core: sign-in, the connection, the local store, the outbox and one event stream."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Argon2id for `DatabaseKey::derive`, as auth-svc hashes passwords.
+argon2.workspace = true
+futures-util.workspace = true
+push-domain.workspace = true
+push-proto.workspace = true
+rand.workspace = true
+# HTTPS to auth-svc: rustls with ring and the webpki roots, no OpenSSL and no cmake.
+reqwest = { workspace = true, features = ["rustls-tls"] }
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+# wss:// with rustls; ring is its provider through reqwest's rustls-tls.
+tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }
+tracing.workspace = true
+uuid.workspace = true
+zeroize.workspace = true
+
+[build-dependencies]
+# SQLite3 Multiple Ciphers (build.rs): the amalgamation, compiled with `cc`.
+cc = "1"
+sqlite3mc-src = "205.1"
+
+[dev-dependencies]
+axum.workspace = true
+
+[lints]
+workspace = true
