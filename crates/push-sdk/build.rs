@@ -21,8 +21,8 @@ fn main() {
         .define("SQLITE_OMIT_DEPRECATED", None)
         .define("SQLITE_OMIT_LOAD_EXTENSION", None)
         .define("SQLITE_USE_URI", "1")
-        // Temporary tables and indexes stay in memory, never in a plain file.
-        .define("SQLITE_TEMP_STORE", "2")
+        // 3 is always memory: no PRAGMA can send temporary data to a plain file.
+        .define("SQLITE_TEMP_STORE", "3")
         .define("SQLITE_SECURE_DELETE", None)
         .define("HAVE_ISNAN", None)
         .warnings(false)

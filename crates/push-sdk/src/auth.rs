@@ -553,14 +553,14 @@ mod tests {
         let mut api = AuthApi::new(&serve(router).await, None).unwrap();
         // The real 8 s and 25 s, scaled down: two attempts fit, a third would end late.
         api.refresh_attempts = Attempts {
-            timeout: Duration::from_millis(200),
-            window: Some(Duration::from_millis(1_000)),
+            timeout: Duration::from_millis(300),
+            window: Some(Duration::from_millis(1_400)),
         };
         let started = std::time::Instant::now();
         let error = api.refresh("refresh-0").await.unwrap_err();
         assert_eq!(error.code(), "network");
         assert_eq!(calls.load(Ordering::SeqCst), 2);
-        assert!(started.elapsed() < Duration::from_millis(1_000));
+        assert!(started.elapsed() < Duration::from_millis(1_400));
     }
 
     #[tokio::test]

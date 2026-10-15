@@ -21,6 +21,10 @@ use crate::secrets::{REGISTRATION_KEY, SESSION_KEY, SecretStore, Session};
 pub(crate) const MIN_ACCESS_LIFETIME_S: i64 = 90;
 
 pub(crate) struct Credentials {
+    inner: Arc<Inner>,
+}
+
+struct Inner {
     secrets: Arc<dyn SecretStore>,
     auth: AuthApi,
     refreshing: tokio::sync::Mutex<()>,
@@ -29,19 +33,76 @@ pub(crate) struct Credentials {
 impl Credentials {
     pub fn new(secrets: Arc<dyn SecretStore>, auth: AuthApi) -> Self {
         Self {
-            secrets,
-            auth,
-            refreshing: tokio::sync::Mutex::new(()),
+            inner: Arc::new(Inner {
+                secrets,
+                auth,
+                refreshing: tokio::sync::Mutex::new(()),
+            }),
         }
     }
 
     /// The stored session, if a device is signed in.
     pub fn session(&self) -> Result<Option<Session>, SdkError> {
-        Session::load(self.secrets.as_ref()).map_err(|error| SdkError::Secrets(error.0))
+        self.inner.session()
     }
 
     /// Keeps the tokens of a fresh sign-in.
     pub fn sign_in(&self, tokens: Tokens) -> Result<Session, SdkError> {
+        self.inner.sign_in(tokens)
+    }
+
+    /// Forgets the session. Waits for a refresh in flight, so that it cannot save the
+    /// session again afterwards.
+    pub async fn sign_out(&self) -> Result<(), SdkError> {
+        let _refreshing = self.inner.refreshing.lock().await;
+        self.inner.forget_session()
+    }
+
+    /// A session whose access token is good for at least [`MIN_ACCESS_LIFETIME_S`],
+    /// refreshed first if needed. [`SdkError::NotSignedIn`] when no device is signed in
+    /// or auth-svc refuses the refresh token (the session is forgotten then).
+    ///
+    /// The work runs in its own task: a caller that goes away mid-refresh cannot lose
+    /// the tokens auth-svc has already rotated.
+    pub async fn fresh(&self) -> Result<Session, SdkError> {
+        let inner = self.inner.clone();
+        Self::finish(tokio::spawn(async move { inner.fresh().await })).await
+    }
+
+    /// A session with an access token other than `stale`, which the server refused or
+    /// is about to expire: refreshed now unless another caller already did. Runs in
+    /// its own task like [`Credentials::fresh`].
+    pub async fn refresh(&self, stale: &str) -> Result<Session, SdkError> {
+        let inner = self.inner.clone();
+        let stale = stale.to_owned();
+        Self::finish(tokio::spawn(async move { inner.refresh(&stale).await })).await
+    }
+
+    async fn finish(
+        task: tokio::task::JoinHandle<Result<Session, SdkError>>,
+    ) -> Result<Session, SdkError> {
+        task.await
+            .unwrap_or_else(|_| Err(SdkError::Network("the refresh was interrupted".to_owned())))
+    }
+
+    /// The `registration_id` of the device registration in progress, created and kept
+    /// before the first attempt so that every retry, even after a restart, names it.
+    pub fn registration_id(&self) -> Result<Uuid, SdkError> {
+        self.inner.registration_id()
+    }
+
+    /// The registration was answered: the next one is a new device.
+    pub fn registration_done(&self) -> Result<(), SdkError> {
+        self.inner.registration_done()
+    }
+}
+
+impl Inner {
+    fn session(&self) -> Result<Option<Session>, SdkError> {
+        Session::load(self.secrets.as_ref()).map_err(|error| SdkError::Secrets(error.0))
+    }
+
+    fn sign_in(&self, tokens: Tokens) -> Result<Session, SdkError> {
         let session = Session {
             user_id: tokens.user_id,
             device_id: tokens.device_id,
@@ -53,37 +114,25 @@ impl Credentials {
         Ok(session)
     }
 
-    /// Forgets the session. Waits for a refresh in flight, so that it cannot save the
-    /// session again afterwards.
-    pub async fn sign_out(&self) -> Result<(), SdkError> {
-        let _refreshing = self.refreshing.lock().await;
-        self.forget_session()
-    }
-
     fn forget_session(&self) -> Result<(), SdkError> {
         self.secrets
             .delete(SESSION_KEY)
             .map_err(|error| SdkError::Secrets(error.0))
     }
 
-    /// A session whose access token is good for at least [`MIN_ACCESS_LIFETIME_S`],
-    /// refreshed first if needed. [`SdkError::NotSignedIn`] when no device is signed in
-    /// or auth-svc refuses the refresh token (the session is forgotten then).
-    pub async fn fresh(&self) -> Result<Session, SdkError> {
+    async fn fresh(&self) -> Result<Session, SdkError> {
         let _refreshing = self.refreshing.lock().await;
         let session = self.session()?.ok_or(SdkError::NotSignedIn)?;
-        if session.access_expires_at - unix_now() >= MIN_ACCESS_LIFETIME_S {
+        if has_lifetime(&session) {
             return Ok(session);
         }
         self.refresh_locked(session).await
     }
 
-    /// A session with an access token other than `stale`, which the server refused or
-    /// is about to expire: refreshed now unless another caller already did.
-    pub async fn refresh(&self, stale: &str) -> Result<Session, SdkError> {
+    async fn refresh(&self, stale: &str) -> Result<Session, SdkError> {
         let _refreshing = self.refreshing.lock().await;
         let session = self.session()?.ok_or(SdkError::NotSignedIn)?;
-        if session.access_token != stale {
+        if session.access_token != stale && has_lifetime(&session) {
             return Ok(session);
         }
         self.refresh_locked(session).await
@@ -118,9 +167,7 @@ impl Credentials {
             .map_err(|error| SdkError::Secrets(error.0))
     }
 
-    /// The `registration_id` of the device registration in progress, created and kept
-    /// before the first attempt so that every retry, even after a restart, names it.
-    pub fn registration_id(&self) -> Result<Uuid, SdkError> {
+    fn registration_id(&self) -> Result<Uuid, SdkError> {
         let stored = self
             .secrets
             .load(REGISTRATION_KEY)
@@ -136,12 +183,15 @@ impl Credentials {
         Ok(id)
     }
 
-    /// The registration was answered: the next one is a new device.
-    pub fn registration_done(&self) -> Result<(), SdkError> {
+    fn registration_done(&self) -> Result<(), SdkError> {
         self.secrets
             .delete(REGISTRATION_KEY)
             .map_err(|error| SdkError::Secrets(error.0))
     }
+}
+
+fn has_lifetime(session: &Session) -> bool {
+    session.access_expires_at - unix_now() >= MIN_ACCESS_LIFETIME_S
 }
 
 /// auth-svc refused the credentials for good: they were revoked, reused or expired.
@@ -182,6 +232,10 @@ mod tests {
     /// auth-svc answering refreshes with new tokens for the same device (or refusing
     /// them), and a stored session whose access token expires in `left` seconds.
     async fn fixture(left: i64, refuse: bool) -> Fixture {
+        fixture_slow(left, refuse, 50).await
+    }
+
+    async fn fixture_slow(left: i64, refuse: bool, delay_ms: u64) -> Fixture {
         let session = Session {
             user_id: UserId::new(),
             device_id: DeviceId::new(),
@@ -198,7 +252,7 @@ mod tests {
                 async move {
                     let call = counter.fetch_add(1, Ordering::SeqCst) + 1;
                     // Slow enough for a concurrent caller to queue behind it.
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                     if refuse {
                         let error = json!({"error": {"code": "unauthorized", "message": "sign in again", "retryable": false}});
                         return (StatusCode::UNAUTHORIZED, axum::Json(error)).into_response();
@@ -262,6 +316,48 @@ mod tests {
         assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
     }
 
+    #[tokio::test]
+    async fn a_refresh_finishes_when_its_caller_goes_away() {
+        let fixture = fixture_slow(30, false, 300).await;
+        let cut_off = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            fixture.credentials.fresh(),
+        )
+        .await;
+        assert!(cut_off.is_err());
+        let mut stored = None;
+        for _ in 0..100 {
+            stored = Session::load(fixture.secrets.as_ref()).unwrap();
+            if stored
+                .as_ref()
+                .is_some_and(|s| s.access_token == "access-1")
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let stored = stored.unwrap();
+        assert_eq!(stored.access_token, "access-1");
+        assert_eq!(stored.refresh_token, "refresh-1");
+        assert_eq!(fixture.credentials.fresh().await.unwrap(), stored);
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_newer_token_that_is_about_to_expire_is_refreshed_again() {
+        let fixture = fixture(30, false).await;
+        let session = fixture.credentials.refresh("access-other").await.unwrap();
+        assert_eq!(session.access_token, "access-1");
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_newer_token_with_time_left_is_returned_without_a_refresh() {
+        let fixture = fixture(600, false).await;
+        let session = fixture.credentials.refresh("access-other").await.unwrap();
+        assert_eq!(session, fixture.session);
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+    }
     #[tokio::test]
     async fn a_refused_refresh_signs_out() {
         let fixture = fixture(30, true).await;
