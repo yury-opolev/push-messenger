@@ -211,7 +211,7 @@ enum KickReason {
   // message-svc.
   KICK_REASON_PASSWORD_RESET = 2;
   // A newer connection of the device identified, on this or another gateway: the older
-  // one stops (close code 4003). From the gateway.
+  // one stops (close code 4007, "opened elsewhere"). From the gateway.
   KICK_REASON_TAKEN_OVER = 3;
 }
 

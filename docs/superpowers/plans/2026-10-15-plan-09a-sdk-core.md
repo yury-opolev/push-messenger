@@ -324,17 +324,23 @@ Decisions the owner made on this plan's review (2026-10-15), recorded in the spe
    with `WrongKey`, a change of key, no stored key, a derivation helper, and the guide.
    (Task 2, Task 6, Task 10, Task 13.)
 
+5. **A removed device keeps its data** (decided 2026-10-15; was "owner decision needed 1").
+   On 4003 the SDK reports `DeviceRemoved` and stops, and erases nothing: it never erases
+   on the server's word, like decision 1. The app may call `sign_out()` itself.
+6. **The SQLite3 Multiple Ciphers source is vendored** (decided 2026-10-15; was "owner
+   decision needed 2", option b): `crates/push-sdk/vendor/sqlite3mc`, hashes verified on
+   every build, updated by a script that verifies the release's signatures.
+
 Earlier owner decisions this plan follows: a password reset signs in again (4001) and a
 revoked device stops (4003) (Plan 7); 4006 is retried and never signs out (Plan 8); groups
 are not offered to apps in the first release (Plan 7); device registration is idempotent
 with a client-chosen `registration_id` and refresh has a 30 s grace (Plan 5).
 
-## Owner decisions needed
+## Owner questions raised on this plan (both decided: Owner decisions 5 and 6)
 
-The plan works as written; these choose a default the owner may want otherwise. Neither
-changes the wire protocol.
+None is open. The discussion is kept for the record.
 
-1. **Should a revoked device erase its local data?**
+1. **Should a revoked device erase its local data?** *Decided: no (Owner decision 5).*
    When a user removes a device from another one ("sign out my old phone"), the gateway
    closes that device's connection with 4003 and the SDK reports `DeviceRemoved` and stops.
    The device can no longer send or receive anything. The question is what happens to the
@@ -366,6 +372,8 @@ changes the wire protocol.
    (a) it reaches us only if someone runs `cargo update` and misses it in review; with (b)
    only if someone replaces the vendored files.
    *Recommendation:* (a) for now; (b) before the first public release of the SDK.
+   *Decided (owner, 2026-10-15):* (b) at once; see spec §8, "The SQLite3 Multiple Ciphers
+   source is vendored".
 
 ## File structure
 
@@ -9703,8 +9711,73 @@ MSVC and in `rust:1.85-slim-bookworm`, there both without and with `libsqlite3-d
 plan's blocks, replayed onto a fresh `main`, reproduce the verified tree exactly. Plan 9B
 ran the SDK against the whole stack, locally and on minikube.
 
+## Review fixes made after the plan was written
+
+The code was reviewed after the tasks above were built, and these fixes were committed on
+the branch; the guide (Task 13) and the docs describe the code as it is now.
+
+- **4007** is the takeover's close code in the gateway and the SDK (Task 1).
+- **Refresh:** a refresh runs spawned, so it finishes when its caller goes away; an access
+  token near expiry is refreshed before use.
+- **Temp store in memory:** SQLite's temporary data never touches a file.
+- **`encryption_unavailable`:** a key given to a SQLite that cannot encrypt is refused
+  (fatal) instead of being ignored.
+- **Atomic versioned migrations:** the schema changes in one transaction under
+  `user_version`.
+- **Stale-history guard:** an old history page never brings back the body of a message
+  that was deleted or edited since.
+- **`change_key` safety, the erase's checkpoint check, `Zeroizing` keys:** a failed rekey
+  leaves the file usable; an erase that cannot truncate the log is an error; key strings
+  are wiped.
+- **4002 back-off reset, capped frames per turn, reads never starve:** a long healthy
+  connection resets the 4002 back-off; a wake sends a bounded number of frames; reads of
+  the socket are served between them.
+- **Stop acknowledgement before a wipe or a rebind:** `sign_out` and `sign_in` stop the
+  connection first (5 s bound) and wait for it; `sign_out` always wipes, even if the
+  keychain delete fails, and returns `connection_busy` without erasing the data if the stop
+  is not confirmed (credentials already forgotten, revocation still attempted).
+- **`timeout` and `unexpected_answer` are not retryable;** `connection_busy` is.
+- **`Client::close`** waits until the connection has stopped and the database is closed;
+  `change_database_key` is async.
+- **Vendored sqlite3mc:** the amalgamation lives in `crates/push-sdk/vendor/sqlite3mc`,
+  checked against pinned SHA-256s on every build, with an update script that verifies the
+  release's signatures (Owner decision 6).
+
 ## Deferred to later plans
 
+- **`open_async` for bindings:** `Client::open` is synchronous (it blocks on the file, the
+  key and the migrations); bindings call it on a blocking thread until an async variant
+  exists.
+- **Timed-out pending requests:** a request that timed out is not cleaned up on its own.
+- **Cancel on an edit id:** `cancel` is given an edit's id and does not treat it as a
+  message's.
+- **Unchecked empty or limit inputs:** some calls do not refuse an empty or out-of-range
+  input before asking the server.
+- **`connect` state is not atomic:** its check of the state and its change are two steps.
+- **A `sign_out` whose stop times out leaves the local data:** it returns
+  `connection_busy` after forgetting the credentials and trying the revocation; the app
+  repeats the call or wipes on the next open.
+- **A `SendAck` the store cannot take stalls the outbox** until the next connection.
+- **A malformed delivery is never acked** and comes again on every connection.
+- **`apply_deliver` is not one transaction.**
+- **Missing tests:** a second 4002 in a row, a `ReAuth` retry, a `Pong` timeout and a
+  broken reconnect have no test of their own.
+- **Wall-clock connection tests:** they wait real time, so a loaded machine can make them
+  flaky.
+- **Argon2 parameters for PINs:** the helper's 19 MiB and 2 passes are a floor; a short PIN
+  can be brute-forced offline. The guide recommends a passphrase or higher parameters and
+  gives an entropy table; the SDK does not enforce a minimum.
+- **Old plaintext after adding a key:** encrypting a plain database in use can leave
+  plaintext in deleted WAL or journal files; the guide recommends choosing encryption at
+  the first open, or wiping and syncing again.
+- **`parent_id` is unused.**
+- **`edit_unsent` matches a message without its `conversation_id`.**
+- **Unread recount** when a read position moves.
+- **Tokens are not zeroized** in memory (the database key is).
+- **Error code name overlap:** the SDK's own `invalid` shares its name with a server
+  refusal code.
+- **The vendored sqlite3mc `LICENSE` is unsigned:** it is not covered by the signature
+  check.
 - **The bindings** (Plan 10): napi-rs and cbindgen over `Client`, `Events`, `SecretStore`
   and `DatabaseKey`, with `catch_unwind`, `*_free` and the callback rules of spec §8.5;
   building SQLite3 Multiple Ciphers for the mobile targets.
@@ -9723,5 +9796,3 @@ ran the SDK against the whole stack, locally and on minikube.
   that chance. Inherent to rotation.
 - **Groups** (owner decision): the store and the types already carry group kinds and
   group receipts; group calls come when the owner turns groups on.
-- **Owner decisions needed 1–2** above (erasing on a revocation, where the SQLite3 Multiple
-  Ciphers source comes from).

@@ -1,0 +1,16 @@
+# SQLite3 Multiple Ciphers, vendored for push-sdk's build.rs.
+# Written by scripts/update-sqlite3mc.ps1 (or .sh); do not edit by hand.
+# build.rs fails the build unless every file: line below has exactly its SHA-256.
+release: v2.5.1
+sqlite3mc: 2.5.1
+sqlite: 3.53.4
+asset: sqlite3mc-2.5.1-sqlite-3.53.4-amalgamation.zip
+asset-sha256: 4125f8ff275ea953dabb3289331b20a0e76d4fc060f57148f4a5df3bf3b0d5e0
+sha256sums-sha256: 307d1b86ac51637cf769a858530c75bcf35a238f9eb1e02c580a12e93893acd1
+source-commit: 91ec9b6a9ec3455c91103788cdbc90dc34d24c6f
+signer: https://github.com/utelle/SQLite3MultipleCiphers/.github/workflows/build-reusable.yml@refs/heads/main
+oidc-issuer: https://token.actions.githubusercontent.com
+retrieved: 2026-10-15
+file: 59e30889a7b0106152e6d4fc3c18ac1592f252cb4defbb0a7e618fdecf1a221c  sqlite3mc_amalgamation.c
+file: 034c22a23268735059850aa22ea79333865c093c90c32287cc03cc606dcbc177  sqlite3mc_amalgamation.h
+file: 39205ec18e0f25f56c62d3bda9768e7509b63a74ba58beb7442903dfc81c247a  LICENSE

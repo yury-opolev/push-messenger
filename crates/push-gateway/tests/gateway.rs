@@ -540,14 +540,15 @@ async fn a_revocation_and_a_password_reset_close_the_socket_at_once() {
     assert_eq!(next(&mut laptop_socket).await, Body::Pong(Pong {}));
 }
 
-/// Spec §7.3: the newest connection of a device wins; the older one is told to stop.
+/// Spec §7.3, §7.4: the newest connection of a device wins; the older one is told it was
+/// opened elsewhere (4007), not that the device was removed (4003).
 #[tokio::test]
 async fn a_newer_connection_of_the_device_takes_over() {
     let stack = stack().await;
     let (user, device) = person(&stack).await;
     let mut first = ready(&stack, user, device).await;
     let mut second = ready(&stack, user, device).await;
-    assert_eq!(close_code(&mut first).await, 4003);
+    assert_eq!(close_code(&mut first).await, 4007);
     send(&mut second, Body::Ping(Ping {})).await;
     assert_eq!(next(&mut second).await, Body::Pong(Pong {}));
 }

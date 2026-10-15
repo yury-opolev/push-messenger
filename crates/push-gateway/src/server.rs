@@ -563,9 +563,9 @@ fn kick_close(reason: KickReason) -> (u16, &'static str) {
             close::INVALID_IDENTITY,
             "the password was changed; sign in again",
         ),
-        KickReason::DeviceRevoked => (close::TAKEN_OVER, "the device was revoked"),
+        KickReason::DeviceRevoked => (close::DEVICE_REMOVED, "the device was revoked"),
         KickReason::TakenOver | KickReason::Unspecified => (
-            close::TAKEN_OVER,
+            close::OPENED_ELSEWHERE,
             "another connection of this device took over",
         ),
     }
@@ -617,9 +617,10 @@ async fn admit(messaging: &mut MessagingApi, claims: &Claims) -> Result<(), Refu
             close::INVALID_IDENTITY,
             "the password was changed; sign in again",
         )),
-        ErrorCode::UnknownDevice => {
-            Err(Refusal::Close(close::TAKEN_OVER, "the device was revoked"))
-        }
+        ErrorCode::UnknownDevice => Err(Refusal::Close(
+            close::DEVICE_REMOVED,
+            "the device was revoked",
+        )),
         ErrorCode::DeviceNotReady => {
             // Normal for a second after a device registers: the worker has not relayed it.
             tracing::debug!(device = %claims.device, "device not relayed yet");

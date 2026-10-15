@@ -1128,8 +1128,8 @@ Implementation notes (push-sdk, Plan 9A):
   one client never presents a rotated refresh token twice; new tokens saved before use),
   `store.rs`, `store/outbox.rs` and `key.rs` (SQLite through `rusqlite` 0.32 — its
   `libsqlite3-sys` must match the one sqlx 0.8 puts in the lockfile — linked to SQLite3
-  Multiple Ciphers, which `push-sdk`'s `build.rs` compiles from the `sqlite3mc-src`
-  amalgamation with `cc`: no system library, no OpenSSL, no Perl; WAL), `policy.rs` (close
+  Multiple Ciphers, which `push-sdk`'s `build.rs` compiles with `cc` from the vendored
+  amalgamation: no system library, no OpenSSL, no Perl; WAL), `policy.rs` (close
   codes, backoff, frame budget, acks; no I/O), `engine.rs` (what rides on a connection,
   without the socket), `connection.rs` (the socket and the reconnect loop), `client.rs`
   and `client/requests.rs`. The client owns a two-worker tokio runtime, dropped with
@@ -1199,10 +1199,43 @@ Implementation notes (push-sdk, Plan 9A):
   (`opened_elsewhere`), and with `disconnected` when the connection drops before the
   answer. `connect()` moves a stopped state to `Connecting` before it returns, so a request
   right after it waits instead of failing as offline. The SDK never repeats a request.
-  Errors carry a stable string code: the server's own for refusals.
+  Errors carry a stable string code: the server's own for refusals. A request sent but not
+  answered in time is `timeout` (not retryable: it may have been carried out); an answer of
+  the wrong kind is `unexpected_answer` (not retryable); `connection_busy` (retryable) means
+  a sign-out or sign-in could not stop the connection in time: the store was not changed
+  (a sign-out has forgotten the credentials by then and still tries the revocation);
+  `encryption_unavailable` (fatal: do not retry) means a key was given but the linked
+  SQLite is not SQLite3 Multiple Ciphers, so database encryption is unavailable.
+- **Sign-out and sign-in stop the connection first.** `sign_out` forgets the credentials
+  and the device (both deletes are tried), waits (up to 5 s) until the connection task
+  confirms it stopped and will not touch the store again, then erases the local data, and
+  finally asks auth-svc to revoke the device; the erase and the revocation happen even if
+  the keychain delete failed, and the first error is reported. A sign-in waits for a
+  refresh in flight before it saves its tokens, so a refresh of the earlier session
+  cannot overwrite them. `sign_in` does the same wait before it binds the
+  store to the user, so a connection of an earlier user cannot write into the new user's
+  data; the app calls `connect()` again afterwards. `Client::close()` stops the connection,
+  the runtime and the store, for apps that need the database file closed at once.
+- **The SQLite3 Multiple Ciphers source is vendored** (owner decision, Plan 9A), not
+  taken from a crate: `crates/push-sdk/vendor/sqlite3mc` holds the release's
+  `sqlite3mc_amalgamation.c` and `.h` byte for byte (marked `binary` in `.gitattributes`,
+  so git never rewrites their line endings) and upstream's `LICENSE`. `VERSION` records
+  the release tag, the SQLite version, the release asset's SHA-256 and the SHA-256 of each
+  file; `build.rs` hashes every file before compiling and fails the build on any
+  difference. `scripts/update-sqlite3mc.ps1 -Version <x.y.z>` (or `update-sqlite3mc.sh
+  <x.y.z>`) downloads a release from `utelle/SQLite3MultipleCiphers` and replaces the
+  files only after `gh attestation verify` accepts the GitHub Artifact Attestations of
+  the amalgamation zip and of `SHA256SUMS`, `cosign verify-blob` (when cosign is
+  installed) accepts the signature of `SHA256SUMS`, and the zip's hash is the one
+  `SHA256SUMS` lists. The trust anchor is Sigstore's public-good root plus the exact
+  signer identity `https://github.com/utelle/SQLite3MultipleCiphers/.github/workflows/build-reusable.yml@refs/heads/main`
+  (issuer `https://token.actions.githubusercontent.com`); keyless signing has no key
+  fingerprint to pin. `LICENSE` is not in the zip and is fetched over HTTPS at the
+  commit the attestation names. Vendored now: 2.5.1 (SQLite 3.53.4), the same bytes the
+  `sqlite3mc-src` crate 205.1.0 shipped.
 - **Not yet:** proxies, and TLS against a real certificate (compiled in, first used in
-  Plan 11). Open owner questions (Plan 9A): whether a revoked device (4003) should erase
-  its data, and whether to vendor the SQLite3 Multiple Ciphers source.
+  Plan 11). Decided (owner, Plan 9A): a revoked device (4003) keeps its data, like every
+  server-side sign-out; the app may still call `sign_out()` itself.
 
 ## 9. Email
 
