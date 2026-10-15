@@ -142,7 +142,9 @@ await client.close();
   thrown by the listener is reported as an uncaught exception.
 - `close()` aborts the calls still pending, which reject with `closed` rather than staying
   pending, and resolves once the database is closed. It rejects with `timeout` if the work
-  does not end within its 5 s cap (the database closes once it does). It is memoized: every
+  does not end within its 5 s cap (the database closes once it does). The whole close takes
+  at most about 15 s: 5 s for the calls, 5 s for other holders of the client, 5 s for the
+  runtime to end. It is memoized: every
   call returns the same promise. A call made after `close()` fails with `closed`, and so does
   `onEvent`, which throws.
 - The connection does not keep Node running. Without an event listener or a pending call,

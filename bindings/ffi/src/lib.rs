@@ -97,4 +97,21 @@ mod tests {
         block_on(client.close()).unwrap();
         drop(runtime);
     }
+
+    /// Waiting for a clone to go must not need a runtime on the thread that closes.
+    #[test]
+    fn close_waits_for_a_clone_from_a_thread_without_a_runtime() {
+        let (client, _events) = Client::open(
+            Config::new("http://127.0.0.1:1", "http://127.0.0.1:1", ":memory:"),
+            Arc::new(MemorySecretStore::new()),
+        )
+        .unwrap();
+        let clone = client.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(clone);
+        });
+        let closing = std::thread::spawn(move || block_on(client.close()));
+        assert_eq!(closing.join().expect("close must not panic"), Ok(()));
+    }
 }

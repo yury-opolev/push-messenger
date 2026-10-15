@@ -205,6 +205,21 @@ test('a store whose load throws or rejects fails the open with secrets', { timeo
   await assert.rejects(Client.open(config(), rejecting), code('secrets'));
 });
 
+test('close() right after signOut() waits for its slow store tail, and the database opens again', { timeout: 20000 }, async () => {
+  const store = memoryStore();
+  const databasePath = path.join(scratchDir('close-after-sign-out'), 'client.db');
+  const client = await Client.open(config({ databasePath }), store);
+  await client.signIn('a@example.com', 'password', 'node test', 'desktop');
+  store.later = () => new Promise((resolve) => setTimeout(resolve, 1500));
+  const signedOut = client.signOut().catch(() => {});
+  // The sign-out reaches its shielded part, which the close cannot abort.
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  await client.close();
+  await signedOut;
+  const again = await Client.open(config({ databasePath }), memoryStore());
+  await again.close();
+});
+
 test('close() twice, also at once, gives every caller the same outcome', async () => {
   const client = await Client.open(config(), memoryStore());
   const first = client.close();

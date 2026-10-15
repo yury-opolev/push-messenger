@@ -24,7 +24,9 @@
  *   pending call.
  * - `close()` rejects the calls still pending with `closed` and aborts their work, so the
  *   database is closed when it resolves. It rejects with `timeout` if that work does not end
- *   within 5 s; the database closes once it does. Calling it again gives the same promise.
+ *   within 5 s; the database closes once it does. The whole close takes at most about 15 s
+ *   (5 s for the calls, 5 s for other holders of the client, 5 s for the runtime to end).
+ *   Calling it again gives the same promise.
  *
  * docs/sdk-bindings.md describes every call and the shapes of the data.
  */

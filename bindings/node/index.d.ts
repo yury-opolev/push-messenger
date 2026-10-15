@@ -147,7 +147,9 @@ export class Client {
   /**
    * Stops the connection and closes the database. Calls still pending reject with `closed`
    * and their work is aborted, so the database is closed when this resolves. Rejects with
-   * `timeout` if that work does not end within 5 s (the database closes once it does). Later
+   * `timeout` if that work does not end within 5 s (the database closes once it does).
+   * The whole close takes at most about 15 s: 5 s for the calls, 5 s for other holders of the
+   * client, 5 s for the runtime to end. Later
    * calls fail with `closed`; calling `close()` again returns the same promise.
    */
   close(): Promise<void>;

@@ -507,6 +507,15 @@ impl Client {
     pub async fn close(self) -> Result<(), SdkError> {
         let inner = self.inner.clone();
         let stopped = self.run(async move { stop_connection(&inner).await }).await;
+        // The caller may have no tokio runtime (the bindings' threads), so the waiting
+        // sleeps on the client's.
+        let handle = self
+            .inner
+            .runtime
+            .as_ref()
+            .ok_or(SdkError::Closed)?
+            .handle()
+            .clone();
         let deadline = tokio::time::Instant::now() + STOP_TIMEOUT;
         let mut shared = self.inner;
         let mut inner = loop {
@@ -518,7 +527,9 @@ impl Client {
                 }
                 Err(still_shared) => {
                     shared = still_shared;
-                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    let _ = handle
+                        .spawn(async { tokio::time::sleep(Duration::from_millis(10)).await })
+                        .await;
                 }
             }
         };
