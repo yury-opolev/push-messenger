@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use push_domain::{ConversationId, DeviceId, UserId};
 use tokio::runtime::Runtime;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::SdkError;
 use crate::auth::{AuthApi, Platform};
@@ -74,6 +74,26 @@ async fn blocking<T: Send + 'static>(
     tokio::task::spawn_blocking(move || work(&mut shared.store()))
         .await
         .unwrap_or_else(|_| Err(SdkError::Storage("the store task ended".to_owned())))
+}
+
+/// How long a sign-out, a sign-in or a close waits for the connection task to confirm it
+/// stopped (closing a socket takes up to 2 s).
+const STOP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Stops the connection and waits until its task has ended the connection and will not
+/// touch the store again. [`SdkError::ConnectionBusy`] if that is not confirmed in time:
+/// the caller must then not wipe or rebind the store.
+async fn stop_connection(inner: &Inner) -> Result<(), SdkError> {
+    let (ack, stopped) = oneshot::channel();
+    inner
+        .commands
+        .send(Command::Stop(ack))
+        .map_err(|_| SdkError::Closed)?;
+    match tokio::time::timeout(STOP_TIMEOUT, stopped).await {
+        // A dropped acknowledgement means the task itself is gone.
+        Ok(_) => Ok(()),
+        Err(_) => Err(SdkError::ConnectionBusy),
+    }
 }
 
 /// The signed-in user and device.
@@ -253,7 +273,10 @@ impl Client {
     /// signed in again if it is still active; otherwise a device is registered, with a
     /// `registration_id` kept until the registration is answered and its tokens saved, so
     /// a retry, even after a restart, never creates a second device. Then call
-    /// [`Client::connect`].
+    /// [`Client::connect`]. A connection that is up (or coming up) is stopped first, and
+    /// this waits for it, so one for an earlier user never writes into the new user's
+    /// data ([`SdkError::ConnectionBusy`] if it does not stop in time: the new session is
+    /// saved then, and signing in again completes the sign-in). Connect again afterwards.
     pub async fn sign_in(
         &self,
         email: &str,
@@ -308,6 +331,10 @@ impl Client {
             let session = credentials.sign_in(tokens)?;
             credentials.registration_done()?;
             let user = session.user_id;
+            // A connection of the earlier user may be live (or handshaking): it stops
+            // before the store changes hands, and it does not come back as the earlier
+            // user, the session being the new one's now. The app connects again.
+            stop_connection(&inner).await?;
             blocking(&inner.shared, move |store| store.bind_owner(user)).await?;
             Ok(Account {
                 user_id: session.user_id,
@@ -333,10 +360,21 @@ impl Client {
     /// removed from another device ([`Client::revoke_device`]).
     pub async fn sign_out(&self) -> Result<(), SdkError> {
         let inner = self.inner.clone();
-        self.command(Command::Disconnect)?;
         self.run(async move {
-            let session = inner.credentials.sign_out_for_good().await?;
-            blocking(&inner.shared, |store| store.erase_all()).await?;
+            // The session goes first, so no connection can start again; then the one that
+            // runs is stopped, and only then is the store erased: nothing of it can come
+            // after the erase. An explicit sign-out always erases: a failed keychain
+            // delete does not keep the local data, and the first error is reported.
+            let forgotten = inner.credentials.sign_out_for_good().await;
+            let stopped = stop_connection(&inner).await;
+            if let Err(error) = stopped {
+                return Err(forgotten.err().unwrap_or(error));
+            }
+            let erased = blocking(&inner.shared, |store| store.erase_all()).await;
+            let session = match (forgotten, erased) {
+                (Ok(session), Ok(())) => session,
+                (Err(error), _) | (Ok(_), Err(error)) => return Err(error),
+            };
             let Some(session) = session else {
                 return Ok(());
             };
@@ -391,6 +429,35 @@ impl Client {
     /// Closes the connection and stops reconnecting. The outbox waits.
     pub fn disconnect(&self) -> Result<(), SdkError> {
         self.command(Command::Disconnect)
+    }
+
+    /// Shuts the client down and waits until the connection has stopped, the runtime has
+    /// ended and the local database is closed, so the file can be opened again, rekeyed
+    /// or deleted at once. Dropping the client does the same without waiting (it never
+    /// blocks); an app that does not need to wait may simply drop it.
+    ///
+    /// Only the last handle can close the database: with other clones alive this still
+    /// disconnects, and returns [`SdkError::Invalid`].
+    pub async fn close(self) -> Result<(), SdkError> {
+        let inner = self.inner.clone();
+        let stopped = self.run(async move { stop_connection(&inner).await }).await;
+        let Ok(mut inner) = Arc::try_unwrap(self.inner) else {
+            return Err(SdkError::Invalid(
+                "other clones of the client are alive: close the last one".to_owned(),
+            ));
+        };
+        let runtime = inner.runtime.take();
+        let (done, finished) = oneshot::channel();
+        // Dropping a runtime waits for its tasks, which an async caller must not do.
+        std::thread::spawn(move || {
+            if let Some(runtime) = runtime {
+                runtime.shutdown_timeout(STOP_TIMEOUT);
+            }
+            drop(inner);
+            let _ = done.send(());
+        });
+        let _ = finished.await;
+        stopped
     }
 
     pub fn connection_state(&self) -> ConnectionState {
@@ -673,6 +740,158 @@ mod tests {
         assert_eq!(secrets.load(REGISTRATION_KEY).unwrap(), None);
     }
 
+    /// Streams deliveries for `conversation` until the connection is gone. It never reads,
+    /// so a close handshake from the client takes its whole wait.
+    fn stream_deliveries(
+        mut socket: crate::testing::Server,
+        conversation: ConversationId,
+        peer: UserId,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            for seq in 1.. {
+                let entry = crate::store::tests::entry(
+                    conversation,
+                    peer,
+                    seq,
+                    push_proto::v1::EntryKind::Message,
+                );
+                if !crate::testing::try_send(&mut socket, Body::Deliver(entry)).await {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+    }
+
+    fn is_empty(client: &Client) -> bool {
+        let store = client.inner.shared.store();
+        store.owner().unwrap().is_none()
+            && store.conversations().unwrap().is_empty()
+            && store.outbox().unwrap().is_empty()
+    }
+
+    #[tokio::test]
+    async fn signing_out_waits_for_the_connection_and_nothing_comes_back() {
+        let mut f = Fixture::new().await;
+        let (conversation, peer) = f.conversation();
+        queue(&f.client, conversation, "unsent");
+        f.client.connect().unwrap();
+        let socket = f.ready().await;
+        f.client
+            .wait_connected(Duration::from_secs(5))
+            .await
+            .unwrap();
+        let _deliveries = stream_deliveries(socket, conversation, peer);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!is_empty(&f.client), "deliveries are landing");
+
+        f.client.sign_out().await.unwrap();
+        assert_eq!(f.client.connection_state(), ConnectionState::Offline);
+        assert!(is_empty(&f.client));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(is_empty(&f.client));
+    }
+
+    #[tokio::test]
+    async fn signing_out_during_the_handshake_cannot_rebind_the_wiped_store() {
+        let f = Fixture::new().await;
+        let session = f.client.account().unwrap().unwrap();
+        // Expiring: the connection refreshes (slowly) before it binds the store.
+        crate::secrets::Session {
+            user_id: session.user_id,
+            device_id: session.device_id,
+            access_token: "access-old".to_owned(),
+            access_expires_at: crate::credentials::unix_now() + 10,
+            refresh_token: "refresh-old".to_owned(),
+        }
+        .save(f.secrets.as_ref())
+        .unwrap();
+        f.auth.refresh_delay_ms.store(400, Ordering::SeqCst);
+        f.client.connect().unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        f.client.sign_out().await.unwrap();
+        assert!(is_empty(&f.client));
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert!(is_empty(&f.client));
+    }
+
+    #[tokio::test]
+    async fn signing_in_as_another_user_stops_the_old_connection_first() {
+        let mut f = Fixture::new().await;
+        let (conversation, peer) = f.conversation();
+        f.client.connect().unwrap();
+        let socket = f.ready().await;
+        f.client
+            .wait_connected(Duration::from_secs(5))
+            .await
+            .unwrap();
+        let _deliveries = stream_deliveries(socket, conversation, peer);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(f.client.conversation(conversation).unwrap().is_some());
+
+        let user_b = UserId::new();
+        *f.auth.identity.lock().unwrap() = (user_b, DeviceId::new());
+        let account = f
+            .client
+            .sign_in("b@example.com", "password", "tablet", Platform::Ios)
+            .await
+            .unwrap();
+        assert_eq!(account.user_id, user_b);
+        assert_eq!(f.client.connection_state(), ConnectionState::Offline);
+        let holds_a_data = |client: &Client| {
+            let store = client.inner.shared.store();
+            store.owner().unwrap() != Some(user_b) || !store.conversations().unwrap().is_empty()
+        };
+        assert!(!holds_a_data(&f.client));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!holds_a_data(&f.client));
+    }
+
+    /// A keychain that cannot delete the session.
+    #[derive(Default)]
+    struct Undeletable(MemorySecretStore);
+
+    impl SecretStore for Undeletable {
+        fn load(&self, key: &str) -> Result<Option<Vec<u8>>, crate::SecretError> {
+            self.0.load(key)
+        }
+
+        fn save(&self, key: &str, value: &[u8]) -> Result<(), crate::SecretError> {
+            self.0.save(key, value)
+        }
+
+        fn delete(&self, key: &str) -> Result<(), crate::SecretError> {
+            if key == crate::secrets::SESSION_KEY {
+                return Err(crate::SecretError("the keychain is locked".to_owned()));
+            }
+            self.0.delete(key)
+        }
+    }
+
+    #[tokio::test]
+    async fn signing_out_erases_even_when_the_keychain_delete_fails() {
+        let (auth, gateway) = (FakeAuth::start().await, FakeGateway::start().await);
+        let secrets = Arc::new(Undeletable::default());
+        let database = format!("file:client-{}?mode=memory&cache=shared", Uuid::now_v7());
+        let config = Config::new(&auth.url, &gateway.url, &database);
+        let (client, _events) = Client::open(config, secrets).unwrap();
+        client
+            .sign_in("a@example.com", "password", "phone", Platform::Ios)
+            .await
+            .unwrap();
+        let conversation = ConversationId::new();
+        client
+            .inner
+            .shared
+            .store()
+            .open_direct(conversation, UserId::new())
+            .unwrap();
+        queue(&client, conversation, "unsent");
+        let error = client.sign_out().await.unwrap_err();
+        assert!(matches!(error, SdkError::Secrets(_)));
+        assert!(is_empty(&client));
+    }
+
     #[tokio::test]
     async fn an_encrypted_database_opens_only_with_its_key() {
         let scratch = crate::store::tests::Scratch::new();
@@ -697,7 +916,8 @@ mod tests {
             .open_direct(conversation, UserId::new())
             .unwrap();
         queue(&client, conversation, "for the key holder");
-        drop((client, events));
+        client.close().await.unwrap();
+        drop(events);
         assert!(!scratch.holds("for the key holder"));
 
         for wrong in [None, Some(DatabaseKey::derive(b"1357", &salt).unwrap())] {
@@ -708,7 +928,7 @@ mod tests {
         assert_eq!(client.messages(conversation, None, 10).unwrap().len(), 1);
         let changed = DatabaseKey::derive(b"new pin", &salt).unwrap();
         client.change_database_key(Some(&changed)).await.unwrap();
-        drop(client);
+        client.close().await.unwrap();
         let (client, _events) = Client::open(config(Some(&changed)), secrets).unwrap();
         assert_eq!(client.messages(conversation, None, 10).unwrap().len(), 1);
     }

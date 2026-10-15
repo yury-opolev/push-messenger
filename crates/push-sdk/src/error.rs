@@ -44,7 +44,20 @@ pub enum SdkError {
         /// Rate limited: when the same request may succeed.
         retry_after_s: Option<u32>,
     },
-    /// The server could not be reached, or answered something unreadable.
+    /// The request was sent and no answer came in time: it may or may not have been
+    /// carried out, so repeating it unchanged could do it twice. Not retryable; check
+    /// what the server holds first.
+    #[error("no answer from the server in time")]
+    Timeout,
+    /// The server answered something this client does not understand (a protocol
+    /// mismatch). Repeating the call does not help.
+    #[error("unexpected answer: {0}")]
+    UnexpectedAnswer(String),
+    /// The connection to the server could not be stopped in time (a sign-out or sign-in
+    /// must not change local data while it runs): nothing was changed; try again.
+    #[error("the connection did not stop in time")]
+    ConnectionBusy,
+    /// The server could not be reached.
     #[error("network: {0}")]
     Network(String),
     /// The local database failed.
@@ -81,6 +94,9 @@ impl SdkError {
             Self::Offline => "offline",
             Self::Disconnected => "disconnected",
             Self::Server { code, .. } => code,
+            Self::Timeout => "timeout",
+            Self::UnexpectedAnswer(_) => "unexpected_answer",
+            Self::ConnectionBusy => "connection_busy",
             Self::Network(_) => "network",
             Self::Storage(_) => "storage",
             Self::WrongKey => "wrong_key",
@@ -93,7 +109,7 @@ impl SdkError {
     /// Whether the same call may succeed later, unchanged.
     pub fn is_retryable(&self) -> bool {
         match self {
-            Self::Offline | Self::Disconnected | Self::Network(_) => true,
+            Self::Offline | Self::Disconnected | Self::Network(_) | Self::ConnectionBusy => true,
             Self::Server { retryable, .. } => *retryable,
             _ => false,
         }
@@ -161,5 +177,16 @@ mod tests {
         assert_eq!(SdkError::WrongKey.code(), "wrong_key");
         assert!(!SdkError::WrongKey.is_retryable());
         assert!(!SdkError::NotSignedIn.is_retryable());
+    }
+
+    #[test]
+    fn an_unanswered_or_misunderstood_request_is_not_retryable() {
+        assert_eq!(SdkError::Timeout.code(), "timeout");
+        assert!(!SdkError::Timeout.is_retryable());
+        let mismatch = SdkError::UnexpectedAnswer("x".to_owned());
+        assert_eq!(mismatch.code(), "unexpected_answer");
+        assert!(!mismatch.is_retryable());
+        assert_eq!(SdkError::ConnectionBusy.code(), "connection_busy");
+        assert!(SdkError::ConnectionBusy.is_retryable());
     }
 }

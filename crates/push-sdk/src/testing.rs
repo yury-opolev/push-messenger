@@ -90,6 +90,14 @@ pub(crate) async fn send(socket: &mut Server, body: Body) {
         .unwrap();
 }
 
+/// Like [`send`], but false instead of a panic once the connection is gone.
+pub(crate) async fn try_send(socket: &mut Server, body: Body) -> bool {
+    socket
+        .send(Message::Binary(encode_frame(body).into()))
+        .await
+        .is_ok()
+}
+
 pub(crate) async fn close(socket: &mut Server, code: u16) {
     let frame = CloseFrame {
         code: CloseCode::from(code),
@@ -104,6 +112,8 @@ pub(crate) struct FakeAuth {
     pub url: String,
     pub user: UserId,
     pub device: DeviceId,
+    /// Who the tokens it issues name from now on; starts as `user` and `device`.
+    pub identity: Arc<Mutex<(UserId, DeviceId)>>,
     pub registrations: Arc<AtomicUsize>,
     pub refreshes: Arc<AtomicUsize>,
     pub device_logins: Arc<AtomicUsize>,
@@ -129,7 +139,10 @@ impl FakeAuth {
         let fail_revocations = Arc::new(AtomicBool::new(false));
         let spend_next_registration = Arc::new(AtomicBool::new(false));
         let registration_ids = Arc::new(Mutex::new(Vec::new()));
+        let identity = Arc::new(Mutex::new((user, device)));
+        let current = identity.clone();
         let tokens = move |n: usize| {
+            let (user, device) = *current.lock().unwrap();
             json!({
                 "user_id": user,
                 "device_id": device,
@@ -150,11 +163,13 @@ impl FakeAuth {
             spend_next_registration.clone(),
             registration_ids.clone(),
         );
+        let (login_tokens, device_tokens, refresh_tokens) =
+            (tokens.clone(), tokens.clone(), tokens);
         let router = Router::new()
             .route(
                 "/v1/auth/login",
                 post(move |Json(body): Json<Value>| {
-                    let logins = logins.clone();
+                    let (logins, tokens) = (logins.clone(), login_tokens.clone());
                     async move {
                         if body.get("device_id").is_some() {
                             let n = logins.fetch_add(1, Ordering::SeqCst) + 100;
@@ -170,6 +185,7 @@ impl FakeAuth {
                 "/v1/devices",
                 post(move |Json(body): Json<Value>| {
                     let (registered, spend, ids) = (registered.clone(), spend.clone(), ids.clone());
+                    let tokens = device_tokens.clone();
                     async move {
                         let id = body["registration_id"].as_str().expect("a registration_id");
                         ids.lock().unwrap().push(id.to_owned());
@@ -199,6 +215,7 @@ impl FakeAuth {
                 "/v1/auth/refresh",
                 post(move || {
                     let (refreshed, delay) = (refreshed.clone(), delay.clone());
+                    let tokens = refresh_tokens.clone();
                     async move {
                         let n = refreshed.fetch_add(1, Ordering::SeqCst) + 1;
                         let delay = Duration::from_millis(delay.load(Ordering::SeqCst));
@@ -214,6 +231,7 @@ impl FakeAuth {
             url,
             user,
             device,
+            identity,
             registrations,
             refreshes,
             device_logins,

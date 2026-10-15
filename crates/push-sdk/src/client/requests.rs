@@ -56,7 +56,7 @@ impl Client {
             match tokio::time::timeout(inner.request_timeout, answer).await {
                 Ok(Ok(result)) => result,
                 Ok(Err(_)) => Err(SdkError::Disconnected),
-                Err(_) => Err(SdkError::Network("no answer in time".to_owned())),
+                Err(_) => Err(SdkError::Timeout),
             }
         })
         .await
@@ -308,7 +308,7 @@ impl Client {
 }
 
 fn unexpected() -> SdkError {
-    SdkError::Network("the server answered with something unexpected".to_owned())
+    SdkError::UnexpectedAnswer("the server answered with something unexpected".to_owned())
 }
 
 #[cfg(test)]
@@ -374,6 +374,38 @@ mod tests {
         };
         send(&mut socket, Body::Response(answer)).await;
         assert!(opening.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn an_unanswered_or_misanswered_request_is_not_retryable() {
+        let mut f = Fixture::new().await;
+        f.client.connect().unwrap();
+        let mut socket = f.ready().await;
+        let (client, peer) = (f.client.clone(), UserId::new());
+        let unanswered = tokio::spawn(async move { client.create_invite(600, 1).await });
+        recv_until(&mut socket, |body| matches!(body, Body::Request(_))).await;
+        let error = unanswered.await.unwrap().unwrap_err();
+        assert_eq!(error, SdkError::Timeout);
+        assert_eq!(error.code(), "timeout");
+        assert!(!error.is_retryable());
+
+        let client = f.client.clone();
+        let wrong = tokio::spawn(async move { client.open_direct(peer).await });
+        let Body::Request(request) = recv_until(&mut socket, |body| {
+            matches!(body, Body::Request(request) if matches!(request.body, Some(request::Body::OpenDirect(_))))
+        })
+        .await
+        else {
+            unreachable!();
+        };
+        let answer = v1::Response {
+            request_id: request.request_id,
+            body: Some(response::Body::Conversations(Default::default())),
+        };
+        send(&mut socket, Body::Response(answer)).await;
+        let error = wrong.await.unwrap().unwrap_err();
+        assert_eq!(error.code(), "unexpected_answer");
+        assert!(!error.is_retryable());
     }
 
     #[tokio::test]

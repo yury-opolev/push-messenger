@@ -72,6 +72,9 @@ pub(crate) enum Command {
     Connect,
     /// Close the connection and stop reconnecting.
     Disconnect,
+    /// Like `Disconnect`, and fires the sender once the connection has ended and the task
+    /// will not touch the store again, so the caller may erase or rebind it.
+    Stop(oneshot::Sender<()>),
     /// The outbox or a read position changed.
     Wake,
     /// A request (spec §7.1); answered with its `Response`, or an error.
@@ -89,8 +92,8 @@ pub(crate) struct Endpoint {
 
 /// How a connection ended.
 enum Ended {
-    /// The app disconnected.
-    Disconnected,
+    /// The app disconnected (and wants to know when it is done: a `Stop`).
+    Disconnected(Option<oneshot::Sender<()>>),
     /// The client is gone.
     Closed,
     /// No credentials, or auth-svc refused them.
@@ -183,15 +186,22 @@ impl Connection {
                         let _ = reply.send(Err(SdkError::Offline));
                         continue;
                     }
+                    Some(Command::Stop(ack)) => {
+                        let _ = ack.send(());
+                        continue;
+                    }
                     Some(Command::Disconnect | Command::Wake) => continue,
                 }
             }
             self.set_state(ConnectionState::Connecting);
             let (after, ready_for, token) = match self.connect_and_serve().await {
                 Ended::Closed => return,
-                Ended::Disconnected => {
+                Ended::Disconnected(ack) => {
                     wanted = false;
                     self.set_state(ConnectionState::Offline);
+                    if let Some(ack) = ack {
+                        let _ = ack.send(());
+                    }
                     continue;
                 }
                 Ended::SignedOut => {
@@ -269,6 +279,12 @@ impl Connection {
                             self.set_state(ConnectionState::Offline);
                             break;
                         }
+                        Some(Command::Stop(ack)) => {
+                            wanted = false;
+                            self.set_state(ConnectionState::Offline);
+                            let _ = ack.send(());
+                            break;
+                        }
                         Some(Command::Request { reply, .. }) => {
                             let _ = reply.send(Err(SdkError::Offline));
                         }
@@ -279,64 +295,127 @@ impl Connection {
         }
     }
 
+    /// The handshake runs where a `Stop` or `Disconnect` can end it at once: until the
+    /// connection serves, nothing of it is worth keeping, and a `Stop` must not wait for
+    /// a slow gateway.
     async fn connect_and_serve(&mut self) -> Ended {
-        let session = match self.credentials.fresh().await {
-            Ok(session) => session,
-            Err(SdkError::NotSignedIn) => return Ended::SignedOut,
-            Err(error) => {
-                tracing::info!(code = error.code(), "could not get an access token");
-                return lost(AfterClose::Reconnect, None, String::new());
+        let mut handshake = Box::pin(Self::handshake(
+            self.credentials.clone(),
+            self.shared.clone(),
+            self.endpoint.clone(),
+        ));
+        let shaken = loop {
+            tokio::select! {
+                shaken = &mut handshake => break shaken,
+                command = self.commands.recv() => match command {
+                    None => return Ended::Closed,
+                    Some(Command::Disconnect) => return Ended::Disconnected(None),
+                    Some(Command::Stop(ack)) => {
+                        // Dropped first: nothing of it runs after the acknowledgement.
+                        drop(handshake);
+                        return Ended::Disconnected(Some(ack));
+                    }
+                    Some(Command::Request { reply, .. }) => {
+                        let _ = reply.send(Err(SdkError::Offline));
+                    }
+                    Some(Command::Connect | Command::Wake) => {}
+                },
             }
         };
-        let shared = Arc::clone(&self.shared);
-        let user = session.user_id;
-        // Whole-file work (an erase may truncate the log): off the async workers.
-        let bound = match tokio::task::spawn_blocking(move || shared.store().bind_owner(user)).await
-        {
-            Ok(bound) => bound,
-            Err(_) => Err(SdkError::Storage("the store task ended".to_owned())),
+        match shaken {
+            Ok((socket, session, ready)) => self.serve(socket, &session, &ready).await,
+            Err(ended) => ended,
+        }
+    }
+
+    /// Gets a session, binds the store to its user, opens the socket and identifies.
+    /// Holds no reference to the task, so it can be dropped at any await.
+    async fn handshake(
+        credentials: Arc<Credentials>,
+        shared: Arc<Shared>,
+        endpoint: Endpoint,
+    ) -> Result<(Socket, Session, v1::Ready), Ended> {
+        let session = match credentials.fresh().await {
+            Ok(session) => session,
+            Err(SdkError::NotSignedIn) => return Err(Ended::SignedOut),
+            Err(error) => {
+                tracing::info!(code = error.code(), "could not get an access token");
+                return Err(lost(AfterClose::Reconnect, None, String::new()));
+            }
         };
+        let (user, device) = (session.user_id, session.device_id);
+        let (bind_shared, bind_credentials) = (shared, credentials.clone());
+        // Whole-file work (an erase may truncate the log): off the async workers. The
+        // session is checked again under the store's lock: a sign-out or sign-in that
+        // changed it has wiped or is about to rebind the store, and a bind for the old
+        // session must not come after that.
+        let bound = tokio::task::spawn_blocking(move || {
+            let mut store = bind_shared.store();
+            match bind_credentials.session() {
+                Ok(Some(current)) if current.user_id == user && current.device_id == device => {
+                    store.bind_owner(user).map(Some)
+                }
+                Ok(_) => Ok(None),
+                Err(error) => Err(error),
+            }
+        })
+        .await
+        .unwrap_or_else(|_| Err(SdkError::Storage("the store task ended".to_owned())));
         match bound {
-            Ok(true) => tracing::info!("another user signed in: the local store was emptied"),
-            Ok(false) => {}
+            Ok(Some(true)) => {
+                tracing::info!("another user signed in: the local store was emptied");
+            }
+            Ok(Some(false)) => {}
+            Ok(None) => {
+                tracing::info!("the session changed meanwhile");
+                return Err(lost(AfterClose::Reconnect, None, session.access_token));
+            }
             Err(error) => {
                 tracing::warn!(code = error.code(), "could not open the local store");
-                return lost(AfterClose::Reconnect, None, session.access_token);
+                return Err(lost(AfterClose::Reconnect, None, session.access_token));
             }
         }
         let token = session.access_token.clone();
-        let mut socket = match timeout(CONNECT_TIMEOUT, open(&self.endpoint)).await {
+        let mut socket = match timeout(CONNECT_TIMEOUT, open(&endpoint)).await {
             Ok(Ok(socket)) => socket,
             Ok(Err(error)) => {
                 tracing::info!(%error, "could not connect");
-                return lost(AfterClose::Reconnect, None, token);
+                return Err(lost(AfterClose::Reconnect, None, token));
             }
             Err(_) => {
                 tracing::info!("connecting timed out");
-                return lost(AfterClose::Reconnect, None, token);
+                return Err(lost(AfterClose::Reconnect, None, token));
             }
         };
         let identify = Body::Identify(Identify {
             token: token.clone(),
         });
         if send_now(&mut socket, identify).await.is_err() {
-            return lost(AfterClose::Reconnect, None, token);
+            return Err(lost(AfterClose::Reconnect, None, token));
         }
         let ready = match timeout(IDENTIFY_TIMEOUT, first_answer(&mut socket)).await {
             Ok(Ok(ready)) => ready,
-            Ok(Err(code)) => return lost(after_close(code), None, token),
+            Ok(Err(code)) => return Err(lost(after_close(code), None, token)),
             Err(_) => {
                 tracing::info!("no answer to Identify");
-                return lost(AfterClose::Reconnect, None, token);
+                return Err(lost(AfterClose::Reconnect, None, token));
             }
         };
         if ready.user_id != id_bytes(session.user_id.0)
             || ready.device_id != id_bytes(session.device_id.0)
         {
             tracing::warn!("Ready named another user or device than the token");
-            return lost(AfterClose::Reconnect, None, token);
+            return Err(lost(AfterClose::Reconnect, None, token));
         }
-        self.serve(socket, &session, &ready).await
+        // After all the awaits: a session that changed meanwhile must not be served.
+        let unchanged = credentials.session().is_ok_and(|current| {
+            current.is_some_and(|current| current.user_id == user && current.device_id == device)
+        });
+        if !unchanged {
+            tracing::info!("the session changed meanwhile");
+            return Err(lost(AfterClose::Reconnect, None, token));
+        }
+        Ok((socket, session, ready))
     }
 
     async fn serve(&mut self, socket: Socket, session: &Session, ready: &v1::Ready) -> Ended {
@@ -408,7 +487,12 @@ impl Connection {
                     Some(Command::Disconnect) => {
                         live.close().await;
                         self.end(&mut live);
-                        return Ended::Disconnected;
+                        return Ended::Disconnected(None);
+                    }
+                    Some(Command::Stop(ack)) => {
+                        live.close().await;
+                        self.end(&mut live);
+                        return Ended::Disconnected(Some(ack));
                     }
                     Some(Command::Connect) => {}
                     Some(Command::Wake) => self.engine.wake(unix_ms(), &mut out),
@@ -490,7 +574,9 @@ impl Connection {
             Body::Response(answer) => {
                 if let Some(reply) = live.pending.remove(&answer.request_id) {
                     let _ = reply.send(answer.body.ok_or_else(|| {
-                        SdkError::Network("the server answered a request with nothing".to_owned())
+                        SdkError::UnexpectedAnswer(
+                            "the server answered a request with nothing".to_owned(),
+                        )
                     }));
                 }
             }

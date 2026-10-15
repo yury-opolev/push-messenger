@@ -1199,7 +1199,17 @@ Implementation notes (push-sdk, Plan 9A):
   (`opened_elsewhere`), and with `disconnected` when the connection drops before the
   answer. `connect()` moves a stopped state to `Connecting` before it returns, so a request
   right after it waits instead of failing as offline. The SDK never repeats a request.
-  Errors carry a stable string code: the server's own for refusals.
+  Errors carry a stable string code: the server's own for refusals. A request sent but not
+  answered in time is `timeout` (not retryable: it may have been carried out); an answer of
+  the wrong kind is `unexpected_answer` (not retryable); `connection_busy` (retryable) means
+  a sign-out or sign-in could not stop the connection in time and changed nothing.
+- **Sign-out and sign-in stop the connection first.** `sign_out` forgets the credentials,
+  waits (up to 5 s) until the connection task confirms it stopped and will not touch the
+  store again, then erases the local data; the erase happens even if the keychain delete
+  failed, and the first error is reported. `sign_in` does the same wait before it binds the
+  store to the user, so a connection of an earlier user cannot write into the new user's
+  data; the app calls `connect()` again afterwards. `Client::close()` stops the connection,
+  the runtime and the store, for apps that need the database file closed at once.
 - **Not yet:** proxies, and TLS against a real certificate (compiled in, first used in
   Plan 11). Open owner questions (Plan 9A): whether a revoked device (4003) should erase
   its data, and whether to vendor the SQLite3 Multiple Ciphers source.
