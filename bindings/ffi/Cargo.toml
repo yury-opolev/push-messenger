@@ -1,0 +1,23 @@
+[package]
+name = "push-sdk-ffi"
+description = "What push-sdk's Node and C bindings share: the data and error codes they hand to apps, as JSON, and waiting on the SDK from their own threads."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+push-sdk.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# Only to tell the SDK's runtime threads apart.
+tokio = { workspace = true, features = ["rt"] }
+
+[dev-dependencies]
+push-sdk = { workspace = true, features = ["testing"] }
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+
+[lints]
+workspace = true

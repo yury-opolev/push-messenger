@@ -2229,6 +2229,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "push-sdk-ffi"
+version = "0.1.0"
+dependencies = [
+ "push-sdk",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "push-smoke"
 version = "0.1.0"
 dependencies = [
