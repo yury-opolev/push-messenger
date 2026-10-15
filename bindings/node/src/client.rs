@@ -8,7 +8,9 @@ use napi::bindgen_prelude::{Buffer, Function, Object};
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi::{Env, Status};
 use napi_derive::napi;
-use push_sdk::{Client, DatabaseKey, Events, SdkError};
+use push_sdk::{
+    Client, ClientMsgId, ConversationId, DatabaseKey, DeviceId, Events, SdkError, UserId,
+};
 use push_sdk_ffi::{block_on, json};
 use serde_json::Value;
 
@@ -33,6 +35,14 @@ pub struct NativeClient {
 
 fn invalid(message: &str) -> napi::Error {
     failure(&SdkError::Invalid(message.to_owned()))
+}
+
+fn conversation_id(text: &str) -> Result<ConversationId, SdkError> {
+    json::id(text, "conversationId")
+}
+
+fn user_id(text: &str) -> Result<UserId, SdkError> {
+    json::id(text, "userId")
 }
 
 impl NativeClient {
@@ -271,6 +281,254 @@ impl NativeClient {
                 .change_database_key(key.as_ref())
                 .await
                 .map(|()| Value::Null)
+        })
+    }
+
+    // ----- local data -----
+
+    #[napi(catch_unwind)]
+    pub fn conversations<'env>(&self, env: &'env Env) -> napi::Result<Object<'env>> {
+        self.promise(env, |client| async move {
+            Ok(json::list(&client.conversations()?, json::conversation))
+        })
+    }
+
+    /// One conversation, or null.
+    #[napi(catch_unwind)]
+    pub fn conversation<'env>(&self, env: &'env Env, id: String) -> napi::Result<Object<'env>> {
+        self.promise(env, |client| async move {
+            let found = client.conversation(conversation_id(&id)?)?;
+            Ok(found.as_ref().map_or(Value::Null, json::conversation))
+        })
+    }
+
+    #[napi(catch_unwind)]
+    pub fn messages<'env>(
+        &self,
+        env: &'env Env,
+        conversation: String,
+        before_seq: Option<i64>,
+        limit: u32,
+    ) -> napi::Result<Object<'env>> {
+        self.promise(env, |client| async move {
+            let messages = client.messages(conversation_id(&conversation)?, before_seq, limit)?;
+            Ok(json::list(&messages, json::message))
+        })
+    }
+
+    #[napi(catch_unwind)]
+    pub fn contacts<'env>(&self, env: &'env Env) -> napi::Result<Object<'env>> {
+        self.promise(env, |client| async move {
+            Ok(json::list(&client.contacts()?, json::contact))
+        })
+    }
+
+    // ----- sending -----
+
+    /// Queues a message; resolves to the local echo.
+    #[napi(catch_unwind)]
+    pub fn send<'env>(
+        &self,
+        env: &'env Env,
+        conversation: String,
+        text: String,
+    ) -> napi::Result<Object<'env>> {
+        self.promise(env, |client| async move {
+            let message = client.send(conversation_id(&conversation)?, &text)?;
+            Ok(json::message(&message))
+        })
+    }
+
+    /// Resolves to the change's id.
+    #[napi(catch_unwind)]
+    pub fn edit<'env>(
+        &self,
+        env: &'env Env,
+        conversation: String,
+        target: String,
+        text: String,
+    ) -> napi::Result<Object<'env>> {
+        self.promise(env, |client| async move {
+            let target: ClientMsgId = json::id(&target, "clientMsgId")?;
+            let change = client.edit(conversation_id(&conversation)?, target, &text)?;
+            Ok(Value::String(change.to_string()))
+        })
+    }
+
+    /// Resolves to the change's id.
+    #[napi(catch_unwind)]
+    pub fn delete<'env>(
+        &self,
+        env: &'env Env,
+        conversation: String,
+        target: String,
+    ) -> napi::Result<Object<'env>> {
+        self.promise(env, |client| async move {
+            let target: ClientMsgId = json::id(&target, "clientMsgId")?;
+            let change = client.delete(conversation_id(&conversation)?, target)?;
+            Ok(Value::String(change.to_string()))
+        })
+    }
+
+    /// Resolves to whether the message was taken back.
+    #[napi(catch_unwind)]
+    pub fn cancel<'env>(
+        &self,
+        env: &'env Env,
+        conversation: String,
+        message: String,
+    ) -> napi::Result<Object<'env>> {
+        self.promise(env, |client| async move {
+            let message: ClientMsgId = json::id(&message, "clientMsgId")?;
+            Ok(Value::Bool(
+                client.cancel(conversation_id(&conversation)?, message)?,
+            ))
+        })
+    }
+
+    #[napi(catch_unwind)]
+    pub fn mark_read<'env>(
+        &self,
+        env: &'env Env,
+        conversation: String,
+        seq: i64,
+    ) -> napi::Result<Object<'env>> {
+        self.promise(env, |client| async move {
+            client
+                .mark_read(conversation_id(&conversation)?, seq)
+                .map(|()| Value::Null)
+        })
+    }
+
+    // ----- requests -----
+
+    #[napi(catch_unwind)]
+    pub fn list_conversations<'env>(&self, env: &'env Env) -> napi::Result<Object<'env>> {
+        self.promise(env, |client| async move {
+            Ok(json::list(
+                &client.list_conversations().await?,
+                json::conversation,
+            ))
+        })
+    }
+
+    #[napi(catch_unwind)]
+    pub fn fetch_history<'env>(
+        &self,
+        env: &'env Env,
+        conversation: String,
+        before_seq: Option<i64>,
+        limit: u32,
+    ) -> napi::Result<Object<'env>> {
+        self.promise(env, |client| async move {
+            let id = conversation_id(&conversation)?;
+            let messages = client.fetch_history(id, before_seq, limit).await?;
+            Ok(json::list(&messages, json::message))
+        })
+    }
+
+    #[napi(catch_unwind)]
+    pub fn open_direct<'env>(&self, env: &'env Env, peer: String) -> napi::Result<Object<'env>> {
+        self.promise(env, |client| async move {
+            let conversation = client.open_direct(user_id(&peer)?).await?;
+            Ok(json::conversation(&conversation))
+        })
+    }
+
+    #[napi(catch_unwind)]
+    pub fn list_contacts<'env>(&self, env: &'env Env) -> napi::Result<Object<'env>> {
+        self.promise(env, |client| async move {
+            Ok(json::list(&client.list_contacts().await?, json::contact))
+        })
+    }
+
+    /// `request`, `accept`, `decline`, `block` or `unblock`; resolves to the relationship.
+    #[napi(catch_unwind)]
+    pub fn change_contact<'env>(
+        &self,
+        env: &'env Env,
+        change: String,
+        user: String,
+    ) -> napi::Result<Object<'env>> {
+        self.promise(env, |client| async move {
+            let user = user_id(&user)?;
+            let contact = match change.as_str() {
+                "request" => client.request_contact(user).await?,
+                "accept" => client.accept_contact(user).await?,
+                "decline" => client.decline_contact(user).await?,
+                "block" => client.block(user).await?,
+                "unblock" => client.unblock(user).await?,
+                _ => return Err(SdkError::Invalid(format!("no contact change {change:?}"))),
+            };
+            Ok(json::contact(&contact))
+        })
+    }
+
+    #[napi(catch_unwind)]
+    pub fn create_invite<'env>(
+        &self,
+        env: &'env Env,
+        expires_in_s: u32,
+        max_uses: u32,
+    ) -> napi::Result<Object<'env>> {
+        self.promise(env, |client| async move {
+            Ok(json::invite(
+                &client.create_invite(expires_in_s, max_uses).await?,
+            ))
+        })
+    }
+
+    /// Resolves to the inviter's user id.
+    #[napi(catch_unwind)]
+    pub fn redeem_invite<'env>(&self, env: &'env Env, code: String) -> napi::Result<Object<'env>> {
+        self.promise(env, |client| async move {
+            Ok(Value::String(
+                client.redeem_invite(&code).await?.to_string(),
+            ))
+        })
+    }
+
+    #[napi(catch_unwind)]
+    pub fn revoke_invite<'env>(&self, env: &'env Env, code: String) -> napi::Result<Object<'env>> {
+        self.promise(env, |client| async move {
+            client.revoke_invite(&code).await.map(|()| Value::Null)
+        })
+    }
+
+    #[napi(catch_unwind)]
+    pub fn profiles<'env>(&self, env: &'env Env, ids: Vec<String>) -> napi::Result<Object<'env>> {
+        self.promise(env, |client| async move {
+            let ids = ids
+                .iter()
+                .map(|id| user_id(id))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(json::list(&client.profiles(ids).await?, json::profile))
+        })
+    }
+
+    #[napi(catch_unwind)]
+    pub fn lookup<'env>(&self, env: &'env Env, handle: String) -> napi::Result<Object<'env>> {
+        self.promise(env, |client| async move {
+            Ok(json::profile(&client.lookup(&handle).await?))
+        })
+    }
+
+    #[napi(catch_unwind)]
+    pub fn devices<'env>(&self, env: &'env Env) -> napi::Result<Object<'env>> {
+        self.promise(env, |client| async move {
+            Ok(json::list(&client.devices().await?, json::device))
+        })
+    }
+
+    #[napi(catch_unwind)]
+    pub fn revoke_device<'env>(
+        &self,
+        env: &'env Env,
+        device: String,
+    ) -> napi::Result<Object<'env>> {
+        self.promise(env, |client| async move {
+            let device: DeviceId = json::id(&device, "deviceId")?;
+            client.revoke_device(device).await.map(|()| Value::Null)
         })
     }
 }

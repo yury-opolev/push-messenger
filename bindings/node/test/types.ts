@@ -1,0 +1,50 @@
+// Compiled by `npm run typecheck` (never run): the typings describe a real app's use.
+
+import { Client, PushError, PushEvent, SecretStore, deriveDatabaseKey, newSalt, SECRET_KEYS } from '../index';
+
+const values = new Map<string, Uint8Array>();
+const store: SecretStore = {
+  load: async (key) => values.get(key) ?? null,
+  save: (key, value) => {
+    values.set(key, value);
+  },
+  delete: async (key) => {
+    values.delete(key);
+  },
+};
+
+async function app(): Promise<void> {
+  const databaseKey = await deriveDatabaseKey('2468', newSalt());
+  const client = await Client.open(
+    { authUrl: 'https://push.example', socketUrl: 'wss://push.example/v1/socket', databasePath: 'app.db', databaseKey },
+    store,
+  );
+  client.onEvent((event: PushEvent) => {
+    switch (event.type) {
+      case 'messageAdded':
+        console.log(event.message.clientMsgId, event.message.status);
+        break;
+      case 'connectionStateChanged':
+        if (event.state === 'reconnecting') console.log(event.retryInMs);
+        break;
+      case 'sendFailed':
+        console.log(event.error.code);
+        break;
+    }
+  });
+  const account = await client.signIn('a@example.com', 'password', 'laptop', 'desktop');
+  console.log(account.userId, client.account()?.deviceId, SECRET_KEYS.length);
+  client.connect();
+  const conversation = await client.openDirect('0199e1c2-0000-7000-8000-000000000001');
+  const echo = await client.send(conversation.id, 'hi');
+  const history = await client.messages(conversation.id, null, 50);
+  console.log(echo.seq, history.length);
+  try {
+    await client.redeemInvite('NOSUCHCODE');
+  } catch (error) {
+    if (error instanceof PushError && error.code === 'invite_not_found') console.log(error.retryable);
+  }
+  await client.close();
+}
+
+void app;

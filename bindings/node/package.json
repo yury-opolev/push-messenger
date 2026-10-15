@@ -5,8 +5,10 @@
   "private": true,
   "license": "MIT",
   "main": "index.js",
+  "types": "index.d.ts",
   "files": [
     "index.js",
+    "index.d.ts",
     "push_sdk.node"
   ],
   "engines": {
@@ -15,6 +17,10 @@
   "scripts": {
     "build": "node scripts/build.js",
     "pretest": "node scripts/build.js --with-fakes",
-    "test": "node --test test/client.test.js"
+    "test": "node --test test/client.test.js test/messaging.test.js",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3"
   }
 }

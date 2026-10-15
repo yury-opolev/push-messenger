@@ -201,6 +201,122 @@ class Client {
     return settled(() => this.#native.changeDatabaseKey(key));
   }
 
+  // ----- local data -----
+
+  /** Every conversation this device knows, most recently changed first. */
+  conversations() {
+    return settled(() => this.#native.conversations());
+  }
+
+  /** One conversation, or null. */
+  conversation(conversationId) {
+    return settled(() => this.#native.conversation(conversationId));
+  }
+
+  /**
+   * Up to `limit` stored messages before `beforeSeq` (null: the newest, then those still in
+   * the outbox), oldest first.
+   */
+  messages(conversationId, beforeSeq, limit) {
+    return settled(() => this.#native.messages(conversationId, beforeSeq ?? null, limit));
+  }
+
+  contacts() {
+    return settled(() => this.#native.contacts());
+  }
+
+  // ----- sending -----
+
+  /** Queues a message; resolves to the local echo, whose `clientMsgId` is its handle. */
+  send(conversationId, text) {
+    return settled(() => this.#native.send(conversationId, text));
+  }
+
+  /** Resolves to the change's own id. */
+  edit(conversationId, clientMsgId, text) {
+    return settled(() => this.#native.edit(conversationId, clientMsgId, text));
+  }
+
+  /** Resolves to the change's own id. */
+  delete(conversationId, clientMsgId) {
+    return settled(() => this.#native.delete(conversationId, clientMsgId));
+  }
+
+  /** Takes back a message never sent; resolves to whether it was. */
+  cancel(conversationId, clientMsgId) {
+    return settled(() => this.#native.cancel(conversationId, clientMsgId));
+  }
+
+  markRead(conversationId, seq) {
+    return settled(() => this.#native.markRead(conversationId, seq));
+  }
+
+  // ----- requests -----
+
+  listConversations() {
+    return settled(() => this.#native.listConversations());
+  }
+
+  fetchHistory(conversationId, beforeSeq, limit) {
+    return settled(() => this.#native.fetchHistory(conversationId, beforeSeq ?? null, limit));
+  }
+
+  openDirect(userId) {
+    return settled(() => this.#native.openDirect(userId));
+  }
+
+  listContacts() {
+    return settled(() => this.#native.listContacts());
+  }
+
+  requestContact(userId) {
+    return settled(() => this.#native.changeContact('request', userId));
+  }
+
+  acceptContact(userId) {
+    return settled(() => this.#native.changeContact('accept', userId));
+  }
+
+  declineContact(userId) {
+    return settled(() => this.#native.changeContact('decline', userId));
+  }
+
+  block(userId) {
+    return settled(() => this.#native.changeContact('block', userId));
+  }
+
+  unblock(userId) {
+    return settled(() => this.#native.changeContact('unblock', userId));
+  }
+
+  createInvite(expiresInS, maxUses) {
+    return settled(() => this.#native.createInvite(expiresInS, maxUses));
+  }
+
+  /** Resolves to the inviter's user id. */
+  redeemInvite(code) {
+    return settled(() => this.#native.redeemInvite(code));
+  }
+
+  revokeInvite(code) {
+    return settled(() => this.#native.revokeInvite(code));
+  }
+
+  profiles(userIds) {
+    return settled(() => this.#native.profiles(userIds));
+  }
+
+  lookup(handle) {
+    return settled(() => this.#native.lookup(handle));
+  }
+
+  devices() {
+    return settled(() => this.#native.devices());
+  }
+
+  revokeDevice(deviceId) {
+    return settled(() => this.#native.revokeDevice(deviceId));
+  }
 }
 
 /** Derives a 32-byte database key from what the user knows and a salt the app keeps. */
