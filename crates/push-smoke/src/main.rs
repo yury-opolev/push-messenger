@@ -4,7 +4,7 @@ use std::time::Duration;
 use push_smoke::{Target, run};
 
 /// The whole run, so that a hung deployment fails a helm test instead of hanging it.
-const TOTAL_TIMEOUT: Duration = Duration::from_secs(180);
+const TOTAL_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[tokio::main]
 async fn main() -> ExitCode {

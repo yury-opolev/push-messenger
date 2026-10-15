@@ -22,12 +22,17 @@
 //!    (4002, 4001);
 //! 7. Carol revokes her device and Bob resets his password through auth-svc; once the
 //!    worker relays them, message-svc kicks both devices and the gateway closes Carol's
-//!    socket with 4003 and Bob's with 4001, and refuses their old tokens from then on.
+//!    socket with 4003 and Bob's with 4001, and refuses their old tokens from then on;
+//! 8. Dana and Erin do it all again as apps built on `push-sdk` (`sdk.rs`): signing up and
+//!    in, an invite, a chat with receipts, an edit and a delete, an outbox that survives
+//!    restarts, and the SDK's `DeviceRemoved` and `SignedOut`.
 //!
 //! The deployment must run the worker with the log sender and `PUSH_DEV_MAILBOX=1`. The
-//! smoke test needs auth-svc's signing key (from the deployment's Secret) for step 6.
+//! smoke test needs auth-svc's signing key (from the deployment's Secret) for step 6 and
+//! a writable directory for the SDK's databases.
 
 mod auth;
+mod sdk;
 mod socket;
 mod tokens;
 
@@ -72,6 +77,8 @@ pub struct Target {
     /// auth-svc's signing key (base64 of the 32-byte Ed25519 seed), to sign tokens the
     /// gateway must refuse. It can sign in as anyone, so it is never shown.
     pub signing_key: String,
+    /// A writable directory for the SDK apps' databases.
+    pub data_dir: String,
 }
 
 impl std::fmt::Debug for Target {
@@ -83,23 +90,26 @@ impl std::fmt::Debug for Target {
             .field("socket_url", &self.socket_url)
             .field("host", &self.host)
             .field("signing_key", &"<redacted>")
+            .field("data_dir", &self.data_dir)
             .finish()
     }
 }
 
 /// The usage line of the `push-smoke` binary.
-pub const USAGE: &str = "usage: push-smoke --auth <url> --mailbox <url> --socket <ws-url> [--host <host>], with auth-svc's signing key in PUSH_SMOKE_SIGNING_KEY";
+pub const USAGE: &str = "usage: push-smoke --auth <url> --mailbox <url> --socket <ws-url> --data-dir <dir> [--host <host>], with auth-svc's signing key in PUSH_SMOKE_SIGNING_KEY";
 
 impl Target {
-    /// Reads `--auth`, `--mailbox`, `--socket` and `--host` from `args`; each one missing
-    /// there is read from `env` (`PUSH_SMOKE_AUTH_URL`, `PUSH_SMOKE_MAILBOX_URL`,
-    /// `PUSH_SMOKE_SOCKET_URL`, `PUSH_SMOKE_HOST`). The signing key comes from
+    /// Reads `--auth`, `--mailbox`, `--socket`, `--data-dir` and `--host` from `args`;
+    /// each one missing there is read from `env` (`PUSH_SMOKE_AUTH_URL`,
+    /// `PUSH_SMOKE_MAILBOX_URL`, `PUSH_SMOKE_SOCKET_URL`, `PUSH_SMOKE_DATA_DIR`,
+    /// `PUSH_SMOKE_HOST`). The signing key comes from
     /// `PUSH_SMOKE_SIGNING_KEY` only: a secret never belongs in a Pod's arguments.
     pub fn parse(
         args: impl IntoIterator<Item = String>,
         env: impl Fn(&str) -> Option<String>,
     ) -> Result<Self, String> {
         let (mut auth_url, mut mailbox_url, mut socket_url, mut host) = (None, None, None, None);
+        let mut data_dir = None;
         let mut args = args.into_iter();
         while let Some(flag) = args.next() {
             let slot = match flag.as_str() {
@@ -107,6 +117,7 @@ impl Target {
                 "--mailbox" => &mut mailbox_url,
                 "--socket" => &mut socket_url,
                 "--host" => &mut host,
+                "--data-dir" => &mut data_dir,
                 other => return Err(format!("unknown argument {other:?}; {USAGE}")),
             };
             *slot = Some(args.next().ok_or_else(|| format!("{flag} needs a value"))?);
@@ -137,6 +148,11 @@ impl Target {
                 .or_else(|| env("PUSH_SMOKE_HOST"))
                 .filter(|host| !host.is_empty()),
             signing_key: required(None, "PUSH_SMOKE_SIGNING_KEY", "PUSH_SMOKE_SIGNING_KEY")?,
+            data_dir: required(
+                data_dir,
+                "--data-dir or PUSH_SMOKE_DATA_DIR",
+                "PUSH_SMOKE_DATA_DIR",
+            )?,
         })
     }
 }
@@ -152,8 +168,8 @@ struct Client {
     conn: Box<Conn>,
 }
 
-/// Runs the smoke test, printing each step. Fails at the first step that does not
-/// complete within 10 s (30 s for what waits for the worker).
+/// Runs the smoke test, printing each step: the raw protocol, then the SDK. Fails at the
+/// first step that does not complete within 10 s (30 s for what waits for the worker).
 pub async fn run(target: &Target) -> anyhow::Result<()> {
     let started = Instant::now();
     let auth = auth::Auth::connect(target, STEP_TIMEOUT).await?;
@@ -176,6 +192,7 @@ pub async fn run(target: &Target) -> anyhow::Result<()> {
     refuse_tokens(target, &auth, &forger, &alice).await?;
     kick(target, &auth, bob, carol).await?;
     alice.conn.close().await;
+    sdk::run(target, &auth).await?;
     step(&format!("PASS in {} ms", started.elapsed().as_millis()));
     Ok(())
 }
@@ -674,6 +691,8 @@ mod tests {
                 "ws://ingress/v1/socket",
                 "--host",
                 "push.local",
+                "--data-dir",
+                "/data",
             ]),
             key,
         );
@@ -685,6 +704,7 @@ mod tests {
                 socket_url: "ws://ingress/v1/socket".to_owned(),
                 host: Some("push.local".to_owned()),
                 signing_key: "c2VjcmV0LWtleQ==".to_owned(),
+                data_dir: "/data".to_owned(),
             })
         );
     }
@@ -696,6 +716,7 @@ mod tests {
             |name| match name {
                 "PUSH_SMOKE_AUTH_URL" => Some("http://auth:8080".to_owned()),
                 "PUSH_SMOKE_MAILBOX_URL" => Some("http://worker:8080".to_owned()),
+                "PUSH_SMOKE_DATA_DIR" => Some("/data".to_owned()),
                 other => key(other),
             },
         )
@@ -714,6 +735,7 @@ mod tests {
             "PUSH_SMOKE_MAILBOX_URL",
             "PUSH_SMOKE_SOCKET_URL",
             "PUSH_SMOKE_SIGNING_KEY",
+            "PUSH_SMOKE_DATA_DIR",
         ] {
             let error =
                 Target::parse(args(&[]), |name| all(name).filter(|_| name != missing)).unwrap_err();
