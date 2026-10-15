@@ -1,0 +1,36 @@
+[package]
+name = "push-sdk-c"
+description = "The C binding of push-sdk: a stable C ABI with opaque handles, error codes and UTF-8 JSON (spec §8.5)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+# The shared library apps link (push_sdk_c.dll, libpush_sdk_c.so, libpush_sdk_c.dylib);
+# rlib for the Rust tests.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+push-sdk.workspace = true
+push-sdk-ffi.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["sync", "time"] }
+
+[dev-dependencies]
+# Generates include/push_sdk.h; tests/header.rs fails when the checked-in header is stale.
+cbindgen = { version = "0.29", default-features = false }
+push-sdk = { workspace = true, features = ["testing"] }
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+
+[lints.rust]
+# The C ABI needs unsafe; every unsafe operation is still marked inside unsafe functions.
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+# Every function has the same safety rules (valid pointers, UTF-8, ownership), stated once
+# in the crate's documentation and the header.
+missing_safety_doc = "allow"
