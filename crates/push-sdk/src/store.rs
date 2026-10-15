@@ -6,6 +6,10 @@
 //! echo are written together, before the first attempt, so a retry after a restart sends
 //! the same `client_msg_id`. Positions only move forward (`MAX`), because receipts can
 //! arrive in any order (spec §7.2).
+//!
+//! Opened with a [`DatabaseKey`], the whole file is encrypted (SQLite3 Multiple Ciphers):
+//! the key is checked by the first read, before anything is written, so a wrong key never
+//! damages the data.
 
 use std::time::Duration;
 
@@ -15,6 +19,7 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 use uuid::Uuid;
 
 use crate::SdkError;
+use crate::key::DatabaseKey;
 use crate::model::{
     Contact, ContactState, Conversation, ConversationKind, Message, MessageKind, MessageStatus,
 };
@@ -106,10 +111,25 @@ pub(crate) struct Store {
 }
 
 impl Store {
-    /// Opens (or creates) the database at `path`; `:memory:` keeps it in memory.
-    pub fn open(path: &str) -> Result<Self, SdkError> {
+    /// Opens (or creates) the database at `path`; `:memory:` keeps it in memory. With a
+    /// key the file is encrypted; [`SdkError::WrongKey`] if the key does not open it (or a
+    /// database that has one is opened without, or one without with a key).
+    pub fn open(path: &str, key: Option<&DatabaseKey>) -> Result<Self, SdkError> {
         let conn = Connection::open(path)?;
         conn.busy_timeout(Duration::from_secs(5))?;
+        if let Some(key) = key {
+            conn.execute_batch(&format!("PRAGMA hexkey = '{}'", key.hex().as_str()))?;
+        }
+        // The first read of the file: it fails with "not a database" when the key does
+        // not fit, before anything is written.
+        if let Err(error) = conn.query_row("SELECT count(*) FROM sqlite_master", [], |row| {
+            row.get::<_, i64>(0)
+        }) {
+            return Err(match error.sqlite_error_code() {
+                Some(rusqlite::ErrorCode::NotADatabase) => SdkError::WrongKey,
+                _ => error.into(),
+            });
+        }
         // WAL: a crash never loses a committed outbox row; NORMAL syncs at checkpoints.
         let _mode: String = conn.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
@@ -126,6 +146,26 @@ impl Store {
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
         Ok(Self { conn })
+    }
+
+    /// Encrypts the database with `key`, re-encrypts it with a new one, or with `None`
+    /// decrypts it. Every page is rewritten in one transaction: a crash leaves the old key
+    /// or the new one, never a mix. The next [`Store::open`] needs the new key.
+    pub fn change_key(&mut self, key: Option<&DatabaseKey>) -> Result<(), SdkError> {
+        // SQLite3 Multiple Ciphers changes keys only outside WAL mode.
+        let _mode: String = self
+            .conn
+            .query_row("PRAGMA journal_mode = DELETE", [], |row| row.get(0))?;
+        let changed = match key {
+            Some(key) => self
+                .conn
+                .execute_batch(&format!("PRAGMA hexrekey = '{}'", key.hex().as_str())),
+            None => self.conn.execute_batch("PRAGMA rekey = ''"),
+        };
+        let _mode: String = self
+            .conn
+            .query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
+        Ok(changed?)
     }
 
     /// The user the database belongs to.
@@ -785,7 +825,7 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn fixture() -> Fixture {
-        let mut store = Store::open(":memory:").unwrap();
+        let mut store = Store::open(":memory:", None).unwrap();
         let (me, peer) = (UserId::new(), UserId::new());
         store.bind_owner(me).unwrap();
         let conversation = ConversationId::new();
@@ -945,7 +985,7 @@ pub(crate) mod tests {
     #[test]
     fn erasing_leaves_no_trace_in_the_files() {
         let scratch = Scratch::new();
-        let mut store = Store::open(&scratch.database()).unwrap();
+        let mut store = Store::open(&scratch.database(), None).unwrap();
         let (me, peer, conversation) = (UserId::new(), UserId::new(), ConversationId::new());
         store.bind_owner(me).unwrap();
         store.open_direct(conversation, peer).unwrap();
@@ -970,6 +1010,99 @@ pub(crate) mod tests {
         assert!(scratch.holds(&marker));
         assert!(store.bind_owner(UserId::new()).unwrap());
         assert!(!scratch.holds(&marker));
+    }
+
+    /// Fills `store` for `me` with a delivered message and a queued one, both carrying
+    /// `marker`; the conversation.
+    fn fill(store: &mut Store, me: UserId, marker: &str) -> ConversationId {
+        let (peer, conversation) = (UserId::new(), ConversationId::new());
+        store.bind_owner(me).unwrap();
+        store.open_direct(conversation, peer).unwrap();
+        let mut delivered = entry(conversation, peer, 1, EntryKind::Message);
+        delivered.body = Some(format!("{marker} received").into_bytes());
+        store.apply_deliver(&delivered).unwrap();
+        store
+            .queue_send(
+                conversation,
+                ClientMsgId::new(),
+                &format!("{marker} queued"),
+                1,
+            )
+            .unwrap();
+        conversation
+    }
+
+    fn key(byte: u8) -> DatabaseKey {
+        DatabaseKey::from_bytes(&[byte; DatabaseKey::LEN]).unwrap()
+    }
+
+    #[test]
+    fn with_a_key_the_files_hold_no_plaintext() {
+        let scratch = Scratch::new();
+        let marker = format!("secret-{}", Uuid::now_v7());
+        let me = UserId::new();
+        let mut store = Store::open(&scratch.database(), Some(&key(1))).unwrap();
+        let conversation = fill(&mut store, me, &marker);
+        assert!(!scratch.holds(&marker), "the open database and its log");
+        drop(store);
+        assert!(!scratch.holds(&marker), "the closed database");
+        assert!(
+            !scratch.holds("SQLite format 3"),
+            "even the header is encrypted"
+        );
+
+        let store = Store::open(&scratch.database(), Some(&key(1))).unwrap();
+        assert_eq!(store.messages(conversation, None, 10).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_wrong_or_missing_key_is_refused_and_changes_nothing() {
+        let scratch = Scratch::new();
+        let me = UserId::new();
+        let mut store = Store::open(&scratch.database(), Some(&key(1))).unwrap();
+        let conversation = fill(&mut store, me, "kept");
+        drop(store);
+        for wrong in [Some(key(2)), None] {
+            assert_eq!(
+                Store::open(&scratch.database(), wrong.as_ref()).err(),
+                Some(SdkError::WrongKey)
+            );
+        }
+        let store = Store::open(&scratch.database(), Some(&key(1))).unwrap();
+        assert_eq!(store.owner().unwrap(), Some(me));
+        assert_eq!(store.messages(conversation, None, 10).unwrap().len(), 2);
+        assert_eq!(store.outbox().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_key_can_be_added_changed_and_removed() {
+        let scratch = Scratch::new();
+        let marker = format!("secret-{}", Uuid::now_v7());
+        let me = UserId::new();
+        let mut store = Store::open(&scratch.database(), None).unwrap();
+        let conversation = fill(&mut store, me, &marker);
+        store.change_key(Some(&key(1))).unwrap();
+        assert!(!scratch.holds(&marker), "encrypted in place");
+        drop(store);
+        assert_eq!(
+            Store::open(&scratch.database(), None).err(),
+            Some(SdkError::WrongKey)
+        );
+
+        let mut store = Store::open(&scratch.database(), Some(&key(1))).unwrap();
+        store.change_key(Some(&key(2))).unwrap();
+        drop(store);
+        assert_eq!(
+            Store::open(&scratch.database(), Some(&key(1))).err(),
+            Some(SdkError::WrongKey)
+        );
+
+        let mut store = Store::open(&scratch.database(), Some(&key(2))).unwrap();
+        store.change_key(None).unwrap();
+        drop(store);
+        let store = Store::open(&scratch.database(), None).unwrap();
+        assert_eq!(store.messages(conversation, None, 10).unwrap().len(), 2);
+        assert!(scratch.holds(&marker), "decrypted again");
     }
 
     #[test]

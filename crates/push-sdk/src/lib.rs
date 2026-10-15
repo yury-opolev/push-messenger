@@ -17,12 +17,14 @@
 mod auth;
 mod credentials;
 mod error;
+mod key;
 mod model;
 mod secrets;
 mod store;
 
 pub use auth::{Device, Platform, Profile};
 pub use error::SdkError;
+pub use key::DatabaseKey;
 pub use model::{
     ConnectionState, Contact, ContactState, Conversation, ConversationKind, Event, Invite, Message,
     MessageKind, MessageStatus, OutboxKind,
