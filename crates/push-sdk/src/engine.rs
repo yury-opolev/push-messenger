@@ -81,6 +81,11 @@ impl Shared {
 /// outbox never holds the connection in the frame budget for long.
 const MAX_SENDS_AT_ONCE: usize = 20;
 
+/// Most `ReadUpTo` frames one wake produces, and most `Ack`s one flush produces: the rest
+/// go on later turns of the connection, so reads of the socket (a `Pong` among them) are
+/// never held back by a long run of frames waiting for the frame budget.
+pub(crate) const MAX_FRAMES_PER_TURN: usize = 20;
+
 /// The engine's own requests have ids from here up; the app's count up from 1.
 pub(crate) const INTERNAL_REQUESTS: u64 = 1 << 63;
 
@@ -102,6 +107,8 @@ pub(crate) struct Engine {
     relist: bool,
     /// A delivery could not be stored: the connection must end (see `on_deliver`).
     broken: bool,
+    /// The last wake left read positions unsent: it is wanted again.
+    backlog: bool,
 }
 
 impl Engine {
@@ -114,7 +121,14 @@ impl Engine {
             internal: HashMap::new(),
             relist: false,
             broken: false,
+            backlog: false,
         }
+    }
+
+    /// A wake left read positions unsent; call [`Engine::wake`] again once the frames it
+    /// produced are out.
+    pub fn backlog(&self) -> bool {
+        self.backlog
     }
 
     /// A delivery could not be stored: end the connection and reconnect with backoff.
@@ -143,13 +157,16 @@ impl Engine {
         self.internal.clear();
         self.relist = false;
         self.broken = false;
+        self.backlog = false;
     }
 
     /// The app queued something or marked something read.
     pub fn wake(&mut self, now_ms: i64, out: &mut Vec<Body>) {
+        self.backlog = false;
         let reads = self.shared.store().unsynced_reads();
         match reads {
             Ok(reads) => {
+                let mut produced = 0;
                 for (conversation, seq) in reads {
                     if self
                         .reads_sent
@@ -158,6 +175,11 @@ impl Engine {
                     {
                         continue;
                     }
+                    if produced == MAX_FRAMES_PER_TURN {
+                        self.backlog = true;
+                        break;
+                    }
+                    produced += 1;
                     self.reads_sent.insert(conversation, seq);
                     out.push(Body::ReadUpTo(ReadUpTo {
                         conversation_id: bytes(conversation.0),
@@ -206,9 +228,10 @@ impl Engine {
         self.acks.due_at()
     }
 
-    /// One `Ack` per conversation, naming the highest `seq` stored.
+    /// One `Ack` per conversation, naming the highest `seq` stored, at most
+    /// [`MAX_FRAMES_PER_TURN`] of them; the rest stay due.
     pub fn flush_acks(&mut self, out: &mut Vec<Body>) {
-        for (conversation, seq) in self.acks.take() {
+        for (conversation, seq) in self.acks.take_up_to(MAX_FRAMES_PER_TURN) {
             out.push(Body::Ack(v1::Ack {
                 conversation_id: bytes(conversation.0),
                 seq,
@@ -897,6 +920,44 @@ mod tests {
             read_seq: 1,
         }));
         assert!(f.shared.store().unsynced_reads().unwrap().is_empty());
+    }
+
+    #[test]
+    fn many_read_positions_and_acks_are_produced_a_turn_at_a_time() {
+        let mut f = fixture();
+        for _ in 0..45 {
+            let conversation = ConversationId::new();
+            let mut store = f.shared.store();
+            store.open_direct(conversation, f.peer).unwrap();
+            drop(store);
+            f.frame(Body::Deliver(entry(
+                conversation,
+                f.peer,
+                1,
+                EntryKind::Message,
+            )));
+            f.shared.store().mark_read(conversation, 1).unwrap();
+        }
+        let reads = |out: &[Body]| {
+            out.iter()
+                .filter(|body| matches!(body, Body::ReadUpTo(_)))
+                .count()
+        };
+        let mut turns = Vec::new();
+        while turns.is_empty() || f.engine.backlog() {
+            let mut out = Vec::new();
+            f.engine.wake(0, &mut out);
+            turns.push(reads(&out));
+        }
+        assert_eq!(turns, [20, 20, 5]);
+
+        let mut acks = Vec::new();
+        while f.engine.acks_due().is_some() {
+            let mut out = Vec::new();
+            f.engine.flush_acks(&mut out);
+            acks.push(out.len());
+        }
+        assert_eq!(acks, [20, 20, 5]);
     }
 
     #[test]

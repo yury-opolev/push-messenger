@@ -174,6 +174,22 @@ impl Acks {
         std::mem::take(&mut self.waiting).into_iter().collect()
     }
 
+    /// Like [`Acks::take`], at most `limit` conversations; the others keep waiting and
+    /// stay due.
+    pub fn take_up_to(&mut self, limit: usize) -> Vec<(ConversationId, i64)> {
+        if self.waiting.len() <= limit {
+            return self.take();
+        }
+        let mut taken = Vec::with_capacity(limit);
+        while taken.len() < limit {
+            match self.waiting.pop_first() {
+                Some(entry) => taken.push(entry),
+                None => break,
+            }
+        }
+        taken
+    }
+
     /// Forgets what waits: the connection dropped, and the next one is acknowledged from
     /// the store's positions.
     pub fn clear(&mut self) {

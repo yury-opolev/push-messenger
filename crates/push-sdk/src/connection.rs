@@ -33,7 +33,7 @@ use push_proto::{decode_frame, encode_frame, id_bytes};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
-use tokio::time::{Instant, sleep, sleep_until, timeout};
+use tokio::time::{Instant, sleep_until, timeout};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
@@ -130,6 +130,9 @@ pub(crate) struct Connection {
     state: Arc<watch::Sender<ConnectionState>>,
     commands: mpsc::UnboundedReceiver<Command>,
     engine: Engine,
+    pong_timeout: Duration,
+    /// How long a connection must stay up to reset the backoff.
+    stable: Duration,
 }
 
 impl Connection {
@@ -147,6 +150,8 @@ impl Connection {
             endpoint,
             state,
             commands,
+            pong_timeout: PONG_TIMEOUT,
+            stable: STABLE,
         }
     }
 
@@ -200,9 +205,10 @@ impl Connection {
                     token,
                 } => (after, ready_for, token),
             };
-            if ready_for.is_some_and(|ready_for| ready_for >= STABLE) {
+            if ready_for.is_some_and(|ready_for| ready_for >= self.stable) {
                 attempts = 0;
                 not_ready = 0;
+                refreshed = false;
             }
             let delay = match after {
                 AfterClose::SignOut => {
@@ -352,10 +358,18 @@ impl Connection {
         let mut out = Vec::new();
         self.engine.start(unix_ms(), &mut out);
         let after = loop {
-            if live.send_all(&mut out).await.is_err() {
+            if live.send_ready(&mut out).await.is_err() {
                 break AfterClose::Reconnect;
             }
-            let acks_at = self.engine.acks_due();
+            // Frames over the budget wait here, while the socket is still read.
+            let send_at =
+                (!out.is_empty()).then(|| Instant::now() + live.budget.wait(Instant::now()));
+            let acks_at = if out.is_empty() {
+                self.engine.acks_due()
+            } else {
+                None
+            };
+            let more_reads = out.is_empty() && self.engine.backlog();
             let retry_at = self.engine.retry_due(unix_ms()).map(|due| {
                 Instant::now() + Duration::from_millis(u64::try_from(due - unix_ms()).unwrap_or(0))
             });
@@ -406,9 +420,15 @@ impl Connection {
                     }
                 },
                 () = sleep_until(live.ping_at) => {
-                    out.push(Body::Ping(Ping {}));
+                    // First in line: a long run of frames waiting for the budget must not
+                    // delay the Ping that the Pong deadline counts from.
+                    out.insert(0, Body::Ping(Ping {}));
                     live.ping_at = Instant::now() + heartbeat;
-                    live.pong_by.get_or_insert(Instant::now() + PONG_TIMEOUT);
+                    live.pong_by.get_or_insert(Instant::now() + self.pong_timeout);
+                }
+                () = sleep_until(send_at.unwrap_or_else(far_future)), if send_at.is_some() => {}
+                () = std::future::ready(()), if more_reads => {
+                    self.engine.wake(unix_ms(), &mut out);
                 }
                 () = sleep_until(live.pong_by.unwrap_or_else(far_future)), if live.pong_by.is_some() => {
                     tracing::info!("no Pong: the connection is dead");
@@ -527,14 +547,15 @@ struct Live {
 }
 
 impl Live {
-    /// Sends the frames in order, within the client's frame budget.
-    async fn send_all(&mut self, out: &mut Vec<Body>) -> Result<(), ()> {
-        for body in out.drain(..) {
-            let wait = self.budget.wait(Instant::now());
-            if !wait.is_zero() {
-                sleep(wait).await;
-            }
+    /// Sends the frames in order while the client's frame budget allows; the rest stay in
+    /// `out` for the next turn, so the connection keeps reading while it waits for budget.
+    async fn send_ready(&mut self, out: &mut Vec<Body>) -> Result<(), ()> {
+        let mut ready = 0;
+        while ready < out.len() && self.budget.wait(Instant::now()).is_zero() {
             self.budget.spend(Instant::now());
+            ready += 1;
+        }
+        for body in out.drain(..ready) {
             send_now(&mut self.socket, body).await?;
         }
         Ok(())
@@ -621,6 +642,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     use push_proto::v1::{AuthExpiring, ListContacts, Pong, Ready};
+    use tokio::time::sleep;
 
     use super::*;
     use crate::MemorySecretStore;
@@ -628,10 +650,11 @@ mod tests {
     use crate::credentials::unix_now;
     use crate::secrets::SecretStore;
     use crate::store::Store;
-    use crate::testing::{FakeAuth, FakeGateway, Server, close, recv, send};
+    use crate::testing::{FakeAuth, FakeGateway, Server, close, recv, recv_until, send};
 
     struct Client {
         commands: mpsc::UnboundedSender<Command>,
+        shared: Arc<Shared>,
         state: watch::Receiver<ConnectionState>,
         events: mpsc::Receiver<Event>,
         secrets: Arc<MemorySecretStore>,
@@ -673,6 +696,16 @@ mod tests {
 
     /// A signed-in client of `gateway`, connecting; refreshes answer `access-N`.
     async fn connect(gateway: &FakeGateway) -> Client {
+        connect_with(gateway, |_, _| {}, |_| {}).await
+    }
+
+    /// Like [`connect`]; `fill` prepares the store (owned by the user) and `tune` the
+    /// connection before it starts.
+    async fn connect_with(
+        gateway: &FakeGateway,
+        fill: impl FnOnce(&mut Store, push_domain::UserId),
+        tune: impl FnOnce(&mut Connection),
+    ) -> Client {
         let auth = FakeAuth::start().await;
         let session = Session {
             user_id: auth.user,
@@ -690,10 +723,11 @@ mod tests {
             AuthApi::new(&auth_url, None).unwrap(),
         ));
         let (event_sender, events) = mpsc::channel(crate::engine::EVENT_QUEUE);
-        let shared = Arc::new(Shared::new(
-            Store::open(":memory:", None).unwrap(),
-            event_sender,
-        ));
+        let mut store = Store::open(":memory:", None).unwrap();
+        store.bind_owner(session.user_id).unwrap();
+        fill(&mut store, session.user_id);
+        let shared = Arc::new(Shared::new(store, event_sender));
+        let handle = shared.clone();
         let (state_sender, state) = watch::channel(ConnectionState::Offline);
         let state_sender = Arc::new(state_sender);
         let (commands, receiver) = mpsc::unbounded_channel();
@@ -701,11 +735,13 @@ mod tests {
             socket_url: gateway.url.clone(),
             host: None,
         };
-        let connection = Connection::new(shared, credentials, endpoint, state_sender, receiver);
+        let mut connection = Connection::new(shared, credentials, endpoint, state_sender, receiver);
+        tune(&mut connection);
         tokio::spawn(connection.run());
         commands.send(Command::Connect).unwrap();
         Client {
             commands,
+            shared: handle,
             state,
             events,
             secrets,
@@ -897,6 +933,87 @@ mod tests {
         };
         assert_eq!(ping, Ping {});
         send(&mut socket, Body::Pong(Pong {})).await;
+    }
+
+    #[tokio::test]
+    async fn a_4002_after_a_long_healthy_connection_reconnects_at_once() {
+        let mut gateway = FakeGateway::start().await;
+        let mut client = connect_with(
+            &gateway,
+            |_, _| {},
+            |connection| connection.stable = Duration::from_millis(200),
+        )
+        .await;
+        // The first 4002 is answered at once and arms the back-off for a second one.
+        let mut socket = gateway.next().await;
+        recv(&mut socket).await;
+        close(&mut socket, 4002).await;
+        let mut socket = gateway.next().await;
+        identify(&client, &mut socket, 30_000).await;
+        client.wait_for(ConnectionState::Connected).await;
+        sleep(Duration::from_millis(400)).await;
+        let closed_at = Instant::now();
+        close(&mut socket, 4002).await;
+        let mut socket = gateway.next().await;
+        assert!(
+            closed_at.elapsed() < Duration::from_millis(400),
+            "no back-off after a healthy connection: {:?}",
+            closed_at.elapsed()
+        );
+        assert_eq!(identify(&client, &mut socket, 30_000).await, "access-2");
+    }
+
+    #[tokio::test]
+    async fn many_read_positions_do_not_starve_the_reads_of_the_connection() {
+        const CONVERSATIONS: usize = 90;
+        let mut gateway = FakeGateway::start().await;
+        let client = connect_with(
+            &gateway,
+            |_, _| {},
+            |connection| connection.pong_timeout = Duration::from_millis(1_500),
+        )
+        .await;
+        let mut socket = gateway.next().await;
+        identify(&client, &mut socket, 1_000).await;
+        recv_until(&mut socket, |body| matches!(body, Body::Ping(_))).await;
+
+        // The app reads everything at once, while the Pong is still on its way.
+        {
+            let mut store = client.shared.store();
+            let peer = push_domain::UserId::new();
+            for _ in 0..CONVERSATIONS {
+                let conversation = push_domain::ConversationId::new();
+                store.open_direct(conversation, peer).unwrap();
+                let entry = crate::store::tests::entry(
+                    conversation,
+                    peer,
+                    1,
+                    push_proto::v1::EntryKind::Message,
+                );
+                store.apply_deliver(&entry).unwrap();
+                store.mark_read(conversation, 1).unwrap();
+            }
+        }
+        client.commands.send(Command::Wake).unwrap();
+        sleep(Duration::from_millis(100)).await;
+        send(&mut socket, Body::Pong(Pong {})).await;
+
+        let mut reads = 0;
+        let started = Instant::now();
+        while reads < CONVERSATIONS {
+            match recv(&mut socket).await {
+                Body::ReadUpTo(_) => reads += 1,
+                Body::Ping(_) => send(&mut socket, Body::Pong(Pong {})).await,
+                _ => {}
+            }
+        }
+        assert!(
+            started.elapsed() > Duration::from_secs(2),
+            "the frame budget held the rest back"
+        );
+        sleep(Duration::from_millis(300)).await;
+        assert_eq!(*client.state.borrow(), ConnectionState::Connected);
+        gateway.quiet(Duration::from_millis(300)).await;
     }
 
     #[tokio::test]
