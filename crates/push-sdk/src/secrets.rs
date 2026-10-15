@@ -10,9 +10,17 @@ use serde::{Deserialize, Serialize};
 
 /// The key of the signed-in device's credentials.
 pub(crate) const SESSION_KEY: &str = "push.session";
+/// The key of the device this client registered last, kept after a sign-out by the server
+/// (a password reset) so that signing in again finds the same device rather than
+/// registering another.
+pub(crate) const DEVICE_KEY: &str = "push.device";
 /// The key of a device registration that has not been answered yet: its
 /// `registration_id`, reused when the registration is retried (spec §5.3).
 pub(crate) const REGISTRATION_KEY: &str = "push.registration";
+
+/// Every key the SDK uses in the [`SecretStore`]: a store may map them to keychain items,
+/// and an app that moves its data to another store copies these.
+pub const SECRET_KEYS: [&str; 3] = [SESSION_KEY, DEVICE_KEY, REGISTRATION_KEY];
 
 /// A failure of the app's secret store, in its own words.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

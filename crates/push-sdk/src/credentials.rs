@@ -14,7 +14,9 @@ use uuid::Uuid;
 
 use crate::SdkError;
 use crate::auth::{AuthApi, Tokens};
-use crate::secrets::{REGISTRATION_KEY, SESSION_KEY, SecretStore, Session};
+use push_domain::DeviceId;
+
+use crate::secrets::{DEVICE_KEY, REGISTRATION_KEY, SESSION_KEY, SecretStore, Session};
 
 /// An access token with less than this left is refreshed before it is used: the gateway
 /// warns 60 s before expiry, and a token used for a connection should outlast that.
@@ -46,9 +48,42 @@ impl Credentials {
         self.inner.session()
     }
 
-    /// Keeps the tokens of a fresh sign-in.
+    /// Keeps the tokens of a fresh sign-in, and remembers the device.
     pub fn sign_in(&self, tokens: Tokens) -> Result<Session, SdkError> {
+        self.inner
+            .secrets
+            .save(DEVICE_KEY, tokens.device_id.0.as_bytes())
+            .map_err(|error| SdkError::Secrets(error.0))?;
         self.inner.sign_in(tokens)
+    }
+
+    /// The device this client registered last, if it was not signed out for good.
+    pub fn last_device(&self) -> Result<Option<DeviceId>, SdkError> {
+        Ok(self
+            .inner
+            .secrets
+            .load(DEVICE_KEY)
+            .map_err(|error| SdkError::Secrets(error.0))?
+            .and_then(|bytes| Uuid::from_slice(&bytes).ok())
+            .map(DeviceId))
+    }
+
+    /// The device is gone (revoked): the next sign-in registers a new one.
+    pub fn forget_device(&self) -> Result<(), SdkError> {
+        self.inner
+            .secrets
+            .delete(DEVICE_KEY)
+            .map_err(|error| SdkError::Secrets(error.0))
+    }
+
+    /// Signs the device out for good: forgets the session and the device once no refresh
+    /// is in flight (so none saves them again), and returns the session it forgot.
+    pub async fn sign_out_for_good(&self) -> Result<Option<Session>, SdkError> {
+        let _refreshing = self.inner.refreshing.lock().await;
+        let session = self.inner.session()?;
+        self.inner.forget_session()?;
+        self.forget_device()?;
+        Ok(session)
     }
 
     /// Forgets the session. Waits for a refresh in flight, so that it cannot save the

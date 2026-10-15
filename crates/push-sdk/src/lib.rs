@@ -15,6 +15,7 @@
 #![allow(dead_code)]
 
 mod auth;
+mod client;
 mod connection;
 mod credentials;
 mod engine;
@@ -28,6 +29,7 @@ mod store;
 mod testing;
 
 pub use auth::{Device, Platform, Profile};
+pub use client::{Account, Client, Config, EDIT_WINDOW, Events};
 pub use error::SdkError;
 pub use key::DatabaseKey;
 pub use model::{
@@ -35,7 +37,7 @@ pub use model::{
     MessageKind, MessageStatus, OutboxKind,
 };
 pub use push_domain::{ClientMsgId, ConversationId, DeviceId, MessageId, UserId};
-pub use secrets::{MemorySecretStore, SecretError, SecretStore};
+pub use secrets::{MemorySecretStore, SECRET_KEYS, SecretError, SecretStore};
 
 #[cfg(test)]
 mod tests {
