@@ -14,10 +14,13 @@
 // then some crate-private items have no caller outside their tests.
 #![allow(dead_code)]
 
+mod auth;
+mod credentials;
 mod error;
 mod model;
 mod secrets;
 
+pub use auth::{Device, Platform, Profile};
 pub use error::SdkError;
 pub use model::{
     ConnectionState, Contact, ContactState, Conversation, ConversationKind, Event, Invite, Message,
