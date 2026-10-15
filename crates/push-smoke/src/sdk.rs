@@ -360,6 +360,10 @@ async fn restart_resumes_the_outbox(
         };
         seqs.push(message.seq.context("a delivered message has a seq")?);
     }
+    // Positive control: the same scan finds the text in a plain database.
+    if !file_holds(&dana.database, "queued offline")? {
+        bail!("the scan did not find the text in dana's plain database");
+    }
     // The edit and the delete took after + 1 and after + 2.
     let first = after + 3;
     if seqs != [first, first + 1, first + 2] {
@@ -534,6 +538,7 @@ async fn removed_and_signed_out(
         .account()?
         .context("erin is signed in")?
         .device_id;
+    let held_before = erin.client.messages(chat, None, 50)?.len();
     erin.client.forgot_password(&erin.email).await?;
     erin.password = auth.complete_password_reset(&erin.email).await?;
     erin.wait_for("SignedOut", WORKER_TIMEOUT, |event| {
@@ -557,8 +562,8 @@ async fn removed_and_signed_out(
     }
     erin.connect().await?;
     let history = erin.client.messages(chat, None, 50)?.len();
-    if history == 0 {
-        bail!("erin's app lost its history");
+    if history == 0 || history != held_before {
+        bail!("erin's app held {held_before} messages before the reset and {history} after");
     }
     sdk_step(&format!(
         "erin reset her password; her app reported SignedOut (4001) after {} ms, signed the same device in again and kept its {history} messages",
