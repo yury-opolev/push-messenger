@@ -36,6 +36,28 @@ jobs:
       - run: docker pull redis:7-alpine
       - run: cargo test --workspace --locked
 
+  # The C and Node bindings on Linux: the generated header is current, a C program built
+  # with gcc runs against the shared library, and the Node tests and typings pass.
+  bindings:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: bindings/node/package-lock.json
+      - run: cargo test --locked -p push-sdk-c -p push-sdk-ffi
+      - run: npm ci
+        working-directory: bindings/node
+      - run: npm test
+        working-directory: bindings/node
+      - run: npm run typecheck
+        working-directory: bindings/node
+
   # The container images build (nothing is pushed). Deploying them is verified on
   # minikube before merge: deploy/minikube/up.ps1 -Smoke.
   images:

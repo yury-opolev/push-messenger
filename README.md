@@ -19,8 +19,8 @@ one).
 
 ## The client SDK
 
-`crates/push-sdk` is the Rust core that apps embed (the Node and C bindings come with
-Plan 10). A `Client` signs up and in through auth-svc, keeps the device's credentials in
+`crates/push-sdk` is the Rust core that apps embed, from Rust or through its Node.js and C
+bindings. A `Client` signs up and in through auth-svc, keeps the device's credentials in
 a `SecretStore` the app provides (the platform's keychain), and holds the WebSocket to the
 gateway, reconnecting with backoff; it signs out only when the server says so (4001) and
 stops only when the device is removed (4003) or its data was opened elsewhere (4007).
@@ -44,6 +44,13 @@ verifying the release's Sigstore signatures. The SDK ships no keychain store and
 stores the key: [docs/sdk-secure-storage.md](docs/sdk-secure-storage.md) shows how to keep
 the credentials in the platform's keychain and how to derive and change the key. Groups
 are not offered to apps in the first release, so the SDK has no group calls yet.
+
+From Node.js, `bindings/node` (napi-rs) gives the same client with promises, one event
+listener and the secret store as a JavaScript object (`cd bindings/node; npm test`). From
+C, `bindings/c` builds a shared library with a generated header,
+`bindings/c/include/push_sdk.h`: opaque handles, error codes, UTF-8 JSON and blocking calls
+(`cargo test -p push-sdk-c` compiles and runs a C program against it). Both report the
+same error codes as Rust: [docs/sdk-bindings.md](docs/sdk-bindings.md) is the guide.
 
 ## Run it on minikube
 

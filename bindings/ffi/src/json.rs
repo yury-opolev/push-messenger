@@ -385,4 +385,92 @@ mod tests {
         assert_eq!(platform("toaster").unwrap_err().code(), "invalid");
         assert!(id::<UserId>("not an id", "userId").is_err());
     }
+
+    /// docs/sdk-bindings.md tells app developers every code the SDK makes, whether it is
+    /// retryable, and every event.
+    #[test]
+    fn the_bindings_guide_names_every_error_code_and_event() {
+        let guide = include_str!("../../../docs/sdk-bindings.md");
+        let text = String::new;
+        let errors = [
+            SdkError::Invalid(text()),
+            SdkError::NotSignedIn,
+            SdkError::DeviceRemoved,
+            SdkError::OpenedElsewhere,
+            SdkError::Offline,
+            SdkError::Disconnected,
+            SdkError::Timeout,
+            SdkError::UnexpectedAnswer(text()),
+            SdkError::ConnectionBusy,
+            SdkError::Network(text()),
+            SdkError::Storage(text()),
+            SdkError::WrongKey,
+            SdkError::EncryptionUnavailable,
+            SdkError::Secrets(text()),
+            SdkError::Closed,
+        ];
+        for failure in &errors {
+            let retryable = if failure.is_retryable() { "yes" } else { "no" };
+            let row = format!("| `{}` | {retryable} |", failure.code());
+            assert!(guide.contains(&row), "{row}");
+        }
+        assert!(guide.contains("| `panic` | no |"));
+        let (conversation_id, user) = (ConversationId::new(), UserId::new());
+        let message = Message {
+            conversation_id,
+            client_msg_id: ClientMsgId::new(),
+            message_id: None,
+            seq: None,
+            sender_id: user,
+            kind: MessageKind::Text,
+            body: None,
+            client_ts: None,
+            server_ts: None,
+            edited_at: None,
+            deleted: false,
+            status: MessageStatus::Pending,
+        };
+        let events = [
+            Event::ConnectionStateChanged(ConnectionState::Offline),
+            Event::MessageAdded(message.clone()),
+            Event::MessageSent(message.clone()),
+            Event::MessageEdited(message.clone()),
+            Event::MessageDeleted(message),
+            Event::SendFailed {
+                conversation_id,
+                client_msg_id: ClientMsgId::new(),
+                kind: OutboxKind::Send,
+                error: SdkError::Offline,
+            },
+            Event::ReceiptChanged {
+                conversation_id,
+                peer_delivered_seq: 0,
+                peer_read_seq: 0,
+            },
+            Event::ConversationChanged(Conversation {
+                id: conversation_id,
+                kind: ConversationKind::Direct,
+                peer: Some(user),
+                title: None,
+                last_seq: 0,
+                read_seq: 0,
+                unread: 0,
+                peer_delivered_seq: 0,
+                peer_read_seq: 0,
+                updated_at: 0,
+            }),
+            Event::ContactChanged(Contact {
+                user_id: user,
+                state: ContactState::Accepted,
+            }),
+            Event::SignedOut,
+            Event::DeviceRemoved,
+            Event::OpenedElsewhere,
+            Event::EventsLost,
+        ];
+        for shown in events.iter().map(event) {
+            let row = format!("| `{}` |", shown["type"].as_str().unwrap());
+            assert!(guide.contains(&row), "{row}");
+        }
+    }
 }

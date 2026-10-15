@@ -14,7 +14,8 @@ protected:
 The SDK ships no keychain integration (owner decision): every platform has its own, and
 the app already knows which one it runs on. This guide shows how to connect the SDK to the
 platform's secure storage, what never to do, and how to derive and change the database
-key.
+key. Apps on the Node.js and C bindings give the same store as callbacks:
+[sdk-bindings.md](sdk-bindings.md) shows how, with a keychain store for Node.js.
 
 ## The secret store
 
