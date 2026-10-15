@@ -164,5 +164,5 @@ if [[ "$smoke" == true ]]; then
   step 'wait for the worker pod to be Ready'
   kubectl --context "$cluster" -n "$namespace" wait --for=condition=Ready pod -l "$worker_selector" --timeout=90s
   step 'run the smoke test'
-  helm test "$release" --kube-context "$cluster" --namespace "$namespace" --logs --timeout 5m
+  helm test "$release" --kube-context "$cluster" --namespace "$namespace" --logs --timeout 6m
 fi

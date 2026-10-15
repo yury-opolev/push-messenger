@@ -174,16 +174,21 @@ async fn the_smoke_test_passes_against_the_whole_stack() {
     wait_until_ready("message-svc", message_svc_health_addr, &message_svc).await;
     wait_until_ready("the gateway", gateway_health_addr, &gateway).await;
 
+    // The SDK apps' databases, fresh for every run.
+    let data_dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("push-smoke-{}", uuid::Uuid::now_v7()));
+    std::fs::create_dir_all(&data_dir).unwrap();
     let target = Target {
         mailbox_url: worker_url,
         auth_url,
         socket_url,
         host: None,
         signing_key: signing_key.to_owned(),
+        data_dir: data_dir.to_string_lossy().into_owned(),
     };
-    tokio::time::timeout(Duration::from_secs(180), run(&target))
+    tokio::time::timeout(Duration::from_secs(300), run(&target))
         .await
-        .expect("the smoke test finishes within 120 s")
+        .expect("the smoke test finishes within 300 s")
         .expect("the smoke test passes");
 
     shutdown.cancel();
@@ -194,6 +199,7 @@ async fn the_smoke_test_passes_against_the_whole_stack() {
     gateway.await.unwrap().expect("the gateway stops cleanly");
     auth.await.unwrap().expect("auth-svc stops cleanly");
     worker.await.unwrap().expect("the worker stops cleanly");
+    let _ = std::fs::remove_dir_all(&data_dir);
 }
 
 /// Polls `/readyz` of a server task until it answers 200; fails if the task stops first.

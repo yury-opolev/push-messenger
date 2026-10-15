@@ -2240,6 +2240,7 @@ dependencies = [
  "push-gateway",
  "push-message-svc",
  "push-proto",
+ "push-sdk",
  "push-store",
  "push-worker",
  "reqwest",

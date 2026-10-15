@@ -158,6 +158,13 @@ Check 'minikube: the smoke test reaches only the ingress and the mailbox, with a
         $smoke -match 'name: PUSH_SMOKE_SIGNING_KEY\s+valueFrom:\s+secretKeyRef:\s+name: push-secrets\s+key: auth-signing-key' -and
         $key -and -not $smoke.Contains($key) -and $dev -notmatch 'PUSH_DEV_SETUP'
 }
+Check 'minikube: the smoke test keeps the SDK apps'' databases in an emptyDir' {
+    $smoke = Doc $dev 'Pod' 'push-smoke'
+    $smoke -match '- --data-dir\s+- /data' -and
+        $smoke -match 'volumeMounts:\s+- name: data\s+mountPath: /data' -and
+        $smoke -match 'volumes:\s+- name: data\s+emptyDir:' -and
+        $smoke -match 'readOnlyRootFilesystem: true'
+}
 Check 'minikube: the worker''s dev mailbox on' {
     (Doc $dev 'Deployment' 'push-worker') -match 'name: PUSH_DEV_MAILBOX\s+value: "1"'
 }
@@ -169,6 +176,13 @@ Check 'minikube: links use http://push.local, tokens ws://push.local/v1/socket' 
     $dev -match 'name: PUSH_AUTH_TOKEN_AUDIENCE\s+value: "ws://push.local/v1/socket"'
 }
 Check 'minikube: the smoke test is a helm test' { $dev -match 'helm.sh/hook: test' }
+Check 'minikube: helm test waits 6 minutes, longer than the smoke run''s 300 s' {
+    $scripts = Join-Path $PSScriptRoot '../minikube'
+    $main = Join-Path $PSScriptRoot '../../crates/push-smoke/src/main.rs'
+    (Get-Content (Join-Path $scripts 'up.ps1') -Raw) -match 'helm test .* --timeout 6m' -and
+        (Get-Content (Join-Path $scripts 'up.sh') -Raw) -match 'helm test .* --timeout 6m' -and
+        (Get-Content $main -Raw) -match 'TOTAL_TIMEOUT: Duration = Duration::from_secs\(300\)'
+}
 Check 'minikube: ingress timeouts are 120 s' { $dev -match 'proxy-read-timeout: "120"' -and $dev -match 'proxy-send-timeout: "120"' }
 
 Check 'dev mode without the acknowledgement is refused' {

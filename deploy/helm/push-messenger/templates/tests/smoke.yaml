@@ -3,7 +3,9 @@
 # API and the WebSockets go through the ingress controller with the ingress host as the
 # Host header, as a client's would; only the DEV ONLY mailbox is read straight from the
 # worker, which the ingress does not route. It gets auth-svc's signing key from the Secret,
-# to sign an expired token and one for another audience that the gateway must refuse.
+# to sign an expired token and one for another audience that the gateway must refuse. Its
+# second half runs two apps built on push-sdk, whose SQLite databases live in an emptyDir
+# (the root filesystem is read-only).
 apiVersion: v1
 kind: Pod
 metadata:
@@ -30,6 +32,11 @@ spec:
         - {{ .Values.smoke.socketUrl | quote }}
         - --host
         - {{ .Values.ingress.host | quote }}
+        - --data-dir
+        - /data
+      volumeMounts:
+        - name: data
+          mountPath: /data
       env:
         - name: PUSH_SMOKE_SIGNING_KEY
           valueFrom:
@@ -39,8 +46,12 @@ spec:
       resources:
         requests:
           cpu: 10m
-          memory: 16Mi
+          memory: 32Mi
         limits:
           cpu: 200m
-          memory: 64Mi
+          memory: 128Mi
+  volumes:
+    - name: data
+      emptyDir:
+        sizeLimit: 64Mi
 {{- end }}

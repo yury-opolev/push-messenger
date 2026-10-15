@@ -282,6 +282,13 @@ impl<'a> Auth<'a> {
             "ask for a password reset",
         )
         .await?;
+        self.complete_password_reset(email).await?;
+        Ok(())
+    }
+
+    /// Opens the newest reset link the worker delivered to `email` and sets a new
+    /// password, as the user does in a browser; the new password.
+    pub async fn complete_password_reset(&self, email: &str) -> anyhow::Result<String> {
         let (token, _) = self.mailbox_token(email, "reset_password").await?;
         let password = format!("smoke-{}", Uuid::now_v7());
         expect(
@@ -291,6 +298,19 @@ impl<'a> Auth<'a> {
             ),
             StatusCode::OK,
             "reset the password",
+        )
+        .await?;
+        Ok(password)
+    }
+
+    /// Verifies `email` with the link the worker delivered, as the user does in a
+    /// browser (an app signed up through the SDK).
+    pub async fn verify_email(&self, email: &str) -> anyhow::Result<()> {
+        let (token, _) = self.mailbox_token(email, "verify_email").await?;
+        expect(
+            self.post("/v1/auth/verify", json!({"token": token})),
+            StatusCode::OK,
+            "verify the email",
         )
         .await?;
         Ok(())

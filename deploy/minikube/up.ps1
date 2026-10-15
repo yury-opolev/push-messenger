@@ -199,6 +199,6 @@ if ($Smoke) {
         kubectl --context $Cluster -n $namespace wait --for=condition=Ready pod -l $workerSelector --timeout=90s
     }
     Invoke-Step 'run the smoke test' {
-        helm test $release --kube-context $Cluster --namespace $namespace --logs --timeout 5m
+        helm test $release --kube-context $Cluster --namespace $namespace --logs --timeout 6m
     }
 }

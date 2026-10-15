@@ -62,7 +62,12 @@ register a device and connect its WebSocket with the access token (the gateway a
 become contacts by request and by invite, chat, edit, read and delete, see a group request
 refused, and see their allowed profiles from auth-svc; the gateway refuses an expired token
 and one for another audience; finally a revoked device and a password reset close their
-sockets with 4003 and 4001. Only the DEV ONLY mailbox is read from the worker directly.
+sockets with 4003 and 4001. Then two apps built on `push-sdk` do the same through the
+SDK: they sign up and in, chat with receipts, edit and delete, restart with messages in
+their outbox (sent in order, once; one app's database encrypted), and see `OpenedElsewhere`
+when a copy of an app takes over its device, `DeviceRemoved` after a revocation and
+`SignedOut` after a password reset. Only the DEV ONLY mailbox is read from the worker
+directly.
 `deploy/minikube/up.sh --smoke` does the same on Linux
 and macOS. Both wait for ingress-nginx, retry
 `helm upgrade --install` up to 5 times while its admission webhook comes up, and
