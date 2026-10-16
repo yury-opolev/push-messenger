@@ -8,12 +8,13 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use rand::RngCore;
+use rand::distr::{Alphanumeric, SampleString};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 /// How long an access token is valid.
-pub const ACCESS_TOKEN_TTL: Duration = Duration::from_secs(15 * 60);
+pub const ACCESS_TOKEN_TTL: Duration = Duration::from_secs(30 * 60);
 /// How long a refresh token is valid.
 pub const REFRESH_TOKEN_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
@@ -27,6 +28,9 @@ pub struct AccessClaims {
     pub exp: i64,
     pub iat: i64,
     pub jti: Uuid,
+    /// Fresh random alphanumeric text; empty only for tokens issued before this claim.
+    #[serde(default)]
+    pub nonce: String,
     /// The gateway's URL: the only service that accepts these tokens.
     pub aud: String,
 }
@@ -108,6 +112,7 @@ impl AccessTokens {
             exp: now + ACCESS_TOKEN_TTL.as_secs() as i64,
             iat: now,
             jti: Uuid::now_v7(),
+            nonce: Alphanumeric.sample_string(&mut rand::rng(), 64),
             aud: self.audience.clone(),
         };
         let mut header = Header::new(Algorithm::EdDSA);
@@ -187,7 +192,7 @@ mod tests {
         assert_eq!(claims.sub, user);
         assert_eq!(claims.device_id, device);
         assert!(claims.email_verified);
-        assert_eq!(claims.exp - claims.iat, 900);
+        assert_eq!(claims.exp - claims.iat, 1800);
         assert_eq!(claims.aud, AUDIENCE);
         assert_eq!(tokens().verify(&token), Ok(claims));
         let header = jsonwebtoken::decode_header(&token).unwrap();
@@ -196,9 +201,47 @@ mod tests {
     }
 
     #[test]
+    fn every_access_token_has_a_fresh_64_character_alphanumeric_nonce() {
+        let issuer = tokens();
+        let user = Uuid::now_v7();
+        let issued_at = now();
+        let mut nonces = std::collections::HashSet::new();
+        for _ in 0..32 {
+            let (token, _) = issuer.issue(user, user, issued_at);
+            let claims = serde_json::to_value(issuer.verify(&token).unwrap()).unwrap();
+            let nonce = claims["nonce"].as_str().expect("nonce must be a string");
+            assert_eq!(nonce.len(), 64);
+            assert!(nonce.bytes().all(|byte| byte.is_ascii_alphanumeric()));
+            assert!(nonces.insert(nonce.to_owned()), "nonce was reused");
+        }
+    }
+
+    #[test]
+    fn tokens_issued_before_the_nonce_claim_still_verify() {
+        let issuer = tokens();
+        let (_, claims) = issuer.issue(Uuid::now_v7(), Uuid::now_v7(), now());
+        let mut legacy = serde_json::to_value(claims).unwrap();
+        legacy.as_object_mut().unwrap().remove("nonce");
+        let token = jsonwebtoken::encode(&Header::new(Algorithm::EdDSA), &legacy, &issuer.encoding)
+            .unwrap();
+        assert!(issuer.verify(&token).unwrap().nonce.is_empty());
+    }
+
+    #[test]
+    fn access_tokens_remain_valid_for_thirty_minutes() {
+        let issuer = tokens();
+        let user = Uuid::now_v7();
+        let (valid, _) = issuer.issue(user, user, now() - 29 * 60);
+        assert!(issuer.verify(&valid).is_ok());
+        let (expired, _) = issuer.issue(user, user, now() - 30 * 60 - 1);
+        assert_eq!(issuer.verify(&expired), Err(TokenError::Expired));
+    }
+
+    #[test]
     fn expired_foreign_and_other_audience_tokens_are_refused() {
         let user = Uuid::now_v7();
-        let (expired, _) = tokens().issue(user, user, now() - 901);
+        let (expired, _) =
+            tokens().issue(user, user, now() - ACCESS_TOKEN_TTL.as_secs() as i64 - 1);
         assert_eq!(tokens().verify(&expired), Err(TokenError::Expired));
         let stranger = AccessTokens::from_seed(&[10; 32], AUDIENCE).unwrap();
         let (foreign, _) = stranger.issue(user, user, now());

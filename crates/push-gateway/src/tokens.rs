@@ -5,7 +5,7 @@
 //! gateway restarting.
 //!
 //! A rotation signs nobody out. auth-svc publishes only its current key, so a key that
-//! leaves the set is kept for [`RETIRED_KEY_TTL`] (an access token's 15 minutes plus the
+//! leaves the set is kept for [`RETIRED_KEY_TTL`] (an access token's 30 minutes plus the
 //! leeway): tokens it signed keep passing until they expire. A token naming a key the
 //! gateway does not hold even after fetching the set for it, such as a key retired before
 //! this gateway started, is `Expired` (refresh, then reconnect), never `Invalid`: a
@@ -33,9 +33,9 @@ use uuid::Uuid;
 pub const LEEWAY: Duration = Duration::from_secs(60);
 /// A token naming an unknown key fetches the key set again at most this often.
 pub const REFETCH_INTERVAL: Duration = Duration::from_secs(30);
-/// How long a key that left the set keeps verifying: the 15 minutes an access token lives,
+/// How long a key that left the set keeps verifying: the 30 minutes an access token lives,
 /// plus the leeway.
-pub const RETIRED_KEY_TTL: Duration = Duration::from_secs(15 * 60 + LEEWAY.as_secs());
+pub const RETIRED_KEY_TTL: Duration = Duration::from_secs(30 * 60 + LEEWAY.as_secs());
 /// The largest key set read; auth-svc's is under 1 KiB.
 pub const MAX_KEY_SET_BYTES: usize = 64 * 1024;
 /// How long fetching the key set may take.
@@ -436,9 +436,10 @@ mod tests {
         let verifier = verifier_for(&issuer).await;
         let user = Uuid::now_v7();
         // Expired 30 s ago: within the 60 s leeway.
-        let (fresh_enough, _) = issuer.issue(user, user, now() - 900 - 30);
+        let lifetime = push_auth::tokens::ACCESS_TOKEN_TTL.as_secs() as i64;
+        let (fresh_enough, _) = issuer.issue(user, user, now() - lifetime - 30);
         assert!(verifier.verify(&fresh_enough).await.is_ok());
-        let (expired, _) = issuer.issue(user, user, now() - 900 - 90);
+        let (expired, _) = issuer.issue(user, user, now() - lifetime - 90);
         assert_eq!(verifier.verify(&expired).await, Err(TokenError::Expired));
     }
 
@@ -528,6 +529,32 @@ mod tests {
         Arc::get_mut(&mut verifier.inner).unwrap().refetch_interval = Duration::ZERO;
         assert_eq!(verifier.verify(&stranger).await, Err(TokenError::Expired));
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn a_retired_key_verifies_for_thirty_minutes_plus_leeway() {
+        let (old, new) = (issuer(SEED), issuer([9; 32]));
+        let (url, jwks, _) = key_server(old.jwks()).await;
+        let verifier = Verifier::new(url, AUDIENCE);
+        verifier.fetch().await.unwrap();
+        let user = Uuid::now_v7();
+        let (token, _) = old.issue(user, user, now());
+        *jwks.lock().unwrap() = new.jwks();
+        verifier.fetch().await.unwrap();
+        {
+            let mut keys = verifier.inner.keys.write().unwrap();
+            keys.get_mut(old.kid()).unwrap().retired_at =
+                Some(Instant::now() - Duration::from_secs(30 * 60 + 30));
+        }
+        verifier.fetch().await.unwrap();
+        assert!(verifier.verify(&token).await.is_ok());
+        {
+            let mut keys = verifier.inner.keys.write().unwrap();
+            keys.get_mut(old.kid()).unwrap().retired_at =
+                Some(Instant::now() - Duration::from_secs(31 * 60 + 1));
+        }
+        verifier.fetch().await.unwrap();
+        assert_eq!(verifier.key_ids(), [new.kid()]);
     }
 
     #[tokio::test]

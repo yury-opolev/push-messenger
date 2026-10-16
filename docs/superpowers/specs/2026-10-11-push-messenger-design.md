@@ -75,6 +75,13 @@ each internal API takes a token of its own (Plans 7A, 8B).
 **Public endpoints:** `wss://api.<domain>/v1/socket` (gateway) and
 `https://api.<domain>/v1/auth/*`, `/v1/devices/*`, `/v1/users/*` (auth-svc).
 
+**API URL versioning.** Public HTTP and WebSocket API URLs include an explicit major
+version in the path: `/v1/...` for the first version, including the Resend webhook at
+`/v1/webhooks/resend`. Backward-compatible changes stay under the same prefix; breaking
+API changes use a new major-version prefix, such as `/v2/...`, rather than changing
+the existing version's contract. Operational probes (`/healthz`, `/readyz`) and the
+DEV ONLY mailbox are not public API endpoints and are not versioned.
+
 ## 3. Data model
 
 ### 3.1 auth schema (auth-svc)
@@ -503,12 +510,15 @@ honest statement is "Bob has read up to message N".
 | Credential | Proves | Lifetime | Stored |
 |---|---|---|---|
 | Registration token | "this account may register a device" | 5 min | no |
-| Access token (JWT, EdDSA) | "user X on device D, email verified" | 15 min | no |
+| Access token (JWT, EdDSA) | "user X on device D, email verified" | 30 min | no |
 | Refresh token | "device D may get new access tokens" | 30 days | yes, hashed and rotated |
 | Email link | one action on one account | 30 min | no |
 
-Access-token claims: `sub`, `device_id`, `email_verified`, `exp`, `iat`, `jti`, and
-`aud` set to the gateway URL. Only access and refresh tokens are sign-in credentials.
+Access-token claims: `sub`, `device_id`, `email_verified`, `exp`, `iat`, `jti`, `nonce`,
+and `aud` set to the gateway URL. Each newly issued token has a fresh, cryptographically
+random 64-character ASCII alphanumeric `nonce` (`A-Z`, `a-z`, `0-9`); previously issued
+tokens without it remain valid until they expire. Only access and refresh tokens are
+sign-in credentials.
 
 ### 5.2 Signup and email verification
 
@@ -586,7 +596,7 @@ tokens' `iat` (`reset_at` in the `user.password_reset` payload, relayed in
 `AccountUser.reset_at`; message-svc's own clock only for an event written before auth-svc
 sent it). The latest reset is kept, so a redelivered or older event moves nothing.
 `Identify` refuses (`UNAUTHENTICATED`, `PASSWORD_CHANGED`) any access token whose `iat` is
-no later than that second: a token that outlives the reset (up to 15 minutes) or a kick
+no later than that second: a token that outlives the reset (up to 30 minutes) or a kick
 lost on Redis cannot keep or bring back a session, while a sign-in after the reset passes
 even if the worker relays the reset later. The gateway passes the token's `iat` with
 every `Identify`, also on `ReAuth`. The `PASSWORD_RESET` kick carries the reset time, and
@@ -710,7 +720,7 @@ Implementation notes (push-auth, Plan 5A):
   never extend the window. Anything else presented after rotation is reuse and revokes
   every refresh token of the device. Signing in again with `device_id` revokes the
   device's earlier refresh tokens. A cut-off pair's access token stays valid until it
-  expires (at most 15 minutes).
+  expires (at most 30 minutes).
 - **Lock order.** Every path that changes a device's refresh tokens locks the device row
   first, in the order user row → device rows → token rows. Concurrent refreshes are
   thereby serialised and leave one live branch, a stolen token cannot survive a
@@ -763,7 +773,7 @@ Implementation notes (push-auth, Plan 5A):
   pages return JSON errors, not HTML. Path, Query, 404 and 405 rejections are plain text.
   `Bearer` is matched case-sensitively. `?token=` is kept out of ingress access
   logs (Plan 5B; the nginx error log is Plan 11). A password reset revokes refresh tokens but leaves devices active, so an
-  access token issued before the reset keeps working for up to 15 minutes; later, a
+  access token issued before the reset keeps working for up to 30 minutes; later, a
   `password_changed_at` stamp should make `authenticate` and the gateway reject older
   tokens. Plan 8 does it for the gateway (message-svc's `password_reset_at`, §5.3);
   auth-svc's own API (`/v1/devices`, `/v1/users`) still accepts such a token until it
@@ -886,7 +896,7 @@ Implementation notes (gateway, Plan 8):
   expired one with 4002; when the keys cannot be fetched the close is 1011, never a
   sign-out. The key set is read up to 64 KiB.
 - **Key rotation signs nobody out.** auth-svc publishes only its current key, so a key
-  that leaves the set stays usable for 16 minutes (a token's 15 minutes plus the leeway)
+  that leaves the set stays usable for 31 minutes (a token's 30 minutes plus the leeway)
   after the first fetch that missed it. A token naming a key the gateway does not hold
   even after fetching the set for it (one retired before this gateway started, or a
   made-up `kid`) closes with 4002: a refresh gets a token signed with the current key.
@@ -908,7 +918,7 @@ Implementation notes (gateway, Plan 8):
   of another device closes with 4001; when the keys or message-svc cannot be reached a
   retryable `Error` asks for the `ReAuth` again. A kick lost on Redis is thus caught
   within one token lifetime: the owner accepted that a device revoked while Redis is down
-  may stay connected up to 15 minutes, until its next `ReAuth` is refused, rather than
+  may stay connected up to 30 minutes, until its next `ReAuth` is refused, rather than
   re-checking every connection when the subscription returns (to revisit with the load
   test of Plan 11).
 - **Kicks** close the socket: `DEVICE_REVOKED` with 4003, `TAKEN_OVER` (and a kick without

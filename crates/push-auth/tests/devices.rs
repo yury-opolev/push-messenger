@@ -112,7 +112,7 @@ async fn a_registered_device_gets_tokens_and_is_announced() {
         .register_device(&registration, Uuid::now_v7(), "Alice's phone", "ios")
         .await
         .unwrap();
-    assert_eq!(tokens.access_expires_in_s, 900);
+    assert_eq!(tokens.access_expires_in_s, 1800);
     assert_eq!(tokens.refresh_expires_in_s, 30 * 24 * 3600);
     assert_eq!(tokens.device_id.get_version_num(), 7);
 

@@ -26,7 +26,7 @@
 //! Redis is a doorbell, not the truth (spec §2): whenever the subscription is
 //! re-established after a break, every connection is rung, since notifications may have
 //! been lost meanwhile. A kick lost that way is caught when the connection renews its
-//! token (`ReAuth`, within 15 minutes): message-svc refuses a revoked device and a token
+//! token (`ReAuth`, within 30 minutes): message-svc refuses a revoked device and a token
 //! older than a password reset.
 
 use std::collections::{HashMap, HashSet};

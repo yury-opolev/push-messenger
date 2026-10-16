@@ -256,7 +256,7 @@ async fn sign_up_verify_register_and_use_a_device() {
     let world = world().await;
     let tokens = with_device(&world, "alice").await;
     assert_eq!(tokens["token_type"], "Bearer");
-    assert_eq!(tokens["expires_in_s"], 900);
+    assert_eq!(tokens["expires_in_s"], 1800);
     let access = tokens["access_token"].as_str().unwrap();
 
     let devices = call(&world, Method::GET, "/v1/devices", Some(access), None).await;
