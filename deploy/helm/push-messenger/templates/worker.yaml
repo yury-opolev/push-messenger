@@ -63,7 +63,7 @@ spec:
                   name: {{ include "push.secretName" . }}
                   key: worker-auth-database-url
             - name: PUSH_MESSAGE_SVC_URL
-              value: {{ printf "http://%s:50051" (include "push.name" (dict "root" . "component" "message-svc")) | quote }}
+              value: {{ printf "http://%s:50052" (include "push.name" (dict "root" . "component" "message-svc")) | quote }}
             - name: PUSH_ACCOUNTS_TOKEN
               valueFrom:
                 secretKeyRef:

@@ -34,7 +34,7 @@ ENTRYPOINT ["/usr/local/bin/push-auth"]
 
 FROM runtime AS message-svc
 COPY --from=builder /out/push-message-svc /usr/local/bin/push-message-svc
-EXPOSE 50051 8081
+EXPOSE 50051 50052 50053 8081
 ENTRYPOINT ["/usr/local/bin/push-message-svc"]
 
 FROM runtime AS gateway

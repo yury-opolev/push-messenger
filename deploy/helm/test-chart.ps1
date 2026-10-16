@@ -33,6 +33,29 @@ Check 'lint with the default values' { helm lint $chart --strict | Out-Null; $LA
 Check 'lint with values-minikube.yaml' { helm lint $chart --strict -f $minikube | Out-Null; $LASTEXITCODE -eq 0 }
 
 $default = helm template push $chart | Out-String
+Check 'default: message-svc exposes dedicated named gRPC Service ports' {
+    $service = Doc $default 'Service' 'push-message-svc'
+    ([regex]::Matches($service, '(?m)^\s+- name: ')).Count -eq 3 -and
+        $service -match 'name: messaging\s+port: 50051\s+targetPort: messaging\s+appProtocol: grpc' -and
+        $service -match 'name: accounts\s+port: 50052\s+targetPort: accounts\s+appProtocol: grpc' -and
+        $service -match 'name: directory\s+port: 50053\s+targetPort: directory\s+appProtocol: grpc'
+}
+Check 'default: message-svc binds dedicated API listeners and preserves the health port' {
+    $messageSvc = Doc $default 'Deployment' 'push-message-svc'
+    ([regex]::Matches($messageSvc, 'containerPort: ')).Count -eq 4 -and
+        $messageSvc -match 'name: messaging\s+containerPort: 50051' -and
+        $messageSvc -match 'name: accounts\s+containerPort: 50052' -and
+        $messageSvc -match 'name: directory\s+containerPort: 50053' -and
+        $messageSvc -match 'name: health\s+containerPort: 8081' -and
+        $messageSvc -match 'name: PUSH_GRPC_ADDR\s+value: "0.0.0.0:50051"' -and
+        $messageSvc -match 'name: PUSH_ACCOUNTS_GRPC_ADDR\s+value: "0.0.0.0:50052"' -and
+        $messageSvc -match 'name: PUSH_DIRECTORY_GRPC_ADDR\s+value: "0.0.0.0:50053"'
+}
+Check 'default: each message-svc caller uses its dedicated API port' {
+    (Doc $default 'Deployment' 'push-gateway') -match 'name: PUSH_MESSAGE_SVC_URL\s+value: "http://push-message-svc:50051"' -and
+        (Doc $default 'Deployment' 'push-worker') -match 'name: PUSH_MESSAGE_SVC_URL\s+value: "http://push-message-svc:50052"' -and
+        (Doc $default 'Deployment' 'push-auth') -match 'name: PUSH_MESSAGE_SVC_URL\s+value: "http://push-message-svc:50053"'
+}
 Check 'default: the gateway checks tokens with auth-svc''s keys, for its own URL, and has no dev identities' {
     $gateway = Doc $default 'Deployment' 'push-gateway'
     $gateway -match 'name: PUSH_AUTH_URL\s+value: "http://push-auth:8080"' -and
@@ -94,7 +117,7 @@ Check 'default: auth-svc and message-svc share the Directory token from the Secr
     $token.Length -eq 48 -and
         $auth -match 'name: PUSH_DIRECTORY_TOKEN\s+valueFrom:\s+secretKeyRef:\s+name: push-secrets\s+key: directory-token' -and
         $messageSvc -match 'name: PUSH_DIRECTORY_TOKEN\s+valueFrom:\s+secretKeyRef:\s+name: push-secrets\s+key: directory-token' -and
-        $auth -match 'name: PUSH_MESSAGE_SVC_URL\s+value: "http://push-message-svc:50051"' -and
+        $auth -match 'name: PUSH_MESSAGE_SVC_URL\s+value: "http://push-message-svc:50053"' -and
         $auth -notmatch 'accounts-token' -and
         (Doc $default 'Deployment' 'push-worker') -notmatch 'directory-token' -and
         (Doc $default 'Deployment' 'push-gateway') -notmatch 'directory-token' -and

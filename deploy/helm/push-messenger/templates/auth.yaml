@@ -89,7 +89,7 @@ spec:
             # GET /v1/users?ids=… asks message-svc's Directory API whose profiles the
             # caller may see, with auth-svc's own token.
             - name: PUSH_MESSAGE_SVC_URL
-              value: {{ printf "http://%s:50051" (include "push.name" (dict "root" . "component" "message-svc")) | quote }}
+              value: {{ printf "http://%s:50053" (include "push.name" (dict "root" . "component" "message-svc")) | quote }}
             - name: PUSH_DIRECTORY_TOKEN
               valueFrom:
                 secretKeyRef:
