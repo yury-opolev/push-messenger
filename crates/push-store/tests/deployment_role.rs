@@ -1,4 +1,4 @@
-//! The operator-run ownership upgrade must preserve a populated legacy installation.
+//! Fresh database ownership and the data-preserving operator upgrade support unprivileged migrations.
 
 use std::path::Path;
 
@@ -259,6 +259,90 @@ impl Fixture {
         );
         assert_eq!(self.data().await, before);
     }
+}
+
+#[tokio::test]
+async fn fresh_database_owner_can_run_application_migrations_twice() {
+    let container = Postgres::default()
+        .with_tag("17-alpine")
+        .start()
+        .await
+        .expect("start PostgreSQL 17 (Docker must be running)");
+    let host = container.get_host().await.unwrap().to_string();
+    let host = if host == "localhost" {
+        "127.0.0.1"
+    } else {
+        &host
+    };
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    let endpoint = format!("{host}:{port}");
+    let admin = pool(&format!("postgres://postgres:postgres@{endpoint}/postgres")).await;
+    admin
+        .execute(
+            "CREATE ROLE push_messaging LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
+                 NOREPLICATION NOBYPASSRLS PASSWORD 'FreshMessagingTest42'",
+        )
+        .await
+        .unwrap();
+    admin
+        .execute("CREATE DATABASE push_messaging")
+        .await
+        .unwrap();
+    admin
+        .execute(
+            "ALTER DATABASE push_messaging OWNER TO push_messaging;
+             REVOKE ALL ON DATABASE push_messaging FROM PUBLIC;",
+        )
+        .await
+        .unwrap();
+    let flags: (bool, bool, bool, bool, bool, bool) = sqlx::query_as(
+        "SELECT rolcanlogin, rolsuper, rolcreatedb, rolcreaterole, rolreplication, rolbypassrls
+         FROM pg_roles WHERE rolname = 'push_messaging'",
+    )
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    assert_eq!(flags, (true, false, false, false, false, false));
+    let owner: String = sqlx::query_scalar(
+        "SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname = 'push_messaging'",
+    )
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    assert_eq!(owner, "push_messaging");
+    let public_access: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT FROM pg_database d, aclexplode(d.datacl) a
+             WHERE d.datname = 'push_messaging' AND a.grantee = 0
+         )",
+    )
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    assert!(!public_access);
+    admin.close().await;
+
+    let url = format!("postgres://push_messaging:FreshMessagingTest42@{endpoint}/push_messaging");
+    let messaging = pool(&url).await;
+    let schema: Option<String> = sqlx::query_scalar("SELECT to_regnamespace('messaging')::text")
+        .fetch_one(&messaging)
+        .await
+        .unwrap();
+    assert!(
+        schema.is_none(),
+        "bootstrap must leave app migrations to the service"
+    );
+    for _ in 0..2 {
+        push_store::migrate_database(&url).await.unwrap();
+    }
+    let table_owner: String = sqlx::query_scalar(
+        "SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid = 'messaging.message'::regclass",
+    )
+    .fetch_one(&messaging)
+    .await
+    .unwrap();
+    assert_eq!(table_owner, "push_messaging");
+    messaging.close().await;
 }
 
 #[tokio::test]

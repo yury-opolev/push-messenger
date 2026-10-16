@@ -119,9 +119,12 @@ messageSvc:
 
 postgres:
   image: postgres:17-alpine
-  # Empty: generated on install and kept on upgrades. If set, use letters and digits
-  # only (it is part of a URL).
+  # Bootstrap administrator password, used only by bundled PostgreSQL.
+  # Empty: generated on install and kept on upgrades. Use letters and digits only.
   password: ""
+  # Dedicated password for message-svc's non-superuser database owner, push_messaging.
+  # Empty: generated on fresh install and kept on upgrades. ASCII letters/digits only.
+  messagingPassword: ""
   # The password of auth-svc's own role, push_auth; the same rules.
   authPassword: ""
   # The password of the worker's own role, push_worker; the same rules.

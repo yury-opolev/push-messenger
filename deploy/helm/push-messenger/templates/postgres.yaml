@@ -54,6 +54,11 @@ spec:
                   key: postgres-password
             - name: PGDATA
               value: /var/lib/postgresql/data/pgdata
+            - name: PUSH_MESSAGING_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "push.secretName" . }}
+                  key: messaging-db-password
             - name: PUSH_AUTH_DB_PASSWORD
               valueFrom:
                 secretKeyRef:

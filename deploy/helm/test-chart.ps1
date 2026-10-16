@@ -33,6 +33,44 @@ Check 'lint with the default values' { helm lint $chart --strict | Out-Null; $LA
 Check 'lint with values-minikube.yaml' { helm lint $chart --strict -f $minikube | Out-Null; $LASTEXITCODE -eq 0 }
 
 $default = helm template push $chart | Out-String
+Check 'default: messaging has a dedicated alphanumeric credential and matching non-superuser URL' {
+    $secret = Doc $default 'Secret' 'push-secrets'
+    $password = [regex]::Match($secret, '(?m)^  messaging-db-password: "([A-Za-z0-9]+)"\s*$').Groups[1].Value
+    $admin = [regex]::Match($secret, '(?m)^  postgres-password: "([^"]+)"\s*$').Groups[1].Value
+    $password -and $admin -and $password -ne $admin -and
+        $secret.Contains("database-url: `"postgres://push_messaging:${password}@push-postgres:5432/push_messaging`"") -and
+        $secret -notmatch 'postgres://push:'
+}
+Check 'default: only bundled Postgres receives the bootstrap admin credential' {
+    $postgres = Doc $default 'StatefulSet' 'push-postgres'
+    $consumers = @($default -split "(?m)^---\s*$" | Where-Object {
+        $_ -match '(?m)^kind: (Deployment|StatefulSet|Pod)\s*$' -and $_ -match 'key: postgres-password'
+    })
+    $consumers.Count -eq 1 -and $consumers[0] -eq $postgres -and
+        $postgres -match 'name: POSTGRES_USER\s+value: push\s' -and
+        $postgres -match 'name: POSTGRES_PASSWORD\s+valueFrom:\s+secretKeyRef:\s+name: push-secrets\s+key: postgres-password' -and
+        $postgres -match 'name: PUSH_MESSAGING_DB_PASSWORD\s+valueFrom:\s+secretKeyRef:\s+name: push-secrets\s+key: messaging-db-password' -and
+        (Doc $default 'Deployment' 'push-message-svc') -match 'key: database-url' -and
+        (Doc $default 'Deployment' 'push-message-svc') -notmatch 'postgres-password|envFrom:'
+}
+Check 'default: fresh messaging bootstrap creates a plain login and transfers only its database' {
+    $init = Doc $default 'ConfigMap' 'push-postgres-init'
+    $init -match '(?s)05-push-messaging\.sh:.*CREATE ROLE push_messaging LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS.*ALTER DATABASE push_messaging OWNER TO push_messaging;.*10-push-auth\.sh:' -and
+        $init.Contains('\getenv password PUSH_MESSAGING_DB_PASSWORD') -and
+        $init -match '(?s)\\else\s+\\echo Invalid PUSH_MESSAGING_DB_PASSWORD.*?RAISE EXCEPTION' -and
+        $init -notmatch 'CREATE SCHEMA messaging|messaging-role\.sql' -and
+        -not $init.Contains([regex]::Match($default, 'messaging-db-password: "([^"]+)"').Groups[1].Value)
+}
+$messagingOverride = helm template push $chart --set-string postgres.messagingPassword=MessagingTest42 --set-string postgres.password=AdminTest24 | Out-String
+Check 'explicit messaging password agrees with its URL without replacing the admin credential' {
+    $secret = Doc $messagingOverride 'Secret' 'push-secrets'
+    $secret -match 'messaging-db-password: "MessagingTest42"' -and
+        $secret -match 'database-url: "postgres://push_messaging:MessagingTest42@push-postgres:5432/push_messaging"' -and
+        $secret -match 'postgres-password: "AdminTest24"'
+}
+Check 'messaging passwords with URL delimiters are refused' {
+    (Render @('--set-string', 'postgres.messagingPassword=bad:password')) -ne 0
+}
 Check 'default: message-svc exposes dedicated named gRPC Service ports' {
     $service = Doc $default 'Service' 'push-message-svc'
     ([regex]::Matches($service, '(?m)^\s+- name: ')).Count -eq 3 -and
