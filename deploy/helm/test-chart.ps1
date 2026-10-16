@@ -133,13 +133,13 @@ $withControllers = helm template push $chart --set-json "networkPolicy.ingressCo
 Check 'network: each controller peer ANDs both selectors; no webhook means no worker access or production mailbox' {
     PolicyMatrix $withControllers 'push' $controllerPeers
 }
-$withWebhookControllers = helm template push $chart --set-json "networkPolicy.ingressControllerPeers=$peerJson" --set worker.email.webhookSecret=whsec_test | Out-String
+$withWebhookControllers = helm template push $chart --set-json "networkPolicy.ingressControllerPeers=$peerJson" --set worker.email.webhookSecret=whsec_test --set worker.email.webhook.enabled=true | Out-String
 Check 'network: controller peers reach the worker only with webhook exposure' {
     PolicyMatrix $withWebhookControllers 'push' $controllerPeers $true
 }
-$withoutIngress = helm template push $chart --set-json "networkPolicy.ingressControllerPeers=$peerJson" --set worker.email.webhookSecret=whsec_test --set ingress.enabled=false | Out-String
-Check 'network: disabling webhook Ingress removes controller access to the worker' {
-    PolicyMatrix $withoutIngress 'push' $controllerPeers
+$withoutIngress = helm template push $chart --set-json "networkPolicy.ingressControllerPeers=$peerJson" --set worker.email.webhookSecret=whsec_test --set worker.email.webhook.enabled=true --set ingress.enabled=false | Out-String
+Check 'network: enabled webhook admits configured consumer routing peers without chart Ingress' {
+    PolicyMatrix $withoutIngress 'push' $controllerPeers $true
 }
 foreach ($invalid in @(
     '[{}]',
@@ -314,7 +314,7 @@ Check 'default: the ingress routes the auth API, not /dev, and keeps link tokens
         $links -match 'path: /v1/auth/verify\s' -and $links -match 'path: /v1/auth/password/reset\s'
 }
 
-$webhook = helm template push $chart --set worker.email.webhookSecret=whsec_AAAAAAAAAAAAAAAAAAAAAAAA | Out-String
+$webhook = helm template push $chart --set worker.email.webhookSecret=whsec_AAAAAAAAAAAAAAAAAAAAAAAA --set worker.email.webhook.enabled=true | Out-String
 Check 'with a webhook secret: the worker''s Ingress routes /v1/webhooks/resend and nothing else' {
     $ingress = Doc $webhook 'Ingress' 'push-worker'
     $ingress -and ([regex]::Matches($ingress, '- path: ')).Count -eq 1 -and

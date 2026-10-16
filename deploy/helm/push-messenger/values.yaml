@@ -81,18 +81,21 @@ worker:
   dbMaxConnections: 5
   email:
     # log: logs each email instead of sending it. resend: sends through Resend, which
-    # needs resendApiKey and from. Real sending comes with the Azure plan (Plan 11), which
-    # brings the key and the webhook secret through Key Vault.
+    # needs resendApiKey (or the resend-api-key of a consumer-managed Secret) and from.
     sender: log
     # The From of every email (owner decision: the push.kubegames.dk domain).
     from: "Push Messenger <no-reply@push.kubegames.dk>"
     # The name emails sign with.
     productName: Push Messenger
     # Resend's API key and the signing secret of its webhook (whsec_...): kept in the
-    # Secret. Without a webhook secret the worker does not serve the webhook, and the
-    # webhook Ingress is not rendered (in dev mode one is generated).
+    # chart-managed Secret. Consumers using secrets.existingSecret leave both empty.
     resendApiKey: ""
     webhookSecret: ""
+    webhook:
+      # Serves /v1/webhooks/resend: references resend-webhook-secret and, with chart
+      # Ingress, renders its route. Never inferred from a live Secret. A disabled webhook
+      # keeps a retained signing secret.
+      enabled: false
   # Accounts left unverified this many days are deleted.
   unverifiedAccountDays: 7
   # Buried jobs, email records and delivery events are kept this many days.

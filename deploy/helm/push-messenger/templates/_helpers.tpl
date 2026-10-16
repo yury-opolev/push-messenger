@@ -112,25 +112,27 @@ true
 {{- end -}}
 
 {{/*
-"true" when the worker gets a webhook secret, so it serves /v1/webhooks/resend and the
-webhook Ingress is rendered: set in values, kept in the existing Secret, or generated in
-dev mode (secret.yaml).
+"true" when the worker serves /v1/webhooks/resend: an explicit decision
+(worker.email.webhook.enabled), never inferred from a live Secret, so external-Secret
+installations render offline. It references resend-webhook-secret and, with chart Ingress,
+renders the webhook route.
 */}}
 {{- define "push.hasWebhook" -}}
-{{- $existing := (lookup "v1" "Secret" .Release.Namespace (include "push.secretName" .)).data | default dict -}}
-{{- if or .Values.worker.email.webhookSecret (hasKey $existing "resend-webhook-secret") (include "push.devMode" .) -}}
-true
-{{- end -}}
+{{- if .Values.worker.email.webhook.enabled -}}true{{- end -}}
 {{- end -}}
 
 {{/*
-Checks the worker's email settings: the sender is log or resend; resend needs an API key
-and a From address and is refused in dev mode, whose mailbox shows every email it sent.
-Dev mode needs exactly one worker: its mailbox is in memory, per replica, so with more
-the smoke test would look in the wrong one.
+Checks the worker's email settings: the sender is log or resend; resend needs a From
+address and is refused in dev mode, whose mailbox shows every email it sent. Dev mode needs
+at most one worker: its mailbox is in memory, per replica. Chart-managed credentials must
+exist for resend and an enabled webhook; a consumer-managed Secret is never looked up (a
+missing key stops the worker with a Kubernetes configuration error instead).
 */}}
 {{- define "push.checkEmail" -}}
 {{- $email := .Values.worker.email -}}
+{{- if not (kindIs "bool" $email.webhook.enabled) -}}
+{{- fail "worker.email.webhook.enabled must be a boolean" -}}
+{{- end -}}
 {{- if and (include "push.devMode" .) (gt (int .Values.worker.replicas) 1) -}}
 {{- fail "dev mode keeps the DEV ONLY mailbox in memory, per worker replica: use worker.replicas 1 with it" -}}
 {{- end -}}
@@ -138,15 +140,20 @@ the smoke test would look in the wrong one.
 {{- fail (printf "worker.email.sender must be log or resend, not %q" $email.sender) -}}
 {{- end -}}
 {{- if eq $email.sender "resend" -}}
-{{- $existing := (lookup "v1" "Secret" .Release.Namespace (include "push.secretName" .)).data | default dict -}}
-{{- if not (or $email.resendApiKey (hasKey $existing "resend-api-key")) -}}
-{{- fail "worker.email.sender resend needs worker.email.resendApiKey" -}}
-{{- end -}}
 {{- if not $email.from -}}
 {{- fail "worker.email.sender resend needs worker.email.from" -}}
 {{- end -}}
 {{- if include "push.devMode" . -}}
 {{- fail "dev mode shows every email the worker sends at /dev/mailbox: use worker.email.sender log with it" -}}
+{{- end -}}
+{{- end -}}
+{{- if not .Values.secrets.existingSecret -}}
+{{- $existing := (lookup "v1" "Secret" .Release.Namespace (include "push.secretName" .)).data | default dict -}}
+{{- if and (eq $email.sender "resend") (not (or $email.resendApiKey (get $existing "resend-api-key"))) -}}
+{{- fail "worker.email.sender resend needs worker.email.resendApiKey or a retained resend-api-key" -}}
+{{- end -}}
+{{- if and $email.webhook.enabled (not (include "push.devMode" .)) (not (or $email.webhookSecret (get $existing "resend-webhook-secret"))) -}}
+{{- fail "worker.email.webhook.enabled needs worker.email.webhookSecret or a retained resend-webhook-secret" -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}

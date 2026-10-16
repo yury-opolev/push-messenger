@@ -134,6 +134,17 @@ def email():
            "worker.email.resendApiKey")
     render({"worker": {"email": {"webhook": {"enabled": "false"}}}},
            "worker.email.webhook.enabled")
+    values = external()
+    values["worker"] = {"email": {"webhook": {"enabled": True}}}
+    values["ingress"] = {"enabled": False}
+    values["networkPolicy"] = {"ingressControllerPeers": [{
+        "namespaceSelector": {"kubernetes.io/metadata.name": "edge"},
+        "podSelector": {"app.kubernetes.io/name": "traefik"},
+    }]}
+    docs = render(values)
+    policy = document(docs, "NetworkPolicy", "worker")
+    assert policy["spec"]["ingress"][0]["ports"] == [{"protocol": "TCP", "port": 8080}]
+    assert not any(doc["kind"] == "Ingress" for doc in docs)
 
 
 def ingress():

@@ -5,6 +5,12 @@ devMode:
   enabled: true
   acknowledge: insecure-local-only
 
+# The local webhook path, signed with a generated DEV ONLY secret.
+worker:
+  email:
+    webhook:
+      enabled: true
+
 # Existing local minikube controller only, not a production controller default.
 networkPolicy:
   ingressControllerPeers:

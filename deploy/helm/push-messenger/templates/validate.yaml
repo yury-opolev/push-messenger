@@ -1,2 +1,3 @@
 {{- /* Validation only: emits no Kubernetes object, also when Ingress is disabled. */ -}}
 {{- include "push.checkSecretSelection" . -}}
+{{- include "push.checkEmail" . -}}
