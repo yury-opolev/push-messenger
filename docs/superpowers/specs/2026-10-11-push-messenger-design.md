@@ -34,7 +34,9 @@ Research behind these decisions: `docs/research/2026-10-11-prior-art.md` and
 
 ## 2. Architecture
 
-Four services and two stores on one k3s node, behind ingress-nginx.
+Four services and two stores on Kubernetes, behind a consumer-managed ingress
+controller. One k3s node is the initial Azure reference topology, not a requirement
+for consumers. See §11 for the portable deployment contract.
 
 | Unit | Role | Client connections | Database | Scales on |
 |---|---|---|---|---|
@@ -68,7 +70,7 @@ rules stay with the data and the worker never reads it. Only the worker may call
 message-svc's `Accounts` API, which records the users and devices auth-svc announces:
 each call carries a shared internal token from the cluster's Secret, which the gateway
 does not get, so a compromised gateway cannot register devices (a NetworkPolicy adds a
-second fence with the Azure plan). Likewise only auth-svc may call `Directory`, and only
+second fence in Plan 11A). Likewise only auth-svc may call `Directory`, and only
 the gateway may call `Messaging`, which acts for whatever user and device it is given:
 each internal API takes a token of its own (Plans 7A, 8B).
 
@@ -1333,8 +1335,9 @@ Owner decisions (2026-10-13, Plan 6):
 
 - Emails come from `no-reply@push.kubegames.dk` and name the product "Push Messenger"
   (`Push Messenger <no-reply@push.kubegames.dk>`).
-- Real sending through Resend comes with the Azure plan (Plan 11), with the API key and
-  the webhook secret in Key Vault and the domain's SPF, DKIM and DMARC. Until then the
+- Real sending through Resend comes with the consumer-owned Azure deployment, with the
+  API key and webhook secret delivered from Key Vault and the domain's SPF, DKIM and DMARC.
+  Other consumers supply their own sender identity and secret delivery. Until then the
   chart's default sender is the log sender: a deployment sends no email.
 - An email gives up after 12 attempts, about 30 minutes, when its link has expired.
 - Emails are plain English text plus minimal HTML for now.
@@ -1363,8 +1366,9 @@ push-messenger/
 │   ├── node/             napi-rs
 │   └── c/                cbindgen
 ├── deploy/
+│   ├── docker/
 │   ├── helm/
-│   └── k3s/              VM provisioning scripts
+│   └── minikube/         local verification; consumer provisioning lives outside this repo
 ├── docs/
 │   ├── research/
 │   └── superpowers/specs/
@@ -1373,15 +1377,29 @@ push-messenger/
 
 ## 11. Deployment
 
-- k3s on one Azure VM, with ingress-nginx and cert-manager (Let's Encrypt).
+**Portable core, consumer-owned deployment.** Consumers may include this public
+repository as a Git submodule and supply their own infrastructure scaffolding,
+cluster metadata and CI/CD. The services, Docker build, Helm chart and reusable
+verification tools belong here; cloud provisioning, secret delivery, controller
+installation, registries and deployment pipelines belong to consumers. GitHub
+Actions and GHCR are not requirements for using the project. The detailed contract
+and revised Plans 11A-11C are in
+[`2026-10-16-portable-deployment-readiness-design.md`](2026-10-16-portable-deployment-readiness-design.md).
+
+The later Azure deployment is a consumer-owned reference deployment:
+
+- k3s on one Azure VM, with a maintained ingress controller and consumer-provisioned TLS.
+  Ingress-nginx is retired and retained only for existing local compatibility.
 - Use a **non-burstable** VM size for load testing and production. Burstable B-series CPU
   credits run out under a 10,000-connection test and Argon2 load.
 - PostgreSQL and Redis run in the cluster for v1, with persistent volumes and Redis AUTH.
-- Secrets (database passwords, JWT signing key, HMAC key, Resend API key) come from
-  Azure Key Vault through the CSI driver — never from git or ConfigMaps.
+- Secrets (database passwords, JWT signing key, HMAC key, Resend API key) can come
+  from Azure Key Vault through consumer-owned integration, materialized as the
+  Kubernetes Secret the chart references; never from git or ConfigMaps.
 - Gateway pods have a `preStop` hook that closes connections in batches with 4005, and
   `terminationGracePeriodSeconds` longer than that.
-- Images go to GHCR and are deployed with Helm.
+- Consumers build and publish images to their chosen registry and deploy with Helm
+  through their own CI/CD.
 - Region, VM size and domain are confirmed with the owner before any cloud spend.
 
 Implementation notes (local minikube, Plan 4B):
@@ -1399,7 +1417,7 @@ Implementation notes (local minikube, Plan 4B):
   `push_auth`, created by a PostgreSQL init script (a ConfigMap without credentials; the
   password comes from the Secret). `REVOKE ALL … FROM PUBLIC` on both databases keeps
   auth-svc's plain role out of `push_messaging`; message-svc still connects as the
-  superuser `push`, which can reach every database, until Plan 11. The Secret also holds
+  superuser `push`, which can reach every database, until Plan 11A. The Secret also holds
   the generated Ed25519 seed and HMAC key (`randBytes 32`). A second Ingress routes
   `/v1/auth`, `/v1/devices` and `/v1/users` to it; the public URL and the token audience
   come from `ingress.scheme` and `ingress.host` (plain `http` only for a local host).
@@ -1442,12 +1460,14 @@ Implementation notes (local minikube, Plan 4B):
   token-bearing URLs, retries only on 502, 503, 504 and transport errors, and ignores
   `HTTP_PROXY`. The per-IP signup limit (20/h) caps smoke runs on a long-lived
   cluster (about four an hour since Plan 9B's five signups a run).
-- Deferred to Plan 11: validate hand-set auth keys at render time; `x-real-ip` on Azure
+- Plan 11B validates hand-set auth keys at render time and verifies controller-neutral
+  routing and token-safe logging. Consumer deployments verify source-IP preservation:
+  `x-real-ip` on Azure
   needs `externalTrafficPolicy: Local` or the PROXY protocol (behind an SNAT load balancer
   every client arrives with the balancer's address, collapsing the per-IP limits of
-  auth-svc and the gateway into one bucket); nginx error-log token exposure; the gateway
-  fetches the JWKS over plain http inside the cluster, and an https JWKS URL needs TLS
-  turned on in its reqwest (built without TLS today).
+  auth-svc and the gateway into one bucket). The gateway fetches the JWKS over plain
+  http inside the cluster; transport TLS for an external https JWKS URL remains separate
+  work (its reqwest is built without TLS today).
 - Shutdown: the gateway has a `lifecycle.preStop.sleep.seconds: 5` (ingress-nginx stops
   routing to it before SIGTERM) and all three Deployments (gateway,
   message-svc, auth-svc) set `terminationGracePeriodSeconds: 30`.
@@ -1469,9 +1489,9 @@ Implementation notes (local minikube, Plan 4B):
   contacts by request and invite, chat, edit, read and delete, a group request is refused,
   they see only allowed profiles, the gateway refuses an expired token and one for another
   audience, and a revoked device and a password reset close their sockets with 4003 and
-  4001 and their old tokens are refused (Plan 8B). The Azure plan
-  replaces the in-chart secrets with Key Vault and adds TLS, and may replace the in-chart
-  PostgreSQL and Redis.
+  4001 and their old tokens are refused (Plan 8B). Plan 11B adds existing-Secret and TLS
+  interfaces; consumer scaffolding can deliver secrets from Key Vault. Replacing the
+  bundled PostgreSQL and Redis with managed services is outside Plans 11A-11C.
 
 ## 12. Testing
 
@@ -1506,7 +1526,7 @@ Required adverse-condition tests:
 - Confirm the Azure Load Balancer idle-timeout annotation against the
   cloud-provider-azure documentation before writing manifests.
 - The production sender is `no-reply@push.kubegames.dk` (decided 2026-10-13); its DNS
-  (SPF, DKIM, DMARC) and Resend's domain setup come with Plan 11.
+  (SPF, DKIM, DMARC) and Resend's domain setup belong to the consumer-owned deployment.
 - Calibrate Argon2id on the chosen VM size.
 - Groups: message-svc serves them in full from Plan 7A, but they are not exposed to apps in
   the first release (owner decision): the gateway refuses the group requests with
