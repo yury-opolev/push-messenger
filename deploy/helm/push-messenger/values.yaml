@@ -152,6 +152,13 @@ redis:
       cpu: 250m
       memory: 128Mi
 
+# Credentials. Empty existingSecret: the chart generates them on install and keeps them
+# (push-secrets, helm.sh/resource-policy: keep). A name: references that consumer-managed
+# Secret in the release namespace (key contract: docs/deployment-configuration.md); the chart
+# then never creates, reads, changes or deletes it, and refuses inline credential values.
+secrets:
+  existingSecret: ""
+
 # Ingress-only isolation for the six application components; egress is unchanged.
 # Requires a NetworkPolicy-enforcing CNI (render checks alone cannot prove enforcement).
 networkPolicy:

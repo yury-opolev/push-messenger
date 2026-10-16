@@ -18,7 +18,50 @@ app.kubernetes.io/instance: {{ .root.Release.Name }}
 {{- end -}}
 
 {{- define "push.secretName" -}}
+{{- if .Values.secrets.existingSecret -}}
+{{- .Values.secrets.existingSecret -}}
+{{- else -}}
 {{- printf "%s-secrets" .Release.Name -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+A consumer-managed Secret (secrets.existingSecret) is only referenced: inline credential
+values would be silently ignored, so they are refused by name, never by value.
+*/}}
+{{- define "push.checkSecretSelection" -}}
+{{- $name := .Values.secrets.existingSecret -}}
+{{- if not (kindIs "string" $name) -}}
+{{- fail "secrets.existingSecret must be a string" -}}
+{{- end -}}
+{{- if $name -}}
+{{- if or (gt (len $name) 253) (not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$" $name)) -}}
+{{- fail "secrets.existingSecret must be a Kubernetes Secret name" -}}
+{{- end -}}
+{{- $inline := dict
+  "postgres.password" .Values.postgres.password
+  "postgres.messagingPassword" .Values.postgres.messagingPassword
+  "postgres.authPassword" .Values.postgres.authPassword
+  "postgres.workerPassword" .Values.postgres.workerPassword
+  "redis.password" .Values.redis.password
+  "auth.signingKey" .Values.auth.signingKey
+  "auth.linkKey" .Values.auth.linkKey
+  "worker.email.resendApiKey" .Values.worker.email.resendApiKey
+  "worker.email.webhookSecret" .Values.worker.email.webhookSecret -}}
+{{- range $key, $value := $inline -}}
+{{- if $value -}}
+{{- fail (printf "%s conflicts with secrets.existingSecret" $key) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/* Checks a chart-managed auth key: canonical standard base64 of 32 (or at least 32) bytes. */}}
+{{- define "push.checkAuthKey" -}}
+{{- $decoded := .value | b64dec -}}
+{{- if or (ne ($decoded | b64enc) .value) (and .exact (ne (len $decoded) 32)) (and (not .exact) (lt (len $decoded) 32)) -}}
+{{- fail (printf "%s must be canonical standard base64 of %s" .name (ternary "exactly 32 bytes" "at least 32 bytes" .exact)) -}}
+{{- end -}}
 {{- end -}}
 
 {{/*
