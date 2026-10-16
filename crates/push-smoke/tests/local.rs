@@ -111,6 +111,8 @@ async fn the_smoke_test_passes_against_the_whole_stack() {
             database_url,
             redis_url: redis_url.clone(),
             grpc_addr: grpc.local_addr().unwrap(),
+            accounts_grpc_addr: "127.0.0.1:0".parse().unwrap(),
+            directory_grpc_addr: "127.0.0.1:0".parse().unwrap(),
             health_addr: message_svc_health.local_addr().unwrap(),
             store: StoreOptions::default(),
             accounts_token: Some(accounts_token.clone()),
