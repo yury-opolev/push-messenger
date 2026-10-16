@@ -6,6 +6,7 @@
 {{- define "push.labels" -}}
 app.kubernetes.io/name: {{ .component }}
 app.kubernetes.io/instance: {{ .root.Release.Name }}
+push-messenger/network-peer: {{ .component }}
 app.kubernetes.io/part-of: push-messenger
 app.kubernetes.io/managed-by: {{ .root.Release.Service }}
 helm.sh/chart: {{ printf "%s-%s" .root.Chart.Name .root.Chart.Version }}

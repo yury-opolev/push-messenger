@@ -1,0 +1,88 @@
+{{- if .Values.networkPolicy.enabled -}}
+{{- $controllers := .Values.networkPolicy.ingressControllerPeers -}}
+{{- $peerError := "networkPolicy.ingressControllerPeers requires namespaceSelector and podSelector as non-empty label maps on every peer" -}}
+{{- if not (kindIs "slice" $controllers) -}}
+{{- fail $peerError -}}
+{{- end -}}
+{{- range $controllers -}}
+{{- if not (kindIs "map" .) -}}
+{{- fail $peerError -}}
+{{- end -}}
+{{- if or (not (kindIs "map" .namespaceSelector)) (not .namespaceSelector) (not (kindIs "map" .podSelector)) (not .podSelector) -}}
+{{- fail $peerError -}}
+{{- end -}}
+{{- end -}}
+
+{{- $gatewayRules := list -}}
+{{- if $controllers -}}
+{{- $gatewayRules = list (dict "port" 8080 "controllers" $controllers) -}}
+{{- end -}}
+{{- $workerControllers := list -}}
+{{- if and .Values.ingress.enabled (include "push.hasWebhook" .) -}}
+{{- $workerControllers = $controllers -}}
+{{- end -}}
+{{- $workerCallers := list -}}
+{{- if include "push.devMode" . -}}
+{{- $workerCallers = list "smoke" -}}
+{{- end -}}
+{{- $workerRules := list -}}
+{{- if or $workerControllers $workerCallers -}}
+{{- $workerRules = list (dict "port" 8080 "callers" $workerCallers "controllers" $workerControllers) -}}
+{{- end -}}
+
+{{- $policies := list
+  (dict "component" "message-svc" "rules" (list
+    (dict "port" 50051 "callers" (list "gateway"))
+    (dict "port" 50052 "callers" (list "worker"))
+    (dict "port" 50053 "callers" (list "auth"))))
+  (dict "component" "postgres" "rules" (list
+    (dict "port" 5432 "callers" (list "message-svc" "auth" "worker"))))
+  (dict "component" "redis" "rules" (list
+    (dict "port" 6379 "callers" (list "message-svc" "auth" "gateway"))))
+  (dict "component" "auth" "rules" (list
+    (dict "port" 8080 "callers" (list "gateway") "controllers" $controllers)))
+  (dict "component" "gateway" "rules" $gatewayRules)
+  (dict "component" "worker" "rules" $workerRules)
+-}}
+{{- range $policies -}}
+{{- $context := dict "root" $ "component" .component -}}
+{{- printf "\n---\n" }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "push.name" $context }}
+  labels:
+    {{- include "push.labels" $context | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "push.selector" $context | nindent 6 }}
+  policyTypes:
+    - Ingress
+  {{- if not .rules }}
+  ingress: []
+  {{- else }}
+  ingress:
+    {{- range .rules }}
+    - ports:
+        - protocol: TCP
+          port: {{ .port }}
+      from:
+        {{- range .callers }}
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: {{ $.Release.Name }}
+              push-messenger/network-peer: {{ . }}
+        {{- end }}
+        {{- range .controllers }}
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .namespaceSelector | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .podSelector | nindent 14 }}
+        {{- end }}
+    {{- end }}
+  {{- end }}
+{{- end }}
+{{- end }}

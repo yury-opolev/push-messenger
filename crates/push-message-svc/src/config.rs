@@ -10,7 +10,9 @@ use push_store::{StoreOptions, check_database_url};
 /// |---|---|---|
 /// | `PUSH_DATABASE_URL` | Postgres URL of the `push_messaging` database, as its owner | required |
 /// | `PUSH_REDIS_URL` | Redis URL, `redis://:password@host:6379` | required |
-/// | `PUSH_GRPC_ADDR` | address of the gRPC API | `0.0.0.0:50051` |
+/// | `PUSH_GRPC_ADDR` | address of the `Messaging` gRPC API | `0.0.0.0:50051` |
+/// | `PUSH_ACCOUNTS_GRPC_ADDR` | address of the `Accounts` gRPC API | `0.0.0.0:50052` |
+/// | `PUSH_DIRECTORY_GRPC_ADDR` | address of the `Directory` gRPC API | `0.0.0.0:50053` |
 /// | `PUSH_HEALTH_ADDR` | address of `/healthz` and `/readyz` | `0.0.0.0:8081` |
 /// | `PUSH_DB_MAX_CONNECTIONS` | pool size, at least 1 | `10` |
 /// | `PUSH_ACCOUNTS_TOKEN` | the worker's token for the `Accounts` API, 32 to 256 visible ASCII characters; without it `Accounts` refuses every call | none |
@@ -20,7 +22,10 @@ use push_store::{StoreOptions, check_database_url};
 pub struct Config {
     pub database_url: String,
     pub redis_url: String,
+    /// The Messaging gRPC API address.
     pub grpc_addr: SocketAddr,
+    pub accounts_grpc_addr: SocketAddr,
+    pub directory_grpc_addr: SocketAddr,
     pub health_addr: SocketAddr,
     pub store: StoreOptions,
     pub accounts_token: Option<String>,
@@ -35,6 +40,8 @@ impl std::fmt::Debug for Config {
             .field("database_url", &"<redacted>")
             .field("redis_url", &"<redacted>")
             .field("grpc_addr", &self.grpc_addr)
+            .field("accounts_grpc_addr", &self.accounts_grpc_addr)
+            .field("directory_grpc_addr", &self.directory_grpc_addr)
             .field("health_addr", &self.health_addr)
             .field("store", &self.store)
             .field(
@@ -121,6 +128,16 @@ impl Config {
             database_url,
             redis_url,
             grpc_addr: parsed(&lookup, "PUSH_GRPC_ADDR", ([0, 0, 0, 0], 50051).into())?,
+            accounts_grpc_addr: parsed(
+                &lookup,
+                "PUSH_ACCOUNTS_GRPC_ADDR",
+                ([0, 0, 0, 0], 50052).into(),
+            )?,
+            directory_grpc_addr: parsed(
+                &lookup,
+                "PUSH_DIRECTORY_GRPC_ADDR",
+                ([0, 0, 0, 0], 50053).into(),
+            )?,
             health_addr: parsed(&lookup, "PUSH_HEALTH_ADDR", ([0, 0, 0, 0], 8081).into())?,
             store,
             accounts_token,
@@ -211,6 +228,8 @@ mod tests {
         );
         assert_eq!(config.redis_url, "redis://:secret@redis:6379");
         assert_eq!(config.grpc_addr, "0.0.0.0:50051".parse().unwrap());
+        assert_eq!(config.accounts_grpc_addr, "0.0.0.0:50052".parse().unwrap());
+        assert_eq!(config.directory_grpc_addr, "0.0.0.0:50053".parse().unwrap());
         assert_eq!(config.health_addr, "0.0.0.0:8081".parse().unwrap());
         assert_eq!(config.store, StoreOptions::default());
         assert_eq!(config.accounts_token, None);
@@ -306,11 +325,18 @@ mod tests {
         let mut variables = REQUIRED.to_vec();
         variables.extend([
             ("PUSH_GRPC_ADDR", "127.0.0.1:6000"),
+            ("PUSH_ACCOUNTS_GRPC_ADDR", "127.0.0.1:6002"),
+            ("PUSH_DIRECTORY_GRPC_ADDR", "127.0.0.1:6003"),
             ("PUSH_HEALTH_ADDR", "127.0.0.1:6001"),
             ("PUSH_DB_MAX_CONNECTIONS", "3"),
         ]);
         let config = config(&variables).unwrap();
         assert_eq!(config.grpc_addr, "127.0.0.1:6000".parse().unwrap());
+        assert_eq!(config.accounts_grpc_addr, "127.0.0.1:6002".parse().unwrap());
+        assert_eq!(
+            config.directory_grpc_addr,
+            "127.0.0.1:6003".parse().unwrap()
+        );
         assert_eq!(config.health_addr, "127.0.0.1:6001".parse().unwrap());
         assert_eq!(config.store.max_connections, 3);
     }
@@ -342,6 +368,18 @@ mod tests {
         let shown = format!("{config:?}");
         assert!(!shown.contains("secret"), "{shown}");
         assert!(shown.contains("<redacted>"), "{shown}");
+    }
+
+    #[test]
+    fn malformed_additional_api_addresses_are_not_ignored() {
+        for name in ["PUSH_ACCOUNTS_GRPC_ADDR", "PUSH_DIRECTORY_GRPC_ADDR"] {
+            let mut variables = REQUIRED.to_vec();
+            variables.push((name, "not-an-address"));
+            assert!(matches!(
+                config(&variables),
+                Err(ConfigError::Invalid { name: bad, .. }) if bad == name
+            ));
+        }
     }
 
     #[test]

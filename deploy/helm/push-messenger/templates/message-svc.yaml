@@ -9,9 +9,17 @@ spec:
   selector:
     {{- include "push.selector" (dict "root" . "component" "message-svc") | nindent 4 }}
   ports:
-    - name: grpc
+    - name: messaging
       port: 50051
-      targetPort: grpc
+      targetPort: messaging
+      appProtocol: grpc
+    - name: accounts
+      port: 50052
+      targetPort: accounts
+      appProtocol: grpc
+    - name: directory
+      port: 50053
+      targetPort: directory
       appProtocol: grpc
 ---
 apiVersion: apps/v1
@@ -44,6 +52,12 @@ spec:
           imagePullPolicy: {{ .Values.images.pullPolicy }}
           {{- include "push.containerSecurity" . | nindent 10 }}
           env:
+            - name: PUSH_GRPC_ADDR
+              value: "0.0.0.0:50051"
+            - name: PUSH_ACCOUNTS_GRPC_ADDR
+              value: "0.0.0.0:50052"
+            - name: PUSH_DIRECTORY_GRPC_ADDR
+              value: "0.0.0.0:50053"
             - name: PUSH_DATABASE_URL
               valueFrom:
                 secretKeyRef:
@@ -75,8 +89,12 @@ spec:
                   name: {{ include "push.secretName" . }}
                   key: messaging-token
           ports:
-            - name: grpc
+            - name: messaging
               containerPort: 50051
+            - name: accounts
+              containerPort: 50052
+            - name: directory
+              containerPort: 50053
             - name: health
               containerPort: 8081
           readinessProbe:

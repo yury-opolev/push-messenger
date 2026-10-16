@@ -33,7 +33,7 @@ impl std::fmt::Debug for Sender {
 /// |---|---|---|
 /// | `PUSH_DATABASE_URL` | Postgres URL of the `push_worker` database, as its owner | required |
 /// | `PUSH_AUTH_DATABASE_URL` | Postgres URL of auth-svc's `push_auth` database, as the worker's role | required |
-/// | `PUSH_MESSAGE_SVC_URL` | gRPC URL of message-svc, `http://host:50051` (plain `http://` only: the worker is built without TLS) | required |
+/// | `PUSH_MESSAGE_SVC_URL` | Accounts gRPC URL of message-svc, `http://host:50052` (plain `http://` only: the worker is built without TLS) | required |
 /// | `PUSH_ACCOUNTS_TOKEN` | the token message-svc requires for its `Accounts` API, 32 to 256 visible ASCII characters | required |
 /// | `PUSH_EMAIL_SENDER` | `log` (logs instead of sending) or `resend` | `log` |
 /// | `PUSH_EMAIL_FROM` | the From of every email, `Push Messenger <no-reply@push.kubegames.dk>` | required for `resend` |

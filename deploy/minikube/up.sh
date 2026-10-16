@@ -52,16 +52,17 @@ fi
 # when it initialises an empty volume. A volume from before auth-svc (Plan 4B) has no
 # push_auth, one from before the worker (Plan 5B) no push_worker, and the services would
 # never become ready: stop now, not after five slow install attempts.
-predates="The Postgres volume predates auth-svc or the worker: it lacks the push_auth or push_worker database, and PostgreSQL creates them only on an empty volume. Run deploy/minikube/down.sh --cluster $cluster first (it deletes the cluster's data), then run this script again."
+upgrade="Stop and back up the existing data. Follow docs/deployment-upgrade.md for a manual, data-preserving upgrade; do not delete the Secret, PVC, database or cluster."
+predates="The Postgres volume lacks push_auth or push_worker. Older layouts require operator review and a restore rehearsal before manual migration. $upgrade"
 # A plain `helm uninstall` removes the StatefulSet but keeps the volume and the Secret
 # (helm.sh/resource-policy: keep), so the Secret is the evidence that survives it.
 secret_name="$release-secrets"
 secret="$(kubectl --context "$cluster" -n "$namespace" get secret "$secret_name" -o name --ignore-not-found)"
 if [[ -n "$secret" ]]; then
-  for key in auth-db-password worker-db-password; do
+  for key in auth-db-password worker-db-password messaging-db-password; do
     password="$(kubectl --context "$cluster" -n "$namespace" get secret "$secret_name" -o "jsonpath={.data.$key}")"
     if [[ -z "$password" ]]; then
-      echo "The kept Secret $secret_name has no $key: it predates the service that needs it. $predates" >&2
+      echo "The kept Secret $secret_name has no $key. $upgrade" >&2
       exit 1
     fi
   done
@@ -71,12 +72,21 @@ if [[ -n "$postgres" ]]; then
   step 'check that the Postgres volume has the push_auth and push_worker databases'
   kubectl --context "$cluster" -n "$namespace" rollout status statefulset/push-postgres --timeout=300s
   if ! databases="$(kubectl --context "$cluster" -n "$namespace" exec push-postgres-0 -- \
-    psql -U push -d postgres -Atc "SELECT count(*) FROM pg_database WHERE datname IN ('push_auth', 'push_worker')")"; then
+    psql -X -v ON_ERROR_STOP=1 -U push -d postgres -Atc "SELECT count(*) FROM pg_database WHERE datname IN ('push_auth', 'push_worker')")"; then
     echo 'checking the Postgres volume failed' >&2
     exit 1
   fi
   if [[ "$databases" != 2 ]]; then
     echo "$predates" >&2
+    exit 1
+  fi
+  if ! owner="$(kubectl --context "$cluster" -n "$namespace" exec push-postgres-0 -- \
+    psql -X -v ON_ERROR_STOP=1 -U push -d postgres -Atc "SELECT count(*) FROM pg_roles r JOIN pg_database d ON d.datdba=r.oid WHERE r.rolname='push_messaging' AND d.datname='push_messaging' AND r.rolcanlogin AND NOT r.rolsuper AND NOT r.rolcreatedb AND NOT r.rolcreaterole AND NOT r.rolreplication AND NOT r.rolbypassrls")"; then
+    echo 'checking the messaging database owner failed' >&2
+    exit 1
+  fi
+  if [[ "$owner" != 1 ]]; then
+    echo "The Postgres volume lacks the plain push_messaging login owning push_messaging. $upgrade" >&2
     exit 1
   fi
 fi

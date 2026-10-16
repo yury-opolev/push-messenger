@@ -8,11 +8,13 @@
 mod config;
 mod convert;
 mod grpc;
+mod listeners;
 mod notify;
 mod requests;
 mod server;
 
 pub use config::{Config, ConfigError};
 pub use grpc::{AccountsApi, DirectoryApi, InternalToken, MAX_VISIBLE_USERS, MessagingApi};
+pub use listeners::Listeners;
 pub use notify::RedisNotifier;
 pub use server::{init_logging, serve, terminated};

@@ -1,10 +1,9 @@
 {{- /*
 Runs once, when PostgreSQL initialises an empty data volume (/docker-entrypoint-initdb.d):
-creates auth-svc's and the worker's own roles and databases (one database per service,
+creates each service's own role and database ownership (one database per service,
 spec §2), in file name order. The passwords come from the environment, which reads them
-from the Secret; this ConfigMap holds no credentials. A volume initialised before a script
-existed (Plan 4B: no push_auth; Plan 5B: no push_worker) must be removed with
-deploy/minikube/down.ps1 first.
+from the Secret; this ConfigMap holds no credentials. Existing installations need the
+data-preserving operator upgrade in docs/deployment-upgrade.md; do not delete their volumes.
 */ -}}
 apiVersion: v1
 kind: ConfigMap
@@ -13,6 +12,26 @@ metadata:
   labels:
     {{- include "push.labels" (dict "root" . "component" "postgres") | nindent 4 }}
 data:
+  05-push-messaging.sh: |
+    # Sourced by the entrypoint after it creates push_messaging, before app migrations.
+    # Suppress SQL error details in both client and server logs: CREATE ROLE has a secret.
+    if ! psql -X -q -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname postgres 2>/dev/null <<'SQL'
+    SET log_statement = 'none';
+    SET log_min_error_statement = 'panic';
+    \getenv password PUSH_MESSAGING_DB_PASSWORD
+    SELECT :'password' ~ '^[A-Za-z0-9]+$' AS valid_password \gset
+    \if :valid_password
+    SELECT format('CREATE ROLE push_messaging LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD %L', :'password') \gexec
+    ALTER DATABASE push_messaging OWNER TO push_messaging;
+    \else
+    \echo Invalid PUSH_MESSAGING_DB_PASSWORD: use only ASCII letters and digits.
+    DO $invalid$ BEGIN RAISE EXCEPTION 'Invalid messaging database password'; END $invalid$;
+    \endif
+    SQL
+    then
+      echo 'Messaging database bootstrap failed; SQL details withheld to protect credentials.' >&2
+      exit 1
+    fi
   10-push-auth.sh: |
     # Sourced by the image's entrypoint (bash) as the superuser, before the server opens.
     psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname postgres \
@@ -20,8 +39,8 @@ data:
     CREATE ROLE push_auth LOGIN PASSWORD :'password';
     CREATE DATABASE push_auth OWNER push_auth;
     -- Revoking CONNECT from PUBLIC keeps push_auth out of push_messaging and every
-    -- other role out of push_auth. Superusers bypass it: message-svc still connects as
-    -- the superuser push until Plan 11.
+    -- other service role out of push_auth. The bootstrap administrator bypasses it;
+    -- message-svc instead owns only push_messaging as a non-superuser.
     REVOKE ALL ON DATABASE push_auth FROM PUBLIC;
     REVOKE ALL ON DATABASE push_messaging FROM PUBLIC;
     SQL

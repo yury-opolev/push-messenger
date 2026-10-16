@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use prost::Message;
-use push_message_svc::{Config, serve};
+use push_message_svc::{Config, Listeners, serve};
 use push_proto::internal::v1::accounts_client::AccountsClient;
 use push_proto::internal::v1::directory_client::DirectoryClient;
 use push_proto::internal::v1::messaging_client::MessagingClient;
@@ -51,6 +51,8 @@ struct Running {
     _redis: ContainerAsync<Redis>,
     redis_url: String,
     grpc: SocketAddr,
+    accounts: SocketAddr,
+    directory: SocketAddr,
     health: SocketAddr,
     shutdown: CancellationToken,
     server: JoinHandle<anyhow::Result<()>>,
@@ -74,7 +76,11 @@ async fn start() -> Running {
     let redis_url = format!("redis://127.0.0.1:{redis_port}");
 
     let grpc_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let accounts_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let directory_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let health_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let accounts = accounts_listener.local_addr().unwrap();
+    let directory = directory_listener.local_addr().unwrap();
     let (grpc, health) = (
         grpc_listener.local_addr().unwrap(),
         health_listener.local_addr().unwrap(),
@@ -83,6 +89,8 @@ async fn start() -> Running {
         database_url: format!("postgres://postgres:postgres@127.0.0.1:{postgres_port}/postgres"),
         redis_url: redis_url.clone(),
         grpc_addr: grpc,
+        accounts_grpc_addr: accounts,
+        directory_grpc_addr: directory,
         health_addr: health,
         store: StoreOptions::default(),
         accounts_token: Some(ACCOUNTS_TOKEN.to_owned()),
@@ -92,8 +100,12 @@ async fn start() -> Running {
     let shutdown = CancellationToken::new();
     let server = tokio::spawn(serve(
         config,
-        grpc_listener,
-        health_listener,
+        Listeners {
+            messaging: grpc_listener,
+            accounts: accounts_listener,
+            directory: directory_listener,
+            health: health_listener,
+        },
         shutdown.clone(),
     ));
     let running = Running {
@@ -101,6 +113,8 @@ async fn start() -> Running {
         _redis: redis,
         redis_url,
         grpc,
+        accounts,
+        directory,
         health,
         shutdown,
         server,
@@ -120,14 +134,92 @@ async fn start() -> Running {
 }
 
 #[tokio::test]
+async fn the_messaging_listener_does_not_serve_accounts() {
+    let running = start().await;
+    let mut accounts = accounts_client(format!("http://{}", running.grpc)).await;
+    let result = accounts.device_registered(AccountDevice::default()).await;
+    running.shutdown.cancel();
+    running.server.await.unwrap().unwrap();
+    assert_eq!(result.unwrap_err().code(), tonic::Code::Unimplemented);
+}
+
+#[tokio::test]
+async fn each_listener_serves_only_its_own_api() {
+    let running = start().await;
+    let mut statuses = Vec::new();
+    for (own_api, addr) in [
+        ("Messaging", running.grpc),
+        ("Accounts", running.accounts),
+        ("Directory", running.directory),
+    ] {
+        let url = format!("http://{addr}");
+        if own_api != "Accounts" {
+            let status = accounts_client(url.clone())
+                .await
+                .device_registered(AccountDevice::default())
+                .await
+                .unwrap_err();
+            statuses.push((own_api, "Accounts", status.code()));
+        }
+        if own_api != "Messaging" {
+            let status = messaging_client(url.clone())
+                .await
+                .identify(IdentifyRequest::default())
+                .await
+                .unwrap_err();
+            statuses.push((own_api, "Messaging", status.code()));
+        }
+        if own_api != "Directory" {
+            let mut request = Request::new(VisibleUsersRequest::default());
+            request.metadata_mut().insert(
+                "authorization",
+                format!("Bearer {DIRECTORY_TOKEN}").parse().unwrap(),
+            );
+            let status = DirectoryClient::connect(url)
+                .await
+                .unwrap()
+                .visible_users(request)
+                .await
+                .unwrap_err();
+            statuses.push((own_api, "Directory", status.code()));
+        }
+    }
+    running.shutdown.cancel();
+    running.server.await.unwrap().unwrap();
+    for (listener, api, code) in statuses {
+        assert_eq!(
+            code,
+            tonic::Code::Unimplemented,
+            "{listener} listener must not serve {api}, even with its correct token"
+        );
+    }
+    for addr in [
+        running.grpc,
+        running.accounts,
+        running.directory,
+        running.health,
+    ] {
+        assert!(
+            TcpStream::connect(addr).await.is_err(),
+            "{addr} is still serving"
+        );
+    }
+}
+
+#[tokio::test]
 async fn shutdown_is_honoured_while_the_database_is_unreachable() {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
     let grpc = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let accounts = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let directory = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let health = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let health_addr = health.local_addr().unwrap();
     let config = Config {
         database_url: "postgres://postgres:postgres@127.0.0.1:1/postgres".to_owned(),
         redis_url: "redis://127.0.0.1:1".to_owned(),
         grpc_addr: grpc.local_addr().unwrap(),
+        accounts_grpc_addr: accounts.local_addr().unwrap(),
+        directory_grpc_addr: directory.local_addr().unwrap(),
         health_addr: health.local_addr().unwrap(),
         store: StoreOptions::default(),
         accounts_token: None,
@@ -135,8 +227,18 @@ async fn shutdown_is_honoured_while_the_database_is_unreachable() {
         messaging_token: None,
     };
     let shutdown = CancellationToken::new();
-    let server = tokio::spawn(serve(config, grpc, health, shutdown.clone()));
+    let server = tokio::spawn(serve(
+        config,
+        Listeners {
+            messaging: grpc,
+            accounts,
+            directory,
+            health,
+        },
+        shutdown.clone(),
+    ));
     tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(get(health_addr, "/readyz").await.0, 503);
 
     let started = std::time::Instant::now();
     shutdown.cancel();
@@ -179,7 +281,7 @@ async fn a_message_goes_from_send_to_ack_and_rings_the_recipient() {
     );
 
     let url = format!("http://{}", running.grpc);
-    let mut accounts = accounts_client(url.clone()).await;
+    let mut accounts = accounts_client(format!("http://{}", running.accounts)).await;
     let mut messaging = messaging_client(url).await;
     let (alice, bob) = (Uuid::now_v7(), Uuid::now_v7());
     let (alice_device, bob_device) = (Uuid::now_v7(), Uuid::now_v7());
@@ -275,7 +377,12 @@ async fn a_message_goes_from_send_to_ack_and_rings_the_recipient() {
 async fn accounts_are_served_only_with_the_workers_token() {
     let running = start().await;
     let url = format!("http://{}", running.grpc);
-    let channel = Channel::from_shared(url.clone())
+    let channel = Channel::from_shared(format!("http://{}", running.accounts))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let messaging_channel = Channel::from_shared(url.clone())
         .unwrap()
         .connect()
         .await
@@ -301,7 +408,7 @@ async fn accounts_are_served_only_with_the_workers_token() {
     let status = stranger.device_registered(event.clone()).await.unwrap_err();
     assert_eq!(status.code(), tonic::Code::Unauthenticated);
     // And Messaging, which trusts the ids it is given, refuses anyone but the gateway.
-    let status = MessagingClient::new(channel.clone())
+    let status = MessagingClient::new(messaging_channel)
         .identify(identify.clone())
         .await
         .unwrap_err();
@@ -380,7 +487,7 @@ fn call(user: Uuid, body: request::Body) -> RequestCall {
 async fn the_client_requests_and_the_directory_run_on_postgres() {
     let running = start().await;
     let url = format!("http://{}", running.grpc);
-    let mut accounts = accounts_client(url.clone()).await;
+    let mut accounts = accounts_client(format!("http://{}", running.accounts)).await;
     let mut messaging = messaging_client(url).await;
     let (alice, bob, carol) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
     let devices = [Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7()];
@@ -519,7 +626,7 @@ async fn the_client_requests_and_the_directory_run_on_postgres() {
 
     // auth-svc asks whose profiles Carol may see: her contact Alice and Bob, from the
     // group, but not a stranger.
-    let channel = Channel::from_shared(format!("http://{}", running.grpc))
+    let channel = Channel::from_shared(format!("http://{}", running.directory))
         .unwrap()
         .connect()
         .await

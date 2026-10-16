@@ -41,7 +41,7 @@ pub struct GrpcDirectory {
 }
 
 impl GrpcDirectory {
-    /// A client for message-svc at `url` (`http://host:50051`) that presents `token`,
+    /// A client for message-svc's Directory API at `url` (`http://host:50053`) that presents `token`,
     /// auth-svc's internal token for this API. It connects on first use and reconnects by
     /// itself, so auth-svc starts without waiting for message-svc.
     pub fn new(url: &str, token: &str) -> Result<Self, String> {
