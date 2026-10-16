@@ -3,21 +3,29 @@
 # chart refuses dev mode for an ingress host that is not local (see _helpers.tpl).
 
 images:
+  # A non-empty digest (sha256: and 64 lowercase hex digits) renders repository@digest
+  # and takes precedence over the tag, so consumers pin exactly what they built and
+  # published. The chart never builds, logs in, pushes or checks a registry.
   auth:
     repository: push-messenger/auth
     tag: dev
+    digest: ""
   messageSvc:
     repository: push-messenger/message-svc
     tag: dev
+    digest: ""
   gateway:
     repository: push-messenger/gateway
     tag: dev
+    digest: ""
   smoke:
     repository: push-messenger/smoke
     tag: dev
+    digest: ""
   worker:
     repository: push-messenger/worker
     tag: dev
+    digest: ""
   pullPolicy: IfNotPresent
 
 # Changing this rolls out new auth, gateway, message-svc and worker pods even when the image tags
@@ -40,6 +48,10 @@ gateway:
   # refuses group requests with NOT_AVAILABLE. message-svc keeps full group support;
   # true serves them.
   groups: false
+  # Header with the client's IP for the per-IP limits, written by the controller in front
+  # (its last line, then last entry, is used). Empty: the peer address. Only set one the
+  # trusted proxy overwrites or appends to, with direct backend access blocked.
+  clientIpHeader: ""
   # 5 s preStop sleep + the gateway's own 10 s drain + margin.
   terminationGracePeriodSeconds: 30
   resources:
@@ -58,6 +70,8 @@ auth:
   dbMaxConnections: 10
   # Password hashes computed at once; each takes 19 MiB (Argon2id, spec §5.6).
   hashConcurrency: 2
+  # As gateway.clientIpHeader, for auth-svc's per-IP limits.
+  clientIpHeader: ""
   # Empty: generated on install and kept on upgrades. The Ed25519 seed that signs access
   # tokens and the HMAC key of email links and registration tokens, base64 of 32 bytes.
   signingKey: ""
@@ -81,18 +95,21 @@ worker:
   dbMaxConnections: 5
   email:
     # log: logs each email instead of sending it. resend: sends through Resend, which
-    # needs resendApiKey and from. Real sending comes with the Azure plan (Plan 11), which
-    # brings the key and the webhook secret through Key Vault.
+    # needs resendApiKey (or the resend-api-key of a consumer-managed Secret) and from.
     sender: log
     # The From of every email (owner decision: the push.kubegames.dk domain).
     from: "Push Messenger <no-reply@push.kubegames.dk>"
     # The name emails sign with.
     productName: Push Messenger
     # Resend's API key and the signing secret of its webhook (whsec_...): kept in the
-    # Secret. Without a webhook secret the worker does not serve the webhook, and the
-    # webhook Ingress is not rendered (in dev mode one is generated).
+    # chart-managed Secret. Consumers using secrets.existingSecret leave both empty.
     resendApiKey: ""
     webhookSecret: ""
+    webhook:
+      # Serves /v1/webhooks/resend: references resend-webhook-secret and, with chart
+      # Ingress, renders its route. Never inferred from a live Secret. A disabled webhook
+      # keeps a retained signing secret.
+      enabled: false
   # Accounts left unverified this many days are deleted.
   unverifiedAccountDays: 7
   # Buried jobs, email records and delivery events are kept this many days.
@@ -152,6 +169,13 @@ redis:
       cpu: 250m
       memory: 128Mi
 
+# Credentials. Empty existingSecret: the chart generates them on install and keeps them
+# (push-secrets, helm.sh/resource-policy: keep). A name: references that consumer-managed
+# Secret in the release namespace (key contract: docs/deployment-configuration.md); the chart
+# then never creates, reads, changes or deletes it, and refuses inline credential values.
+secrets:
+  existingSecret: ""
+
 # Ingress-only isolation for the six application components; egress is unchanged.
 # Requires a NetworkPolicy-enforcing CNI (render checks alone cannot prove enforcement).
 networkPolicy:
@@ -164,17 +188,29 @@ networkPolicy:
 
 ingress:
   enabled: true
-  className: nginx
+  # Empty omits spec.ingressClassName (the cluster's default class).
+  className: ""
+  # The public host. Kept as the public identity also with enabled: false, for consumer
+  # routes (e.g. Gateway API): email links start with `<scheme>://<host>` and access
+  # tokens name the gateway at `ws[s]://<host>/v1/socket`.
   host: push.example.com
-  # The scheme clients use: email links start with `<scheme>://<host>` and access tokens
-  # name the gateway at `ws[s]://<host>/v1/socket`. TLS comes with the Azure plan; plain
-  # http is accepted only for a local host.
+  # Plain http is accepted only for a local host.
   scheme: https
-  # nginx closes a proxied connection that is silent for this long; clients ping every
-  # 30 s (spec §7.5).
-  timeoutSeconds: 120
+  tls:
+    # An existing kubernetes.io/tls Secret in the release namespace, provisioned by the
+    # consumer; used by every public route with https. The chart never generates one.
+    secretName: push-tls
+  # String-valued annotations for the consumer's controller. `annotations` goes on every
+  # public Ingress; a per-route key overrides a common one. authLinkAnnotations applies
+  # only to the token-bearing email link routes (e.g. to keep tokens out of access logs).
+  annotations: {}
+  gatewayAnnotations: {}
+  authAnnotations: {}
+  authLinkAnnotations: {}
+  webhookAnnotations: {}
 
 smoke:
+  # DEV ONLY (`helm test` in dev mode). Defaults name minikube's local ingress-nginx addon.
   # auth-svc's public API as the smoke test reaches it: the ingress controller, with
   # `ingress.host` as the Host header.
   authUrl: http://ingress-nginx-controller.ingress-nginx.svc.cluster.local

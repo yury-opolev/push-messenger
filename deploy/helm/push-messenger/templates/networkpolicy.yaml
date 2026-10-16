@@ -18,7 +18,7 @@
 {{- $gatewayRules = list (dict "port" 8080 "controllers" $controllers) -}}
 {{- end -}}
 {{- $workerControllers := list -}}
-{{- if and .Values.ingress.enabled (include "push.hasWebhook" .) -}}
+{{- if include "push.hasWebhook" . -}}
 {{- $workerControllers = $controllers -}}
 {{- end -}}
 {{- $workerCallers := list -}}

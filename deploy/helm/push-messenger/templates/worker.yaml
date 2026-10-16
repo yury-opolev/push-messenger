@@ -1,4 +1,3 @@
-{{- include "push.checkEmail" . -}}
 {{- $name := include "push.name" (dict "root" . "component" "worker") -}}
 apiVersion: v1
 kind: Service
@@ -75,18 +74,20 @@ spec:
               value: {{ .Values.worker.email.from | quote }}
             - name: PUSH_EMAIL_PRODUCT_NAME
               value: {{ .Values.worker.email.productName | quote }}
+            {{- if eq .Values.worker.email.sender "resend" }}
             - name: PUSH_RESEND_API_KEY
               valueFrom:
                 secretKeyRef:
                   name: {{ include "push.secretName" . }}
                   key: resend-api-key
-                  optional: true
+            {{- end }}
+            {{- if include "push.hasWebhook" . }}
             - name: PUSH_RESEND_WEBHOOK_SECRET
               valueFrom:
                 secretKeyRef:
                   name: {{ include "push.secretName" . }}
                   key: resend-webhook-secret
-                  optional: true
+            {{- end }}
             - name: PUSH_UNVERIFIED_ACCOUNT_DAYS
               value: {{ .Values.worker.unverifiedAccountDays | quote }}
             - name: PUSH_WORKER_RETENTION_DAYS

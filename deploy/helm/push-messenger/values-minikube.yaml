@@ -5,6 +5,12 @@ devMode:
   enabled: true
   acknowledge: insecure-local-only
 
+# The local webhook path, signed with a generated DEV ONLY secret.
+worker:
+  email:
+    webhook:
+      enabled: true
+
 # Existing local minikube controller only, not a production controller default.
 networkPolicy:
   ingressControllerPeers:
@@ -13,6 +19,30 @@ networkPolicy:
       podSelector:
         app.kubernetes.io/name: ingress-nginx
 
+# The retired ingress-nginx, as minikube's addon: a local compatibility path only, not a
+# production controller recommendation.
 ingress:
+  className: nginx
   host: push.local
   scheme: http
+  tls:
+    secretName: ""
+  # nginx closes a proxied connection silent for 60 s by default; clients ping every 30 s.
+  gatewayAnnotations:
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "120"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "120"
+    nginx.ingress.kubernetes.io/proxy-http-version: "1.1"
+  authAnnotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "16k"
+  # The link routes carry a one-time ?token=: no access log for them.
+  authLinkAnnotations:
+    nginx.ingress.kubernetes.io/enable-access-log: "false"
+    nginx.ingress.kubernetes.io/proxy-body-size: "16k"
+  webhookAnnotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "256k"
+
+# ingress-nginx overwrites X-Real-IP with the client's address.
+auth:
+  clientIpHeader: x-real-ip
+gateway:
+  clientIpHeader: x-real-ip

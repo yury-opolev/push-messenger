@@ -18,7 +18,50 @@ app.kubernetes.io/instance: {{ .root.Release.Name }}
 {{- end -}}
 
 {{- define "push.secretName" -}}
+{{- if .Values.secrets.existingSecret -}}
+{{- .Values.secrets.existingSecret -}}
+{{- else -}}
 {{- printf "%s-secrets" .Release.Name -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+A consumer-managed Secret (secrets.existingSecret) is only referenced: inline credential
+values would be silently ignored, so they are refused by name, never by value.
+*/}}
+{{- define "push.checkSecretSelection" -}}
+{{- $name := .Values.secrets.existingSecret -}}
+{{- if not (kindIs "string" $name) -}}
+{{- fail "secrets.existingSecret must be a string" -}}
+{{- end -}}
+{{- if $name -}}
+{{- if or (gt (len $name) 253) (not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$" $name)) -}}
+{{- fail "secrets.existingSecret must be a Kubernetes Secret name" -}}
+{{- end -}}
+{{- $inline := dict
+  "postgres.password" .Values.postgres.password
+  "postgres.messagingPassword" .Values.postgres.messagingPassword
+  "postgres.authPassword" .Values.postgres.authPassword
+  "postgres.workerPassword" .Values.postgres.workerPassword
+  "redis.password" .Values.redis.password
+  "auth.signingKey" .Values.auth.signingKey
+  "auth.linkKey" .Values.auth.linkKey
+  "worker.email.resendApiKey" .Values.worker.email.resendApiKey
+  "worker.email.webhookSecret" .Values.worker.email.webhookSecret -}}
+{{- range $key, $value := $inline -}}
+{{- if $value -}}
+{{- fail (printf "%s conflicts with secrets.existingSecret" $key) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/* Checks a chart-managed auth key: canonical standard base64 of 32 (or at least 32) bytes. */}}
+{{- define "push.checkAuthKey" -}}
+{{- $decoded := .value | b64dec -}}
+{{- if or (ne ($decoded | b64enc) .value) (and .exact (ne (len $decoded) 32)) (and (not .exact) (lt (len $decoded) 32)) -}}
+{{- fail (printf "%s must be canonical standard base64 of %s" .name (ternary "exactly 32 bytes" "at least 32 bytes" .exact)) -}}
+{{- end -}}
 {{- end -}}
 
 {{/*
@@ -41,8 +84,21 @@ local host, as auth-svc itself insists.
 {{- printf "%s://%s/v1/socket" (ternary "wss" "ws" (eq .Values.ingress.scheme "https")) .Values.ingress.host -}}
 {{- end -}}
 
+{{/* repository@digest when a digest is set, otherwise repository:tag. */}}
 {{- define "push.image" -}}
-{{- printf "%s:%s" .repository .tag -}}
+{{- $repository := required "image repository is required" .repository -}}
+{{- if contains "@" $repository -}}
+{{- fail "image repository must not include a digest; use image digest" -}}
+{{- end -}}
+{{- $digest := .digest | default "" -}}
+{{- if $digest -}}
+{{- if not (regexMatch "^sha256:[a-f0-9]{64}$" $digest) -}}
+{{- fail "image digest must be sha256 followed by 64 lowercase hexadecimal digits" -}}
+{{- end -}}
+{{- printf "%s@%s" $repository $digest -}}
+{{- else -}}
+{{- printf "%s:%s" $repository (required "image tag is required without an image digest" .tag) -}}
+{{- end -}}
 {{- end -}}
 
 {{/*
@@ -69,25 +125,27 @@ true
 {{- end -}}
 
 {{/*
-"true" when the worker gets a webhook secret, so it serves /v1/webhooks/resend and the
-webhook Ingress is rendered: set in values, kept in the existing Secret, or generated in
-dev mode (secret.yaml).
+"true" when the worker serves /v1/webhooks/resend: an explicit decision
+(worker.email.webhook.enabled), never inferred from a live Secret, so external-Secret
+installations render offline. It references resend-webhook-secret and, with chart Ingress,
+renders the webhook route.
 */}}
 {{- define "push.hasWebhook" -}}
-{{- $existing := (lookup "v1" "Secret" .Release.Namespace (include "push.secretName" .)).data | default dict -}}
-{{- if or .Values.worker.email.webhookSecret (hasKey $existing "resend-webhook-secret") (include "push.devMode" .) -}}
-true
-{{- end -}}
+{{- if .Values.worker.email.webhook.enabled -}}true{{- end -}}
 {{- end -}}
 
 {{/*
-Checks the worker's email settings: the sender is log or resend; resend needs an API key
-and a From address and is refused in dev mode, whose mailbox shows every email it sent.
-Dev mode needs exactly one worker: its mailbox is in memory, per replica, so with more
-the smoke test would look in the wrong one.
+Checks the worker's email settings: the sender is log or resend; resend needs a From
+address and is refused in dev mode, whose mailbox shows every email it sent. Dev mode needs
+at most one worker: its mailbox is in memory, per replica. Chart-managed credentials must
+exist for resend and an enabled webhook; a consumer-managed Secret is never looked up (a
+missing key stops the worker with a Kubernetes configuration error instead).
 */}}
 {{- define "push.checkEmail" -}}
 {{- $email := .Values.worker.email -}}
+{{- if not (kindIs "bool" $email.webhook.enabled) -}}
+{{- fail "worker.email.webhook.enabled must be a boolean" -}}
+{{- end -}}
 {{- if and (include "push.devMode" .) (gt (int .Values.worker.replicas) 1) -}}
 {{- fail "dev mode keeps the DEV ONLY mailbox in memory, per worker replica: use worker.replicas 1 with it" -}}
 {{- end -}}
@@ -95,15 +153,20 @@ the smoke test would look in the wrong one.
 {{- fail (printf "worker.email.sender must be log or resend, not %q" $email.sender) -}}
 {{- end -}}
 {{- if eq $email.sender "resend" -}}
-{{- $existing := (lookup "v1" "Secret" .Release.Namespace (include "push.secretName" .)).data | default dict -}}
-{{- if not (or $email.resendApiKey (hasKey $existing "resend-api-key")) -}}
-{{- fail "worker.email.sender resend needs worker.email.resendApiKey" -}}
-{{- end -}}
 {{- if not $email.from -}}
 {{- fail "worker.email.sender resend needs worker.email.from" -}}
 {{- end -}}
 {{- if include "push.devMode" . -}}
 {{- fail "dev mode shows every email the worker sends at /dev/mailbox: use worker.email.sender log with it" -}}
+{{- end -}}
+{{- end -}}
+{{- if not .Values.secrets.existingSecret -}}
+{{- $existing := (lookup "v1" "Secret" .Release.Namespace (include "push.secretName" .)).data | default dict -}}
+{{- if and (eq $email.sender "resend") (not (or $email.resendApiKey (get $existing "resend-api-key"))) -}}
+{{- fail "worker.email.sender resend needs worker.email.resendApiKey or a retained resend-api-key" -}}
+{{- end -}}
+{{- if and $email.webhook.enabled (not (include "push.devMode" .)) (not (or $email.webhookSecret (get $existing "resend-webhook-secret"))) -}}
+{{- fail "worker.email.webhook.enabled needs worker.email.webhookSecret or a retained resend-webhook-secret" -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}
@@ -120,4 +183,58 @@ securityContext:
     drop: ["ALL"]
   seccompProfile:
     type: RuntimeDefault
+{{- end -}}
+
+{{/*
+Checks the public routing settings, also with ingress.enabled false (the public identity
+still names email links and the token audience): HTTPS chart Ingress needs a TLS Secret,
+annotation maps are string-valued, trusted client-IP headers are header names.
+*/}}
+{{- define "push.checkIngress" -}}
+{{- $ingress := .Values.ingress -}}
+{{- if not (kindIs "bool" $ingress.enabled) -}}
+{{- fail "ingress.enabled must be a boolean" -}}
+{{- end -}}
+{{- if not (and (kindIs "string" $ingress.host) $ingress.host) -}}
+{{- fail "ingress.host must be a nonempty public hostname" -}}
+{{- end -}}
+{{- if not (kindIs "string" $ingress.className) -}}
+{{- fail "ingress.className must be a string" -}}
+{{- end -}}
+{{- if not (kindIs "string" $ingress.tls.secretName) -}}
+{{- fail "ingress.tls.secretName must be a string" -}}
+{{- end -}}
+{{- $_ := include "push.publicUrl" . -}}
+{{- if and $ingress.enabled (eq $ingress.scheme "https") (not $ingress.tls.secretName) -}}
+{{- fail "ingress.tls.secretName is required for HTTPS chart Ingress" -}}
+{{- end -}}
+{{- range $name := list "annotations" "gatewayAnnotations" "authAnnotations" "authLinkAnnotations" "webhookAnnotations" -}}
+{{- $map := index $ingress $name -}}
+{{- if not (kindIs "map" $map) -}}
+{{- fail (printf "ingress.%s must be a string-valued annotation map" $name) -}}
+{{- end -}}
+{{- range $key, $value := $map -}}
+{{- if not (kindIs "string" $value) -}}
+{{- fail (printf "ingress.%s must be a string-valued annotation map" $name) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- range $name := list "auth" "gateway" -}}
+{{- $header := index $.Values $name "clientIpHeader" -}}
+{{- if not (kindIs "string" $header) -}}
+{{- fail (printf "%s.clientIpHeader must be a string" $name) -}}
+{{- end -}}
+{{- if and $header (not (regexMatch "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$" $header)) -}}
+{{- fail (printf "%s.clientIpHeader must be an HTTP header name" $name) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/* The common annotations merged with a route's own; the route's keys win. */}}
+{{- define "push.ingressAnnotations" -}}
+{{- $annotations := mergeOverwrite (deepCopy .root.Values.ingress.annotations) .specific -}}
+{{- with $annotations }}
+annotations:
+  {{- toYaml . | nindent 2 }}
+{{- end -}}
 {{- end -}}

@@ -75,9 +75,11 @@ spec:
               value: {{ include "push.publicUrl" . | quote }}
             - name: PUSH_AUTH_TOKEN_AUDIENCE
               value: {{ include "push.socketUrl" . | quote }}
-            # ingress-nginx overwrites X-Real-IP with the client's address.
+            {{- with .Values.auth.clientIpHeader }}
+            # Written by the trusted controller in front; see values.yaml.
             - name: PUSH_AUTH_CLIENT_IP_HEADER
-              value: x-real-ip
+              value: {{ . | quote }}
+            {{- end }}
             - name: PUSH_AUTH_HASH_CONCURRENCY
               value: {{ .Values.auth.hashConcurrency | quote }}
             - name: PUSH_DB_MAX_CONNECTIONS
