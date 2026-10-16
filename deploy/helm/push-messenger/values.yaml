@@ -3,21 +3,29 @@
 # chart refuses dev mode for an ingress host that is not local (see _helpers.tpl).
 
 images:
+  # A non-empty digest (sha256: and 64 lowercase hex digits) renders repository@digest
+  # and takes precedence over the tag, so consumers pin exactly what they built and
+  # published. The chart never builds, logs in, pushes or checks a registry.
   auth:
     repository: push-messenger/auth
     tag: dev
+    digest: ""
   messageSvc:
     repository: push-messenger/message-svc
     tag: dev
+    digest: ""
   gateway:
     repository: push-messenger/gateway
     tag: dev
+    digest: ""
   smoke:
     repository: push-messenger/smoke
     tag: dev
+    digest: ""
   worker:
     repository: push-messenger/worker
     tag: dev
+    digest: ""
   pullPolicy: IfNotPresent
 
 # Changing this rolls out new auth, gateway, message-svc and worker pods even when the image tags

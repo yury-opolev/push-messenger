@@ -84,8 +84,21 @@ local host, as auth-svc itself insists.
 {{- printf "%s://%s/v1/socket" (ternary "wss" "ws" (eq .Values.ingress.scheme "https")) .Values.ingress.host -}}
 {{- end -}}
 
+{{/* repository@digest when a digest is set, otherwise repository:tag. */}}
 {{- define "push.image" -}}
-{{- printf "%s:%s" .repository .tag -}}
+{{- $repository := required "image repository is required" .repository -}}
+{{- if contains "@" $repository -}}
+{{- fail "image repository must not include a digest; use image digest" -}}
+{{- end -}}
+{{- $digest := .digest | default "" -}}
+{{- if $digest -}}
+{{- if not (regexMatch "^sha256:[a-f0-9]{64}$" $digest) -}}
+{{- fail "image digest must be sha256 followed by 64 lowercase hexadecimal digits" -}}
+{{- end -}}
+{{- printf "%s@%s" $repository $digest -}}
+{{- else -}}
+{{- printf "%s:%s" $repository (required "image tag is required without an image digest" .tag) -}}
+{{- end -}}
 {{- end -}}
 
 {{/*

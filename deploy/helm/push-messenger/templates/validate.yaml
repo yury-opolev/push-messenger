@@ -2,3 +2,6 @@
 {{- include "push.checkSecretSelection" . -}}
 {{- include "push.checkEmail" . -}}
 {{- include "push.checkIngress" . -}}
+{{- range $name := list "auth" "messageSvc" "gateway" "worker" "smoke" -}}
+{{- $_ := include "push.image" (index $.Values.images $name) -}}
+{{- end -}}
