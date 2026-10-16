@@ -1,5 +1,6 @@
 # Checks the Helm chart without a cluster: lint with each values file, the DEV ONLY
 # switches, and the guards that keep dev mode out of real deployments.
+# Requires Helm and Python (py) with PyYAML for structural policy checks.
 #
 #   pwsh deploy/helm/test-chart.ps1
 $ErrorActionPreference = 'Stop'
@@ -29,10 +30,122 @@ function Render([string[]] $arguments) {
     return $LASTEXITCODE
 }
 
+# Parse YAML with the installed Python/PyYAML, so checks cover complete rules, not
+# unrelated occurrences of ports and labels. These checks do not prove CNI enforcement.
+function PolicyMatrix([string] $rendered, [string] $release, [array] $controllers = @(),
+    [bool] $webhook = $false, [bool] $devMode = $false) {
+    $validator = @'
+import json, sys, yaml
+case = json.load(sys.stdin)
+docs = [d for d in yaml.safe_load_all(case["rendered"]) if d]
+release = case["release"]
+policies = {d["metadata"]["name"]: d for d in docs if d["kind"] == "NetworkPolicy"}
+components = ["message-svc", "postgres", "redis", "auth", "gateway", "worker"]
+assert sum(d["kind"] == "NetworkPolicy" for d in docs) == 6, "exactly six policy documents"
+assert set(policies) == {f"{release}-{c}" for c in components}, "exactly six application policies"
+def selector(component):
+    return {"app.kubernetes.io/name": component, "app.kubernetes.io/instance": release}
+def peer(component):
+    return {"podSelector": {"matchLabels": {
+        "app.kubernetes.io/instance": release, "push-messenger/network-peer": component}}}
+def rule(port, peers):
+    return {"ports": [{"protocol": "TCP", "port": port}], "from": peers}
+controllers = [{"namespaceSelector": {"matchLabels": p["namespaceSelector"]},
+                "podSelector": {"matchLabels": p["podSelector"]}} for p in case["controllers"]]
+expected = {
+    "message-svc": [rule(50051, [peer("gateway")]), rule(50052, [peer("worker")]),
+                    rule(50053, [peer("auth")])],
+    "postgres": [rule(5432, [peer(c) for c in ["message-svc", "auth", "worker"]])],
+    "redis": [rule(6379, [peer(c) for c in ["message-svc", "auth", "gateway"]])],
+    "auth": [rule(8080, [peer("gateway")] + controllers)],
+    "gateway": [rule(8080, controllers)] if controllers else [],
+    "worker": [],
+}
+worker_peers = (controllers if case["webhook"] else []) + ([peer("smoke")] if case["devMode"] else [])
+if worker_peers:
+    expected["worker"] = [rule(8080, worker_peers)]
+for component in components:
+    policy = policies[f"{release}-{component}"]
+    assert policy["apiVersion"] == "networking.k8s.io/v1"
+    # Source ordering has no meaning; compare the complete source sets per rule.
+    for ingress_rule in policy["spec"].get("ingress", []) + expected[component]:
+        ingress_rule["from"] = sorted(ingress_rule["from"], key=lambda p: json.dumps(p, sort_keys=True))
+    assert policy["spec"] == {"podSelector": {"matchLabels": selector(component)},
+                              "policyTypes": ["Ingress"], "ingress": expected[component]}, component
+    resources = [d for d in docs if d["metadata"]["name"] == f"{release}-{component}"]
+    service = next(d for d in resources if d["kind"] == "Service")
+    workload = next(d for d in resources if d["kind"] in ["Deployment", "StatefulSet"])
+    assert service["spec"]["selector"] == selector(component), f"{component} Service selector changed"
+    assert workload["spec"]["selector"] == {"matchLabels": selector(component)}, f"{component} workload selector changed"
+for doc in docs:
+    if doc["kind"] not in ["Deployment", "StatefulSet", "Pod"]:
+        continue
+    labels = (doc["metadata"] if doc["kind"] == "Pod" else doc["spec"]["template"]["metadata"])["labels"]
+    assert labels["push-messenger/network-peer"] == labels["app.kubernetes.io/name"]
+    assert labels["app.kubernetes.io/instance"] == release
+    # A later probe with only role+instance labels cannot become a Service endpoint.
+    probe = {k: v for k, v in labels.items() if k != "app.kubernetes.io/name"}
+    assert not selector(labels["app.kubernetes.io/name"]).items() <= probe.items()
+'@
+    $result = @{
+        rendered = $rendered; release = $release; controllers = @($controllers)
+        webhook = $webhook; devMode = $devMode
+    } | ConvertTo-Json -Depth 10 -Compress | py -c $validator 2>&1
+    $passed = $LASTEXITCODE -eq 0
+    if (-not $passed) { $result | ForEach-Object { Write-Host $_ } }
+    return $passed
+}
+
 Check 'lint with the default values' { helm lint $chart --strict | Out-Null; $LASTEXITCODE -eq 0 }
 Check 'lint with values-minikube.yaml' { helm lint $chart --strict -f $minikube | Out-Null; $LASTEXITCODE -eq 0 }
 
 $default = helm template push $chart | Out-String
+Check 'network: message-svc has separate release-scoped rules for all three API callers' {
+    $policy = Doc $default 'NetworkPolicy' 'push-message-svc'
+    $policy -and
+        $policy -match 'port: 50051' -and $policy -match 'port: 50052' -and $policy -match 'port: 50053' -and
+        (PolicyMatrix $default 'push')
+}
+Check 'network: default denies public traffic, has no egress rules, and preserves workload/Service selectors' {
+    PolicyMatrix $default 'push'
+}
+Check 'network: explicit opt-out renders zero policies' {
+    $off = helm template push $chart --set networkPolicy.enabled=false | Out-String
+    $LASTEXITCODE -eq 0 -and $off -notmatch '(?m)^kind: NetworkPolicy\s*$'
+}
+$secondRelease = helm template other $chart --namespace another | Out-String
+Check 'network: a second release targets and admits only its own instance' { PolicyMatrix $secondRelease 'other' }
+$controllerPeers = @(
+    @{ namespaceSelector = @{ 'example.com/namespace' = 'edge' }; podSelector = @{ 'example.com/controller' = 'public' } },
+    @{ namespaceSelector = @{ 'example.com/namespace' = 'edge-private' }; podSelector = @{ 'example.com/controller' = 'private' } }
+)
+$peerJson = ConvertTo-Json -InputObject $controllerPeers -Depth 5 -Compress
+$withControllers = helm template push $chart --set-json "networkPolicy.ingressControllerPeers=$peerJson" | Out-String
+Check 'network: each controller peer ANDs both selectors; no webhook means no worker access or production mailbox' {
+    PolicyMatrix $withControllers 'push' $controllerPeers
+}
+$withWebhookControllers = helm template push $chart --set-json "networkPolicy.ingressControllerPeers=$peerJson" --set worker.email.webhookSecret=whsec_test | Out-String
+Check 'network: controller peers reach the worker only with webhook exposure' {
+    PolicyMatrix $withWebhookControllers 'push' $controllerPeers $true
+}
+$withoutIngress = helm template push $chart --set-json "networkPolicy.ingressControllerPeers=$peerJson" --set worker.email.webhookSecret=whsec_test --set ingress.enabled=false | Out-String
+Check 'network: disabling webhook Ingress removes controller access to the worker' {
+    PolicyMatrix $withoutIngress 'push' $controllerPeers
+}
+foreach ($invalid in @(
+    '[{}]',
+    '[{"podSelector":{"app":"edge"}}]',
+    '[{"namespaceSelector":{"team":"edge"}}]',
+    '[{"namespaceSelector":{},"podSelector":{"app":"edge"}}]',
+    '[{"namespaceSelector":{"team":"edge"},"podSelector":{}}]',
+    '[{"namespaceSelector":"edge","podSelector":{"app":"edge"}}]',
+    '[{"namespaceSelector":{"team":"edge"},"podSelector":["edge"]}]'
+)) {
+    Check "network: invalid controller selector is refused: $invalid" {
+        $errorText = helm template push $chart --set-json "networkPolicy.ingressControllerPeers=$invalid" 2>&1 | Out-String
+        $LASTEXITCODE -ne 0 -and $errorText -match 'networkPolicy.ingressControllerPeers.*namespaceSelector.*podSelector.*non-empty.*maps'
+    }
+}
 Check 'default: messaging has a dedicated alphanumeric credential and matching non-superuser URL' {
     $secret = Doc $default 'Secret' 'push-secrets'
     $password = [regex]::Match($secret, '(?m)^  messaging-db-password: "([A-Za-z0-9]+)"\s*$').Groups[1].Value
@@ -208,6 +321,17 @@ Check 'resend: the worker sends through Resend with the key from the Secret' {
 }
 
 $dev = helm template push $chart -f $minikube | Out-String
+Check 'network: minikube explicitly admits its local controller and same-release smoke mailbox peer' {
+    $localPeers = @(@{
+        namespaceSelector = @{ 'kubernetes.io/metadata.name' = 'ingress-nginx' }
+        podSelector = @{ 'app.kubernetes.io/name' = 'ingress-nginx' }
+    })
+    PolicyMatrix $dev 'push' $localPeers $true $true
+}
+$devWithoutControllers = helm template push $chart -f $minikube --set-json 'networkPolicy.ingressControllerPeers=[]' | Out-String
+Check 'network: dev mailbox admits smoke without a wildcard public fallback' {
+    PolicyMatrix $devWithoutControllers 'push' @() $true $true
+}
 Check 'minikube: no dev identities either; tokens name ws://push.local/v1/socket' {
     $dev -notmatch 'PUSH_DEV_AUTH' -and
         (Doc $dev 'Deployment' 'push-gateway') -match 'name: PUSH_TOKEN_AUDIENCE\s+value: "ws://push.local/v1/socket"'

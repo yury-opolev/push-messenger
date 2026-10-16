@@ -5,6 +5,14 @@ devMode:
   enabled: true
   acknowledge: insecure-local-only
 
+# Existing local minikube controller only, not a production controller default.
+networkPolicy:
+  ingressControllerPeers:
+    - namespaceSelector:
+        kubernetes.io/metadata.name: ingress-nginx
+      podSelector:
+        app.kubernetes.io/name: ingress-nginx
+
 ingress:
   host: push.local
   scheme: http

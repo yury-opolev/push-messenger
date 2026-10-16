@@ -152,6 +152,16 @@ redis:
       cpu: 250m
       memory: 128Mi
 
+# Ingress-only isolation for the six application components; egress is unchanged.
+# Requires a NetworkPolicy-enforcing CNI (render checks alone cannot prove enforcement).
+networkPolicy:
+  enabled: true
+  # Empty denies public traffic until the actual controller's selectors are configured.
+  # Each peer must have BOTH non-empty label maps, ANDed in one source:
+  # - namespaceSelector: {example.com/namespace: edge}
+  #   podSelector: {example.com/controller: public}
+  ingressControllerPeers: []
+
 ingress:
   enabled: true
   className: nginx
