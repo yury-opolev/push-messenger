@@ -403,6 +403,11 @@ Check 'dev mode with more than one worker is refused' {
     (Render @('--set', 'worker.replicas=2')) -eq 0
 }
 
+Check 'portable chart interface matrix' {
+    & $python.Source (Join-Path $PSScriptRoot 'test-portability.py') | Out-Host
+    $LASTEXITCODE -eq 0
+}
+
 if ($failures -gt 0) {
     Write-Output "$failures check(s) failed"
     exit 1
