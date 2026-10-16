@@ -21,7 +21,20 @@ Read these before implementation:
   maintenance gate supersede earlier draft upgrade snippets.
 
 Plan 11A is merged in #20 (`9e27443`). Do not reimplement its listeners,
-ownership migration or isolation model. This document is a plan, not permission
+ownership migration or isolation model.
+
+**Execution corrections (recorded after Task 7 ran):** the tested procedure in
+`docs\deployment-ingress-verification.md` supersedes Task 7's draft snippets
+where they differ. Traefik chart 42 sets the Service type with
+`service.spec.type`. A Service target port pointing at unused port 65530 cannot
+produce a refusal on an enforcing CNI (the auth policy drops it, so the dial
+times out); the refusal fixture instead declares port 8080 on a same-release
+auth-labelled pod that does not listen on it. Each failure phase also waits for
+the controller to answer the expected status on a non-link route before probing,
+the timeout backend uses `ThreadingHTTPServer`, and restore waits for
+`condition=Available`.
+
+This document is a plan, not permission
 to start implementation. Review it first, then use the normal branch/PR process.
 Start implementation from clean `main` containing this reviewed document:
 
@@ -1245,7 +1258,8 @@ providers:
 api:
   dashboard: false
 service:
-  type: NodePort
+  spec:
+    type: NodePort
 ports:
   web:
     forwardedHeaders:
@@ -1962,8 +1976,9 @@ function Wait-AuthEndpoints([int] $Port) {
         $json = kubectl --context push11b-traefik -n push get endpointslice `
             -l 'kubernetes.io/service-name=push-auth' -o json
         NativeOK 'Read fixture auth EndpointSlices'
+        # `$_ -and`: piping a null endpoints list yields one $null item.
         $ready = @(($json | ConvertFrom-Json).items | Where-Object {
-            @($_.endpoints | Where-Object { $_.conditions.ready -ne $false }).Count -gt 0
+            @($_.endpoints | Where-Object { $_ -and $_.conditions.ready -ne $false }).Count -gt 0
         })
         if ($Port -eq 0 -and $ready.Count -eq 0) { return }
         $ports = @($ready | ForEach-Object { $_.ports } | ForEach-Object { $_.port })
