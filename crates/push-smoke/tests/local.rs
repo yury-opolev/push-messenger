@@ -64,7 +64,11 @@ async fn the_smoke_test_passes_against_the_whole_stack() {
     let auth_health_addr = auth_health.local_addr().unwrap();
     let auth_url = format!("http://{}", auth_http.local_addr().unwrap());
     let grpc = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let accounts = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let directory = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let message_svc_url = format!("http://{}", grpc.local_addr().unwrap());
+    let accounts_url = format!("http://{}", accounts.local_addr().unwrap());
+    let directory_url = format!("http://{}", directory.local_addr().unwrap());
     // auth-svc's token for message-svc's Directory API, as the chart's Secret holds it.
     // message-svc refuses it equal to the Accounts token.
     let directory_token = "directory-token-for-the-local-smoke-test";
@@ -85,7 +89,7 @@ async fn the_smoke_test_passes_against_the_whole_stack() {
             "CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk=",
         ),
         ("PUSH_AUTH_WORKER_ROLE", "push_worker"),
-        ("PUSH_MESSAGE_SVC_URL", message_svc_url.as_str()),
+        ("PUSH_MESSAGE_SVC_URL", directory_url.as_str()),
         ("PUSH_DIRECTORY_TOKEN", directory_token),
     ];
     let auth_config = push_auth::Config::from_lookup(|name| {
@@ -111,16 +115,20 @@ async fn the_smoke_test_passes_against_the_whole_stack() {
             database_url,
             redis_url: redis_url.clone(),
             grpc_addr: grpc.local_addr().unwrap(),
-            accounts_grpc_addr: "127.0.0.1:0".parse().unwrap(),
-            directory_grpc_addr: "127.0.0.1:0".parse().unwrap(),
+            accounts_grpc_addr: accounts.local_addr().unwrap(),
+            directory_grpc_addr: directory.local_addr().unwrap(),
             health_addr: message_svc_health.local_addr().unwrap(),
             store: StoreOptions::default(),
             accounts_token: Some(accounts_token.clone()),
             directory_token: Some(directory_token.to_owned()),
             messaging_token: Some(messaging_token.to_owned()),
         },
-        grpc,
-        message_svc_health,
+        push_message_svc::Listeners {
+            messaging: grpc,
+            accounts,
+            directory,
+            health: message_svc_health,
+        },
         shutdown.clone(),
     ));
 
@@ -152,7 +160,7 @@ async fn the_smoke_test_passes_against_the_whole_stack() {
         push_worker::Config {
             database_url: format!("{worker_server}/push_worker"),
             auth_database_url: format!("{worker_server}/push_auth"),
-            message_svc_url: message_svc_url.clone(),
+            message_svc_url: accounts_url,
             accounts_token,
             sender: push_worker::Sender::Log,
             from: String::new(),

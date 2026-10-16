@@ -1,5 +1,4 @@
-use push_message_svc::{Config, init_logging, serve, terminated};
-use tokio::net::TcpListener;
+use push_message_svc::{Config, Listeners, init_logging, serve, terminated};
 use tokio_util::sync::CancellationToken;
 
 // `serve` runs the migrations itself, with `push_store::migrate_database(url)` on a
@@ -8,8 +7,7 @@ use tokio_util::sync::CancellationToken;
 async fn main() -> anyhow::Result<()> {
     init_logging();
     let config = Config::from_env()?;
-    let grpc = TcpListener::bind(config.grpc_addr).await?;
-    let health = TcpListener::bind(config.health_addr).await?;
+    let listeners = Listeners::bind(&config).await?;
     let shutdown = CancellationToken::new();
     let signal = shutdown.clone();
     tokio::spawn(async move {
@@ -17,5 +15,5 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("shutting down");
         signal.cancel();
     });
-    serve(config, grpc, health, shutdown).await
+    serve(config, listeners, shutdown).await
 }
