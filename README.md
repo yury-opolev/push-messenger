@@ -90,6 +90,19 @@ way: it forwards local ports to the ingress and to the DEV ONLY mailbox, and two
 apps (`bindings/node/examples/minikube.js`) sign up, verify, sign in, become contacts by
 invite and chat with a read receipt.
 
+To verify internal API isolation on an **existing, enforcing-CNI** cluster, run
+`.\deploy\minikube\test-network-policy.ps1 -Context <explicit-context>`.
+It accepts `-Namespace` and `-Release` (both default to `push`) and `-ProbeImage`
+(default `python:3.13-alpine`). Disposable non-root pods first prove each API is live,
+then test gateway/worker/auth, unrelated and cross-release callers against all three
+message-svc ports. Only timeouts count as denied connections; refusals and exec errors
+fail the check. It deletes only its own named probe pods, including on failure.
+The script neither provisions a CNI nor changes policies. For local acceptance, use
+a separate fresh profile started with `minikube start -p push11a --driver=docker
+--cni=calico --cpus=4 --memory=6g`, then
+`.\deploy\minikube\up.ps1 -Cluster push11a -Smoke`. Do not install the new chart on
+an existing data-bearing profile as part of this test.
+
 The minikube values switch on a DEV ONLY shortcut: the worker, which logs emails instead
 of sending them, shows them at `/dev/mailbox`, which the ingress does not route (it
 reaches the worker only at `/v1/webhooks/resend`). Clients, the smoke test included,
