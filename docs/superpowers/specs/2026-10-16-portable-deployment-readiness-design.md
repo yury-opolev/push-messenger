@@ -7,9 +7,11 @@ that this public repository must provision Azure or operate a deployment pipelin
 The existing messaging design remains authoritative for service behaviour and the
 public `/v1/...` API.
 
-Implementation status: **11A implemented / under review**, not Done until merged.
+Implementation status: **11A Done (#20)**.
 Its [operator upgrade runbook](../../deployment-upgrade.md) is the executable guide
-for existing bundled installations. 11B and 11C remain pending.
+for existing bundled installations. The
+[11B implementation plan](../plans/2026-10-16-plan-11b-portable-chart-interfaces.md)
+is written and awaiting review; implementation of 11B and 11C remains pending.
 
 ## 1. Goal and ownership
 
