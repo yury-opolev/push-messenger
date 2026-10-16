@@ -1,12 +1,21 @@
 # Checks the Helm chart without a cluster: lint with each values file, the DEV ONLY
 # switches, and the guards that keep dev mode out of real deployments.
-# Requires Helm and Python (py) with PyYAML for structural policy checks.
+# Requires Helm and Python with deploy/helm/requirements-test.txt for policy checks.
 #
 #   pwsh deploy/helm/test-chart.ps1
 $ErrorActionPreference = 'Stop'
 $chart = Join-Path $PSScriptRoot 'push-messenger'
 $minikube = Join-Path $chart 'values-minikube.yaml'
 $failures = 0
+$python = Get-Command python, python3 -CommandType Application -ErrorAction SilentlyContinue |
+    Select-Object -First 1
+if (-not $python) {
+    throw 'Chart checks require Python 3 (python or python3) and deploy/helm/requirements-test.txt.'
+}
+& $python.Source -c 'import yaml' 2>$null
+if ($LASTEXITCODE -ne 0) {
+    throw "Chart checks require PyYAML. Install it with: `"$($python.Source)`" -m pip install --requirement deploy/helm/requirements-test.txt"
+}
 
 function Check([string] $name, [scriptblock] $test) {
     if (& $test) {
@@ -30,7 +39,7 @@ function Render([string[]] $arguments) {
     return $LASTEXITCODE
 }
 
-# Parse YAML with the installed Python/PyYAML, so checks cover complete rules, not
+# Parse YAML with Python/PyYAML, so checks cover complete rules, not
 # unrelated occurrences of ports and labels. These checks do not prove CNI enforcement.
 function PolicyMatrix([string] $rendered, [string] $release, [array] $controllers = @(),
     [bool] $webhook = $false, [bool] $devMode = $false) {
@@ -90,7 +99,7 @@ for doc in docs:
     $result = @{
         rendered = $rendered; release = $release; controllers = @($controllers)
         webhook = $webhook; devMode = $devMode
-    } | ConvertTo-Json -Depth 10 -Compress | py -c $validator 2>&1
+    } | ConvertTo-Json -Depth 10 -Compress | & $python.Source -c $validator 2>&1
     $passed = $LASTEXITCODE -eq 0
     if (-not $passed) { $result | ForEach-Object { Write-Host $_ } }
     return $passed

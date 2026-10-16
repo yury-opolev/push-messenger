@@ -96,7 +96,9 @@ reaches the worker only at `/v1/webhooks/resend`). Clients, the smoke test inclu
 always identify with real access tokens. The chart refuses that mode unless the
 values also say `devMode.acknowledge: insecure-local-only` and the ingress host is local
 (`*.local`, `*.localhost` or `*.test`), and refuses it with the Resend sender.
-`pwsh deploy/helm/test-chart.ps1` checks the chart without a cluster.
+`pwsh deploy/helm/test-chart.ps1` checks the chart without a cluster. These contributor
+checks need Python 3 and `python -m pip install --requirement deploy/helm/requirements-test.txt`
+for structural YAML assertions; installing the chart itself does not need Python.
 
 auth-svc and the worker have databases and roles of their own, `push_auth` and
 `push_worker`, which PostgreSQL's init scripts create when it initialises an empty volume;
