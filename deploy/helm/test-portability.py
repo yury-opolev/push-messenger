@@ -173,6 +173,18 @@ def ingress():
         assert not any(key.startswith("nginx.ingress.") for key in annotations)
         assert all(path["path"].startswith("/v1/")
                    for rule in spec["rules"] for path in rule["http"]["paths"])
+    expected = {
+        "portable-gateway": [("/v1/socket", "Exact", "portable-gateway")],
+        "portable-auth": [(p, "Prefix", "portable-auth")
+                          for p in ("/v1/auth", "/v1/devices", "/v1/users")],
+        "portable-auth-links": [(p, "Exact", "portable-auth")
+                                for p in ("/v1/auth/verify", "/v1/auth/password/reset")],
+        "portable-worker": [("/v1/webhooks/resend", "Exact", "portable-worker")],
+    }
+    for route in routes:
+        actual = [(p["path"], p["pathType"], p["backend"]["service"]["name"])
+                  for rule in route["spec"]["rules"] for p in rule["http"]["paths"]]
+        assert actual == expected[route["metadata"]["name"]]
     values["ingress"]["enabled"] = False
     values["ingress"]["tls"]["secretName"] = ""
     docs = render(values)
@@ -188,6 +200,16 @@ def ingress():
            "ingress.annotations")
     render({"ingress": {"authLinkAnnotations": ["bad"]}},
            "ingress.authLinkAnnotations")
+    docs = render({})
+    assert all("ingressClassName" not in d["spec"]
+               for d in docs if d["kind"] == "Ingress")
+    for section, variable in (("auth", "PUSH_AUTH_CLIENT_IP_HEADER"),
+                              ("gateway", "PUSH_CLIENT_IP_HEADER")):
+        docs = render({section: {"clientIpHeader": "x-forwarded-for"}})
+        env = document(docs, "Deployment", section)["spec"]["template"]["spec"][
+            "containers"][0]["env"]
+        assert next(e["value"] for e in env if e["name"] == variable) == "x-forwarded-for"
+        render({section: {"clientIpHeader": "bad header"}}, section + ".clientIpHeader")
 
 
 def images():

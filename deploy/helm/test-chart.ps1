@@ -220,7 +220,7 @@ Check 'default: the gateway checks tokens with auth-svc''s keys, for its own URL
     $gateway = Doc $default 'Deployment' 'push-gateway'
     $gateway -match 'name: PUSH_AUTH_URL\s+value: "http://push-auth:8080"' -and
         $gateway -match 'name: PUSH_TOKEN_AUDIENCE\s+value: "wss://push.example.com/v1/socket"' -and
-        $gateway -match 'name: PUSH_CLIENT_IP_HEADER\s+value: x-real-ip' -and
+        $gateway -notmatch 'PUSH_CLIENT_IP_HEADER' -and
         $default -notmatch 'PUSH_DEV_AUTH'
 }
 Check 'default: groups are refused; one switch serves them' {
@@ -305,13 +305,14 @@ Check 'default: auth-svc and the worker drain like the gateway (preStop sleep, g
 Check 'default: without a webhook secret there is no webhook Ingress' {
     -not (Doc $default 'Ingress' 'push-worker') -and $default -notmatch 'resend-webhook-secret:'
 }
-Check 'default: the ingress routes the auth API, not /dev, and keeps link tokens out of the access log' {
+Check 'default: the ingress routes the auth API, not /dev, with Exact link routes and no controller-specific annotations' {
     $ingress = Doc $default 'Ingress' 'push-auth'
     $links = Doc $default 'Ingress' 'push-auth-links'
     $ingress -match 'path: /v1/auth\s' -and $ingress -match 'path: /v1/devices\s' -and
         $ingress -match 'path: /v1/users\s' -and $default -notmatch 'path: /dev' -and
-        $ingress -notmatch 'enable-access-log' -and $links -match 'enable-access-log: "false"' -and
-        $links -match 'path: /v1/auth/verify\s' -and $links -match 'path: /v1/auth/password/reset\s'
+        $default -notmatch 'nginx\.ingress\.kubernetes\.io/' -and
+        $links -match 'path: /v1/auth/verify\s+pathType: Exact' -and
+        $links -match 'path: /v1/auth/password/reset\s+pathType: Exact'
 }
 
 $webhook = helm template push $chart --set worker.email.webhookSecret=whsec_AAAAAAAAAAAAAAAAAAAAAAAA --set worker.email.webhook.enabled=true | Out-String
@@ -378,6 +379,12 @@ Check 'minikube: helm test waits 6 minutes, longer than the smoke run''s 300 s' 
         (Get-Content $main -Raw) -match 'TOTAL_TIMEOUT: Duration = Duration::from_secs\(300\)'
 }
 Check 'minikube: ingress timeouts are 120 s' { $dev -match 'proxy-read-timeout: "120"' -and $dev -match 'proxy-send-timeout: "120"' }
+Check 'local compatibility: link-only nginx log override and explicit trusted headers' {
+    (Doc $dev 'Ingress' 'push-auth-links') -match 'enable-access-log: "false"' -and
+    (Doc $dev 'Ingress' 'push-auth') -notmatch 'enable-access-log' -and
+    (Doc $dev 'Deployment' 'push-auth') -match 'name: PUSH_AUTH_CLIENT_IP_HEADER\s+value: "x-real-ip"' -and
+    (Doc $dev 'Deployment' 'push-gateway') -match 'name: PUSH_CLIENT_IP_HEADER\s+value: "x-real-ip"'
+}
 
 Check 'dev mode without the acknowledgement is refused' {
     (Render @('--set', 'devMode.enabled=true', '--set', 'ingress.host=push.local')) -ne 0

@@ -171,3 +171,57 @@ securityContext:
   seccompProfile:
     type: RuntimeDefault
 {{- end -}}
+
+{{/*
+Checks the public routing settings, also with ingress.enabled false (the public identity
+still names email links and the token audience): HTTPS chart Ingress needs a TLS Secret,
+annotation maps are string-valued, trusted client-IP headers are header names.
+*/}}
+{{- define "push.checkIngress" -}}
+{{- $ingress := .Values.ingress -}}
+{{- if not (kindIs "bool" $ingress.enabled) -}}
+{{- fail "ingress.enabled must be a boolean" -}}
+{{- end -}}
+{{- if not (and (kindIs "string" $ingress.host) $ingress.host) -}}
+{{- fail "ingress.host must be a nonempty public hostname" -}}
+{{- end -}}
+{{- if not (kindIs "string" $ingress.className) -}}
+{{- fail "ingress.className must be a string" -}}
+{{- end -}}
+{{- if not (kindIs "string" $ingress.tls.secretName) -}}
+{{- fail "ingress.tls.secretName must be a string" -}}
+{{- end -}}
+{{- $_ := include "push.publicUrl" . -}}
+{{- if and $ingress.enabled (eq $ingress.scheme "https") (not $ingress.tls.secretName) -}}
+{{- fail "ingress.tls.secretName is required for HTTPS chart Ingress" -}}
+{{- end -}}
+{{- range $name := list "annotations" "gatewayAnnotations" "authAnnotations" "authLinkAnnotations" "webhookAnnotations" -}}
+{{- $map := index $ingress $name -}}
+{{- if not (kindIs "map" $map) -}}
+{{- fail (printf "ingress.%s must be a string-valued annotation map" $name) -}}
+{{- end -}}
+{{- range $key, $value := $map -}}
+{{- if not (kindIs "string" $value) -}}
+{{- fail (printf "ingress.%s must be a string-valued annotation map" $name) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- range $name := list "auth" "gateway" -}}
+{{- $header := index $.Values $name "clientIpHeader" -}}
+{{- if not (kindIs "string" $header) -}}
+{{- fail (printf "%s.clientIpHeader must be a string" $name) -}}
+{{- end -}}
+{{- if and $header (not (regexMatch "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$" $header)) -}}
+{{- fail (printf "%s.clientIpHeader must be an HTTP header name" $name) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/* The common annotations merged with a route's own; the route's keys win. */}}
+{{- define "push.ingressAnnotations" -}}
+{{- $annotations := mergeOverwrite (deepCopy .root.Values.ingress.annotations) .specific -}}
+{{- with $annotations }}
+annotations:
+  {{- toYaml . | nindent 2 }}
+{{- end -}}
+{{- end -}}

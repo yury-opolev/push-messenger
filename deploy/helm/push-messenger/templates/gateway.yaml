@@ -71,10 +71,12 @@ spec:
               value: {{ printf "http://%s:8080" (include "push.name" (dict "root" . "component" "auth")) | quote }}
             - name: PUSH_TOKEN_AUDIENCE
               value: {{ include "push.socketUrl" . | quote }}
-            # ingress-nginx overwrites X-Real-IP with the client's address: the per-IP
-            # limits on redeeming invites and contact requests count by it.
+            {{- with .Values.gateway.clientIpHeader }}
+            # Written by the trusted controller in front: the per-IP limits on redeeming
+            # invites and contact requests count by it; see values.yaml.
             - name: PUSH_CLIENT_IP_HEADER
-              value: x-real-ip
+              value: {{ . | quote }}
+            {{- end }}
             - name: PUSH_GROUPS
               value: {{ ternary "1" "0" (eq (toString .Values.gateway.groups) "true") | quote }}
           ports:

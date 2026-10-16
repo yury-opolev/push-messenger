@@ -1,110 +1,52 @@
+{{- /*
+The public routes (spec §2), as standard Kubernetes Ingress resources for the consumer's
+controller: class, TLS Secret and annotations come from values; nothing here is specific
+to one controller. All public paths are under /v1. The email link pages carry a one-time
+token in the query string (?token=), so they are a separate Ingress with Exact paths
+(winning over the Prefix paths of the auth Ingress): its own annotations can keep the
+token out of the controller's logs. The worker's only public path is the Resend webhook,
+one Exact path, so its DEV ONLY /dev/mailbox is never routed.
+*/ -}}
 {{- if .Values.ingress.enabled -}}
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: {{ include "push.name" (dict "root" . "component" "gateway") }}
-  labels:
-    {{- include "push.labels" (dict "root" . "component" "gateway") | nindent 4 }}
-  annotations:
-    # ingress-nginx passes the WebSocket upgrade through by itself; what it needs is
-    # longer timeouts than its 60 s default, so idle sockets between client pings
-    # survive (spec §7.5).
-    nginx.ingress.kubernetes.io/proxy-read-timeout: {{ .Values.ingress.timeoutSeconds | quote }}
-    nginx.ingress.kubernetes.io/proxy-send-timeout: {{ .Values.ingress.timeoutSeconds | quote }}
-    nginx.ingress.kubernetes.io/proxy-http-version: "1.1"
-spec:
-  ingressClassName: {{ .Values.ingress.className }}
-  rules:
-    - host: {{ .Values.ingress.host }}
-      http:
-        paths:
-          - path: /v1/socket
-            pathType: Exact
-            backend:
-              service:
-                name: {{ include "push.name" (dict "root" . "component" "gateway") }}
-                port:
-                  name: http
+{{- $routes := list
+  (dict "name" "gateway" "component" "gateway" "paths" (list "/v1/socket") "type" "Exact" "annotations" .Values.ingress.gatewayAnnotations)
+  (dict "name" "auth" "component" "auth" "paths" (list "/v1/auth" "/v1/devices" "/v1/users") "type" "Prefix" "annotations" .Values.ingress.authAnnotations)
+  (dict "name" "auth-links" "component" "auth" "paths" (list "/v1/auth/verify" "/v1/auth/password/reset") "type" "Exact" "annotations" .Values.ingress.authLinkAnnotations)
+-}}
+{{- if include "push.hasWebhook" . -}}
+{{- $routes = append $routes (dict "name" "worker" "component" "worker" "paths" (list "/v1/webhooks/resend") "type" "Exact" "annotations" .Values.ingress.webhookAnnotations) -}}
+{{- end -}}
+{{- range $route := $routes }}
 ---
-# auth-svc's public API (spec §2): /v1/auth, /v1/devices and /v1/users.
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
-  name: {{ include "push.name" (dict "root" . "component" "auth") }}
+  name: {{ include "push.name" (dict "root" $ "component" $route.name) }}
   labels:
-    {{- include "push.labels" (dict "root" . "component" "auth") | nindent 4 }}
-  annotations:
-    # Requests are small JSON bodies.
-    nginx.ingress.kubernetes.io/proxy-body-size: 16k
+    {{- include "push.labels" (dict "root" $ "component" $route.component) | nindent 4 }}
+  {{- include "push.ingressAnnotations" (dict "root" $ "specific" $route.annotations) | nindent 2 }}
 spec:
-  ingressClassName: {{ .Values.ingress.className }}
+  {{- with $.Values.ingress.className }}
+  ingressClassName: {{ . | quote }}
+  {{- end }}
+  {{- if eq $.Values.ingress.scheme "https" }}
+  tls:
+    - hosts:
+        - {{ $.Values.ingress.host | quote }}
+      secretName: {{ $.Values.ingress.tls.secretName | quote }}
+  {{- end }}
   rules:
-    - host: {{ .Values.ingress.host }}
+    - host: {{ $.Values.ingress.host | quote }}
       http:
         paths:
-          {{- range list "/v1/auth" "/v1/devices" "/v1/users" }}
+          {{- range $route.paths }}
           - path: {{ . }}
-            pathType: Prefix
+            pathType: {{ $route.type }}
             backend:
               service:
-                name: {{ include "push.name" (dict "root" $ "component" "auth") }}
+                name: {{ include "push.name" (dict "root" $ "component" $route.component) }}
                 port:
                   name: http
           {{- end }}
----
-# The email link pages carry a one-time token in the query string (?token=). They get an
-# Ingress of their own with the access log off, so the token never reaches ingress-nginx's
-# logs; the Exact paths win over the Prefix paths of the Ingress above. A separate
-# Ingress rather than a configuration-snippet, which ingress-nginx refuses by default.
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: {{ include "push.name" (dict "root" . "component" "auth-links") }}
-  labels:
-    {{- include "push.labels" (dict "root" . "component" "auth") | nindent 4 }}
-  annotations:
-    nginx.ingress.kubernetes.io/enable-access-log: "false"
-    nginx.ingress.kubernetes.io/proxy-body-size: 16k
-spec:
-  ingressClassName: {{ .Values.ingress.className }}
-  rules:
-    - host: {{ .Values.ingress.host }}
-      http:
-        paths:
-          {{- range list "/v1/auth/verify" "/v1/auth/password/reset" }}
-          - path: {{ . }}
-            pathType: Exact
-            backend:
-              service:
-                name: {{ include "push.name" (dict "root" $ "component" "auth") }}
-                port:
-                  name: http
-          {{- end }}
-{{- if include "push.hasWebhook" . }}
----
-# Resend's delivery webhooks (spec §9), the worker's only public path: one Exact path, so
-# its DEV ONLY /dev/mailbox is never routed. The worker checks each request's Svix
-# signature and refuses timestamps more than 5 minutes off.
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: {{ include "push.name" (dict "root" . "component" "worker") }}
-  labels:
-    {{- include "push.labels" (dict "root" . "component" "worker") | nindent 4 }}
-  annotations:
-    nginx.ingress.kubernetes.io/proxy-body-size: 256k
-spec:
-  ingressClassName: {{ .Values.ingress.className }}
-  rules:
-    - host: {{ .Values.ingress.host }}
-      http:
-        paths:
-          - path: /v1/webhooks/resend
-            pathType: Exact
-            backend:
-              service:
-                name: {{ include "push.name" (dict "root" . "component" "worker") }}
-                port:
-                  name: http
 {{- end }}
 {{- end }}
