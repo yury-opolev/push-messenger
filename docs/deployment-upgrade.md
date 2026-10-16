@@ -37,6 +37,10 @@ Required before proceeding:
   application maintenance: no external writers, ad-hoc SQL clients, jobs or autoscalers
   that reconnect/restart these four deployments. Suspend only this application's
   public routing **before scaling**; record how to restore it. Keep PostgreSQL running.
+  The consumer's maintenance gate must survive Helm reconciliation. A one-time patch
+  to chart-managed Ingress backends is not sufficient: Helm can recreate the original
+  routes. Keep consumer-managed routes gated independently; phase 6 also disables
+  chart-managed Ingresses until validation finishes.
 - A NetworkPolicy-enforcing CNI. The new chart enables six ingress policies. Configure
   `networkPolicy.ingressControllerPeers` with the actual controller's **namespace and
   pod label maps in the same peer**; the default empty list denies public traffic.
@@ -77,7 +81,8 @@ NativeOK 'target PVC inventory'
 helm history $Release --kube-context $Context -n $Namespace -o json |
     Set-Content -Encoding utf8 (Join-Path $Backup 'helm-history.json')
 NativeOK 'record chart revisions'
-# Also retain the exact old chart package, immutable images and private consumer values.
+# Also retain the exact old chart package, immutable images and private consumer values,
+# including the intended ingress.enabled setting for restoring routing after validation.
 # Do not print inline values or use `helm get all` in logs.
 kubectl --context $Context -n $Namespace get secret $SecretName -o json |
     Set-Content -Encoding utf8 (Join-Path $Backup 'old-secret.json')
@@ -438,16 +443,30 @@ Compare-Snapshots 'after'
 Keep external routing suspended. Deploy the new chart and matching images using the
 consumer's pinned packages/private values and deployment process. **Initially set
 all four application replicas to zero** so Helm cannot restart writers before the
-snapshot comparisons and credential checks. For example (replace paths with prepared
-consumer artifacts; no secrets on the command line):
+snapshot comparisons and credential checks. Also set **`ingress.enabled=false`**
+throughout validation, including after restoring application replicas. This removes
+the chart-managed routes instead of relying on a backend patch Helm can overwrite.
+Consumer-managed Ingress/Gateway routes need their own persistent maintenance gate.
+For example (replace paths with prepared consumer artifacts; no secrets on the
+command line):
 
 ```powershell
 helm upgrade $Release .\deploy\helm\push-messenger --kube-context $Context -n $Namespace `
     -f $ConsumerPrivateValues --set auth.replicas=0 --set gateway.replicas=0 `
-    --set messageSvc.replicas=0 --set worker.replicas=0 --wait --timeout 10m
+    --set messageSvc.replicas=0 --set worker.replicas=0 --set ingress.enabled=false `
+    --wait --timeout 10m
 NativeOK 'deploy coordinated chart and images while stopped'
 # Check your pinned image references, three Service ports/endpoints and six policies.
 # Ensure Snapshot 'after' / Compare-Snapshots 'after' have passed before starting writers.
+function Assert-ChartRoutesClosed {
+    $routes = kubectl --context $Context -n $Namespace get ingress `
+        -l "app.kubernetes.io/instance=$Release" -o json
+    NativeOK 'verify chart-managed routes remain closed'
+    if (@(($routes | ConvertFrom-Json).items).Count -ne 0) {
+        throw 'Release Ingress routes were recreated; KEEP MAINTENANCE and do not resume traffic'
+    }
+}
+Assert-ChartRoutesClosed
 $Replicas = Get-Content (Join-Path $Backup 'replicas.json') -Raw | ConvertFrom-Json -AsHashtable
 foreach ($name in $Names) {
     kubectl --context $Context -n $Namespace scale deployment $name --replicas=$($Replicas[$name])
@@ -457,20 +476,26 @@ foreach ($name in $Names) {
     kubectl --context $Context -n $Namespace rollout status deployment/$name --timeout=300s
     NativeOK "ready $name"
 }
+Assert-ChartRoutesClosed
 .\deploy\minikube\test-network-policy.ps1 -Context $Context -Namespace $Namespace -Release $Release
 NativeOK 'live allowed/denied internal API matrix'
 ```
 
 Readiness plus data verification is required **before restoring public routing**.
-Use the consumer's normal credentials/client (no signing-key access or DEV ONLY
+Use an operator-only validation path that does not admit general public traffic,
+with the consumer's normal credentials/client (no signing-key access or DEV ONLY
 mailbox): sign in an existing test account, verify its original devices, contacts
 and history, send a new uniquely marked message and read it from the peer, and check
 worker/outbox progress and normal email delivery. Record outcomes privately. Pending
 outbox/queue work may legitimately settle after restarting; do not compare complete
 pre/post hashes after writers resume. Verify original rows/history separately.
 Restore public routing and the recorded reconciliation/autoscaling settings only
-when readiness, history, new-message and policy checks all pass. Persist the
-original replica counts in your consumer values/reconciliation source too.
+when readiness, history, new-message and policy checks all pass. At that point,
+remove the temporary `ingress.enabled=false` override through the consumer's
+deployment process, restoring its explicit intended routing setting and retaining
+the same verified images and recorded replica counts. Do not reuse the zero-replica
+command above to reopen traffic. Persist the original replica counts and intended
+routing in your consumer values/reconciliation source too.
 
 For **local test installations only**, `up.ps1 -Cluster <owned-profile> -Smoke`
 (or `up.sh --cluster <owned-profile> --smoke`) builds the coordinated new images/chart,

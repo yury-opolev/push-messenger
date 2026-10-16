@@ -21,6 +21,13 @@ Ingress/TLS, image digests and external configuration are 11B. Load tools are
 provisioning or consumer cluster metadata is added. Existing contributor CI is
 not removed.
 
+Execution/review corrections: the installed and bundled kubectl versions treat
+`--patch-file=-` as a literal filename, so that draft command below is superseded
+by the tested private transport in `docs\deployment-upgrade.md`. The final runbook
+also keeps chart-managed Ingress disabled through validation and requires
+consumer-managed maintenance gates to survive Helm reconciliation. Use the runbook,
+not the original draft snippets, for operator execution.
+
 Base: `018cdca` contains the specification; the implementation base must also
 include this reviewed plan. Current application base is `bf93bbd` (PR #19).
 Do not start implementation until the owner approves the plan. Integrate the
