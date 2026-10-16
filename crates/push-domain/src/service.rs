@@ -129,7 +129,7 @@ where
     /// auth-svc reset `user`'s password at `reset_at` (`user.password_reset`, relayed by
     /// the worker): every active device of the user is kicked, to sign in again with the
     /// new password, and [`Self::identify`] refuses access tokens issued no later than that
-    /// second, so a token that outlives the reset (up to 15 minutes) or a lost kick cannot
+    /// second, so a token that outlives the reset (up to 30 minutes) or a lost kick cannot
     /// keep a device signed in. `reset_at` is auth-svc's time, the clock of the tokens'
     /// `iat`; an event from before auth-svc sent it (`None`) takes message-svc's clock.
     ///

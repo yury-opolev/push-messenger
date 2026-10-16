@@ -377,7 +377,12 @@ async fn an_invalid_token_is_closed_with_4001_and_an_expired_one_with_4002() {
         let mut socket = connect(&stack).await;
         send(
             &mut socket,
-            identify_issued(&stack, user, device, now() - 900 - expired),
+            identify_issued(
+                &stack,
+                user,
+                device,
+                now() - push_auth::tokens::ACCESS_TOKEN_TTL.as_secs() as i64 - expired,
+            ),
         )
         .await;
         let first = tokio::time::timeout(Duration::from_secs(10), socket.next())
@@ -463,7 +468,7 @@ async fn an_expiring_token_is_announced_and_renewed_by_reauth() {
     let (other, other_device) = person(&stack).await;
     // Expired 22 s ago, within the leeway: 8 s left to send ReAuth (the lapsed socket's
     // close then comes inside close_code's 10 s wait).
-    let issued_at = now() - 900 - 22;
+    let issued_at = now() - push_auth::tokens::ACCESS_TOKEN_TTL.as_secs() as i64 - 22;
     let mut renewed = connect(&stack).await;
     let mut lapsed = connect(&stack).await;
     for (socket, user, device) in [

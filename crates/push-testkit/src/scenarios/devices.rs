@@ -214,7 +214,7 @@ async fn a_password_reset_kicks_every_active_device_of_the_user<B: Backend>(back
     assert_eq!(world.notifier.take(), []);
 }
 
-/// A token that outlives the reset (up to 15 minutes), on a device whose kick was lost,
+/// A token that outlives the reset (up to 30 minutes), on a device whose kick was lost,
 /// cannot sign in again. The reset's time is auth-svc's: a token issued after it passes
 /// even when the worker relays the reset later.
 async fn identify_refuses_tokens_issued_until_the_password_reset<B: Backend>(backend: &B) {
