@@ -69,9 +69,10 @@ worker's role call (auth-svc: expired refresh tokens, accounts left unverified),
 rules stay with the data and the worker never reads it. Only the worker may call
 message-svc's `Accounts` API, which records the users and devices auth-svc announces:
 each call carries a shared internal token from the cluster's Secret, which the gateway
-does not get, so a compromised gateway cannot register devices (a NetworkPolicy adds a
-second fence in Plan 11A). Likewise only auth-svc may call `Directory`, and only
-the gateway may call `Messaging`, which acts for whatever user and device it is given:
+does not get, so a compromised gateway cannot register devices. Plan 11A adds separate
+listeners (Messaging 50051, Accounts 50052, Directory 50053) and same-release caller
+NetworkPolicies as a second fence, requiring an enforcing CNI. Likewise only auth-svc
+may call `Directory`, and only the gateway may call `Messaging`, which acts for whatever user and device it is given:
 each internal API takes a token of its own (Plans 7A, 8B).
 
 **Public endpoints:** `wss://api.<domain>/v1/socket` (gateway) and
@@ -1416,8 +1417,9 @@ Implementation notes (local minikube, Plan 4B):
 - auth-svc (Plan 5B) is a third Deployment with its own database `push_auth` and role
   `push_auth`, created by a PostgreSQL init script (a ConfigMap without credentials; the
   password comes from the Secret). `REVOKE ALL … FROM PUBLIC` on both databases keeps
-  auth-svc's plain role out of `push_messaging`; message-svc still connects as the
-  superuser `push`, which can reach every database, until Plan 11A. The Secret also holds
+  auth-svc's plain role out of `push_messaging`. Since Plan 11A, message-svc connects as
+  plain database owner `push_messaging`, not bootstrap superuser `push`; a separate
+  kept `messaging-db-password` key supplies its URL. The Secret also holds
   the generated Ed25519 seed and HMAC key (`randBytes 32`). A second Ingress routes
   `/v1/auth`, `/v1/devices` and `/v1/users` to it; the public URL and the token audience
   come from `ingress.scheme` and `ingress.host` (plain `http` only for a local host).
@@ -1476,9 +1478,18 @@ Implementation notes (local minikube, Plan 4B):
 - The chart Secret carries `helm.sh/resource-policy: keep`, so `helm uninstall` keeps the
   Secret and the PVC and the passwords keep matching the database. `down` wipes the
   Secret, PVC, PVs and the hostpath directory.
-- `deploy/minikube/up.ps1` (and `up.sh`) wait for ingress-nginx, stop at once with
-  "run down.ps1 first" when an existing PostgreSQL volume lacks the `push_auth` or
-  `push_worker` database (or the kept Secret their passwords), retry
+- Plan 11A enables six application ingress policies. Internal caller selectors require
+  same-namespace, same-release and network-peer labels. Public traffic requires explicit
+  controller namespace/pod selectors (empty defaults deny); an enforcing CNI and live
+  allowed/denied checks are mandatory. Opting out requires equivalent consumer policies.
+  The [upgrade runbook](../../deployment-upgrade.md) covers encrypted backups, isolated
+  restore proof, stopped writers, ownership/password/Secret transition, canonical row
+  comparisons, coordinated chart/images and rollback checkpoints. Helm rollback alone
+  does not reverse database ownership or migrations.
+- `deploy/minikube/up.ps1` (and `up.sh`) wait for ingress-nginx, refuse unsafe upgrades
+  when an existing PostgreSQL volume lacks the `push_auth` or `push_worker` database,
+  a kept service password, or a plain `push_messaging` database owner. They link the
+  data-preserving runbook, never suggest deleting data or migrate existing volumes, retry
   `helm upgrade --install` up to 5 times, and bring it up on minikube; with `--smoke` they
   then wait until the old worker pod is gone (exactly one worker pod remains, so the DEV
   ONLY mailbox is the new worker's), and `helm test` runs

@@ -88,7 +88,7 @@ pub struct Accounts {
 }
 
 impl Accounts {
-    /// A client for message-svc at `url` (`http://host:50051`) that presents `token`, the
+    /// A client for message-svc's Accounts API at `url` (`http://host:50052`) that presents `token`, the
     /// shared internal token message-svc requires for this API. It connects on first use
     /// and reconnects by itself.
     pub fn new(url: &str, token: &str) -> Result<Self, String> {

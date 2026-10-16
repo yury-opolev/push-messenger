@@ -112,6 +112,9 @@ values also say `devMode.acknowledge: insecure-local-only` and the ingress host 
 `pwsh deploy/helm/test-chart.ps1` checks the chart without a cluster. These contributor
 checks need Python 3 and `python -m pip install --requirement deploy/helm/requirements-test.txt`
 for structural YAML assertions; installing the chart itself does not need Python.
+`pwsh deploy/minikube/test-upgrade-preflight.ps1` and
+`bash deploy/minikube/test-upgrade-preflight.sh` exercise the bring-up refusal paths
+with command mocks; they neither deploy nor replace the real upgrade rehearsal.
 
 auth-svc and the worker have databases and roles of their own, `push_auth` and
 `push_worker`, which PostgreSQL's init scripts create when it initialises an empty volume;
@@ -121,8 +124,26 @@ message-svc and auth-svc a Directory token, and message-svc and the gateway a Me
 token; each internal API takes only its own. A
 cluster whose Postgres volume predates them (Plans 4B and 5B) lacks a database. `up` stops
 when the kept Secret `push-secrets` (it survives a plain `helm uninstall`) has no
-`auth-db-password` or `worker-db-password`, or when the running Postgres lacks `push_auth`
-or `push_worker`: run `deploy/minikube/down.ps1` once, then `up` again.
+`auth-db-password`, `worker-db-password` or `messaging-db-password`, when the running
+Postgres lacks `push_auth` or `push_worker`, or when `push_messaging` is not owned by
+its plain login role. It does not repair old volumes or generate a missing key.
+message-svc now uses the dedicated non-superuser `push_messaging` role, not bootstrap
+administrator `push`. For existing data, use the
+[maintenance-window upgrade runbook](docs/deployment-upgrade.md): encrypted backup,
+isolated restore rehearsal, stopped writers, exact ownership SQL, password/Secret
+transition, row-hash comparisons and coordinated chart/images. **Do not run `down`
+to repair an upgrade**; it deletes data.
+
+The chart enables six application ingress NetworkPolicies by default and requires
+a CNI that actually enforces them. Messaging (`50051`) accepts the same-release
+gateway, Accounts (`50052`) the worker, and Directory (`50053`) auth-svc, using
+`app.kubernetes.io/instance` plus `push-messenger/network-peer` caller labels in the
+same namespace. API tokens remain required. Configure
+`networkPolicy.ingressControllerPeers` with explicit nonempty namespace and pod label
+maps for the actual controller (ANDed within each peer); the default empty list
+denies public traffic. Only set `networkPolicy.enabled: false` when equivalent
+consumer-managed policies enforce these boundaries. Restrict label assignment and
+verify enforcement with the live checker above.
 
 The smoke client checks the access token's audience (`socket_url` with its authority
 replaced by the Host override: `ws://push.local/v1/socket` on minikube) and the refreshed
@@ -141,7 +162,9 @@ at start-up.
 |----------|---------|---------|
 | `PUSH_DATABASE_URL` | Postgres URL of the `push_messaging` database, as its owner | required |
 | `PUSH_REDIS_URL` | Redis URL, `redis://:password@host:6379` | required |
-| `PUSH_GRPC_ADDR` | address of the gRPC API | `0.0.0.0:50051` |
+| `PUSH_GRPC_ADDR` | address of the gateway-only Messaging API | `0.0.0.0:50051` |
+| `PUSH_ACCOUNTS_GRPC_ADDR` | address of the worker-only Accounts API | `0.0.0.0:50052` |
+| `PUSH_DIRECTORY_GRPC_ADDR` | address of the auth-only Directory API | `0.0.0.0:50053` |
 | `PUSH_HEALTH_ADDR` | address of `/healthz` and `/readyz` | `0.0.0.0:8081` |
 | `PUSH_DB_MAX_CONNECTIONS` | pool size, at least 1 | `10` |
 | `PUSH_ACCOUNTS_TOKEN` | the worker's token for the `Accounts` API, 32 to 256 visible ASCII characters; without it `Accounts` refuses every call | none |
@@ -152,7 +175,7 @@ at start-up.
 
 | Variable | Meaning | Default |
 |----------|---------|---------|
-| `PUSH_MESSAGE_SVC_URL` | gRPC URL of message-svc | required |
+| `PUSH_MESSAGE_SVC_URL` | Messaging gRPC URL of message-svc, `http://host:50051` | required |
 | `PUSH_MESSAGING_TOKEN` | message-svc's token for its `Messaging` API, the same value as message-svc's | required |
 | `PUSH_REDIS_URL` | Redis URL, `redis://:password@host:6379` | required |
 | `PUSH_LISTEN_ADDR` | address of the WebSocket endpoint `/v1/socket` | `0.0.0.0:8080` |
@@ -180,7 +203,7 @@ at start-up.
 | `PUSH_HEALTH_ADDR` | address of `/healthz` and `/readyz` | `0.0.0.0:8081` |
 | `PUSH_DB_MAX_CONNECTIONS` | pool size, at least 1 | `10` |
 | `PUSH_AUTH_WORKER_ROLE` | the worker's role: granted `auth.outbox` and the two cleanup functions at start-up | none |
-| `PUSH_MESSAGE_SVC_URL` | gRPC URL of message-svc, `http://host:50051` (plain `http://` only), asked whose profiles a caller may see; without it `GET /v1/users` answers 503 | none |
+| `PUSH_MESSAGE_SVC_URL` | Directory gRPC URL of message-svc, `http://host:50053` (plain `http://` only), asked whose profiles a caller may see; without it `GET /v1/users` answers 503 | none |
 | `PUSH_DIRECTORY_TOKEN` | message-svc's token for its `Directory` API, the same value as message-svc's, 32 to 256 visible ASCII characters; required with `PUSH_MESSAGE_SVC_URL` | none |
 
 `push-worker`:
@@ -189,7 +212,7 @@ at start-up.
 |----------|---------|---------|
 | `PUSH_DATABASE_URL` | Postgres URL of the `push_worker` database, as its owner | required |
 | `PUSH_AUTH_DATABASE_URL` | Postgres URL of auth-svc's `push_auth` database, as the worker's role | required |
-| `PUSH_MESSAGE_SVC_URL` | gRPC URL of message-svc, `http://host:50051` (plain `http://` only: the worker is built without TLS) | required |
+| `PUSH_MESSAGE_SVC_URL` | Accounts gRPC URL of message-svc, `http://host:50052` (plain `http://` only: the worker is built without TLS) | required |
 | `PUSH_ACCOUNTS_TOKEN` | message-svc's token for its `Accounts` API, the same value as message-svc's | required |
 | `PUSH_EMAIL_SENDER` | `log` (logs instead of sending) or `resend` | `log` |
 | `PUSH_EMAIL_FROM` | the From of every email, `Push Messenger <no-reply@push.kubegames.dk>` | required for `resend` |

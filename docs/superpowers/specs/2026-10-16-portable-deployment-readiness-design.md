@@ -7,6 +7,10 @@ that this public repository must provision Azure or operate a deployment pipelin
 The existing messaging design remains authoritative for service behaviour and the
 public `/v1/...` API.
 
+Implementation status: **11A implemented / under review**, not Done until merged.
+Its [operator upgrade runbook](../../deployment-upgrade.md) is the executable guide
+for existing bundled installations. 11B and 11C remain pending.
+
 ## 1. Goal and ownership
 
 Consumers can include push-messenger as a Git submodule and build their own
