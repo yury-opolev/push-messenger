@@ -9,8 +9,8 @@ public `/v1/...` API.
 
 Implementation status: **11A Done (#20)**.
 Its [operator upgrade runbook](../../deployment-upgrade.md) is the executable guide
-for existing bundled installations. **11B implemented / under review**, not Done
-until merged: [plan](../plans/2026-10-16-plan-11b-portable-chart-interfaces.md),
+for existing bundled installations. **11B Done (#21)**:
+[plan](../plans/2026-10-16-plan-11b-portable-chart-interfaces.md),
 [consumer configuration](../../deployment-configuration.md) and
 [maintained-controller verification](../../deployment-ingress-verification.md).
 11C remains pending.
