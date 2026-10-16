@@ -15,6 +15,14 @@ before the window. Old ports/new images and new ports/old images are unsupported
 Registry publication, consumer CI, external-Secret selection and TLS configuration are
 not added by this procedure.
 
+**Scope note (Plan 11B charts):** these tested steps describe the transition of the
+chart-managed Secret layout. A chart that includes Plan 11B additionally needs explicit
+values before the coordinated deployment in phase 6: `worker.email.webhook.enabled: true`
+if the installation serves Resend webhooks (a retained key no longer implies the route),
+and, with HTTPS chart Ingress, `ingress.tls.secretName`, a controller class/annotations
+and trusted client-IP headers. Moving to a consumer-managed Secret is a separate step in
+[deployment-configuration.md](deployment-configuration.md).
+
 ## 0. Preconditions and explicit target
 
 The examples use **PowerShell 7 on Windows**, kubectl, Helm, Docker and a checked-out

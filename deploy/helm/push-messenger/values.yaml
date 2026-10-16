@@ -210,6 +210,7 @@ ingress:
   webhookAnnotations: {}
 
 smoke:
+  # DEV ONLY (`helm test` in dev mode). Defaults name minikube's local ingress-nginx addon.
   # auth-svc's public API as the smoke test reaches it: the ingress controller, with
   # `ingress.host` as the Host header.
   authUrl: http://ingress-nginx-controller.ingress-nginx.svc.cluster.local

@@ -55,7 +55,9 @@ same error codes as Rust: [docs/sdk-bindings.md](docs/sdk-bindings.md) is the gu
 ## Run it on minikube
 
 The whole system runs on a local [minikube](https://minikube.sigs.k8s.io/) cluster with
-the same Helm chart that will deploy to Azure. With Docker, minikube, kubectl and Helm
+the same Helm chart consumers deploy with. Locally it uses minikube's ingress addon, the
+retired ingress-nginx, as a compatibility path only (`values-minikube.yaml`), not as a
+production recommendation. With Docker, minikube, kubectl and Helm
 installed:
 
     deploy/minikube/up.ps1 -Smoke
@@ -150,6 +152,17 @@ replaced by the Host override: `ws://push.local/v1/socket` on minikube) and the 
 token's `sub` and `device_id`. It never prints response bodies, tokens or token-bearing
 URLs, retries only on 502, 503, 504 and transport errors, and ignores `HTTP_PROXY`. The
 per-IP signup limit (20/h) caps smoke runs to about 10 per hour on a long-lived cluster.
+
+## Deploying it
+
+This repository is a reusable core: consumers bring their own infrastructure,
+controllers, certificates, Secret delivery, registries and CI/CD, and configure the
+chart with values. [docs/deployment-configuration.md](docs/deployment-configuration.md)
+is the contract: a consumer-managed Secret (`secrets.existingSecret`) and its key names,
+offline rendering, the explicit Resend webhook switch, controller-neutral Ingress with
+TLS and annotation maps, trusted client-IP headers, and image digests.
+[docs/deployment-ingress-verification.md](docs/deployment-ingress-verification.md)
+records the routing checks against a maintained controller (Traefik).
 
 ## Configuration
 

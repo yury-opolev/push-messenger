@@ -1,15 +1,27 @@
 push-messenger {{ .Chart.AppVersion }} is installed as release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
 
-WebSocket endpoint: {{ include "push.socketUrl" . }} (through the ingress controller).
-Auth API: {{ include "push.publicUrl" . }}/v1/auth, /v1/devices and /v1/users; JWKS at /v1/auth/jwks.
-Email: the worker's {{ .Values.worker.email.sender }} sender{{ if include "push.hasWebhook" . }}; Resend webhooks at {{ include "push.publicUrl" . }}/v1/webhooks/resend{{ end }}.
+Public identity: {{ include "push.publicUrl" . }} (email links) and {{ include "push.socketUrl" . }} (token audience).
+{{- if .Values.ingress.enabled }}
+Routes (chart Ingress): /v1/socket; /v1/auth, /v1/devices and /v1/users (JWKS at /v1/auth/jwks){{ if include "push.hasWebhook" . }}; Resend webhooks at /v1/webhooks/resend{{ end }}.
+{{- else }}
+Chart Ingress is disabled: the consumer must supply routes for these public paths; the
+URLs above are configured identities, not proof that the endpoints are reachable.
+{{- end }}
+Email: the worker's {{ .Values.worker.email.sender }} sender.
+{{- if .Values.secrets.existingSecret }}
 
-`helm uninstall` keeps the PostgreSQL volume (data-{{ .Release.Name }}-postgres-0) and the
-Secret ({{ include "push.secretName" . }}, helm.sh/resource-policy: keep), so a later install
-reuses the password the database was initialised with.
-To wipe everything on minikube, use deploy/minikube/down.ps1 (or down.sh): it also removes
-the released volumes and the provisioner's data directory, which deleting the namespace
-alone can leave behind.
+Credentials reference consumer-managed Secret "{{ include "push.secretName" . }}".
+The chart does not create, adopt, update or delete it. Provision it before startup.
+{{- else }}
+
+The chart-managed Secret "{{ include "push.secretName" . }}" and PostgreSQL volume
+(data-{{ .Release.Name }}-postgres-0) are retained on uninstall; keep credentials
+consistent with the retained database.
+{{- end }}
+{{- if and .Values.ingress.enabled (eq .Values.ingress.scheme "https") }}
+Public Ingress requires existing TLS Secret "{{ .Values.ingress.tls.secretName }}".
+The consumer supplies the controller, certificate and enforcing network policies.
+{{- end }}
 {{- if include "push.devMode" . }}
 
 DEV MODE IS ON: the worker shows the emails its log sender delivered at /dev/mailbox (not
@@ -17,4 +29,8 @@ routed by the ingress). This is for a local cluster only.
 
 Run the end-to-end smoke test:
   helm test {{ .Release.Name }} --namespace {{ .Release.Namespace }} --logs
+
+To wipe a LOCAL minikube installation, deploy/minikube/down.ps1 (or down.sh) also removes
+the volumes and the provisioner's data directory. This DELETES ALL DATA: never use it to
+repair or upgrade an installation with data worth keeping (docs/deployment-upgrade.md).
 {{- end }}
