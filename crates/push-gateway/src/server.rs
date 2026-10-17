@@ -270,7 +270,7 @@ fn client_ip(
 /// One client connection, from `Identify` to close.
 async fn connection(mut socket: WebSocket, app: App, ip: IpAddr) {
     let mut session = Session::new(app.config.groups);
-    let Some((claims, mut membership)) = identify(&mut socket, &mut session, &app).await else {
+    let Some((claims, mut membership)) = identify(&mut socket, &mut session, &app, ip).await else {
         return;
     };
     membership.join_user(claims.user).await;
@@ -414,6 +414,7 @@ async fn identify(
     socket: &mut WebSocket,
     session: &mut Session,
     app: &App,
+    ip: IpAddr,
 ) -> Option<(Claims, Membership)> {
     let deadline = tokio::time::sleep(IDENTIFY_TIMEOUT);
     tokio::pin!(deadline);
@@ -460,6 +461,16 @@ async fn identify(
         Ok(claims) => claims,
         Err(error) => {
             let (code, reason) = token_refusal(error);
+            if error != TokenError::KeysUnavailable {
+                tracing::warn!(
+                    target: "security",
+                    event = "gateway.identify.refused",
+                    %ip,
+                    close_code = code,
+                    reason,
+                    "a connection was refused"
+                );
+            }
             close_with(socket, code, reason).await;
             return None;
         }
@@ -470,6 +481,14 @@ async fn identify(
     };
     // Fails open: devices keep connecting while Redis is down.
     if let Err(Refused::Limited { .. }) = app.limits.check(Action::Identify, device).await {
+        tracing::warn!(
+            target: "security",
+            event = "gateway.rate_limited",
+            %ip,
+            user_id = %claims.user,
+            device_id = %claims.device,
+            "a device connects too often"
+        );
         close_with(
             socket,
             close::RATE_LIMITED,
@@ -492,6 +511,20 @@ async fn identify(
         }
         Err(refusal) => {
             let (code, reason) = refusal.close();
+            if let Refusal::Close(code, reason) = refusal {
+                if code != close::NOT_READY_YET {
+                    tracing::warn!(
+                        target: "security",
+                        event = "gateway.identify.refused",
+                        %ip,
+                        user_id = %claims.user,
+                        device_id = %claims.device,
+                        close_code = code,
+                        reason,
+                        "a connection was refused"
+                    );
+                }
+            }
             close_with(socket, code, reason).await;
             None
         }
@@ -873,6 +906,14 @@ impl Connected {
             }
         };
         if claims.user != self.user || claims.device != self.device {
+            tracing::warn!(
+                target: "security",
+                event = "gateway.reauth.mismatch",
+                ip = %self.ip,
+                user_id = %self.user,
+                device_id = %self.device,
+                "a ReAuth token named another device"
+            );
             close_with(
                 &mut self.socket,
                 close::INVALID_IDENTITY,
