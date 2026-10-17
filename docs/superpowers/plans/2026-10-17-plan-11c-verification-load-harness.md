@@ -22,6 +22,14 @@ creation for production. The full 10,000-connection run, sizing and performance
 acceptance belong to a later consumer deployment; this plan proves the harness
 locally and on a small real deployment and never claims capacity.
 
+**Execution notes (recorded after Task 11 ran):** `push11b-local` could not restart
+(its node lost the kubelet kubeconfig: `bootstrap-kubelet.conf` missing), so the small
+real deployment ran on a new owned profile `push11c-local`; `push11b-local` was left
+stopped with its data. `Start-Process -ArgumentList` does not quote array elements, so
+the `--target-build` label must contain no spaces there (the harness refused the split
+arguments, as intended). Whole-stack servers are spawned through a small `spawn` helper
+instead of `async move` blocks, which would capture the shared setup variables.
+
 Start from clean, current `main` containing this reviewed plan:
 
 ```powershell

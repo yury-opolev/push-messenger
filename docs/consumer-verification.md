@@ -151,3 +151,32 @@ cargo run -p push-smoke --bin push-dev-accounts -- --auth http://127.0.0.1:18080
 (with `kubectl port-forward` of the ingress controller to 18080 and of the worker to
 18081). Then prepare and run against `http://push.local:18080` with
 `--connect-to 127.0.0.1`.
+
+## Local functional evidence (2026-10-17)
+
+A small real deployment, not a capacity result: branch `feature/plan-11c-verification-load`
+at `3dbbbf8`, a fresh minikube profile (Kubernetes v1.31.0, Calico, the local
+ingress-nginx compatibility path) installed with `deploy/minikube/up.ps1`, reached
+through `kubectl port-forward` of the ingress controller.
+
+1. `push-dev-accounts --count 6` created six DEV ONLY verified accounts through the
+   public API and the worker's dev mailbox.
+2. `push-load prepare --devices-per-account 2 --sample-pairs 2` prepared 12 of 12
+   devices and 2 of 2 pairs (exit 0).
+3. `push-load run --connections 12 --ramp-per-second 4 --duration-seconds 180
+   --message-interval-seconds 5`, with `kubectl rollout restart deployment/push-gateway`
+   60 s into the run, ended `passed` (exit 0):
+
+| Measurement | Result |
+|---|---|
+| Connections | 12/12 ready, peak 12 open; 12 disconnects (close code 4005 from the rolled gateway), 12 reconnects, 0 failures; fewest open during the rollout: 5 |
+| Heartbeats | 60 Pings, 60 Pongs at the 30 s heartbeat; RTT p50 3 ms, p99 85 ms |
+| Connect latency | p50 14 ms, p99 60 ms |
+| Reconnect latency (losing a connection to Ready again) | p50 564 ms, p90 725 ms, p99 754 ms |
+| Sample messages | 68 sent, 68 stored, 68 delivered, 68 receipted, 0 lost |
+| Delivery / receipt latency | delivery p50 17 ms, p99 65 ms; receipt p50 115 ms, p99 935 ms |
+| Generator | scheduling lag p99 15 ms (limit 250 ms), not saturated |
+
+The report held no token, password or email address. The local port-forward collapses
+client addresses and the run is tiny: it proves the harness and the reconnect path,
+not production capacity.
