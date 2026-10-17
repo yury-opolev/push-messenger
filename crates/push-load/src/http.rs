@@ -19,6 +19,9 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(900);
 const TRANSPORT_ATTEMPTS: u32 = 5;
 const TRANSPORT_PAUSE: Duration = Duration::from_secs(2);
+/// Every attempt to refresh one token ends within this, inside auth-svc's 30 s grace for
+/// presenting a just-rotated token again (as the SDK's `REFRESH_WINDOW`).
+pub const REFRESH_WINDOW: Duration = Duration::from_secs(25);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApiError {
@@ -79,6 +82,19 @@ impl Pacer {
         let until = *self.0.lock().await;
         if let Some(until) = until {
             tokio::time::sleep_until(until).await;
+        }
+    }
+
+    /// Waits for the pause to end if it ends by `deadline`; false (at once) if it does not.
+    pub async fn wait_within(&self, deadline: Instant) -> bool {
+        let until = *self.0.lock().await;
+        match until {
+            Some(until) if until > deadline => false,
+            Some(until) => {
+                tokio::time::sleep_until(until).await;
+                true
+            }
+            None => true,
         }
     }
 
@@ -155,22 +171,43 @@ impl AuthApi {
 
     /// Waits out rate limits (pausing every worker) and retries up to five transport
     /// failures; every request here is safe to repeat (registration is idempotent by
-    /// `registration_id`, a repeated refresh falls in the 30 s grace).
+    /// `registration_id`). With a `window`, every attempt and wait ends within it: a
+    /// repeated refresh is only safe inside auth-svc's 30 s grace after a rotation.
     async fn post(
         &self,
         path: &str,
         body: Value,
         bearer: Option<&str>,
         expected: StatusCode,
+        window: Option<Duration>,
     ) -> Result<Value, ApiError> {
+        let deadline = window.map(|window| Instant::now() + window);
+        let expired =
+            || ApiError::Transport("the refresh window ended without an answer".to_owned());
         let mut failures = 0;
         loop {
-            self.pacer.wait().await;
-            match self.post_once(path, &body, bearer, expected).await {
+            let attempt = match deadline {
+                None => {
+                    self.pacer.wait().await;
+                    self.post_once(path, &body, bearer, expected).await
+                }
+                Some(deadline) => {
+                    if !self.pacer.wait_within(deadline).await {
+                        return Err(expired());
+                    }
+                    tokio::time::timeout_at(deadline, self.post_once(path, &body, bearer, expected))
+                        .await
+                        .unwrap_or_else(|_| Err(expired()))
+                }
+            };
+            match attempt {
                 Err(ApiError::RetryAfter(delay)) => self.pacer.defer(delay).await,
                 Err(ApiError::Transport(error)) => {
                     failures += 1;
-                    if failures >= TRANSPORT_ATTEMPTS {
+                    if failures >= TRANSPORT_ATTEMPTS
+                        || deadline
+                            .is_some_and(|deadline| Instant::now() + TRANSPORT_PAUSE >= deadline)
+                    {
                         return Err(ApiError::Transport(error));
                     }
                     tokio::time::sleep(TRANSPORT_PAUSE).await;
@@ -188,6 +225,7 @@ impl AuthApi {
                 json!({"email": email, "password": password}),
                 None,
                 StatusCode::OK,
+                None,
             )
             .await?;
         answer["registration_token"]
@@ -205,7 +243,7 @@ impl AuthApi {
     ) -> Result<DeviceTokens, ApiError> {
         let body = json!({"email": email, "password": password, "device_id": device_id});
         tokens(
-            self.post("/v1/auth/login", body, None, StatusCode::OK)
+            self.post("/v1/auth/login", body, None, StatusCode::OK, None)
                 .await?,
         )
     }
@@ -223,16 +261,25 @@ impl AuthApi {
                 body,
                 Some(registration_token),
                 StatusCode::CREATED,
+                None,
             )
             .await?,
         )
     }
 
+    /// Rotates the device's tokens. Retries stay within [`REFRESH_WINDOW`]: presenting the
+    /// old token after auth-svc's 30 s grace would revoke the device's tokens.
     pub async fn refresh(&self, refresh_token: &str) -> Result<DeviceTokens, ApiError> {
         let body = json!({"refresh_token": refresh_token});
         tokens(
-            self.post("/v1/auth/refresh", body, None, StatusCode::OK)
-                .await?,
+            self.post(
+                "/v1/auth/refresh",
+                body,
+                None,
+                StatusCode::OK,
+                Some(REFRESH_WINDOW),
+            )
+            .await?,
         )
     }
 }
@@ -259,5 +306,22 @@ mod tests {
         assert_eq!(retry_delay(Some("99999")), Duration::from_secs(900));
         assert_eq!(retry_delay(Some("soon")), Duration::from_secs(1));
         assert_eq!(retry_delay(None), Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn a_pause_beyond_the_refresh_window_gives_up_at_once() {
+        let pacer = Pacer::default();
+        assert!(
+            pacer
+                .wait_within(Instant::now() + Duration::from_secs(1))
+                .await
+        );
+        pacer.defer(Duration::from_secs(60)).await;
+        let started = std::time::Instant::now();
+        assert!(!pacer.wait_within(Instant::now() + REFRESH_WINDOW).await);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "it must not wait for the pause"
+        );
     }
 }

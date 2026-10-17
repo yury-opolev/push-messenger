@@ -103,7 +103,13 @@ It refreshes every selected device's token once, opens one connection per device
 ramp rate, keeps each alive with application Pings at the announced heartbeat, and sends
 a sample message every `--message-interval-seconds` (default 10) on each pair. Ramp plus
 duration is limited to 25 minutes (tokens last 30 minutes; the harness does not
-re-authenticate). At the end, or on Ctrl-C, it closes every socket and writes the report.
+re-authenticate). At the end, or on Ctrl-C (or SIGTERM on Unix), it closes every socket
+and writes the report. An interruption during the token refresh lets the refreshes in
+flight finish, saves every rotated token and connects nothing. A device whose refresh
+failed without an answer is marked for the next `prepare` to sign in again, because
+auth-svc may have rotated its token; each refresh is retried only within 25 s, inside
+auth-svc's 30 s grace for a repeated token. Killing the process outright can still lose
+rotated tokens; the next run then reports those devices and `prepare` repairs them.
 Exit 0 only when the run `passed`; 1 `failed`; 130 `interrupted`; 2 a usage or
 precondition error. A run that did not pass is never a capacity result.
 
@@ -123,8 +129,9 @@ rollout must still be delivered: `lost` must stay 0.
 
 - `status` and `failures`: `passed` requires every connection to have reached Ready and
   all to have been open at once, no connect/reconnect failure, no authentication
-  failure, no takeover (4007), no rate limiting, every Ping answered within 10 s, no
-  unexpected close code, no lost sample message and an unsaturated generator.
+  failure, no takeover (4007), no rate limiting, no other Error frame (a refused Send
+  or request), every Ping answered within 10 s, no unexpected close code, sample
+  messages stored (`SendAck`) and none lost, and an unsaturated generator.
 - `latency`: `connect`, `ping_rtt`, `delivery`, `receipt` and `reconnect` as count, p50,
   p90, p99 and max in milliseconds; `percentiles` states the nearest-rank definition.
 - `generator.scheduling_lag`: if `saturated`, the generator limited the run and the

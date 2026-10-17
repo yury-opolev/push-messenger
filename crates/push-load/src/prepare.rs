@@ -419,13 +419,15 @@ async fn connect_device(
         .context("a paired device has no refresh token")?;
     let tokens = match api.refresh(&refresh_token).await {
         Ok(tokens) => tokens,
-        Err(ApiError::Rejected { status: 401, .. }) => {
+        Err(error) => {
+            // Refused, or failed without an answer (auth-svc may have rotated it): either
+            // way the saved token must not be presented again; the next prepare signs the
+            // same device in again.
             shared
                 .update(|state| state.device_mut(device).needs_sign_in = true)
                 .await?;
-            bail!("a device's refresh token was refused; run prepare again to sign it in");
+            bail!("refreshing a paired device failed ({error}); run prepare again to sign it in");
         }
-        Err(error) => return Err(error.into()),
     };
     let access_token = tokens.access_token.clone();
     shared

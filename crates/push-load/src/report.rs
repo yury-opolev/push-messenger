@@ -137,6 +137,10 @@ pub fn judge(report: &Report, interrupted: bool) -> (Status, Vec<String>) {
             connections.protocol_failures,
             "frames from the gateway could not be decoded",
         ),
+        (
+            connections.error_frames,
+            "Error frames from the gateway (a refused Send or request)",
+        ),
     ] {
         if count > 0 {
             failures.push(format!("{count} {what}"));
@@ -157,6 +161,12 @@ pub fn judge(report: &Report, interrupted: bool) -> (Status, Vec<String>) {
     let messages = &report.messages;
     if report.workload.sample_pairs > 0 && messages.sent == 0 {
         failures.push("no sample messages were sent".to_owned());
+    }
+    if messages.sent > 0 && messages.stored == 0 {
+        failures.push(format!(
+            "none of {} sample messages was stored (no SendAck)",
+            messages.sent
+        ));
     }
     if messages.lost > 0 {
         failures.push(format!(
@@ -341,6 +351,17 @@ mod tests {
                 }),
             ),
             ("never delivered", Box::new(|r| r.messages.lost = 1)),
+            ("Error frames", Box::new(|r| r.connections.error_frames = 3)),
+            (
+                "none of 5 sample messages was stored",
+                Box::new(|r| {
+                    r.messages = MessageCounts {
+                        sent: 5,
+                        unconfirmed: 5,
+                        ..MessageCounts::default()
+                    }
+                }),
+            ),
             (
                 "no sample messages",
                 Box::new(|r| r.messages = MessageCounts::default()),

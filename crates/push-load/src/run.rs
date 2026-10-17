@@ -158,15 +158,15 @@ pub async fn run(
         messages: Messages::default(),
     });
 
-    let tokens = refresh_all(target, &mut state, state_path, &selected, &shared).await?;
-
+    // Before the refresh phase: an interruption there must save every rotated token.
     let interrupt = CancellationToken::new();
-    let on_interrupt = interrupt.clone();
-    tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            on_interrupt.cancel();
-        }
-    });
+    tokio::spawn(watch_interrupt(interrupt.clone()));
+
+    let tokens = refresh_all(
+        target, &mut state, state_path, &selected, &shared, &interrupt,
+    )
+    .await?;
+
     let lag = Arc::new(Samples::default());
     let lag_cancel = CancellationToken::new();
     let lag_watch = tokio::spawn(metrics::watch_lag(lag.clone(), lag_cancel.clone()));
@@ -292,19 +292,43 @@ pub async fn run(
     Ok(report)
 }
 
+/// Cancels `interrupt` on Ctrl-C, and on SIGTERM (`docker stop`) on Unix.
+async fn watch_interrupt(interrupt: CancellationToken) {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        if let Ok(mut terminate) = signal(SignalKind::terminate()) {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = terminate.recv() => {}
+            }
+            interrupt.cancel();
+            return;
+        }
+    }
+    if tokio::signal::ctrl_c().await.is_ok() {
+        interrupt.cancel();
+    }
+}
+
 /// One refresh per selected device: the access tokens, in `selected` order (`None` when
-/// refused). Rotated refresh tokens are saved before any connection uses them; a refused
-/// one marks its device for `prepare` to sign in again.
+/// not available). Rotated refresh tokens are saved before any connection uses them.
+/// A device whose refresh was refused, or whose rotation is unknown (a failed, aborted or
+/// timed-out request: auth-svc may have rotated it), is marked for `prepare` to sign in
+/// again rather than reusing a token auth-svc would treat as stolen. An interruption
+/// lets the refreshes in flight finish, saves, and stops before connecting.
 async fn refresh_all(
     target: &Target,
     state: &mut State,
     path: &Path,
     selected: &[DeviceRef],
     shared: &Shared,
+    interrupt: &CancellationToken,
 ) -> anyhow::Result<Vec<Option<String>>> {
     let api = AuthApi::new(target)?;
     let deadline = Instant::now() + REFRESH_PHASE_LIMIT;
     let limit = Arc::new(Semaphore::new(REFRESH_CONCURRENCY));
+    let started: Arc<std::sync::Mutex<HashSet<usize>>> = Arc::default();
     let mut jobs = JoinSet::new();
     for (position, device) in selected.iter().enumerate() {
         let token = state
@@ -312,16 +336,26 @@ async fn refresh_all(
             .refresh_token
             .clone()
             .context("a ready device has no refresh token")?;
-        let (api, limit) = (api.clone(), limit.clone());
+        let (api, limit, started, interrupt) = (
+            api.clone(),
+            limit.clone(),
+            started.clone(),
+            interrupt.clone(),
+        );
         jobs.spawn(async move {
             let _permit = limit
                 .acquire_owned()
                 .await
                 .expect("the semaphore stays open");
-            (position, api.refresh(&token).await)
+            if interrupt.is_cancelled() {
+                return (position, None);
+            }
+            started.lock().expect("started lock").insert(position);
+            (position, Some(api.refresh(&token).await))
         });
     }
     let mut access = vec![None; selected.len()];
+    let mut finished = HashSet::new();
     let mut unsaved = 0;
     loop {
         let joined = match tokio::time::timeout_at(deadline, jobs.join_next()).await {
@@ -330,25 +364,41 @@ async fn refresh_all(
             Err(_) => {
                 jobs.abort_all();
                 while jobs.join_next().await.is_some() {}
+                let cut_off: Vec<usize> = started
+                    .lock()
+                    .expect("started lock")
+                    .iter()
+                    .copied()
+                    .filter(|position| !finished.contains(position))
+                    .collect();
+                for position in &cut_off {
+                    state.device_mut(selected[*position]).needs_sign_in = true;
+                }
                 state.save(path)?;
                 bail!(
-                    "refreshing the devices' tokens took longer than {} s; nothing was connected. Devices whose answers were cut off need `prepare` again after 30 s",
-                    REFRESH_PHASE_LIMIT.as_secs()
+                    "refreshing the devices' tokens took longer than {} s; nothing was connected. Run prepare to sign in the {} devices whose refreshes were cut off",
+                    REFRESH_PHASE_LIMIT.as_secs(),
+                    cut_off.len()
                 );
             }
         };
         let (position, outcome) = joined;
         let device = selected[position];
+        finished.insert(position);
         match outcome {
-            Ok(tokens) => {
+            None => {}
+            Some(Ok(tokens)) => {
                 state.device_mut(device).refresh_token = Some(tokens.refresh_token);
                 access[position] = Some(tokens.access_token);
             }
-            Err(ApiError::Rejected { status: 401, .. }) => {
+            Some(Err(ApiError::Rejected { status: 401, .. })) => {
                 state.device_mut(device).needs_sign_in = true;
                 bump(&shared.counters.auth_failures);
             }
-            Err(_) => bump(&shared.counters.connect_failures),
+            Some(Err(_)) => {
+                state.device_mut(device).needs_sign_in = true;
+                bump(&shared.counters.connect_failures);
+            }
         }
         unsaved += 1;
         if unsaved >= SAVE_EVERY {
@@ -357,6 +407,11 @@ async fn refresh_all(
         }
     }
     state.save(path)?;
+    if interrupt.is_cancelled() {
+        bail!(
+            "interrupted while refreshing the devices' tokens; every rotated token was saved and nothing was connected"
+        );
+    }
     Ok(access)
 }
 
@@ -529,9 +584,12 @@ async fn session(shared: &Shared, plan: &Plan, mut socket: Socket, ready: Ready)
                             }
                             Body::AuthExpiring(_) => bump(&shared.counters.auth_expiring),
                             Body::Error(error) => {
-                                bump(&shared.counters.error_frames);
+                                // Rate limiting is its own failure; any other Error frame
+                                // (a refused Send or request) fails the run too.
                                 if error.code() == ErrorCode::RateLimited {
                                     bump(&shared.counters.rate_limited);
+                                } else {
+                                    bump(&shared.counters.error_frames);
                                 }
                             }
                             _ => {}
