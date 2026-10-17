@@ -329,6 +329,21 @@ async fn befriend(
     Ok(opened.conversation_id)
 }
 
+/// DEV ONLY: `count` new verified accounts for push-load, through auth-svc's public API
+/// and the worker's dev mailbox. auth-svc allows 20 signups per IP an hour.
+pub async fn create_verified_accounts(
+    target: &Target,
+    count: usize,
+) -> anyhow::Result<Vec<push_load::accounts::Account>> {
+    let auth = auth::Auth::connect(target, STEP_TIMEOUT).await?;
+    let mut accounts = Vec::with_capacity(count);
+    for index in 0..count {
+        let (email, password) = auth.sign_up_verified(&format!("load{index}")).await?;
+        accounts.push(push_load::accounts::Account { email, password });
+    }
+    Ok(accounts)
+}
+
 fn contact_event(user: Uuid, state: ContactState) -> Body {
     Body::ContactEvent(ContactEvent {
         user_id: id_bytes(user),
