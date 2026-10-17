@@ -464,12 +464,17 @@ impl Auth {
         if claims.pw.as_deref() != Some(password_stamp(&current).as_str()) {
             return Err(AuthError::LinkInvalid);
         }
+        // The clock that sets the access tokens' `iat`: auth-svc (in `authenticate`) and
+        // message-svc refuse every token issued no later than this second, and only those.
+        let reset_at = unix_now();
         sqlx::query(
             "UPDATE auth.user_account SET password_hash = $2, \
-             email_verified_at = coalesce(email_verified_at, now()) WHERE user_id = $1",
+             email_verified_at = coalesce(email_verified_at, now()), \
+             password_reset_at = greatest(password_reset_at, $3) WHERE user_id = $1",
         )
         .bind(claims.sub)
         .bind(&new_hash)
+        .bind(reset_at)
         .execute(&mut *tx)
         .await?;
         // Device rows first, in a fixed order, like every other change to a device's tokens.
@@ -502,7 +507,7 @@ impl Auth {
             &mut tx,
             &Event::UserPasswordReset {
                 user_id: claims.sub,
-                reset_at: unix_now(),
+                reset_at,
             },
         )
         .await?;

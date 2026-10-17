@@ -512,6 +512,50 @@ async fn a_password_reset_revokes_every_refresh_token() {
     );
 }
 
+/// The cutoff message-svc applies (`iat` no later than the reset's second is refused)
+/// holds at auth-svc's own API too: a stolen access token cannot keep reading the account
+/// or revoking the devices its owner signs back in with.
+#[tokio::test]
+async fn a_password_reset_ends_earlier_access_tokens_and_a_later_sign_in_works() {
+    let world = world().await;
+    let alice = verified(&world, "alice").await;
+    let phone = world
+        .auth
+        .register_device(&alice, Uuid::now_v7(), "Phone", "ios")
+        .await
+        .unwrap();
+    world.auth.authenticate(&phone.access_token).await.unwrap();
+    world
+        .auth
+        .forgot_password("alice@example.com")
+        .await
+        .unwrap();
+    let (_, payload) = outbox(&world.pool).await.pop().unwrap();
+    let link = payload["params"]["link"].as_str().unwrap();
+    let token = link.split_once("?token=").unwrap().1;
+    world
+        .auth
+        .reset_password(token, "battery staple")
+        .await
+        .unwrap();
+    assert_eq!(
+        world.auth.authenticate(&phone.access_token).await,
+        Err(AuthError::Unauthorized),
+        "a token issued before the reset"
+    );
+    // Tokens carry whole seconds: one issued in a later second than the reset works.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let again = world
+        .auth
+        .login_device("alice@example.com", "battery staple", phone.device_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        world.auth.authenticate(&again.access_token).await,
+        Ok(caller(&again))
+    );
+}
+
 #[tokio::test]
 async fn profiles_show_handles_and_only_the_owner_sees_the_email() {
     let world = world().await;

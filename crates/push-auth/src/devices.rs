@@ -318,7 +318,10 @@ impl Auth {
         Ok(tokens)
     }
 
-    /// The caller behind an access token: valid, and its device still active.
+    /// The caller behind an access token: valid, its device still active, and issued in a
+    /// later second than the account's last password reset (the cutoff message-svc applies
+    /// too: within that second the order is unknown, and refusing a token minted just
+    /// after the reset only asks for one more sign-in).
     pub async fn authenticate(&self, access_token: &str) -> Result<Caller, AuthError> {
         let claims = self
             .tokens
@@ -327,16 +330,20 @@ impl Auth {
                 TokenError::Expired => AuthError::TokenExpired,
                 TokenError::Invalid => AuthError::Unauthorized,
             })?;
-        let active = sqlx::query(
-            "SELECT 1 FROM auth.device WHERE device_id = $1 AND user_id = $2 \
-             AND revoked_at IS NULL",
+        let reset_at: Option<Option<i64>> = sqlx::query_scalar(
+            "SELECT account.password_reset_at FROM auth.device AS device \
+             JOIN auth.user_account AS account ON account.user_id = device.user_id \
+             WHERE device.device_id = $1 AND device.user_id = $2 \
+             AND device.revoked_at IS NULL",
         )
         .bind(claims.device_id)
         .bind(claims.sub)
         .fetch_optional(&self.pool)
         .await?;
-        if active.is_none() {
-            return Err(AuthError::Unauthorized);
+        match reset_at {
+            None => return Err(AuthError::Unauthorized),
+            Some(Some(reset_at)) if claims.iat <= reset_at => return Err(AuthError::Unauthorized),
+            Some(_) => {}
         }
         Ok(Caller {
             user_id: claims.sub,
