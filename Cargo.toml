@@ -52,7 +52,7 @@ push-sdk-ffi = { path = "bindings/ffi" }
 push-store = { path = "crates/push-store" }
 push-testkit = { path = "crates/push-testkit" }
 push-worker = { path = "crates/push-worker" }
-rand = "0.9"
+rand = "0.10"
 redis = { version = "1", default-features = false, features = [
     "connection-manager",
     "tokio-comp",
