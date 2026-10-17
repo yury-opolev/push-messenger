@@ -880,6 +880,57 @@ async fn redeeming_invites_is_rate_limited() {
     ));
 }
 
+/// A user's writes are limited across their devices: past 120 a minute, a write is
+/// answered with a retryable `RATE_LIMITED` carrying its `client_msg_id`, and the
+/// connection stays open.
+#[tokio::test]
+async fn writes_past_the_users_quota_are_refused_for_their_client_msg_id() {
+    let stack = stack().await;
+    let (alice, alice_device) = person(&stack).await;
+    let (bob, _) = person(&stack).await;
+    let conversation = direct_chat(&stack, alice, bob).await;
+    let mut socket = ready(&stack, alice, alice_device).await;
+    let send_one = |id: Vec<u8>| {
+        Body::Send(Send {
+            client_msg_id: id,
+            conversation_id: conversation.clone(),
+            content_type: ContentType::Text.into(),
+            body: b"hello".to_vec(),
+            client_ts: None,
+        })
+    };
+    // Paced under the frame budget (100 at once, then 20 a second).
+    for sent in 0..120 {
+        if sent == 90 {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        send(&mut socket, send_one(id_bytes(Uuid::now_v7()))).await;
+        let answer = wait_for(&mut socket, |body| {
+            matches!(body, Body::SendAck(_) | Body::Error(_))
+        })
+        .await;
+        assert!(matches!(answer, Body::SendAck(_)), "{answer:?}");
+    }
+    let refused_id = id_bytes(Uuid::now_v7());
+    send(&mut socket, send_one(refused_id.clone())).await;
+    let Body::Error(error) = wait_for(&mut socket, |body| {
+        matches!(body, Body::SendAck(_) | Body::Error(_))
+    })
+    .await
+    else {
+        panic!("the 121st write of the minute was stored");
+    };
+    assert_eq!(error.code(), ErrorCode::RateLimited);
+    assert!(error.retryable);
+    assert_eq!(error.client_msg_id, Some(refused_id));
+    assert!(error.retry_after_s.is_some_and(|seconds| seconds <= 60));
+    send(&mut socket, Body::Ping(Ping {})).await;
+    assert_eq!(
+        wait_for(&mut socket, |body| matches!(body, Body::Pong(_))).await,
+        Body::Pong(Pong {})
+    );
+}
+
 /// A connection that floods the gateway with frames is closed with 4004.
 #[tokio::test]
 async fn too_many_frames_close_the_connection_with_4004() {

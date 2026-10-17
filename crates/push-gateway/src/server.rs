@@ -744,6 +744,9 @@ impl Connected {
             Step::ReAuth(token) => self.reauth(&token).await,
             Step::Send(frame) => {
                 let client_msg_id = frame.client_msg_id.clone();
+                if !self.may_write(&client_msg_id).await? {
+                    return Ok(());
+                }
                 let request = SendRequest {
                     user_id: id_bytes(self.user),
                     device_id: id_bytes(self.device),
@@ -781,6 +784,9 @@ impl Connected {
             }
             Step::Edit(edit) => {
                 let client_msg_id = edit.client_msg_id.clone();
+                if !self.may_write(&client_msg_id).await? {
+                    return Ok(());
+                }
                 let request = EditRequest {
                     user_id: id_bytes(self.user),
                     device_id: id_bytes(self.device),
@@ -791,6 +797,9 @@ impl Connected {
             }
             Step::Delete(delete) => {
                 let client_msg_id = delete.client_msg_id.clone();
+                if !self.may_write(&client_msg_id).await? {
+                    return Ok(());
+                }
                 let request = DeleteRequest {
                     user_id: id_bytes(self.user),
                     device_id: id_bytes(self.device),
@@ -850,6 +859,38 @@ impl Connected {
                 send(&mut self.socket, error).await
             }
         }
+    }
+
+    /// Counts a write (`Send`, `Edit`, `Delete`) against the user's quota. Over it, the
+    /// client gets a retryable `RATE_LIMITED` for that `client_msg_id` and `false`. Fails
+    /// open: without Redis, writes go on.
+    async fn may_write(&mut self, client_msg_id: &[u8]) -> Result<bool, Closed> {
+        let who = Subject {
+            user: Some(self.user),
+            ..Subject::default()
+        };
+        let Err(Refused::Limited { retry_after_s }) = self.limits.check(Action::Write, who).await
+        else {
+            return Ok(true);
+        };
+        tracing::warn!(
+            target: "security",
+            event = "gateway.write.rate_limited",
+            ip = %self.ip,
+            user_id = %self.user,
+            device_id = %self.device,
+            "a user writes too often"
+        );
+        let error = Error {
+            code: ErrorCode::RateLimited.into(),
+            message: "too many messages; retry later".to_owned(),
+            retryable: true,
+            client_msg_id: Some(client_msg_id.to_vec()),
+            request_id: None,
+            retry_after_s: Some(retry_after_s),
+        };
+        send(&mut self.socket, Body::Error(error)).await?;
+        Ok(false)
     }
 
     /// Answers an edit or a delete: its `SendAck`, or the error with its `client_msg_id`.

@@ -1,14 +1,14 @@
 //! Rate limits of the gateway: the requests that let someone guess or probe (redeeming
-//! invites, contact requests, creating invites), `Identify` per device (spec §7.3), and
-//! frames per connection.
+//! invites, contact requests, creating invites), `Identify` per device (spec §7.3),
+//! writes (`Send`, `Edit`, `Delete`) per user, and frames per connection.
 //!
 //! Request limits are fixed windows in Redis (`INCR`, then `EXPIRE … NX`), keyed by a
 //! hash of the subject, so no user id or IP is stored in Redis; they count across every
 //! gateway. When Redis does not answer within 500 ms the request is refused with a
 //! retryable `UNAVAILABLE` and a warning (fail closed, like auth-svc): without counters
-//! nothing would stop someone guessing invite codes. `Identify` fails open instead:
-//! signed-in devices must keep connecting while Redis is down (spec §12, test 4), and a
-//! connection storm is bounded by the frame budget and the token checks anyway.
+//! nothing would stop someone guessing invite codes. `Identify` and writes fail open
+//! instead: signed-in devices must keep connecting and messaging while Redis is down
+//! (spec §12, test 4); meanwhile writes are bounded only by the frame budget.
 //!
 //! The frame budget is per connection, in memory: a token bucket of 100 frames refilled
 //! at 20 a second. A connection that runs dry is closed with 4004.
@@ -36,6 +36,9 @@ pub enum Action {
     CreateInvite,
     /// `Identify`, per device: reconnect loops.
     Identify,
+    /// `Send`, `Edit` and `Delete`, per user across their devices: flooding conversations
+    /// and storage.
+    Write,
 }
 
 /// Whom a limit counts.
@@ -81,6 +84,7 @@ impl Action {
             Self::ContactRequest => "contact",
             Self::CreateInvite => "invite",
             Self::Identify => "identify",
+            Self::Write => "write",
         }
     }
 
@@ -96,11 +100,18 @@ impl Action {
             &[(Scope::User, per(30, HOUR)), (Scope::Ip, per(120, HOUR))];
         const INVITE: &[(Scope, Limit)] = &[(Scope::User, per(20, HOUR))];
         const IDENTIFY: &[(Scope, Limit)] = &[(Scope::Device, per(30, MINUTE))];
+        // Two a second on average, in bursts: far above a person typing, on all their
+        // devices together; the hour caps a sustained flood.
+        const WRITE: &[(Scope, Limit)] = &[
+            (Scope::User, per(120, MINUTE)),
+            (Scope::User, per(3000, HOUR)),
+        ];
         match self {
             Self::RedeemInvite => REDEEM,
             Self::ContactRequest => CONTACT,
             Self::CreateInvite => INVITE,
             Self::Identify => IDENTIFY,
+            Self::Write => WRITE,
         }
     }
 }
@@ -175,7 +186,11 @@ impl Limits {
             let Some(id) = id else {
                 continue;
             };
-            match self.counter.hit(&key(action, scope, &id), limit).await {
+            match self
+                .counter
+                .hit(&key(action, scope, limit, &id), limit)
+                .await
+            {
                 Ok(Outcome::Allowed) => {}
                 Ok(Outcome::Limited { retry_after_s }) => {
                     return Err(Refused::Limited { retry_after_s });
@@ -205,14 +220,20 @@ fn ip_subject(ip: IpAddr) -> String {
     }
 }
 
-/// `gw:{action}:{scope}:{hash}`: the subject is hashed, never stored.
-fn key(action: Action, scope: Scope, subject: &str) -> String {
+/// `gw:{action}:{scope}:{hash}:{window_s}`: the subject is hashed, never stored; the
+/// window tells apart two limits of one scope.
+fn key(action: Action, scope: Scope, limit: Limit, subject: &str) -> String {
     let digest = Sha256::digest(subject.as_bytes());
     let hex: String = digest[..16]
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect();
-    format!("gw:{}:{}:{hex}", action.name(), scope.name())
+    format!(
+        "gw:{}:{}:{hex}:{}",
+        action.name(),
+        scope.name(),
+        limit.window.as_secs()
+    )
 }
 
 /// How long a counter may take before the request is decided without it.
@@ -474,6 +495,42 @@ mod tests {
         ));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn writes_are_counted_per_user_by_the_minute_and_the_hour() {
+        let limits = memory();
+        let alice = Uuid::now_v7();
+        let writer = Subject {
+            user: Some(alice),
+            ..Subject::default()
+        };
+        for _ in 0..120 {
+            limits.check(Action::Write, writer).await.unwrap();
+        }
+        assert!(matches!(
+            limits.check(Action::Write, writer).await,
+            Err(Refused::Limited { retry_after_s }) if retry_after_s <= 60
+        ));
+        // Another user is not affected.
+        let bob = Subject {
+            user: Some(Uuid::now_v7()),
+            ..Subject::default()
+        };
+        limits.check(Action::Write, bob).await.unwrap();
+        // 120 a minute for 24 more minutes reach the hour's 3,000; the 25th minute is
+        // refused by the hour, not the minute.
+        for _ in 0..24 {
+            tokio::time::advance(Duration::from_secs(60)).await;
+            for _ in 0..120 {
+                limits.check(Action::Write, writer).await.unwrap();
+            }
+        }
+        tokio::time::advance(Duration::from_secs(60)).await;
+        assert!(matches!(
+            limits.check(Action::Write, writer).await,
+            Err(Refused::Limited { retry_after_s }) if retry_after_s > 60
+        ));
+    }
+
     #[tokio::test]
     async fn a_failing_counter_is_unavailable() {
         let limits = Limits::new(Arc::new(Broken));
@@ -488,8 +545,9 @@ mod tests {
     #[test]
     fn keys_hash_the_subject() {
         let user = Uuid::now_v7().to_string();
-        let key = key(Action::ContactRequest, Scope::User, &user);
+        let key = key(Action::ContactRequest, Scope::User, per(30, HOUR), &user);
         assert!(key.starts_with("gw:contact:user:"), "{key}");
+        assert!(key.ends_with(":3600"), "{key}");
         assert!(!key.contains(&user), "{key}");
         assert_eq!(
             ip_subject("::ffff:10.0.0.1".parse().unwrap()),
