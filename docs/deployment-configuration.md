@@ -20,6 +20,12 @@ ExternalSecret/CSI object, registry or pipeline, and nothing cluster-scoped. Man
 databases, multi-node HA and automatic or zero-downtime secret rotation are out of
 scope. Using the chart requires no GitHub Actions, GHCR or particular cloud.
 
+Every container runs with `RuntimeDefault` seccomp, no privilege escalation and a
+read-only root filesystem. The services and Redis run as non-root with no capabilities.
+The bundled PostgreSQL's image entrypoint starts as root only to hand PGDATA and its
+socket directory to the `postgres` user, so it keeps just `CHOWN`, `DAC_OVERRIDE`,
+`FOWNER`, `SETGID` and `SETUID`; the server itself runs as `postgres` with none.
+
 ## Credentials
 
 ### Chart-managed (default, local development)

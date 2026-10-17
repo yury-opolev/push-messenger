@@ -231,6 +231,14 @@ Check 'default: the bundled PostgreSQL and Redis images are pinned by digest' {
     (Doc $default 'StatefulSet' 'push-postgres') -match 'image: postgres:17-alpine@sha256:[0-9a-f]{64}\s' -and
         (Doc $default 'Deployment' 'push-redis') -match 'image: redis:7-alpine@sha256:[0-9a-f]{64}\s'
 }
+Check 'default: PostgreSQL keeps only the capabilities its entrypoint needs, on a read-only root' {
+    $postgres = Doc $default 'StatefulSet' 'push-postgres'
+    $postgres -match 'allowPrivilegeEscalation: false' -and
+        $postgres -match 'readOnlyRootFilesystem: true' -and
+        $postgres -match 'drop: \["ALL"\]\s+add: \["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"\]' -and
+        $postgres -match 'mountPath: /var/run/postgresql' -and $postgres -match 'mountPath: /tmp' -and
+        $postgres -notmatch 'fsGroup'
+}
 Check 'default: groups are refused; one switch serves them' {
     $on = helm template push $chart --set gateway.groups=true | Out-String
     (Doc $default 'Deployment' 'push-gateway') -match 'name: PUSH_GROUPS\s+value: "0"' -and
