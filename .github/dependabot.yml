@@ -1,0 +1,33 @@
+# Weekly update proposals for every ecosystem the repository pins. Contributor tooling:
+# consumers who vendor this repository as a submodule run their own.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      cargo:
+        patterns: ["*"]
+        update-types: [minor, patch]
+  - package-ecosystem: npm
+    directory: /bindings/node
+    schedule:
+      interval: weekly
+    groups:
+      npm:
+        patterns: ["*"]
+        update-types: [minor, patch]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+  # The FROM images of deploy/docker/Dockerfile, pinned by digest.
+  - package-ecosystem: docker
+    directory: /deploy/docker
+    schedule:
+      interval: weekly
+  - package-ecosystem: pip
+    directory: /deploy/helm
+    schedule:
+      interval: weekly
