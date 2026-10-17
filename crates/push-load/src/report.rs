@@ -307,9 +307,12 @@ mod tests {
         assert_eq!(judged(&report, false).0, Status::Passed);
     }
 
+    /// A change that must fail the run, and a phrase its failure must contain.
+    type Case = (&'static str, Box<dyn Fn(&mut Report)>);
+
     #[test]
     fn every_criterion_fails_the_run() {
-        let cases: Vec<(&str, Box<dyn Fn(&mut Report)>)> = vec![
+        let cases: Vec<Case> = vec![
             (
                 "never became ready",
                 Box::new(|r| r.connections.ready_once = 3),
