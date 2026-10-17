@@ -75,7 +75,7 @@ sqlx = { version = "0.8", default-features = false, features = [
     "runtime-tokio",
     "uuid",
 ] }
-testcontainers-modules = { version = "0.13", features = ["postgres", "redis"] }
+testcontainers-modules = { version = "0.15", features = ["postgres", "redis"] }
 thiserror = "2"
 tokio = { version = "1", features = ["sync"] }
 tokio-stream = { version = "0.1", features = ["net"] }

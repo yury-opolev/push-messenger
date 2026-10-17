@@ -25,6 +25,9 @@ jobs:
       - run: docker pull redis:7-alpine
       - run: cargo test --workspace --locked
 
+  # The crates build with the oldest supported Rust (rust-version). Tests run on stable
+  # above: their dev-dependencies (testcontainers) need a newer Rust, which consumers
+  # never compile.
   msrv:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -32,9 +35,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.85
       - uses: Swatinem/rust-cache@v2
-      - run: docker pull postgres:17-alpine
-      - run: docker pull redis:7-alpine
-      - run: cargo test --workspace --locked
+      - run: cargo build --workspace --locked
 
   # The C and Node bindings on Linux: the generated header is current, a C program built
   # with gcc runs against the shared library, and the Node tests and typings pass.
