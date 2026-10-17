@@ -52,6 +52,10 @@ gateway:
   # (its last line, then last entry, is used). Empty: the peer address. Only set one the
   # trusted proxy overwrites or appends to, with direct backend access blocked.
   clientIpHeader: ""
+  # auth-svc's URL for its key set (GET /v1/auth/jwks). Empty: the in-cluster Service
+  # over plain HTTP. Set an https:// URL when a mesh or a TLS-terminating Service fronts
+  # auth-svc; the gateway trusts the system roots, or the bundle in SSL_CERT_FILE.
+  authUrl: ""
   # 5 s preStop sleep + the gateway's own 10 s drain + margin.
   terminationGracePeriodSeconds: 30
   resources:

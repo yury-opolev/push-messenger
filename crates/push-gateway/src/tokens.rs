@@ -126,7 +126,7 @@ impl Verifier {
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .expect("a client without TLS or proxies always builds");
+            .expect("the key set's HTTP client builds; check the CA bundle in SSL_CERT_FILE");
         Self {
             inner: Arc::new(Inner {
                 jwks_url: jwks_url.into(),

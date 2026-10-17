@@ -143,6 +143,21 @@ peers). For example `x-forwarded-for` with Traefik and no trusted upstream IPs. 
 external load balancer's source-IP preservation is a deployment-specific acceptance
 check.
 
+## In-cluster transport
+
+Public traffic is TLS at the controller. Traffic between the services inside the
+cluster is not encrypted by the chart: gRPC to message-svc, HTTP from the gateway to
+auth-svc's key set, PostgreSQL and Redis. The internal tokens and the NetworkPolicies
+decide who may call what, but someone who can read pod traffic on the node network
+could read messages and credentials. Production deployments should encrypt it with a
+service mesh that adds mutual TLS (Istio, Linkerd) or a CNI that encrypts pod traffic
+(Cilium or Calico with WireGuard). That choice belongs to the consumer.
+
+When a mesh or a TLS-terminating Service fronts auth-svc, set `gateway.authUrl` to its
+`https://` URL; the gateway trusts the image's system roots, or the PEM bundle that
+`SSL_CERT_FILE` names (mount a private CA there). The URL must still reach this
+release's auth-svc: its key set decides which access tokens the gateway accepts.
+
 ## Images
 
 ```yaml

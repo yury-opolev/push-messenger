@@ -68,7 +68,7 @@ spec:
             # Access tokens are checked against auth-svc's key set (GET /v1/auth/jwks)
             # and must name the gateway's public URL as their audience.
             - name: PUSH_AUTH_URL
-              value: {{ printf "http://%s:8080" (include "push.name" (dict "root" . "component" "auth")) | quote }}
+              value: {{ .Values.gateway.authUrl | default (printf "http://%s:8080" (include "push.name" (dict "root" . "component" "auth"))) | quote }}
             - name: PUSH_TOKEN_AUDIENCE
               value: {{ include "push.socketUrl" . | quote }}
             {{- with .Values.gateway.clientIpHeader }}

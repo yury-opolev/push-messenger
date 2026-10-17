@@ -16,7 +16,9 @@ jsonwebtoken.workspace = true
 prost.workspace = true
 push-proto.workspace = true
 redis.workspace = true
-reqwest.workspace = true
+# HTTPS to auth-svc's key set when PUSH_AUTH_URL is https://: rustls with ring, trusting the
+# system roots (SSL_CERT_FILE names a private CA bundle).
+reqwest = { workspace = true, features = ["rustls-tls-native-roots"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
