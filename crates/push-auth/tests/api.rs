@@ -483,6 +483,98 @@ async fn errors_have_one_format() {
     assert_eq!(jwks.headers["cache-control"], "public, max-age=300");
 }
 
+/// Security events are logged with the client IP and the account's ids, and never with an
+/// email address, a password or a token. The capture is the process's global subscriber:
+/// a thread's own subscriber misses events while other tests run in parallel.
+#[tokio::test]
+async fn security_events_are_logged_without_secrets() {
+    static LINES: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_writer(|| Capture(&LINES))
+        .with_max_level(tracing::Level::INFO)
+        .finish();
+    tracing::subscriber::set_global_default(subscriber).unwrap();
+
+    let world = world().await;
+    let tokens = with_device(&world, "audited").await;
+    let refresh = tokens["refresh_token"].as_str().unwrap();
+    let wrong = call(
+        &world,
+        Method::POST,
+        "/v1/auth/login",
+        None,
+        Some(json!({"email": "audited@example.com", "password": "wrong horse"})),
+    )
+    .await;
+    assert_eq!(wrong.status, StatusCode::UNAUTHORIZED);
+    let refused = call(
+        &world,
+        Method::POST,
+        "/v1/auth/refresh",
+        None,
+        Some(json!({"refresh_token": "not-a-refresh-token"})),
+    )
+    .await;
+    assert_eq!(refused.status, StatusCode::UNAUTHORIZED);
+
+    let text = String::from_utf8(LINES.lock().unwrap().clone()).unwrap();
+    let events: Vec<Value> = text
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|line| line["target"] == "security")
+        .map(|line| line["fields"].clone())
+        .collect();
+    let named = |name: &str| {
+        events
+            .iter()
+            .find(|event| event["event"] == name)
+            .unwrap_or_else(|| panic!("no {name} in {events:?}"))
+            .clone()
+    };
+    let registered = events
+        .iter()
+        .find(|event| {
+            event["event"] == "auth.device.registered" && event["user_id"] == tokens["user_id"]
+        })
+        .expect("the registration is logged");
+    assert_eq!(registered["device_id"], tokens["device_id"]);
+    assert_eq!(registered["ip"], "198.51.100.7");
+    assert_eq!(named("auth.email.verified")["ip"], "198.51.100.7");
+    assert_eq!(named("auth.login.success")["status"], 200);
+    let failure = events
+        .iter()
+        .find(|event| {
+            event["event"] == "auth.login.failure" && event["code"] == "invalid_credentials"
+        })
+        .expect("the failed sign-in is logged");
+    assert_eq!(failure["status"], 401);
+    assert_eq!(failure["ip"], "198.51.100.7");
+    assert_eq!(named("auth.refresh.refused")["route"], "/v1/auth/refresh");
+    for secret in [
+        "audited@example.com",
+        "correct horse",
+        "wrong horse",
+        refresh,
+        tokens["access_token"].as_str().unwrap(),
+    ] {
+        assert!(!text.contains(secret), "the log holds {secret}");
+    }
+}
+
+struct Capture(&'static Mutex<Vec<u8>>);
+
+impl std::io::Write for Capture {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 #[tokio::test]
 async fn login_is_rate_limited_per_account_and_ip_without_locking_the_account() {
     let world = world().await;

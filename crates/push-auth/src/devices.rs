@@ -294,7 +294,13 @@ impl Auth {
             .await?
             .is_some();
         if !live_successor {
-            tracing::warn!(%device_id, "a retired refresh token was used again; revoking the device's tokens");
+            tracing::warn!(
+                target: "security",
+                event = "auth.refresh.reuse",
+                %user_id,
+                %device_id,
+                "a retired refresh token was used again; revoking the device's tokens"
+            );
             revoke_refresh_tokens(&mut tx, device_id).await?;
             tx.commit().await?;
             return Err(AuthError::Unauthorized);

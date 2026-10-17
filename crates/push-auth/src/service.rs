@@ -441,8 +441,8 @@ impl Auth {
     /// account and writes `user.password_reset`, on which every device is kicked
     /// (spec §5.4). Setting the password changes the stamp, so the link works once. The
     /// link reached the address, so the email counts as verified from now on; if it was
-    /// not, `user.verified` is written too.
-    pub async fn reset_password(&self, token: &str, password: &str) -> Result<(), AuthError> {
+    /// not, `user.verified` is written too. Returns the user's id.
+    pub async fn reset_password(&self, token: &str, password: &str) -> Result<Uuid, AuthError> {
         let claims = self
             .links
             .verify(token, Purpose::Reset, unix_now())
@@ -512,7 +512,7 @@ impl Auth {
         )
         .await?;
         tx.commit().await?;
-        Ok(())
+        Ok(claims.sub)
     }
 }
 

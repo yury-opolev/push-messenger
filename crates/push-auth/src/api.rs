@@ -12,12 +12,12 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use axum::extract::{ConnectInfo, FromRequest, FromRequestParts, Path, Query, Request, State};
-use axum::http::StatusCode;
 use axum::http::header::{
     CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue,
     REFERRER_POLICY, RETRY_AFTER, WWW_AUTHENTICATE, X_CONTENT_TYPE_OPTIONS,
 };
 use axum::http::request::Parts;
+use axum::http::{Extensions, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Form, Json, Router};
@@ -27,6 +27,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+use crate::audit::{self, ErrorCode, Subject};
 use crate::devices::{Caller, Tokens};
 use crate::directory::Directory;
 use crate::error::AuthError;
@@ -66,6 +67,10 @@ pub fn router(api: Api) -> Router {
         .route("/v1/users", get(profiles))
         .route("/v1/users/me", get(own_profile).patch(set_display_name))
         .route("/v1/users/lookup", get(lookup))
+        .route_layer(axum::middleware::from_fn_with_state(
+            api.clone(),
+            audit::audit,
+        ))
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(axum::middleware::map_response(no_store_by_default))
         .with_state(api)
@@ -90,6 +95,7 @@ impl IntoResponse for AuthError {
             }
         }));
         let mut response = (status, body).into_response();
+        response.extensions_mut().insert(ErrorCode(self.code()));
         let headers = response.headers_mut();
         match self {
             Self::RateLimited { retry_after_s } => {
@@ -163,24 +169,22 @@ impl FromRequestParts<Api> for ClientIp {
     type Rejection = AuthError;
 
     async fn from_request_parts(parts: &mut Parts, api: &Api) -> Result<Self, Self::Rejection> {
-        let from_header = api.client_ip_header.as_ref().and_then(|name| {
-            // The last line: a proxy that appends its own line instead of joining it must
-            // not let the client's line win.
-            let value = parts
-                .headers
-                .get_all(name)
-                .iter()
-                .next_back()?
-                .to_str()
-                .ok()?;
-            ip_from_header(value)
-        });
-        let peer = parts
-            .extensions
-            .get::<ConnectInfo<SocketAddr>>()
-            .map(|ConnectInfo(address)| address.ip());
-        Ok(Self(from_header.or(peer)))
+        Ok(Self(client_ip(api, &parts.headers, &parts.extensions)))
     }
+}
+
+/// The client's IP: from the configured header, else the peer address.
+pub(crate) fn client_ip(api: &Api, headers: &HeaderMap, extensions: &Extensions) -> Option<IpAddr> {
+    let from_header = api.client_ip_header.as_ref().and_then(|name| {
+        // The last line: a proxy that appends its own line instead of joining it must
+        // not let the client's line win.
+        let value = headers.get_all(name).iter().next_back()?.to_str().ok()?;
+        ip_from_header(value)
+    });
+    let peer = extensions
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(address)| address.ip());
+    from_header.or(peer)
 }
 
 /// The client's IP in a header value: its last entry. `X-Real-IP` holds one address,
@@ -203,6 +207,16 @@ fn bearer(headers: &HeaderMap) -> Result<&str, AuthError> {
 
 async fn caller(api: &Api, headers: &HeaderMap) -> Result<Caller, AuthError> {
     api.auth.authenticate(bearer(headers)?).await
+}
+
+/// Tokens as JSON, with their user and device for the security log.
+fn tokens_response(status: StatusCode, tokens: &Tokens) -> Response {
+    let mut response = (status, Json(tokens_json(tokens))).into_response();
+    response.extensions_mut().insert(Subject {
+        user: Some(tokens.user_id),
+        device: Some(tokens.device_id),
+    });
+    response
 }
 
 fn tokens_json(tokens: &Tokens) -> Value {
@@ -339,7 +353,7 @@ async fn login(
                 .auth
                 .login_device(&body.email, &body.password, device_id)
                 .await?;
-            Json(tokens_json(&tokens)).into_response()
+            tokens_response(StatusCode::OK, &tokens)
         }
     })
 }
@@ -354,7 +368,7 @@ async fn refresh(
     JsonBody(body): JsonBody<RefreshBody>,
 ) -> Result<Response, AuthError> {
     let tokens = api.auth.refresh(&body.refresh_token).await?;
-    Ok(Json(tokens_json(&tokens)).into_response())
+    Ok(tokens_response(StatusCode::OK, &tokens))
 }
 
 async fn forgot(
@@ -392,22 +406,29 @@ async fn reset(
     body: Submitted<ResetBody>,
 ) -> Result<Response, AuthError> {
     api.limits.check(Action::OpenLink, ip, None).await?;
-    match body {
-        Submitted::Json(body) => {
-            api.auth.reset_password(&body.token, &body.password).await?;
-            Ok(Json(json!({"status": "password_changed"})).into_response())
-        }
-        Submitted::Form(body) => Ok(
-            match api.auth.reset_password(&body.token, &body.password).await {
-                Ok(()) => page(
-                    StatusCode::OK,
-                    "Password changed",
-                    "<p>Your password is changed and every device is signed out. Sign in again with the new password.</p>",
-                ),
-                Err(error) => error_page(&error),
-            },
-        ),
-    }
+    let (body, as_page) = match body {
+        Submitted::Json(body) => (body, false),
+        Submitted::Form(body) => (body, true),
+    };
+    let user = match api.auth.reset_password(&body.token, &body.password).await {
+        Ok(user) => user,
+        Err(error) if as_page => return Ok(error_page(&error)),
+        Err(error) => return Err(error),
+    };
+    let mut response = if as_page {
+        page(
+            StatusCode::OK,
+            "Password changed",
+            "<p>Your password is changed and every device is signed out. Sign in again with the new password.</p>",
+        )
+    } else {
+        Json(json!({"status": "password_changed"})).into_response()
+    };
+    response.extensions_mut().insert(Subject {
+        user: Some(user),
+        device: None,
+    });
+    Ok(response)
 }
 
 async fn jwks(State(api): State<Api>) -> Response {
@@ -441,7 +462,7 @@ async fn register_device(
             &body.platform,
         )
         .await?;
-    Ok((StatusCode::CREATED, Json(tokens_json(&tokens))).into_response())
+    Ok(tokens_response(StatusCode::CREATED, &tokens))
 }
 
 async fn list_devices(State(api): State<Api>, headers: HeaderMap) -> Result<Response, AuthError> {
@@ -475,7 +496,12 @@ async fn revoke_device(
     let caller = caller(&api, &headers).await?;
     let device_id: Uuid = device_id.parse().map_err(|_| AuthError::DeviceNotFound)?;
     api.auth.revoke_device(caller, device_id).await?;
-    Ok(StatusCode::NO_CONTENT.into_response())
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    response.extensions_mut().insert(Subject {
+        user: Some(caller.user_id),
+        device: Some(device_id),
+    });
+    Ok(response)
 }
 
 fn own_profile_json(profile: &crate::profiles::OwnProfile) -> Value {
@@ -594,11 +620,13 @@ fn error_page(error: &AuthError) -> Response {
         AuthError::LinkInvalid => "This link is not valid, or it was used already.".to_owned(),
         other => other.to_string(),
     };
-    page(
+    let mut response = page(
         status,
         "Something went wrong",
         &format!("<p>{}</p>", escape(&message)),
-    )
+    );
+    response.extensions_mut().insert(ErrorCode(error.code()));
+    response
 }
 
 /// Escapes text for HTML content and attribute values.
