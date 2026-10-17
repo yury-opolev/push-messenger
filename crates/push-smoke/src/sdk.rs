@@ -63,6 +63,8 @@ impl App {
         );
         let mut config = Config::new(&target.auth_url, &target.socket_url, &database);
         config.host = target.host.clone();
+        // The smoke test reaches the cluster's Services over plain HTTP, inside the cluster.
+        config.allow_insecure_transport = true;
         if encrypted {
             let passphrase = format!("{name}'s passphrase {suffix}");
             let salt = DatabaseKey::new_salt();
@@ -470,6 +472,7 @@ async fn opened_elsewhere(target: &Target, dana: &mut App) -> anyhow::Result<App
     let database = format!("{}-copy.db", dana.database.trim_end_matches(".db"));
     let mut config = Config::new(&target.auth_url, &target.socket_url, &database);
     config.host = target.host.clone();
+    config.allow_insecure_transport = true;
     let (client, events) = Client::open(config.clone(), secrets.clone())?;
     let mut copy = App {
         name: "dana's copy",

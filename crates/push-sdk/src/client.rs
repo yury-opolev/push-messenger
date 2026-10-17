@@ -49,6 +49,11 @@ pub struct Config {
     pub database_key: Option<DatabaseKey>,
     /// How long a request waits for the connection, and then for its answer.
     pub request_timeout: Duration,
+    /// Allows `http://` and `ws://` URLs to hosts other than this machine (loopback,
+    /// `localhost`, `*.localhost`, `*.local`, `*.test`), whose traffic — passwords,
+    /// tokens and messages — anyone on the path can read. Off by default: only for
+    /// development clusters reached over a private network.
+    pub allow_insecure_transport: bool,
 }
 
 impl Config {
@@ -60,8 +65,69 @@ impl Config {
             database_path: database_path.to_owned(),
             database_key: None,
             request_timeout: Duration::from_secs(15),
+            allow_insecure_transport: false,
         }
     }
+
+    /// Refuses URLs whose traffic would cross a network in plaintext, unless
+    /// [`Self::allow_insecure_transport`]: `auth_url` must be `https://` and
+    /// `socket_url` `wss://`, except to this machine.
+    fn check_transport(&self) -> Result<(), SdkError> {
+        check_url(
+            "auth_url",
+            &self.auth_url,
+            "https",
+            "http",
+            self.allow_insecure_transport,
+        )?;
+        check_url(
+            "socket_url",
+            &self.socket_url,
+            "wss",
+            "ws",
+            self.allow_insecure_transport,
+        )
+    }
+}
+
+fn check_url(
+    field: &str,
+    url: &str,
+    secure: &str,
+    plain: &str,
+    allow_insecure: bool,
+) -> Result<(), SdkError> {
+    let parsed =
+        reqwest::Url::parse(url).map_err(|error| SdkError::Invalid(format!("{field}: {error}")))?;
+    let scheme = parsed.scheme();
+    if scheme == secure {
+        return Ok(());
+    }
+    if scheme != plain {
+        return Err(SdkError::Invalid(format!(
+            "{field} must be a {secure}:// URL"
+        )));
+    }
+    if allow_insecure || parsed.host_str().is_some_and(is_this_machine) {
+        return Ok(());
+    }
+    Err(SdkError::Invalid(format!(
+        "{field} must be a {secure}:// URL: {plain}:// sends passwords, tokens and messages \
+         in plaintext (set allow_insecure_transport only for a development cluster)"
+    )))
+}
+
+/// Loopback addresses and the names reserved for this machine or local testing.
+fn is_this_machine(host: &str) -> bool {
+    let unbracketed = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(address) = unbracketed.parse::<std::net::IpAddr>() {
+        return address.is_loopback();
+    }
+    let name = host.trim_end_matches('.').to_ascii_lowercase();
+    name == "localhost"
+        || [".localhost", ".local", ".test"]
+            .iter()
+            .any(|suffix| name.ends_with(suffix))
 }
 
 /// Runs whole-file store work (an erase, a rekey, a rebind) on a blocking thread, so no
@@ -208,6 +274,7 @@ impl Client {
     /// [`Client::connect`]; once connected, whatever the outbox held is sent.
     /// [`SdkError::WrongKey`] if `config.database_key` does not open the database.
     pub fn open(config: Config, secrets: Arc<dyn SecretStore>) -> Result<(Self, Events), SdkError> {
+        config.check_transport()?;
         let auth = AuthApi::new(&config.auth_url, config.host.as_deref())?;
         let credentials = Arc::new(Credentials::new(secrets, auth.clone()));
         let mut store = Store::open(&config.database_path, config.database_key.as_ref())?;
@@ -626,6 +693,62 @@ mod tests {
     use crate::secrets::REGISTRATION_KEY;
     use crate::store::bytes;
     use crate::testing::{FakeAuth, FakeGateway, recv, send};
+
+    #[test]
+    fn plaintext_urls_are_refused_beyond_this_machine_unless_allowed() {
+        let open = |auth: &str, socket: &str, allow: bool| {
+            let config = Config {
+                allow_insecure_transport: allow,
+                ..Config::new(auth, socket, ":memory:")
+            };
+            Client::open(config, Arc::new(MemorySecretStore::new())).map(|_| ())
+        };
+        let refused = |result: Result<(), SdkError>| matches!(result, Err(SdkError::Invalid(_)));
+        assert!(
+            open(
+                "https://push.example",
+                "wss://push.example/v1/socket",
+                false
+            )
+            .is_ok()
+        );
+        for (auth, socket) in [
+            ("http://127.0.0.1:8080", "ws://127.0.0.1:8080/v1/socket"),
+            ("http://[::1]:8080", "ws://localhost/v1/socket"),
+            ("http://push.localhost", "ws://push.test/v1/socket"),
+            ("http://minikube.local", "ws://minikube.local/v1/socket"),
+        ] {
+            assert!(open(auth, socket, false).is_ok(), "{auth} {socket}");
+        }
+        assert!(refused(open(
+            "http://push.example",
+            "wss://push.example/v1/socket",
+            false
+        )));
+        assert!(refused(open(
+            "https://push.example",
+            "ws://192.168.49.2/v1/socket",
+            false
+        )));
+        assert!(refused(open(
+            "ftp://push.example",
+            "wss://push.example/v1/socket",
+            true
+        )));
+        assert!(refused(open(
+            "not a url",
+            "wss://push.example/v1/socket",
+            false
+        )));
+        assert!(
+            open(
+                "http://push-auth:8080",
+                "ws://push-gateway:8080/v1/socket",
+                true
+            )
+            .is_ok()
+        );
+    }
 
     pub(super) struct Fixture {
         pub client: Client,

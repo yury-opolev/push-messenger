@@ -116,7 +116,9 @@ void push_string_free(char *value);
 // It does not connect until `push_client_connect`. May take a second (a database key is
 // checked, the schema migrated): call it off the UI thread.
 //
-// `config_json`: `{"authUrl", "socketUrl", "databasePath", "host"?, "requestTimeoutMs"?}`.
+// `config_json`: `{"authUrl", "socketUrl", "databasePath", "host"?, "requestTimeoutMs"?,
+// "allowInsecureTransport"?}`; http:// and ws:// URLs beyond this machine are `invalid`
+// unless `allowInsecureTransport` is true (development clusters only).
 // `database_key`: NULL for a plain database, or `PUSH_DATABASE_KEY_LEN` bytes that
 // encrypt the whole file (`wrong_key` if they do not open it); copied, never stored or
 // logged. A non-zero `database_key_len` with a NULL key is `invalid`. `store`: the app's secret store, owned by the client from now on (released
