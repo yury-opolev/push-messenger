@@ -13,7 +13,8 @@ for existing bundled installations. **11B Done (#21)**:
 [plan](../plans/2026-10-16-plan-11b-portable-chart-interfaces.md),
 [consumer configuration](../../deployment-configuration.md) and
 [maintained-controller verification](../../deployment-ingress-verification.md).
-11C remains pending.
+11C: the [implementation plan](../plans/2026-10-17-plan-11c-verification-load-harness.md)
+is written and awaiting review.
 
 ## 1. Goal and ownership
 
