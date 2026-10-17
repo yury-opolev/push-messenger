@@ -13,7 +13,7 @@ for existing bundled installations. **11B Done (#21)**:
 [plan](../plans/2026-10-16-plan-11b-portable-chart-interfaces.md),
 [consumer configuration](../../deployment-configuration.md) and
 [maintained-controller verification](../../deployment-ingress-verification.md).
-**11C implemented / under review**, not Done until merged:
+**11C Done (#22)**:
 [plan](../plans/2026-10-17-plan-11c-verification-load-harness.md) and
 [consumer verification](../../consumer-verification.md).
 
