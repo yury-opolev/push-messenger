@@ -545,6 +545,35 @@ async fn a_revocation_and_a_password_reset_close_the_socket_at_once() {
     assert_eq!(next(&mut laptop_socket).await, Body::Pong(Pong {}));
 }
 
+/// A revocation whose kick was lost still ends the session: the next call message-svc
+/// refuses for the revoked device closes the socket with 4003.
+#[tokio::test]
+async fn a_revoked_device_whose_kick_was_lost_is_closed_on_its_next_call() {
+    let stack = stack().await;
+    let (alice, alice_device) = person(&stack).await;
+    let (bob, _) = person(&stack).await;
+    let conversation = direct_chat(&stack, alice, bob).await;
+    let mut socket = ready(&stack, alice, alice_device).await;
+    // Stored without a kick, as when the kick never reached the gateway.
+    stack
+        .messaging
+        .revoke_device(DeviceId(alice_device))
+        .await
+        .unwrap();
+    send(
+        &mut socket,
+        Body::Send(Send {
+            client_msg_id: id_bytes(Uuid::now_v7()),
+            conversation_id: conversation,
+            content_type: ContentType::Text.into(),
+            body: b"still here?".to_vec(),
+            client_ts: None,
+        }),
+    )
+    .await;
+    assert_eq!(close_code(&mut socket).await, 4003);
+}
+
 /// Spec §7.3, §7.4: the newest connection of a device wins; the older one is told it was
 /// opened elsewhere (4007), not that the device was removed (4003).
 #[tokio::test]

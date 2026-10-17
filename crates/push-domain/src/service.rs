@@ -118,12 +118,11 @@ where
         }
         tx.revoke_device(device).await?;
         tx.commit().await?;
-        self.publish(vec![Event::Kick {
+        self.kick(vec![Event::Kick {
             devices: vec![device],
             reason: KickReason::DeviceRevoked,
         }])
-        .await;
-        Ok(())
+        .await
     }
 
     /// auth-svc reset `user`'s password at `reset_at` (`user.password_reset`, relayed by
@@ -151,13 +150,22 @@ where
         tx.commit().await?;
         if !devices.is_empty() {
             devices.sort();
-            self.publish(vec![Event::Kick {
+            self.kick(vec![Event::Kick {
                 devices,
                 reason: KickReason::PasswordReset { reset_at },
             }])
-            .await;
+            .await?;
         }
         Ok(())
+    }
+
+    /// Kicks devices after a commit; a failure fails the operation, so the relay is
+    /// retried and kicks again ([`Notifier::kick`]).
+    async fn kick(&self, events: Vec<Event>) -> DomainResult<()> {
+        self.notifier
+            .kick(&events)
+            .await
+            .map_err(DomainError::KickFailed)
     }
 
     /// Publishes events after a commit. Publishes nothing when there is nothing to say.

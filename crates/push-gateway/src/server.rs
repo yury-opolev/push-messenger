@@ -55,7 +55,8 @@ const KEYS_RETRY: Duration = Duration::from_secs(2);
 const REDIS_TIMEOUT: Duration = Duration::from_millis(500);
 /// How long sending one frame may take; a client that does not read is cut off.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
-/// How long sending a close frame may take.
+/// How long closing a connection may take: sending the close frame and hearing the
+/// client's answer.
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Every connection syncs this often even without a ring, so entries arrive while Redis
 /// is lost or a notification was (spec §12, test 4).
@@ -601,6 +602,20 @@ impl Refusal {
     }
 }
 
+/// The close code and reason when message-svc refused a call because the connection's
+/// device was revoked or its user's password changed: the session is over, even if the
+/// kick that should have ended it was lost.
+fn session_ended(status: &tonic::Status) -> Option<(u16, &'static str)> {
+    match error_from_status(status).code() {
+        ErrorCode::PasswordChanged => Some((
+            close::INVALID_IDENTITY,
+            "the password was changed; sign in again",
+        )),
+        ErrorCode::UnknownDevice => Some((close::DEVICE_REMOVED, "the device was revoked")),
+        _ => None,
+    }
+}
+
 /// Asks message-svc whether the device of a valid token may connect: it is active and the
 /// user's, and the token is newer than the user's last password reset.
 async fn admit(messaging: &mut MessagingApi, claims: &Claims) -> Result<(), Refusal> {
@@ -612,15 +627,10 @@ async fn admit(messaging: &mut MessagingApi, claims: &Claims) -> Result<(), Refu
     let Err(status) = messaging.identify(request).await else {
         return Ok(());
     };
+    if let Some((code, reason)) = session_ended(&status) {
+        return Err(Refusal::Close(code, reason));
+    }
     match error_from_status(&status).code() {
-        ErrorCode::PasswordChanged => Err(Refusal::Close(
-            close::INVALID_IDENTITY,
-            "the password was changed; sign in again",
-        )),
-        ErrorCode::UnknownDevice => Err(Refusal::Close(
-            close::DEVICE_REMOVED,
-            "the device was revoked",
-        )),
         ErrorCode::DeviceNotReady => {
             // Normal for a second after a device registers: the worker has not relayed it.
             tracing::debug!(device = %claims.device, "device not relayed yet");
@@ -709,6 +719,7 @@ impl Connected {
                 let body = match self.messaging.send(request).await {
                     Ok(ack) => Body::SendAck(ack.into_inner()),
                     Err(status) => {
+                        self.end_if_over(&status).await?;
                         let mut error = error_from_status(&status);
                         error.client_msg_id = Some(client_msg_id);
                         Body::Error(error)
@@ -729,6 +740,7 @@ impl Connected {
                     }
                     Ok(_) => Ok(()),
                     Err(status) => {
+                        self.end_if_over(&status).await?;
                         let error = Body::Error(error_from_status(&status));
                         send(&mut self.socket, error).await
                     }
@@ -762,6 +774,7 @@ impl Connected {
                 match self.messaging.read_up_to(request).await {
                     Ok(_) => Ok(()),
                     Err(status) => {
+                        self.end_if_over(&status).await?;
                         let error = Body::Error(error_from_status(&status));
                         send(&mut self.socket, error).await
                     }
@@ -787,6 +800,7 @@ impl Connected {
                 let body = match self.messaging.request(call).await {
                     Ok(response) => Body::Response(response.into_inner()),
                     Err(status) => {
+                        self.end_if_over(&status).await?;
                         let mut error = error_from_status(&status);
                         error.request_id = Some(request_id);
                         Body::Error(error)
@@ -814,12 +828,25 @@ impl Connected {
         let body = match answer {
             Ok(ack) => Body::SendAck(ack.into_inner()),
             Err(status) => {
+                self.end_if_over(&status).await?;
                 let mut error = error_from_status(&status);
                 error.client_msg_id = Some(client_msg_id);
                 Body::Error(error)
             }
         };
         send(&mut self.socket, body).await
+    }
+
+    /// Closes the connection when message-svc refused a call because the session is over
+    /// ([`session_ended`]); otherwise lets the caller answer the error.
+    async fn end_if_over(&mut self, status: &tonic::Status) -> Result<(), Closed> {
+        match session_ended(status) {
+            Some((code, reason)) => {
+                close_with(&mut self.socket, code, reason).await;
+                Err(Closed)
+            }
+            None => Ok(()),
+        }
     }
 
     /// Tells the client its token expires soon, once per token.
@@ -891,6 +918,7 @@ impl Connected {
             let batch = match self.messaging.sync(request).await {
                 Ok(batch) => batch.into_inner(),
                 Err(status) => {
+                    self.end_if_over(&status).await?;
                     let delay = self.retry.failed();
                     self.retry_at = Some(Instant::now() + delay);
                     tracing::warn!(
@@ -928,12 +956,26 @@ async fn send(socket: &mut WebSocket, body: Body) -> Result<(), Closed> {
     }
 }
 
+/// Closes the connection (RFC 6455 §7.1.2): sends the close frame, then reads until the
+/// client answers it, so the client receives the frame before the connection is dropped;
+/// dropping it first can reset the connection and lose the frame. Both together take at
+/// most [`CLOSE_TIMEOUT`].
 async fn close_with(socket: &mut WebSocket, code: u16, reason: &'static str) {
     let frame = CloseFrame {
         code,
         reason: reason.into(),
     };
-    let _ = tokio::time::timeout(CLOSE_TIMEOUT, socket.send(Message::Close(Some(frame)))).await;
+    let handshake = async {
+        if socket.send(Message::Close(Some(frame))).await.is_err() {
+            return;
+        }
+        while let Some(Ok(message)) = socket.recv().await {
+            if matches!(message, Message::Close(_)) {
+                return;
+            }
+        }
+    };
+    let _ = tokio::time::timeout(CLOSE_TIMEOUT, handshake).await;
 }
 
 /// Structured JSON logs on stdout. The level comes from `RUST_LOG` (default `info`).
