@@ -227,6 +227,10 @@ Check 'gateway.authUrl fetches the key set over https' {
     $tls = helm template push $chart --set gateway.authUrl=https://push-auth.push.svc:8443 | Out-String
     (Doc $tls 'Deployment' 'push-gateway') -match 'name: PUSH_AUTH_URL\s+value: "https://push-auth.push.svc:8443"'
 }
+Check 'default: the bundled PostgreSQL and Redis images are pinned by digest' {
+    (Doc $default 'StatefulSet' 'push-postgres') -match 'image: postgres:17-alpine@sha256:[0-9a-f]{64}\s' -and
+        (Doc $default 'Deployment' 'push-redis') -match 'image: redis:7-alpine@sha256:[0-9a-f]{64}\s'
+}
 Check 'default: groups are refused; one switch serves them' {
     $on = helm template push $chart --set gateway.groups=true | Out-String
     (Doc $default 'Deployment' 'push-gateway') -match 'name: PUSH_GROUPS\s+value: "0"' -and

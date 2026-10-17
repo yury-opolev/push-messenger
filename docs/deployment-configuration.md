@@ -173,7 +173,10 @@ rendered as `repository@digest`. Use the digest your own publication returned fo
 **each** image; they differ. For example (synthetic, non-deployable):
 `digest: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`.
 `postgres.image` and `redis.image` are complete references and accept
-`repository@sha256:...` directly. Valid syntax does not prove a digest exists or is
+`repository@sha256:...` directly; by default they are `postgres:17-alpine` and
+`redis:7-alpine` pinned to the digest of their multi-arch index, as are the
+Dockerfile's base images. Upgrading from a chart that named them by tag alone restarts
+the bundled PostgreSQL and Redis once (their pod spec changes). Valid syntax does not prove a digest exists or is
 signed; registry authorization is supplied through your own workload mechanisms.
 Build images with `docker build -f deploy/docker/Dockerfile --target <name> .` for
 `auth`, `message-svc`, `gateway`, `worker` and `smoke`.

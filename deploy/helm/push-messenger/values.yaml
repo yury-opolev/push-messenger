@@ -139,7 +139,9 @@ messageSvc:
       memory: 256Mi
 
 postgres:
-  image: postgres:17-alpine
+  # Pinned by digest (the multi-arch index of postgres:17-alpine), so every install runs
+  # the same bytes; set another tag@digest to move.
+  image: postgres:17-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24
   # Bootstrap administrator password, used only by bundled PostgreSQL.
   # Empty: generated on install and kept on upgrades. Use letters and digits only.
   password: ""
@@ -162,7 +164,8 @@ postgres:
       memory: 1Gi
 
 redis:
-  image: redis:7-alpine
+  # Pinned by digest (the multi-arch index of redis:7-alpine), like postgres.image.
+  image: redis:7-alpine@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499
   # Empty: generated on install and kept on upgrades. Letters and digits only.
   password: ""
   resources:
