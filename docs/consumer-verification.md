@@ -8,7 +8,8 @@ publish to your own registry. Chart configuration is in
 
 ## Build
 
-From source (Rust 1.85 or later; Docker for the integration tests):
+From source (Rust 1.85 or later builds every crate; the tests need Rust 1.88 or later,
+for testcontainers, and Docker):
 
 ```text
 cargo build --release --locked -p push-auth -p push-message-svc -p push-gateway -p push-worker -p push-load

@@ -68,10 +68,12 @@ pub(crate) fn domain_error(error: DomainError) -> Status {
         DomainError::NotAdmin => (Code::PermissionDenied, ErrorCode::NotAdmin),
         DomainError::LastAdmin => (Code::FailedPrecondition, ErrorCode::LastAdmin),
         DomainError::Conflict => (Code::Aborted, ErrorCode::Unavailable),
+        DomainError::KickFailed(_) => (Code::Unavailable, ErrorCode::Unavailable),
         DomainError::Store(_) => (Code::Unavailable, ErrorCode::Unavailable),
     };
     let message = match &error {
         DomainError::Store(_) => "a temporary storage problem; retry".to_owned(),
+        DomainError::KickFailed(_) => "the change was saved but not delivered; retry".to_owned(),
         other => other.to_string(),
     };
     error_status(
@@ -351,6 +353,11 @@ mod tests {
             ),
             (DomainError::Conflict, Code::Aborted, ErrorCode::Unavailable),
             (
+                DomainError::KickFailed("redis down".into()),
+                Code::Unavailable,
+                ErrorCode::Unavailable,
+            ),
+            (
                 DomainError::Store("relation missing".into()),
                 Code::Unavailable,
                 ErrorCode::Unavailable,
@@ -360,7 +367,10 @@ mod tests {
         for (domain, code, error_code) in cases {
             let retryable = matches!(
                 domain,
-                DomainError::DeviceNotKnownYet | DomainError::Conflict | DomainError::Store(_)
+                DomainError::DeviceNotKnownYet
+                    | DomainError::Conflict
+                    | DomainError::KickFailed(_)
+                    | DomainError::Store(_)
             );
             let message = domain.to_string();
             let status = domain_error(domain);

@@ -18,7 +18,8 @@ use crate::convert::contact_state;
 /// `EntriesAvailable` syncs the user's devices.
 ///
 /// Best effort, as `Notifier` requires: a failed publish is logged and dropped, since
-/// clients catch up on their next sync.
+/// clients catch up on their next sync. A failed kick is reported instead, so the relay
+/// that asked for it is retried.
 #[derive(Clone)]
 pub struct RedisNotifier {
     connection: ConnectionManager,
@@ -32,27 +33,43 @@ impl RedisNotifier {
         let connection = client.get_connection_manager().await?;
         Ok(Self { connection })
     }
+
+    async fn send(&self, messages: &[(String, Vec<u8>)]) -> redis::RedisResult<()> {
+        if messages.is_empty() {
+            return Ok(());
+        }
+        let mut pipeline = redis::pipe();
+        for (channel, payload) in messages {
+            pipeline.publish(channel, payload).ignore();
+        }
+        let mut connection = self.connection.clone();
+        pipeline.query_async::<()>(&mut connection).await
+    }
 }
 
 #[async_trait]
 impl Notifier for RedisNotifier {
     async fn publish(&self, events: &[Event]) {
         let messages = notifications(events);
-        if messages.is_empty() {
-            return;
-        }
-        let mut pipeline = redis::pipe();
-        for (channel, payload) in &messages {
-            pipeline.publish(channel, payload).ignore();
-        }
-        let mut connection = self.connection.clone();
-        if let Err(error) = pipeline.query_async::<()>(&mut connection).await {
+        if let Err(error) = self.send(&messages).await {
             tracing::warn!(
                 %error,
                 count = messages.len(),
                 "could not publish notifications; clients catch up on their next sync"
             );
         }
+    }
+
+    async fn kick(&self, events: &[Event]) -> Result<(), String> {
+        let messages = notifications(events);
+        self.send(&messages).await.map_err(|error| {
+            tracing::warn!(
+                %error,
+                count = messages.len(),
+                "could not publish kicks; the relay will retry"
+            );
+            error.to_string()
+        })
     }
 }
 

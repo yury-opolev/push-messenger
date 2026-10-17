@@ -37,6 +37,17 @@ spec:
       containers:
         - name: postgres
           image: {{ .Values.postgres.image }}
+          # The image's entrypoint starts as root only to give PGDATA and the socket
+          # directory to the postgres user, then switches to it: these capabilities are
+          # all it needs, and the server itself runs with none. No fs group ownership change
+          # either: its recursive chmod would loosen PGDATA, which PostgreSQL refuses to
+          # start on.
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+              add: ["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"]
           ports:
             - name: postgres
               containerPort: 5432
@@ -86,10 +97,19 @@ spec:
             - name: init
               mountPath: /docker-entrypoint-initdb.d
               readOnly: true
+            # The root filesystem is read-only: the server's socket and temporary files.
+            - name: run
+              mountPath: /var/run/postgresql
+            - name: tmp
+              mountPath: /tmp
       volumes:
         - name: init
           configMap:
             name: {{ include "push.name" (dict "root" . "component" "postgres-init") }}
+        - name: run
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
   volumeClaimTemplates:
     - metadata:
         name: data

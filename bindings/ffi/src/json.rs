@@ -230,12 +230,14 @@ struct ConfigFields {
     host: Option<String>,
     #[serde(default)]
     request_timeout_ms: Option<u64>,
+    #[serde(default)]
+    allow_insecure_transport: bool,
 }
 
 /// A [`push_sdk::Config`] from `{"authUrl", "socketUrl", "databasePath", "host"?,
-/// "requestTimeoutMs"?}` and, apart from the JSON so it never sits in a string, the
-/// database key's 32 bytes. An unknown field is refused, so a misspelt setting is not
-/// silently dropped.
+/// "requestTimeoutMs"?, "allowInsecureTransport"?}` and, apart from the JSON so it never
+/// sits in a string, the database key's 32 bytes. An unknown field is refused, so a
+/// misspelt setting is not silently dropped.
 pub fn config(value: Value, database_key: Option<&[u8]>) -> Result<push_sdk::Config, SdkError> {
     let fields: ConfigFields = serde_json::from_value(value)
         .map_err(|error| SdkError::Invalid(format!("config: {error}")))?;
@@ -245,6 +247,7 @@ pub fn config(value: Value, database_key: Option<&[u8]>) -> Result<push_sdk::Con
     if let Some(timeout) = fields.request_timeout_ms {
         config.request_timeout = Duration::from_millis(timeout);
     }
+    config.allow_insecure_transport = fields.allow_insecure_transport;
     config.database_key = database_key.map(DatabaseKey::from_bytes).transpose()?;
     Ok(config)
 }
@@ -372,6 +375,10 @@ mod tests {
         let opened = config(value.clone(), Some(&[7; 32])).unwrap();
         assert_eq!(opened.host.as_deref(), Some("push.local"));
         assert_eq!(opened.request_timeout, Duration::from_millis(2500));
+        assert!(!opened.allow_insecure_transport);
+        let mut insecure = value.clone();
+        insecure["allowInsecureTransport"] = json!(true);
+        assert!(config(insecure, None).unwrap().allow_insecure_transport);
         assert!(opened.database_key.is_some());
         assert_eq!(config(value.clone(), None).unwrap().database_key, None);
         assert_eq!(

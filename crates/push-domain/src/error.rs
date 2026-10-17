@@ -52,16 +52,23 @@ pub enum DomainError {
     LastAdmin,
     #[error("a concurrent change conflicted; retry the operation")]
     Conflict,
+    /// A revocation or password reset was stored, but its kick could not be delivered to
+    /// the gateways: the caller (the worker's relay) retries, which kicks again.
+    #[error("the kick could not be delivered; retry: {0}")]
+    KickFailed(String),
     #[error("storage error: {0}")]
     Store(String),
 }
 
 impl DomainError {
     /// Whether the same operation may succeed if the caller tries it again unchanged.
-    /// Only `Conflict` and `DeviceNotKnownYet` are retryable: every other error repeats
-    /// until something changes.
+    /// `Conflict`, `DeviceNotKnownYet` and `KickFailed` are retryable: every other error
+    /// repeats until something changes.
     pub fn is_retryable(&self) -> bool {
-        matches!(self, Self::Conflict | Self::DeviceNotKnownYet)
+        matches!(
+            self,
+            Self::Conflict | Self::DeviceNotKnownYet | Self::KickFailed(_)
+        )
     }
 }
 
@@ -72,9 +79,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_a_conflict_and_a_device_not_known_yet_are_retryable() {
+    fn only_a_conflict_a_device_not_known_yet_and_a_failed_kick_are_retryable() {
         assert!(DomainError::Conflict.is_retryable());
         assert!(DomainError::DeviceNotKnownYet.is_retryable());
+        assert!(DomainError::KickFailed("redis down".into()).is_retryable());
         assert!(!DomainError::UnknownDevice.is_retryable());
         assert!(!DomainError::NotMember.is_retryable());
         assert!(!DomainError::Store("connection lost".into()).is_retryable());

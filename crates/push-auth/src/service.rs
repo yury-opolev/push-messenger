@@ -441,8 +441,8 @@ impl Auth {
     /// account and writes `user.password_reset`, on which every device is kicked
     /// (spec §5.4). Setting the password changes the stamp, so the link works once. The
     /// link reached the address, so the email counts as verified from now on; if it was
-    /// not, `user.verified` is written too.
-    pub async fn reset_password(&self, token: &str, password: &str) -> Result<(), AuthError> {
+    /// not, `user.verified` is written too. Returns the user's id.
+    pub async fn reset_password(&self, token: &str, password: &str) -> Result<Uuid, AuthError> {
         let claims = self
             .links
             .verify(token, Purpose::Reset, unix_now())
@@ -464,12 +464,17 @@ impl Auth {
         if claims.pw.as_deref() != Some(password_stamp(&current).as_str()) {
             return Err(AuthError::LinkInvalid);
         }
+        // The clock that sets the access tokens' `iat`: auth-svc (in `authenticate`) and
+        // message-svc refuse every token issued no later than this second, and only those.
+        let reset_at = unix_now();
         sqlx::query(
             "UPDATE auth.user_account SET password_hash = $2, \
-             email_verified_at = coalesce(email_verified_at, now()) WHERE user_id = $1",
+             email_verified_at = coalesce(email_verified_at, now()), \
+             password_reset_at = greatest(password_reset_at, $3) WHERE user_id = $1",
         )
         .bind(claims.sub)
         .bind(&new_hash)
+        .bind(reset_at)
         .execute(&mut *tx)
         .await?;
         // Device rows first, in a fixed order, like every other change to a device's tokens.
@@ -502,12 +507,12 @@ impl Auth {
             &mut tx,
             &Event::UserPasswordReset {
                 user_id: claims.sub,
-                reset_at: unix_now(),
+                reset_at,
             },
         )
         .await?;
         tx.commit().await?;
-        Ok(())
+        Ok(claims.sub)
     }
 }
 

@@ -102,7 +102,7 @@ mod tests {
     #[test]
     fn close_waits_for_a_clone_from_a_thread_without_a_runtime() {
         let (client, _events) = Client::open(
-            Config::new("http://127.0.0.1:1", "http://127.0.0.1:1", ":memory:"),
+            Config::new("http://127.0.0.1:1", "ws://127.0.0.1:1", ":memory:"),
             Arc::new(MemorySecretStore::new()),
         )
         .unwrap();

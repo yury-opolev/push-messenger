@@ -11,7 +11,9 @@
 # The context is the repository root. Needs BuildKit (the default for `docker build`
 # since Docker 23) for the cache mounts.
 
-FROM rust:1.85-slim-bookworm AS builder
+# The base images are pinned by digest (their multi-arch index), so a rebuild uses
+# exactly the reviewed bytes; Dependabot proposes new digests.
+FROM rust:1.85-slim-bookworm@sha256:9f841bbe9e7d8e37ceb96ed907265a3a0df7f44e3737d0b100e7907a679acb36 AS builder
 WORKDIR /src
 COPY . .
 # The registry and target caches survive between builds on the same Docker daemon; the
@@ -26,7 +28,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
         target/release/push-load /out/
 
 # glibc and libgcc, no shell, no package manager; runs as uid 65532 ("nonroot").
-FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
+FROM gcr.io/distroless/cc-debian12:nonroot@sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f AS runtime
 
 FROM runtime AS auth
 COPY --from=builder /out/push-auth /usr/local/bin/push-auth

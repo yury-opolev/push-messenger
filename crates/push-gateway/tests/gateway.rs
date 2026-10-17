@@ -545,6 +545,35 @@ async fn a_revocation_and_a_password_reset_close_the_socket_at_once() {
     assert_eq!(next(&mut laptop_socket).await, Body::Pong(Pong {}));
 }
 
+/// A revocation whose kick was lost still ends the session: the next call message-svc
+/// refuses for the revoked device closes the socket with 4003.
+#[tokio::test]
+async fn a_revoked_device_whose_kick_was_lost_is_closed_on_its_next_call() {
+    let stack = stack().await;
+    let (alice, alice_device) = person(&stack).await;
+    let (bob, _) = person(&stack).await;
+    let conversation = direct_chat(&stack, alice, bob).await;
+    let mut socket = ready(&stack, alice, alice_device).await;
+    // Stored without a kick, as when the kick never reached the gateway.
+    stack
+        .messaging
+        .revoke_device(DeviceId(alice_device))
+        .await
+        .unwrap();
+    send(
+        &mut socket,
+        Body::Send(Send {
+            client_msg_id: id_bytes(Uuid::now_v7()),
+            conversation_id: conversation,
+            content_type: ContentType::Text.into(),
+            body: b"still here?".to_vec(),
+            client_ts: None,
+        }),
+    )
+    .await;
+    assert_eq!(close_code(&mut socket).await, 4003);
+}
+
 /// Spec §7.3, §7.4: the newest connection of a device wins; the older one is told it was
 /// opened elsewhere (4007), not that the device was removed (4003).
 #[tokio::test]
@@ -849,6 +878,57 @@ async fn redeeming_invites_is_rate_limited() {
         request(&mut socket, 22, list).await,
         Body::Response(_)
     ));
+}
+
+/// A user's writes are limited across their devices: past 120 a minute, a write is
+/// answered with a retryable `RATE_LIMITED` carrying its `client_msg_id`, and the
+/// connection stays open.
+#[tokio::test]
+async fn writes_past_the_users_quota_are_refused_for_their_client_msg_id() {
+    let stack = stack().await;
+    let (alice, alice_device) = person(&stack).await;
+    let (bob, _) = person(&stack).await;
+    let conversation = direct_chat(&stack, alice, bob).await;
+    let mut socket = ready(&stack, alice, alice_device).await;
+    let send_one = |id: Vec<u8>| {
+        Body::Send(Send {
+            client_msg_id: id,
+            conversation_id: conversation.clone(),
+            content_type: ContentType::Text.into(),
+            body: b"hello".to_vec(),
+            client_ts: None,
+        })
+    };
+    // Paced under the frame budget (100 at once, then 20 a second).
+    for sent in 0..120 {
+        if sent == 90 {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        send(&mut socket, send_one(id_bytes(Uuid::now_v7()))).await;
+        let answer = wait_for(&mut socket, |body| {
+            matches!(body, Body::SendAck(_) | Body::Error(_))
+        })
+        .await;
+        assert!(matches!(answer, Body::SendAck(_)), "{answer:?}");
+    }
+    let refused_id = id_bytes(Uuid::now_v7());
+    send(&mut socket, send_one(refused_id.clone())).await;
+    let Body::Error(error) = wait_for(&mut socket, |body| {
+        matches!(body, Body::SendAck(_) | Body::Error(_))
+    })
+    .await
+    else {
+        panic!("the 121st write of the minute was stored");
+    };
+    assert_eq!(error.code(), ErrorCode::RateLimited);
+    assert!(error.retryable);
+    assert_eq!(error.client_msg_id, Some(refused_id));
+    assert!(error.retry_after_s.is_some_and(|seconds| seconds <= 60));
+    send(&mut socket, Body::Ping(Ping {})).await;
+    assert_eq!(
+        wait_for(&mut socket, |body| matches!(body, Body::Pong(_))).await,
+        Body::Pong(Pong {})
+    );
 }
 
 /// A connection that floods the gateway with frames is closed with 4004.

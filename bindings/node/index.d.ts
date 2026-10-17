@@ -13,6 +13,12 @@ export interface Config {
   host?: string;
   /** How long a request waits for the connection, and then for its answer (15 000). */
   requestTimeoutMs?: number;
+  /**
+   * Allows `http://` and `ws://` URLs beyond this machine (loopback, `localhost`,
+   * `*.localhost`, `*.local`, `*.test`), which send passwords, tokens and messages in
+   * plaintext. Development clusters only (false).
+   */
+  allowInsecureTransport?: boolean;
   /** 32 bytes that encrypt the whole database; never stored or logged by the SDK. */
   databaseKey?: Uint8Array;
 }

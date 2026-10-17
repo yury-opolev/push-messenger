@@ -100,6 +100,15 @@ pub trait Notifier: Send + Sync {
     /// Called only after the triggering transaction committed. Best effort: it must not
     /// fail the operation that triggered it.
     async fn publish(&self, events: &[Event]);
+
+    /// Kicks devices (a revocation or a password reset), after the commit. Unlike
+    /// [`Self::publish`] a failure is reported: the relay that asked for the kick fails
+    /// and the worker retries it, so a lost kick cannot leave a signed-out session open
+    /// until its token expires. A repeated kick is harmless.
+    async fn kick(&self, events: &[Event]) -> Result<(), String> {
+        self.publish(events).await;
+        Ok(())
+    }
 }
 
 /// Discards events.
@@ -111,16 +120,23 @@ impl Notifier for NoopNotifier {
     async fn publish(&self, _events: &[Event]) {}
 }
 
-/// Records events. For tests.
+/// Records events. For tests; [`Self::fail_kicks`] makes its kicks fail.
 #[derive(Debug, Default)]
 pub struct RecordingNotifier {
     events: Mutex<Vec<Event>>,
+    failing_kicks: std::sync::atomic::AtomicBool,
 }
 
 impl RecordingNotifier {
     /// Returns and clears every event published so far, in publication order.
     pub fn take(&self) -> Vec<Event> {
         std::mem::take(&mut *self.events.lock().expect("notifier lock poisoned"))
+    }
+
+    /// Makes kicks fail (and record nothing) until called again with `false`.
+    pub fn fail_kicks(&self, failing: bool) {
+        self.failing_kicks
+            .store(failing, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -132,11 +148,23 @@ impl Notifier for RecordingNotifier {
             .expect("notifier lock poisoned")
             .extend_from_slice(events);
     }
+
+    async fn kick(&self, events: &[Event]) -> Result<(), String> {
+        if self.failing_kicks.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("kicks are failing".to_owned());
+        }
+        self.publish(events).await;
+        Ok(())
+    }
 }
 
 #[async_trait]
 impl<T: Notifier + ?Sized> Notifier for Arc<T> {
     async fn publish(&self, events: &[Event]) {
         (**self).publish(events).await;
+    }
+
+    async fn kick(&self, events: &[Event]) -> Result<(), String> {
+        (**self).kick(events).await
     }
 }

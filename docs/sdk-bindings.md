@@ -133,6 +133,12 @@ try {
 await client.close();
 ```
 
+The URLs must be `https://` and `wss://`. Plain `http://` and `ws://` are accepted only
+to this machine (loopback, `localhost`, `*.localhost`, `*.local`, `*.test`), since they
+send passwords, tokens and messages in plaintext; anything else fails `Client.open` with
+`invalid` unless the config sets `allowInsecureTransport: true` (Rust:
+`Config::allow_insecure_transport`, C: the same JSON field), which is meant for
+development clusters only.
 - `Client.open` loads the credentials from the store, then opens the database on a thread
   of its own (a key is stretched, the schema migrated): the JavaScript thread never waits.
 - `account()`, `connectionState()`, `connect()`, `disconnect()` and `onEvent()` answer at

@@ -885,6 +885,17 @@ one; `ListConversations` gives the current values.
 - **Reconnect backoff.** Exponential with jitter, 1 s up to 60 s.
 - Because takeover depends on Redis, two sockets for one device can briefly coexist. The
   SDK ignores a `Deliver` it already has, keyed by `(conversation_id, seq)`.
+- **Write quota.** `Send`, `Edit` and `Delete` together are limited per user across their
+  devices: 120 a minute and 3,000 an hour. Over it, the write gets a retryable
+  `RATE_LIMITED` with its `client_msg_id` and `retry_after_s`, and the connection stays
+  open. Like `Identify` the quota fails open while Redis is down, so messaging continues;
+  the per-connection frame budget still applies. (OWASP review 2026-10-17, F4.)
+- **A session that is over closes.** When message-svc refuses any call because the
+  device was revoked or the password changed (`UNKNOWN_DEVICE`, `PASSWORD_CHANGED`), the
+  gateway closes the connection with 4003 or 4001, as the kick would have; a lost kick
+  cannot leave such a session working. Kicks themselves are retried: message-svc fails
+  the relayed revocation or reset when it cannot publish the kick, and the worker
+  retries the relay.
 
 Implementation notes (gateway, Plan 8):
 

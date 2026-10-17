@@ -223,6 +223,22 @@ Check 'default: the gateway checks tokens with auth-svc''s keys, for its own URL
         $gateway -notmatch 'PUSH_CLIENT_IP_HEADER' -and
         $default -notmatch 'PUSH_DEV_AUTH'
 }
+Check 'gateway.authUrl fetches the key set over https' {
+    $tls = helm template push $chart --set gateway.authUrl=https://push-auth.push.svc:8443 | Out-String
+    (Doc $tls 'Deployment' 'push-gateway') -match 'name: PUSH_AUTH_URL\s+value: "https://push-auth.push.svc:8443"'
+}
+Check 'default: the bundled PostgreSQL and Redis images are pinned by digest' {
+    (Doc $default 'StatefulSet' 'push-postgres') -match 'image: postgres:17-alpine@sha256:[0-9a-f]{64}\s' -and
+        (Doc $default 'Deployment' 'push-redis') -match 'image: redis:7-alpine@sha256:[0-9a-f]{64}\s'
+}
+Check 'default: PostgreSQL keeps only the capabilities its entrypoint needs, on a read-only root' {
+    $postgres = Doc $default 'StatefulSet' 'push-postgres'
+    $postgres -match 'allowPrivilegeEscalation: false' -and
+        $postgres -match 'readOnlyRootFilesystem: true' -and
+        $postgres -match 'drop: \["ALL"\]\s+add: \["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"\]' -and
+        $postgres -match 'mountPath: /var/run/postgresql' -and $postgres -match 'mountPath: /tmp' -and
+        $postgres -notmatch 'fsGroup'
+}
 Check 'default: groups are refused; one switch serves them' {
     $on = helm template push $chart --set gateway.groups=true | Out-String
     (Doc $default 'Deployment' 'push-gateway') -match 'name: PUSH_GROUPS\s+value: "0"' -and

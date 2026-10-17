@@ -284,6 +284,8 @@ where
 #[derive(Clone)]
 pub struct InternalToken {
     expected: Option<Arc<str>>,
+    /// The API it guards, for the security log.
+    api: &'static str,
     /// Why every call is refused without a configured token.
     off: &'static str,
     /// Why a call without the right token is refused.
@@ -295,6 +297,7 @@ impl InternalToken {
     pub fn accounts(expected: Option<String>) -> Self {
         Self {
             expected: expected.map(Arc::from),
+            api: "Accounts",
             off: "the Accounts API is off: PUSH_ACCOUNTS_TOKEN is not set",
             refused: "the Accounts API needs the internal token",
         }
@@ -304,6 +307,7 @@ impl InternalToken {
     pub fn directory(expected: Option<String>) -> Self {
         Self {
             expected: expected.map(Arc::from),
+            api: "Directory",
             off: "the Directory API is off: PUSH_DIRECTORY_TOKEN is not set",
             refused: "the Directory API needs the internal token",
         }
@@ -315,6 +319,7 @@ impl InternalToken {
     pub fn messaging(expected: Option<String>) -> Self {
         Self {
             expected: expected.map(Arc::from),
+            api: "Messaging",
             off: "the Messaging API is off: PUSH_MESSAGING_TOKEN is not set",
             refused: "the Messaging API needs the internal token",
         }
@@ -326,6 +331,7 @@ impl std::fmt::Debug for InternalToken {
         formatter
             .debug_struct("InternalToken")
             .field("expected", &self.expected.as_ref().map(|_| "<redacted>"))
+            .field("api", &self.api)
             .field("off", &self.off)
             .finish()
     }
@@ -343,7 +349,20 @@ impl Interceptor for InternalToken {
             .and_then(|value| value.strip_prefix("Bearer "));
         match presented {
             Some(token) if same(token.as_bytes(), expected.as_bytes()) => Ok(request),
-            _ => Err(Status::unauthenticated(self.refused)),
+            _ => {
+                // A caller inside the cluster without the right token: a misconfiguration
+                // or a compromised pod. Never the token itself.
+                let peer = request.remote_addr().map(tracing::field::display);
+                tracing::warn!(
+                    target: "security",
+                    event = "internal.token.refused",
+                    api = self.api,
+                    token_presented = presented.is_some(),
+                    peer,
+                    "an internal API call was refused"
+                );
+                Err(Status::unauthenticated(self.refused))
+            }
         }
     }
 }

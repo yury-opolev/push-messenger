@@ -177,6 +177,52 @@ async fn a_relayed_revocation_kicks_the_device<B: Backend>(backend: &B) {
     assert_eq!(world.notifier.take(), []);
 }
 
+async fn a_failed_kick_fails_the_relay_so_it_is_retried<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
+    let alice = world.person().await;
+    let tablet = world.add_device(&alice).await;
+    world.notifier.take();
+    world.notifier.fail_kicks(true);
+
+    let revoked = world.svc.device_revoked(tablet, alice.user).await;
+    assert!(matches!(revoked, Err(DomainError::KickFailed(_))));
+    assert!(revoked.unwrap_err().is_retryable());
+    let reset_at = world.clock.now();
+    let reset = world.svc.password_reset(alice.user, Some(reset_at)).await;
+    assert!(matches!(reset, Err(DomainError::KickFailed(_))));
+    // The changes were stored even though their kicks were lost.
+    assert_eq!(
+        world.identify(tablet, alice.user).await,
+        Err(DomainError::UnknownDevice)
+    );
+    assert_eq!(
+        world.svc.identify(alice.device, alice.user, reset_at).await,
+        Err(DomainError::PasswordChanged)
+    );
+
+    // The retries kick.
+    world.notifier.fail_kicks(false);
+    world.svc.device_revoked(tablet, alice.user).await.unwrap();
+    world
+        .svc
+        .password_reset(alice.user, Some(reset_at))
+        .await
+        .unwrap();
+    assert_eq!(
+        world.notifier.take(),
+        [
+            Event::Kick {
+                devices: vec![tablet],
+                reason: KickReason::DeviceRevoked,
+            },
+            Event::Kick {
+                devices: vec![alice.device],
+                reason: KickReason::PasswordReset { reset_at },
+            },
+        ]
+    );
+}
+
 async fn a_password_reset_kicks_every_active_device_of_the_user<B: Backend>(backend: &B) {
     let world = World::new(backend).await;
     let (alice, bob) = (world.person().await, world.person().await);
@@ -323,6 +369,7 @@ pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
         a_relayed_revocation_closes_an_active_device,
         relayed_events_for_another_users_device_are_refused,
         a_relayed_revocation_kicks_the_device,
+        a_failed_kick_fails_the_relay_so_it_is_retried,
         a_password_reset_kicks_every_active_device_of_the_user,
         identify_refuses_tokens_issued_until_the_password_reset,
         a_redelivered_or_older_reset_signs_out_no_newer_session,

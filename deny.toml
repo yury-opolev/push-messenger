@@ -1,0 +1,41 @@
+# cargo-deny (https://embarkstudios.github.io/cargo-deny/): known vulnerabilities,
+# licences and where crates come from. Contributor tooling: `cargo deny check`; CI runs
+# it on every pull request and Dependabot proposes updates.
+
+[graph]
+all-features = false
+
+[advisories]
+# Every advisory in the RustSec database fails the check, unmaintained crates included,
+# unless it is listed here with the reason it does not apply. (rsa's RUSTSEC-2023-0071
+# needs no entry: Cargo.lock lists rsa for sqlx-mysql, which this workspace never builds,
+# and cargo-deny checks the crates actually built.)
+unmaintained = "workspace"
+yanked = "deny"
+ignore = []
+
+[licenses]
+# The workspace is MIT; dependencies must be under a permissive licence.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "allow"
+# The workspace's own crates depend on each other by path; none is published.
+wildcards = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
