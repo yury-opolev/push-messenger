@@ -3847,4 +3847,3 @@ consumer deployment's work; nothing in this plan claims them.
 - The only deliberately compressed step is Task 8's move of the existing whole-stack
   setup into `Stack::start`: it is the current code moved verbatim with the two stated
   changes, not new behaviour.
-
