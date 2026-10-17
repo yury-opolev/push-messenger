@@ -2300,6 +2300,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "push-load"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "futures-util",
+ "push-proto",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite",
+ "tokio-util",
+ "uuid",
+]
+
+[[package]]
 name = "push-message-svc"
 version = "0.1.0"
 dependencies = [

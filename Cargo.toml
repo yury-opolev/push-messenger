@@ -8,6 +8,7 @@ members = [
     "crates/push-domain",
     "crates/push-email",
     "crates/push-gateway",
+    "crates/push-load",
     "crates/push-message-svc",
     "crates/push-proto",
     "crates/push-sdk",
@@ -42,6 +43,7 @@ push-auth = { path = "crates/push-auth" }
 push-domain = { path = "crates/push-domain" }
 push-email = { path = "crates/push-email" }
 push-gateway = { path = "crates/push-gateway" }
+push-load = { path = "crates/push-load" }
 push-message-svc = { path = "crates/push-message-svc" }
 push-proto = { path = "crates/push-proto" }
 push-sdk = { path = "crates/push-sdk" }
