@@ -163,6 +163,10 @@ offline rendering, the explicit Resend webhook switch, controller-neutral Ingres
 TLS and annotation maps, trusted client-IP headers, and image digests.
 [docs/deployment-ingress-verification.md](docs/deployment-ingress-verification.md)
 records the routing checks against a maintained controller (Traefik).
+[docs/consumer-verification.md](docs/consumer-verification.md) gives the build, image,
+chart packaging and verification commands, and `push-load`, an explicitly targeted,
+bounded harness for connection, heartbeat, message-latency and reconnect checks with
+dedicated test accounts.
 
 ## Configuration
 

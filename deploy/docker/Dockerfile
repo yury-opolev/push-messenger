@@ -6,6 +6,7 @@
 #   docker build -f deploy/docker/Dockerfile --target gateway -t push-messenger/gateway:dev .
 #   docker build -f deploy/docker/Dockerfile --target worker -t push-messenger/worker:dev .
 #   docker build -f deploy/docker/Dockerfile --target smoke -t push-messenger/smoke:dev .
+#   docker build -f deploy/docker/Dockerfile --target load -t push-messenger/load:dev .
 #
 # The context is the repository root. Needs BuildKit (the default for `docker build`
 # since Docker 23) for the cache mounts.
@@ -18,11 +19,11 @@ COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     cargo build --release --locked \
-        -p push-auth -p push-message-svc -p push-gateway -p push-worker -p push-smoke \
+        -p push-auth -p push-message-svc -p push-gateway -p push-worker -p push-smoke -p push-load \
     && mkdir /out \
     && cp target/release/push-auth target/release/push-message-svc \
         target/release/push-gateway target/release/push-worker target/release/push-smoke \
-        /out/
+        target/release/push-load /out/
 
 # glibc and libgcc, no shell, no package manager; runs as uid 65532 ("nonroot").
 FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
@@ -50,3 +51,9 @@ ENTRYPOINT ["/usr/local/bin/push-worker"]
 FROM runtime AS smoke
 COPY --from=builder /out/push-smoke /usr/local/bin/push-smoke
 ENTRYPOINT ["/usr/local/bin/push-smoke"]
+
+# push-load, the explicitly targeted load harness (docs/consumer-verification.md). It
+# needs a writable mounted directory for its state file and report.
+FROM runtime AS load
+COPY --from=builder /out/push-load /usr/local/bin/push-load
+ENTRYPOINT ["/usr/local/bin/push-load"]

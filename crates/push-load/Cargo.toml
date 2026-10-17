@@ -1,0 +1,25 @@
+[package]
+name = "push-load"
+description = "Explicitly targeted, bounded connection and latency verification of a push-messenger deployment."
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+futures-util.workspace = true
+push-proto.workspace = true
+# HTTPS with rustls, ring and the webpki roots, as push-sdk.
+reqwest = { workspace = true, features = ["rustls-tls"] }
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }
+tokio-util.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

@@ -235,6 +235,31 @@ impl<'a> Auth<'a> {
         })
     }
 
+    /// DEV ONLY: signs a new account up and verifies it with the link the worker's log
+    /// sender delivered to the dev mailbox; its email and password.
+    pub async fn sign_up_verified(&self, name: &str) -> anyhow::Result<(String, String)> {
+        let suffix = Uuid::now_v7().simple().to_string();
+        let suffix = &suffix[suffix.len() - 10..];
+        let email = format!("{name}.{suffix}@load.test");
+        let password = format!("load-{}", Uuid::now_v7());
+        expect(
+            self.post(
+                "/v1/auth/signup",
+                json!({
+                    "email": email,
+                    "password": password,
+                    "handle": format!("{name}_{suffix}"),
+                    "display_name": name,
+                }),
+            ),
+            StatusCode::ACCEPTED,
+            "sign up",
+        )
+        .await?;
+        self.verify_email(&email).await?;
+        Ok((email, password))
+    }
+
     /// The user ids among `ids` whose profiles `GET /v1/users?ids=…` shows the holder of
     /// `access_token`; every profile shown must have a handle.
     pub async fn profiles(&self, access_token: &str, ids: &[Uuid]) -> anyhow::Result<Vec<Uuid>> {
