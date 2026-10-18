@@ -13,6 +13,7 @@ mod devices;
 mod directory;
 pub mod entra;
 mod error;
+mod external;
 pub mod limits;
 pub mod links;
 pub mod outbox;
@@ -30,8 +31,12 @@ pub use db::{
 pub use devices::{Caller, DeviceInfo, MAX_ACTIVE_DEVICES, REFRESH_GRACE, Tokens};
 pub use directory::{Directory, GrpcDirectory, NoDirectory};
 pub use error::AuthError;
+pub use external::EntraRegistration;
 pub use profiles::{OwnProfile, PublicProfile};
 pub use server::{init_logging, migrate, serve, terminated};
 pub use service::{
-    Auth, LINK_SECONDS, REGISTRATION_TOKEN_SECONDS, RegistrationToken, Settings, Signup,
+    Auth, LINK_SECONDS, REGISTRATION_TOKEN_SECONDS, RegistrationToken, Settings, SignIn, Signup,
 };
+
+#[cfg(test)]
+mod tests;

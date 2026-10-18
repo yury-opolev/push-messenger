@@ -12,6 +12,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
+use crate::entra::EntraSignIn;
 use crate::error::AuthError;
 use crate::links::{LinkClaims, LinkError, LinkSigner, Purpose, password_stamp};
 use crate::outbox::{self, Email, Event, LINK_MINUTES};
@@ -57,6 +58,25 @@ pub struct RegistrationToken {
     pub expires_in_s: i64,
 }
 
+/// Which ways to sign in the service offers (spec 2026-10-19 D9).
+#[derive(Debug, Clone)]
+pub struct SignIn {
+    /// Email and password: signup, links, login.
+    pub password: bool,
+    /// Microsoft Entra ID, with its token checker.
+    pub entra: Option<EntraSignIn>,
+}
+
+impl Default for SignIn {
+    /// Email and password only: today's behaviour.
+    fn default() -> Self {
+        Self {
+            password: true,
+            entra: None,
+        }
+    }
+}
+
 /// The auth service.
 #[derive(Debug, Clone)]
 pub struct Auth {
@@ -66,6 +86,7 @@ pub struct Auth {
     pub(crate) links: LinkSigner,
     pub(crate) tokens: AccessTokens,
     public_url: String,
+    sign_in: SignIn,
 }
 
 /// Seconds since the Unix epoch.
@@ -99,6 +120,7 @@ impl Auth {
             links: settings.links,
             tokens: settings.tokens,
             public_url: settings.public_url.trim_end_matches('/').to_owned(),
+            sign_in: SignIn::default(),
         }
     }
 
@@ -110,6 +132,22 @@ impl Auth {
     /// The database pool, for readiness checks.
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// The service offering `sign_in` instead of email and password only.
+    pub fn with_sign_in(mut self, sign_in: SignIn) -> Self {
+        self.sign_in = sign_in;
+        self
+    }
+
+    /// Whether email and password sign-in is offered.
+    pub fn password_enabled(&self) -> bool {
+        self.sign_in.password
+    }
+
+    /// The Entra ID token checker, when Entra ID sign-in is offered.
+    pub fn entra(&self) -> Option<&EntraSignIn> {
+        self.sign_in.entra.as_ref()
     }
 
     // The permit moves into the blocking closure: a cancelled request must not free the
