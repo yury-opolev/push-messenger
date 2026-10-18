@@ -1,8 +1,10 @@
-//! DEV ONLY: tools for the Entra ID rehearsal on a local cluster (Plan 12B,
-//! `deploy/minikube/entra-rehearsal.ps1`). Never in a service image and never against
-//! real datastores or a real tenant.
+//! DEV ONLY: tools for the Entra ID rehearsals on a local cluster (Plan 12B,
+//! `deploy/minikube/entra-rehearsal.ps1`; Plan 13B,
+//! `deploy/minikube/entra-sign-in-rehearsal.ps1`). Never in a service image and never
+//! against real datastores or a real tenant.
 //!
-//!   push-dev-entra issuer    an HTTPS stub of Microsoft Entra ID
+//!   push-dev-entra issuer    an HTTPS stub of Microsoft Entra ID's token endpoint
+//!   push-dev-entra sign-in   an HTTPS stub of Microsoft Entra ID sign-in (Plan 13B)
 //!
 //! The test CA and the certificates come from the `dev-entra-certs` example of this crate
 //! (`cargo run -p push-smoke --example dev-entra-certs -- <dir> <dns name>...`): the test
@@ -27,6 +29,20 @@
 //! connect, which Azure would not do; the rehearsal waits for rollouts to settle. It
 //! accepts any non-empty federated token: in the cluster that is the pod's projected
 //! service-account token. It logs one line per token, never the token.
+//!
+//! `sign-in` serves Plan 13A's stub OpenID metadata and key set (`push_auth::entra::testing`)
+//! over TLS for auth-svc, and `POST /dev/token {"oid", "tenant"?}` over plain HTTP, which
+//! mints a delegated user token for the stub's API with the **public** test key: whoever
+//! reaches it signs in as anyone. It reads:
+//!
+//! | Variable | Meaning |
+//! |---|---|
+//! | `PUSH_DEV_ENTRA_TLS_DIR` | directory with `server.crt` and `server.key` |
+//! | `PUSH_DEV_SIGN_IN_AUTHORITY` | the authority auth-svc trusts, `https://<service>.<namespace>.svc/` |
+//! | `PUSH_DEV_SIGN_IN_TLS_PORT` | the metadata port (default 8443; the rehearsal uses 443, the port egress policies open) |
+//! | `PUSH_DEV_SIGN_IN_TOKEN_PORT` | the token endpoint's port (default 8080) |
+//!
+//! It logs one line per minted token, never the token.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -51,7 +67,8 @@ async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("issuer") => issuer().await,
-        _ => anyhow::bail!("usage: push-dev-entra issuer (DEV ONLY)"),
+        Some("sign-in") => sign_in().await,
+        _ => anyhow::bail!("usage: push-dev-entra issuer | push-dev-entra sign-in (DEV ONLY)"),
     }
 }
 
@@ -185,6 +202,59 @@ async fn issuer() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8443").await?;
     println!("serving the DEV ONLY Entra ID stub on :8443");
     serve_tls(listener, router, &cert, &key).await;
+    Ok(())
+}
+
+fn port(name: &str, default: u16) -> anyhow::Result<u16> {
+    match std::env::var(name) {
+        Ok(value) => value
+            .parse()
+            .with_context(|| format!("{name} must be a port number")),
+        Err(_) => Ok(default),
+    }
+}
+
+/// DEV ONLY: Microsoft Entra ID sign-in for the Plan 13B rehearsal (see the module docs).
+async fn sign_in() -> anyhow::Result<()> {
+    use axum::extract::State;
+    use axum::http::StatusCode;
+    use axum::routing::post;
+    use axum::{Json, Router};
+    use push_auth::entra::testing::{KEY_A, StubOpenId, TENANT, sign};
+    use serde_json::{Value, json};
+
+    let authority = var("PUSH_DEV_SIGN_IN_AUTHORITY")?;
+    let (stub, metadata) = StubOpenId::with_authority(&authority);
+    let mint = Router::new()
+        .route(
+            "/dev/token",
+            post(
+                |State(stub): State<Arc<StubOpenId>>, Json(body): Json<Value>| async move {
+                    let oid = body["oid"].as_str().unwrap_or_default();
+                    let tenant = body["tenant"].as_str().unwrap_or(TENANT);
+                    if uuid::Uuid::try_parse(oid).is_err() || uuid::Uuid::try_parse(tenant).is_err()
+                    {
+                        return Err(StatusCode::BAD_REQUEST);
+                    }
+                    let token = sign(KEY_A, &stub.user_claims(tenant, oid));
+                    println!("minted a DEV ONLY Entra ID user token for tenant {tenant}");
+                    Ok(Json(json!({ "token": token })))
+                },
+            ),
+        )
+        .with_state(Arc::new(stub));
+    let tls = std::path::PathBuf::from(var("PUSH_DEV_ENTRA_TLS_DIR")?);
+    let cert = std::fs::read_to_string(tls.join("server.crt"))?;
+    let key = std::fs::read_to_string(tls.join("server.key"))?;
+    let tls_port = port("PUSH_DEV_SIGN_IN_TLS_PORT", 8443)?;
+    let token_port = port("PUSH_DEV_SIGN_IN_TOKEN_PORT", 8080)?;
+    let plain = tokio::net::TcpListener::bind(("0.0.0.0", token_port)).await?;
+    tokio::spawn(axum::serve(plain, mint).into_future());
+    let listener = tokio::net::TcpListener::bind(("0.0.0.0", tls_port)).await?;
+    println!(
+        "serving the DEV ONLY Entra ID sign-in stub for {authority}: metadata and keys on :{tls_port} (TLS), user tokens on :{token_port}"
+    );
+    serve_tls(listener, metadata, &cert, &key).await;
     Ok(())
 }
 

@@ -702,6 +702,240 @@ Check 'egress: CIDRs, DNS peers and extra rules are validated' {
         (Render @('--set', 'networkPolicy.egress.enabled=true', '--set', 'networkPolicy.egress.httpsCidrs={0.0.0.0/0}')) -eq 0
 }
 
+# ---- Entra ID sign-in (Plan 13B) ----
+$signInArgs = @(
+    '--set', 'auth.signIn.providers=entra',
+    '--set', 'auth.signIn.entra.clientIds={11111111-0000-4000-8000-000000000001}',
+    '--set', 'auth.signIn.entra.tenants={33333333-0000-4000-8000-000000000003}'
+)
+Check 'sign-in: a complete Entra-only configuration renders' { (Render $signInArgs) -eq 0 }
+Check 'sign-in: both providers render, in either order' {
+    (Render ($signInArgs + @('--set', 'auth.signIn.providers=password\,entra'))) -eq 0 -and
+        (Render ($signInArgs + @('--set', 'auth.signIn.providers=entra\, password'))) -eq 0
+}
+Check 'sign-in: unknown providers and incomplete Entra settings are refused' {
+    (Render @('--set', 'auth.signIn.providers=ldap')) -ne 0 -and
+        (Render @('--set', 'auth.signIn.providers=entra\,entra')) -ne 0 -and
+        (Render @('--set', 'auth.signIn.providers=entra')) -ne 0 -and
+        (Render $signInArgs[0..3]) -ne 0 -and
+        (Render ($signInArgs[0..1] + $signInArgs[4..5])) -ne 0
+}
+Check 'sign-in: tenants are one keyword or tenant ids, never a mixture' {
+    $ok = foreach ($tenants in '{common}', '{Organizations}', '{consumers}',
+        '{33333333-0000-4000-8000-000000000003,44444444-0000-4000-8000-000000000004}') {
+        Render ($signInArgs + @('--set', "auth.signIn.entra.tenants=$tenants"))
+    }
+    $bad = foreach ($tenants in '{common,33333333-0000-4000-8000-000000000003}', '{organizations,consumers}',
+        '{common,common}', '{33333333-0000-4000-8000-000000000003,33333333-0000-4000-8000-000000000003}',
+        '{33333333-0000-4000-8000-000000000003,33333333-0000-4000-8000-00000000000A,33333333-0000-4000-8000-00000000000a}',
+        '{contoso.onmicrosoft.com}', '{00000000-0000-0000-0000-000000000000}', '{""}') {
+        Render ($signInArgs + @('--set', "auth.signIn.entra.tenants=$tenants"))
+    }
+    $many = '{' + ((1..21 | ForEach-Object { '33333333-0000-4000-8000-{0:d12}' -f $_ }) -join ',') + '}'
+    $twenty = '{' + ((1..20 | ForEach-Object { '33333333-0000-4000-8000-{0:d12}' -f $_ }) -join ',') + '}'
+    (@($ok | Where-Object { $_ -ne 0 }).Count -eq 0) -and (@($bad | Where-Object { $_ -eq 0 }).Count -eq 0) -and
+        (Render ($signInArgs + @('--set', "auth.signIn.entra.tenants=$twenty"))) -eq 0 -and
+        (Render ($signInArgs + @('--set', "auth.signIn.entra.tenants=$many"))) -ne 0
+}
+Check 'sign-in: the audience must include the application id; at most four' {
+    (Render ($signInArgs + @('--set', 'auth.signIn.entra.clientIds={api://push-api}'))) -ne 0 -and
+        (Render ($signInArgs + @('--set', 'auth.signIn.entra.clientIds={https://push.example.com,11111111-0000-4000-8000-000000000001}'))) -ne 0 -and
+        (Render ($signInArgs + @('--set', 'auth.signIn.entra.clientIds={api://push-api,11111111-0000-4000-8000-000000000001}'))) -eq 0 -and
+        (Render ($signInArgs + @('--set', 'auth.signIn.entra.clientIds={api://a,api://b,api://c,api://d,11111111-0000-4000-8000-000000000001}'))) -ne 0
+}
+Check 'sign-in: authority, scope, role, client apps, session age and proxy are checked' {
+    (Render ($signInArgs + @('--set', 'auth.signIn.entra.authorityHost=http://login.microsoftonline.com/'))) -ne 0 -and
+        (Render ($signInArgs + @('--set', 'auth.signIn.entra.authorityHost=https://login.microsoftonline.com/tenant/'))) -ne 0 -and
+        (Render ($signInArgs + @('--set', 'auth.signIn.entra.authorityHost=https://login.microsoftonline.us'))) -eq 0 -and
+        (Render ($signInArgs + @('--set', 'auth.signIn.entra.requiredScope=two scopes'))) -ne 0 -and
+        (Render ($signInArgs + @('--set', 'auth.signIn.entra.requiredScope=*'))) -eq 0 -and
+        (Render ($signInArgs + @('--set', 'auth.signIn.entra.requiredRole=two roles'))) -ne 0 -and
+        (Render ($signInArgs + @('--set', 'auth.signIn.entra.allowedClientApps={not-a-guid}'))) -ne 0 -and
+        (Render ($signInArgs + @('--set', 'auth.signIn.entra.maxSessionHours=0'))) -ne 0 -and
+        (Render ($signInArgs + @('--set', 'auth.signIn.entra.maxSessionHours=721'))) -ne 0 -and
+        (Render ($signInArgs + @('--set', 'auth.signIn.entra.maxSessionHours=720'))) -eq 0 -and
+        (Render ($signInArgs + @('--set', 'auth.signIn.entra.httpsProxy=proxy:3128'))) -ne 0 -and
+        (Render ($signInArgs + @('--set', 'auth.signIn.entra.httpsProxy=http://proxy.corp.example:3128'))) -eq 0
+}
+Check 'sign-in: Entra-only refuses the Resend sender and the webhook' {
+    (Render ($signInArgs + @('--set', 'worker.email.sender=resend', '--set', 'worker.email.resendApiKey=re_x',
+        '--set', 'worker.email.from=a@example.com'))) -ne 0 -and
+        (Render ($signInArgs + @('--set', 'worker.email.webhook.enabled=true',
+            '--set', 'worker.email.webhookSecret=whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw'))) -ne 0
+}
+Check 'email: the none sender is for Entra-only installations and refuses the webhook' {
+    (Render ($signInArgs + @('--set', 'worker.email.sender=none'))) -eq 0 -and
+        (Render @('--set', 'worker.email.sender=none')) -ne 0 -and
+        (Render ($signInArgs + @('--set', 'auth.signIn.providers=password\,entra', '--set', 'worker.email.sender=none'))) -ne 0 -and
+        (Render @('--set', 'worker.email.sender=smtp')) -ne 0
+}
+Check 'default: the render is unchanged by Plan 13B' {
+    # Saved before the work started; absent on CI, where this passes trivially.
+    $baseline = Join-Path ([IO.Path]::GetTempPath()) 'push-default-before-13b.yaml'
+    (-not (Test-Path $baseline)) -or ((Normalized (Get-Content $baseline -Raw)) -eq (Normalized (helm template push $chart | Out-String)))
+}
+
+Check 'sign-in: the default renders no sign-in variable' {
+    (helm template push $chart | Out-String) -notmatch 'PUSH_AUTH_PROVIDERS|PUSH_ENTRA_|HTTPS_PROXY|NO_PROXY|entra-ca'
+}
+Check 'sign-in: Entra-only renders auth-svc''s variables' {
+    $auth = Doc (helm template push $chart @signInArgs | Out-String) 'Deployment' 'push-auth'
+    $auth -match '(?s)name: PUSH_AUTH_PROVIDERS\s+value: "entra"' -and
+        $auth -match '(?s)name: PUSH_ENTRA_CLIENT_ID\s+value: "11111111-0000-4000-8000-000000000001"' -and
+        $auth -match '(?s)name: PUSH_ENTRA_ALLOWED_TENANTS\s+value: "33333333-0000-4000-8000-000000000003"' -and
+        $auth -match '(?s)name: PUSH_ENTRA_AUTHORITY_HOST\s+value: "https://login.microsoftonline.com/"' -and
+        $auth -match '(?s)name: PUSH_ENTRA_REQUIRED_SCOPE\s+value: "access_as_user"' -and
+        $auth -match '(?s)name: PUSH_ENTRA_MAX_SESSION_HOURS\s+value: "24"' -and
+        $auth -notmatch 'PUSH_ENTRA_REQUIRED_ROLE|PUSH_ENTRA_ALLOWED_CLIENT_APPS|HTTPS_PROXY|SSL_CERT_FILE'
+}
+Check 'sign-in: a keyword reaches auth-svc alone, lower-cased; tenant ids joined by commas' {
+    $auth = Doc (helm template push $chart @signInArgs --set 'auth.signIn.entra.tenants={Organizations}' | Out-String) 'Deployment' 'push-auth'
+    $two = Doc (helm template push $chart @signInArgs --set 'auth.signIn.entra.tenants={33333333-0000-4000-8000-000000000003,44444444-0000-4000-8000-000000000004}' | Out-String) 'Deployment' 'push-auth'
+    $auth -match '(?s)name: PUSH_ENTRA_ALLOWED_TENANTS\s+value: "organizations"' -and
+        $two -match '(?s)name: PUSH_ENTRA_ALLOWED_TENANTS\s+value: "33333333-0000-4000-8000-000000000003,44444444-0000-4000-8000-000000000004"'
+}
+Check 'sign-in: optional settings, a proxy and a CA bundle reach auth-svc only' {
+    $rendered = helm template push $chart @signInArgs `
+        --set auth.signIn.entra.requiredRole=Messenger.User `
+        --set 'auth.signIn.entra.allowedClientApps={22222222-0000-4000-8000-000000000002}' `
+        --set auth.signIn.entra.httpsProxy=http://proxy.corp.example:3128 `
+        --set auth.signIn.entra.caConfigMap=corp-ca | Out-String
+    $auth = Doc $rendered 'Deployment' 'push-auth'
+    $auth -match '(?s)name: PUSH_ENTRA_REQUIRED_ROLE\s+value: "Messenger.User"' -and
+        $auth -match '(?s)name: PUSH_ENTRA_ALLOWED_CLIENT_APPS\s+value: "22222222-0000-4000-8000-000000000002"' -and
+        $auth -match '(?s)name: HTTPS_PROXY\s+value: "http://proxy.corp.example:3128"' -and
+        $auth -match '(?s)name: NO_PROXY\s+value: "localhost,127.0.0.1,.svc,.cluster.local"' -and
+        $auth -match '(?s)name: SSL_CERT_FILE\s+value: "/etc/push/entra-ca/ca.crt"' -and
+        $auth -match '(?s)configMap:\s+name: corp-ca' -and $auth -match 'mountPath: /etc/push/entra-ca' -and
+        @($rendered -split "(?m)^---\s*$" | Where-Object {
+            $_ -match '(?m)^kind: (Deployment|StatefulSet|Job|Pod)\s*$' -and $_ -notmatch '(?m)^  name: push-auth\s*$' -and
+                $_ -match 'HTTPS_PROXY|entra-ca|PUSH_ENTRA_' }).Count -eq 0
+}
+Check 'sign-in: password,entra offers both' {
+    $auth = Doc (helm template push $chart @signInArgs --set 'auth.signIn.providers=password\,entra' | Out-String) 'Deployment' 'push-auth'
+    $auth -match '(?s)name: PUSH_AUTH_PROVIDERS\s+value: "password,entra"'
+}
+Check 'sign-in: auth-svc trusts one CA bundle when Plan 12B''s authority bundle is set too' {
+    $chartInjection = $entraArgs + $signInArgs + @('--set', 'azure.workloadIdentity.injection=chart',
+        '--set', 'azure.workloadIdentity.tenantId=11111111-2222-3333-4444-555555555555',
+        '--set', 'azure.workloadIdentity.authorityCaConfigMap=corp-ca')
+    $auth = Doc (helm template push $chart @chartInjection --set auth.signIn.entra.caConfigMap=corp-ca | Out-String) 'Deployment' 'push-auth'
+    (Render ($chartInjection + @('--set', 'auth.signIn.entra.caConfigMap=other-ca'))) -ne 0 -and
+        ([regex]::Matches($auth, 'name: SSL_CERT_FILE')).Count -eq 1 -and
+        $auth -match '(?s)name: SSL_CERT_FILE\s+value: /etc/push/authority-ca/ca.crt' -and $auth -notmatch 'entra-ca'
+}
+
+Check 'sign-in: Entra-only sends no email and routes no link page' {
+    $rendered = helm template push $chart @signInArgs | Out-String
+    $worker = Doc $rendered 'Deployment' 'push-worker'
+    $worker -match '(?s)name: PUSH_EMAIL_SENDER\s+value: "none"' -and
+        $worker -match '(?s)name: PUSH_DEV_MAILBOX\s+value: "0"' -and
+        $worker -notmatch 'resend-api-key|resend-webhook-secret' -and
+        -not (Doc $rendered 'Ingress' 'push-auth-links') -and -not (Doc $rendered 'Ingress' 'push-worker') -and
+        (Doc $rendered 'Ingress' 'push-auth') -match 'path: /v1/auth'
+}
+Check 'sign-in: Entra-only in dev mode keeps the mailbox off and generates no webhook secret' {
+    $rendered = helm template push $chart -f $minikube @signInArgs --set worker.email.webhook.enabled=false | Out-String
+    (Doc $rendered 'Deployment' 'push-worker') -match '(?s)name: PUSH_DEV_MAILBOX\s+value: "0"' -and
+        (Doc $rendered 'Secret' 'push-secrets') -notmatch 'resend-' -and
+        (Doc (helm template push $chart -f $minikube | Out-String) 'Secret' 'push-secrets') -match 'resend-webhook-secret:'
+}
+Check 'sign-in: password,entra keeps the link pages and the sender' {
+    $rendered = helm template push $chart @signInArgs --set 'auth.signIn.providers=password\,entra' | Out-String
+    (Doc $rendered 'Ingress' 'push-auth-links') -and
+        (Doc $rendered 'Deployment' 'push-worker') -match '(?s)name: PUSH_EMAIL_SENDER\s+value: "log"'
+}
+Check 'sign-in: an Entra-only consumer Secret needs no email key' {
+    $rendered = helm template push $chart @signInArgs --set secrets.existingSecret=push-creds | Out-String
+    $rendered -notmatch 'key: resend-' -and $rendered -notmatch '(?m)^kind: Secret'
+}
+
+Check 'sign-in egress: auth-svc alone reaches the Entra ID ranges, on 443 only' {
+    $rendered = helm template push $chart @signInArgs --set networkPolicy.egress.enabled=true `
+        --set 'networkPolicy.egress.entraSignInCidrs={20.190.128.0/18,40.126.0.0/18}' | Out-String
+    $policies = @'
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(sys.stdin.read()) if d]
+policies = {d["metadata"]["name"]: d["spec"] for d in docs if d["kind"] == "NetworkPolicy"}
+def reaches(name):
+    return [(p["ipBlock"]["cidr"], port["port"]) for rule in policies[name].get("egress", [])
+            for p in rule.get("to", []) if "ipBlock" in p for port in rule.get("ports", [])]
+assert sorted(reaches("push-auth")) == [("20.190.128.0/18", 443), ("40.126.0.0/18", 443)], reaches("push-auth")
+for other in ["push-gateway", "push-message-svc", "push-worker"]:
+    assert reaches(other) == [], (other, reaches(other))
+'@
+    $rendered | & $python.Source -c $policies; $LASTEXITCODE -eq 0
+}
+Check 'sign-in egress: Entra sign-in with egress needs a way to Entra ID; the list holds CIDRs' {
+    (Render ($signInArgs + @('--set', 'networkPolicy.egress.enabled=true'))) -ne 0 -and
+        (Render ($signInArgs + @('--set', 'networkPolicy.egress.enabled=true',
+            '--set', 'auth.signIn.entra.httpsProxy=http://proxy.corp.example:3128'))) -eq 0 -and
+        (Render ($signInArgs + @('--set', 'networkPolicy.egress.enabled=true',
+            '--set', 'networkPolicy.egress.httpsCidrs={20.190.128.0/18}'))) -eq 0 -and
+        (Render ($signInArgs + @('--set', 'networkPolicy.egress.enabled=true',
+            '--set', 'networkPolicy.egress.entraSignInCidrs={login.microsoftonline.com}'))) -ne 0
+}
+Check 'sign-in egress: without Entra sign-in the list adds nothing' {
+    $rendered = helm template push $chart --set networkPolicy.egress.enabled=true `
+        --set 'networkPolicy.egress.entraSignInCidrs={20.190.128.0/18}' | Out-String
+    $rendered -notmatch '20\.190\.128\.0/18'
+}
+
+Check 'admin: off by default' {
+    (helm template push $chart | Out-String) -notmatch 'PUSH_AUTH_ADMIN|auth-admin-token|name: admin|8082'
+}
+$adminPeer = '[{"namespaceSelector":{"kubernetes.io/metadata.name":"ops"},"podSelector":{"app":"admin-shell"}}]'
+Check 'admin: the listener, its Secret key, and a NetworkPolicy rule for its peers only' {
+    $rendered = helm template push $chart --set auth.admin.enabled=true --set-json "networkPolicy.adminPeers=$adminPeer" | Out-String
+    $auth = Doc $rendered 'Deployment' 'push-auth'
+    $rules = @'
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(sys.stdin.read()) if d]
+policy = next(d for d in docs if d["kind"] == "NetworkPolicy" and d["metadata"]["name"] == "push-auth")
+rules = {rule["ports"][0]["port"]: rule["from"] for rule in policy["spec"]["ingress"]}
+assert set(rules) == {8080, 8082}, rules
+assert rules[8082] == [{"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "ops"}},
+                        "podSelector": {"matchLabels": {"app": "admin-shell"}}}], rules[8082]
+assert rules[8080] == [{"podSelector": {"matchLabels": {"app.kubernetes.io/instance": "push",
+                                                         "push-messenger/network-peer": "gateway"}}}], rules[8080]
+for d in docs:
+    if d["kind"] == "Ingress":
+        for rule in d["spec"]["rules"]:
+            for path in rule["http"]["paths"]:
+                assert path["backend"]["service"]["port"] == {"name": "http"}, d["metadata"]["name"]
+'@
+    $rendered | & $python.Source -c $rules
+    $LASTEXITCODE -eq 0 -and
+        $auth -match '(?s)name: PUSH_AUTH_ADMIN_TOKEN\s+valueFrom:\s+secretKeyRef:\s+name: push-secrets\s+key: auth-admin-token' -and
+        $auth -match '(?s)name: PUSH_AUTH_ADMIN_ADDR\s+value: "0.0.0.0:8082"' -and
+        $auth -match '(?s)name: admin\s+containerPort: 8082' -and
+        (Doc $rendered 'Service' 'push-auth') -match '(?s)name: admin\s+port: 8082\s+targetPort: admin' -and
+        (Doc $rendered 'Secret' 'push-secrets') -match 'auth-admin-token: "[A-Za-z0-9]{48}"' -and
+        @($rendered -split "(?m)^---\s*$" | Where-Object {
+            $_ -match '(?m)^kind: (Deployment|StatefulSet|Job|Pod)\s*$' -and $_ -notmatch '(?m)^  name: push-auth\s*$' -and
+                $_ -match 'auth-admin-token|PUSH_AUTH_ADMIN' }).Count -eq 0
+}
+Check 'admin: without peers no rule opens the port; peers need both label maps' {
+    (Doc (helm template push $chart --set auth.admin.enabled=true | Out-String) 'NetworkPolicy' 'push-auth') -notmatch '8082' -and
+        (Doc (helm template push $chart --set-json "networkPolicy.adminPeers=$adminPeer" | Out-String) 'NetworkPolicy' 'push-auth') -notmatch '8082' -and
+        (Render @('--set', 'auth.admin.enabled=true', '--set-json', 'networkPolicy.adminPeers=[{"podSelector":{"a":"b"}}]')) -ne 0 -and
+        (Render @('--set', 'auth.admin.enabled=true', '--set-json', 'networkPolicy.adminPeers=[{"namespaceSelector":{},"podSelector":{"a":"b"}}]')) -ne 0 -and
+        (Render @('--set', 'auth.admin.enabled=yes')) -ne 0
+}
+Check 'admin: a consumer-managed Secret is referenced, never generated' {
+    $rendered = helm template push $chart --set auth.admin.enabled=true --set secrets.existingSecret=push-creds | Out-String
+    (Doc $rendered 'Deployment' 'push-auth') -match '(?s)name: push-creds\s+key: auth-admin-token' -and
+        $rendered -notmatch '(?m)^kind: Secret'
+}
+
+Check 'sign-in: the DEV ONLY smoke test runs in Entra mode with a token endpoint' {
+    $rendered = helm template push $chart -f $minikube @signInArgs --set worker.email.webhook.enabled=false `
+        --set smoke.entraTokenUrl=http://push-idp.push-idp.svc:8080/dev/token | Out-String
+    (Doc $rendered 'Pod' 'push-smoke') -match '(?s)- --entra-token-url\s+- "http://push-idp.push-idp.svc:8080/dev/token"' -and
+        (Doc (helm template push $chart -f $minikube | Out-String) 'Pod' 'push-smoke') -notmatch 'entra-token-url' -and
+        (helm template push $chart --set smoke.entraTokenUrl=http://x/dev/token | Out-String) -notmatch 'entra-token-url'
+}
+
 if ($failures -gt 0) {
     Write-Output "$failures check(s) failed"
     exit 1

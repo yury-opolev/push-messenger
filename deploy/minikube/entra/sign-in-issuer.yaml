@@ -1,0 +1,106 @@
+# DEV ONLY: the Microsoft Entra ID sign-in stand-in of the Entra ID sign-in rehearsal
+# (Plan 13B), applied by deploy/minikube/entra-sign-in-rehearsal.ps1 to its own minikube
+# profile. Never for real data, never in a shared cluster.
+#
+# push-dev-entra sign-in serves Plan 13A's stub OpenID metadata and key set over HTTPS on
+# 443 (the port the chart's networkPolicy.egress.entraSignInCidrs opens for auth-svc) and
+# POST /dev/token on 8080, which mints a user token for ANYONE with a public test key:
+# whoever reaches it signs in as anyone. The script creates the Secret push-idp-tls
+# (server.crt, server.key from the dev-entra-certs example).
+apiVersion: v1
+kind: Service
+metadata:
+  name: push-idp
+  namespace: push-idp
+  labels:
+    app.kubernetes.io/part-of: push-entra-sign-in-rehearsal
+spec:
+  selector:
+    app.kubernetes.io/name: push-idp
+  ports:
+    - name: https
+      port: 443
+      targetPort: https
+    - name: tokens
+      port: 8080
+      targetPort: tokens
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: push-idp
+  namespace: push-idp
+  labels:
+    app.kubernetes.io/part-of: push-entra-sign-in-rehearsal
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: push-idp
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: push-idp
+    spec:
+      automountServiceAccountToken: false
+      # The tool does not handle SIGTERM; nothing to drain.
+      terminationGracePeriodSeconds: 2
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+        # Lets the non-root process listen on 443 without any capability (a safe sysctl):
+        # NetworkPolicies match the pod's port, so the issuer listens where Entra ID does.
+        sysctls:
+          - name: net.ipv4.ip_unprivileged_port_start
+            value: "0"
+      containers:
+        - name: issuer
+          # The DEV ONLY smoke image, which also carries push-dev-entra.
+          image: push-messenger/smoke:dev
+          imagePullPolicy: IfNotPresent
+          command: ["/usr/local/bin/push-dev-entra", "sign-in"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          env:
+            - name: PUSH_DEV_ENTRA_TLS_DIR
+              value: /tls
+            - name: PUSH_DEV_SIGN_IN_AUTHORITY
+              value: https://push-idp.push-idp.svc/
+            - name: PUSH_DEV_SIGN_IN_TLS_PORT
+              value: "443"
+            - name: PUSH_DEV_SIGN_IN_TOKEN_PORT
+              value: "8080"
+          ports:
+            - name: https
+              containerPort: 443
+            - name: tokens
+              containerPort: 8080
+          readinessProbe:
+            tcpSocket:
+              port: https
+            periodSeconds: 2
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 200m
+              memory: 64Mi
+          volumeMounts:
+            - name: tls
+              mountPath: /tls
+              readOnly: true
+      volumes:
+        - name: tls
+          secret:
+            secretName: push-idp-tls
+            defaultMode: 0440

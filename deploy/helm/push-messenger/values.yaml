@@ -80,6 +80,45 @@ auth:
   # tokens and the HMAC key of email links and registration tokens, base64 of 32 bytes.
   signingKey: ""
   linkKey: ""
+  # Ways to sign in (docs/entra-sign-in.md, spec 2026-10-19).
+  signIn:
+    # password (default: email and password), entra (Microsoft Entra ID only), or
+    # password,entra. With entra alone the worker sends no email (sender none), the email
+    # and password routes answer 404 and the link pages are not routed. Switching to entra
+    # alone signs every password device out when the new auth-svc pods start.
+    providers: password
+    # Read only when providers include entra.
+    entra:
+      # The API registration's application (client) id, optionally also its api://
+      # identifier URI; at most four.
+      clientIds: []
+      # Exactly one of [common], [organizations], [consumers], or one to twenty tenant ids.
+      # A keyword lets anyone with such an account create an account here: the app
+      # registration, user assignment and Conditional Access are then the only gate.
+      tenants: []
+      # https://login.microsoftonline.com/ or a sovereign cloud's host.
+      authorityHost: https://login.microsoftonline.com/
+      # The delegated scope tokens must carry; * accepts any scope of the API.
+      requiredScope: access_as_user
+      # An app role tokens must carry; empty: none.
+      requiredRole: ""
+      # Client app ids allowed to present tokens (azp); empty allows any.
+      allowedClientApps: []
+      # An Entra-backed device signs in with Entra ID again after this many hours (1-720).
+      maxSessionHours: 24
+      # A proxy for auth-svc's requests to Entra ID (HTTPS_PROXY); NO_PROXY keeps
+      # in-cluster names direct. Empty: direct.
+      httpsProxy: ""
+      # A ConfigMap in the release namespace whose ca.crt auth-svc trusts instead of the
+      # system roots (SSL_CERT_FILE) for every TLS connection it makes, e.g. a
+      # TLS-inspecting proxy's root plus the public roots it needs. Empty: system roots.
+      caConfigMap: ""
+  admin:
+    # Serves auth-svc's admin API (sign a user out of every device) on port 8082: never
+    # through the chart's Ingresses, and only from networkPolicy.adminPeers (or a
+    # kubectl port-forward). Its bearer token is the Secret's auth-admin-token: generated
+    # for a chart-managed Secret, required in a consumer-managed one.
+    enabled: false
   resources:
     requests:
       cpu: 100m
@@ -100,6 +139,7 @@ worker:
   email:
     # log: logs each email instead of sending it. resend: sends through Resend, which
     # needs resendApiKey (or the resend-api-key of a consumer-managed Secret) and from.
+    # none: no email at all, only with auth.signIn.providers entra (rendered then anyway).
     sender: log
     # The From of every email (owner decision: the push.kubegames.dk domain).
     from: "Push Messenger <no-reply@push.kubegames.dk>"
@@ -266,6 +306,10 @@ networkPolicy:
   # - namespaceSelector: {example.com/namespace: edge}
   #   podSelector: {example.com/controller: public}
   ingressControllerPeers: []
+  # Peers allowed to reach auth-svc's admin port 8082 (auth.admin.enabled), each with both
+  # non-empty label maps, like ingressControllerPeers. Empty: nobody (kubectl
+  # port-forward still works).
+  adminPeers: []
   egress:
     # Adds Egress rules to every application policy: DNS, the release's own peers, the
     # datastores and HTTPS. Off: egress is not restricted (as before).
@@ -284,6 +328,10 @@ networkPolicy:
     # CIDRs allowed on port 443 for token requests (Entra ID) and anything else HTTPS
     # the services call (the worker's Resend API).
     httpsCidrs: []
+    # CIDRs auth-svc alone may reach on 443 for Microsoft Entra ID sign-in
+    # (auth.signIn.providers with entra): the AzureActiveDirectory service tag ranges. A
+    # proxy (auth.signIn.entra.httpsProxy) needs a rule of its own in extra instead.
+    entraSignInCidrs: []
     # Raw NetworkPolicyEgressRule objects added to every application policy.
     extra: []
 
@@ -319,3 +367,7 @@ smoke:
   # cluster, with `ingress.host` as the Host header, so the test goes through the
   # ingress like a client.
   socketUrl: ws://ingress-nginx-controller.ingress-nginx.svc.cluster.local/v1/socket
+  # DEV ONLY: the rehearsal issuer's token endpoint
+  # (deploy/minikube/entra-sign-in-rehearsal.ps1); the smoke test then signs in with
+  # Microsoft Entra ID tokens instead of email and password.
+  entraTokenUrl: ""

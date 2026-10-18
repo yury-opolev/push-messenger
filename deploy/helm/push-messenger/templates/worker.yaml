@@ -79,8 +79,9 @@ spec:
                 secretKeyRef:
                   name: {{ include "push.secretName" . }}
                   key: accounts-token
+            {{- /* none when email and password sign-in is off: nothing writes an email then. */}}
             - name: PUSH_EMAIL_SENDER
-              value: {{ .Values.worker.email.sender | quote }}
+              value: {{ include "push.emailSender" . | quote }}
             - name: PUSH_EMAIL_FROM
               value: {{ .Values.worker.email.from | quote }}
             - name: PUSH_EMAIL_PRODUCT_NAME
@@ -106,7 +107,7 @@ spec:
             - name: PUSH_DB_MAX_CONNECTIONS
               value: {{ .Values.worker.dbMaxConnections | quote }}
             - name: PUSH_DEV_MAILBOX
-              value: {{ include "push.devFlag" . | quote }}
+              value: {{ include "push.mailboxFlag" . | quote }}
           ports:
             - name: http
               containerPort: 8080

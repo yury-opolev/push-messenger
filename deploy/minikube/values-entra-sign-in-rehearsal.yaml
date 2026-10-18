@@ -1,0 +1,37 @@
+# DEV ONLY rehearsal of Microsoft Entra ID-only sign-in on minikube (Plan 13B), layered
+# after values-minikube.yaml by deploy/minikube/entra-sign-in-rehearsal.ps1. The Entra ID
+# stand-in is deploy/minikube/entra/sign-in-issuer.yaml in namespace push-idp; the script
+# sets networkPolicy.egress.entraSignInCidrs to its pod's address (/32), the stand-in for
+# Microsoft's AzureActiveDirectory ranges, so auth-svc alone may reach it on 443.
+auth:
+  signIn:
+    providers: entra
+    entra:
+      # push_auth::entra::testing's API_CLIENT_ID and TENANT, which the issuer's tokens carry.
+      clientIds:
+        - 11111111-0000-4000-8000-000000000001
+      tenants:
+        - 33333333-0000-4000-8000-000000000003
+      authorityHost: https://push-idp.push-idp.svc/
+      # The rehearsal's test CA (ConfigMap push-idp-ca, created by the script).
+      caConfigMap: push-idp-ca
+      maxSessionHours: 1
+  admin:
+    enabled: true
+worker:
+  email:
+    # Entra-only writes no email: no webhook (values-minikube.yaml turns it on).
+    webhook:
+      enabled: false
+smoke:
+  entraTokenUrl: http://push-idp.push-idp.svc:8080/dev/token
+networkPolicy:
+  # The only pods that may reach auth-svc's admin port: label push-messenger/admin-shell
+  # in namespace push-admin (the script's probes and nothing else).
+  adminPeers:
+    - namespaceSelector:
+        kubernetes.io/metadata.name: push-admin
+      podSelector:
+        push-messenger/admin-shell: "true"
+  egress:
+    enabled: true
