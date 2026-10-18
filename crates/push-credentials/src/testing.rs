@@ -321,9 +321,12 @@ impl TlsPostgres {
     }
 
     pub async fn try_admin(&self, ca: &TestCa) -> Result<sqlx::PgPool, sqlx::Error> {
-        let options = self
-            .options(ca, "postgres", "postgres")
-            .password(POSTGRES_ADMIN_PASSWORD);
+        // Statements are not logged: this pool sets the stub's tokens as passwords, and a
+        // test that captures the services' logs must not find them there.
+        let options = sqlx::ConnectOptions::disable_statement_logging(
+            self.options(ca, "postgres", "postgres")
+                .password(POSTGRES_ADMIN_PASSWORD),
+        );
         PgPoolOptions::new()
             .max_connections(2)
             .acquire_timeout(Duration::from_secs(5))
