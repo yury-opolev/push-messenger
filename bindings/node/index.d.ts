@@ -164,6 +164,12 @@ export class Client {
   resendVerification(email: string): Promise<void>;
   forgotPassword(email: string): Promise<void>;
   signIn(email: string, password: string, deviceName: string, platform: Platform): Promise<Account>;
+  /**
+   * Signs in with a Microsoft Entra ID access token for auth-svc's API, obtained by the app
+   * with MSAL (scope `api://<api-client-id>/access_as_user`). `handle` names the account on
+   * its first sign-in only. Rejects with `entra_token_invalid` or `entra_unavailable`.
+   */
+  signInWithEntra(accessToken: string, handle: string | null, deviceName: string, platform: Platform): Promise<Account>;
   account(): Account | null;
   signOut(): Promise<void>;
 
@@ -198,6 +204,12 @@ export class Client {
   revokeInvite(code: string): Promise<void>;
   profiles(userIds: string[]): Promise<Profile[]>;
   lookup(handle: string): Promise<Profile>;
+  /**
+   * Changes the user's display name, handle or both (null leaves one as it is; at least one).
+   * Rejects with `handle_taken` when someone else holds the handle, `rate_limited` after 5
+   * handle changes a day.
+   */
+  updateProfile(displayName: string | null, handle: string | null): Promise<Profile>;
   devices(): Promise<Device[]>;
   revokeDevice(deviceId: string): Promise<void>;
 }

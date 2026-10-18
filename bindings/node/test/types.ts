@@ -1,6 +1,6 @@
 // Compiled by `npm run typecheck` (never run): the typings describe a real app's use.
 
-import { Client, PushError, PushEvent, SecretStore, deriveDatabaseKey, newSalt, SECRET_KEYS } from '../index';
+import { Account, Client, Profile, PushError, PushEvent, SecretStore, deriveDatabaseKey, newSalt, SECRET_KEYS } from '../index';
 
 const values = new Map<string, Uint8Array>();
 const store: SecretStore = {
@@ -33,6 +33,10 @@ async function app(): Promise<void> {
     }
   });
   const account = await client.signIn('a@example.com', 'password', 'laptop', 'desktop');
+  const viaEntra: Account = await client.signInWithEntra('token', null, 'laptop', 'desktop');
+  console.log(viaEntra.deviceId);
+  const renamed: Profile = await client.updateProfile(null, 'erin');
+  console.log(renamed.handle);
   console.log(account.userId, client.account()?.deviceId, SECRET_KEYS.length);
   client.connect();
   const conversation = await client.openDirect('0199e1c2-0000-7000-8000-000000000001');

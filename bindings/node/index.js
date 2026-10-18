@@ -198,6 +198,14 @@ class Client {
     return settled(() => this.#native.signIn(email, password, deviceName, platform));
   }
 
+  /**
+   * Signs in with a Microsoft Entra ID access token the app obtained with MSAL; `handle`
+   * (or null) names the account on its first sign-in only. The token is never stored.
+   */
+  signInWithEntra(accessToken, handle, deviceName, platform) {
+    return settled(() => this.#native.signInWithEntra(accessToken, handle ?? null, deviceName, platform));
+  }
+
   /** The signed-in account, or null. Answered at once. */
   account() {
     return now(() => this.#native.account());
@@ -339,6 +347,11 @@ class Client {
 
   lookup(handle) {
     return settled(() => this.#native.lookup(handle));
+  }
+
+  /** Changes the display name, the handle or both (null leaves one as it is). */
+  updateProfile(displayName, handle) {
+    return settled(() => this.#native.updateProfile(displayName ?? null, handle ?? null));
   }
 
   devices() {
