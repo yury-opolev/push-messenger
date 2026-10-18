@@ -17,6 +17,9 @@ use crate::tokens::{
     ACCESS_TOKEN_TTL, REFRESH_TOKEN_TTL, TokenError, new_refresh_token, refresh_hash,
 };
 
+/// Devices revoked per transaction by the Entra ID-only sweep.
+const SWEEP_BATCH: i64 = 500;
+
 /// Most active devices per account (spec §5.3).
 pub const MAX_ACTIVE_DEVICES: i64 = 10;
 
@@ -244,8 +247,10 @@ impl Auth {
             return Err(AuthError::Unauthorized);
         };
         let device = sqlx::query(
-            "SELECT user_id, revoked_at IS NULL, session_expires_at FROM auth.device \
-             WHERE device_id = $1 FOR UPDATE",
+            "SELECT device.user_id, device.revoked_at IS NULL, device.session_expires_at, \
+             account.password_hash IS NOT NULL \
+             FROM auth.device AS device JOIN auth.user_account AS account USING (user_id) \
+             WHERE device.device_id = $1 FOR UPDATE OF device",
         )
         .bind(device_id)
         .fetch_optional(&mut *tx)
@@ -262,6 +267,10 @@ impl Auth {
         let session: Option<i64> = device.get(2);
         if session.is_some_and(|end| end <= unix_now()) {
             return Err(AuthError::SessionExpired);
+        }
+        // Entra ID only: password sessions ended with the switch (spec D16).
+        if device.get::<bool, _>(3) && !self.password_enabled() {
+            return Err(AuthError::Unauthorized);
         }
         // Read again under the device lock: what the first look saw may have changed. The
         // clock is the statement's, not the transaction's: the lock wait must not stretch
@@ -480,6 +489,35 @@ impl Auth {
         revoke_devices(&mut tx, &pairs).await?;
         tx.commit().await?;
         Ok(pairs.len() as u64)
+    }
+
+    /// Entra ID only (spec D16): revokes, in batches, the active devices of accounts that
+    /// sign in with a password, as an admin revocation does. Rows another replica holds
+    /// are skipped (it revokes them), so several replicas share the work and each device
+    /// is revoked once. Returns how many this call revoked; 0 once nothing is left.
+    pub async fn revoke_password_devices(&self) -> Result<u64, AuthError> {
+        let mut total = 0;
+        loop {
+            let mut tx = self.pool.begin().await?;
+            let rows = sqlx::query(
+                "SELECT device.user_id, device.device_id FROM auth.device AS device \
+                 JOIN auth.user_account AS account USING (user_id) \
+                 WHERE device.revoked_at IS NULL AND account.password_hash IS NOT NULL \
+                 ORDER BY device.device_id LIMIT $1 FOR UPDATE OF device SKIP LOCKED",
+            )
+            .bind(SWEEP_BATCH)
+            .fetch_all(&mut *tx)
+            .await?;
+            if rows.is_empty() {
+                tx.commit().await?;
+                return Ok(total);
+            }
+            let devices: Vec<(Uuid, Uuid)> =
+                rows.iter().map(|row| (row.get(0), row.get(1))).collect();
+            revoke_devices(&mut tx, &devices).await?;
+            tx.commit().await?;
+            total += devices.len() as u64;
+        }
     }
 }
 

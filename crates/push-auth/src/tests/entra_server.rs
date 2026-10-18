@@ -42,6 +42,15 @@ async fn the_service_starts_entra_only_and_signs_in_over_a_socket() {
         .start()
         .await
         .expect("start Redis");
+    // A password device from before the switch to Entra ID only.
+    let url = format!(
+        "postgres://postgres:postgres@127.0.0.1:{}/postgres",
+        postgres.get_host_port_ipv4(5432).await.unwrap()
+    );
+    crate::db::migrate_database(&url).await.unwrap();
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+    let before = super::service(pool.clone(), crate::service::SignIn::default());
+    let alice = super::password_user(&before, &pool, "alice", 1).await;
     let stub = StubOpenId::start().await;
     let mut variables: Vec<(String, String)> = vec![
         (
@@ -92,6 +101,16 @@ async fn the_service_starts_entra_only_and_signs_in_over_a_socket() {
 
     let client = reqwest::Client::new();
     ready(&client, health_addr).await;
+    let revoked: bool =
+        sqlx::query_scalar("SELECT revoked_at IS NOT NULL FROM auth.device WHERE device_id = $1")
+            .bind(alice[0].device_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(
+        revoked,
+        "ready only after the password devices are signed out"
+    );
     let signed_in = client
         .post(format!("http://{addr}/v1/auth/entra"))
         .json(&json!({"token": stub.token("55555555-0000-4000-8000-000000000005")}))

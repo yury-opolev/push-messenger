@@ -127,7 +127,6 @@ pub async fn serve(
         pool.close().await;
         return finish(health_server).await;
     };
-    let _ = ready.pool.set(pool.clone());
 
     if let Some(entra) = &entra {
         // Fetched now so the first sign-in is quick; a failure only warns: readiness never
@@ -156,6 +155,21 @@ pub async fn serve(
         password: config.providers.password,
         entra,
     });
+    if !config.providers.password {
+        // Entra ID only: every password session ends now, before this replica is ready
+        // (spec D16). Idempotent; replicas share the work.
+        let revoked = auth
+            .revoke_password_devices()
+            .await
+            .context("sign out the password devices")?;
+        tracing::info!(
+            target: "security",
+            event = "auth.password_sessions.revoked",
+            devices = revoked,
+            "email and password sign-in is off: password devices were signed out"
+        );
+    }
+    let _ = ready.pool.set(pool.clone());
     let limits = Limits::new(Arc::new(counter));
     let api = router(Api {
         auth: auth.clone(),
