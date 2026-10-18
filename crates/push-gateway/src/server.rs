@@ -5,6 +5,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use anyhow::Context;
 use axum::Router;
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, State};
@@ -12,6 +13,8 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use axum::routing::get;
 use prost::Message as _;
+use push_credentials::startup::{redis_permanent, retry};
+use push_credentials::{AuthMode, AzureConfig, RedisConnector};
 use push_proto::internal::v1::messaging_client::MessagingClient;
 use push_proto::internal::v1::{
     AckRequest, DeleteRequest, EditRequest, IdentifyRequest, Kick, KickReason, ReadUpToRequest,
@@ -121,15 +124,48 @@ pub async fn serve(
         .map_err(|_| anyhow::anyhow!("PUSH_MESSAGING_TOKEN is not fit for a header"))?;
     bearer.set_sensitive(true);
     let messaging = MessagingClient::with_interceptor(endpoint.connect_lazy(), BearerToken(bearer));
-    // The error is not passed on: the URL carries the Redis password.
-    let redis = redis::Client::open(config.redis_url.as_str())
-        .map_err(|_| anyhow::anyhow!("PUSH_REDIS_URL is not a valid Redis URL"))?;
+    push_credentials::install_crypto_provider();
+    let azure = config
+        .azure
+        .as_ref()
+        .map(AzureConfig::source)
+        .transpose()
+        .context("the Azure identity")?;
+    // `OpenError` never contains the URL, which carries the Redis password.
+    let redis = RedisConnector::open(&config.redis, azure.as_ref(), shutdown.clone())
+        .await
+        .context("Redis credentials")?;
+    // In Entra mode the lazy publisher and the background subscriber would hide a refused
+    // token or certificate forever: prove one signed-in connection first. An unreachable
+    // Redis is retried; password mode keeps the lazy start.
+    if config.redis.mode() == AuthMode::AzureEntra {
+        let fatal = |error: &anyhow::Error| redis_permanent(error);
+        let checked = retry(
+            "redis",
+            Duration::from_secs(2),
+            &shutdown,
+            &fatal,
+            || async {
+                let mut connection = redis
+                    .connection_manager(ConnectionManagerConfig::new())
+                    .await?;
+                redis::cmd("PING")
+                    .query_async::<String>(&mut connection)
+                    .await?;
+                anyhow::Ok(())
+            },
+        )
+        .await?;
+        if checked.is_none() {
+            return Ok(());
+        }
+    }
     let commands = ConnectionManagerConfig::new()
         .set_connection_timeout(Some(REDIS_TIMEOUT))
         .set_response_timeout(Some(REDIS_TIMEOUT))
         .set_number_of_retries(1);
     let publisher = redis
-        .get_connection_manager_lazy(commands)
+        .connection_manager_lazy(commands)
         .map_err(|_| anyhow::anyhow!("PUSH_REDIS_URL is not a valid Redis URL"))?;
     let (hub, subscriber) = Hub::start(redis, shutdown.clone());
     let verifier = Verifier::new(config.jwks_url(), &config.token_audience);

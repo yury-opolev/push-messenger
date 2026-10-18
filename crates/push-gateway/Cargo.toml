@@ -14,6 +14,7 @@ async-trait.workspace = true
 axum = { workspace = true, features = ["ws"] }
 jsonwebtoken.workspace = true
 prost.workspace = true
+push-credentials.workspace = true
 push-proto.workspace = true
 redis.workspace = true
 # HTTPS to auth-svc's key set when PUSH_AUTH_URL is https://: rustls with ring, trusting the
@@ -36,6 +37,7 @@ uuid.workspace = true
 [dev-dependencies]
 futures-util.workspace = true
 push-auth.workspace = true
+push-credentials = { workspace = true, features = ["testing"] }
 push-domain.workspace = true
 push-message-svc.workspace = true
 testcontainers-modules.workspace = true

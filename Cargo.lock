@@ -2297,6 +2297,7 @@ dependencies = [
  "jsonwebtoken",
  "prost",
  "push-auth",
+ "push-credentials",
  "push-domain",
  "push-message-svc",
  "push-proto",

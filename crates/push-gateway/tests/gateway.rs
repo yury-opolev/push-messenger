@@ -175,7 +175,8 @@ async fn stack_with(sync_failures: u32, heartbeat: Duration) -> Stack {
     let config = Config {
         message_svc_url: message_svc.clone(),
         messaging_token: MESSAGING_TOKEN.to_owned(),
-        redis_url,
+        redis: push_credentials::RedisTarget::Password { url: redis_url },
+        azure: None,
         auth_url,
         token_audience: AUDIENCE.to_owned(),
         listen_addr: gateway,

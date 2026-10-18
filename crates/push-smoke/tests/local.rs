@@ -170,7 +170,10 @@ impl Stack {
             push_gateway::Config {
                 message_svc_url: message_svc_url.clone(),
                 messaging_token: messaging_token.to_owned(),
-                redis_url: redis_url.clone(),
+                redis: push_credentials::RedisTarget::Password {
+                    url: redis_url.clone(),
+                },
+                azure: None,
                 auth_url: auth_url.clone(),
                 token_audience: socket_url.clone(),
                 listen_addr: listener.local_addr().unwrap(),
