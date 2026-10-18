@@ -2,6 +2,8 @@
 
 Date: 2026-10-18
 
+Implementation status: **12A** in progress ([plan](../plans/2026-10-18-plan-12a-entra-datastore-credentials.md)).
+
 This answers the downstream change request "passwordless Azure PostgreSQL and Redis
 support" (based on `d1e1bf2`, PR #23). The services can run against external, managed
 PostgreSQL and Redis that accept only Microsoft Entra ID tokens from Azure Workload ID
