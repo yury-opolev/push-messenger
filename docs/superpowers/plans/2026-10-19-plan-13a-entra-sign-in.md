@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. Work sequentially on one branch.
 
-**Goal:** Let users sign in with Microsoft Entra ID beside (or instead of) email and password: auth-svc checks an Entra access token for its API, finds or creates the user by `(tid, oid)` and hands out today's registration token; Entra-backed devices have a maximum session age; the SDK and its bindings accept an Entra token the app obtained; the default stays exactly today's behaviour.
+**Goal:** Let users sign in with Microsoft Entra ID beside (or instead of) email and password: auth-svc checks an Entra access token for its API, finds or creates the user by `(tid, oid)` and hands out today's registration token; Entra-backed devices have a maximum session age; every user can change their handle; an operator can sign a user out of all devices through a separate admin listener; switching to Entra ID only signs password sessions out at once; the SDK and its bindings accept an Entra token the app obtained and change the handle; the default stays exactly today's behaviour.
 
-**Architecture:** A new module `crates\push-auth\src\entra\` holds the settings (`PUSH_AUTH_PROVIDERS`, `PUSH_ENTRA_*`), the claim rules, a per-tenant key cache (OpenID metadata and JWKS over rustls, refreshed on unknown `kid` with a cooldown, stale-if-error, fail closed) and the verifier `EntraSignIn` built on the `jsonwebtoken` 9 (ring) the workspace already uses. `crates\push-auth\src\external.rs` maps identities to accounts in a new `auth.external_identity` table and binds registration tokens to the identity (`xid`, `sx`) instead of the password (`pw`). `auth.device.session_expires_at` ends refresh after the maximum age. The router serves `POST /v1/auth/entra` and drops the email/password routes when `password` is not a provider. The worker gains `PUSH_EMAIL_SENDER=none`. The SDK gains `Client::sign_in_with_entra`. Tests run against a stub OpenID issuer with fixed RSA test keys.
+**Architecture:** A new module `crates\push-auth\src\entra\` holds the settings (`PUSH_AUTH_PROVIDERS`, `PUSH_ENTRA_*`), the claim rules, a key cache per key source (one per listed tenant, or one shared source for `common`/`organizations`/`consumers`; OpenID metadata and JWKS over rustls, refreshed on unknown `kid` with a cooldown, stale-if-error, fail closed) and the verifier `EntraSignIn` built on the `jsonwebtoken` 9 (ring) the workspace already uses. `crates\push-auth\src\external.rs` maps identities to accounts in a new `auth.external_identity` table and binds registration tokens to the identity (`xid`, `sx`) instead of the password (`pw`). `auth.device.session_expires_at` ends refresh after the maximum age. The router serves `POST /v1/auth/entra` and drops the email/password routes when `password` is not a provider. `PATCH /v1/users/me` also changes the handle. `crates\push-auth\src\admin.rs` serves `POST /v1/admin/users/revoke-sessions` on its own listener behind `PUSH_AUTH_ADMIN_TOKEN`; it and the Entra-only start-up sweep revoke devices through the existing `device.revoked` relay. The worker gains `PUSH_EMAIL_SENDER=none`. The SDK gains `Client::sign_in_with_entra` and `Client::update_profile`. Tests run against a stub OpenID issuer with fixed RSA test keys.
 
 **Tech Stack:** Rust 2024 / MSRV 1.85, Tokio, axum 0.8, sqlx 0.8.6 (PostgreSQL), jsonwebtoken 9.3.1 (RS256 on ring), reqwest 0.12 (`rustls-tls-native-roots`, ring), testcontainers; no new crate.
 
@@ -57,6 +57,9 @@ Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
 | `credentials::is_refused` treats `unauthorized`, `token_expired`, `http_401` as a sign-out | `crates\push-sdk\src\credentials.rs:241-244` | Add `session_expired` |
 | push-smoke's `common::lookup` returns the first match | `crates\push-smoke\tests\common\mod.rs:30-37` | Make later entries win, so a test can override what `Stack` sets |
 | A package cannot depend on itself to enable its own feature | Plan 12A Task 2 | Entra tests that need the stub live in `src\tests\` (compiled with `cfg(test)`), like push-credentials |
+| No handle-change endpoint exists: `PATCH /v1/users/me` takes only `display_name`; no `handle` in push-message-svc, push-domain, the protocol or push-store; the SDK stores no handle | `src\api.rs`, `src\profiles.rs`, search of the workspace | Task 12 extends the PATCH; nothing to propagate |
+| `DELETE /v1/devices/{id}` writes `device.revoked`; the worker relays it to message-svc's `Accounts.DeviceRevoked`, which kicks `kick:{device}` (gateway close 4003) and refuses the device's access tokens | `src\devices.rs`, `push-worker\src\accounts.rs`, `push-message-svc\src\grpc.rs` | The admin API and the Entra-only switch reuse `device.revoked` |
+| message-svc compares internal tokens in constant time by folding XOR | `push-message-svc\src\grpc.rs` (`fn same`) | The admin token uses the same fold over SHA-256 digests (no length leak) |
 
 ## Files
 
@@ -71,12 +74,13 @@ Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
 | `crates\push-auth\migrations\0004_entra.sql` | nullable email/password with a CHECK, `auth.external_identity`, `auth.device.session_expires_at`, cleanup guard |
 | `crates\push-auth\src\external.rs` | Entra accounts: find, create, registration, device sign-in |
 | `crates\push-auth\src\{config,service,devices,links,profiles,error,api,limits,audit,server,lib}.rs` | providers, sign-in options, bindings, session age, endpoint, routes, limits, events, wiring |
-| `crates\push-auth\src\tests\{mod,entra_accounts,entra_api,entra_server}.rs` | integration tests with Postgres, Redis and the stub |
-| `crates\push-auth\tests\{schema,accounts,devices}.rs` | the new table, accounts without a password, optional email |
+| `crates\push-auth\src\admin.rs` | the admin router: token, rate limit, `POST /v1/admin/users/revoke-sessions` |
+| `crates\push-auth\src\tests\{mod,entra_accounts,entra_api,entra_server,admin,switch}.rs` | integration tests with Postgres, Redis and the stub |
+| `crates\push-auth\tests\{schema,accounts,devices,api}.rs` | the new table, accounts without a password, optional email, handle changes |
 | `crates\push-worker\src\{config,jobs,server}.rs` | `PUSH_EMAIL_SENDER=none` |
-| `crates\push-sdk\src\{auth,client,credentials,testing}.rs` | `sign_in_with_entra`, `session_expired`, the fake endpoint |
-| `bindings\node\{src\client.rs,index.js,index.d.ts,test\client.test.js,test\types.ts}` | `signInWithEntra` |
-| `bindings\c\{src\client.rs,src\lib.rs,include\push_sdk.h}` | `push_client_sign_in_with_entra` |
+| `crates\push-sdk\src\{auth,client,credentials,testing}.rs`, `src\client\requests.rs` | `sign_in_with_entra`, `update_profile`, `session_expired`, the fake endpoints |
+| `bindings\node\{src\client.rs,index.js,index.d.ts,test\client.test.js,test\types.ts}` | `signInWithEntra`, `updateProfile` |
+| `bindings\c\{src\client.rs,src\lib.rs,include\push_sdk.h}` | `push_client_sign_in_with_entra`, `push_client_update_profile` |
 | `crates\push-smoke\Cargo.toml`, `tests\common\mod.rs`, `tests\local.rs`, `tests\entra_sign_in.rs` | shared password datastores, later variables win, the Entra-only whole stack |
 | `docs\entra-sign-in.md` | new guide |
 | `README.md`, `docs\sdk-bindings.md`, roadmap, spec | configuration and status |
@@ -115,7 +119,10 @@ reqwest = { workspace = true, features = ["rustls-tls-native-roots"] }
 
 mod settings;
 
-pub use settings::{DEFAULT_AUTHORITY_HOST, DEFAULT_REQUIRED_SCOPE, EntraSettings, Providers};
+pub use settings::{
+    CONSUMERS_TENANT, DEFAULT_AUTHORITY_HOST, DEFAULT_REQUIRED_SCOPE, EntraSettings, Providers,
+    Tenants,
+};
 ```
 
 and in `crates\push-auth\src\lib.rs` add `pub mod entra;` after `mod directory;`.
@@ -187,19 +194,19 @@ mod tests {
     fn the_defaults_name_the_global_cloud_a_day_and_access_as_user() {
         let settings = settings(&[]).unwrap();
         assert_eq!(settings.authority_host, DEFAULT_AUTHORITY_HOST);
-        assert_eq!(settings.tenants, [Uuid::parse_str(TENANT).unwrap()]);
+        let tenant = Uuid::parse_str(TENANT).unwrap();
+        assert_eq!(settings.tenants, Tenants::Ids(vec![tenant]));
         assert_eq!(settings.audiences, [API]);
         assert_eq!(settings.required_scope.as_deref(), Some("access_as_user"));
         assert_eq!(settings.required_role, None);
         assert!(settings.client_apps.is_empty());
         assert_eq!(settings.max_session, Duration::from_secs(24 * 3600));
-        let tenant = settings.tenants[0];
         assert_eq!(
             settings.issuer(tenant),
             format!("https://login.microsoftonline.com/{TENANT}/v2.0")
         );
         assert_eq!(
-            settings.metadata_url(tenant),
+            settings.metadata_url(TENANT),
             format!(
                 "https://login.microsoftonline.com/{TENANT}/v2.0/.well-known/openid-configuration"
             )
@@ -207,22 +214,45 @@ mod tests {
     }
 
     #[test]
-    fn tenants_are_listed_ids_never_wildcards_or_personal_accounts() {
+    fn tenants_are_one_keyword_or_a_list_of_ids_never_a_mixture() {
         let two = settings(&[(
             "PUSH_ENTRA_ALLOWED_TENANTS",
             "33333333-0000-4000-8000-000000000003, 44444444-0000-4000-8000-000000000004",
         )])
         .unwrap();
-        assert_eq!(two.tenants.len(), 2);
-        let with_common = format!("{TENANT},common");
+        assert!(matches!(two.tenants, Tenants::Ids(ref ids) if ids.len() == 2));
+        for (value, expected) in [
+            ("common", Tenants::Common),
+            (" Organizations ", Tenants::Organizations),
+            ("CONSUMERS", Tenants::Consumers),
+        ] {
+            assert_eq!(
+                settings(&[("PUSH_ENTRA_ALLOWED_TENANTS", value)])
+                    .unwrap()
+                    .tenants,
+                expected
+            );
+        }
+        let mixed = format!("{TENANT},common");
+        let twice = format!("{TENANT},{TENANT}");
+        let empty_entry = format!("{TENANT},,44444444-0000-4000-8000-000000000004");
+        let trailing = format!("{TENANT},");
+        let many = (1..=21)
+            .map(|n| format!("{n:08x}-0000-4000-8000-000000000000"))
+            .collect::<Vec<_>>()
+            .join(",");
         for bad in [
-            "common",
-            "Organizations",
-            "consumers",
+            mixed.as_str(),
+            "common,organizations",
+            "organizations,consumers",
+            "consumers,consumers",
+            twice.as_str(),
+            empty_entry.as_str(),
+            trailing.as_str(),
             "contoso.onmicrosoft.com",
-            "9188040d-6c67-4c5b-b112-36a304b66dad",
             "00000000-0000-0000-0000-000000000000",
-            with_common.as_str(),
+            "all",
+            many.as_str(),
         ] {
             assert!(refused("PUSH_ENTRA_ALLOWED_TENANTS", bad), "{bad}");
         }
@@ -230,6 +260,33 @@ mod tests {
             settings(&[("PUSH_ENTRA_ALLOWED_TENANTS", "")]),
             Err(ConfigError::Missing("PUSH_ENTRA_ALLOWED_TENANTS"))
         );
+    }
+
+    #[test]
+    fn each_keyword_admits_exactly_its_tenants_and_has_one_key_source() {
+        let listed = Uuid::parse_str(TENANT).unwrap();
+        let work = Uuid::from_u128(0x55555555_0000_4000_8000_000000000005);
+        let cases = [
+            (Tenants::Common, [true, true, true], "common"),
+            (Tenants::Organizations, [true, true, false], "organizations"),
+            (Tenants::Consumers, [false, false, true], "consumers"),
+        ];
+        for (tenants, [admits_listed, admits_work, admits_personal], source) in cases {
+            assert_eq!(tenants.admits(listed), admits_listed, "{tenants:?}");
+            assert_eq!(tenants.admits(work), admits_work, "{tenants:?}");
+            assert_eq!(tenants.admits(CONSUMERS_TENANT), admits_personal, "{tenants:?}");
+            assert!(!tenants.admits(Uuid::nil()));
+            assert_eq!(tenants.key_sources(), [source]);
+            let admitted = [listed, work, CONSUMERS_TENANT]
+                .into_iter()
+                .find(|tid| tenants.admits(*tid))
+                .unwrap();
+            assert_eq!(tenants.key_source(admitted).as_deref(), Some(source));
+        }
+        let ids = Tenants::Ids(vec![listed]);
+        assert!(ids.admits(listed) && !ids.admits(work) && !ids.admits(CONSUMERS_TENANT));
+        assert_eq!(ids.key_source(listed), Some(TENANT.to_owned()));
+        assert_eq!(ids.key_source(work), None);
     }
 
     #[test]
@@ -342,8 +399,8 @@ pub const DEFAULT_AUTHORITY_HOST: &str = "https://login.microsoftonline.com/";
 /// The delegated scope required by default: the one the guide tells the API registration
 /// to expose.
 pub const DEFAULT_REQUIRED_SCOPE: &str = "access_as_user";
-/// The tenant of personal Microsoft accounts: never a workforce tenant.
-const CONSUMERS_TENANT: Uuid = Uuid::from_u128(0x9188040d_6c67_4c5b_b112_36a304b66dad);
+/// The tenant of personal Microsoft accounts.
+pub const CONSUMERS_TENANT: Uuid = Uuid::from_u128(0x9188040d_6c67_4c5b_b112_36a304b66dad);
 const MAX_TENANTS: usize = 20;
 const MAX_AUDIENCES: usize = 4;
 const MAX_SESSION_HOURS: u64 = 720;
@@ -392,8 +449,8 @@ impl Providers {
 pub struct EntraSettings {
     /// Scheme and host, ending in `/`: `https://login.microsoftonline.com/`.
     pub authority_host: String,
-    /// The tenants whose users may sign in.
-    pub tenants: Vec<Uuid>,
+    /// Whose users may sign in.
+    pub tenants: Tenants,
     /// The accepted `aud` values: the API's application id (what v2.0 tokens carry) and
     /// optionally its `api://` identifier URI.
     pub audiences: Vec<String>,
@@ -429,7 +486,7 @@ impl EntraSettings {
 
         let tenants_value = get("PUSH_ENTRA_ALLOWED_TENANTS")
             .ok_or(ConfigError::Missing("PUSH_ENTRA_ALLOWED_TENANTS"))?;
-        let tenants = tenants(&tenants_value)
+        let tenants = Tenants::parse(&tenants_value)
             .map_err(|reason| invalid("PUSH_ENTRA_ALLOWED_TENANTS", &tenants_value, reason))?;
 
         let audiences_value =
@@ -495,10 +552,10 @@ impl EntraSettings {
         format!("{}{tenant}/v2.0", self.authority_host)
     }
 
-    /// `tenant`'s OpenID Connect metadata document.
-    pub fn metadata_url(&self, tenant: Uuid) -> String {
+    /// The OpenID Connect metadata document of a key source ([`Tenants::key_source`]).
+    pub fn metadata_url(&self, source: &str) -> String {
         format!(
-            "{}{tenant}/v2.0/.well-known/openid-configuration",
+            "{}{source}/v2.0/.well-known/openid-configuration",
             self.authority_host
         )
     }
@@ -525,24 +582,92 @@ fn authority_host(value: &str) -> Result<String, &'static str> {
     Ok(url.to_string())
 }
 
-/// Tenant ids; never the multi-tenant names, personal accounts or the nil id (spec D3).
-fn tenants(value: &str) -> Result<Vec<Uuid>, &'static str> {
-    for name in value.split(',').map(str::trim) {
-        if matches!(
-            name.to_ascii_lowercase().as_str(),
-            "common" | "organizations" | "consumers"
-        ) {
-            return Err("multi-tenant authorities are not supported: list tenant ids");
+/// Whose users may sign in: `PUSH_ENTRA_ALLOWED_TENANTS` (spec D3). Exactly one keyword,
+/// or one or more tenant ids; never a mixture.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Tenants {
+    /// Any tenant, personal Microsoft accounts included.
+    Common,
+    /// Any work or school tenant: every tenant but the personal-account one.
+    Organizations,
+    /// Personal Microsoft accounts only: [`CONSUMERS_TENANT`].
+    Consumers,
+    /// Exactly these tenants.
+    Ids(Vec<Uuid>),
+}
+
+impl Tenants {
+    /// `common`, `organizations` or `consumers` alone (any case), or tenant ids separated by
+    /// commas: no keyword among them, no empty entry, no duplicate, not the nil id, at most
+    /// [`MAX_TENANTS`].
+    pub fn parse(value: &str) -> Result<Self, &'static str> {
+        let value = value.trim();
+        match value.to_ascii_lowercase().as_str() {
+            "common" => return Ok(Self::Common),
+            "organizations" => return Ok(Self::Organizations),
+            "consumers" => return Ok(Self::Consumers),
+            _ => {}
+        }
+        let mut ids: Vec<Uuid> = Vec::new();
+        for item in value.split(',').map(str::trim) {
+            if item.is_empty() {
+                return Err("an empty entry: list tenant ids separated by commas");
+            }
+            if matches!(
+                item.to_ascii_lowercase().as_str(),
+                "common" | "organizations" | "consumers"
+            ) {
+                return Err("common, organizations and consumers stand alone: never combined");
+            }
+            let id = Uuid::try_parse(item).map_err(|_| {
+                "expected common, organizations, consumers, or tenant ids (GUIDs) separated by commas"
+            })?;
+            if id.is_nil() {
+                return Err("the nil GUID is not a tenant");
+            }
+            if ids.contains(&id) {
+                return Err("a tenant id is listed twice");
+            }
+            ids.push(id);
+        }
+        if ids.len() > MAX_TENANTS {
+            return Err("at most 20 tenant ids");
+        }
+        Ok(Self::Ids(ids))
+    }
+
+    /// Whether a token of tenant `tid` may sign in.
+    pub fn admits(&self, tid: Uuid) -> bool {
+        match self {
+            Self::Common => !tid.is_nil(),
+            Self::Organizations => !tid.is_nil() && tid != CONSUMERS_TENANT,
+            Self::Consumers => tid == CONSUMERS_TENANT,
+            Self::Ids(ids) => ids.contains(&tid),
         }
     }
-    let tenants = guids(value, MAX_TENANTS)?;
-    if tenants
-        .iter()
-        .any(|tenant| tenant.is_nil() || *tenant == CONSUMERS_TENANT)
-    {
-        return Err("personal Microsoft accounts and the nil tenant are not supported");
+
+    /// The authority path whose metadata and keys sign `tid`'s tokens: the tenant itself in
+    /// a list, the keyword's shared endpoint otherwise (spec D4); `None` if not admitted.
+    pub fn key_source(&self, tid: Uuid) -> Option<String> {
+        if !self.admits(tid) {
+            return None;
+        }
+        Some(match self {
+            Self::Ids(_) => tid.to_string(),
+            keyword => keyword.key_sources().remove(0),
+        })
     }
-    Ok(tenants)
+
+    /// Every key source: one per listed tenant, or the keyword itself. This bounds the key
+    /// cache whatever `tid`s tokens carry.
+    pub fn key_sources(&self) -> Vec<String> {
+        match self {
+            Self::Common => vec!["common".to_owned()],
+            Self::Organizations => vec!["organizations".to_owned()],
+            Self::Consumers => vec!["consumers".to_owned()],
+            Self::Ids(ids) => ids.iter().map(Uuid::to_string).collect(),
+        }
+    }
 }
 
 /// 1 to `most` GUIDs, comma-separated; duplicates count once.
@@ -599,7 +724,7 @@ fn is_claim_value(value: &str) -> bool {
 - [ ] **Step 6: Run.**
 
 Run: `cargo test -p push-auth --lib entra::settings`
-Expected: 6 tests pass.
+Expected: 7 tests pass.
 
 - [ ] **Step 7: The service configuration.** In `crates\push-auth\src\config.rs`:
 
@@ -610,7 +735,7 @@ Add rows to the doc table, after `PUSH_DIRECTORY_TOKEN`'s row:
 ```rust
 /// | `PUSH_AUTH_PROVIDERS` | `password`, `entra` or `password,entra` (spec 2026-10-19) | `password` |
 /// | `PUSH_ENTRA_CLIENT_ID` | accepted audiences: the API registration's application id, optionally with its `api://` URI | required with `entra` |
-/// | `PUSH_ENTRA_ALLOWED_TENANTS` | tenant ids (GUIDs), comma-separated; `common`, `organizations`, `consumers` refused | required with `entra` |
+/// | `PUSH_ENTRA_ALLOWED_TENANTS` | exactly one of `common`, `organizations`, `consumers`, or tenant ids (GUIDs), comma-separated; never mixed | required with `entra` |
 /// | `PUSH_ENTRA_AUTHORITY_HOST` | the Entra ID host; `http://` only for loopback (tests) | `https://login.microsoftonline.com/` |
 /// | `PUSH_ENTRA_REQUIRED_SCOPE` | the delegated scope `scp` must contain; `*` for any | `access_as_user` |
 /// | `PUSH_ENTRA_REQUIRED_ROLE` | an app role `roles` must contain | none |
@@ -689,8 +814,10 @@ Add to the config tests module:
             }
         );
         assert_eq!(
-            entra.entra.as_ref().map(|settings| settings.tenants.len()),
-            Some(1)
+            entra.entra.as_ref().map(|settings| settings.tenants.clone()),
+            Some(crate::entra::Tenants::Ids(vec![
+                uuid::Uuid::parse_str("33333333-0000-4000-8000-000000000003").unwrap()
+            ]))
         );
         entra_only.retain(|(name, _)| *name != "PUSH_ENTRA_CLIENT_ID");
         assert_eq!(
@@ -741,7 +868,10 @@ mod settings;
 
 use uuid::Uuid;
 
-pub use settings::{DEFAULT_AUTHORITY_HOST, DEFAULT_REQUIRED_SCOPE, EntraSettings, Providers};
+pub use settings::{
+    CONSUMERS_TENANT, DEFAULT_AUTHORITY_HOST, DEFAULT_REQUIRED_SCOPE, EntraSettings, Providers,
+    Tenants,
+};
 
 /// Why a token was refused. Logged by name; the client only ever hears
 /// `entra_token_invalid`.
@@ -829,6 +959,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::entra::Tenants;
 
     const TENANT: Uuid = Uuid::from_u128(0x33333333_0000_4000_8000_000000000003);
     const USER: &str = "55555555-0000-4000-8000-000000000005";
@@ -837,7 +968,7 @@ mod tests {
     fn settings() -> EntraSettings {
         EntraSettings {
             authority_host: "https://login.microsoftonline.com/".to_owned(),
-            tenants: vec![TENANT],
+            tenants: Tenants::Ids(vec![TENANT]),
             audiences: vec!["11111111-0000-4000-8000-000000000001".to_owned()],
             required_scope: Some("access_as_user".to_owned()),
             required_role: None,
@@ -1203,7 +1334,7 @@ use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use super::EntraSettings;
+use super::{CONSUMERS_TENANT, EntraSettings, Tenants};
 
 /// The tenant the stub's tokens come from by default.
 pub const TENANT: &str = "33333333-0000-4000-8000-000000000003";
@@ -1381,10 +1512,10 @@ impl StubOpenId {
     pub fn settings(&self) -> EntraSettings {
         EntraSettings {
             authority_host: self.state.authority.clone(),
-            tenants: vec![
+            tenants: Tenants::Ids(vec![
                 Uuid::parse_str(TENANT).expect("a GUID"),
                 Uuid::parse_str(OTHER_TENANT).expect("a GUID"),
-            ],
+            ]),
             audiences: vec![API_CLIENT_ID.to_owned()],
             required_scope: Some("access_as_user".to_owned()),
             required_role: None,
@@ -1453,10 +1584,16 @@ async fn metadata(State(stub): State<Arc<Stub>>, Path(tenant): Path<String>) -> 
     if let Some(refused) = pause(&stub).await {
         return refused;
     }
+    // As Entra ID answers: the shared endpoints of common and organizations name a
+    // template issuer, consumers' names the personal-account tenant.
     let issuer = if stub.wrong_issuer.load(Ordering::SeqCst) {
         format!("https://sts.example.test/{tenant}/v2.0")
     } else {
-        format!("{}{tenant}/v2.0", stub.authority)
+        match tenant.as_str() {
+            "common" | "organizations" => format!("{}{{tenantid}}/v2.0", stub.authority),
+            "consumers" => format!("{}{CONSUMERS_TENANT}/v2.0", stub.authority),
+            _ => format!("{}{tenant}/v2.0", stub.authority),
+        }
     };
     let jwks_uri = if stub.foreign_jwks.load(Ordering::SeqCst) {
         "http://203.0.113.9/keys".to_owned()
@@ -1601,6 +1738,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_keyword_shares_one_key_source_whatever_the_tenant() {
+        let stub = StubOpenId::start().await;
+        let settings = EntraSettings {
+            tenants: Tenants::Organizations,
+            ..stub.settings()
+        };
+        let keys = KeySets::new(&settings, quick()).unwrap();
+        for n in 1..=5u128 {
+            let tenant = Uuid::from_u128(0x7000_0000_0000_4000_8000_000000000000 + n);
+            assert!(keys.key(tenant, KEY_A.kid).await.unwrap().is_some());
+        }
+        assert_eq!(
+            (stub.metadata_fetches(), stub.jwks_fetches()),
+            (1, 1),
+            "one shared source, whose template issuer is not compared"
+        );
+        // Personal accounts are not organizations: nothing is fetched for them.
+        assert!(
+            keys.key(crate::entra::CONSUMERS_TENANT, KEY_A.kid)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(stub.metadata_fetches(), 1);
+    }
+
+    #[tokio::test]
     async fn an_unknown_kid_fetches_again_but_not_within_the_cooldown() {
         let stub = StubOpenId::start().await;
         let keys = KeySets::new(&stub.settings(), quick()).unwrap();
@@ -1725,13 +1889,16 @@ Expected: compile errors (`KeySets`, `KeyTiming` not found).
 - [ ] **Step 4: Implement.** Put above the tests in `keys.rs`:
 
 ```rust
-//! Each allowed tenant's signing keys (spec D4). The tenant's OpenID metadata names its
-//! issuer, which must be the expected one, and its key set, which must be on the authority
-//! host. Keys are fetched on first use (and warmed at start-up), kept for `max_age`, fetched
-//! again for a token naming an unknown key at most every `unknown_kid_cooldown`, and kept
-//! up to `stale_for` longer while the authority is down. Without usable keys every Entra
-//! sign-in fails closed. A tenant's fetches are serialised by its lock, so a burst of
-//! sign-ins fetches once.
+//! The signing keys of each key source (spec D4): one per listed tenant, or the one shared
+//! endpoint of `common`, `organizations` or `consumers`, so the cache is bounded whatever
+//! `tid`s tokens carry. A source's OpenID metadata names its issuer (checked for a listed
+//! tenant; a keyword's names a template, and every token's issuer is checked against its
+//! own `tid` anyway) and its key set, which must be on the authority host. Keys are fetched
+//! on first use (and warmed at start-up), kept for `max_age`, fetched again for a token
+//! naming an unknown key at most every `unknown_kid_cooldown`, and kept up to `stale_for`
+//! longer while the authority is down. Without usable keys every Entra sign-in fails
+//! closed. A source's fetches are serialised by its lock, so a burst of sign-ins fetches
+//! once.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -1742,7 +1909,7 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use uuid::Uuid;
 
-use super::{EntraError, EntraSettings};
+use super::{EntraError, EntraSettings, Tenants};
 
 /// Largest metadata or key set read.
 const MAX_DOCUMENT_BYTES: usize = 256 * 1024;
@@ -1779,16 +1946,18 @@ impl Default for KeyTiming {
     }
 }
 
-/// The keys of every allowed tenant.
+/// The keys of every key source.
 pub(crate) struct KeySets {
     http: reqwest::Client,
     authority: Url,
     timing: KeyTiming,
-    tenants: HashMap<Uuid, Tenant>,
+    tenants: Tenants,
+    sources: HashMap<String, Source>,
 }
 
-struct Tenant {
-    issuer: String,
+struct Source {
+    /// The issuer its metadata must name: a listed tenant's; `None` for a keyword's.
+    issuer: Option<String>,
     metadata_url: String,
     cache: tokio::sync::Mutex<Cache>,
 }
@@ -1837,30 +2006,34 @@ impl KeySets {
             .map_err(|_| "cannot build the HTTP client for Entra ID".to_owned())?;
         let authority = Url::parse(&settings.authority_host)
             .map_err(|_| "the Entra ID authority host is not a URL".to_owned())?;
-        let tenants = settings
+        let sources = settings
             .tenants
-            .iter()
-            .map(|&tenant| {
-                let entry = Tenant {
-                    issuer: settings.issuer(tenant),
-                    metadata_url: settings.metadata_url(tenant),
+            .key_sources()
+            .into_iter()
+            .map(|source| {
+                let entry = Source {
+                    issuer: Uuid::try_parse(&source)
+                        .ok()
+                        .map(|tenant| settings.issuer(tenant)),
+                    metadata_url: settings.metadata_url(&source),
                     cache: tokio::sync::Mutex::new(Cache::default()),
                 };
-                (tenant, entry)
+                (source, entry)
             })
             .collect();
         Ok(Self {
             http,
             authority,
             timing,
-            tenants,
+            tenants: settings.tenants.clone(),
+            sources,
         })
     }
 
-    /// Fetches every tenant's keys that are not cached yet. Failures are logged, not
+    /// Fetches every source's keys that are not cached yet. Failures are logged, not
     /// fatal: readiness never depends on Entra ID.
     pub(crate) async fn warm(&self) {
-        for (tenant, entry) in &self.tenants {
+        for (source, entry) in &self.sources {
             let mut cache = entry.cache.lock().await;
             if cache.fetched_at.is_some() {
                 continue;
@@ -1870,24 +2043,28 @@ impl KeySets {
                 Ok(keys) => {
                     cache.keys = keys;
                     cache.fetched_at = Some(Instant::now());
-                    tracing::info!(%tenant, "fetched the Entra ID signing keys");
+                    tracing::info!(%source, "fetched the Entra ID signing keys");
                 }
                 Err(error) => {
-                    tracing::warn!(%tenant, %error, "cannot fetch the Entra ID signing keys yet; sign-ins try again");
+                    tracing::warn!(%source, %error, "cannot fetch the Entra ID signing keys yet; sign-ins try again");
                     cache.last_error = Some(error);
                 }
             }
         }
     }
 
-    /// The key `kid` of `tenant`; `None` if the tenant is not allowed or does not publish
-    /// that key. `Unavailable` when no usable keys can be had.
+    /// The key `kid` for tokens of tenant `tenant`, from its key source; `None` if the
+    /// tenant is not admitted or the source does not publish that key. `Unavailable` when
+    /// no usable keys can be had.
     pub(crate) async fn key(
         &self,
         tenant: Uuid,
         kid: &str,
     ) -> Result<Option<DecodingKey>, EntraError> {
-        let Some(entry) = self.tenants.get(&tenant) else {
+        let Some(source) = self.tenants.key_source(tenant) else {
+            return Ok(None);
+        };
+        let Some(entry) = self.sources.get(&source) else {
             return Ok(None);
         };
         let mut cache = entry.cache.lock().await;
@@ -1913,7 +2090,7 @@ impl KeySets {
                     return Ok(cache.keys.get(kid).cloned());
                 }
                 Err(error) => {
-                    tracing::warn!(%tenant, %error, "cannot fetch the Entra ID signing keys");
+                    tracing::warn!(%source, %error, "cannot fetch the Entra ID signing keys");
                     cache.last_error = Some(error);
                 }
             }
@@ -1931,10 +2108,14 @@ impl KeySets {
         Ok(cache.keys.get(kid).cloned())
     }
 
-    /// The tenant's RSA signing keys, by key id.
-    async fn refresh(&self, tenant: &Tenant) -> Result<HashMap<String, DecodingKey>, String> {
-        let metadata: Metadata = self.document(&tenant.metadata_url).await?;
-        if metadata.issuer != tenant.issuer {
+    /// The source's RSA signing keys, by key id.
+    async fn refresh(&self, source: &Source) -> Result<HashMap<String, DecodingKey>, String> {
+        let metadata: Metadata = self.document(&source.metadata_url).await?;
+        if source
+            .issuer
+            .as_ref()
+            .is_some_and(|issuer| metadata.issuer != *issuer)
+        {
             return Err("the metadata names another issuer".to_owned());
         }
         let jwks_url = self.on_authority(&metadata.jwks_uri)?;
@@ -2000,7 +2181,7 @@ fn describe(error: reqwest::Error) -> String {
 - [ ] **Step 5: Run.**
 
 Run: `cargo test -p push-auth --lib entra::keys`
-Expected: 5 tests pass.
+Expected: 6 tests pass.
 
 - [ ] **Step 6: Commit.**
 
@@ -2208,6 +2389,56 @@ mod tests {
         );
         assert_eq!(down.metadata_fetches(), fetched);
     }
+
+    #[tokio::test]
+    async fn each_keyword_admits_its_tenants_and_checks_each_token_against_its_own_tid() {
+        let stub = StubOpenId::start().await;
+        let work = "77777777-0000-4000-8000-000000000007";
+        let personal = CONSUMERS_TENANT.to_string();
+        let verifier = |tenants: Tenants| {
+            let settings = EntraSettings {
+                tenants,
+                ..stub.settings()
+            };
+            EntraSignIn::with_timing(settings, quick()).unwrap()
+        };
+        let token = |tenant: &str| sign(KEY_A, &stub.user_claims(tenant, USER));
+        for (tenants, work_ok, personal_ok) in [
+            (Tenants::Common, true, true),
+            (Tenants::Organizations, true, false),
+            (Tenants::Consumers, false, true),
+        ] {
+            let entra = verifier(tenants.clone());
+            for (tenant, admitted) in [(work, work_ok), (personal.as_str(), personal_ok)] {
+                let verified = entra.verify(&token(tenant)).await;
+                if admitted {
+                    assert_eq!(
+                        verified.unwrap().tenant_id.to_string(),
+                        tenant,
+                        "{tenants:?}"
+                    );
+                } else {
+                    assert_eq!(
+                        verified,
+                        Err(EntraError::Rejected(Reason::Tenant)),
+                        "{tenants:?}"
+                    );
+                }
+            }
+            // The issuer must still name the token's own tenant.
+            let other_issuer = changed(
+                stub.user_claims(work, USER),
+                "iss",
+                json!(stub.issuer(TENANT)),
+            );
+            if tenants.admits(Uuid::parse_str(work).unwrap()) {
+                assert_eq!(
+                    entra.verify(&sign(KEY_A, &other_issuer)).await,
+                    Err(EntraError::Rejected(Reason::Issuer))
+                );
+            }
+        }
+    }
 }
 ```
 
@@ -2239,7 +2470,7 @@ const MAX_TOKEN_BYTES: usize = 8 * 1024;
 pub const LEEWAY_SECONDS: u64 = 60;
 
 /// Checks Entra ID access tokens for this API (spec D2): RS256 with a published key of
-/// an allowed tenant, that tenant's v2.0 issuer, a configured audience, `exp`/`nbf`
+/// the key source of an admitted tenant, the v2.0 issuer of the token's own tenant, a configured audience, `exp`/`nbf`
 /// within 60 s, then the claim rules.
 #[derive(Clone)]
 pub struct EntraSignIn {
@@ -2341,7 +2572,7 @@ impl EntraSignIn {
             .tid
             .as_deref()
             .and_then(|tid| Uuid::try_parse(tid).ok())
-            .filter(|tenant| self.settings.tenants.contains(tenant))
+            .filter(|tenant| self.settings.tenants.admits(*tenant))
             .ok_or(EntraError::Rejected(Reason::Tenant))?;
         let issuer = self.settings.issuer(tenant);
         if unverified.iss.as_deref() != Some(issuer.as_str()) {
@@ -2389,7 +2620,7 @@ fn reason_of(error: &jsonwebtoken::errors::Error) -> Reason {
 - [ ] **Step 4: Run.**
 
 Run: `cargo test -p push-auth --lib entra`
-Expected: every `entra` test passes (settings 6, claims 5, testing 2, keys 5, verifier 3).
+Expected: every `entra` test passes (settings 7, claims 5, testing 2, keys 6, verifier 4).
 
 - [ ] **Step 5: Commit.**
 
@@ -4544,7 +4775,7 @@ Expected: every test passes.
 ```markdown
 | `PUSH_AUTH_PROVIDERS` | `password`, `entra` or `password,entra`; without `password` the signup, verification, login and password-reset routes answer 404 ([Entra ID sign-in](docs/entra-sign-in.md)) | `password` |
 | `PUSH_ENTRA_CLIENT_ID` | accepted audiences: the API registration's application id, optionally with its `api://` identifier URI | required with `entra` |
-| `PUSH_ENTRA_ALLOWED_TENANTS` | tenant ids (GUIDs), comma-separated; `common`, `organizations` and `consumers` are refused | required with `entra` |
+| `PUSH_ENTRA_ALLOWED_TENANTS` | exactly one of `common` (any tenant and personal accounts), `organizations` (any work or school tenant), `consumers` (personal accounts), or tenant ids (GUIDs), comma-separated; never mixed. A keyword lets anyone with such an account create an account here | required with `entra` |
 | `PUSH_ENTRA_AUTHORITY_HOST` | Microsoft Entra ID's host (a sovereign cloud's); `http://` only for loopback | `https://login.microsoftonline.com/` |
 | `PUSH_ENTRA_REQUIRED_SCOPE` | the delegated scope tokens must carry; `*` for any scope of the API | `access_as_user` |
 | `PUSH_ENTRA_REQUIRED_ROLE` | an app role tokens must carry | none |
@@ -4747,10 +4978,1213 @@ git add -A
 git commit -m "feat(worker): add PUSH_EMAIL_SENDER=none for installations without email"
 ```
 
-### Task 12: The SDK signs in with an Entra ID access token
+### Task 12: Every user can change their handle
+
+`PATCH /v1/users/me` already changes the display name; it now also takes `handle` (spec
+D14). No re-authentication beyond the access token: a handle is a public name, not a
+credential (contacts and conversations are bound to user ids), and this keeps password and
+Entra users on one path. Nothing caches handles: lookup and profiles read
+`auth.user_account`; message-svc, push-domain, the protocol, push-store and the SDK keep no
+handle (verified by search), so there is nothing to propagate.
 
 **Files:**
-- Modify: `crates\push-sdk\src\auth.rs`, `src\client.rs`, `src\credentials.rs`, `src\testing.rs`
+- Modify: `crates\push-auth\src\profiles.rs`, `src\api.rs`, `src\limits.rs`, `src\tests\entra_api.rs`
+- Test: `crates\push-auth\tests\api.rs`
+
+- [ ] **Step 1: Write the failing tests.** Append to `crates\push-auth\tests\api.rs`:
+
+```rust
+async fn patch_me(world: &World, token: &str, body: Value) -> Answer {
+    call(world, Method::PATCH, "/v1/users/me", Some(token), Some(body)).await
+}
+
+async fn lookup_status(world: &World, token: &str, handle: &str) -> StatusCode {
+    let uri = format!("/v1/users/lookup?handle={handle}");
+    call(world, Method::GET, &uri, Some(token), None).await.status
+}
+
+#[tokio::test]
+async fn a_user_changes_their_handle_and_the_old_one_is_free_at_once() {
+    let world = world().await;
+    let alice = with_device(&world, "alice").await;
+    let bob = with_device(&world, "bob").await;
+    let alice_access = alice["access_token"].as_str().unwrap();
+    let bob_access = bob["access_token"].as_str().unwrap();
+
+    let renamed = patch_me(&world, alice_access, json!({"handle": "@Alice_2"})).await;
+    assert_eq!(renamed.status, StatusCode::OK, "{}", renamed.text);
+    assert_eq!(renamed.json()["handle"], "alice_2");
+    assert_eq!(renamed.json()["display_name"], "alice");
+    assert_eq!(
+        lookup_status(&world, bob_access, "alice").await,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(lookup_status(&world, bob_access, "alice_2").await, StatusCode::OK);
+
+    let taken = patch_me(&world, bob_access, json!({"handle": "alice_2"})).await;
+    assert_eq!(taken.status, StatusCode::CONFLICT);
+    assert_eq!(taken.json()["error"]["code"], "handle_taken");
+    let freed = patch_me(
+        &world,
+        bob_access,
+        json!({"handle": "alice", "display_name": "Bob B."}),
+    )
+    .await;
+    assert_eq!(freed.status, StatusCode::OK, "{}", freed.text);
+    assert_eq!(freed.json()["handle"], "alice");
+    assert_eq!(freed.json()["display_name"], "Bob B.");
+
+    for bad in [
+        json!({}),
+        json!({"handle": "x"}),
+        json!({"handle": "9lives"}),
+        json!({"display_name": ""}),
+    ] {
+        let answer = patch_me(&world, alice_access, bad.clone()).await;
+        assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{bad}");
+    }
+    // A display name alone is changed as before and is not counted as a handle change.
+    let named = patch_me(&world, alice_access, json!({"display_name": "Alice A."})).await;
+    assert_eq!(named.json()["handle"], "alice_2");
+    // 5 handle changes a day per account: Alice made 3 (the two invalid ones count).
+    for handle in ["alice_3", "alice_4"] {
+        let answer = patch_me(&world, alice_access, json!({"handle": handle})).await;
+        assert_eq!(answer.status, StatusCode::OK, "{handle}");
+    }
+    let limited = patch_me(&world, alice_access, json!({"handle": "alice_5"})).await;
+    assert_eq!(limited.status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(limited.headers.contains_key("retry-after"));
+    let unauthenticated = call(
+        &world,
+        Method::PATCH,
+        "/v1/users/me",
+        None,
+        Some(json!({"handle": "carol"})),
+    )
+    .await;
+    assert_eq!(unauthenticated.status, StatusCode::UNAUTHORIZED);
+}
+```
+
+and to `crates\push-auth\src\tests\entra_api.rs`:
+
+```rust
+#[tokio::test]
+async fn an_entra_user_changes_their_handle_with_an_access_token_alone() {
+    static LINES: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_writer(|| Capture(&LINES))
+        .with_max_level(tracing::Level::INFO)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let world = world(Offer::Entra).await;
+    let tokens = with_device(&world, USER).await;
+    let renamed = call(
+        &world,
+        Method::PATCH,
+        "/v1/users/me",
+        tokens["access_token"].as_str(),
+        Some(json!({"handle": "erin_renamed"})),
+    )
+    .await;
+    assert_eq!(renamed.status, StatusCode::OK, "{}", renamed.json);
+    assert_eq!(renamed.json["handle"], "erin_renamed");
+    // A later sign-in keeps the chosen handle, whatever it asks for.
+    let again = entra(
+        &world,
+        json!({"token": world.stub.token(USER), "handle": "something_else"}),
+    )
+    .await;
+    assert_eq!(again.status, StatusCode::OK);
+    let handle: String = sqlx::query_scalar("SELECT handle::text FROM auth.user_account")
+        .fetch_one(&world.pool)
+        .await
+        .unwrap();
+    assert_eq!(handle, "erin_renamed");
+
+    let text = String::from_utf8(LINES.lock().unwrap().clone()).unwrap();
+    let changed = text
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|line| line["fields"]["event"] == "auth.handle.changed")
+        .expect("the change is a security event");
+    assert_eq!(changed["fields"]["user_id"], tokens["user_id"]);
+    assert!(!text.contains("erin_renamed"), "the handle is not logged");
+}
+```
+
+- [ ] **Step 2: Run them to see them fail.**
+
+Run: `cargo test -p push-auth --test api a_user_changes_their_handle; cargo test -p push-auth --lib an_entra_user_changes_their_handle`
+Expected: FAIL: the PATCH body without `display_name` is refused (400) and the handle never changes.
+
+- [ ] **Step 3: Limits.** In `crates\push-auth\src\limits.rs` add `const DAY: u64 = 24 * HOUR;`
+after `QUARTER`, the variant (after `EntraAccount`):
+
+```rust
+    /// `PATCH /v1/users/me` with a handle: per IP and per user.
+    HandleChange,
+```
+
+its name `Self::HandleChange => "handle_change",` and limits:
+
+```rust
+        // Handles are public names: a few changes a day, so nobody cycles through them.
+        const HANDLE_CHANGE: &[(Scope, Limit)] =
+            &[(Scope::Ip, per(30, HOUR)), (Scope::Account, per(5, DAY))];
+```
+
+```rust
+            Self::HandleChange => HANDLE_CHANGE,
+```
+
+- [ ] **Step 4: The service.** In `crates\push-auth\src\profiles.rs` add
+`use crate::rules::Invalid;` and `use crate::service::is_violation;` and replace
+`set_display_name` with:
+
+```rust
+    /// `PATCH /v1/users/me {display_name?, handle?}` (spec D14): changes the display name,
+    /// the handle or both, at least one, in one transaction. A handle any other account
+    /// holds is `handle_taken` (the unique constraint decides); the old handle is free at
+    /// once. Nothing else stores handles, so nothing else changes.
+    pub async fn update_profile(
+        &self,
+        caller: Caller,
+        display_name: Option<&str>,
+        handle: Option<&str>,
+    ) -> Result<OwnProfile, AuthError> {
+        let display_name = display_name.map(rules::display_name).transpose()?;
+        let handle = handle.map(rules::handle).transpose()?;
+        if display_name.is_none() && handle.is_none() {
+            return Err(AuthError::Invalid(Invalid {
+                field: "body",
+                reason: "give display_name, handle or both",
+            }));
+        }
+        let mut tx = self.pool.begin().await?;
+        if let Some(display_name) = &display_name {
+            sqlx::query("UPDATE auth.user_account SET display_name = $2 WHERE user_id = $1")
+                .bind(caller.user_id)
+                .bind(display_name)
+                .execute(&mut *tx)
+                .await?;
+        }
+        let mut renamed = false;
+        if let Some(handle) = &handle {
+            let changed = sqlx::query(
+                "UPDATE auth.user_account SET handle = $2 \
+                 WHERE user_id = $1 AND handle <> $2::citext RETURNING 1",
+            )
+            .bind(caller.user_id)
+            .bind(handle)
+            .fetch_optional(&mut *tx)
+            .await;
+            match changed {
+                Ok(row) => renamed = row.is_some(),
+                Err(error) if is_violation(&error, "user_account_handle_key") => {
+                    return Err(AuthError::HandleTaken);
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        tx.commit().await?;
+        if renamed {
+            tracing::info!(
+                target: "security",
+                event = "auth.handle.changed",
+                user_id = %caller.user_id,
+                "a user changed their handle"
+            );
+        }
+        self.own_profile(caller).await
+    }
+
+    /// `PATCH /v1/users/me {display_name}`.
+    pub async fn set_display_name(
+        &self,
+        caller: Caller,
+        display_name: &str,
+    ) -> Result<OwnProfile, AuthError> {
+        self.update_profile(caller, Some(display_name), None).await
+    }
+```
+
+(`is_violation` is `pub(crate)` in `service.rs` already.)
+
+- [ ] **Step 5: The API.** In `crates\push-auth\src\api.rs` change the route to
+`.route("/v1/users/me", get(own_profile).patch(update_profile))`, and replace
+`DisplayNameBody` and `set_display_name` with:
+
+```rust
+#[derive(Deserialize)]
+struct ProfileBody {
+    #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default)]
+    handle: Option<String>,
+}
+
+/// `PATCH /v1/users/me {display_name?, handle?}`: the access token is the only proof
+/// needed (spec D14); a handle change is rate limited per IP and per user.
+async fn update_profile(
+    State(api): State<Api>,
+    headers: HeaderMap,
+    ClientIp(ip): ClientIp,
+    JsonBody(body): JsonBody<ProfileBody>,
+) -> Result<Response, AuthError> {
+    let caller = caller(&api, &headers).await?;
+    if body.handle.is_some() {
+        let user = caller.user_id.to_string();
+        api.limits
+            .check(Action::HandleChange, ip, Some(&user))
+            .await?;
+    }
+    let profile = api
+        .auth
+        .update_profile(caller, body.display_name.as_deref(), body.handle.as_deref())
+        .await?;
+    let mut response = Json(own_profile_json(&profile)).into_response();
+    response.extensions_mut().insert(Subject {
+        user: Some(caller.user_id),
+        device: Some(caller.device_id),
+    });
+    Ok(response)
+}
+```
+
+- [ ] **Step 6: Run.**
+
+Run: `cargo test -p push-auth`
+Expected: every test passes, the two new ones included (and the existing display-name tests
+unchanged).
+
+- [ ] **Step 7: Commit.**
+
+```powershell
+git add -A
+git commit -m "feat(auth): let every user change their handle"
+```
+
+### Task 13: The admin API: sign a user out of every device
+
+A separate listener (`PUSH_AUTH_ADMIN_ADDR`, default `0.0.0.0:8082`) that exists only with
+`PUSH_AUTH_ADMIN_TOKEN` serves `POST /v1/admin/users/revoke-sessions` (spec D15). It reuses
+the revocation relay: `device.revoked` per device, which the worker relays to message-svc
+(`DeviceRevoked`), which publishes `kick:{device}` for the gateway (close 4003) and refuses
+the device's access tokens from then on. No CLI and no "remove the Entra link" option.
+
+**Files:**
+- Create: `crates\push-auth\src\admin.rs`, `crates\push-auth\src\tests\admin.rs`
+- Modify: `crates\push-auth\src\devices.rs`, `src\config.rs`, `src\server.rs`, `src\limits.rs`, `src\lib.rs`, `src\tests\mod.rs`, `README.md`
+
+- [ ] **Step 1: Shared test helpers.** In `crates\push-auth\src\tests\mod.rs` add
+`mod admin;`, the imports `use uuid::Uuid;`, `use crate::devices::Tokens;`,
+`use crate::entra::EntraIdentity;`, `use crate::entra::testing::TENANT;`,
+`use crate::service::Signup;`, replace the `let auth = Auth::new(…).with_sign_in(sign_in);`
+statement in `world()` with `let auth = service(pool.clone(), sign_in);`, and add:
+
+```rust
+/// The service on `pool` offering `sign_in`, with the settings every world uses.
+pub(crate) fn service(pool: PgPool, sign_in: SignIn) -> Auth {
+    Auth::new(
+        pool,
+        Settings {
+            public_url: "http://push.local".to_owned(),
+            passwords: Passwords::new(64, 1, 1).unwrap(),
+            links: LinkSigner::new(LINK_KEY.to_vec()).unwrap(),
+            tokens: AccessTokens::from_seed(&[5; 32], AUDIENCE).unwrap(),
+            hash_concurrency: 4,
+            hash_queue: 64,
+            hash_wait: Duration::from_secs(5),
+        },
+    )
+    .with_sign_in(sign_in)
+}
+
+/// A verified email/password account `name@example.com` (handle `name`) with `devices`
+/// registered devices: their tokens. `auth` must offer password sign-in.
+pub(crate) async fn password_user(
+    auth: &Auth,
+    pool: &PgPool,
+    name: &str,
+    devices: usize,
+) -> Vec<Tokens> {
+    let email = format!("{name}@example.com");
+    auth.signup(Signup {
+        email: email.clone(),
+        password: "correct horse".to_owned(),
+        handle: name.to_owned(),
+        display_name: name.to_owned(),
+    })
+    .await
+    .unwrap();
+    let link: String = sqlx::query_scalar(
+        "SELECT payload->'params'->>'link' FROM auth.outbox WHERE kind = 'email.send' \
+         AND payload->>'to' = $1 ORDER BY created_at DESC, event_id DESC LIMIT 1",
+    )
+    .bind(&email)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    auth.verify_email(link.split_once("?token=").unwrap().1)
+        .await
+        .unwrap();
+    let mut tokens = Vec::new();
+    for _ in 0..devices {
+        let registration = auth.login(&email, "correct horse").await.unwrap().token;
+        tokens.push(
+            auth.register_device(&registration, Uuid::now_v7(), "Phone", "ios")
+                .await
+                .unwrap(),
+        );
+    }
+    tokens
+}
+
+/// An Entra ID user of the stub's tenant with one registered device: its tokens.
+pub(crate) async fn entra_user(auth: &Auth, object_id: Uuid) -> Tokens {
+    let identity = EntraIdentity {
+        tenant_id: Uuid::parse_str(TENANT).unwrap(),
+        object_id,
+        name: Some("Erin".to_owned()),
+        email: None,
+    };
+    let signed_in = auth.sign_in_entra(&identity, None).await.unwrap();
+    auth.register_device(&signed_in.registration.token, Uuid::now_v7(), "Laptop", "web")
+        .await
+        .unwrap()
+}
+```
+
+- [ ] **Step 2: Write the failing tests.** Create `crates\push-auth\src\tests\admin.rs`:
+
+```rust
+//! The admin API (spec AC10): each selector, refusals, the rate limit, the relay events
+//! and the security log, through the admin router.
+
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
+
+use axum::Router;
+use axum::body::Body;
+use axum::extract::ConnectInfo;
+use axum::http::{Method, Request, StatusCode};
+use http_body_util::BodyExt;
+use serde_json::{Value, json};
+use tower::ServiceExt;
+use uuid::Uuid;
+
+use super::{Offer, World, entra_user, password_user, world};
+use crate::admin::{AdminApi, admin_router};
+use crate::entra::testing::TENANT;
+use crate::error::AuthError;
+use crate::limits::{Limits, MemoryCounter};
+
+const ADMIN_TOKEN: &str = "admin-token-of-the-auth-svc-tests-0123456789";
+
+fn admin(world: &World) -> Router {
+    admin_router(AdminApi::new(
+        world.auth.clone(),
+        Limits::new(Arc::new(MemoryCounter::default())),
+        ADMIN_TOKEN,
+    ))
+}
+
+async fn revoke(router: &Router, bearer: Option<&str>, body: Value) -> (StatusCode, Value) {
+    let mut request = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/admin/users/revoke-sessions")
+        .header("content-type", "application/json");
+    if let Some(token) = bearer {
+        request = request.header("authorization", format!("Bearer {token}"));
+    }
+    let mut request = request.body(Body::from(body.to_string())).unwrap();
+    request
+        .extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from(([10, 0, 0, 9], 40000))));
+    let response = router.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+}
+
+struct Capture(&'static Mutex<Vec<u8>>);
+
+impl std::io::Write for Capture {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn an_operator_signs_a_user_out_of_every_device_by_handle_id_or_entra_identity() {
+    static LINES: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_writer(|| Capture(&LINES))
+        .with_max_level(tracing::Level::INFO)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let world = world(Offer::Both).await;
+    let router = admin(&world);
+    let alice = password_user(&world.auth, &world.pool, "alice", 2).await;
+    let erin_oid = Uuid::now_v7();
+    let erin = entra_user(&world.auth, erin_oid).await;
+
+    let (status, answer) = revoke(&router, Some(ADMIN_TOKEN), json!({"handle": "@Alice"})).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(
+        answer,
+        json!({"user_id": alice[0].user_id, "devices_revoked": 2})
+    );
+    for tokens in &alice {
+        assert_eq!(
+            world.auth.refresh(&tokens.refresh_token).await,
+            Err(AuthError::Unauthorized)
+        );
+        assert_eq!(
+            world.auth.authenticate(&tokens.access_token).await,
+            Err(AuthError::Unauthorized)
+        );
+    }
+    let relayed: Vec<Value> = world
+        .outbox()
+        .await
+        .into_iter()
+        .filter(|(kind, _)| kind == "device.revoked")
+        .map(|(_, payload)| payload["device_id"].clone())
+        .collect();
+    assert_eq!(
+        relayed,
+        alice
+            .iter()
+            .map(|tokens| json!(tokens.device_id))
+            .collect::<Vec<_>>()
+    );
+    // Nothing is left to revoke; the account stays and may sign in again.
+    let (status, again) = revoke(
+        &router,
+        Some(ADMIN_TOKEN),
+        json!({"user_id": alice[0].user_id}),
+    )
+    .await;
+    assert_eq!((status, again["devices_revoked"].clone()), (StatusCode::OK, json!(0)));
+    assert!(world.auth.login("alice@example.com", "correct horse").await.is_ok());
+
+    let (status, answer) = revoke(
+        &router,
+        Some(ADMIN_TOKEN),
+        json!({"entra": {"tenant_id": TENANT, "object_id": erin_oid}}),
+    )
+    .await;
+    assert_eq!(
+        (status, answer["devices_revoked"].clone()),
+        (StatusCode::OK, json!(1))
+    );
+    assert_eq!(
+        world.auth.refresh(&erin.refresh_token).await,
+        Err(AuthError::Unauthorized)
+    );
+
+    let text = String::from_utf8(LINES.lock().unwrap().clone()).unwrap();
+    let event = text
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|line| line["fields"]["event"] == "auth.admin.sessions_revoked")
+        .expect("the revocation is a security event");
+    assert_eq!(event["fields"]["user_id"], alice[0].user_id.to_string());
+    assert_eq!(event["fields"]["selector"], "handle");
+    assert_eq!(event["fields"]["devices"], 2);
+    assert!(!text.contains(ADMIN_TOKEN));
+}
+
+#[tokio::test]
+async fn the_admin_api_refuses_wrong_tokens_and_bodies_and_is_rate_limited() {
+    let world = world(Offer::Both).await;
+    let router = admin(&world);
+    password_user(&world.auth, &world.pool, "alice", 1).await;
+    let short = &ADMIN_TOKEN[1..];
+    for bearer in [None, Some("wrong-token-wrong-token-wrong-token-wrong"), Some(short)] {
+        let (status, answer) = revoke(&router, bearer, json!({"handle": "alice"})).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{bearer:?}");
+        assert_eq!(answer["error"]["code"], "unauthorized");
+    }
+    for body in [
+        json!({}),
+        json!({"user_id": Uuid::now_v7(), "handle": "alice"}),
+        json!({"handle": "x"}),
+        json!({"user": "alice"}),
+    ] {
+        let (status, _) = revoke(&router, Some(ADMIN_TOKEN), body.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    }
+    for body in [json!({"user_id": Uuid::now_v7()}), json!({"handle": "nobody"})] {
+        let (status, answer) = revoke(&router, Some(ADMIN_TOKEN), body).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(answer["error"]["code"], "user_not_found");
+    }
+    // 60 calls per 15 minutes per IP, refused ones included: 9 so far.
+    for _ in 0..51 {
+        let (status, _) = revoke(&router, Some(ADMIN_TOKEN), json!({"handle": "nobody"})).await;
+        assert_ne!(status, StatusCode::TOO_MANY_REQUESTS);
+    }
+    let (status, _) = revoke(&router, Some(ADMIN_TOKEN), json!({"handle": "alice"})).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+}
+```
+
+Add to `crates\push-auth\src\config.rs`'s tests:
+
+```rust
+    #[test]
+    fn the_admin_listener_needs_a_strong_token_and_is_off_without_one() {
+        let default = config(&REQUIRED).unwrap();
+        assert_eq!(default.admin_token, None);
+        assert_eq!(default.admin_addr, "0.0.0.0:8082".parse().unwrap());
+        let token = "admin-admin-admin-admin-admin-admin-1";
+        let mut variables = with("PUSH_AUTH_ADMIN_TOKEN", token);
+        variables.push(("PUSH_AUTH_ADMIN_ADDR", "127.0.0.1:9090"));
+        let admin = config(&variables).unwrap();
+        assert_eq!(admin.admin_token.as_deref(), Some(token));
+        assert_eq!(admin.admin_addr, "127.0.0.1:9090".parse().unwrap());
+        assert!(!format!("{admin:?}").contains(token));
+        for weak in ["short", "an admin token with spaces in it, long enough"] {
+            let message = config(&with("PUSH_AUTH_ADMIN_TOKEN", weak))
+                .unwrap_err()
+                .to_string();
+            assert!(message.contains("PUSH_AUTH_ADMIN_TOKEN"), "{message}");
+            assert!(!message.contains(weak), "{message}");
+        }
+    }
+```
+
+- [ ] **Step 3: Run them to see them fail.**
+
+Run: `cargo test -p push-auth --lib admin`
+Expected: compile errors (`crate::admin`, `admin_token` not found).
+
+- [ ] **Step 4: Revocation shared by the admin API and the switch.** In
+`crates\push-auth\src\devices.rs` add to `impl Auth`:
+
+```rust
+    /// Signs `user_id` out of every device (spec D15): each active device is revoked with
+    /// its refresh tokens, and `device.revoked` closes its connections through the usual
+    /// relay. Returns how many devices were active. The account stays.
+    pub async fn revoke_user_sessions(&self, user_id: Uuid) -> Result<u64, AuthError> {
+        let mut tx = self.pool.begin().await?;
+        // Device rows first, in a fixed order, like every other change to a device's tokens.
+        let devices: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT device_id FROM auth.device WHERE user_id = $1 AND revoked_at IS NULL \
+             ORDER BY device_id FOR UPDATE",
+        )
+        .bind(user_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        let pairs: Vec<(Uuid, Uuid)> = devices.iter().map(|device| (user_id, *device)).collect();
+        revoke_devices(&mut tx, &pairs).await?;
+        tx.commit().await?;
+        Ok(pairs.len() as u64)
+    }
+```
+
+and below `revoke_refresh_tokens`:
+
+```rust
+/// Revokes `devices` (`(user, device)` pairs whose rows the caller has locked) and their
+/// refresh tokens, and writes `device.revoked` for each: message-svc then refuses their
+/// access tokens and the gateway closes their connections (4003).
+pub(crate) async fn revoke_devices(
+    connection: &mut PgConnection,
+    devices: &[(Uuid, Uuid)],
+) -> Result<(), AuthError> {
+    if devices.is_empty() {
+        return Ok(());
+    }
+    let ids: Vec<Uuid> = devices.iter().map(|(_, device)| *device).collect();
+    sqlx::query(
+        "UPDATE auth.device SET revoked_at = now() \
+         WHERE device_id = ANY($1) AND revoked_at IS NULL",
+    )
+    .bind(&ids)
+    .execute(&mut *connection)
+    .await?;
+    sqlx::query(
+        "UPDATE auth.refresh_token SET revoked_at = now() \
+         WHERE device_id = ANY($1) AND revoked_at IS NULL",
+    )
+    .bind(&ids)
+    .execute(&mut *connection)
+    .await?;
+    for (user_id, device_id) in devices {
+        let event = Event::DeviceRevoked {
+            user_id: *user_id,
+            device_id: *device_id,
+        };
+        outbox::write(&mut *connection, &event).await?;
+    }
+    Ok(())
+}
+```
+
+- [ ] **Step 5: The admin router.** Create `crates\push-auth\src\admin.rs`:
+
+```rust
+//! The admin API (spec D15): `POST /v1/admin/users/revoke-sessions` signs a user out of
+//! every device. It is served only on its own listener (`PUSH_AUTH_ADMIN_ADDR`), and only
+//! when `PUSH_AUTH_ADMIN_TOKEN` is set; the chart never routes it through the Ingress. The
+//! token is compared in constant time over SHA-256 digests and never logged.
+
+use std::net::SocketAddr;
+
+use axum::body::to_bytes;
+use axum::extract::{ConnectInfo, Request, State};
+use axum::http::HeaderValue;
+use axum::http::header::{AUTHORIZATION, CACHE_CONTROL};
+use axum::response::{IntoResponse, Response};
+use axum::routing::post;
+use axum::{Json, Router};
+use serde::Deserialize;
+use serde_json::json;
+use sha2::{Digest, Sha256};
+use uuid::Uuid;
+
+use crate::error::AuthError;
+use crate::limits::{Action, Limits};
+use crate::rules::{self, Invalid};
+use crate::service::Auth;
+
+/// Largest request body.
+const MAX_BODY_BYTES: usize = 4 * 1024;
+
+/// Whom to sign out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UserSelector {
+    Id(Uuid),
+    /// A normalised handle.
+    Handle(String),
+    Entra { tenant_id: Uuid, object_id: Uuid },
+}
+
+impl UserSelector {
+    /// The kind, for the security log (never the value).
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Id(_) => "user_id",
+            Self::Handle(_) => "handle",
+            Self::Entra { .. } => "entra",
+        }
+    }
+}
+
+/// What the admin handlers share.
+#[derive(Clone)]
+pub struct AdminApi {
+    auth: Auth,
+    limits: Limits,
+    /// SHA-256 of `PUSH_AUTH_ADMIN_TOKEN`.
+    token: [u8; 32],
+}
+
+impl std::fmt::Debug for AdminApi {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("AdminApi(<redacted>)")
+    }
+}
+
+impl AdminApi {
+    pub fn new(auth: Auth, limits: Limits, token: &str) -> Self {
+        Self {
+            auth,
+            limits,
+            token: Sha256::digest(token.as_bytes()).into(),
+        }
+    }
+
+    /// Whether `presented` is the admin token; constant time over the digests, so neither
+    /// the content nor the length leaks.
+    fn authorized(&self, presented: Option<&str>) -> bool {
+        let Some(presented) = presented else {
+            return false;
+        };
+        let digest: [u8; 32] = Sha256::digest(presented.as_bytes()).into();
+        digest
+            .iter()
+            .zip(&self.token)
+            .fold(0u8, |difference, (a, b)| difference | (a ^ b))
+            == 0
+    }
+}
+
+/// The admin router; serve it with `into_make_service_with_connect_info::<SocketAddr>()`.
+pub fn admin_router(admin: AdminApi) -> Router {
+    Router::new()
+        .route("/v1/admin/users/revoke-sessions", post(revoke_sessions))
+        .layer(axum::middleware::map_response(
+            |mut response: Response| async move {
+                response
+                    .headers_mut()
+                    .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+                response
+            },
+        ))
+        .with_state(admin)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RevokeBody {
+    #[serde(default)]
+    user_id: Option<Uuid>,
+    #[serde(default)]
+    handle: Option<String>,
+    #[serde(default)]
+    entra: Option<EntraSubject>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EntraSubject {
+    tenant_id: Uuid,
+    object_id: Uuid,
+}
+
+fn invalid(reason: &'static str) -> AuthError {
+    AuthError::Invalid(Invalid {
+        field: "body",
+        reason,
+    })
+}
+
+/// `POST /v1/admin/users/revoke-sessions` with exactly one of `{user_id}`, `{handle}`,
+/// `{entra: {tenant_id, object_id}}`: `{user_id, devices_revoked}`.
+async fn revoke_sessions(
+    State(admin): State<AdminApi>,
+    request: Request,
+) -> Result<Response, AuthError> {
+    let ip = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(peer)| peer.ip());
+    admin.limits.check(Action::Admin, ip, None).await?;
+    let presented = request
+        .headers()
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim);
+    if !admin.authorized(presented) {
+        tracing::warn!(
+            target: "security",
+            event = "auth.admin.token.refused",
+            ip = ip.map(tracing::field::display),
+            token_presented = presented.is_some(),
+            "an admin call was refused"
+        );
+        return Err(AuthError::Unauthorized);
+    }
+    let bytes = to_bytes(request.into_body(), MAX_BODY_BYTES)
+        .await
+        .map_err(|_| invalid("expected a JSON object of at most 4 KiB"))?;
+    let body: RevokeBody = serde_json::from_slice(&bytes)
+        .map_err(|_| invalid("expected exactly one of user_id, handle or entra"))?;
+    let selector = match (body.user_id, body.handle, body.entra) {
+        (Some(id), None, None) => UserSelector::Id(id),
+        (None, Some(handle), None) => UserSelector::Handle(rules::handle(&handle)?),
+        (None, None, Some(entra)) => UserSelector::Entra {
+            tenant_id: entra.tenant_id,
+            object_id: entra.object_id,
+        },
+        _ => return Err(invalid("give exactly one of user_id, handle or entra")),
+    };
+    let user_id = admin.auth.find_user(&selector).await?;
+    let revoked = admin.auth.revoke_user_sessions(user_id).await?;
+    tracing::warn!(
+        target: "security",
+        event = "auth.admin.sessions_revoked",
+        %user_id,
+        devices = revoked,
+        selector = selector.kind(),
+        ip = ip.map(tracing::field::display),
+        "an operator signed a user out of every device"
+    );
+    Ok(Json(json!({"user_id": user_id, "devices_revoked": revoked})).into_response())
+}
+
+impl Auth {
+    /// The account `selector` names; `UserNotFound` if none.
+    pub async fn find_user(&self, selector: &UserSelector) -> Result<Uuid, AuthError> {
+        let found: Option<Uuid> = match selector {
+            UserSelector::Id(id) => {
+                sqlx::query_scalar("SELECT user_id FROM auth.user_account WHERE user_id = $1")
+                    .bind(id)
+                    .fetch_optional(&self.pool)
+                    .await?
+            }
+            UserSelector::Handle(handle) => {
+                sqlx::query_scalar(
+                    "SELECT user_id FROM auth.user_account WHERE handle = $1::citext",
+                )
+                .bind(handle)
+                .fetch_optional(&self.pool)
+                .await?
+            }
+            UserSelector::Entra {
+                tenant_id,
+                object_id,
+            } => {
+                sqlx::query_scalar(
+                    "SELECT user_id FROM auth.external_identity \
+                     WHERE provider = 'entra' AND tenant_id = $1 AND subject = $2",
+                )
+                .bind(tenant_id)
+                .bind(object_id.to_string())
+                .fetch_optional(&self.pool)
+                .await?
+            }
+        };
+        found.ok_or(AuthError::UserNotFound)
+    }
+}
+```
+
+In `crates\push-auth\src\limits.rs` add the variant `Admin` (doc: "The admin API, per
+IP: refused calls count too."), name `"admin"`, and
+`const ADMIN: &[(Scope, Limit)] = &[(Scope::Ip, per(60, QUARTER))];` with
+`Self::Admin => ADMIN,`. In `crates\push-auth\src\lib.rs` add `pub mod admin;` and
+`pub use admin::{AdminApi, UserSelector, admin_router};`.
+
+- [ ] **Step 6: Configuration.** In `crates\push-auth\src\config.rs`, doc rows:
+
+```rust
+/// | `PUSH_AUTH_ADMIN_TOKEN` | the admin API's bearer token, 32 to 256 visible ASCII characters; unset: no admin listener (spec 2026-10-19 D15) | none |
+/// | `PUSH_AUTH_ADMIN_ADDR` | address of the admin listener; never expose it publicly | `0.0.0.0:8082` |
+```
+
+fields `pub admin_token: Option<String>,` and `pub admin_addr: SocketAddr,`, in `Debug`
+`.field("admin_token", &self.admin_token.as_ref().map(|_| "<redacted>"))` and
+`.field("admin_addr", &self.admin_addr)`, and in `from_lookup` before `Ok(Self {`:
+
+```rust
+        let admin_token = lookup("PUSH_AUTH_ADMIN_TOKEN").filter(|v| !v.is_empty());
+        if let Some(token) = &admin_token {
+            if !((32..=256).contains(&token.len()) && token.bytes().all(|b| b.is_ascii_graphic())) {
+                return Err(redacted(
+                    "PUSH_AUTH_ADMIN_TOKEN",
+                    "use 32 to 256 visible ASCII characters".to_owned(),
+                ));
+            }
+        }
+```
+
+with `admin_token,` and
+`admin_addr: parsed(&lookup, "PUSH_AUTH_ADMIN_ADDR", ([0, 0, 0, 0], 8082).into())?,` in the
+literal.
+
+- [ ] **Step 7: Serve it.** In `crates\push-auth\src\server.rs` add
+`use crate::admin::{AdminApi, admin_router};`. Replace
+`limits: Limits::new(Arc::new(counter)),` in the `router(Api { … })` literal with
+`limits: limits.clone(),`, preceded by `let limits = Limits::new(Arc::new(counter));`, and
+after the API router is built:
+
+```rust
+    // The admin listener exists only with its token (spec D15).
+    let admin_server = match &config.admin_token {
+        Some(token) => {
+            let listener = TcpListener::bind(config.admin_addr)
+                .await
+                .with_context(|| format!("bind the admin listener {}", config.admin_addr))?;
+            tracing::info!(addr = %config.admin_addr, "serving the admin API");
+            let admin = admin_router(AdminApi::new(auth.clone(), limits.clone(), token));
+            Some(tokio::spawn(
+                axum::serve(
+                    listener,
+                    admin.into_make_service_with_connect_info::<SocketAddr>(),
+                )
+                .with_graceful_shutdown(shutdown.clone().cancelled_owned())
+                .into_future(),
+            ))
+        }
+        None => None,
+    };
+```
+
+(the `auth` value passed to `router(Api { auth, … })` becomes `auth: auth.clone()`), and
+after `pool.close().await;` at the end:
+
+```rust
+    if let Some(admin_server) = admin_server {
+        admin_server.await??;
+    }
+```
+
+- [ ] **Step 8: README.** Add to the `push-auth` table:
+
+```markdown
+| `PUSH_AUTH_ADMIN_TOKEN` | the admin API's bearer token, 32 to 256 visible ASCII characters; with it, `POST /v1/admin/users/revoke-sessions` (sign a user out of every device by `user_id`, `handle` or `entra` tenant and object id) is served on `PUSH_AUTH_ADMIN_ADDR` only; unset: no admin listener ([guide](docs/entra-sign-in.md#admin-api)) | none |
+| `PUSH_AUTH_ADMIN_ADDR` | address of the admin listener; never route it publicly | `0.0.0.0:8082` |
+```
+
+- [ ] **Step 9: Run.**
+
+Run: `cargo test -p push-auth`
+Expected: every test passes, the admin and config tests included.
+
+- [ ] **Step 10: Commit.**
+
+```powershell
+git add -A
+git commit -m "feat(auth): add the admin API that signs a user out of every device"
+```
+
+### Task 14: Switching to Entra ID only signs password sessions out at once
+
+With `password` not among the providers, auth-svc revokes every active device of every
+account with a password before it reports ready, in batches shared by replicas
+(`SKIP LOCKED`), through the same `revoke_devices` (spec D16). Refresh also refuses such
+devices meanwhile. A later start finds nothing; re-enabling `password` revives nothing.
+
+**Files:**
+- Modify: `crates\push-auth\src\devices.rs`, `src\server.rs`, `src\tests\mod.rs`, `src\tests\entra_server.rs`
+- Create: `crates\push-auth\src\tests\switch.rs`
+
+- [ ] **Step 1: Write the failing tests.** In `src\tests\mod.rs` add `mod switch;`. Create
+`crates\push-auth\src\tests\switch.rs`:
+
+```rust
+//! Switching to Entra ID only (spec AC11): password devices are signed out at once,
+//! idempotently and once each under concurrent sweeps; switching back revives none.
+
+use serde_json::Value;
+use uuid::Uuid;
+
+use super::{Offer, entra_user, password_user, world};
+use crate::error::AuthError;
+use crate::service::SignIn;
+
+#[tokio::test]
+async fn entra_only_signs_password_devices_out_and_switching_back_revives_none() {
+    let world = world(Offer::Both).await;
+    let alice = password_user(&world.auth, &world.pool, "alice", 2).await;
+    let erin = entra_user(&world.auth, Uuid::now_v7()).await;
+    let entra_only = world.auth.clone().with_sign_in(SignIn {
+        password: false,
+        entra: world.auth.entra().cloned(),
+    });
+    // Before the sweep runs, refresh already refuses a password account's device.
+    assert_eq!(
+        entra_only.refresh(&alice[0].refresh_token).await,
+        Err(AuthError::Unauthorized)
+    );
+    assert_eq!(entra_only.revoke_password_devices().await.unwrap(), 2);
+    assert_eq!(entra_only.revoke_password_devices().await.unwrap(), 0, "idempotent");
+    for tokens in &alice {
+        assert_eq!(
+            entra_only.authenticate(&tokens.access_token).await,
+            Err(AuthError::Unauthorized)
+        );
+    }
+    assert!(entra_only.refresh(&erin.refresh_token).await.is_ok());
+    let relayed: Vec<Value> = world
+        .outbox()
+        .await
+        .into_iter()
+        .filter(|(kind, _)| kind == "device.revoked")
+        .map(|(_, payload)| payload["device_id"].clone())
+        .collect();
+    assert_eq!(relayed.len(), 2);
+    assert!(!relayed.contains(&serde_json::json!(erin.device_id)));
+
+    // Password sign-in on again: the revoked devices stay revoked.
+    for tokens in &alice {
+        assert_eq!(
+            world.auth.refresh(&tokens.refresh_token).await,
+            Err(AuthError::Unauthorized)
+        );
+    }
+    assert_eq!(
+        world
+            .auth
+            .login_device("alice@example.com", "correct horse", alice[0].device_id)
+            .await,
+        Err(AuthError::DeviceNotFound)
+    );
+    let registration = world
+        .auth
+        .login("alice@example.com", "correct horse")
+        .await
+        .unwrap()
+        .token;
+    let fresh = world
+        .auth
+        .register_device(&registration, Uuid::now_v7(), "Phone", "ios")
+        .await
+        .unwrap();
+    assert!(alice.iter().all(|tokens| tokens.device_id != fresh.device_id));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_sweeps_revoke_each_device_once() {
+    let world = world(Offer::Both).await;
+    for n in 0..6 {
+        password_user(&world.auth, &world.pool, &format!("user{n}"), 3).await;
+    }
+    let entra_only = world.auth.clone().with_sign_in(SignIn {
+        password: false,
+        entra: world.auth.entra().cloned(),
+    });
+    let sweeps: Vec<_> = (0..4)
+        .map(|_| {
+            let auth = entra_only.clone();
+            tokio::spawn(async move { auth.revoke_password_devices().await.unwrap() })
+        })
+        .collect();
+    let mut total = 0;
+    for sweep in sweeps {
+        total += sweep.await.unwrap();
+    }
+    assert_eq!(total, 18);
+    let events: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM auth.outbox WHERE kind = 'device.revoked'")
+            .fetch_one(&world.pool)
+            .await
+            .unwrap();
+    assert_eq!(events, 18);
+}
+```
+
+In `src\tests\entra_server.rs`, before the service starts, create a password device on
+the same database and check after readiness that it was signed out:
+
+```rust
+    // A password device from before the switch to Entra ID only.
+    let url = format!(
+        "postgres://postgres:postgres@127.0.0.1:{}/postgres",
+        postgres.get_host_port_ipv4(5432).await.unwrap()
+    );
+    crate::db::migrate_database(&url).await.unwrap();
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+    let before = super::service(pool.clone(), crate::service::SignIn::default());
+    let alice = super::password_user(&before, &pool, "alice", 1).await;
+```
+
+(after the containers start, before `Config::from_lookup`), and after `ready(…)`:
+
+```rust
+    let revoked: bool =
+        sqlx::query_scalar("SELECT revoked_at IS NOT NULL FROM auth.device WHERE device_id = $1")
+            .bind(alice[0].device_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(revoked, "ready only after the password devices are signed out");
+```
+
+- [ ] **Step 2: Run them to see them fail.**
+
+Run: `cargo test -p push-auth --lib tests::switch tests::entra_server`
+Expected: compile error (`revoke_password_devices` not found); then the refresh and the
+server checks fail.
+
+- [ ] **Step 3: The sweep and the refresh guard.** In `crates\push-auth\src\devices.rs` add
+`const SWEEP_BATCH: i64 = 500;` and to `impl Auth`:
+
+```rust
+    /// Entra ID only (spec D16): revokes, in batches, the active devices of accounts that
+    /// sign in with a password, as an admin revocation does. Rows another replica holds
+    /// are skipped (it revokes them), so several replicas share the work and each device
+    /// is revoked once. Returns how many this call revoked; 0 once nothing is left.
+    pub async fn revoke_password_devices(&self) -> Result<u64, AuthError> {
+        let mut total = 0;
+        loop {
+            let mut tx = self.pool.begin().await?;
+            let rows = sqlx::query(
+                "SELECT device.user_id, device.device_id FROM auth.device AS device \
+                 JOIN auth.user_account AS account USING (user_id) \
+                 WHERE device.revoked_at IS NULL AND account.password_hash IS NOT NULL \
+                 ORDER BY device.device_id LIMIT $1 FOR UPDATE OF device SKIP LOCKED",
+            )
+            .bind(SWEEP_BATCH)
+            .fetch_all(&mut *tx)
+            .await?;
+            if rows.is_empty() {
+                tx.commit().await?;
+                return Ok(total);
+            }
+            let devices: Vec<(Uuid, Uuid)> =
+                rows.iter().map(|row| (row.get(0), row.get(1))).collect();
+            revoke_devices(&mut tx, &devices).await?;
+            tx.commit().await?;
+            total += devices.len() as u64;
+        }
+    }
+```
+
+In `refresh`, replace the device query (from Task 8) with one that also reads whether the
+account has a password, and refuse it while password sign-in is off:
+
+```rust
+        let device = sqlx::query(
+            "SELECT device.user_id, device.revoked_at IS NULL, device.session_expires_at, \
+             account.password_hash IS NOT NULL \
+             FROM auth.device AS device JOIN auth.user_account AS account USING (user_id) \
+             WHERE device.device_id = $1 FOR UPDATE OF device",
+        )
+```
+
+and after the session check:
+
+```rust
+        // Entra ID only: password sessions ended with the switch (spec D16).
+        if device.get::<bool, _>(3) && !self.password_enabled() {
+            return Err(AuthError::Unauthorized);
+        }
+```
+
+- [ ] **Step 4: Sweep before ready.** In `crates\push-auth\src\server.rs`, move
+`let _ = ready.pool.set(pool.clone());` after the `Auth` is built (with its sign-in) and
+put before it:
+
+```rust
+    if !config.providers.password {
+        // Entra ID only: every password session ends now, before this replica is ready
+        // (spec D16). Idempotent; replicas share the work.
+        let revoked = auth
+            .revoke_password_devices()
+            .await
+            .context("sign out the password devices")?;
+        tracing::info!(
+            target: "security",
+            event = "auth.password_sessions.revoked",
+            devices = revoked,
+            "email and password sign-in is off: password devices were signed out"
+        );
+    }
+```
+
+- [ ] **Step 5: Run.**
+
+Run: `cargo test -p push-auth`
+Expected: every test passes, the switch and server tests included.
+
+- [ ] **Step 6: Commit.**
+
+```powershell
+git add -A
+git commit -m "feat(auth): sign password sessions out when switching to Entra ID only"
+```
+
+### Task 15: The SDK signs in with an Entra ID access token
+
+**Files:**
+- Modify: `crates\push-sdk\src\auth.rs`, `src\client.rs`, `src\client\requests.rs`, `src\credentials.rs`, `src\testing.rs`
 
 - [ ] **Step 1: The fake endpoint.** In `crates\push-sdk\src\testing.rs`:
 
@@ -5079,14 +6513,147 @@ password, or an Entra ID access token)".
 Run: `cargo test -p push-sdk`
 Expected: every test passes, the two new ones included.
 
-- [ ] **Step 6: Commit.**
+- [ ] **Step 6: The handle (and display name) from the SDK: failing test.** In
+`crates\push-sdk\src\testing.rs` add after `WRONG_ENTRA_TOKEN`:
+
+```rust
+/// The handle [`FakeAuth`] refuses with `handle_taken`; it accepts any other.
+pub const TAKEN_HANDLE: &str = "taken";
+```
+
+and in `FakeAuth::start`, before `let listener`, give the router a profile route (import
+`axum::routing::patch` beside `post`; `current_user` is a clone of `identity` taken before it
+moves):
+
+```rust
+        let current_user = identity.clone();
+        let router = router.route(
+            "/v1/users/me",
+            patch(move |Json(body): Json<Value>| {
+                let current_user = current_user.clone();
+                async move {
+                    if body["handle"] == TAKEN_HANDLE {
+                        let error = json!({"error": {"code": "handle_taken", "message": "this handle is taken", "retryable": false}});
+                        return (StatusCode::CONFLICT, Json(error)).into_response();
+                    }
+                    let (user, _) = *current_user.lock().unwrap();
+                    Json(json!({
+                        "user_id": user,
+                        "handle": body["handle"].as_str().unwrap_or("alice"),
+                        "display_name": body["display_name"].as_str().unwrap_or("Alice"),
+                        "email": null,
+                    }))
+                    .into_response()
+                }
+            }),
+        );
+```
+
+In `crates\push-sdk\src\client.rs`'s tests add:
+
+```rust
+    #[tokio::test]
+    async fn the_profile_changes_its_handle_or_display_name() {
+        use crate::testing::TAKEN_HANDLE;
+
+        let f = Fixture::new().await;
+        let renamed = f.client.update_profile(None, Some("erin")).await.unwrap();
+        assert_eq!(
+            (renamed.user_id, renamed.handle.as_str(), renamed.display_name.as_str()),
+            (f.auth.user, "erin", "Alice")
+        );
+        let named = f
+            .client
+            .update_profile(Some("Erin E."), None)
+            .await
+            .unwrap();
+        assert_eq!(named.display_name, "Erin E.");
+        let taken = f
+            .client
+            .update_profile(None, Some(TAKEN_HANDLE))
+            .await
+            .unwrap_err();
+        assert_eq!(taken.code(), "handle_taken");
+        assert_eq!(
+            f.client.update_profile(None, None).await.unwrap_err().code(),
+            "invalid"
+        );
+    }
+```
+
+Run: `cargo test -p push-sdk --lib the_profile_changes`
+Expected: compile error (`update_profile` not found).
+
+- [ ] **Step 7: Implement.** In `crates\push-sdk\src\auth.rs` after `lookup`:
+
+```rust
+    /// `PATCH /v1/users/me {display_name?, handle?}`: the caller's profile after the
+    /// change. Never repeated by the SDK: a handle change counts against rate limits.
+    pub async fn update_profile(
+        &self,
+        access_token: &str,
+        display_name: Option<&str>,
+        handle: Option<&str>,
+    ) -> Result<Profile, SdkError> {
+        let mut body = serde_json::Map::new();
+        if let Some(display_name) = display_name {
+            body.insert("display_name".to_owned(), json!(display_name));
+        }
+        if let Some(handle) = handle {
+            body.insert("handle".to_owned(), json!(handle));
+        }
+        let answer = once(
+            self.request(Method::PATCH, "/v1/users/me")
+                .bearer_auth(access_token)
+                .json(&body),
+        )
+        .await?;
+        serde_json::from_value::<ProfileBody>(answer)
+            .map(Profile::from)
+            .map_err(|_| unreadable("the profile"))
+    }
+```
+
+In `crates\push-sdk\src\client\requests.rs` after `lookup`:
+
+```rust
+    /// Changes the user's display name, handle or both (at least one); the profile after
+    /// the change. A handle someone else holds is `handle_taken`; the old handle is free
+    /// at once. Any signed-in user may do this, with an Entra ID account too.
+    pub async fn update_profile(
+        &self,
+        display_name: Option<&str>,
+        handle: Option<&str>,
+    ) -> Result<Profile, SdkError> {
+        if display_name.is_none() && handle.is_none() {
+            return Err(SdkError::Invalid(
+                "give a display name, a handle or both".to_owned(),
+            ));
+        }
+        let inner = self.inner.clone();
+        let (display_name, handle) = (display_name.map(str::to_owned), handle.map(str::to_owned));
+        self.run(async move {
+            let session = inner.credentials.fresh().await?;
+            inner
+                .auth
+                .update_profile(&session.access_token, display_name.as_deref(), handle.as_deref())
+                .await
+        })
+        .await
+    }
+```
+
+Run: `cargo test -p push-sdk`
+Expected: every test passes (`SdkError::Invalid`'s code is `invalid`).
+
+- [ ] **Step 8: Commit.**
 
 ```powershell
 git add -A
-git commit -m "feat(sdk): sign in with a Microsoft Entra ID access token"
+git commit -m "feat(sdk): sign in with an Entra ID access token and change the profile"
 ```
 
-### Task 13: The bindings
+### Task 16: The bindings
 
 **Files:**
 - Modify: `bindings\node\src\client.rs`, `bindings\node\index.js`, `bindings\node\index.d.ts`, `bindings\node\test\client.test.js`, `bindings\node\test\types.ts`
@@ -5295,14 +6862,169 @@ lacked the scope), `entra_unavailable` (retryable), and `session_expired`, after
 reports `SignedOut` and the app signs in with Entra ID again.
 ```
 
-- [ ] **Step 6: Commit.**
+- [ ] **Step 6: Profile changes from Node and C.** Tests first. In
+`bindings\node\test\client.test.js`:
+
+```js
+test('changes the handle and the display name, and reports a taken handle', async () => {
+  const client = await Client.open(config(), memoryStore());
+  await client.signIn('a@example.com', 'password', 'node test', 'desktop');
+  const profile = await client.updateProfile(null, 'erin');
+  assert.equal(profile.handle, 'erin');
+  assert.equal(profile.userId, fakes.userId);
+  assert.equal((await client.updateProfile('Erin E.', null)).displayName, 'Erin E.');
+  await assert.rejects(client.updateProfile(null, 'taken'), code('handle_taken'));
+  await assert.rejects(client.updateProfile(null, null), code('invalid'));
+  await client.close();
+});
+```
+
+(`json::profile` names its fields `userId`, `handle`, `displayName`, as `lookup` returns
+them.) In `bindings\node\test\types.ts`, after the `signInWithEntra` lines:
+
+```ts
+  const renamed: Profile = await client.updateProfile(null, 'erin');
+  console.log(renamed.handle);
+```
+
+(import `Profile` with the other types if needed). In `bindings\c\src\lib.rs`'s tests:
+
+```rust
+    #[test]
+    fn the_profile_changes_from_c() {
+        let servers = servers();
+        let client = open(&servers, memory_store());
+        sign_in(client);
+        let (mut profile, mut error) = (ptr::null_mut(), ptr::null_mut());
+        let status = unsafe {
+            push_client_update_profile(
+                client,
+                ptr::null(),
+                c"erin".as_ptr(),
+                &mut profile,
+                &mut error,
+            )
+        };
+        assert_eq!(status, PUSH_OK);
+        let json = unsafe { CStr::from_ptr(profile) }.to_str().unwrap().to_owned();
+        assert!(json.contains("\"erin\""), "{json}");
+        unsafe { push_string_free(profile) };
+        let (mut profile, mut error) = (ptr::null_mut(), ptr::null_mut());
+        let status = unsafe {
+            push_client_update_profile(
+                client,
+                ptr::null(),
+                c"taken".as_ptr(),
+                &mut profile,
+                &mut error,
+            )
+        };
+        assert_eq!(status, PUSH_ERROR);
+        assert!(profile.is_null());
+        assert_eq!(code(error), "handle_taken");
+        unsafe { push_client_destroy(client) };
+    }
+```
+
+Then the code. `bindings\c\src\client.rs`, after `push_client_lookup`:
+
+```rust
+/// Changes the user's display name, handle or both; NULL leaves one as it is (at least
+/// one must be given). `*profile_json` gets the profile after the change.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn push_client_update_profile(
+    client: *const PushClient,
+    display_name: *const c_char,
+    handle_name: *const c_char,
+    profile_json: *mut *mut c_char,
+    error: *mut *mut PushError,
+) -> i32 {
+    guard(error, || {
+        let out = place(profile_json, "profile_json")?;
+        let this = unsafe { handle(client) }?;
+        let display_name = if display_name.is_null() {
+            None
+        } else {
+            Some(unsafe { text(display_name, "display_name") }?)
+        };
+        let handle_name = if handle_name.is_null() {
+            None
+        } else {
+            Some(unsafe { text(handle_name, "handle_name") }?)
+        };
+        let profile = wait(this.client.update_profile(display_name, handle_name))?;
+        put_json(out, &json::profile(&profile));
+        Ok(())
+    })
+}
+```
+
+`bindings\node\src\client.rs`, after `lookup`:
+
+```rust
+    #[napi(catch_unwind)]
+    pub fn update_profile<'env>(
+        &self,
+        env: &'env Env,
+        display_name: Option<String>,
+        handle: Option<String>,
+    ) -> napi::Result<Object<'env>> {
+        self.promise(env, |client| async move {
+            Ok(json::profile(
+                &client
+                    .update_profile(display_name.as_deref(), handle.as_deref())
+                    .await?,
+            ))
+        })
+    }
+```
+
+`bindings\node\index.js`, after `lookup(handle)`:
+
+```js
+  /** Changes the display name, the handle or both (null leaves one as it is). */
+  updateProfile(displayName, handle) {
+    return settled(() => this.#native.updateProfile(displayName ?? null, handle ?? null));
+  }
+```
+
+`bindings\node\index.d.ts`, after `lookup(…)`:
+
+```ts
+  /**
+   * Changes the user's display name, handle or both (null leaves one as it is; at least one).
+   * Rejects with `handle_taken` when someone else holds the handle, `rate_limited` after 5
+   * handle changes a day.
+   */
+  updateProfile(displayName: string | null, handle: string | null): Promise<Profile>;
+```
+
+Regenerate the header and run everything:
+
+```powershell
+$env:PUSH_SDK_BLESS_HEADER = '1'
+cargo test -p push-sdk-c --test header
+Remove-Item Env:PUSH_SDK_BLESS_HEADER
+cargo test -p push-sdk-c
+cd bindings/node
+npm run build
+npm test
+cd ../..
+```
+
+Expected: all pass. In `docs\sdk-bindings.md` add one sentence to the new section: "Any
+signed-in user changes the handle or display name with `update_profile(display_name,
+handle)` (`updateProfile`, `push_client_update_profile`); `handle_taken` when someone else
+holds it."
+
+- [ ] **Step 7: Commit.**
 
 ```powershell
 git add -A
-git commit -m "feat(bindings): sign in with an Entra ID access token from Node and C"
+git commit -m "feat(bindings): Entra ID sign-in and profile changes from Node and C"
 ```
 
-### Task 14: The whole stack with Entra ID sign-in only
+### Task 17: The whole stack with Entra ID sign-in only
 
 **Files:**
 - Modify: `crates\push-smoke\Cargo.toml`, `tests\common\mod.rs`, `tests\local.rs`
@@ -5420,8 +7142,8 @@ Expected: both local tests pass, as before.
 ```rust
 //! The whole stack with Microsoft Entra ID sign-in only (spec 2026-10-19 AC2): auth-svc
 //! trusts the stub issuer and serves no email route, the worker sends no email, and two
-//! users sign in with Entra ID tokens through push-sdk, become contacts and chat; signing
-//! in again keeps the device. No token, object id, name or address reaches a log.
+//! users sign in with Entra ID tokens through push-sdk, become contacts and chat; one picks
+//! another handle and the other finds her by it; signing in again keeps the device. No token, object id, name or address reaches a log.
 //!
 //! One test per binary: it owns the global log capture.
 
@@ -5588,6 +7310,11 @@ async fn entra_users_sign_in_and_chat_with_no_email_anywhere() {
     assert_eq!(received.body.as_deref(), Some(text.as_str()));
     assert_eq!(received.status, MessageStatus::Received);
 
+    // Erin picks a handle of her own; Finn finds her by it.
+    let renamed = erin.client.update_profile(None, Some("erin_entra")).await.unwrap();
+    assert_eq!(renamed.handle, "erin_entra");
+    assert_eq!(finn.client.lookup("erin_entra").await.unwrap().user_id, erin.user);
+
     // Signing in again keeps the device.
     let device = erin.client.account().unwrap().unwrap().device_id;
     let again = stub.token(&erin_oid);
@@ -5644,7 +7371,7 @@ git add -A
 git commit -m "test(smoke): run the whole stack with Entra ID sign-in only"
 ```
 
-### Task 15: The guide, documentation and status
+### Task 18: The guide, documentation and status
 
 **Files:**
 - Create: `docs\entra-sign-in.md`
@@ -5669,12 +7396,17 @@ yours.
 
 | `PUSH_AUTH_PROVIDERS` | What users can do |
 |---|---|
-| `password` (default) | Today's email and password sign-up and sign-in |
-| `entra` | Entra ID only: the signup, verification, login and password-reset routes answer 404; no email is ever written, so the worker runs with `PUSH_EMAIL_SENDER=none` and no email provider is needed |
+| `password` (default) | Today's email and password sign-up and sign-in, with email confirmation and password reset by email (an email provider is needed) |
+| `entra` | Entra ID only: no email confirmation, no passwords, no email provider. The signup, verification, login and password-reset routes answer 404; no email is ever written, so the worker runs with `PUSH_EMAIL_SENDER=none` |
 | `password,entra` | Both; the two kinds of accounts are never linked, even with the same address |
 
-Switching an existing installation to `entra`: email/password devices keep working until
-their refresh tokens expire (30 days) or you revoke them; those users cannot sign in again.
+**Switching an existing installation to `entra` is destructive for password sessions.**
+When auth-svc starts without `password`, it signs every device of every email/password
+account out before it reports ready: refresh fails, open connections close within seconds,
+and their access tokens stop working. Those accounts cannot sign in any more. Entra ID
+sign-in does not link to them: the same people get **new, empty accounts** (new user ids,
+no contacts or history). Switching `password` back on later revives none of the signed-out
+devices; those users sign in again with their password as new devices.
 
 ## 1. Register the API
 
@@ -5720,7 +7452,7 @@ as to any other: MFA, compliant devices, named locations.
 |---|---|
 | `PUSH_AUTH_PROVIDERS` | `entra` (or `password,entra`) |
 | `PUSH_ENTRA_CLIENT_ID` | the API's application id; optionally also its `api://…` URI, comma-separated |
-| `PUSH_ENTRA_ALLOWED_TENANTS` | your tenant id; a list for more tenants later. `common`, `organizations` and `consumers` are refused: multi-tenant wildcards are not supported |
+| `PUSH_ENTRA_ALLOWED_TENANTS` | your tenant id, or several, comma-separated; or exactly one of `common`, `organizations`, `consumers` (see below). Never a mixture |
 | `PUSH_ENTRA_AUTHORITY_HOST` | `https://login.microsoftonline.com/` (default) or your sovereign cloud's host |
 | `PUSH_ENTRA_REQUIRED_SCOPE` | `access_as_user` (default) |
 | `PUSH_ENTRA_REQUIRED_ROLE` | optional app role value |
@@ -5728,6 +7460,58 @@ as to any other: MFA, compliant devices, named locations.
 | `PUSH_ENTRA_MAX_SESSION_HOURS` | `24` (default), 1 to 720 |
 
 And for the worker in Entra-only mode: `PUSH_EMAIL_SENDER=none`.
+
+### Which tenants
+
+`PUSH_ENTRA_ALLOWED_TENANTS` is exactly one of these; anything else (a mixture such as
+`common,<id>`, a duplicate, an empty entry) stops auth-svc at start-up:
+
+| Value | Who can sign in |
+|---|---|
+| `<tenant id>[,<tenant id>…]` | users of exactly these tenants (recommended) |
+| `organizations` | users of **any** Microsoft Entra tenant (work or school accounts) |
+| `consumers` | **any** personal Microsoft account |
+| `common` | **any** work, school or personal Microsoft account |
+
+**With `organizations`, `consumers` or `common`, anyone who has such an account and can get
+a token for your API creates an account here at their first sign-in.** The API registration
+must then be multi-tenant (or allow personal accounts), and the only gates are its user
+assignment, consent and Conditional Access, and `PUSH_ENTRA_REQUIRED_ROLE` /
+`PUSH_ENTRA_ALLOWED_CLIENT_APPS`. Use a keyword only when that is what you want. Each token's
+issuer is still checked against the tenant in the token, and auth-svc fetches the keyword's
+one shared key set, never one per tenant.
+
+## Handles
+
+A new Entra ID account gets the handle the app asked for at its first sign-in, or a random
+one such as `u7k2m9q4x1z`. Every user, Entra ID or password, changes it with
+`PATCH /v1/users/me {"handle": "erin"}` (SDK: `update_profile`) with their access token: no
+password or new Entra sign-in is needed, since a handle is a public name and contacts and
+conversations follow the user id, not the handle. The old handle is free at once; a taken
+one answers 409 `handle_taken`; 5 changes a day per account.
+
+## Admin API
+
+To sign a user out of every device at once (a lost laptop, a compromised account, someone
+leaving), set `PUSH_AUTH_ADMIN_TOKEN` (32 to 256 visible characters, from your Secret store).
+auth-svc then serves, on `PUSH_AUTH_ADMIN_ADDR` (`:8082`) only:
+
+```powershell
+kubectl port-forward -n push deploy/push-auth 8082:8082
+$headers = @{ Authorization = "Bearer $env:PUSH_AUTH_ADMIN_TOKEN" }
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8082/v1/admin/users/revoke-sessions `
+  -Headers $headers -ContentType application/json `
+  -Body '{"entra": {"tenant_id": "<tid>", "object_id": "<oid>"}}'
+# or {"handle": "erin"} or {"user_id": "<uuid>"}
+```
+
+The answer is `{"user_id", "devices_revoked"}`. Every device is revoked, refresh fails, and
+open connections close within seconds. The account stays: the person can sign in again
+unless you also block them where they sign in (disable or unassign them in Entra ID; for a
+password account, reset the password). There is deliberately no way to remove the Entra ID
+link: object ids are never reused, so removing it would only orphan the account and make
+the next sign-in create a duplicate person. Never expose the admin port through an Ingress;
+the chart allows it only from the peers you list (`networkPolicy.adminPeers`).
 
 ## 4. Sign in from a browser (MSAL.js)
 
@@ -5795,17 +7579,8 @@ Entra ID sign-in. After that, refresh answers 401 `session_expired`, the SDK rep
 `SignedOut`, and the app gets a new token from MSAL and signs in again (same device, same
 data). A user disabled or deleted in Entra ID cannot get a new token, so their access ends
 at most `PUSH_ENTRA_MAX_SESSION_HOURS` plus 30 minutes (the last access token's lifetime)
-after their last sign-in. To end it at once, revoke their devices (`DELETE
-/v1/devices/{id}` from one of their devices) or, as an operator, in `push_auth`:
-
-```sql
-UPDATE auth.device SET revoked_at = now()
-WHERE user_id = (SELECT user_id FROM auth.external_identity
-                 WHERE provider = 'entra' AND tenant_id = '<tid>' AND subject = '<oid>')
-  AND revoked_at IS NULL;
-```
-
-and restart nothing: the relayed `device.revoked` closes their sockets.
+after their last sign-in. To end it at once, use the [admin API](#admin-api) with their
+tenant and object id (or a user revokes a device with `DELETE /v1/devices/{id}`).
 
 Users are identified by tenant and object id, never by name or address: a renamed user, a
 new UPN or a changed address is the same account; someone else with the same address is
@@ -5813,7 +7588,7 @@ another account.
 
 ## 7. Network
 
-auth-svc fetches, per allowed tenant, `https://login.microsoftonline.com/<tid>/v2.0/.well-known/openid-configuration`
+auth-svc fetches, per listed tenant (or once for a keyword, with `common`, `organizations` or `consumers` in place of `<tid>`), `https://login.microsoftonline.com/<tid>/v2.0/.well-known/openid-configuration`
 and the key set it names (`https://login.microsoftonline.com/<tid>/discovery/v2.0/keys`), at
 start-up, about daily and when Microsoft rotates keys. Allow HTTPS (443) from auth-svc to
 `login.microsoftonline.com` (FQDN rules in your firewall, or Microsoft's
@@ -5830,7 +7605,7 @@ auth-svc logs every refused token as `auth.entra.rejected` with a reason (never 
 |---|---|
 | `issuer` | v1.0 tokens: set `requestedAccessTokenVersion` to 2 on the API registration |
 | `audience` | the token is for another API (Graph), or an ID token was sent; request `api://<api-client-id>/access_as_user` |
-| `tenant` | the user's tenant is not in `PUSH_ENTRA_ALLOWED_TENANTS` |
+| `tenant` | the user's tenant is not admitted by `PUSH_ENTRA_ALLOWED_TENANTS` (for example a personal account with `organizations`) |
 | `scope` | the token lacks `PUSH_ENTRA_REQUIRED_SCOPE` |
 | `app_only` | a client-credentials (application) token: user sign-in is required |
 | `role` / `client_app` | the user lacks the app role / the client app is not allowed |
@@ -5848,6 +7623,10 @@ auth-svc logs every refused token as `auth.entra.rejected` with a reason (never 
 6. Disable a test user in Entra ID: within the maximum session age plus 30 minutes their
    apps are signed out and cannot sign in again.
 7. auth-svc's logs contain no access token, UPN or address.
+8. A user changes their handle in the app; others find them by the new one only.
+9. The admin API signs a test user out: their apps report `DeviceRemoved` within seconds.
+10. Switching a test installation from `password,entra` to `entra`: every password device is
+    signed out at start-up (`auth.password_sessions.revoked` in the log); Entra users are not.
 ````
 
 - [ ] **Step 2: README.** In the SDK paragraph of `README.md` ("A `Client` signs up and in
@@ -5868,7 +7647,7 @@ git add -A
 git commit -m "docs: add the Entra ID sign-in guide and record Plan 13A"
 ```
 
-### Task 16: Verification and delivery
+### Task 19: Verification and delivery
 
 - [ ] **Step 1: The full checks.**
 
@@ -5916,35 +7695,48 @@ switch to `main` and pull, delete the branch.
 
 | Spec item | Task |
 |---|---|
-| D1 jsonwebtoken 9 (ring) and reqwest over rustls, no new crate | 1, 4, 5; 16 (`cargo tree`, lockfile) |
-| D2 v2.0 access tokens for this API only: RS256 + kid, issuer per tenant, audiences, exp/nbf ±60 s, ver, scp, idtyp, oid; optional role and client apps | 2, 5 |
-| D3 explicit tenant GUIDs; `common`/`organizations`/`consumers`/MSA/nil refused | 1 |
-| D4 metadata + JWKS on the authority host; 24 h cache; unknown-kid refetch with cooldown; 10 s timeouts; 256 KiB; no redirects; stale-if-error; fail closed 503; pre-check before fetching; warm at start without blocking readiness; proxies honoured | 4, 5, 9, 10 |
-| D5 `auth.external_identity`, `(provider, tenant_id, subject)` and `user_id` unique; accounts without email/password, active; no linking; cleanup guard | 6, 8 |
-| D6 JIT provisioning with `user.verified`; optional handle or `u…`; display name from `name`; informational email | 8 |
-| D7 registration tokens bound by `xid` + `sx`; exactly one binding; provider must be enabled | 7, 8 |
-| D8 `session_expires_at`, `session_expired`, refresh tokens capped, renewal on the same device | 6, 8, 9 |
-| D9 `PUSH_AUTH_PROVIDERS`, routes absent, worker `none` | 1, 9, 10, 11 |
+| D1 jsonwebtoken 9 (ring) and reqwest over rustls, no new crate | 1, 4, 5; 19 (`cargo tree`, lockfile) |
+| D2 v2.0 access tokens for this API only: RS256 + kid, issuer of the token's own tenant, audiences, exp/nbf ±60 s, ver, scp, idtyp, oid; optional role and client apps | 2, 5 |
+| D3 exactly one of `common`/`organizations`/`consumers` or a list of tenant ids; mixtures, duplicates, empty entries, nil and other values refused; admission per keyword | 1 (parse, `admits`), 5 (verifier per keyword) |
+| D4 key sources (per listed tenant or one per keyword, bounded); metadata issuer for listed tenants; jwks on the authority host; 24 h cache; unknown-kid cooldown; timeouts; 256 KiB; no redirects; stale-if-error; fail closed 503; pre-check before fetching; warm at start; proxies honoured | 4, 5, 9, 10 |
+| D5 `auth.external_identity`, no linking, accounts without email/password, cleanup guard | 6, 8 |
+| D6 JIT provisioning, optional handle or random `u…`, display name from `name`, informational email | 8 |
+| D7 identity-bound registration tokens | 7, 8 |
+| D8 session age, `session_expired`, renewal on the same device | 6, 8, 9 |
+| D9 `PUSH_AUTH_PROVIDERS` (`password`, `entra`, `password,entra`), routes absent, worker `none` | 1, 9, 10, 11 |
 | D10 `POST /v1/auth/entra`, error codes, rate limits | 7, 9 |
-| D11 security events and log hygiene | 5, 8, 9, 14 |
-| D12 SDK and bindings | 12, 13 |
-| D13 stub issuer, fixed test keys, loopback-only `http://` | 1, 3 |
-| D14 chart in Plan 13B | Plan 13B |
-| AC1 default unchanged | 1 (config default), 9 (404 for `/v1/auth/entra`), existing tests throughout, 16 (chart checks, minikube password smoke) |
-| AC2 Entra-only: 404 routes, no email, sign-in to chat | 9, 10, 11, 14 |
-| AC3 refusals: audience, tenant, expiry, signature, algorithm, scope, app-only, ID token | 2, 5, 9 |
-| AC4 same `(tid, oid)` same user; UPN/email changes; no linking by address | 2, 8 |
-| AC5 maximum session age and renewal | 8, 9, 12 |
+| D11 security events without sensitive values | 5, 8, 9, 12, 13, 14, 17 |
+| D12 SDK and bindings: `sign_in_with_entra`, `update_profile`, `session_expired` | 15, 16 |
+| D13 stub issuer (tenants and keywords), fixed test keys, loopback-only `http://`; no custom signing keys | 1, 3 |
+| D14 handle change for every user, access token only, unique constraint, rate limit, nothing to propagate | 12, 15, 16, 17 |
+| D15 admin API on its own listener, constant-time token, rate limit, selectors, relay, no CLI, no unlink | 13 |
+| D16 Entra-only switch: sweep before ready, SKIP LOCKED batches, refresh guard, nothing revived | 14 |
+| D17 chart in Plan 13B | Plan 13B |
+| AC1 default unchanged | 1, 9, 13 (no admin listener without a token), existing tests throughout, 19 |
+| AC2 Entra-only routes, no email, sign-in to chat | 9, 10, 11, 17 |
+| AC3 refusals | 2, 5, 9 |
+| AC4 identity mapping, no linking | 2, 8 |
+| AC5 maximum session age and renewal | 8, 9, 15 |
 | AC6 rotation without restart; outage fails closed | 4, 5, 9 |
-| AC7 unit and integration tests with a local stub | 1 to 14 |
+| AC7 unit and integration tests with a local stub | 1 to 17 |
+| AC8 tenant forms and keyword admission | 1, 4, 5 |
+| AC9 handle change | 12, 15, 16, 17 |
+| AC10 admin sign-out everywhere | 13 |
+| AC11 Entra-only switch | 14 |
 
 Placeholder scan: no "TBD", "TODO" or "similar to" steps; every code step is complete. Type
-consistency: `EntraSignIn::{new, with_timing, verify, warm, max_session}`, `EntraIdentity`,
+consistency: `Tenants::{Common, Organizations, Consumers, Ids, parse, admits, key_source,
+key_sources}`, `CONSUMERS_TENANT`, `EntraSettings::{issuer, metadata_url(&str)}`,
+`EntraSignIn::{new, with_timing, verify, warm, max_session}`, `EntraIdentity`,
 `EntraError::{Rejected, Unavailable}`, `Reason`, `KeyTiming`, `SignIn { password, entra }`,
-`Auth::{with_sign_in, password_enabled, entra, sign_in_entra, sign_in_entra_device}`,
-`EntraRegistration { user_id, registration }`, `LinkClaims { xid, sx }`,
-`AuthError::{EntraTokenInvalid, EntraUnavailable, SessionExpired}`,
-`Action::{EntraSignIn, EntraAccount}`, `Sender::Off`, `Jobs::without_email`,
-`Client::sign_in_with_entra`, `AuthApi::{entra, entra_device}`, `WRONG_ENTRA_TOKEN`,
+`Auth::{with_sign_in, password_enabled, entra, sign_in_entra, sign_in_entra_device,
+update_profile, set_display_name, find_user, revoke_user_sessions, revoke_password_devices}`,
+`revoke_devices`, `set_session`, `EntraRegistration { user_id, registration }`,
+`LinkClaims { xid, sx }`, `AuthError::{EntraTokenInvalid, EntraUnavailable, SessionExpired}`,
+`Action::{EntraSignIn, EntraAccount, HandleChange, Admin}`, `AdminApi::new`, `admin_router`,
+`UserSelector`, `Config::{providers, entra, admin_token, admin_addr}`, `Sender::Off`,
+`Jobs::without_email`, `Client::{sign_in_with_entra, update_profile}`,
+`AuthApi::{entra, entra_device, update_profile}`, `WRONG_ENTRA_TOKEN`, `TAKEN_HANDLE`, the
+test helpers `service`, `password_user`, `entra_user`, and
 `StubOpenId::{start, with_authority, settings, variables, user_claims, token}` are used with
 the same names and signatures in every task that refers to them.

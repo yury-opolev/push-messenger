@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. Work sequentially on one branch.
 
-**Goal:** Let consumers turn on Microsoft Entra ID sign-in (beside or instead of email and password) with chart values: auth-svc's sign-in variables, Entra-only installations without email (worker `none`, no Resend keys, no link-page route), egress for auth-svc to Entra ID or a proxy, a trusted CA bundle, the guide's chart section, and a minikube rehearsal of an Entra-only installation.
+**Goal:** Let consumers turn on Microsoft Entra ID sign-in (beside or instead of email and password) with chart values: auth-svc's sign-in variables (tenant ids or exactly one of the keywords `common`/`organizations`/`consumers`), the admin listener (Secret key, Service port, NetworkPolicy peers, never an Ingress), Entra-only installations without email (worker `none`, no Resend keys, no link-page route), egress for auth-svc to Entra ID or a proxy, a trusted CA bundle, the guide's chart section, and a minikube rehearsal of an Entra-only installation.
 
 **Architecture:** One new values block, `auth.signIn`, validated by `push.checkSignIn` and rendered by `push.signInEnv` into auth-svc's environment. Two small helpers, `push.entraSignIn` and `push.emailOff`, steer the worker's sender, its DEV ONLY mailbox flag and the link-page Ingress. Plan 12B's opt-in egress policies gain an auth-only list `networkPolicy.egress.entraSignInCidrs`. The DEV ONLY `push-dev-entra` tool of 12B gains a `sign-in` mode serving 13A's stub metadata and keys over HTTPS and minting user tokens, and `push-smoke` gains an Entra mode. With every value at its default the rendered chart is byte-identical to before.
 
@@ -55,6 +55,9 @@ Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
 | The Resend keys are referenced only with `worker.email.sender: resend` or an enabled webhook | `templates\worker.yaml`, `templates\secret.yaml` | Entra-only needs no email key in a consumer-managed Secret |
 | reqwest in auth-svc honours `HTTPS_PROXY`/`NO_PROXY`; rustls-native-certs 0.8.4 loads only `SSL_CERT_FILE` when it is set | reqwest 0.12.28, `rustls-native-certs-0.8.4\src\lib.rs:8,363` | `httpsProxy` affects only the Entra requests; a CA bundle must hold every root auth-svc needs |
 | auth-svc accepts an `http://` authority only on loopback | Plan 13A Task 1 | The rehearsal's issuer serves HTTPS with 12B's test CA |
+| `PUSH_ENTRA_ALLOWED_TENANTS` is exactly one of `common`, `organizations`, `consumers` or tenant ids, never mixed | Plan 13A Task 1, spec D3 | The chart refuses the same forms before install and renders the list as one comma-separated value |
+| auth-svc serves the admin API on `PUSH_AUTH_ADMIN_ADDR` only with `PUSH_AUTH_ADMIN_TOKEN` | Plan 13A Task 13, spec D15 | One more container and Service port, a Secret key, a NetworkPolicy rule; the Ingresses route the port named `http` only |
+| Starting auth-svc without `password` signs out every password device before it is ready | Plan 13A Task 14, spec D16 | Changing `auth.signIn.providers` to `entra` is destructive; the guide's chart section says so |
 | 12B's egress map gives every application component `httpsCidrs` on 443 | Plan 12B Task 6 | A separate auth-only list keeps the other components closed |
 | Entra ID's endpoints are `login.microsoftonline.com`; NetworkPolicies match IP blocks, not names | Microsoft Learn, Kubernetes | The guide offers the service tag ranges, an FQDN firewall, or a proxy |
 
@@ -69,7 +72,8 @@ auth:
     entra:
       # The API registration's application id; optionally also its api:// identifier URI.
       clientIds: []
-      # Tenant ids (GUIDs); common, organizations and consumers are not supported.
+      # Exactly one of: [common], [organizations], [consumers], or one or more tenant ids.
+      # A keyword lets anyone with such an account create an account (docs/entra-sign-in.md).
       tenants: []
       authorityHost: https://login.microsoftonline.com/
       # The delegated scope tokens must carry; * for any scope of the API.
@@ -86,11 +90,20 @@ auth:
       # system roots (SSL_CERT_FILE), e.g. a TLS-inspecting proxy's root plus the public
       # roots it needs. Empty: the system roots.
       caConfigMap: ""
+  admin:
+    # Serves auth-svc's admin API (sign a user out of every device) on port 8082: never
+    # through the Ingress, and only from networkPolicy.adminPeers. Its token is the
+    # Secret's auth-admin-token (generated for a chart-managed Secret, required in a
+    # consumer-managed one).
+    enabled: false
 worker:
   email:
     # log, resend, or none (no email at all; rendered automatically with entra alone).
     sender: log
 networkPolicy:
+  # Peers allowed to reach auth-svc's admin port 8082, each with both non-empty label maps
+  # (like ingressControllerPeers). Empty: nobody (kubectl port-forward still works).
+  adminPeers: []
   egress:
     # With egress enabled (Plan 12B): CIDRs auth-svc alone may reach on 443 for Entra ID
     # sign-in (Microsoft's AzureActiveDirectory service tag ranges).
@@ -107,10 +120,11 @@ smoke:
 | `deploy\helm\push-messenger\values.yaml` | the values above |
 | `templates\_helpers.tpl` | `push.entraSignIn`, `push.emailOff`, `push.mailboxFlag`, `push.checkSignIn`, `push.signInEnv`; `push.checkEmail` accepts `none` |
 | `templates\validate.yaml` | calls `push.checkSignIn` |
-| `templates\auth.yaml` | sign-in environment, CA bundle volume |
+| `templates\auth.yaml` | sign-in environment, CA bundle volume, admin port and token |
+| `templates\secret.yaml` | `auth-admin-token` when the admin API is on |
 | `templates\worker.yaml` | sender and mailbox flag through the helpers |
 | `templates\ingress.yaml` | no `auth-links` route without email |
-| `templates\networkpolicy.yaml` | `entraSignInCidrs` for auth-svc |
+| `templates\networkpolicy.yaml` | `entraSignInCidrs` for auth-svc; the admin port for `adminPeers` only |
 | `templates\tests\smoke.yaml` | `--entra-token-url` |
 | `deploy\helm\test-chart.ps1` | the checks |
 | `crates\push-smoke\Cargo.toml`, `src\bin\push-dev-entra.rs`, `src\entra.rs`, `src\lib.rs`, `src\main.rs` | DEV ONLY sign-in issuer; the Entra smoke mode |
@@ -145,10 +159,21 @@ Check 'sign-in: unknown providers and incomplete Entra settings are refused' {
         (Render ($signInArgs + @('--set-json', 'auth.signIn.entra.tenants=[]'))) -ne 0 -and
         (Render ($signInArgs + @('--set-json', 'auth.signIn.entra.clientIds=[]'))) -ne 0
 }
-Check 'sign-in: wildcard tenants and personal accounts are refused' {
-    (Render ($signInArgs + @('--set', 'auth.signIn.entra.tenants={common}'))) -ne 0 -and
-        (Render ($signInArgs + @('--set', 'auth.signIn.entra.tenants={organizations}'))) -ne 0 -and
-        (Render ($signInArgs + @('--set', 'auth.signIn.entra.tenants={9188040d-6c67-4c5b-b112-36a304b66dad}'))) -ne 0
+Check 'sign-in: tenants are one keyword or tenant ids, never a mixture' {
+    $ok = foreach ($tenants in '{common}', '{Organizations}', '{consumers}',
+        '{33333333-0000-4000-8000-000000000003,44444444-0000-4000-8000-000000000004}') {
+        Render ($signInArgs + @('--set', "auth.signIn.entra.tenants=$tenants"))
+    }
+    $bad = foreach ($tenants in '{common,33333333-0000-4000-8000-000000000003}', '{organizations,consumers}',
+        '{33333333-0000-4000-8000-000000000003,33333333-0000-4000-8000-000000000003}',
+        '{contoso.onmicrosoft.com}', '{00000000-0000-0000-0000-000000000000}', '{""}') {
+        Render ($signInArgs + @('--set', "auth.signIn.entra.tenants=$tenants"))
+    }
+    (@($ok | Where-Object { $_ -ne 0 }).Count -eq 0) -and (@($bad | Where-Object { $_ -eq 0 }).Count -eq 0)
+}
+Check 'sign-in: a keyword reaches auth-svc alone' {
+    $auth = Doc (helm template push $chart @signInArgs --set 'auth.signIn.entra.tenants={organizations}' | Out-String) 'Deployment' 'push-auth'
+    $auth -match '(?s)name: PUSH_ENTRA_ALLOWED_TENANTS\s+value: "organizations"'
 }
 Check 'sign-in: the audience must include the application id' {
     (Render ($signInArgs + @('--set', 'auth.signIn.entra.clientIds={api://push-api}'))) -ne 0 -and
@@ -212,8 +237,8 @@ Expected: the refusal checks FAIL (the values do not exist; Helm renders anythin
 
 {{/*
 Checks the sign-in settings (spec 2026-10-19 §3): the providers; with entra the API's
-application id (optionally its api:// URI), tenant ids (never common, organizations,
-consumers or the personal-account tenant), an https authority host, one scope name or *,
+application id (optionally its api:// URI), the tenants (exactly one of common,
+organizations, consumers, or up to 20 distinct tenant ids; never a mixture), an https authority host, one scope name or *,
 1 to 720 session hours, an http(s) proxy URL. Entra-only installations write no email, so
 the Resend sender and the webhook are refused with them.
 */}}
@@ -241,11 +266,25 @@ the Resend sender and the webhook are refused with them.
 {{- fail "auth.signIn.entra.clientIds must include the application id: v2.0 access tokens carry it as their audience" -}}
 {{- end -}}
 {{- if not $entra.tenants -}}
-{{- fail "auth.signIn.entra.tenants needs your tenant id" -}}
+{{- fail "auth.signIn.entra.tenants needs [common], [organizations], [consumers] or your tenant ids" -}}
 {{- end -}}
-{{- range $entra.tenants -}}
-{{- if or (not (regexMatch $guid (toString .))) (eq (lower (toString .)) "9188040d-6c67-4c5b-b112-36a304b66dad") -}}
-{{- fail (printf "auth.signIn.entra.tenants: %q is not a workforce tenant id (common, organizations and consumers are not supported)" .) -}}
+{{- $keywords := list "common" "organizations" "consumers" -}}
+{{- $lowered := list -}}
+{{- range $entra.tenants -}}{{- $lowered = append $lowered (lower (toString .)) -}}{{- end -}}
+{{- if not (and (eq (len $lowered) 1) (has (first $lowered) $keywords)) -}}
+{{- range $lowered -}}
+{{- if has . $keywords -}}
+{{- fail "auth.signIn.entra.tenants: common, organizations and consumers stand alone, never combined" -}}
+{{- end -}}
+{{- if or (not (regexMatch $guid .)) (eq . "00000000-0000-0000-0000-000000000000") -}}
+{{- fail (printf "auth.signIn.entra.tenants: %q is neither a tenant id nor common, organizations or consumers" .) -}}
+{{- end -}}
+{{- end -}}
+{{- if ne (len $lowered) (len (uniq $lowered)) -}}
+{{- fail "auth.signIn.entra.tenants lists a tenant id twice" -}}
+{{- end -}}
+{{- if gt (len $lowered) 20 -}}
+{{- fail "auth.signIn.entra.tenants: at most 20 tenant ids" -}}
 {{- end -}}
 {{- end -}}
 {{- range $entra.allowedClientApps -}}
@@ -377,7 +416,7 @@ connection auth-svc makes (rustls-native-certs reads SSL_CERT_FILE alone).
 - name: PUSH_ENTRA_CLIENT_ID
   value: {{ join "," $entra.clientIds | quote }}
 - name: PUSH_ENTRA_ALLOWED_TENANTS
-  value: {{ join "," $entra.tenants | quote }}
+  value: {{ join "," $entra.tenants | lower | quote }}
 - name: PUSH_ENTRA_AUTHORITY_HOST
   value: {{ $entra.authorityHost | quote }}
 - name: PUSH_ENTRA_REQUIRED_SCOPE
@@ -642,7 +681,156 @@ git add -A
 git commit -m "feat(chart): let auth-svc alone reach Microsoft Entra ID under egress policies"
 ```
 
-### Task 5: The guide's chart section and the configuration contract
+### Task 5: The admin listener
+
+auth-svc's admin API (Plan 13A Task 13) in the chart: off by default; when
+`auth.admin.enabled`, the token comes from the Secret (`auth-admin-token`), the container and
+Service gain port `admin` 8082, the NetworkPolicy lets only `networkPolicy.adminPeers` reach
+it, and no Ingress ever routes it (the Ingresses name the Service port `http` only).
+
+**Files:**
+- Modify: `templates\auth.yaml`, `templates\secret.yaml`, `templates\networkpolicy.yaml`, `templates\_helpers.tpl`, `docs\deployment-configuration.md`
+- Test: `deploy\helm\test-chart.ps1`
+
+- [ ] **Step 1: Write the failing checks.**
+
+```powershell
+Check 'admin: off by default' {
+    (helm template push $chart | Out-String) -notmatch 'PUSH_AUTH_ADMIN|auth-admin-token|name: admin'
+}
+Check 'admin: the listener, its Secret key, and a NetworkPolicy rule for its peers only' {
+    $rendered = helm template push $chart --set auth.admin.enabled=true `
+        --set-json 'networkPolicy.adminPeers=[{"namespaceSelector":{"kubernetes.io/metadata.name":"ops"},"podSelector":{"app":"admin-shell"}}]' | Out-String
+    $auth = Doc $rendered 'Deployment' 'push-auth'
+    $auth -match '(?s)name: PUSH_AUTH_ADMIN_TOKEN\s+valueFrom:\s+secretKeyRef:\s+name: push-secrets\s+key: auth-admin-token' -and
+        $auth -match '(?s)name: PUSH_AUTH_ADMIN_ADDR\s+value: "0.0.0.0:8082"' -and
+        $auth -match '(?s)name: admin\s+containerPort: 8082' -and
+        (Doc $rendered 'Service' 'push-auth') -match '(?s)name: admin\s+port: 8082' -and
+        (Doc $rendered 'Secret' 'push-secrets') -match 'auth-admin-token:' -and
+        (Doc $rendered 'NetworkPolicy' 'push-auth') -match '(?s)port: 8082.*app: admin-shell' -and
+        @($rendered -split "(?m)^---\s*$" | Where-Object { $_ -match '(?m)^kind: Ingress' -and $_ -match '8082|name: admin' }).Count -eq 0
+}
+Check 'admin: without peers no rule opens the port; peers need both label maps' {
+    (Doc (helm template push $chart --set auth.admin.enabled=true | Out-String) 'NetworkPolicy' 'push-auth') -notmatch 'port: 8082' -and
+        (Render @('--set', 'auth.admin.enabled=true', '--set-json', 'networkPolicy.adminPeers=[{"podSelector":{"a":"b"}}]')) -ne 0 -and
+        (Render @('--set', 'auth.admin.enabled=yes')) -ne 0
+}
+Check 'admin: a consumer-managed Secret is referenced, never generated' {
+    $rendered = helm template push $chart --set auth.admin.enabled=true --set secrets.existingSecret=push-creds | Out-String
+    (Doc $rendered 'Deployment' 'push-auth') -match '(?s)name: push-creds\s+key: auth-admin-token' -and
+        $rendered -notmatch 'kind: Secret'
+}
+```
+
+- [ ] **Step 2: Run them to see them fail.**
+
+Run: `pwsh deploy/helm/test-chart.ps1`
+Expected: the three rendering checks FAIL (nothing renders the admin listener).
+
+- [ ] **Step 3: Validation.** Add to `push.checkSignIn` (it runs for every render):
+
+```yaml
+{{- if not (kindIs "bool" .Values.auth.admin.enabled) -}}
+{{- fail "auth.admin.enabled must be a boolean" -}}
+{{- end -}}
+{{- $adminPeerError := "networkPolicy.adminPeers requires namespaceSelector and podSelector as non-empty label maps on every peer" -}}
+{{- if not (kindIs "slice" .Values.networkPolicy.adminPeers) -}}
+{{- fail $adminPeerError -}}
+{{- end -}}
+{{- range .Values.networkPolicy.adminPeers -}}
+{{- if or (not (kindIs "map" .)) (not (kindIs "map" .namespaceSelector)) (not .namespaceSelector) (not (kindIs "map" .podSelector)) (not .podSelector) -}}
+{{- fail $adminPeerError -}}
+{{- end -}}
+{{- end -}}
+```
+
+- [ ] **Step 4: The Secret.** In `templates\secret.yaml`, with the other kept values:
+
+```yaml
+{{- $adminToken := get $existing "auth-admin-token" | b64dec | default (randAlphaNum 48) -}}
+```
+
+and after `messaging-token`:
+
+```yaml
+  {{- if .Values.auth.admin.enabled }}
+  # auth-svc's admin API token (sign a user out of every device). Only auth-svc gets it;
+  # operators read it from here to call the admin port.
+  auth-admin-token: {{ $adminToken | quote }}
+  {{- end }}
+```
+
+(a disabled admin keeps no key; enabling it again generates a new token unless the Secret
+still holds one).
+
+- [ ] **Step 5: auth-svc.** In `templates\auth.yaml`, the Service's `ports:` gains
+
+```yaml
+    {{- if .Values.auth.admin.enabled }}
+    # Never named in an Ingress: they route the port named http only.
+    - name: admin
+      port: 8082
+      targetPort: admin
+    {{- end }}
+```
+
+the container's `ports:` gains
+
+```yaml
+            {{- if .Values.auth.admin.enabled }}
+            - name: admin
+              containerPort: 8082
+            {{- end }}
+```
+
+and its env, after the sign-in variables:
+
+```yaml
+            {{- if .Values.auth.admin.enabled }}
+            # The admin API: its own listener, reachable only from networkPolicy.adminPeers.
+            - name: PUSH_AUTH_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "push.secretName" . }}
+                  key: auth-admin-token
+            - name: PUSH_AUTH_ADMIN_ADDR
+              value: "0.0.0.0:8082"
+            {{- end }}
+```
+
+- [ ] **Step 6: The NetworkPolicy.** In `templates\networkpolicy.yaml`, before `$policies`:
+
+```yaml
+{{- $authRules := list (dict "port" 8080 "callers" (list "gateway") "controllers" $controllers) -}}
+{{- if and .Values.auth.admin.enabled .Values.networkPolicy.adminPeers -}}
+{{- $authRules = append $authRules (dict "port" 8082 "controllers" .Values.networkPolicy.adminPeers) -}}
+{{- end -}}
+```
+
+and change auth-svc's entry of `$policies` to `(dict "component" "auth" "rules" $authRules)`.
+(The rule template renders `controllers` as namespace-and-pod selector pairs, as for the
+ingress controllers; `callers` is absent for the admin rule, which `range` skips.)
+
+- [ ] **Step 7: The contract.** In `docs\deployment-configuration.md`'s key table add
+``| `auth-admin-token` | auth-svc when `auth.admin.enabled: true` | the admin API's bearer token, 32 to 256 visible ASCII characters |``
+and under "Microsoft Entra ID sign-in" a paragraph: "`auth.admin.enabled` serves auth-svc's
+admin API on port 8082 (sign a user out of every device; [guide](entra-sign-in.md#admin-api)).
+It is never routed by the chart's Ingresses; `networkPolicy.adminPeers` lists who may reach
+it (none by default: use `kubectl port-forward`)."
+
+- [ ] **Step 8: Run.**
+
+Run: `pwsh deploy/helm/test-chart.ps1`
+Expected: every check passes, the default-unchanged and `PolicyMatrix` checks included.
+
+- [ ] **Step 9: Commit.**
+
+```powershell
+git add -A
+git commit -m "feat(chart): serve auth-svc's admin API on its own port for listed peers only"
+```
+
+### Task 6: The guide's chart section and the configuration contract
 
 **Files:**
 - Modify: `docs\entra-sign-in.md`, `docs\deployment-configuration.md`, `README.md`
@@ -660,12 +848,15 @@ auth:
       clientIds:
         - 11111111-0000-4000-8000-000000000001   # the API's application id
       tenants:
-        - 33333333-0000-4000-8000-000000000003   # your tenant id
+        - 33333333-0000-4000-8000-000000000003   # your tenant id; or exactly one of
+                                                 # common, organizations, consumers
       maxSessionHours: 24
       # requiredRole: Messenger.User
       # allowedClientApps: [22222222-0000-4000-8000-000000000002]
       # httpsProxy: http://proxy.corp.example:3128
       # caConfigMap: corp-ca      # ca.crt: every root auth-svc must trust
+  admin:
+    enabled: true               # the admin API on port 8082 (Secret key auth-admin-token)
 networkPolicy:
   egress:
     enabled: true                 # Plan 12B
@@ -675,7 +866,11 @@ networkPolicy:
 With `providers: entra` the chart renders `PUSH_EMAIL_SENDER=none` for the worker, no link
 page Ingress, and references no Resend key: a consumer-managed Secret needs no email keys.
 `worker.email.sender: resend` and `worker.email.webhook.enabled: true` are refused then.
-The `/v1/auth` Ingress route already carries `/v1/auth/entra`.
+The `/v1/auth` Ingress route already carries `/v1/auth/entra`. Changing
+`providers` from `password,entra` to `entra` signs every password device out when the new
+auth-svc pods start (see Modes above). With `admin.enabled`, reach the admin port with
+`kubectl port-forward deploy/push-auth 8082:8082` or from the peers in
+`networkPolicy.adminPeers`; it is never routed by the Ingress.
 ````
 
 - [ ] **Step 2: Configuration contract.** In `docs\deployment-configuration.md`, after the
@@ -704,7 +899,7 @@ git add -A
 git commit -m "docs: document Entra ID sign-in in the chart"
 ```
 
-### Task 6: A DEV ONLY sign-in issuer and the smoke test's Entra mode
+### Task 7: A DEV ONLY sign-in issuer and the smoke test's Entra mode
 
 The rehearsal needs Plan 13A's stub OpenID issuer in the cluster over HTTPS (auth-svc
 refuses `http://` authorities off loopback) and a way for the smoke test to get user tokens.
@@ -1052,11 +1247,11 @@ git add -A
 git commit -m "test: add a DEV ONLY Entra ID sign-in issuer and the smoke test's Entra mode"
 ```
 
-### Task 7: The minikube rehearsal
+### Task 8: The minikube rehearsal
 
 Proves an Entra-only installation end to end without Entra ID: auth-svc trusting the
 in-cluster HTTPS issuer through a CA bundle, under egress policies on Calico; no link page,
-no email; the SDK smoke test signing in with Entra ID tokens.
+no email; the admin port only through a port-forward; the SDK smoke test signing in with Entra ID tokens.
 
 **Files:**
 - Create: `deploy\minikube\entra\sign-in-issuer.yaml`, `deploy\minikube\values-entra-sign-in-rehearsal.yaml`, `deploy\minikube\entra-sign-in-rehearsal.ps1`
@@ -1159,6 +1354,8 @@ auth:
       authorityHost: https://push-idp.push-idp.svc/
       caConfigMap: push-idp-ca
       maxSessionHours: 1
+  admin:
+    enabled: true
 worker:
   email:
     # Entra-only writes no email: no webhook.
@@ -1257,6 +1454,28 @@ try {
     $logs = kubectl logs deployment/push-auth -n push --tail=-1 | Out-String
     if ($logs -match 'eyJ[A-Za-z0-9_-]{10,}\.') { throw 'a JWT reached auth-svc''s log' }
     if ($logs -notmatch 'auth.entra.provisioned') { throw 'no Entra ID account was provisioned' }
+    # The admin API: never in an Ingress; through a port-forward with the generated token.
+    if (kubectl get ingress -n push -o yaml | Select-String -Pattern '8082|name: admin' -Quiet) {
+        throw 'an Ingress routes the admin port'
+    }
+    $encoded = kubectl get secret push-secrets -n push -o 'jsonpath={.data.auth-admin-token}'
+    $token = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($encoded))
+    $forward = Start-Process kubectl -ArgumentList 'port-forward', '-n', 'push', 'deploy/push-auth', '18082:8082' -PassThru
+    try {
+        Start-Sleep -Seconds 3
+        $uri = 'http://127.0.0.1:18082/v1/admin/users/revoke-sessions'
+        foreach ($case in @(@('wrong-token-wrong-token-wrong-token-wrong', 401), @($token, 404))) {
+            try {
+                Invoke-RestMethod -Method Post -Uri $uri -ContentType 'application/json' `
+                    -Body '{"handle":"nobody"}' -Headers @{ Authorization = "Bearer $($case[0])" } | Out-Null
+                throw "the admin API answered 200 where $($case[1]) was expected"
+            } catch {
+                if ($_.Exception.Response.StatusCode.value__ -ne $case[1]) { throw }
+            }
+        }
+    } finally {
+        Stop-Process -Id $forward.Id -ErrorAction SilentlyContinue
+    }
     Write-Host 'Entra ID sign-in rehearsal: PASS'
 }
 finally {
@@ -1282,7 +1501,7 @@ git add -A
 git commit -m "test(minikube): rehearse Entra ID-only sign-in without Entra ID"
 ```
 
-### Task 8: Verification and delivery
+### Task 9: Verification and delivery
 
 - [ ] **Step 1: Full checks.**
 
@@ -1321,21 +1540,26 @@ the branch.
 
 | Spec item | Task |
 |---|---|
-| D9 providers in values; Entra-only without email routes (service) and without email (worker `none`, no Resend keys, no link Ingress) | 1, 2, 3 |
-| D3 tenants as ids; wildcards and personal accounts refused before install | 1 |
+| D3 tenants: exactly one keyword or distinct tenant ids, refused otherwise before install; the implications documented | 1, 6 |
+| D9 providers in values (`password`, `entra`, `password,entra`); Entra-only: worker `none`, no Resend keys, no link Ingress | 1, 2, 3 |
 | D2 audiences include the application id; scope, role, client apps | 1, 2 |
 | D4 egress to the authority host only from auth-svc; proxy; CA bundle | 2, 4 |
 | D8 maximum session age as a value | 1, 2 |
-| D14 builds on 12B's egress map and DEV ONLY tools | 4, 6, 7 |
-| AC1 default render byte-identical; default smoke unchanged | 1 to 4 (checks), 8 |
-| AC2 Entra-only installation signs in, registers and chats; no email anywhere | 3, 6, 7 |
-| AC3 to AC7 | Plan 13A (service tests); 7 shows the issuer path in a cluster |
-| Guide: the two app registrations, tenant restriction, browser flow, chart values, egress | Plan 13A Task 15, 5 |
+| D15 admin listener: Secret key, port, NetworkPolicy peers, never an Ingress, off by default | 5, 6, 8 |
+| D16 the switch to Entra-only is destructive: documented for chart users; shown in the rehearsal (Entra-only start-up) | 6, 8 |
+| D17 builds on 12B's egress map and DEV ONLY tools | 4, 7, 8 |
+| AC1 default render byte-identical; default smoke unchanged | 1 to 5 (checks), 9 |
+| AC2 Entra-only installation signs in, registers and chats; no email anywhere | 3, 7, 8 |
+| AC8 tenant forms | 1 |
+| AC10 admin API reachable only through its port, wrong token refused | 5, 8 |
+| AC3 to AC7, AC9, AC11 | Plan 13A (service tests); 8 shows the issuer path in a cluster |
+| Guide: app registrations, tenants, browser flow, handles, admin API, switching, chart values, egress | Plan 13A Task 18, 6 |
 
 Placeholder scan: no "TBD"; every template, script and code step is complete. Names used
 across tasks: `push.entraSignIn`, `push.emailOff`, `push.mailboxFlag`, `push.checkSignIn`,
-`push.signInEnv`, `push.signInCa`, `auth.signIn.*`, `networkPolicy.egress.entraSignInCidrs`,
-`smoke.entraTokenUrl`, `push_smoke::entra::run`, `push-dev-entra sign-in`, and the 13A names
+`push.signInEnv`, `push.signInCa`, `auth.signIn.*`, `auth.admin.enabled`,
+`networkPolicy.adminPeers`, `networkPolicy.egress.entraSignInCidrs`, `smoke.entraTokenUrl`,
+`auth-admin-token`, `push_smoke::entra::run`, `push-dev-entra sign-in`, and the 13A names
 `StubOpenId::with_authority`, `user_claims`, `KEY_A`, `TENANT`, `sign`. Where 12B's merged
 names differ (`serve_tls`, `$egressOf`, `$https`, the CA volume lists), the PR notes the
 mapping.
