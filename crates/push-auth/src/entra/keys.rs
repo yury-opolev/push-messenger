@@ -334,7 +334,7 @@ mod tests {
         };
         let keys = KeySets::new(&settings, quick()).unwrap();
         for n in 1..=5u128 {
-            let tenant = Uuid::from_u128(0x7000_0000_0000_4000_8000_000000000000 + n);
+            let tenant = Uuid::from_u128(0x70000000_0000_4000_8000_000000000000 + n);
             assert!(keys.key(tenant, KEY_A.kid).await.unwrap().is_some());
         }
         assert_eq!(
