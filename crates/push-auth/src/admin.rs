@@ -1,7 +1,9 @@
 //! The admin API (spec D15): `POST /v1/admin/users/revoke-sessions` signs a user out of
 //! every device. It is served only on its own listener (`PUSH_AUTH_ADMIN_ADDR`), and only
 //! when `PUSH_AUTH_ADMIN_TOKEN` is set; the chart never routes it through the Ingress. The
-//! token is compared in constant time over SHA-256 digests and never logged.
+//! token is compared in constant time over SHA-256 digests and never logged. Calls with the
+//! token are rate limited per IP; failed attempts have a limit of their own per IP, so they
+//! never use up the token holder's.
 
 use std::net::SocketAddr;
 
@@ -137,7 +139,6 @@ async fn revoke_sessions(
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ConnectInfo(peer)| peer.ip());
-    admin.limits.check(Action::Admin, ip, None).await?;
     let presented = request
         .headers()
         .get(AUTHORIZATION)
@@ -152,8 +153,15 @@ async fn revoke_sessions(
             token_presented = presented.is_some(),
             "an admin call was refused"
         );
+        // Failed attempts are counted on their own, so callers without the token can lock
+        // only their own guesses out, never the token's holder.
+        admin
+            .limits
+            .check(Action::AdminAuthFailure, ip, None)
+            .await?;
         return Err(AuthError::Unauthorized);
     }
+    admin.limits.check(Action::Admin, ip, None).await?;
     let bytes = to_bytes(request.into_body(), MAX_BODY_BYTES)
         .await
         .map_err(|_| invalid("expected a JSON object of at most 4 KiB"))?;

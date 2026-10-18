@@ -42,8 +42,11 @@ pub enum Action {
     EntraAccount,
     /// `PATCH /v1/users/me` with a handle: per IP and per user.
     HandleChange,
-    /// The admin API, per IP: refused calls count too.
+    /// The admin API with the admin token, per IP.
     Admin,
+    /// Calls of the admin API without the right token, per IP; counted apart from
+    /// [`Action::Admin`], so they never lock the token's holder out.
+    AdminAuthFailure,
 }
 
 /// Whom a limit counts.
@@ -92,6 +95,7 @@ impl Action {
             Self::EntraAccount => "entra_account",
             Self::HandleChange => "handle_change",
             Self::Admin => "admin",
+            Self::AdminAuthFailure => "admin_auth_failure",
         }
     }
 
@@ -119,6 +123,7 @@ impl Action {
         const HANDLE_CHANGE: &[(Scope, Limit)] =
             &[(Scope::Ip, per(30, HOUR)), (Scope::Account, per(5, DAY))];
         const ADMIN: &[(Scope, Limit)] = &[(Scope::Ip, per(60, QUARTER))];
+        const ADMIN_AUTH_FAILURE: &[(Scope, Limit)] = &[(Scope::Ip, per(20, QUARTER))];
         match self {
             Self::Signup => SIGNUP,
             Self::Login => LOGIN,
@@ -129,6 +134,7 @@ impl Action {
             Self::EntraAccount => ENTRA_ACCOUNT,
             Self::HandleChange => HANDLE_CHANGE,
             Self::Admin => ADMIN,
+            Self::AdminAuthFailure => ADMIN_AUTH_FAILURE,
         }
     }
 }

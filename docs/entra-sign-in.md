@@ -21,7 +21,9 @@ yours.
 **Switching an existing installation to `entra` is destructive for password sessions.**
 When auth-svc starts without `password`, it signs every device of every email/password
 account out before it reports ready: refresh fails, open connections close within seconds,
-and their access tokens stop working. Those accounts cannot sign in any more. Entra ID
+and their access tokens stop working. While `password` is off it checks again every minute,
+so devices that replicas of the previous version sign in during a rolling update are
+signed out too. Those accounts cannot sign in any more. Entra ID
 sign-in does not link to them: the same people get **new, empty accounts** (new user ids,
 no contacts or history). Switching `password` back on later revives none of the signed-out
 devices; those users sign in again with their password as new devices.
@@ -128,7 +130,9 @@ open connections close within seconds. The account stays: the person can sign in
 unless you also block them where they sign in (disable or unassign them in Entra ID; for a
 password account, reset the password). There is deliberately no way to remove the Entra ID
 link: object ids are never reused, so removing it would only orphan the account and make
-the next sign-in create a duplicate person. Never expose the admin port through an Ingress;
+the next sign-in create a duplicate person. Calls with the token are limited to 60 per 15 minutes per IP; failed attempts have a
+separate limit (20 per 15 minutes per IP), so they never lock the token's holder out.
+Never expose the admin port through an Ingress;
 the chart allows it only from the peers you list (`networkPolicy.adminPeers`).
 
 ## 4. Sign in from a browser (MSAL.js)

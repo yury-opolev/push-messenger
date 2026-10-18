@@ -170,10 +170,30 @@ async fn the_admin_api_refuses_wrong_tokens_and_bodies_and_is_rate_limited() {
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(answer["error"]["code"], "user_not_found");
     }
-    // 60 calls per 15 minutes per IP, refused ones included: 9 so far.
-    for _ in 0..51 {
+    // Failed authentications lock the IP out of further guesses (20 per 15 minutes, 3 so
+    // far), but never the holder of the token: they are counted on their own.
+    for _ in 0..17 {
+        let (status, _) = revoke(
+            &router,
+            Some("wrong-token-wrong-token-wrong-token-wrong"),
+            json!({"handle": "nobody"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+    let (status, answer) = revoke(&router, None, json!({"handle": "nobody"})).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(answer["error"]["code"], "rate_limited");
+    let (status, _) = revoke(&router, Some(ADMIN_TOKEN), json!({"handle": "nobody"})).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "the token holder is not locked out"
+    );
+    // Authenticated calls: 60 per 15 minutes per IP, 7 so far.
+    for _ in 0..53 {
         let (status, _) = revoke(&router, Some(ADMIN_TOKEN), json!({"handle": "nobody"})).await;
-        assert_ne!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
     let (status, _) = revoke(&router, Some(ADMIN_TOKEN), json!({"handle": "alice"})).await;
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
