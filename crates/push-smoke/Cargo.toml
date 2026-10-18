@@ -24,6 +24,7 @@ tokio-tungstenite.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+push-credentials = { workspace = true, features = ["testing"] }
 tokio = { workspace = true, features = ["io-util"] }
 push-auth.workspace = true
 push-gateway.workspace = true

@@ -37,7 +37,7 @@ pub async fn retry<T, F, Fut>(
     what: &str,
     delay: Duration,
     shutdown: &CancellationToken,
-    permanent: &dyn Fn(&anyhow::Error) -> bool,
+    permanent: &(dyn Fn(&anyhow::Error) -> bool + Send + Sync),
     connect: F,
 ) -> anyhow::Result<Option<T>>
 where

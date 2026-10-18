@@ -140,8 +140,12 @@ impl Stack {
         let accounts_token = "accounts-token-for-the-local-smoke-test".to_owned();
         let message_svc = spawn(push_message_svc::serve(
             push_message_svc::Config {
-                database_url,
-                redis_url: redis_url.clone(),
+                database: push_store::DatabaseTarget::Url(database_url),
+                redis: push_credentials::RedisTarget::Password {
+                    url: redis_url.clone(),
+                },
+                azure: None,
+                run_migrations: true,
                 grpc_addr: grpc.local_addr().unwrap(),
                 accounts_grpc_addr: accounts.local_addr().unwrap(),
                 directory_grpc_addr: directory.local_addr().unwrap(),

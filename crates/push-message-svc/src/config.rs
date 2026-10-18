@@ -2,14 +2,21 @@
 
 use std::net::SocketAddr;
 
-use push_store::{StoreOptions, check_database_url};
+use push_credentials::{AzureConfig, ConfigProblem, RedisTarget, azure_for};
+use push_store::{DatabaseTarget, DatabaseVars, StoreOptions, postgres_auth};
 
 /// How the service runs. Read from the environment by [`Config::from_env`]:
 ///
 /// | Variable | Meaning | Default |
 /// |---|---|---|
-/// | `PUSH_DATABASE_URL` | Postgres URL of the `push_messaging` database, as its owner | required |
-/// | `PUSH_REDIS_URL` | Redis URL, `redis://:password@host:6379` | required |
+/// | `PUSH_POSTGRES_AUTH` | `password` or `azure-entra` (Microsoft Entra ID tokens, spec 2026-10-18) | `password` |
+/// | `PUSH_DATABASE_URL` | password mode: Postgres URL of the `push_messaging` database, as its owner | required |
+/// | `PUSH_DATABASE_HOST`, `_PORT`, `_NAME`, `_USER`, `_CA_FILE` | Entra mode: the server, port (`5432`), database (`push_messaging`), the principal's role and an optional CA bundle | host and user required |
+/// | `PUSH_REDIS_AUTH` | `password` or `azure-entra` | `password` |
+/// | `PUSH_REDIS_URL` | password mode `redis://:password@host:6379`; Entra mode `rediss://host:port` | required |
+/// | `PUSH_REDIS_USER`, `PUSH_REDIS_CA_FILE` | Entra mode: the ACL user (default: the token's `oid`) and an optional CA bundle | none |
+/// | `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_FEDERATED_TOKEN_FILE`, `AZURE_AUTHORITY_HOST` | Entra mode: the identity (workload identity with the token file, else managed identity) | set by the AKS webhook |
+/// | `PUSH_RUN_MIGRATIONS` | `true` or `false`: migrate at start-up (else `push-message-svc migrate` does) | `true` |
 /// | `PUSH_GRPC_ADDR` | address of the `Messaging` gRPC API | `0.0.0.0:50051` |
 /// | `PUSH_ACCOUNTS_GRPC_ADDR` | address of the `Accounts` gRPC API | `0.0.0.0:50052` |
 /// | `PUSH_DIRECTORY_GRPC_ADDR` | address of the `Directory` gRPC API | `0.0.0.0:50053` |
@@ -20,8 +27,11 @@ use push_store::{StoreOptions, check_database_url};
 /// | `PUSH_MESSAGING_TOKEN` | the gateway's token for the `Messaging` API, 32 to 256 visible ASCII characters and different from the other two; without it `Messaging` refuses every call | none |
 #[derive(Clone, PartialEq, Eq)]
 pub struct Config {
-    pub database_url: String,
-    pub redis_url: String,
+    pub database: DatabaseTarget,
+    pub redis: RedisTarget,
+    /// The identity, when a datastore uses Entra ID.
+    pub azure: Option<AzureConfig>,
+    pub run_migrations: bool,
     /// The Messaging gRPC API address.
     pub grpc_addr: SocketAddr,
     pub accounts_grpc_addr: SocketAddr,
@@ -37,8 +47,10 @@ impl std::fmt::Debug for Config {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("Config")
-            .field("database_url", &"<redacted>")
-            .field("redis_url", &"<redacted>")
+            .field("database", &self.database)
+            .field("redis", &self.redis)
+            .field("azure", &self.azure)
+            .field("run_migrations", &self.run_migrations)
             .field("grpc_addr", &self.grpc_addr)
             .field("accounts_grpc_addr", &self.accounts_grpc_addr)
             .field("directory_grpc_addr", &self.directory_grpc_addr)
@@ -80,11 +92,6 @@ impl Config {
 
     /// Reads variables through `lookup`, which returns a variable's value if it is set.
     pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
-        let required = |name: &'static str| {
-            lookup(name)
-                .filter(|value| !value.is_empty())
-                .ok_or(ConfigError::Missing(name))
-        };
         let store = StoreOptions {
             max_connections: parsed(&lookup, "PUSH_DB_MAX_CONNECTIONS", 10)?,
             ..StoreOptions::default()
@@ -94,16 +101,18 @@ impl Config {
             value: store.max_connections.to_string(),
             reason,
         })?;
-        let database_url = required("PUSH_DATABASE_URL")?;
-        check_database_url(&database_url)
-            .map_err(|reason| redacted("PUSH_DATABASE_URL", reason))?;
-        let redis_url = required("PUSH_REDIS_URL")?;
-        redis::Client::open(redis_url.as_str()).map_err(|_| {
-            redacted(
-                "PUSH_REDIS_URL",
-                "not a valid Redis URL, expected redis://[:password@]host:6379".to_owned(),
-            )
-        })?;
+        let lookup_dyn: &dyn Fn(&str) -> Option<String> = &lookup;
+        let mode = postgres_auth(lookup_dyn).map_err(problem)?;
+        let database = DatabaseTarget::from_lookup(
+            lookup_dyn,
+            mode,
+            &DatabaseVars::own("push_messaging"),
+            None,
+        )
+        .map_err(problem)?;
+        let redis = RedisTarget::from_lookup(lookup_dyn).map_err(problem)?;
+        let azure = azure_for(lookup_dyn, &[database.mode(), redis.mode()]).map_err(problem)?;
+        let run_migrations = flag(&lookup, "PUSH_RUN_MIGRATIONS", true)?;
         let accounts_token = token(&lookup, "PUSH_ACCOUNTS_TOKEN")?;
         let directory_token = token(&lookup, "PUSH_DIRECTORY_TOKEN")?;
         if accounts_token.is_some() && accounts_token == directory_token {
@@ -125,8 +134,10 @@ impl Config {
             ));
         }
         Ok(Self {
-            database_url,
-            redis_url,
+            database,
+            redis,
+            azure,
+            run_migrations,
             grpc_addr: parsed(&lookup, "PUSH_GRPC_ADDR", ([0, 0, 0, 0], 50051).into())?,
             accounts_grpc_addr: parsed(
                 &lookup,
@@ -165,6 +176,82 @@ fn check_token(token: &str) -> Result<(), String> {
         Ok(())
     } else {
         Err("use 32 to 256 visible ASCII characters".to_owned())
+    }
+}
+
+/// What `push-message-svc migrate` reads: the database variables above, the identity,
+/// and `PUSH_DATABASE_RUNTIME_ROLE`, a role granted the use of the `messaging` schema
+/// when the migrating identity is not the one the service runs as.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrateConfig {
+    pub database: DatabaseTarget,
+    pub azure: Option<AzureConfig>,
+    pub runtime_role: Option<String>,
+}
+
+impl MigrateConfig {
+    pub fn from_env() -> Result<Self, ConfigError> {
+        Self::from_lookup(|name| std::env::var(name).ok())
+    }
+
+    pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
+        let lookup_dyn: &dyn Fn(&str) -> Option<String> = &lookup;
+        let mode = postgres_auth(lookup_dyn).map_err(problem)?;
+        let database = DatabaseTarget::from_lookup(
+            lookup_dyn,
+            mode,
+            &DatabaseVars::own("push_messaging"),
+            None,
+        )
+        .map_err(problem)?;
+        let azure = azure_for(lookup_dyn, &[database.mode()]).map_err(problem)?;
+        let runtime_role = runtime_role(&lookup)?;
+        Ok(Self {
+            database,
+            azure,
+            runtime_role,
+        })
+    }
+}
+
+/// `PUSH_DATABASE_RUNTIME_ROLE`: a principal name, or unset.
+fn runtime_role(lookup: &impl Fn(&str) -> Option<String>) -> Result<Option<String>, ConfigError> {
+    match lookup("PUSH_DATABASE_RUNTIME_ROLE").filter(|role| !role.trim().is_empty()) {
+        None => Ok(None),
+        Some(role) if push_store::is_principal_name(role.trim()) => {
+            Ok(Some(role.trim().to_owned()))
+        }
+        Some(role) => Err(ConfigError::Invalid {
+            name: "PUSH_DATABASE_RUNTIME_ROLE",
+            value: role,
+            reason: "expected 1 to 63 ASCII letters, digits, _ - . or @".to_owned(),
+        }),
+    }
+}
+
+/// A datastore or identity variable that is missing or invalid; values are never shown.
+fn problem(problem: ConfigProblem) -> ConfigError {
+    match problem {
+        ConfigProblem::Missing(name) => ConfigError::Missing(name),
+        ConfigProblem::Invalid { name, reason } => redacted(name, reason),
+    }
+}
+
+/// `true` or `false`; `default` when unset or empty.
+fn flag(
+    lookup: &impl Fn(&str) -> Option<String>,
+    name: &'static str,
+    default: bool,
+) -> Result<bool, ConfigError> {
+    match lookup(name).as_deref().map(str::trim) {
+        None | Some("") => Ok(default),
+        Some("true") => Ok(true),
+        Some("false") => Ok(false),
+        Some(other) => Err(ConfigError::Invalid {
+            name,
+            value: other.to_owned(),
+            reason: "expected true or false".to_owned(),
+        }),
     }
 }
 
@@ -223,10 +310,15 @@ mod tests {
     fn defaults_apply_when_only_the_urls_are_set() {
         let config = config(&REQUIRED).unwrap();
         assert_eq!(
-            config.database_url,
-            "postgres://push:dbsecret@db/push_messaging"
+            config.database,
+            DatabaseTarget::Url(REQUIRED[0].1.to_owned())
         );
-        assert_eq!(config.redis_url, "redis://:secret@redis:6379");
+        assert_eq!(
+            config.redis,
+            RedisTarget::Password {
+                url: REQUIRED[1].1.to_owned()
+            }
+        );
         assert_eq!(config.grpc_addr, "0.0.0.0:50051".parse().unwrap());
         assert_eq!(config.accounts_grpc_addr, "0.0.0.0:50052".parse().unwrap());
         assert_eq!(config.directory_grpc_addr, "0.0.0.0:50053".parse().unwrap());
@@ -235,6 +327,46 @@ mod tests {
         assert_eq!(config.accounts_token, None);
         assert_eq!(config.directory_token, None);
         assert_eq!(config.messaging_token, None);
+    }
+
+    #[test]
+    fn entra_mode_reads_the_parts_and_the_identity() {
+        let variables = [
+            ("PUSH_POSTGRES_AUTH", "azure-entra"),
+            ("PUSH_DATABASE_HOST", "pg.example.net"),
+            ("PUSH_DATABASE_USER", "push-message-svc-id"),
+            ("PUSH_REDIS_AUTH", "azure-entra"),
+            ("PUSH_REDIS_URL", "rediss://cache.example.net:10000"),
+            ("AZURE_CLIENT_ID", "client"),
+            ("AZURE_TENANT_ID", "tenant"),
+            (
+                "AZURE_FEDERATED_TOKEN_FILE",
+                "/var/run/secrets/azure/tokens/azure-identity-token",
+            ),
+            ("PUSH_RUN_MIGRATIONS", "false"),
+        ];
+        let entra = config(&variables).unwrap();
+        assert!(
+            matches!(entra.database, DatabaseTarget::Entra(ref database) if database.name == "push_messaging")
+        );
+        assert!(matches!(entra.redis, RedisTarget::Entra { .. }));
+        assert!(entra.azure.is_some());
+        assert!(!entra.run_migrations);
+        let defaults = config(&REQUIRED).unwrap();
+        assert!(defaults.run_migrations && defaults.azure.is_none());
+    }
+
+    #[test]
+    fn run_migrations_is_a_boolean() {
+        let mut variables = REQUIRED.to_vec();
+        variables.push(("PUSH_RUN_MIGRATIONS", "maybe"));
+        assert!(matches!(
+            config(&variables),
+            Err(ConfigError::Invalid {
+                name: "PUSH_RUN_MIGRATIONS",
+                ..
+            })
+        ));
     }
 
     #[test]

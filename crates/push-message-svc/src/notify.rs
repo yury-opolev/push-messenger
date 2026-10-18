@@ -29,8 +29,16 @@ impl RedisNotifier {
     /// Connects to Redis at `url` (`redis://:password@host:6379`). The connection
     /// reconnects by itself when it breaks.
     pub async fn connect(url: &str) -> redis::RedisResult<Self> {
-        let client = redis::Client::open(url)?;
-        let connection = client.get_connection_manager().await?;
+        Self::with_connector(&push_credentials::RedisConnector::password(url)?).await
+    }
+
+    /// Connects through `connector` (password or Entra ID); reconnects by itself.
+    pub async fn with_connector(
+        connector: &push_credentials::RedisConnector,
+    ) -> redis::RedisResult<Self> {
+        let connection = connector
+            .connection_manager(redis::aio::ConnectionManagerConfig::new())
+            .await?;
         Ok(Self { connection })
     }
 

@@ -1,6 +1,5 @@
 //! Running the service: the gRPC API, the health endpoints and graceful shutdown.
 
-use std::future::Future;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -9,17 +8,19 @@ use axum::Router;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::get;
+use push_credentials::startup::{redis_permanent, retry};
+use push_credentials::{AuthMode, AzureConfig, RedisConnector};
 use push_domain::{Messaging, SystemClock};
 use push_proto::internal::v1::accounts_server::AccountsServer;
 use push_proto::internal::v1::directory_server::DirectoryServer;
 use push_proto::internal::v1::messaging_server::MessagingServer;
-use push_store::{PgStore, migrate_database};
+use push_store::{Connector, PgStore, grant_runtime_access, is_permanent_startup, tokens_for};
 use tokio::task::JoinSet;
 use tokio_stream::wrappers::TcpListenerStream;
 use tokio_util::sync::CancellationToken;
 
 use crate::Listeners;
-use crate::config::Config;
+use crate::config::{Config, MigrateConfig};
 use crate::grpc::{AccountsApi, DirectoryApi, InternalToken, MessagingApi};
 use crate::notify::RedisNotifier;
 
@@ -72,22 +73,48 @@ pub async fn serve(
              auth-svc cannot show profiles"
         );
     }
-    let Some(store) = retry("postgres", &shutdown, || async {
-        // Services migrate with `push_store::migrate_database(url)` on a dedicated
-        // connection, not with `PgStore::migrate` on the pool: a migration must not
-        // inherit the pool's request-sized statement and lock timeouts.
-        migrate_database(&config.database_url).await?;
-        let store = PgStore::connect(&config.database_url, &config.store).await?;
-        anyhow::Ok(store)
-    })
-    .await
+    push_credentials::install_crypto_provider();
+    let azure = config
+        .azure
+        .as_ref()
+        .map(AzureConfig::source)
+        .transpose()
+        .context("the Azure identity")?;
+    let pg_tokens = tokens_for(&config.database, azure.as_ref(), shutdown.clone())
+        .await
+        .context("PostgreSQL credentials")?;
+    let connector = Connector::for_target(&config.database, pg_tokens.as_ref())?;
+    let redis = RedisConnector::open(&config.redis, azure.as_ref(), shutdown.clone())
+        .await
+        .context("Redis credentials")?;
+    // Per datastore: a refused token or certificate is configuration in Entra mode only,
+    // so a password-mode datastore keeps retrying exactly as before.
+    let pg_entra = config.database.mode() == AuthMode::AzureEntra;
+    let postgres_fatal = move |error: &anyhow::Error| pg_entra && is_permanent_startup(error);
+    let redis_entra = config.redis.mode() == AuthMode::AzureEntra;
+    let redis_fatal = move |error: &anyhow::Error| redis_entra && redis_permanent(error);
+    let Some(store) = retry(
+        "postgres",
+        RETRY_DELAY,
+        &shutdown,
+        &postgres_fatal,
+        || async {
+            // Services migrate on a connection of their own, not on the pool: a migration must
+            // not inherit the pool's request-sized statement and lock timeouts.
+            if config.run_migrations {
+                connector.migrate(&push_store::MIGRATOR, &[]).await?;
+            }
+            anyhow::Ok(PgStore::new(connector.pool(&config.store).await?))
+        },
+    )
+    .await?
     else {
         return finish(health_server).await;
     };
-    let Some(notifier) = retry("redis", &shutdown, || {
-        RedisNotifier::connect(&config.redis_url)
+    let Some(notifier) = retry("redis", RETRY_DELAY, &shutdown, &redis_fatal, || async {
+        anyhow::Ok(RedisNotifier::with_connector(&redis).await?)
     })
-    .await
+    .await?
     else {
         store.close().await;
         return finish(health_server).await;
@@ -180,39 +207,39 @@ where
     result
 }
 
+/// `push-message-svc migrate`: applies the migrations of `push_messaging` and, with
+/// `PUSH_DATABASE_RUNTIME_ROLE`, grants that role the use of the `messaging` schema, then
+/// returns. For a migration job whose identity owns the database while the service runs
+/// as another (`PUSH_RUN_MIGRATIONS=false`).
+pub async fn migrate(config: MigrateConfig) -> anyhow::Result<()> {
+    push_credentials::install_crypto_provider();
+    let shutdown = CancellationToken::new();
+    let azure = config
+        .azure
+        .as_ref()
+        .map(AzureConfig::source)
+        .transpose()
+        .context("the Azure identity")?;
+    let tokens = tokens_for(&config.database, azure.as_ref(), shutdown.clone())
+        .await
+        .context("PostgreSQL credentials")?;
+    let connector = Connector::for_target(&config.database, tokens.as_ref())?;
+    connector.migrate(&push_store::MIGRATOR, &[]).await?;
+    if let Some(role) = &config.runtime_role {
+        let pool = connector.single().await?;
+        let granted = grant_runtime_access(&pool, "messaging", role).await;
+        pool.close().await;
+        granted?;
+    }
+    shutdown.cancel();
+    tracing::info!("push_messaging is migrated");
+    Ok(())
+}
+
 /// Waits for the health server to stop.
 async fn finish(health_server: tokio::task::JoinHandle<std::io::Result<()>>) -> anyhow::Result<()> {
     health_server.await??;
     Ok(())
-}
-
-/// Calls `connect` until it succeeds, logging each failure. `None` if `shutdown` came
-/// first.
-async fn retry<T, E, F, Fut>(what: &str, shutdown: &CancellationToken, connect: F) -> Option<T>
-where
-    E: std::fmt::Display,
-    F: Fn() -> Fut,
-    Fut: Future<Output = Result<T, E>>,
-{
-    loop {
-        let attempt = tokio::select! {
-            () = shutdown.cancelled() => return None,
-            attempt = connect() => attempt,
-        };
-        match attempt {
-            Ok(value) => {
-                tracing::info!(dependency = what, "connected");
-                return Some(value);
-            }
-            Err(error) => {
-                tracing::warn!(dependency = what, %error, "not reachable yet; retrying");
-            }
-        }
-        tokio::select! {
-            () = shutdown.cancelled() => return None,
-            () = tokio::time::sleep(RETRY_DELAY) => {}
-        }
-    }
 }
 
 #[derive(Clone)]

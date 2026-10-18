@@ -14,6 +14,7 @@ async-trait.workspace = true
 axum.workspace = true
 chrono.workspace = true
 prost.workspace = true
+push-credentials.workspace = true
 push-domain.workspace = true
 push-proto.workspace = true
 push-store.workspace = true
@@ -28,6 +29,7 @@ tracing-subscriber.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+push-credentials = { workspace = true, features = ["testing"] }
 testcontainers-modules.workspace = true
 tokio = { workspace = true, features = ["io-util"] }
 
