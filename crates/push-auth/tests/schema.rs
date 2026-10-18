@@ -88,7 +88,13 @@ async fn the_owner_migrates_and_a_second_run_changes_nothing() {
     .expect("list the tables");
     assert_eq!(
         tables,
-        ["device", "outbox", "refresh_token", "user_account"]
+        [
+            "device",
+            "external_identity",
+            "outbox",
+            "refresh_token",
+            "user_account"
+        ]
     );
 }
 
@@ -324,4 +330,102 @@ async fn the_cleanups_delete_expired_tokens_and_stale_unverified_accounts() {
             .await
             .unwrap();
     assert_eq!(handles, ["alice", "carol", "dave"]);
+}
+
+#[tokio::test]
+async fn an_external_account_has_no_email_or_password_and_the_cleanup_keeps_it() {
+    let (_container, url) = auth_database().await;
+    let pool = migrated(&url).await;
+    grant_worker_access(&url, "push_worker")
+        .await
+        .expect("grant");
+    // Every account was created 8 days ago.
+    let account = |handle: &'static str,
+                   email: Option<&'static str>,
+                   password: Option<&'static str>,
+                   active: bool| {
+        let pool = pool.clone();
+        async move {
+            let user = Uuid::now_v7();
+            sqlx::query(
+                "INSERT INTO auth.user_account \
+                 (user_id, email, handle, display_name, password_hash, email_verified_at, created_at) \
+                 VALUES ($1, $2, $3, 'Someone', $4, CASE WHEN $5 THEN now() END, \
+                 now() - interval '8 days')",
+            )
+            .bind(user)
+            .bind(email)
+            .bind(handle)
+            .bind(password)
+            .bind(active)
+            .execute(&pool)
+            .await
+            .map(|_| user)
+        }
+    };
+    let erin = account("erin", None, None, true)
+        .await
+        .expect("an active external account");
+    for (handle, email, password, active) in [
+        ("fay", None, None, false),
+        ("gus", None, Some("hash"), true),
+        ("hal", Some("hal@example.com"), None, true),
+    ] {
+        let error = account(handle, email, password, active)
+            .await
+            .expect_err(handle);
+        assert_eq!(constraint(error), "user_account_kind", "{handle}");
+    }
+
+    let tenant = Uuid::now_v7();
+    let identity = |user: Uuid, subject: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query(
+                "INSERT INTO auth.external_identity \
+                 (identity_id, provider, tenant_id, subject, user_id) \
+                 VALUES ($1, 'entra', $2, $3, $4)",
+            )
+            .bind(Uuid::now_v7())
+            .bind(tenant)
+            .bind(subject)
+            .bind(user)
+            .execute(&pool)
+            .await
+        }
+    };
+    identity(erin, "oid-1").await.expect("an identity");
+    let ivy = account("ivy", None, None, true).await.expect("ivy");
+    assert_eq!(
+        constraint(identity(ivy, "oid-1").await.expect_err("the same subject")),
+        "external_identity_provider_tenant_id_subject_key"
+    );
+    assert_eq!(
+        constraint(
+            identity(erin, "oid-2")
+                .await
+                .expect_err("a second identity")
+        ),
+        "external_identity_user_id_key"
+    );
+
+    // An email/password account unverified for 8 days is deleted; external ones are kept.
+    account("joe", Some("joe@example.com"), Some("hash"), false)
+        .await
+        .expect("joe");
+    let worker = PgPool::connect(&worker_url(&url))
+        .await
+        .expect("connect as the worker");
+    let deleted: i32 =
+        sqlx::query_scalar("SELECT auth.delete_unverified_accounts(interval '7 days', 100)")
+            .fetch_one(&worker)
+            .await
+            .expect("the cleanup");
+    assert_eq!(deleted, 1);
+    let left: Vec<String> =
+        sqlx::query_scalar("SELECT handle::text FROM auth.user_account ORDER BY handle")
+            .fetch_all(&pool)
+            .await
+            .expect("the accounts");
+    assert_eq!(left, ["erin", "ivy"]);
 }
