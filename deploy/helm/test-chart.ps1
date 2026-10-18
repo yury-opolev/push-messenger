@@ -850,6 +850,37 @@ Check 'sign-in: an Entra-only consumer Secret needs no email key' {
     $rendered -notmatch 'key: resend-' -and $rendered -notmatch '(?m)^kind: Secret'
 }
 
+Check 'sign-in egress: auth-svc alone reaches the Entra ID ranges, on 443 only' {
+    $rendered = helm template push $chart @signInArgs --set networkPolicy.egress.enabled=true `
+        --set 'networkPolicy.egress.entraSignInCidrs={20.190.128.0/18,40.126.0.0/18}' | Out-String
+    $policies = @'
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(sys.stdin.read()) if d]
+policies = {d["metadata"]["name"]: d["spec"] for d in docs if d["kind"] == "NetworkPolicy"}
+def reaches(name):
+    return [(p["ipBlock"]["cidr"], port["port"]) for rule in policies[name].get("egress", [])
+            for p in rule.get("to", []) if "ipBlock" in p for port in rule.get("ports", [])]
+assert sorted(reaches("push-auth")) == [("20.190.128.0/18", 443), ("40.126.0.0/18", 443)], reaches("push-auth")
+for other in ["push-gateway", "push-message-svc", "push-worker"]:
+    assert reaches(other) == [], (other, reaches(other))
+'@
+    $rendered | & $python.Source -c $policies; $LASTEXITCODE -eq 0
+}
+Check 'sign-in egress: Entra sign-in with egress needs a way to Entra ID; the list holds CIDRs' {
+    (Render ($signInArgs + @('--set', 'networkPolicy.egress.enabled=true'))) -ne 0 -and
+        (Render ($signInArgs + @('--set', 'networkPolicy.egress.enabled=true',
+            '--set', 'auth.signIn.entra.httpsProxy=http://proxy.corp.example:3128'))) -eq 0 -and
+        (Render ($signInArgs + @('--set', 'networkPolicy.egress.enabled=true',
+            '--set', 'networkPolicy.egress.httpsCidrs={20.190.128.0/18}'))) -eq 0 -and
+        (Render ($signInArgs + @('--set', 'networkPolicy.egress.enabled=true',
+            '--set', 'networkPolicy.egress.entraSignInCidrs={login.microsoftonline.com}'))) -ne 0
+}
+Check 'sign-in egress: without Entra sign-in the list adds nothing' {
+    $rendered = helm template push $chart --set networkPolicy.egress.enabled=true `
+        --set 'networkPolicy.egress.entraSignInCidrs={20.190.128.0/18}' | Out-String
+    $rendered -notmatch '20\.190\.128\.0/18'
+}
+
 if ($failures -gt 0) {
     Write-Output "$failures check(s) failed"
     exit 1

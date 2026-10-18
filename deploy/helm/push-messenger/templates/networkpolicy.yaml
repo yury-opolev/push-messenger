@@ -81,8 +81,15 @@ datastores (bundled: their pods; external: their CIDRs), HTTPS and extra rules. 
 {{- range $egress.httpsCidrs -}}
 {{- $https = append $https (dict "cidr" . "port" 443) -}}
 {{- end -}}
+{{- /* Microsoft Entra ID sign-in: auth-svc alone reaches its ranges. */ -}}
+{{- $signIn := list -}}
+{{- if include "push.entraSignIn" . -}}
+{{- range $egress.entraSignInCidrs -}}
+{{- $signIn = append $signIn (dict "cidr" . "port" 443) -}}
+{{- end -}}
+{{- end -}}
 {{- $egressOf = dict
-  "auth" (concat (list (dict "peer" "message-svc" "port" 50053)) $postgresTo $redisTo $https)
+  "auth" (concat (list (dict "peer" "message-svc" "port" 50053)) $postgresTo $redisTo $https $signIn)
   "message-svc" (concat $postgresTo $redisTo $https)
   "gateway" (concat (list (dict "peer" "auth" "port" 8080) (dict "peer" "message-svc" "port" 50051)) $redisTo $https)
   "worker" (concat (list (dict "peer" "message-svc" "port" 50052)) $postgresTo $https)

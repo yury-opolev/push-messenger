@@ -296,6 +296,20 @@ The admin listener is a boolean; its peers carry both label maps.
 {{- if and $entra.caConfigMap (include "push.authorityCa" (dict "root" . "key" "auth")) (ne $entra.caConfigMap $authorityCa) -}}
 {{- fail "auth-svc trusts one CA bundle (SSL_CERT_FILE): set auth.signIn.entra.caConfigMap to the same ConfigMap as azure.workloadIdentity.authorityCaConfigMap, holding every root auth-svc needs" -}}
 {{- end -}}
+{{- $egress := .Values.networkPolicy.egress -}}
+{{- if $egress.enabled -}}
+{{- if not (kindIs "slice" $egress.entraSignInCidrs) -}}
+{{- fail "networkPolicy.egress.entraSignInCidrs must be a list of CIDRs" -}}
+{{- end -}}
+{{- range $egress.entraSignInCidrs -}}
+{{- if not (and (kindIs "string" .) (regexMatch "^[0-9a-fA-F:.]+/[0-9]{1,3}$" .)) -}}
+{{- fail (printf "networkPolicy.egress.entraSignInCidrs must hold CIDRs such as 20.190.128.0/18, not %v" .) -}}
+{{- end -}}
+{{- end -}}
+{{- if not (or $egress.entraSignInCidrs $egress.httpsCidrs $egress.extra $entra.httpsProxy) -}}
+{{- fail "Entra ID sign-in with networkPolicy.egress.enabled: auth-svc must reach the authority host (login.microsoftonline.com). Set networkPolicy.egress.entraSignInCidrs (the AzureActiveDirectory service tag ranges), httpsCidrs or extra rules, or auth.signIn.entra.httpsProxy with a rule to the proxy in extra" -}}
+{{- end -}}
+{{- end -}}
 {{- end -}}
 {{- if include "push.emailOff" . -}}
 {{- if eq .Values.worker.email.sender "resend" -}}
