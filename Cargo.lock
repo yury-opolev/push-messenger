@@ -2459,13 +2459,18 @@ dependencies = [
 name = "push-store"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "chrono",
+ "futures-util",
+ "push-credentials",
  "push-domain",
  "push-testkit",
+ "rustls",
  "sqlx",
  "testcontainers-modules",
  "tokio",
+ "tokio-util",
  "tracing",
  "uuid",
 ]

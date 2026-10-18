@@ -16,12 +16,18 @@
 //! never mixes two services' migrations.
 
 mod codes;
+mod connect;
 mod error;
 mod locks;
 mod options;
 mod rows;
 mod store;
 
+pub use connect::{
+    Connector, DatabaseTarget, DatabaseVars, EntraDatabase, POSTGRES_SCOPE, check_allow_listed,
+    grant_runtime_access, is_permanent, is_permanent_startup, is_principal_name, postgres_auth,
+    tokens_for,
+};
 pub use options::StoreOptions;
 pub use store::{PgStore, PgTx};
 
@@ -58,36 +64,12 @@ pub async fn run_migrations(
     url: &str,
     migrator: &sqlx::migrate::Migrator,
 ) -> Result<(), sqlx::migrate::MigrateError> {
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(1)
-        .acquire_timeout(std::time::Duration::from_secs(5))
-        .connect(url)
-        .await?;
-    let result = migrator.run(&pool).await;
-    pool.close().await;
-    result
+    Connector::from_url(url)?.migrate(migrator, &[]).await
 }
 
 /// Connects a request pool to `url` as `options` say: every connection the pool opens
 /// first sets the lock, statement and idle-in-transaction timeouts. Fails if the options
 /// do not pass [`StoreOptions::validate`] or the first connection cannot be made.
 pub async fn connect_pool(url: &str, options: &StoreOptions) -> Result<sqlx::PgPool, sqlx::Error> {
-    use sqlx::Executor;
-
-    options
-        .validate()
-        .map_err(|message| sqlx::Error::Configuration(message.into()))?;
-    let settings = options.session_settings();
-    sqlx::postgres::PgPoolOptions::new()
-        .max_connections(options.max_connections)
-        .acquire_timeout(options.acquire_timeout)
-        .after_connect(move |connection, _| {
-            let settings = settings.clone();
-            Box::pin(async move {
-                connection.execute(settings.as_str()).await?;
-                Ok(())
-            })
-        })
-        .connect(url)
-        .await
+    Connector::from_url(url)?.pool(options).await
 }

@@ -8,17 +8,26 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+anyhow.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
+push-credentials.workspace = true
 push-domain.workspace = true
 sqlx.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+tokio-util.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+push-credentials = { workspace = true, features = ["testing"] }
 push-testkit.workspace = true
+rustls.workspace = true
 testcontainers-modules.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio-util.workspace = true
+futures-util.workspace = true
+uuid.workspace = true
 
 [[test]]
 name = "postgres"
