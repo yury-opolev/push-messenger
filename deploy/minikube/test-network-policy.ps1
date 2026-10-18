@@ -267,6 +267,13 @@ try {
             @{ Host = "push-ds-redis.$DatastoreNamespace.svc"; Port = 6380 },
             @{ Host = "push-ds-issuer.$DatastoreNamespace.svc"; Port = 443 }
         )
+        # Without the Plan 12B rehearsal's datastores (e.g. the bundled ones of the Plan 13B
+        # sign-in rehearsal) there are no external targets to allow.
+        kubectl --context $Context get namespace $DatastoreNamespace --request-timeout=30s 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "egress: no namespace $DatastoreNamespace; skipping the external datastore targets"
+            $datastores = @()
+        }
         $peers = @('auth', 'message-svc', 'gateway', 'worker')
         if ('migrate' -in $egressComponents) { $peers += 'migrate' }
         $egressPods = @{}

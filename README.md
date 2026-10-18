@@ -123,6 +123,16 @@ traffic over many token rotations, killed Redis connections and restarted pods. 
 `-Keep` the profile stays up for
 `.\deploy\minikube\test-network-policy.ps1 -Context push12b-entra -Egress`.
 
+Microsoft Entra ID-only sign-in ([docs/entra-sign-in.md](docs/entra-sign-in.md)) is
+rehearsed without Entra ID by `.\deploy\minikube\entra-sign-in-rehearsal.ps1` on its own
+profile (default `push13b-entra`, Calico; it refuses the `push` profile): a DEV ONLY
+HTTPS stand-in of Entra ID sign-in (`push-dev-entra sign-in`, which mints tokens for
+anyone), `auth.signIn.providers: entra` with the admin listener and egress policies, the
+smoke test in Entra mode (no email anywhere), the admin API over a port-forward, and real
+Calico allow/deny probes: only auth-svc reaches the stand-in, only the listed admin peers
+reach the admin port. With `-Keep` the profile stays up for
+`.\deploy\minikube\test-network-policy.ps1 -Context push13b-entra -Egress`.
+
 The minikube values switch on a DEV ONLY shortcut: the worker, which logs emails instead
 of sending them, shows them at `/dev/mailbox`, which the ingress does not route (it
 reaches the worker only at `/v1/webhooks/resend`). Clients, the smoke test included,
