@@ -34,6 +34,11 @@ spec:
         - {{ .Values.ingress.host | quote }}
         - --data-dir
         - /data
+        {{- with .Values.smoke.entraTokenUrl }}
+        # DEV ONLY: the rehearsal issuer's token endpoint; the Entra ID smoke test runs.
+        - --entra-token-url
+        - {{ . | quote }}
+        {{- end }}
       volumeMounts:
         - name: data
           mountPath: /data

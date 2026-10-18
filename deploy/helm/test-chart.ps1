@@ -928,6 +928,14 @@ Check 'admin: a consumer-managed Secret is referenced, never generated' {
         $rendered -notmatch '(?m)^kind: Secret'
 }
 
+Check 'sign-in: the DEV ONLY smoke test runs in Entra mode with a token endpoint' {
+    $rendered = helm template push $chart -f $minikube @signInArgs --set worker.email.webhook.enabled=false `
+        --set smoke.entraTokenUrl=http://push-idp.push-idp.svc:8080/dev/token | Out-String
+    (Doc $rendered 'Pod' 'push-smoke') -match '(?s)- --entra-token-url\s+- "http://push-idp.push-idp.svc:8080/dev/token"' -and
+        (Doc (helm template push $chart -f $minikube | Out-String) 'Pod' 'push-smoke') -notmatch 'entra-token-url' -and
+        (helm template push $chart --set smoke.entraTokenUrl=http://x/dev/token | Out-String) -notmatch 'entra-token-url'
+}
+
 if ($failures -gt 0) {
     Write-Output "$failures check(s) failed"
     exit 1

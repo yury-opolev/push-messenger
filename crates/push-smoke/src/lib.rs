@@ -30,8 +30,12 @@
 //! The deployment must run the worker with the log sender and `PUSH_DEV_MAILBOX=1`. The
 //! smoke test needs auth-svc's signing key (from the deployment's Secret) for step 6 and
 //! a writable directory for the SDK's databases.
+//!
+//! A Microsoft Entra ID-only deployment is tested by [`entra::run`] instead (DEV ONLY,
+//! with the rehearsal issuer's token endpoint).
 
 mod auth;
+pub mod entra;
 mod sdk;
 mod socket;
 mod tokens;

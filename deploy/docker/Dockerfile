@@ -19,7 +19,8 @@ COPY . .
 # The registry and target caches survive between builds on the same Docker daemon; the
 # binaries are copied out of the cache into the image layer. Two builds: Cargo unifies
 # features within one, and the services must not be built with push-credentials' DEV
-# ONLY `stub` feature, which push-smoke's push-dev-entra uses.
+# ONLY `stub` feature or push-auth's `testing` feature (its public test keys), which
+# push-smoke's push-dev-entra uses.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     cargo build --release --locked \
@@ -53,8 +54,9 @@ COPY --from=builder /out/push-worker /usr/local/bin/push-worker
 EXPOSE 8080 8081
 ENTRYPOINT ["/usr/local/bin/push-worker"]
 
-# DEV ONLY: the smoke test, and push-dev-entra for the Entra ID rehearsal on minikube
-# (deploy/minikube/entra-rehearsal.ps1). No service image contains either.
+# DEV ONLY: the smoke test, and push-dev-entra for the Entra ID rehearsals on minikube
+# (deploy/minikube/entra-rehearsal.ps1, entra-sign-in-rehearsal.ps1). No service image
+# contains either.
 FROM runtime AS smoke
 COPY --from=builder /out/push-smoke /usr/local/bin/push-smoke
 COPY --from=builder /out/push-dev-entra /usr/local/bin/push-dev-entra
