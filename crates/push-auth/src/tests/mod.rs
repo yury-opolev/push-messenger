@@ -3,6 +3,7 @@
 //! service on sockets (`entra_server`). Here rather than under `tests\`: the stub is behind
 //! the crate's `testing` feature, which the crate's own integration tests cannot enable.
 
+mod admin;
 mod entra_accounts;
 mod entra_api;
 mod entra_server;
@@ -17,16 +18,18 @@ use sqlx::PgPool;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::{ContainerAsync, ImageExt};
+use uuid::Uuid;
 
 use crate::api::{Api, router};
 use crate::db::migrate_database;
+use crate::devices::Tokens;
 use crate::directory::NoDirectory;
-use crate::entra::testing::StubOpenId;
-use crate::entra::{EntraSignIn, KeyTiming};
+use crate::entra::testing::{StubOpenId, TENANT};
+use crate::entra::{EntraIdentity, EntraSignIn, KeyTiming};
 use crate::limits::{Limits, MemoryCounter};
 use crate::links::LinkSigner;
 use crate::password::Passwords;
-use crate::service::{Auth, Settings, SignIn};
+use crate::service::{Auth, Settings, SignIn, Signup};
 use crate::tokens::AccessTokens;
 
 pub(crate) const AUDIENCE: &str = "ws://push.local/v1/socket";
@@ -85,19 +88,7 @@ pub(crate) async fn world(offer: Offer) -> World {
             entra: Some(entra),
         },
     };
-    let auth = Auth::new(
-        pool.clone(),
-        Settings {
-            public_url: "http://push.local".to_owned(),
-            passwords: Passwords::new(64, 1, 1).unwrap(),
-            links: LinkSigner::new(LINK_KEY.to_vec()).unwrap(),
-            tokens: AccessTokens::from_seed(&[5; 32], AUDIENCE).unwrap(),
-            hash_concurrency: 4,
-            hash_queue: 64,
-            hash_wait: Duration::from_secs(5),
-        },
-    )
-    .with_sign_in(sign_in);
+    let auth = service(pool.clone(), sign_in);
     let router = router(Api {
         auth: auth.clone(),
         limits: Limits::new(Arc::new(MemoryCounter::default())),
@@ -111,6 +102,82 @@ pub(crate) async fn world(offer: Offer) -> World {
         router,
         stub,
     }
+}
+
+/// The service on `pool` offering `sign_in`, with the settings every world uses.
+pub(crate) fn service(pool: PgPool, sign_in: SignIn) -> Auth {
+    Auth::new(
+        pool,
+        Settings {
+            public_url: "http://push.local".to_owned(),
+            passwords: Passwords::new(64, 1, 1).unwrap(),
+            links: LinkSigner::new(LINK_KEY.to_vec()).unwrap(),
+            tokens: AccessTokens::from_seed(&[5; 32], AUDIENCE).unwrap(),
+            hash_concurrency: 4,
+            hash_queue: 64,
+            hash_wait: Duration::from_secs(5),
+        },
+    )
+    .with_sign_in(sign_in)
+}
+
+/// A verified email/password account `name@example.com` (handle `name`) with `devices`
+/// registered devices: their tokens. `auth` must offer password sign-in.
+pub(crate) async fn password_user(
+    auth: &Auth,
+    pool: &PgPool,
+    name: &str,
+    devices: usize,
+) -> Vec<Tokens> {
+    let email = format!("{name}@example.com");
+    auth.signup(Signup {
+        email: email.clone(),
+        password: "correct horse".to_owned(),
+        handle: name.to_owned(),
+        display_name: name.to_owned(),
+    })
+    .await
+    .unwrap();
+    let link: String = sqlx::query_scalar(
+        "SELECT payload->'params'->>'link' FROM auth.outbox WHERE kind = 'email.send' \
+         AND payload->>'to' = $1 ORDER BY created_at DESC, event_id DESC LIMIT 1",
+    )
+    .bind(&email)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    auth.verify_email(link.split_once("?token=").unwrap().1)
+        .await
+        .unwrap();
+    let mut tokens = Vec::new();
+    for _ in 0..devices {
+        let registration = auth.login(&email, "correct horse").await.unwrap().token;
+        tokens.push(
+            auth.register_device(&registration, Uuid::now_v7(), "Phone", "ios")
+                .await
+                .unwrap(),
+        );
+    }
+    tokens
+}
+
+/// An Entra ID user of the stub's tenant with one registered device: its tokens.
+pub(crate) async fn entra_user(auth: &Auth, object_id: Uuid) -> Tokens {
+    let identity = EntraIdentity {
+        tenant_id: Uuid::parse_str(TENANT).unwrap(),
+        object_id,
+        name: Some("Erin".to_owned()),
+        email: None,
+    };
+    let signed_in = auth.sign_in_entra(&identity, None).await.unwrap();
+    auth.register_device(
+        &signed_in.registration.token,
+        Uuid::now_v7(),
+        "Laptop",
+        "web",
+    )
+    .await
+    .unwrap()
 }
 
 impl World {

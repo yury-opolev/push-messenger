@@ -42,6 +42,8 @@ pub enum Action {
     EntraAccount,
     /// `PATCH /v1/users/me` with a handle: per IP and per user.
     HandleChange,
+    /// The admin API, per IP: refused calls count too.
+    Admin,
 }
 
 /// Whom a limit counts.
@@ -89,6 +91,7 @@ impl Action {
             Self::EntraSignIn => "entra",
             Self::EntraAccount => "entra_account",
             Self::HandleChange => "handle_change",
+            Self::Admin => "admin",
         }
     }
 
@@ -115,6 +118,7 @@ impl Action {
         // Handles are public names: a few changes a day, so nobody cycles through them.
         const HANDLE_CHANGE: &[(Scope, Limit)] =
             &[(Scope::Ip, per(30, HOUR)), (Scope::Account, per(5, DAY))];
+        const ADMIN: &[(Scope, Limit)] = &[(Scope::Ip, per(60, QUARTER))];
         match self {
             Self::Signup => SIGNUP,
             Self::Login => LOGIN,
@@ -124,6 +128,7 @@ impl Action {
             Self::EntraSignIn => ENTRA,
             Self::EntraAccount => ENTRA_ACCOUNT,
             Self::HandleChange => HANDLE_CHANGE,
+            Self::Admin => ADMIN,
         }
     }
 }

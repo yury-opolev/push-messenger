@@ -16,6 +16,7 @@ use sqlx::PgPool;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
+use crate::admin::{AdminApi, admin_router};
 use crate::api::{Api, router};
 use crate::config::{Config, MigrateConfig};
 use crate::db::{MIGRATOR, grant_worker_access_on};
@@ -155,12 +156,32 @@ pub async fn serve(
         password: config.providers.password,
         entra,
     });
+    let limits = Limits::new(Arc::new(counter));
     let api = router(Api {
-        auth,
-        limits: Limits::new(Arc::new(counter)),
+        auth: auth.clone(),
+        limits: limits.clone(),
         client_ip_header: config.client_ip_header.clone(),
         directory,
     });
+    // The admin listener exists only with its token (spec D15).
+    let admin_server = match &config.admin_token {
+        Some(token) => {
+            let listener = TcpListener::bind(config.admin_addr)
+                .await
+                .with_context(|| format!("bind the admin listener {}", config.admin_addr))?;
+            tracing::info!(addr = %config.admin_addr, "serving the admin API");
+            let admin = admin_router(AdminApi::new(auth.clone(), limits.clone(), token));
+            Some(tokio::spawn(
+                axum::serve(
+                    listener,
+                    admin.into_make_service_with_connect_info::<SocketAddr>(),
+                )
+                .with_graceful_shutdown(shutdown.clone().cancelled_owned())
+                .into_future(),
+            ))
+        }
+        None => None,
+    };
     tracing::info!(addr = %config.http_addr, "serving HTTP");
     let result = axum::serve(
         http,
@@ -169,6 +190,9 @@ pub async fn serve(
     .with_graceful_shutdown(shutdown.clone().cancelled_owned())
     .await;
     pool.close().await;
+    if let Some(admin_server) = admin_server {
+        admin_server.await??;
+    }
     tracing::info!("stopped");
     result?;
     finish(health_server).await

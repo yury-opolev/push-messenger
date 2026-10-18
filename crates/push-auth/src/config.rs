@@ -44,6 +44,8 @@ use crate::entra::{EntraSettings, Providers};
 /// | `PUSH_ENTRA_REQUIRED_ROLE` | an app role `roles` must contain | none |
 /// | `PUSH_ENTRA_ALLOWED_CLIENT_APPS` | client app ids allowed in `azp` | any |
 /// | `PUSH_ENTRA_MAX_SESSION_HOURS` | maximum session age of an Entra-backed device, 1 to 720 | `24` |
+/// | `PUSH_AUTH_ADMIN_TOKEN` | the admin API's bearer token, 32 to 256 visible ASCII characters; unset: no admin listener (spec 2026-10-19 D15) | none |
+/// | `PUSH_AUTH_ADMIN_ADDR` | address of the admin listener; never expose it publicly | `0.0.0.0:8082` |
 ///
 /// `http://` public URLs and `ws://` audiences are accepted only for local hosts
 /// (`localhost`, `127.0.0.1`, `*.local`, `*.localhost`, `*.test`), like the chart's guard.
@@ -71,6 +73,10 @@ pub struct Config {
     pub providers: Providers,
     /// How Entra ID tokens are checked, when `entra` is a provider.
     pub entra: Option<EntraSettings>,
+    /// The admin API's bearer token; without it there is no admin listener.
+    pub admin_token: Option<String>,
+    /// Where the admin listener listens.
+    pub admin_addr: SocketAddr,
 }
 
 impl std::fmt::Debug for Config {
@@ -99,6 +105,11 @@ impl std::fmt::Debug for Config {
             )
             .field("providers", &self.providers)
             .field("entra", &self.entra)
+            .field(
+                "admin_token",
+                &self.admin_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("admin_addr", &self.admin_addr)
             .finish()
     }
 }
@@ -231,6 +242,15 @@ impl Config {
         } else {
             None
         };
+        let admin_token = lookup("PUSH_AUTH_ADMIN_TOKEN").filter(|v| !v.is_empty());
+        if let Some(token) = &admin_token {
+            if !((32..=256).contains(&token.len()) && token.bytes().all(|b| b.is_ascii_graphic())) {
+                return Err(redacted(
+                    "PUSH_AUTH_ADMIN_TOKEN",
+                    "use 32 to 256 visible ASCII characters".to_owned(),
+                ));
+            }
+        }
         Ok(Self {
             database,
             redis,
@@ -251,6 +271,8 @@ impl Config {
             directory_token,
             providers,
             entra,
+            admin_token,
+            admin_addr: parsed(&lookup, "PUSH_AUTH_ADMIN_ADDR", ([0, 0, 0, 0], 8082).into())?,
         })
     }
 }
@@ -723,5 +745,26 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn the_admin_listener_needs_a_strong_token_and_is_off_without_one() {
+        let default = config(&REQUIRED).unwrap();
+        assert_eq!(default.admin_token, None);
+        assert_eq!(default.admin_addr, "0.0.0.0:8082".parse().unwrap());
+        let token = "admin-admin-admin-admin-admin-admin-1";
+        let mut variables = with("PUSH_AUTH_ADMIN_TOKEN", token);
+        variables.push(("PUSH_AUTH_ADMIN_ADDR", "127.0.0.1:9090"));
+        let admin = config(&variables).unwrap();
+        assert_eq!(admin.admin_token.as_deref(), Some(token));
+        assert_eq!(admin.admin_addr, "127.0.0.1:9090".parse().unwrap());
+        assert!(!format!("{admin:?}").contains(token));
+        for weak in ["short", "an admin token with spaces in it, long enough"] {
+            let message = config(&with("PUSH_AUTH_ADMIN_TOKEN", weak))
+                .unwrap_err()
+                .to_string();
+            assert!(message.contains("PUSH_AUTH_ADMIN_TOKEN"), "{message}");
+            assert!(!message.contains(weak), "{message}");
+        }
     }
 }

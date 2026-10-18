@@ -5,6 +5,7 @@
 //! transaction as each change. Whose profiles a caller may see it asks message-svc, which
 //! knows the contacts and conversations (spec §5.5).
 
+pub mod admin;
 pub mod api;
 mod audit;
 mod config;
@@ -24,6 +25,7 @@ mod server;
 mod service;
 pub mod tokens;
 
+pub use admin::{AdminApi, UserSelector, admin_router};
 pub use config::{Config, ConfigError, MigrateConfig};
 pub use db::{
     MIGRATOR, grant_worker_access, grant_worker_access_on, is_role_name, migrate_database,

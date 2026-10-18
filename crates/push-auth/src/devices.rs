@@ -456,6 +456,31 @@ impl Auth {
             _ => Err(AuthError::Unauthorized),
         }
     }
+
+    /// Signs `user_id` out of every device (spec D15): each active device is revoked with
+    /// its refresh tokens, and `device.revoked` closes its connections through the usual
+    /// relay. Returns how many devices were active. The account stays.
+    pub async fn revoke_user_sessions(&self, user_id: Uuid) -> Result<u64, AuthError> {
+        let mut tx = self.pool.begin().await?;
+        // The account row first, as registration locks it: a device registered meanwhile
+        // is either seen here or registered after this sign-out, never missed.
+        sqlx::query("SELECT 1 FROM auth.user_account WHERE user_id = $1 FOR UPDATE")
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+        // Device rows next, in a fixed order, like every other change to a device's tokens.
+        let devices: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT device_id FROM auth.device WHERE user_id = $1 AND revoked_at IS NULL \
+             ORDER BY device_id FOR UPDATE",
+        )
+        .bind(user_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        let pairs: Vec<(Uuid, Uuid)> = devices.iter().map(|device| (user_id, *device)).collect();
+        revoke_devices(&mut tx, &pairs).await?;
+        tx.commit().await?;
+        Ok(pairs.len() as u64)
+    }
 }
 
 pub(crate) async fn revoke_refresh_tokens(
@@ -469,6 +494,41 @@ pub(crate) async fn revoke_refresh_tokens(
     .bind(device_id)
     .execute(connection)
     .await?;
+    Ok(())
+}
+
+/// Revokes `devices` (`(user, device)` pairs whose rows the caller has locked) and their
+/// refresh tokens, and writes `device.revoked` for each: message-svc then refuses their
+/// access tokens and the gateway closes their connections (4003).
+pub(crate) async fn revoke_devices(
+    connection: &mut PgConnection,
+    devices: &[(Uuid, Uuid)],
+) -> Result<(), AuthError> {
+    if devices.is_empty() {
+        return Ok(());
+    }
+    let ids: Vec<Uuid> = devices.iter().map(|(_, device)| *device).collect();
+    sqlx::query(
+        "UPDATE auth.device SET revoked_at = now() \
+         WHERE device_id = ANY($1) AND revoked_at IS NULL",
+    )
+    .bind(&ids)
+    .execute(&mut *connection)
+    .await?;
+    sqlx::query(
+        "UPDATE auth.refresh_token SET revoked_at = now() \
+         WHERE device_id = ANY($1) AND revoked_at IS NULL",
+    )
+    .bind(&ids)
+    .execute(&mut *connection)
+    .await?;
+    for (user_id, device_id) in devices {
+        let event = Event::DeviceRevoked {
+            user_id: *user_id,
+            device_id: *device_id,
+        };
+        outbox::write(&mut *connection, &event).await?;
+    }
     Ok(())
 }
 
