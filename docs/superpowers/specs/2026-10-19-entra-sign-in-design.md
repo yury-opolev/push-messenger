@@ -2,7 +2,7 @@
 
 Date: 2026-10-19
 
-Implementation status: **13A** planned ([plan](../plans/2026-10-19-plan-13a-entra-sign-in.md)),
+Implementation status: **13A** in progress ([plan](../plans/2026-10-19-plan-13a-entra-sign-in.md)),
 **13B** planned ([plan](../plans/2026-10-19-plan-13b-entra-sign-in-chart.md)). Design
 approved with the owner's final decisions of 2026-10-18.
 

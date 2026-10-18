@@ -35,6 +35,10 @@ survive a restart and are stored once, and the UI follows one stream of events:
     client.send(chat.id, "hello")?;
     while let Some(event) = events.next().await { /* update the UI */ }
 
+Where auth-svc offers Microsoft Entra ID sign-in, `client.sign_in_with_entra(token, handle,
+device_name, platform)` takes an access token the app got with MSAL instead
+([guide](docs/entra-sign-in.md)).
+
 Given a `DatabaseKey` (`Config::database_key`), the client encrypts the whole database;
 an app derives the key from a PIN or password the user enters (`DatabaseKey::derive`), so
 without it nobody can read the history, not even the app. The encryption is SQLite3
@@ -180,6 +184,8 @@ Managed PostgreSQL and Redis with Microsoft Entra ID tokens instead of passwords
 prerequisites, database roles, egress and limitations).
 [docs/deployment-ingress-verification.md](docs/deployment-ingress-verification.md)
 records the routing checks against a maintained controller (Traefik).
+Microsoft Entra ID sign-in (opt-in, also Entra-only without email):
+[docs/entra-sign-in.md](docs/entra-sign-in.md) (chart values arrive with Plan 13B).
 [docs/consumer-verification.md](docs/consumer-verification.md) gives the build, image,
 chart packaging and verification commands, and `push-load`, an explicitly targeted,
 bounded harness for connection, heartbeat, message-latency and reconnect checks with
