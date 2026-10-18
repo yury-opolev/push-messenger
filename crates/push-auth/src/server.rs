@@ -32,6 +32,8 @@ use crate::tokens::AccessTokens;
 const RETRY_DELAY: Duration = Duration::from_secs(2);
 /// Longest wait for a password-hash slot before a request is refused as `unavailable`.
 const HASH_WAIT: Duration = Duration::from_secs(2);
+/// How often an Entra ID-only service signs out password devices created since.
+const PASSWORD_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Runs the service until `shutdown` is cancelled, then finishes the requests in
 /// progress and closes the database pool.
@@ -155,11 +157,13 @@ pub async fn serve(
         password: config.providers.password,
         entra,
     });
-    if !config.providers.password {
+    let sweeper = if config.providers.password {
+        None
+    } else {
         // Entra ID only: every password session ends now, before this replica is ready
         // (spec D16). Idempotent; replicas share the work.
         let revoked = auth
-            .revoke_password_devices()
+            .revoke_password_devices(&shutdown)
             .await
             .context("sign out the password devices")?;
         tracing::info!(
@@ -168,7 +172,18 @@ pub async fn serve(
             devices = revoked,
             "email and password sign-in is off: password devices were signed out"
         );
-    }
+        if shutdown.is_cancelled() {
+            pool.close().await;
+            return finish(health_server).await;
+        }
+        // Replicas of the previous version (password still on) may sign password devices
+        // in during a rolling update: they are signed out again periodically.
+        Some(password_sweeper(
+            auth.clone(),
+            PASSWORD_SWEEP_INTERVAL,
+            shutdown.clone(),
+        ))
+    };
     let _ = ready.pool.set(pool.clone());
     let limits = Limits::new(Arc::new(counter));
     let api = router(Api {
@@ -203,6 +218,9 @@ pub async fn serve(
     )
     .with_graceful_shutdown(shutdown.clone().cancelled_owned())
     .await;
+    if let Some(sweeper) = sweeper {
+        let _ = sweeper.await;
+    }
     pool.close().await;
     if let Some(admin_server) = admin_server {
         admin_server.await??;
@@ -317,4 +335,34 @@ pub async fn terminated() {
         () = interrupt => {}
         () = terminate => {}
     }
+}
+
+/// While password sign-in is off, signs out every `every` the password devices that
+/// appeared since the last sweep (an older replica's sign-in during a rolling update),
+/// until `shutdown`. Failures are logged and tried again at the next round.
+pub(crate) fn password_sweeper(
+    auth: Auth,
+    every: Duration,
+    shutdown: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                () = shutdown.cancelled() => return,
+                () = tokio::time::sleep(every) => {}
+            }
+            match auth.revoke_password_devices(&shutdown).await {
+                Ok(0) => {}
+                Ok(revoked) => tracing::info!(
+                    target: "security",
+                    event = "auth.password_sessions.revoked",
+                    devices = revoked,
+                    "password devices created since the last sweep were signed out"
+                ),
+                Err(error) => {
+                    tracing::warn!(%error, "signing out password devices failed; trying again");
+                }
+            }
+        }
+    })
 }
