@@ -825,6 +825,31 @@ Check 'sign-in: auth-svc trusts one CA bundle when Plan 12B''s authority bundle 
         $auth -match '(?s)name: SSL_CERT_FILE\s+value: /etc/push/authority-ca/ca.crt' -and $auth -notmatch 'entra-ca'
 }
 
+Check 'sign-in: Entra-only sends no email and routes no link page' {
+    $rendered = helm template push $chart @signInArgs | Out-String
+    $worker = Doc $rendered 'Deployment' 'push-worker'
+    $worker -match '(?s)name: PUSH_EMAIL_SENDER\s+value: "none"' -and
+        $worker -match '(?s)name: PUSH_DEV_MAILBOX\s+value: "0"' -and
+        $worker -notmatch 'resend-api-key|resend-webhook-secret' -and
+        -not (Doc $rendered 'Ingress' 'push-auth-links') -and -not (Doc $rendered 'Ingress' 'push-worker') -and
+        (Doc $rendered 'Ingress' 'push-auth') -match 'path: /v1/auth'
+}
+Check 'sign-in: Entra-only in dev mode keeps the mailbox off and generates no webhook secret' {
+    $rendered = helm template push $chart -f $minikube @signInArgs --set worker.email.webhook.enabled=false | Out-String
+    (Doc $rendered 'Deployment' 'push-worker') -match '(?s)name: PUSH_DEV_MAILBOX\s+value: "0"' -and
+        (Doc $rendered 'Secret' 'push-secrets') -notmatch 'resend-' -and
+        (Doc (helm template push $chart -f $minikube | Out-String) 'Secret' 'push-secrets') -match 'resend-webhook-secret:'
+}
+Check 'sign-in: password,entra keeps the link pages and the sender' {
+    $rendered = helm template push $chart @signInArgs --set 'auth.signIn.providers=password\,entra' | Out-String
+    (Doc $rendered 'Ingress' 'push-auth-links') -and
+        (Doc $rendered 'Deployment' 'push-worker') -match '(?s)name: PUSH_EMAIL_SENDER\s+value: "log"'
+}
+Check 'sign-in: an Entra-only consumer Secret needs no email key' {
+    $rendered = helm template push $chart @signInArgs --set secrets.existingSecret=push-creds | Out-String
+    $rendered -notmatch 'key: resend-' -and $rendered -notmatch '(?m)^kind: Secret'
+}
+
 if ($failures -gt 0) {
     Write-Output "$failures check(s) failed"
     exit 1

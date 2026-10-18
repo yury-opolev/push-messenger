@@ -4,15 +4,19 @@ controller: class, TLS Secret and annotations come from values; nothing here is 
 to one controller. All public paths are under /v1. The email link pages carry a one-time
 token in the query string (?token=), so they are a separate Ingress with Exact paths
 (winning over the Prefix paths of the auth Ingress): its own annotations can keep the
-token out of the controller's logs. The worker's only public path is the Resend webhook,
-one Exact path, so its DEV ONLY /dev/mailbox is never routed.
+token out of the controller's logs. Without email and password sign-in there are no link
+pages, so no auth-links Ingress. The worker's only public path is the Resend webhook, one
+Exact path, so its DEV ONLY /dev/mailbox is never routed. auth-svc's admin port is never
+routed: every route names the Service port http.
 */ -}}
 {{- if .Values.ingress.enabled -}}
 {{- $routes := list
   (dict "name" "gateway" "component" "gateway" "paths" (list "/v1/socket") "type" "Exact" "annotations" .Values.ingress.gatewayAnnotations)
   (dict "name" "auth" "component" "auth" "paths" (list "/v1/auth" "/v1/devices" "/v1/users") "type" "Prefix" "annotations" .Values.ingress.authAnnotations)
-  (dict "name" "auth-links" "component" "auth" "paths" (list "/v1/auth/verify" "/v1/auth/password/reset") "type" "Exact" "annotations" .Values.ingress.authLinkAnnotations)
 -}}
+{{- if not (include "push.emailOff" .) -}}
+{{- $routes = append $routes (dict "name" "auth-links" "component" "auth" "paths" (list "/v1/auth/verify" "/v1/auth/password/reset") "type" "Exact" "annotations" .Values.ingress.authLinkAnnotations) -}}
+{{- end -}}
 {{- if include "push.hasWebhook" . -}}
 {{- $routes = append $routes (dict "name" "worker" "component" "worker" "paths" (list "/v1/webhooks/resend") "type" "Exact" "annotations" .Values.ingress.webhookAnnotations) -}}
 {{- end -}}
