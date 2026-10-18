@@ -17,15 +17,18 @@ FROM rust:1.85-slim-bookworm@sha256:9f841bbe9e7d8e37ceb96ed907265a3a0df7f44e3737
 WORKDIR /src
 COPY . .
 # The registry and target caches survive between builds on the same Docker daemon; the
-# binaries are copied out of the cache into the image layer.
+# binaries are copied out of the cache into the image layer. Two builds: Cargo unifies
+# features within one, and the services must not be built with push-credentials' DEV
+# ONLY `stub` feature, which push-smoke's push-dev-entra uses.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     cargo build --release --locked \
-        -p push-auth -p push-message-svc -p push-gateway -p push-worker -p push-smoke -p push-load \
+        -p push-auth -p push-message-svc -p push-gateway -p push-worker \
+    && cargo build --release --locked -p push-smoke -p push-load \
     && mkdir /out \
     && cp target/release/push-auth target/release/push-message-svc \
         target/release/push-gateway target/release/push-worker target/release/push-smoke \
-        target/release/push-load /out/
+        target/release/push-load target/release/push-dev-entra /out/
 
 # glibc and libgcc, no shell, no package manager; runs as uid 65532 ("nonroot").
 FROM gcr.io/distroless/cc-debian12:nonroot@sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f AS runtime
@@ -50,8 +53,11 @@ COPY --from=builder /out/push-worker /usr/local/bin/push-worker
 EXPOSE 8080 8081
 ENTRYPOINT ["/usr/local/bin/push-worker"]
 
+# DEV ONLY: the smoke test, and push-dev-entra for the Entra ID rehearsal on minikube
+# (deploy/minikube/entra-rehearsal.ps1). No service image contains either.
 FROM runtime AS smoke
 COPY --from=builder /out/push-smoke /usr/local/bin/push-smoke
+COPY --from=builder /out/push-dev-entra /usr/local/bin/push-dev-entra
 ENTRYPOINT ["/usr/local/bin/push-smoke"]
 
 # push-load, the explicitly targeted load harness (docs/consumer-verification.md). It

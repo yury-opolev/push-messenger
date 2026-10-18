@@ -2,6 +2,7 @@
 
 mod azure;
 mod redis_entra;
+mod stub_tls;
 mod tls;
 
 #[test]
