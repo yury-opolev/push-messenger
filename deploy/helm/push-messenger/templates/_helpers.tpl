@@ -238,3 +238,330 @@ annotations:
   {{- toYaml . | nindent 2 }}
 {{- end -}}
 {{- end -}}
+
+{{/* "true" when the services reach an external PostgreSQL with Entra ID tokens. */}}
+{{- define "push.entraPostgres" -}}
+{{- if and (not .Values.postgres.enabled) (eq .Values.postgres.external.auth "azure-entra") -}}true{{- end -}}
+{{- end -}}
+
+{{/* "true" when the services reach an external Redis with Entra ID tokens. */}}
+{{- define "push.entraRedis" -}}
+{{- if and (not .Values.redis.enabled) (eq .Values.redis.external.auth "azure-entra") -}}true{{- end -}}
+{{- end -}}
+
+{{/* "true" when any datastore uses Entra ID: identities and ServiceAccounts are needed. */}}
+{{- define "push.anyEntra" -}}
+{{- if or (include "push.entraPostgres" .) (include "push.entraRedis" .) -}}true{{- end -}}
+{{- end -}}
+
+{{/* A PostgreSQL role or database name the services accept: 1-63 of A-Z a-z 0-9 _ - . @ */}}
+{{- define "push.checkPrincipal" -}}
+{{- if not (and (kindIs "string" .value) (regexMatch "^[A-Za-z0-9_.@-]{1,63}$" .value)) -}}
+{{- fail (printf "%s must be an Entra principal name (1 to 63 ASCII letters, digits, _ - . or @)" .name) -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Checks the datastore and identity settings (spec 2026-10-18). Bundled datastores ignore
+the external blocks. An external datastore needs its address; azure-entra needs a role
+per identity (PostgreSQL), a rediss:// URL without credentials (Redis) and a client id for
+every identity that reaches it; password mode needs a consumer-managed Secret with the URLs.
+*/}}
+{{- define "push.checkDatastores" -}}
+{{- $pg := .Values.postgres -}}
+{{- $redis := .Values.redis -}}
+{{- $wi := .Values.azure.workloadIdentity -}}
+{{- range $name, $value := dict "postgres.enabled" $pg.enabled "redis.enabled" $redis.enabled "migrations.job.enabled" .Values.migrations.job.enabled "networkPolicy.egress.enabled" .Values.networkPolicy.egress.enabled -}}
+{{- if not (kindIs "bool" $value) -}}
+{{- fail (printf "%s must be a boolean" $name) -}}
+{{- end -}}
+{{- end -}}
+{{- if not $pg.enabled -}}
+{{- if not $pg.external.host -}}
+{{- fail "postgres.enabled false needs postgres.external.host" -}}
+{{- end -}}
+{{- $port := int $pg.external.port -}}
+{{- if or (lt $port 1) (gt $port 65535) -}}
+{{- fail "postgres.external.port must be a TCP port (1 to 65535)" -}}
+{{- end -}}
+{{- if not (has $pg.external.auth (list "azure-entra" "password")) -}}
+{{- fail (printf "postgres.external.auth must be azure-entra or password, not %q" (toString $pg.external.auth)) -}}
+{{- end -}}
+{{- if and (eq $pg.external.auth "password") (not .Values.secrets.existingSecret) -}}
+{{- fail "postgres.external.auth password needs secrets.existingSecret holding the database URLs" -}}
+{{- end -}}
+{{- if eq $pg.external.auth "azure-entra" -}}
+{{- range $key := list "messageSvc" "auth" "worker" -}}
+{{- include "push.checkPrincipal" (dict "name" (printf "postgres.external.users.%s" $key) "value" (index $pg.external.users $key)) -}}
+{{- end -}}
+{{- range $key := list "messaging" "auth" "worker" -}}
+{{- include "push.checkPrincipal" (dict "name" (printf "postgres.external.databases.%s" $key) "value" (index $pg.external.databases $key)) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if not $redis.enabled -}}
+{{- if not (has $redis.external.auth (list "azure-entra" "password")) -}}
+{{- fail (printf "redis.external.auth must be azure-entra or password, not %q" (toString $redis.external.auth)) -}}
+{{- end -}}
+{{- if eq $redis.external.auth "azure-entra" -}}
+{{- if not (regexMatch "^rediss://[^@/:]+(:[0-9]+)?/?$" $redis.external.url) -}}
+{{- fail "redis.external.url must be rediss://host:port without credentials for azure-entra" -}}
+{{- end -}}
+{{- else if not .Values.secrets.existingSecret -}}
+{{- fail "redis.external.auth password needs secrets.existingSecret holding redis-url" -}}
+{{- end -}}
+{{- end -}}
+{{- if include "push.anyEntra" . -}}
+{{- if not (has $wi.injection (list "webhook" "chart")) -}}
+{{- fail (printf "azure.workloadIdentity.injection must be webhook or chart, not %q" (toString $wi.injection)) -}}
+{{- end -}}
+{{- if and (eq $wi.injection "chart") (not $wi.tenantId) -}}
+{{- fail "azure.workloadIdentity.injection chart needs azure.workloadIdentity.tenantId" -}}
+{{- end -}}
+{{- $needs := list -}}
+{{- if include "push.entraPostgres" . -}}{{- $needs = concat $needs (list "auth" "messageSvc" "worker") -}}{{- end -}}
+{{- if include "push.entraRedis" . -}}{{- $needs = concat $needs (list "auth" "messageSvc" "gateway") -}}{{- end -}}
+{{- range $key := uniq $needs -}}
+{{- if not (index $wi.clientIds $key) -}}
+{{- fail (printf "azure.workloadIdentity.clientIds.%s is required: that workload reaches an Entra ID datastore" $key) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- with .Values.networkPolicy.egress -}}
+{{- if .enabled -}}
+{{- range $name := list "postgresCidrs" "redisCidrs" "httpsCidrs" -}}
+{{- $cidrs := index $.Values.networkPolicy.egress $name -}}
+{{- if not (kindIs "slice" $cidrs) -}}
+{{- fail (printf "networkPolicy.egress.%s must be a list of CIDRs" $name) -}}
+{{- end -}}
+{{- range $cidrs -}}
+{{- if not (and (kindIs "string" .) (regexMatch "^[0-9a-fA-F:.]+/[0-9]{1,3}$" .)) -}}
+{{- fail (printf "networkPolicy.egress.%s must hold CIDRs such as 10.1.0.4/32, not %v" $name .) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- $dnsError := "networkPolicy.egress.dns requires namespaceSelector and podSelector as non-empty label maps on every peer" -}}
+{{- if not (and (kindIs "slice" .dns) .dns) -}}
+{{- fail $dnsError -}}
+{{- end -}}
+{{- range .dns -}}
+{{- if not (and (kindIs "map" .) (kindIs "map" .namespaceSelector) .namespaceSelector (kindIs "map" .podSelector) .podSelector) -}}
+{{- fail $dnsError -}}
+{{- end -}}
+{{- end -}}
+{{- if not (kindIs "slice" .extra) -}}
+{{- fail "networkPolicy.egress.extra must be a list of NetworkPolicyEgressRule objects" -}}
+{{- end -}}
+{{- range .extra -}}
+{{- if not (kindIs "map" .) -}}
+{{- fail "networkPolicy.egress.extra must be a list of NetworkPolicyEgressRule objects" -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if .Values.migrations.job.enabled -}}
+{{- if not (include "push.entraPostgres" .) -}}
+{{- fail "migrations.job.enabled needs an external PostgreSQL with postgres.external.auth azure-entra" -}}
+{{- end -}}
+{{- include "push.checkPrincipal" (dict "name" "postgres.external.users.migrate" "value" $pg.external.users.migrate) -}}
+{{- if not $wi.clientIds.migrate -}}
+{{- fail "migrations.job.enabled needs azure.workloadIdentity.clientIds.migrate" -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+A service's PostgreSQL variables: the URL from the Secret (bundled, or external password
+mode), or the Entra ID variables of Plan 12A. Arguments: root, secretKey, database, user.
+*/}}
+{{- define "push.postgresEnv" -}}
+{{- $root := .root -}}
+{{- if include "push.entraPostgres" $root }}
+- name: PUSH_POSTGRES_AUTH
+  value: azure-entra
+- name: PUSH_DATABASE_HOST
+  value: {{ $root.Values.postgres.external.host | quote }}
+- name: PUSH_DATABASE_PORT
+  value: {{ $root.Values.postgres.external.port | quote }}
+- name: PUSH_DATABASE_NAME
+  value: {{ .database | quote }}
+- name: PUSH_DATABASE_USER
+  value: {{ .user | quote }}
+{{- if $root.Values.postgres.external.caConfigMap }}
+- name: PUSH_DATABASE_CA_FILE
+  value: /etc/push/postgres-ca/ca.crt
+{{- end }}
+- name: PUSH_RUN_MIGRATIONS
+  value: {{ ternary "false" "true" $root.Values.migrations.job.enabled | quote }}
+{{- else }}
+- name: PUSH_DATABASE_URL
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "push.secretName" $root }}
+      key: {{ .secretKey }}
+{{- end }}
+{{- end -}}
+
+{{/* A service's Redis variables: the URL from the Secret, or the Entra ID variables. */}}
+{{- define "push.redisEnv" -}}
+{{- if include "push.entraRedis" . }}
+- name: PUSH_REDIS_AUTH
+  value: azure-entra
+- name: PUSH_REDIS_URL
+  value: {{ .Values.redis.external.url | quote }}
+{{- with .Values.redis.external.user }}
+- name: PUSH_REDIS_USER
+  value: {{ . | quote }}
+{{- end }}
+{{- if .Values.redis.external.caConfigMap }}
+- name: PUSH_REDIS_CA_FILE
+  value: /etc/push/redis-ca/ca.crt
+{{- end }}
+{{- else }}
+- name: PUSH_REDIS_URL
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "push.secretName" . }}
+      key: redis-url
+{{- end }}
+{{- end -}}
+
+{{/* Pod label: the AKS webhook mutates only pods that opt in. Arguments: root, key. */}}
+{{- define "push.identityLabels" -}}
+{{- $root := .root -}}
+{{- if and (include "push.anyEntra" $root) (eq $root.Values.azure.workloadIdentity.injection "webhook") (index $root.Values.azure.workloadIdentity.clientIds .key) }}
+azure.workload.identity/use: "true"
+{{- end }}
+{{- end -}}
+
+{{/* Pod spec line: the workload's ServiceAccount in Entra ID mode. Arguments: root, component. */}}
+{{- define "push.serviceAccount" -}}
+{{- if include "push.anyEntra" .root }}
+serviceAccountName: {{ include "push.name" (dict "root" .root "component" .component) }}
+{{- end }}
+{{- end -}}
+
+{{/* Container env: the AZURE_* variables when the chart injects the identity itself. */}}
+{{- define "push.identityEnv" -}}
+{{- $root := .root -}}
+{{- $wi := $root.Values.azure.workloadIdentity -}}
+{{- if and (include "push.anyEntra" $root) (eq $wi.injection "chart") (index $wi.clientIds .key) }}
+- name: AZURE_CLIENT_ID
+  value: {{ index $wi.clientIds .key | quote }}
+- name: AZURE_TENANT_ID
+  value: {{ $wi.tenantId | quote }}
+- name: AZURE_FEDERATED_TOKEN_FILE
+  value: /var/run/secrets/azure/tokens/azure-identity-token
+- name: AZURE_AUTHORITY_HOST
+  value: {{ $wi.authorityHost | quote }}
+{{- if $wi.authorityCaConfigMap }}
+- name: SSL_CERT_FILE
+  value: /etc/push/authority-ca/ca.crt
+{{- end }}
+{{- end }}
+{{- end -}}
+
+{{/*
+Container volume mounts: the projected token (injection chart) and the CA bundles of the
+datastores this workload reaches. Arguments: root, key, postgres, redis (booleans).
+*/}}
+{{- define "push.identityMounts" -}}
+{{- $root := .root -}}
+{{- $wi := $root.Values.azure.workloadIdentity -}}
+{{- if and (include "push.anyEntra" $root) (eq $wi.injection "chart") (index $wi.clientIds .key) }}
+- name: azure-identity-token
+  mountPath: /var/run/secrets/azure/tokens
+  readOnly: true
+{{- if $wi.authorityCaConfigMap }}
+- name: authority-ca
+  mountPath: /etc/push/authority-ca
+  readOnly: true
+{{- end }}
+{{- end }}
+{{- if and (include "push.entraPostgres" $root) $root.Values.postgres.external.caConfigMap .postgres }}
+- name: postgres-ca
+  mountPath: /etc/push/postgres-ca
+  readOnly: true
+{{- end }}
+{{- if and (include "push.entraRedis" $root) $root.Values.redis.external.caConfigMap .redis }}
+- name: redis-ca
+  mountPath: /etc/push/redis-ca
+  readOnly: true
+{{- end }}
+{{- end -}}
+
+{{/* Pod volumes matching push.identityMounts. */}}
+{{- define "push.identityVolumes" -}}
+{{- $root := .root -}}
+{{- $wi := $root.Values.azure.workloadIdentity -}}
+{{- if and (include "push.anyEntra" $root) (eq $wi.injection "chart") (index $wi.clientIds .key) }}
+- name: azure-identity-token
+  projected:
+    sources:
+      - serviceAccountToken:
+          audience: api://AzureADTokenExchange
+          expirationSeconds: 3600
+          path: azure-identity-token
+{{- if $wi.authorityCaConfigMap }}
+- name: authority-ca
+  configMap:
+    name: {{ $wi.authorityCaConfigMap }}
+{{- end }}
+{{- end }}
+{{- if and (include "push.entraPostgres" $root) $root.Values.postgres.external.caConfigMap .postgres }}
+- name: postgres-ca
+  configMap:
+    name: {{ $root.Values.postgres.external.caConfigMap }}
+{{- end }}
+{{- if and (include "push.entraRedis" $root) $root.Values.redis.external.caConfigMap .redis }}
+- name: redis-ca
+  configMap:
+    name: {{ $root.Values.redis.external.caConfigMap }}
+{{- end }}
+{{- end -}}
+
+{{/* One `migrate` step of the migration Job (migrate-job.yaml). Arguments: root, step. */}}
+{{- define "push.migrateStep" -}}
+{{- $root := .root -}}
+{{- $step := .step -}}
+- name: {{ $step.name }}
+  image: {{ include "push.image" $step.image }}
+  imagePullPolicy: {{ $root.Values.images.pullPolicy }}
+  args: ["migrate"]
+  {{- include "push.containerSecurity" $root | nindent 2 }}
+  env:
+    {{- with include "push.identityEnv" (dict "root" $root "key" "migrate") }}
+    {{- . | trim | nindent 4 }}
+    {{- end }}
+    - name: PUSH_POSTGRES_AUTH
+      value: azure-entra
+    - name: PUSH_DATABASE_HOST
+      value: {{ $root.Values.postgres.external.host | quote }}
+    - name: PUSH_DATABASE_PORT
+      value: {{ $root.Values.postgres.external.port | quote }}
+    - name: PUSH_DATABASE_NAME
+      value: {{ $step.database | quote }}
+    - name: PUSH_DATABASE_USER
+      value: {{ $root.Values.postgres.external.users.migrate | quote }}
+    - name: PUSH_DATABASE_RUNTIME_ROLE
+      value: {{ $step.runtime | quote }}
+    {{- with $step.worker }}
+    - name: PUSH_AUTH_WORKER_ROLE
+      value: {{ . | quote }}
+    {{- end }}
+    {{- if $root.Values.postgres.external.caConfigMap }}
+    - name: PUSH_DATABASE_CA_FILE
+      value: /etc/push/postgres-ca/ca.crt
+    {{- end }}
+  {{- with include "push.identityMounts" (dict "root" $root "key" "migrate" "postgres" true "redis" false) }}
+  volumeMounts:
+    {{- . | trim | nindent 4 }}
+  {{- end }}
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+{{- end -}}

@@ -139,6 +139,9 @@ messageSvc:
       memory: 256Mi
 
 postgres:
+  # true: the bundled PostgreSQL below. false: an external server (postgres.external);
+  # the bundled settings below are then unused.
+  enabled: true
   # Pinned by digest (the multi-arch index of postgres:17-alpine), so every install runs
   # the same bytes; set another tag@digest to move.
   image: postgres:17-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24
@@ -162,8 +165,32 @@ postgres:
     limits:
       cpu: "1"
       memory: 1Gi
+  # An external PostgreSQL (postgres.enabled false), e.g. Azure Database for PostgreSQL
+  # flexible server: docs/deployment-azure-entra.md.
+  external:
+    host: ""
+    port: 5432
+    # azure-entra: Microsoft Entra ID tokens, no database credential anywhere. password:
+    # the services read the URLs from a consumer-managed Secret (secrets.existingSecret).
+    auth: azure-entra
+    databases:
+      messaging: push_messaging
+      auth: push_auth
+      worker: push_worker
+    # azure-entra: each identity's PostgreSQL role name (its Entra principal name).
+    users:
+      messageSvc: ""
+      auth: ""
+      worker: ""
+      # The migration Job's role (migrations.job.enabled).
+      migrate: ""
+    # A ConfigMap in the release namespace whose key ca.crt is a PEM bundle trusted
+    # instead of the system roots. Empty: the system roots (Azure's public CAs).
+    caConfigMap: ""
 
 redis:
+  # true: the bundled Redis below. false: an external one (redis.external).
+  enabled: true
   # Pinned by digest (the multi-arch index of redis:7-alpine), like postgres.image.
   image: redis:7-alpine@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499
   # Empty: generated on install and kept on upgrades. Letters and digits only.
@@ -175,6 +202,52 @@ redis:
     limits:
       cpu: 250m
       memory: 128Mi
+  # An external Redis (redis.enabled false), e.g. Azure Managed Redis (non-clustered or
+  # Enterprise cluster policy): docs/deployment-azure-entra.md.
+  external:
+    # azure-entra: rediss://host:port (Azure Managed Redis: port 10000), no credentials.
+    url: ""
+    # azure-entra: Entra ID tokens. password: redis-url from a consumer-managed Secret.
+    auth: azure-entra
+    # The ACL user; empty: the token's oid (Azure Managed Redis).
+    user: ""
+    # As postgres.external.caConfigMap.
+    caConfigMap: ""
+
+# The workload identities of an Entra ID datastore (postgres.external.auth or
+# redis.external.auth azure-entra). The chart creates one ServiceAccount per workload,
+# <release>-<component>; the Azure identities and their federated credentials are the
+# consumer's (docs/deployment-azure-entra.md).
+azure:
+  workloadIdentity:
+    # Client ids of the user-assigned identities; distinct identities are allowed.
+    clientIds:
+      auth: ""
+      messageSvc: ""
+      gateway: ""
+      worker: ""
+      migrate: ""
+    # webhook: the AKS workload-identity webhook projects the token and sets AZURE_*.
+    # chart: the chart does both (clusters without the webhook; the local rehearsal).
+    injection: webhook
+    # injection chart only.
+    tenantId: ""
+    authorityHost: https://login.microsoftonline.com/
+    # injection chart only: a ConfigMap whose ca.crt the services trust for the
+    # authority (SSL_CERT_FILE), e.g. a TLS-inspecting proxy or the rehearsal issuer.
+    authorityCaConfigMap: ""
+
+serviceAccounts:
+  # Extra annotations on every ServiceAccount the chart creates (Entra ID mode only).
+  annotations: {}
+
+migrations:
+  job:
+    # A pre-install/pre-upgrade Job migrates as azure.workloadIdentity.clientIds.migrate
+    # and grants the runtime identities; the services then skip migrations. Needs an
+    # external PostgreSQL with Entra ID.
+    enabled: false
+    backoffLimit: 3
 
 # Credentials. Empty existingSecret: the chart generates them on install and keeps them
 # (push-secrets, helm.sh/resource-policy: keep). A name: references that consumer-managed
@@ -183,7 +256,8 @@ redis:
 secrets:
   existingSecret: ""
 
-# Ingress-only isolation for the six application components; egress is unchanged.
+# Ingress isolation for the application components (the bundled datastores' policies
+# only when they are enabled); egress is unrestricted unless egress.enabled.
 # Requires a NetworkPolicy-enforcing CNI (render checks alone cannot prove enforcement).
 networkPolicy:
   enabled: true
@@ -192,6 +266,26 @@ networkPolicy:
   # - namespaceSelector: {example.com/namespace: edge}
   #   podSelector: {example.com/controller: public}
   ingressControllerPeers: []
+  egress:
+    # Adds Egress rules to every application policy: DNS, the release's own peers, the
+    # datastores and HTTPS. Off: egress is not restricted (as before).
+    enabled: false
+    # Peers allowed on port 53 (UDP and TCP), each with both non-empty label maps.
+    dns:
+      - namespaceSelector:
+          kubernetes.io/metadata.name: kube-system
+        podSelector:
+          k8s-app: kube-dns
+    # CIDRs of the external datastores' private endpoints, on postgres.external.port and
+    # the port of redis.external.url (6379 without one). The bundled datastores are
+    # reached by their pods' labels instead and get no egress themselves.
+    postgresCidrs: []
+    redisCidrs: []
+    # CIDRs allowed on port 443 for token requests (Entra ID) and anything else HTTPS
+    # the services call (the worker's Resend API).
+    httpsCidrs: []
+    # Raw NetworkPolicyEgressRule objects added to every application policy.
+    extra: []
 
 ingress:
   enabled: true

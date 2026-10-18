@@ -8,8 +8,20 @@ First proves every API is live, then checks the caller/port matrix, unrelated ca
 and release isolation. A refusal or exec failure is infrastructure failure, not denial.
 Does not install infrastructure or change policies. Every kubectl call uses -Context.
 
+With -Egress (a release with networkPolicy.egress.enabled, e.g. the Entra ID rehearsal
+deploy/minikube/entra-rehearsal.ps1 -Keep) it then checks the egress rules from probe
+pods that carry each component's own labels (so its policy selects them) and a readiness
+probe that never passes (so no Service ever routes to them): DNS resolves from every
+probe, release peers and the rehearsal's datastores and issuer are reachable as allowed,
+and everything else times out, including targets only egress rules can deny (the
+internet, CoreDNS's metrics port, the ingress controller): positive controls first prove
+those reachable from an unrestricted probe, so their timeouts count as denial.
+
 .EXAMPLE
 .\deploy\minikube\test-network-policy.ps1 -Context push11a
+
+.EXAMPLE
+.\deploy\minikube\test-network-policy.ps1 -Context push12b-entra -Egress
 #>
 [CmdletBinding()]
 param(
@@ -22,7 +34,15 @@ param(
     [ValidateLength(1, 53)]
     [string] $Release = 'push',
     [ValidateNotNullOrEmpty()]
-    [string] $ProbeImage = 'python:3.13-alpine'
+    [string] $ProbeImage = 'python:3.13-alpine',
+    # Also check the egress rules (networkPolicy.egress.enabled).
+    [switch] $Egress,
+    # The rehearsal's datastores and issuer (deploy/minikube/entra/datastores.yaml).
+    [ValidateNotNullOrEmpty()]
+    [string] $DatastoreNamespace = 'push-ds',
+    # Outside the cluster: denied by the egress rules, reachable without them.
+    [ValidateNotNullOrEmpty()]
+    [string] $ExternalAddress = '1.1.1.1'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -76,6 +96,76 @@ function Test-ConnectionPolicy($Source, [int] $Port, [string] $Expectation) {
     }
 }
 
+$resolve = @'
+import socket
+import sys
+
+try:
+    socket.getaddrinfo(sys.argv[1], None)
+except OSError:
+    sys.exit(6)
+'@
+
+# A probe pod with `labels`; `neverReady` adds a readiness probe that never passes.
+function New-ProbePod([string] $Name, [hashtable] $Labels, [bool] $NeverReady) {
+    $container = @{
+        name = 'probe'; image = $ProbeImage
+        command = @('python', '-B', '-c', 'import time; time.sleep(540)')
+        securityContext = @{
+            allowPrivilegeEscalation = $false; readOnlyRootFilesystem = $true
+            capabilities = @{ drop = @('ALL') }
+        }
+        resources = @{
+            requests = @{ cpu = '10m'; memory = '16Mi' }
+            limits = @{ cpu = '100m'; memory = '64Mi' }
+        }
+    }
+    if ($NeverReady) {
+        $container.readinessProbe = @{
+            exec = @{ command = @('python', '-c', 'raise SystemExit(1)') }
+            periodSeconds = 30
+        }
+    }
+    $pod = @{
+        apiVersion = 'v1'; kind = 'Pod'
+        metadata = @{ name = $Name; namespace = $Namespace; labels = $Labels }
+        spec = @{
+            automountServiceAccountToken = $false
+            restartPolicy = 'Never'
+            activeDeadlineSeconds = 600
+            terminationGracePeriodSeconds = 0
+            securityContext = @{
+                runAsNonRoot = $true; runAsUser = 65532; runAsGroup = 65532
+                seccompProfile = @{ type = 'RuntimeDefault' }
+            }
+            containers = @($container)
+        }
+    }
+    # Track before create, including a create whose response is lost.
+    $script:ownedPods.Add($Name)
+    $pod | ConvertTo-Json -Depth 12 -Compress |
+        kubectl @kubectlArgs create -f - --request-timeout=30s | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'Could not create probe pod' }
+}
+
+function Test-EgressPolicy([string] $From, [string] $Pod, [string] $TargetHost, [int] $Port, [string] $Expectation) {
+    Write-Host "egress from=$From target=${TargetHost}:$Port expect=$Expectation"
+    for ($attempt = 1; $attempt -le 5; $attempt++) {
+        kubectl @kubectlArgs exec $Pod --request-timeout=15s -- `
+            python -B -c $probe $TargetHost "$Port" $Expectation
+        $code = $LASTEXITCODE
+        if ($code -eq 0) { return }
+        if ($code -notin 3, 5) {
+            throw "Infrastructure failure: egress from=$From target=${TargetHost}:$Port expect=$Expectation exit=$code (4=socket or DNS error; other codes=exec failure)"
+        }
+        if ($attempt -eq 5) {
+            throw "Policy mismatch: egress from=$From target=${TargetHost}:$Port expect=$Expectation exit=$code (3=timed out; 5=forbidden connection succeeded)"
+        }
+        Start-Sleep -Seconds 2
+    }
+}
+
+$egressChecks = 0
 try {
     $serviceJson = kubectl @kubectlArgs get service "$Release-message-svc" -o json --request-timeout=30s
     if ($LASTEXITCODE -ne 0) { throw 'Could not query message-svc Service' }
@@ -160,6 +250,101 @@ try {
             Test-ConnectionPolicy $source $port $expectation
         }
     }
+
+    if ($Egress) {
+        $policiesJson = kubectl @kubectlArgs get networkpolicy -o json --request-timeout=30s
+        if ($LASTEXITCODE -ne 0) { throw 'Could not list the NetworkPolicies' }
+        $egressComponents = @(($policiesJson | ConvertFrom-Json).items |
+            Where-Object { 'Egress' -in $_.spec.policyTypes } |
+            ForEach-Object { $_.spec.podSelector.matchLabels.'app.kubernetes.io/name' })
+        foreach ($component in 'auth', 'message-svc', 'gateway', 'worker') {
+            if ($component -notin $egressComponents) {
+                throw "No egress policy for ${component}: install with networkPolicy.egress.enabled"
+            }
+        }
+        $datastores = @(
+            @{ Host = "push-ds-postgres.$DatastoreNamespace.svc"; Port = 5432 },
+            @{ Host = "push-ds-redis.$DatastoreNamespace.svc"; Port = 6380 },
+            @{ Host = "push-ds-issuer.$DatastoreNamespace.svc"; Port = 443 }
+        )
+        $peers = @('auth', 'message-svc', 'gateway', 'worker')
+        if ('migrate' -in $egressComponents) { $peers += 'migrate' }
+        $egressPods = @{}
+        foreach ($peer in $peers) {
+            $name = "np-egress-$peer-$suffix"
+            # The component's own labels: its policy selects the probe. The readiness probe
+            # never passes, so the Service never routes to it.
+            New-ProbePod $name @{
+                'app.kubernetes.io/name' = $peer
+                'app.kubernetes.io/instance' = $Release
+                'push-messenger/network-peer' = $peer
+            } $true
+            $egressPods[$peer] = $name
+        }
+        $control = "np-egress-control-$suffix"
+        New-ProbePod $control @{
+            'app.kubernetes.io/instance' = $Release
+            'push-messenger/network-peer' = 'unrestricted'
+        } $false
+        foreach ($name in @($egressPods.Values) + $control) {
+            kubectl @kubectlArgs wait --for=jsonpath='{.status.phase}'=Running "pod/$name" `
+                --timeout=120s --request-timeout=125s | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'Egress probe pod did not start within 120s' }
+        }
+        $endpointsJson = kubectl @kubectlArgs get endpointslices -o json --request-timeout=30s
+        if ($LASTEXITCODE -ne 0) { throw 'Could not verify that the egress probes serve nothing' }
+        foreach ($slice in ($endpointsJson | ConvertFrom-Json).items) {
+            foreach ($endpoint in $slice.endpoints) {
+                if ($endpoint.targetRef.name -in $egressPods.Values -and $endpoint.conditions.ready) {
+                    throw 'An egress probe became a ready Service endpoint'
+                }
+            }
+        }
+        # Targets whose own ingress admits anyone, so only egress rules can deny them: the
+        # internet, CoreDNS's metrics port (DNS allows only 53) and the ingress controller.
+        $egressOnly = @(
+            @{ Host = $ExternalAddress; Port = 443 },
+            @{ Host = 'kube-dns.kube-system.svc.cluster.local'; Port = 9153 },
+            @{ Host = 'ingress-nginx-controller.ingress-nginx.svc.cluster.local'; Port = 80 }
+        )
+        # Positive controls first: those targets answer without egress rules, and DNS and
+        # every allowed target answer from each probe, before a timeout counts.
+        foreach ($target in $egressOnly) {
+            Test-EgressPolicy 'unrestricted' $control $target.Host $target.Port 'allow'
+            $egressChecks++
+        }
+        $allowed = @{
+            'gateway' = @(@{ Host = "$Release-auth"; Port = 8080 }, @{ Host = "$Release-message-svc"; Port = 50051 })
+            'worker' = @(@{ Host = "$Release-message-svc"; Port = 50052 })
+            'auth' = @(@{ Host = "$Release-message-svc"; Port = 50053 })
+            'message-svc' = @()
+            'migrate' = @()
+        }
+        $denied = @{
+            'gateway' = @(@{ Host = "$Release-message-svc"; Port = 50052 }, @{ Host = "$Release-message-svc"; Port = 50053 })
+            'worker' = @(@{ Host = "$Release-auth"; Port = 8080 })
+            'auth' = @(@{ Host = "$Release-auth"; Port = 8080 })
+            'message-svc' = @(@{ Host = "$Release-auth"; Port = 8080 })
+            'migrate' = @(@{ Host = "$Release-auth"; Port = 8080 }, @{ Host = "$Release-message-svc"; Port = 50051 })
+        }
+        foreach ($peer in $peers) {
+            Write-Host "egress from=$peer resolve kubernetes.default.svc.cluster.local"
+            kubectl @kubectlArgs exec $egressPods[$peer] --request-timeout=15s -- `
+                python -B -c $resolve 'kubernetes.default.svc.cluster.local'
+            if ($LASTEXITCODE -ne 0) { throw "DNS does not resolve from the $peer probe (exit $LASTEXITCODE)" }
+            $egressChecks++
+            foreach ($target in $allowed[$peer] + $datastores) {
+                Test-EgressPolicy $peer $egressPods[$peer] $target.Host $target.Port 'allow'
+                $egressChecks++
+            }
+        }
+        foreach ($peer in $peers) {
+            foreach ($target in $denied[$peer] + $egressOnly) {
+                Test-EgressPolicy $peer $egressPods[$peer] $target.Host $target.Port 'deny'
+                $egressChecks++
+            }
+        }
+    }
 } catch {
     $failure = $_
 } finally {
@@ -176,3 +361,6 @@ try {
 }
 if ($null -ne $failure) { throw $failure }
 Write-Host 'PASS: live API controls and all 15 caller/API checks matched; probe pods removed.'
+if ($Egress) {
+    Write-Host "PASS: all $egressChecks egress checks (controls, DNS, allowed and denied targets) matched."
+}

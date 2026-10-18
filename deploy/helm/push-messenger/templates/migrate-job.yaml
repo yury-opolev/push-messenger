@@ -1,0 +1,70 @@
+{{- /*
+The migration Job (migrations.job.enabled): before every install and upgrade, the
+migration identity applies each service's migrations and grants the runtime identities
+their access (`<binary> migrate`, Plan 12A). The services run with
+PUSH_RUN_MIGRATIONS=false and need no DDL rights. Its ServiceAccount is a hook too:
+pre-install hooks run before the release's ordinary resources exist.
+*/ -}}
+{{- if .Values.migrations.job.enabled -}}
+{{- $context := dict "root" . "component" "migrate" -}}
+{{- $name := include "push.name" $context -}}
+{{- $pg := .Values.postgres.external -}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "push.labels" $context | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-10"
+    helm.sh/hook-delete-policy: before-hook-creation
+    azure.workload.identity/client-id: {{ .Values.azure.workloadIdentity.clientIds.migrate | quote }}
+    {{- with .Values.serviceAccounts.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+automountServiceAccountToken: false
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "push.labels" $context | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "0"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: {{ .Values.migrations.job.backoffLimit }}
+  template:
+    metadata:
+      labels:
+        {{- include "push.labels" $context | nindent 8 }}
+        {{- with include "push.identityLabels" (dict "root" . "key" "migrate") }}
+        {{- . | trim | nindent 8 }}
+        {{- end }}
+    spec:
+      automountServiceAccountToken: false
+      serviceAccountName: {{ $name }}
+      restartPolicy: Never
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      {{- /* One database after the other: message-svc, auth-svc (which grants the worker
+      its access to push_auth), the worker. */}}
+      {{- $steps := list
+        (dict "name" "message-svc" "image" .Values.images.messageSvc "database" $pg.databases.messaging "runtime" $pg.users.messageSvc)
+        (dict "name" "auth" "image" .Values.images.auth "database" $pg.databases.auth "runtime" $pg.users.auth "worker" $pg.users.worker)
+        (dict "name" "worker" "image" .Values.images.worker "database" $pg.databases.worker "runtime" $pg.users.worker) }}
+      initContainers:
+        {{- range $step := initial $steps }}
+        {{- include "push.migrateStep" (dict "root" $ "step" $step) | nindent 8 }}
+        {{- end }}
+      containers:
+        {{- include "push.migrateStep" (dict "root" . "step" (last $steps)) | nindent 8 }}
+      {{- with include "push.identityVolumes" (dict "root" . "key" "migrate" "postgres" true "redis" false) }}
+      volumes:
+        {{- . | trim | nindent 8 }}
+      {{- end }}
+{{- end }}

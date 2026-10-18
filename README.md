@@ -100,11 +100,24 @@ It accepts `-Namespace` and `-Release` (both default to `push`) and `-ProbeImage
 then test gateway/worker/auth, unrelated and cross-release callers against all three
 message-svc ports. Only timeouts count as denied connections; refusals and exec errors
 fail the check. It deletes only its own named probe pods, including on failure.
+With `-Egress` (a release with `networkPolicy.egress.enabled`) it then checks the egress
+rules from probes carrying each component's labels but never Ready: DNS, the allowed
+peers and datastores, and denied targets, including ones only egress rules can block
+(the internet, CoreDNS's metrics port, the ingress controller) after positive controls.
 The script neither provisions a CNI nor changes policies. For local acceptance, use
 a separate fresh profile started with `minikube start -p push11a --driver=docker
 --cni=calico --cpus=4 --memory=6g`, then
 `.\deploy\minikube\up.ps1 -Cluster push11a -Smoke`. Do not install the new chart on
 an existing data-bearing profile as part of this test.
+
+The Entra ID datastore mode ([docs/deployment-azure-entra.md](docs/deployment-azure-entra.md))
+is rehearsed without Azure by `.\deploy\minikube\entra-rehearsal.ps1` on its own
+profile (default `push12b-entra`, Calico; it refuses the `push` profile): TLS-only
+PostgreSQL and Redis and a DEV ONLY stand-in of Entra ID whose 60-second tokens are the
+only datastore credentials, the migration Job, egress policies, the smoke test, `push-load`
+traffic over many token rotations, killed Redis connections and restarted pods. With
+`-Keep` the profile stays up for
+`.\deploy\minikube\test-network-policy.ps1 -Context push12b-entra -Egress`.
 
 The minikube values switch on a DEV ONLY shortcut: the worker, which logs emails instead
 of sending them, shows them at `/dev/mailbox`, which the ingress does not route (it
@@ -162,9 +175,9 @@ chart with values. [docs/deployment-configuration.md](docs/deployment-configurat
 is the contract: a consumer-managed Secret (`secrets.existingSecret`) and its key names,
 offline rendering, the explicit Resend webhook switch, controller-neutral Ingress with
 TLS and annotation maps, trusted client-IP headers, and image digests.
-Managed PostgreSQL and Redis with Microsoft Entra ID tokens instead of passwords: see the
-[design](docs/superpowers/specs/2026-10-18-azure-entra-datastores-design.md) (the chart
-values and guide arrive with Plan 12B).
+Managed PostgreSQL and Redis with Microsoft Entra ID tokens instead of passwords:
+[docs/deployment-azure-entra.md](docs/deployment-azure-entra.md) (chart values, Azure
+prerequisites, database roles, egress and limitations).
 [docs/deployment-ingress-verification.md](docs/deployment-ingress-verification.md)
 records the routing checks against a maintained controller (Traefik).
 [docs/consumer-verification.md](docs/consumer-verification.md) gives the build, image,

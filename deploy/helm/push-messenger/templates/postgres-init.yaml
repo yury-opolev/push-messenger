@@ -1,3 +1,4 @@
+{{- if .Values.postgres.enabled -}}
 {{- /*
 Runs once, when PostgreSQL initialises an empty data volume (/docker-entrypoint-initdb.d):
 creates each service's own role and database ownership (one database per service,
@@ -54,3 +55,4 @@ data:
     REVOKE ALL ON DATABASE push_worker FROM PUBLIC;
     GRANT CONNECT ON DATABASE push_auth TO push_worker;
     SQL
+{{- end }}

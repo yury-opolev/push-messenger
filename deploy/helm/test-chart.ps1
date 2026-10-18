@@ -431,6 +431,277 @@ Check 'portable chart interface matrix' {
     $LASTEXITCODE -eq 0
 }
 
+# ---- Entra ID datastores (Plan 12B) ----
+$entraArgs = @(
+    '--set', 'postgres.enabled=false',
+    '--set', 'postgres.external.host=pg.example.net',
+    '--set', 'postgres.external.users.messageSvc=push-message-svc-id',
+    '--set', 'postgres.external.users.auth=push-auth-id',
+    '--set', 'postgres.external.users.worker=push-worker-id',
+    '--set', 'redis.enabled=false',
+    '--set', 'redis.external.url=rediss://cache.example.net:10000',
+    '--set', 'azure.workloadIdentity.clientIds.auth=00000000-0000-0000-0000-00000000000a',
+    '--set', 'azure.workloadIdentity.clientIds.messageSvc=00000000-0000-0000-0000-00000000000b',
+    '--set', 'azure.workloadIdentity.clientIds.gateway=00000000-0000-0000-0000-00000000000c',
+    '--set', 'azure.workloadIdentity.clientIds.worker=00000000-0000-0000-0000-00000000000d'
+)
+Check 'entra: a complete external configuration renders' { (Render $entraArgs) -eq 0 }
+Check 'entra: an external PostgreSQL needs a host and every user' {
+    (Render ($entraArgs + @('--set', 'postgres.external.host='))) -ne 0 -and
+        (Render ($entraArgs + @('--set', 'postgres.external.users.worker='))) -ne 0
+}
+Check 'entra: an Entra Redis needs a rediss:// URL without credentials' {
+    (Render ($entraArgs + @('--set', 'redis.external.url=redis://cache:6379'))) -ne 0 -and
+        (Render ($entraArgs + @('--set', 'redis.external.url=rediss://:pw@cache:10000'))) -ne 0
+}
+Check 'entra: every identity that reaches an Entra datastore needs a client id' {
+    (Render ($entraArgs + @('--set', 'azure.workloadIdentity.clientIds.gateway='))) -ne 0
+}
+Check 'entra: the bundled datastores ignore the external settings' {
+    $bundled = helm template push $chart --set postgres.external.auth=azure-entra --set redis.external.auth=azure-entra | Out-String
+    (Doc $bundled 'Deployment' 'push-auth') -match 'key: auth-database-url' -and $bundled -notmatch 'PUSH_POSTGRES_AUTH'
+}
+Check 'entra: an external password-mode datastore needs a consumer-managed Secret' {
+    (Render @('--set', 'postgres.enabled=false', '--set', 'postgres.external.host=pg',
+        '--set', 'postgres.external.auth=password')) -ne 0 -and
+    (Render @('--set', 'postgres.enabled=false', '--set', 'postgres.external.host=pg',
+        '--set', 'postgres.external.auth=password', '--set', 'secrets.existingSecret=creds')) -eq 0
+}
+Check 'entra: chart injection needs a tenant; unknown modes are refused' {
+    (Render ($entraArgs + @('--set', 'azure.workloadIdentity.injection=chart'))) -ne 0 -and
+        (Render ($entraArgs + @('--set', 'azure.workloadIdentity.injection=chart',
+            '--set', 'azure.workloadIdentity.tenantId=11111111-2222-3333-4444-555555555555'))) -eq 0 -and
+        (Render ($entraArgs + @('--set', 'azure.workloadIdentity.injection=magic'))) -ne 0 -and
+        (Render ($entraArgs + @('--set', 'postgres.external.auth=kerberos'))) -ne 0
+}
+Check 'entra: the migration Job needs an Entra PostgreSQL, its user and its client id' {
+    (Render @('--set', 'migrations.job.enabled=true')) -ne 0 -and
+        (Render ($entraArgs + @('--set', 'migrations.job.enabled=true'))) -ne 0 -and
+        (Render ($entraArgs + @('--set', 'migrations.job.enabled=true',
+            '--set', 'postgres.external.users.migrate=push-migrator-id',
+            '--set', 'azure.workloadIdentity.clientIds.migrate=00000000-0000-0000-0000-00000000000e'))) -eq 0
+}
+Check 'entra: role names are Entra principal names' {
+    (Render ($entraArgs + @('--set', 'postgres.external.users.auth=bad"name'))) -ne 0
+}
+# The default render with the Secret's generated values masked: they are random per render.
+function Normalized([string] $rendered) {
+    ($rendered -replace "`r`n", "`n" -split "(?m)^---\s*$" | ForEach-Object {
+        if ($_ -match '(?m)^kind: Secret\s*$') { $_ -replace '(?m)^(  [a-z0-9-]+): ".*"$', '$1: "<generated>"' } else { $_ }
+    }) -join '---'
+}
+Check 'default: the render is unchanged by Plan 12B' {
+    # The baseline is saved before the work starts; absent on CI, where this passes trivially.
+    $baseline = Join-Path ([IO.Path]::GetTempPath()) 'push-default-before.yaml'
+    (-not (Test-Path $baseline)) -or ((Normalized (Get-Content $baseline -Raw)) -eq (Normalized $default))
+}
+$entra = helm template push $chart @entraArgs | Out-String
+Check 'entra: no bundled datastore, and no datastore credential in any Secret or ConfigMap' {
+    $noCredentials = @'
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(sys.stdin.read()) if d]
+names = {(d["kind"], d["metadata"]["name"]) for d in docs}
+assert ("StatefulSet", "push-postgres") not in names and ("Deployment", "push-redis") not in names
+assert ("Service", "push-postgres") not in names and ("Service", "push-redis") not in names
+assert ("ConfigMap", "push-postgres-init") not in names
+for d in docs:
+    if d["kind"] in ("Secret", "ConfigMap"):
+        data = {**(d.get("data") or {}), **(d.get("stringData") or {})}
+        bad = [k for k in data if "database" in k or "redis" in k or "db-password" in k or k == "postgres-password"]
+        assert not bad, (d["metadata"]["name"], bad)
+'@
+    $entra | & $python.Source -c $noCredentials; $LASTEXITCODE -eq 0
+}
+Check 'entra: only the four application policies exist' {
+    ($entra -split "(?m)^---\s*$" | Where-Object { $_ -match '(?m)^kind: NetworkPolicy\s*$' }).Count -eq 4 -and
+        -not (Doc $entra 'NetworkPolicy' 'push-postgres') -and -not (Doc $entra 'NetworkPolicy' 'push-redis')
+}
+Check 'entra: each service gets exactly its datastore variables and no datastore secret' {
+    $envCheck = @'
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(sys.stdin.read()) if d]
+def env(name):
+    d = next(d for d in docs if d["kind"] == "Deployment" and d["metadata"]["name"] == name)
+    c = d["spec"]["template"]["spec"]["containers"][0]
+    return {e["name"]: e.get("value", e.get("valueFrom")) for e in c["env"]}
+pg = {"PUSH_POSTGRES_AUTH": "azure-entra", "PUSH_DATABASE_HOST": "pg.example.net", "PUSH_DATABASE_PORT": "5432", "PUSH_RUN_MIGRATIONS": "true"}
+redis = {"PUSH_REDIS_AUTH": "azure-entra", "PUSH_REDIS_URL": "rediss://cache.example.net:10000"}
+cases = {
+    "push-auth": {**pg, **redis, "PUSH_DATABASE_NAME": "push_auth", "PUSH_DATABASE_USER": "push-auth-id", "PUSH_AUTH_WORKER_ROLE": "push-worker-id"},
+    "push-message-svc": {**pg, **redis, "PUSH_DATABASE_NAME": "push_messaging", "PUSH_DATABASE_USER": "push-message-svc-id"},
+    "push-worker": {**pg, "PUSH_DATABASE_NAME": "push_worker", "PUSH_DATABASE_USER": "push-worker-id", "PUSH_AUTH_DATABASE_NAME": "push_auth"},
+    "push-gateway": redis,
+}
+for name, expected in cases.items():
+    actual = env(name)
+    for key, value in expected.items():
+        assert actual.get(key) == value, (name, key, actual.get(key))
+    assert "PUSH_DATABASE_URL" not in actual and "PUSH_AUTH_DATABASE_URL" not in actual, name
+    refs = [v["secretKeyRef"]["key"] for v in actual.values() if isinstance(v, dict) and "secretKeyRef" in v]
+    assert not [k for k in refs if "database" in k or "redis" in k], (name, refs)
+assert "PUSH_REDIS_AUTH" not in env("push-worker") and "PUSH_POSTGRES_AUTH" not in env("push-gateway")
+'@
+    $entra | & $python.Source -c $envCheck; $LASTEXITCODE -eq 0
+}
+Check 'entra webhook: one ServiceAccount per workload with its client id; pods opt in' {
+    $sa = @'
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(sys.stdin.read()) if d]
+ids = {"push-auth": "a", "push-message-svc": "b", "push-gateway": "c", "push-worker": "d"}
+for name, suffix in ids.items():
+    account = next(d for d in docs if d["kind"] == "ServiceAccount" and d["metadata"]["name"] == name)
+    assert account["metadata"]["annotations"]["azure.workload.identity/client-id"].endswith(suffix), name
+    assert account["automountServiceAccountToken"] is False
+    pod = next(d for d in docs if d["kind"] == "Deployment" and d["metadata"]["name"] == name)["spec"]["template"]
+    assert pod["metadata"]["labels"]["azure.workload.identity/use"] == "true", name
+    assert pod["spec"]["serviceAccountName"] == name and pod["spec"]["automountServiceAccountToken"] is False
+    assert not [e for e in pod["spec"]["containers"][0]["env"] if e["name"].startswith("AZURE_")], name
+    assert "volumes" not in pod["spec"] and "volumeMounts" not in pod["spec"]["containers"][0], name
+'@
+    $entra | & $python.Source -c $sa; $LASTEXITCODE -eq 0
+}
+Check 'entra chart injection: the chart projects the token, sets AZURE_* and mounts the CAs' {
+    $chartInjection = helm template push $chart @entraArgs `
+        --set azure.workloadIdentity.injection=chart `
+        --set azure.workloadIdentity.tenantId=11111111-2222-3333-4444-555555555555 `
+        --set azure.workloadIdentity.authorityCaConfigMap=authority-ca `
+        --set postgres.external.caConfigMap=pg-ca --set redis.external.caConfigMap=redis-ca | Out-String
+    $projection = @'
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(sys.stdin.read()) if d]
+def pod(name):
+    return next(d for d in docs if d["kind"] == "Deployment" and d["metadata"]["name"] == name)["spec"]["template"]
+auth = pod("push-auth")
+assert "azure.workload.identity/use" not in auth["metadata"]["labels"]
+volumes = {v["name"]: v for v in auth["spec"]["volumes"]}
+source = volumes["azure-identity-token"]["projected"]["sources"][0]["serviceAccountToken"]
+assert source == {"audience": "api://AzureADTokenExchange", "expirationSeconds": 3600, "path": "azure-identity-token"}
+assert volumes["postgres-ca"]["configMap"]["name"] == "pg-ca" and volumes["redis-ca"]["configMap"]["name"] == "redis-ca"
+assert volumes["authority-ca"]["configMap"]["name"] == "authority-ca"
+container = auth["spec"]["containers"][0]
+env = {e["name"]: e.get("value") for e in container["env"]}
+assert env["AZURE_CLIENT_ID"].endswith("a") and env["AZURE_TENANT_ID"].startswith("1111")
+assert env["AZURE_FEDERATED_TOKEN_FILE"] == "/var/run/secrets/azure/tokens/azure-identity-token"
+assert env["AZURE_AUTHORITY_HOST"] == "https://login.microsoftonline.com/"
+assert env["SSL_CERT_FILE"] == "/etc/push/authority-ca/ca.crt"
+assert env["PUSH_DATABASE_CA_FILE"] == "/etc/push/postgres-ca/ca.crt"
+assert env["PUSH_REDIS_CA_FILE"] == "/etc/push/redis-ca/ca.crt"
+mounts = {m["mountPath"]: m for m in container["volumeMounts"]}
+for path in ["/var/run/secrets/azure/tokens", "/etc/push/postgres-ca", "/etc/push/redis-ca", "/etc/push/authority-ca"]:
+    assert mounts[path]["readOnly"] is True, path
+# Each workload mounts only the CA bundles of the datastores it reaches.
+gateway = {v["name"] for v in pod("push-gateway")["spec"]["volumes"]}
+worker = {v["name"] for v in pod("push-worker")["spec"]["volumes"]}
+assert gateway == {"azure-identity-token", "authority-ca", "redis-ca"}, gateway
+assert worker == {"azure-identity-token", "authority-ca", "postgres-ca"}, worker
+'@
+    $chartInjection | & $python.Source -c $projection; $LASTEXITCODE -eq 0
+}
+Check 'default: no ServiceAccount and no identity wiring' {
+    $default -notmatch '(?m)^kind: ServiceAccount' -and $default -notmatch 'azure.workload.identity' -and
+        $default -notmatch 'serviceAccountName'
+}
+$jobArgs = $entraArgs + @('--set', 'migrations.job.enabled=true',
+    '--set', 'postgres.external.users.migrate=push-migrator-id',
+    '--set', 'azure.workloadIdentity.clientIds.migrate=00000000-0000-0000-0000-00000000000e')
+Check 'entra: the migration hook Job migrates all three databases as its own identity' {
+    $rendered = helm template push $chart @jobArgs | Out-String
+    $job = @'
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(sys.stdin.read()) if d]
+job = next(d for d in docs if d["kind"] == "Job" and d["metadata"]["name"] == "push-migrate")
+account = next(d for d in docs if d["kind"] == "ServiceAccount" and d["metadata"]["name"] == "push-migrate")
+hooks = lambda d: d["metadata"]["annotations"]
+assert hooks(job)["helm.sh/hook"] == "pre-install,pre-upgrade"
+assert hooks(account)["helm.sh/hook"] == "pre-install,pre-upgrade"
+assert int(hooks(account)["helm.sh/hook-weight"]) < int(hooks(job)["helm.sh/hook-weight"])
+assert account["metadata"]["annotations"]["azure.workload.identity/client-id"].endswith("e")
+assert account["automountServiceAccountToken"] is False
+template = job["spec"]["template"]
+assert template["metadata"]["labels"]["azure.workload.identity/use"] == "true"
+pod = template["spec"]
+assert pod["serviceAccountName"] == "push-migrate" and pod["restartPolicy"] == "Never"
+assert pod["automountServiceAccountToken"] is False
+steps = pod["initContainers"] + pod["containers"]
+assert [c["name"] for c in steps] == ["message-svc", "auth", "worker"]
+assert [c["image"] for c in steps] == ["push-messenger/message-svc:dev", "push-messenger/auth:dev", "push-messenger/worker:dev"]
+expected = {"message-svc": ("push_messaging", "push-message-svc-id"), "auth": ("push_auth", "push-auth-id"), "worker": ("push_worker", "push-worker-id")}
+for c in steps:
+    env = {e["name"]: e.get("value") for e in c["env"]}
+    assert c["args"] == ["migrate"], c["name"]
+    assert env["PUSH_POSTGRES_AUTH"] == "azure-entra" and env["PUSH_DATABASE_HOST"] == "pg.example.net"
+    assert (env["PUSH_DATABASE_NAME"], env["PUSH_DATABASE_RUNTIME_ROLE"]) == expected[c["name"]]
+    assert env["PUSH_DATABASE_USER"] == "push-migrator-id"
+    assert not [e for e in c["env"] if "valueFrom" in e], c["name"]
+    assert c["securityContext"]["readOnlyRootFilesystem"] is True
+    assert c["securityContext"]["runAsNonRoot"] is True
+assert {e["name"]: e.get("value") for e in steps[1]["env"]}["PUSH_AUTH_WORKER_ROLE"] == "push-worker-id"
+services = [d for d in docs if d["kind"] == "Deployment" and d["metadata"]["name"] in ("push-auth", "push-message-svc", "push-worker")]
+assert len(services) == 3
+for d in services:
+    env = {e["name"]: e.get("value") for e in d["spec"]["template"]["spec"]["containers"][0]["env"]}
+    assert env["PUSH_RUN_MIGRATIONS"] == "false", d["metadata"]["name"]
+'@
+    $rendered | & $python.Source -c $job; $LASTEXITCODE -eq 0
+}
+Check 'default and plain Entra: no migration Job' {
+    $default -notmatch '(?m)^kind: Job' -and $entra -notmatch '(?m)^kind: Job' -and $entra -notmatch 'push-migrate'
+}
+Check 'egress: opt-in rules per component (DNS, release peers, datastores, HTTPS, extra)' {
+    $egressArgs = $jobArgs + @('--set', 'networkPolicy.egress.enabled=true',
+        '--set', 'networkPolicy.egress.postgresCidrs={10.1.0.4/32}',
+        '--set', 'networkPolicy.egress.redisCidrs={10.1.0.5/32}',
+        '--set', 'networkPolicy.egress.httpsCidrs={20.190.128.0/18}',
+        '--set', 'networkPolicy.egress.extra[0].to[0].ipBlock.cidr=10.9.0.0/16')
+    $rendered = helm template push $chart @egressArgs | Out-String
+    $egress = @'
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(sys.stdin.read()) if d]
+policies = {d["metadata"]["name"]: d["spec"] for d in docs if d["kind"] == "NetworkPolicy"}
+def peers(rule):
+    return [p.get("ipBlock", {}).get("cidr") or p["podSelector"]["matchLabels"].get("push-messenger/network-peer") or "dns" for p in rule["to"]]
+def ports(rule):
+    return sorted((p["protocol"], p["port"]) for p in rule.get("ports", []))
+extra = {"to": [{"ipBlock": {"cidr": "10.9.0.0/16"}}]}
+expected = {
+    "push-auth": {("message-svc", 50053), ("10.1.0.4/32", 5432), ("10.1.0.5/32", 10000), ("20.190.128.0/18", 443)},
+    "push-message-svc": {("10.1.0.4/32", 5432), ("10.1.0.5/32", 10000), ("20.190.128.0/18", 443)},
+    "push-gateway": {("auth", 8080), ("message-svc", 50051), ("10.1.0.5/32", 10000), ("20.190.128.0/18", 443)},
+    "push-worker": {("message-svc", 50052), ("10.1.0.4/32", 5432), ("20.190.128.0/18", 443)},
+    "push-migrate": {("10.1.0.4/32", 5432), ("20.190.128.0/18", 443)},
+}
+assert set(policies) == set(expected), sorted(policies)
+for name, wanted in expected.items():
+    spec = policies[name]
+    assert spec["policyTypes"] == ["Ingress", "Egress"], name
+    rules = spec["egress"]
+    assert rules[-1] == extra, name
+    rules = rules[:-1]
+    dns = [r for r in rules if ports(r) == [("TCP", 53), ("UDP", 53)]]
+    assert len(dns) == 1, name
+    assert dns[0]["to"] == [{"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "kube-system"}},
+                             "podSelector": {"matchLabels": {"k8s-app": "kube-dns"}}}], name
+    got = {(peer, port) for r in rules if r not in dns for peer in peers(r) for (_, port) in ports(r)}
+    assert got == wanted, (name, got)
+assert policies["push-migrate"]["ingress"] == []
+assert policies["push-migrate"]["podSelector"]["matchLabels"]["app.kubernetes.io/name"] == "migrate"
+'@
+    $rendered | & $python.Source -c $egress; $LASTEXITCODE -eq 0
+}
+Check 'egress: with bundled datastores the rules name their pods; the datastores get no egress' {
+    $bundled = helm template push $chart --set networkPolicy.egress.enabled=true | Out-String
+    $policy = Doc $bundled 'NetworkPolicy' 'push-auth'
+    $policy -match 'Egress' -and $policy -match 'network-peer: postgres' -and $policy -match 'network-peer: redis' -and
+        (Doc $bundled 'NetworkPolicy' 'push-postgres') -match '(?s)policyTypes:\s+- Ingress\s+- Egress.*egress: \[\]' -and
+        (Doc $bundled 'NetworkPolicy' 'push-redis') -match '(?s)policyTypes:\s+- Ingress\s+- Egress.*egress: \[\]'
+}
+Check 'egress: CIDRs, DNS peers and extra rules are validated' {
+    (Render @('--set', 'networkPolicy.egress.enabled=true', '--set', 'networkPolicy.egress.httpsCidrs={login.microsoftonline.com}')) -ne 0 -and
+        (Render @('--set', 'networkPolicy.egress.enabled=true', '--set', 'networkPolicy.egress.dns[0].podSelector.k8s-app=kube-dns')) -ne 0 -and
+        (Render @('--set', 'networkPolicy.egress.enabled=true', '--set', 'networkPolicy.egress.extra[0]=everything')) -ne 0 -and
+        (Render @('--set', 'networkPolicy.egress.enabled=true', '--set', 'networkPolicy.egress.httpsCidrs={0.0.0.0/0}')) -eq 0
+}
+
 if ($failures -gt 0) {
     Write-Output "$failures check(s) failed"
     exit 1

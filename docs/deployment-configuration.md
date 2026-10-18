@@ -18,7 +18,9 @@ release-scoped NetworkPolicies into one namespace. Consumers own:
 The chart installs no controller, CRD, Gateway API resource, certificate issuer,
 ExternalSecret/CSI object, registry or pipeline, and nothing cluster-scoped. Managed
 databases, multi-node HA and automatic or zero-downtime secret rotation are out of
-scope. Using the chart requires no GitHub Actions, GHCR or particular cloud.
+scope (the chart can use managed PostgreSQL and Redis the consumer provisions, see
+[Managed datastores with Microsoft Entra ID](#managed-datastores-with-microsoft-entra-id)).
+Using the chart requires no GitHub Actions, GHCR or particular cloud.
 
 Every container runs with `RuntimeDefault` seccomp, no privilege escalation and a
 read-only root filesystem. The services and Redis run as non-root with no capabilities.
@@ -81,8 +83,8 @@ database and Redis passwords; each password must agree with the URL embedding it
 URL hosts depend on the actual release name (and namespace, if you qualify them).
 The role passwords are applied only when PostgreSQL initialises an empty volume:
 changing them later requires coordinated role changes (see
-[the upgrade runbook](deployment-upgrade.md)). This does not add external-database
-support, and the chart cannot validate credentials against the backing services.
+[the upgrade runbook](deployment-upgrade.md)). The chart cannot validate credentials
+against the backing services; external datastores are configured separately (below).
 
 Materialize the Secret before the workloads start. Helm cannot inspect it offline:
 a missing required key stops that workload with a Kubernetes
@@ -90,6 +92,16 @@ a missing required key stops that workload with a Kubernetes
 start-up or readiness. Neither falls back to generated credentials. Changing the
 Secret's content does not roll workloads or rotate database roles; coordinate
 backing-service changes and rollouts yourself.
+
+### Managed datastores with Microsoft Entra ID
+
+With `postgres.enabled: false` / `redis.enabled: false` and `auth: azure-entra` the
+services reach external Azure Database for PostgreSQL and Azure Managed Redis with
+Microsoft Entra ID tokens from workload identity, one ServiceAccount per workload, an
+optional migration Job and opt-in egress NetworkPolicies: see
+[deployment-azure-entra.md](deployment-azure-entra.md). The Secret's database and Redis
+keys (`postgres-password`, `*-db-password`, `*database-url`, `redis-password`,
+`redis-url`) are then unused and not rendered; the application keys stay.
 
 ## Email and the Resend webhook
 

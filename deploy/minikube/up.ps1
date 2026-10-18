@@ -19,6 +19,10 @@ The same, then runs the smoke test.
 .EXAMPLE
 deploy/minikube/up.ps1 -SkipBuild -Smoke
 Reinstalls the chart with the images already in the cluster and runs the smoke test.
+
+.EXAMPLE
+deploy/minikube/up.ps1 -Cluster push12b-entra -SkipInstall
+Builds the images into the profile without installing the chart (entra-rehearsal.ps1).
 #>
 [CmdletBinding()]
 param(
@@ -26,6 +30,8 @@ param(
     [string] $Cluster = 'push',
     [switch] $Smoke,
     [switch] $SkipBuild,
+    # Build the images, then stop: another script installs the chart.
+    [switch] $SkipInstall,
     [int] $Cpus = 4,
     [string] $Memory = '6g'
 )
@@ -86,7 +92,8 @@ $secret = kubectl --context $Cluster -n $namespace get secret $secretName -o nam
 if ($LASTEXITCODE -ne 0) {
     throw "looking for the kept Secret failed (exit code $LASTEXITCODE)"
 }
-if ($secret) {
+# -SkipInstall installs nothing here: these checks guard the bundled-Postgres install.
+if ($secret -and -not $SkipInstall) {
     foreach ($key in 'auth-db-password', 'worker-db-password', 'messaging-db-password') {
         $password = kubectl --context $Cluster -n $namespace get secret $secretName -o jsonpath="{.data.$key}"
         if ($LASTEXITCODE -ne 0) {
@@ -101,7 +108,7 @@ $postgres = kubectl --context $Cluster -n $namespace get statefulset push-postgr
 if ($LASTEXITCODE -ne 0) {
     throw "looking for an earlier Postgres failed (exit code $LASTEXITCODE)"
 }
-if ($postgres) {
+if ($postgres -and -not $SkipInstall) {
     Invoke-Step 'check that the Postgres volume has the push_auth and push_worker databases' {
         kubectl --context $Cluster -n $namespace rollout status statefulset/push-postgres --timeout=300s
     }
@@ -152,6 +159,11 @@ try {
     foreach ($name in $dockerVariables) {
         [Environment]::SetEnvironmentVariable($name, $saved[$name])
     }
+}
+
+if ($SkipInstall) {
+    Write-Host 'Images built; not installing (-SkipInstall).' -ForegroundColor Green
+    return
 }
 
 # Right after a cluster start the controller can be ready before its admission webhook

@@ -11,6 +11,8 @@ pub mod startup;
 mod token;
 mod tokens;
 
+#[cfg(any(test, feature = "stub"))]
+pub mod stub;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 

@@ -35,15 +35,59 @@
     (dict "port" 50051 "callers" (list "gateway"))
     (dict "port" 50052 "callers" (list "worker"))
     (dict "port" 50053 "callers" (list "auth"))))
-  (dict "component" "postgres" "rules" (list
-    (dict "port" 5432 "callers" (list "message-svc" "auth" "worker"))))
-  (dict "component" "redis" "rules" (list
-    (dict "port" 6379 "callers" (list "message-svc" "auth" "gateway"))))
+-}}
+{{- if .Values.postgres.enabled -}}
+{{- $policies = append $policies (dict "component" "postgres" "rules" (list
+    (dict "port" 5432 "callers" (list "message-svc" "auth" "worker")))) -}}
+{{- end -}}
+{{- if .Values.redis.enabled -}}
+{{- $policies = append $policies (dict "component" "redis" "rules" (list
+    (dict "port" 6379 "callers" (list "message-svc" "auth" "gateway")))) -}}
+{{- end -}}
+{{- $policies = concat $policies (list
   (dict "component" "auth" "rules" (list
     (dict "port" 8080 "callers" (list "gateway") "controllers" $controllers)))
   (dict "component" "gateway" "rules" $gatewayRules)
-  (dict "component" "worker" "rules" $workerRules)
--}}
+  (dict "component" "worker" "rules" $workerRules)) -}}
+
+{{- /* Opt-in egress (networkPolicy.egress.enabled): DNS, the release's own peers, the
+datastores (bundled: their pods; external: their CIDRs), HTTPS and extra rules. */ -}}
+{{- $egress := .Values.networkPolicy.egress -}}
+{{- $egressOf := dict -}}
+{{- if $egress.enabled -}}
+{{- if .Values.migrations.job.enabled -}}
+{{- $policies = append $policies (dict "component" "migrate" "rules" (list)) -}}
+{{- end -}}
+{{- $postgresTo := list (dict "peer" "postgres" "port" 5432) -}}
+{{- if not .Values.postgres.enabled -}}
+{{- $postgresTo = list -}}
+{{- range $egress.postgresCidrs -}}
+{{- $postgresTo = append $postgresTo (dict "cidr" . "port" (int $.Values.postgres.external.port)) -}}
+{{- end -}}
+{{- end -}}
+{{- $redisTo := list (dict "peer" "redis" "port" 6379) -}}
+{{- if not .Values.redis.enabled -}}
+{{- $found := regexFind ":[0-9]+/?$" (toString .Values.redis.external.url) | trimPrefix ":" | trimSuffix "/" -}}
+{{- $redisPort := 6379 -}}
+{{- if $found -}}
+{{- $redisPort = int $found -}}
+{{- end -}}
+{{- $redisTo = list -}}
+{{- range $egress.redisCidrs -}}
+{{- $redisTo = append $redisTo (dict "cidr" . "port" $redisPort) -}}
+{{- end -}}
+{{- end -}}
+{{- $https := list -}}
+{{- range $egress.httpsCidrs -}}
+{{- $https = append $https (dict "cidr" . "port" 443) -}}
+{{- end -}}
+{{- $egressOf = dict
+  "auth" (concat (list (dict "peer" "message-svc" "port" 50053)) $postgresTo $redisTo $https)
+  "message-svc" (concat $postgresTo $redisTo $https)
+  "gateway" (concat (list (dict "peer" "auth" "port" 8080) (dict "peer" "message-svc" "port" 50051)) $redisTo $https)
+  "worker" (concat (list (dict "peer" "message-svc" "port" 50052)) $postgresTo $https)
+  "migrate" (concat $postgresTo $https) -}}
+{{- end -}}
 {{- range $policies -}}
 {{- $context := dict "root" $ "component" .component -}}
 {{- printf "\n---\n" }}
@@ -59,6 +103,9 @@ spec:
       {{- include "push.selector" $context | nindent 6 }}
   policyTypes:
     - Ingress
+    {{- if $egress.enabled }}
+    - Egress
+    {{- end }}
   {{- if not .rules }}
   ingress: []
   {{- else }}
@@ -83,6 +130,46 @@ spec:
               {{- toYaml .podSelector | nindent 14 }}
         {{- end }}
     {{- end }}
+  {{- end }}
+  {{- if $egress.enabled }}
+  {{- if has .component (list "postgres" "redis") }}
+  # The bundled datastores call nothing.
+  egress: []
+  {{- else }}
+  egress:
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+      to:
+        {{- range $egress.dns }}
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .namespaceSelector | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .podSelector | nindent 14 }}
+        {{- end }}
+    {{- range index $egressOf .component }}
+    - ports:
+        - protocol: TCP
+          port: {{ .port }}
+      to:
+        {{- if .peer }}
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: {{ $.Release.Name }}
+              push-messenger/network-peer: {{ .peer }}
+        {{- else }}
+        - ipBlock:
+            cidr: {{ .cidr }}
+        {{- end }}
+    {{- end }}
+    {{- with $egress.extra }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- end }}
   {{- end }}
 {{- end }}
 {{- end }}

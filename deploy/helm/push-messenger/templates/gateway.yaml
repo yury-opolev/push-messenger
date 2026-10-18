@@ -28,12 +28,18 @@ spec:
     metadata:
       labels:
         {{- include "push.labels" (dict "root" . "component" "gateway") | nindent 8 }}
+        {{- with include "push.identityLabels" (dict "root" . "key" "gateway") }}
+        {{- . | trim | nindent 8 }}
+        {{- end }}
       {{- with .Values.buildId }}
       annotations:
         push-messenger/build-id: {{ . | quote }}
       {{- end }}
     spec:
       automountServiceAccountToken: false
+      {{- with include "push.serviceAccount" (dict "root" . "component" "gateway") }}
+      {{- . | trim | nindent 6 }}
+      {{- end }}
       # Shutdown budget: the 5 s preStop sleep, then SIGTERM, on which the gateway closes
       # every connection with 4005 and waits up to 10 s, plus margin. The sleep gives
       # Kubernetes time to take the pod out of the Service and Ingress endpoints before
@@ -50,6 +56,9 @@ spec:
               sleep:
                 seconds: 5
           env:
+            {{- with include "push.identityEnv" (dict "root" . "key" "gateway") }}
+            {{- . | trim | nindent 12 }}
+            {{- end }}
             - name: PUSH_MESSAGE_SVC_URL
               value: {{ printf "http://%s:50051" (include "push.name" (dict "root" . "component" "message-svc")) | quote }}
             # message-svc's Messaging API takes calls only with this token.
@@ -58,11 +67,7 @@ spec:
                 secretKeyRef:
                   name: {{ include "push.secretName" . }}
                   key: messaging-token
-            - name: PUSH_REDIS_URL
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "push.secretName" . }}
-                  key: redis-url
+            {{- include "push.redisEnv" . | trim | nindent 12 }}
             - name: PUSH_HEARTBEAT_MS
               value: {{ .Values.gateway.heartbeatMs | quote }}
             # Access tokens are checked against auth-svc's key set (GET /v1/auth/jwks)
@@ -97,3 +102,11 @@ spec:
             periodSeconds: 10
           resources:
             {{- toYaml .Values.gateway.resources | nindent 12 }}
+          {{- with include "push.identityMounts" (dict "root" . "key" "gateway" "postgres" false "redis" true) }}
+          volumeMounts:
+            {{- . | trim | nindent 12 }}
+          {{- end }}
+      {{- with include "push.identityVolumes" (dict "root" . "key" "gateway" "postgres" false "redis" true) }}
+      volumes:
+        {{- . | trim | nindent 8 }}
+      {{- end }}
