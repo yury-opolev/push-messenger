@@ -7,8 +7,8 @@ use uuid::Uuid;
 
 use crate::devices::Caller;
 use crate::error::AuthError;
-use crate::rules;
-use crate::service::Auth;
+use crate::rules::{self, Invalid};
+use crate::service::{Auth, is_violation};
 
 /// What anyone may see of a user.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,19 +51,69 @@ impl Auth {
         })
     }
 
+    /// `PATCH /v1/users/me {display_name?, handle?}` (spec D14): changes the display name,
+    /// the handle or both, at least one, in one transaction. A handle any other account
+    /// holds is `handle_taken` (the unique constraint decides); the old handle is free at
+    /// once. Nothing else stores handles, so nothing else changes.
+    pub async fn update_profile(
+        &self,
+        caller: Caller,
+        display_name: Option<&str>,
+        handle: Option<&str>,
+    ) -> Result<OwnProfile, AuthError> {
+        let display_name = display_name.map(rules::display_name).transpose()?;
+        let handle = handle.map(rules::handle).transpose()?;
+        if display_name.is_none() && handle.is_none() {
+            return Err(AuthError::Invalid(Invalid {
+                field: "body",
+                reason: "give display_name, handle or both",
+            }));
+        }
+        let mut tx = self.pool.begin().await?;
+        if let Some(display_name) = &display_name {
+            sqlx::query("UPDATE auth.user_account SET display_name = $2 WHERE user_id = $1")
+                .bind(caller.user_id)
+                .bind(display_name)
+                .execute(&mut *tx)
+                .await?;
+        }
+        let mut renamed = false;
+        if let Some(handle) = &handle {
+            let changed = sqlx::query(
+                "UPDATE auth.user_account SET handle = $2 \
+                 WHERE user_id = $1 AND handle <> $2::citext RETURNING 1",
+            )
+            .bind(caller.user_id)
+            .bind(handle)
+            .fetch_optional(&mut *tx)
+            .await;
+            match changed {
+                Ok(row) => renamed = row.is_some(),
+                Err(error) if is_violation(&error, "user_account_handle_key") => {
+                    return Err(AuthError::HandleTaken);
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        tx.commit().await?;
+        if renamed {
+            tracing::info!(
+                target: "security",
+                event = "auth.handle.changed",
+                user_id = %caller.user_id,
+                "a user changed their handle"
+            );
+        }
+        self.own_profile(caller).await
+    }
+
     /// `PATCH /v1/users/me {display_name}`.
     pub async fn set_display_name(
         &self,
         caller: Caller,
         display_name: &str,
     ) -> Result<OwnProfile, AuthError> {
-        let display_name = rules::display_name(display_name)?;
-        sqlx::query("UPDATE auth.user_account SET display_name = $2 WHERE user_id = $1")
-            .bind(caller.user_id)
-            .bind(&display_name)
-            .execute(&self.pool)
-            .await?;
-        self.own_profile(caller).await
+        self.update_profile(caller, Some(display_name), None).await
     }
 
     /// `GET /v1/users/lookup?handle=…`: the verified user with this handle (with or

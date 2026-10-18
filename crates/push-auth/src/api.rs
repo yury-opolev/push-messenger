@@ -75,7 +75,7 @@ pub fn router(api: Api) -> Router {
         .route("/v1/devices", post(register_device).get(list_devices))
         .route("/v1/devices/{device_id}", delete(revoke_device))
         .route("/v1/users", get(profiles))
-        .route("/v1/users/me", get(own_profile).patch(set_display_name))
+        .route("/v1/users/me", get(own_profile).patch(update_profile))
         .route("/v1/users/lookup", get(lookup))
         .route_layer(axum::middleware::from_fn_with_state(
             api.clone(),
@@ -595,21 +595,38 @@ async fn own_profile(State(api): State<Api>, headers: HeaderMap) -> Result<Respo
 }
 
 #[derive(Deserialize)]
-struct DisplayNameBody {
-    display_name: String,
+struct ProfileBody {
+    #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default)]
+    handle: Option<String>,
 }
 
-async fn set_display_name(
+/// `PATCH /v1/users/me {display_name?, handle?}`: the access token is the only proof
+/// needed (spec D14); a handle change is rate limited per IP and per user.
+async fn update_profile(
     State(api): State<Api>,
     headers: HeaderMap,
-    JsonBody(body): JsonBody<DisplayNameBody>,
+    ClientIp(ip): ClientIp,
+    JsonBody(body): JsonBody<ProfileBody>,
 ) -> Result<Response, AuthError> {
     let caller = caller(&api, &headers).await?;
+    if body.handle.is_some() {
+        let user = caller.user_id.to_string();
+        api.limits
+            .check(Action::HandleChange, ip, Some(&user))
+            .await?;
+    }
     let profile = api
         .auth
-        .set_display_name(caller, &body.display_name)
+        .update_profile(caller, body.display_name.as_deref(), body.handle.as_deref())
         .await?;
-    Ok(Json(own_profile_json(&profile)).into_response())
+    let mut response = Json(own_profile_json(&profile)).into_response();
+    response.extensions_mut().insert(Subject {
+        user: Some(caller.user_id),
+        device: Some(caller.device_id),
+    });
+    Ok(response)
 }
 
 #[derive(Deserialize)]

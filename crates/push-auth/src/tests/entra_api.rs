@@ -339,3 +339,43 @@ async fn entra_sign_ins_are_logged_without_tokens_object_ids_names_or_addresses(
         assert!(!text.contains(secret), "the log holds {secret}");
     }
 }
+
+#[tokio::test]
+async fn an_entra_user_changes_their_handle_with_an_access_token_alone() {
+    capture_logs();
+    let world = world(Offer::Entra).await;
+    let tokens = with_device(&world, USER).await;
+    let renamed = call(
+        &world,
+        Method::PATCH,
+        "/v1/users/me",
+        tokens["access_token"].as_str(),
+        Some(json!({"handle": "erin_renamed"})),
+    )
+    .await;
+    assert_eq!(renamed.status, StatusCode::OK, "{}", renamed.json);
+    assert_eq!(renamed.json["handle"], "erin_renamed");
+    // A later sign-in keeps the chosen handle, whatever it asks for.
+    let again = entra(
+        &world,
+        json!({"token": world.stub.token(USER), "handle": "something_else"}),
+    )
+    .await;
+    assert_eq!(again.status, StatusCode::OK);
+    let handle: String = sqlx::query_scalar("SELECT handle::text FROM auth.user_account")
+        .fetch_one(&world.pool)
+        .await
+        .unwrap();
+    assert_eq!(handle, "erin_renamed");
+
+    assert!(
+        security_events().iter().any(|event| {
+            event["event"] == "auth.handle.changed" && event["user_id"] == tokens["user_id"]
+        }),
+        "the change is a security event"
+    );
+    assert!(
+        !captured_logs().contains("erin_renamed"),
+        "the handle is not logged"
+    );
+}

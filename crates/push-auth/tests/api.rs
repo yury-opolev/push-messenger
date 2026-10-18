@@ -682,3 +682,86 @@ async fn a_profile_nobody_asked_for_is_never_returned() {
     assert_eq!(users[0]["handle"], "bob");
     assert!(!answer.text.contains("carol"), "{}", answer.text);
 }
+
+async fn patch_me(world: &World, token: &str, body: Value) -> Answer {
+    call(
+        world,
+        Method::PATCH,
+        "/v1/users/me",
+        Some(token),
+        Some(body),
+    )
+    .await
+}
+
+async fn lookup_status(world: &World, token: &str, handle: &str) -> StatusCode {
+    let uri = format!("/v1/users/lookup?handle={handle}");
+    call(world, Method::GET, &uri, Some(token), None)
+        .await
+        .status
+}
+
+#[tokio::test]
+async fn a_user_changes_their_handle_and_the_old_one_is_free_at_once() {
+    let world = world().await;
+    let alice = with_device(&world, "alice").await;
+    let bob = with_device(&world, "bob").await;
+    let alice_access = alice["access_token"].as_str().unwrap();
+    let bob_access = bob["access_token"].as_str().unwrap();
+
+    let renamed = patch_me(&world, alice_access, json!({"handle": "@Alice_2"})).await;
+    assert_eq!(renamed.status, StatusCode::OK, "{}", renamed.text);
+    assert_eq!(renamed.json()["handle"], "alice_2");
+    assert_eq!(renamed.json()["display_name"], "alice");
+    assert_eq!(
+        lookup_status(&world, bob_access, "alice").await,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        lookup_status(&world, bob_access, "alice_2").await,
+        StatusCode::OK
+    );
+
+    let taken = patch_me(&world, bob_access, json!({"handle": "alice_2"})).await;
+    assert_eq!(taken.status, StatusCode::CONFLICT);
+    assert_eq!(taken.json()["error"]["code"], "handle_taken");
+    let freed = patch_me(
+        &world,
+        bob_access,
+        json!({"handle": "alice", "display_name": "Bob B."}),
+    )
+    .await;
+    assert_eq!(freed.status, StatusCode::OK, "{}", freed.text);
+    assert_eq!(freed.json()["handle"], "alice");
+    assert_eq!(freed.json()["display_name"], "Bob B.");
+
+    for bad in [
+        json!({}),
+        json!({"handle": "x"}),
+        json!({"handle": "9lives"}),
+        json!({"display_name": ""}),
+    ] {
+        let answer = patch_me(&world, alice_access, bad.clone()).await;
+        assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{bad}");
+    }
+    // A display name alone is changed as before and is not counted as a handle change.
+    let named = patch_me(&world, alice_access, json!({"display_name": "Alice A."})).await;
+    assert_eq!(named.json()["handle"], "alice_2");
+    // 5 handle changes a day per account: Alice made 3 (the two invalid ones count).
+    for handle in ["alice_3", "alice_4"] {
+        let answer = patch_me(&world, alice_access, json!({"handle": handle})).await;
+        assert_eq!(answer.status, StatusCode::OK, "{handle}");
+    }
+    let limited = patch_me(&world, alice_access, json!({"handle": "alice_5"})).await;
+    assert_eq!(limited.status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(limited.headers.contains_key("retry-after"));
+    let unauthenticated = call(
+        &world,
+        Method::PATCH,
+        "/v1/users/me",
+        None,
+        Some(json!({"handle": "carol"})),
+    )
+    .await;
+    assert_eq!(unauthenticated.status, StatusCode::UNAUTHORIZED);
+}

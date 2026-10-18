@@ -40,6 +40,8 @@ pub enum Action {
     EntraSignIn,
     /// `POST /v1/auth/entra`, counted per Entra ID identity once the token is accepted.
     EntraAccount,
+    /// `PATCH /v1/users/me` with a handle: per IP and per user.
+    HandleChange,
 }
 
 /// Whom a limit counts.
@@ -65,6 +67,7 @@ impl Scope {
 
 const HOUR: u64 = 3600;
 const QUARTER: u64 = 900;
+const DAY: u64 = 24 * HOUR;
 
 /// At most `max` requests per `seconds`.
 const fn per(max: u32, seconds: u64) -> Limit {
@@ -85,6 +88,7 @@ impl Action {
             Self::HandleLookup => "lookup",
             Self::EntraSignIn => "entra",
             Self::EntraAccount => "entra_account",
+            Self::HandleChange => "handle_change",
         }
     }
 
@@ -108,6 +112,9 @@ impl Action {
         // Like login per IP; per identity once the token is known to be good.
         const ENTRA: &[(Scope, Limit)] = &[(Scope::Ip, per(60, QUARTER))];
         const ENTRA_ACCOUNT: &[(Scope, Limit)] = &[(Scope::Account, per(20, QUARTER))];
+        // Handles are public names: a few changes a day, so nobody cycles through them.
+        const HANDLE_CHANGE: &[(Scope, Limit)] =
+            &[(Scope::Ip, per(30, HOUR)), (Scope::Account, per(5, DAY))];
         match self {
             Self::Signup => SIGNUP,
             Self::Login => LOGIN,
@@ -116,6 +123,7 @@ impl Action {
             Self::HandleLookup => LOOKUP,
             Self::EntraSignIn => ENTRA,
             Self::EntraAccount => ENTRA_ACCOUNT,
+            Self::HandleChange => HANDLE_CHANGE,
         }
     }
 }
