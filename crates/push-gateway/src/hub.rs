@@ -524,6 +524,11 @@ async fn subscribe(
 ) {
     let mut rotations = redis.rotations();
     loop {
+        // Marked seen before signing in, so the connection's token is at least this new
+        // and a token sent while it connects and resubscribes still rotates it.
+        if let Some(receiver) = rotations.as_mut() {
+            receiver.borrow_and_update();
+        }
         let connection = tokio::select! {
             () = shutdown.cancelled() => return,
             connection = redis.pubsub() => connection,
@@ -554,10 +559,6 @@ async fn subscribe(
                     hub.connected.store(true, Ordering::SeqCst);
                     tracing::info!("subscribed to Redis");
                     hub.ring_all();
-                    // This connection signed in with the newest token: only later ones rotate.
-                    if let Some(receiver) = rotations.as_mut() {
-                        receiver.borrow_and_update();
-                    }
                     let mut replacement: Option<
                         Pin<Box<dyn Future<Output = Option<Subscriber>> + Send>>,
                     > = None;

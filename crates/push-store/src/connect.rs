@@ -287,10 +287,17 @@ impl Connector {
         if self.is_entra() {
             options = options.max_lifetime(ENTRA_MAX_LIFETIME);
         }
-        let pool = options.connect_with(self.options()).await?;
-        if let Some(tokens) = &self.tokens {
-            tokio::spawn(rotate(pool.clone(), self.base.clone(), tokens.watch()));
-        }
+        let Some(tokens) = &self.tokens else {
+            return options.connect_with(self.options()).await;
+        };
+        // The receiver exists before the first connect and marks the token used as seen:
+        // a token sent while connecting is then still pending for `rotate`.
+        let mut receiver = tokens.watch();
+        let token = receiver.borrow_and_update().clone();
+        let pool = options
+            .connect_with(self.base.clone().password(token.secret()))
+            .await?;
+        tokio::spawn(rotate(pool.clone(), self.base.clone(), receiver));
         Ok(pool)
     }
 
