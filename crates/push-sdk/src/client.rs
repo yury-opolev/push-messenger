@@ -18,7 +18,7 @@ use tokio::runtime::Runtime;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::SdkError;
-use crate::auth::{AuthApi, Platform};
+use crate::auth::{AuthApi, Platform, Tokens};
 use crate::connection::{Command, Connection, Endpoint, set_state};
 use crate::credentials::{Credentials, MIN_ACCESS_LIFETIME_S, is_refused, unix_now};
 use crate::engine::{EVENT_QUEUE, Shared};
@@ -234,6 +234,46 @@ impl Events {
     }
 }
 
+/// How a sign-in proves who the user is.
+enum Proof {
+    Password {
+        email: String,
+        password: String,
+    },
+    /// An Entra ID access token the app obtained (MSAL); `handle` names a new account.
+    Entra {
+        access_token: String,
+        handle: Option<String>,
+    },
+}
+
+impl Proof {
+    /// New tokens for `device`, a device this client registered before.
+    async fn device(&self, auth: &AuthApi, device: DeviceId) -> Result<Tokens, SdkError> {
+        match self {
+            Self::Password { email, password } => auth.login_device(email, password, device).await,
+            Self::Entra {
+                access_token,
+                handle,
+            } => {
+                auth.entra_device(access_token, handle.as_deref(), device)
+                    .await
+            }
+        }
+    }
+
+    /// A registration token for a new device.
+    async fn registration(&self, auth: &AuthApi) -> Result<String, SdkError> {
+        match self {
+            Self::Password { email, password } => auth.login(email, password).await,
+            Self::Entra {
+                access_token,
+                handle,
+            } => auth.entra(access_token, handle.as_deref()).await,
+        }
+    }
+}
+
 /// A push-messenger client.
 #[derive(Clone)]
 pub struct Client {
@@ -411,17 +451,46 @@ impl Client {
         device_name: &str,
         platform: Platform,
     ) -> Result<Account, SdkError> {
+        let proof = Proof::Password {
+            email: email.to_owned(),
+            password: password.to_owned(),
+        };
+        self.sign_in_with(proof, device_name, platform).await
+    }
+
+    /// Signs in on this device with a Microsoft Entra ID access token for auth-svc's API,
+    /// which the app obtained itself with MSAL (scope `api://<api-client-id>/access_as_user`,
+    /// docs/entra-sign-in.md). `handle` names the account on its first sign-in only. The
+    /// device is kept exactly as by [`Client::sign_in`]. After the session's maximum age
+    /// the SDK reports `SignedOut`: get a new token and call this again (same device). The
+    /// token is sent once and never stored or logged.
+    pub async fn sign_in_with_entra(
+        &self,
+        access_token: &str,
+        handle: Option<&str>,
+        device_name: &str,
+        platform: Platform,
+    ) -> Result<Account, SdkError> {
+        let proof = Proof::Entra {
+            access_token: access_token.to_owned(),
+            handle: handle.map(str::to_owned),
+        };
+        self.sign_in_with(proof, device_name, platform).await
+    }
+
+    async fn sign_in_with(
+        &self,
+        proof: Proof,
+        device_name: &str,
+        platform: Platform,
+    ) -> Result<Account, SdkError> {
         let inner = self.inner.clone();
-        let (email, password, device_name) = (
-            email.to_owned(),
-            password.to_owned(),
-            device_name.to_owned(),
-        );
+        let device_name = device_name.to_owned();
         self.run(async move {
             let credentials = &inner.credentials;
             let mut tokens = None;
             if let Some(device) = credentials.last_device()? {
-                match inner.auth.login_device(&email, &password, device).await {
+                match proof.device(&inner.auth, device).await {
                     Ok(found) => tokens = Some(found),
                     // Revoked meanwhile: register anew.
                     Err(SdkError::Server { code, .. }) if code == "device_not_found" => {
@@ -433,7 +502,7 @@ impl Client {
             let tokens = match tokens {
                 Some(tokens) => tokens,
                 None => {
-                    let registration = inner.auth.login(&email, &password).await?;
+                    let registration = proof.registration(&inner.auth).await?;
                     let register = |registration_id| {
                         inner.auth.register_device(
                             &registration,
@@ -1244,5 +1313,83 @@ mod tests {
         client.close().await.unwrap();
         let (client, _events) = Client::open(config(Some(&changed)), secrets).unwrap();
         assert_eq!(client.messages(conversation, None, 10).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_entra_sign_in_registers_once_and_signs_the_same_device_in_again() {
+        use serde_json::json;
+
+        use crate::testing::WRONG_ENTRA_TOKEN;
+
+        let (auth, gateway) = (FakeAuth::start().await, FakeGateway::start().await);
+        let secrets = Arc::new(MemorySecretStore::new());
+        let database = format!("file:client-{}?mode=memory&cache=shared", Uuid::now_v7());
+        let (client, _events) = open(&auth, &gateway, &database, &secrets);
+        let account = client
+            .sign_in_with_entra("entra-access-token", Some("erin"), "laptop", Platform::Web)
+            .await
+            .unwrap();
+        assert_eq!(
+            (account.user_id, account.device_id),
+            (auth.user, auth.device)
+        );
+        assert_eq!(auth.registrations.load(Ordering::SeqCst), 1);
+        assert_eq!(secrets.load(REGISTRATION_KEY).unwrap(), None);
+
+        // Signed out by the server (the session's maximum age): the same device again.
+        client.inner.credentials.sign_out().await.unwrap();
+        client
+            .sign_in_with_entra("a-newer-entra-token", None, "laptop", Platform::Web)
+            .await
+            .unwrap();
+        assert_eq!(auth.registrations.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            auth.entra_bodies.lock().unwrap().clone(),
+            vec![
+                json!({"token": "entra-access-token", "handle": "erin"}),
+                json!({"token": "a-newer-entra-token", "handle": null, "device_id": auth.device}),
+            ]
+        );
+        let refused = client
+            .sign_in_with_entra(WRONG_ENTRA_TOKEN, None, "laptop", Platform::Web)
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code(), "entra_token_invalid");
+    }
+
+    #[tokio::test]
+    async fn the_profile_changes_its_handle_or_display_name() {
+        use crate::testing::TAKEN_HANDLE;
+
+        let f = Fixture::new().await;
+        let renamed = f.client.update_profile(None, Some("erin")).await.unwrap();
+        assert_eq!(
+            (
+                renamed.user_id,
+                renamed.handle.as_str(),
+                renamed.display_name.as_str()
+            ),
+            (f.auth.user, "erin", "Alice")
+        );
+        let named = f
+            .client
+            .update_profile(Some("Erin E."), None)
+            .await
+            .unwrap();
+        assert_eq!(named.display_name, "Erin E.");
+        let taken = f
+            .client
+            .update_profile(None, Some(TAKEN_HANDLE))
+            .await
+            .unwrap_err();
+        assert_eq!(taken.code(), "handle_taken");
+        assert_eq!(
+            f.client
+                .update_profile(None, None)
+                .await
+                .unwrap_err()
+                .code(),
+            "invalid"
+        );
     }
 }

@@ -237,10 +237,11 @@ fn has_lifetime(session: &Session) -> bool {
     session.access_expires_at - unix_now() >= MIN_ACCESS_LIFETIME_S
 }
 
-/// auth-svc refused the credentials for good: they were revoked, reused or expired.
+/// auth-svc refused the credentials for good: they were revoked, reused or expired, or
+/// the Entra ID-backed session reached its maximum age.
 pub(crate) fn is_refused(error: &SdkError) -> bool {
     matches!(error, SdkError::Server { code, .. }
-        if matches!(code.as_str(), "unauthorized" | "token_expired" | "http_401"))
+        if matches!(code.as_str(), "unauthorized" | "token_expired" | "session_expired" | "http_401"))
 }
 
 pub(crate) fn unix_now() -> i64 {
@@ -466,5 +467,16 @@ mod tests {
         assert_eq!(fixture.credentials.registration_id().unwrap(), first);
         fixture.credentials.registration_done().unwrap();
         assert_ne!(fixture.credentials.registration_id().unwrap(), first);
+    }
+
+    #[test]
+    fn an_ended_session_is_refused_like_a_revoked_token() {
+        let ended = SdkError::Server {
+            code: "session_expired".to_owned(),
+            message: "the session has reached its maximum age; sign in again".to_owned(),
+            retryable: false,
+            retry_after_s: None,
+        };
+        assert!(is_refused(&ended));
     }
 }

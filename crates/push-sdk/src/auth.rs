@@ -254,6 +254,34 @@ impl AuthApi {
         tokens(answer)
     }
 
+    /// `POST /v1/auth/entra`: a registration token for the account of an Entra ID access
+    /// token for auth-svc's API; `handle` names a new account only. Never repeated: it
+    /// counts against rate limits.
+    pub async fn entra(
+        &self,
+        access_token: &str,
+        handle: Option<&str>,
+    ) -> Result<String, SdkError> {
+        let body = json!({ "token": access_token, "handle": handle });
+        let answer = once(self.request(Method::POST, "/v1/auth/entra").json(&body)).await?;
+        answer["registration_token"]
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| unreadable("the sign-in answer"))
+    }
+
+    /// `POST /v1/auth/entra` with an active device: its new tokens and a new session.
+    pub async fn entra_device(
+        &self,
+        access_token: &str,
+        handle: Option<&str>,
+        device: DeviceId,
+    ) -> Result<Tokens, SdkError> {
+        let body = json!({ "token": access_token, "handle": handle, "device_id": device });
+        let answer = once(self.request(Method::POST, "/v1/auth/entra").json(&body)).await?;
+        tokens(answer)
+    }
+
     /// `POST /v1/devices`: registers a device, or finds the one an earlier attempt with
     /// the same `registration_id` registered.
     pub async fn register_device(
@@ -368,6 +396,32 @@ impl AuthApi {
                 .query(&[("handle", handle)])
                 .bearer_auth(access_token)
         })
+        .await?;
+        serde_json::from_value::<ProfileBody>(answer)
+            .map(Profile::from)
+            .map_err(|_| unreadable("the profile"))
+    }
+
+    /// `PATCH /v1/users/me {display_name?, handle?}`: the caller's profile after the
+    /// change. Never repeated by the SDK: a handle change counts against rate limits.
+    pub async fn update_profile(
+        &self,
+        access_token: &str,
+        display_name: Option<&str>,
+        handle: Option<&str>,
+    ) -> Result<Profile, SdkError> {
+        let mut body = serde_json::Map::new();
+        if let Some(display_name) = display_name {
+            body.insert("display_name".to_owned(), json!(display_name));
+        }
+        if let Some(handle) = handle {
+            body.insert("handle".to_owned(), json!(handle));
+        }
+        let answer = once(
+            self.request(Method::PATCH, "/v1/users/me")
+                .bearer_auth(access_token)
+                .json(&body),
+        )
         .await?;
         serde_json::from_value::<ProfileBody>(answer)
             .map(Profile::from)
