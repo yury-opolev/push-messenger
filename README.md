@@ -239,6 +239,14 @@ at start-up.
 | `PUSH_AUTH_WORKER_ROLE` | the worker's role: granted `auth.outbox` and the two cleanup functions at start-up | none |
 | `PUSH_MESSAGE_SVC_URL` | Directory gRPC URL of message-svc, `http://host:50053` (plain `http://` only), asked whose profiles a caller may see; without it `GET /v1/users` answers 503 | none |
 | `PUSH_DIRECTORY_TOKEN` | message-svc's token for its `Directory` API, the same value as message-svc's, 32 to 256 visible ASCII characters; required with `PUSH_MESSAGE_SVC_URL` | none |
+| `PUSH_AUTH_PROVIDERS` | `password`, `entra` or `password,entra`; without `password` the signup, verification, login and password-reset routes answer 404 ([Entra ID sign-in](docs/entra-sign-in.md)) | `password` |
+| `PUSH_ENTRA_CLIENT_ID` | accepted audiences: the API registration's application id, optionally with its `api://` identifier URI | required with `entra` |
+| `PUSH_ENTRA_ALLOWED_TENANTS` | exactly one of `common` (any tenant and personal accounts), `organizations` (any work or school tenant), `consumers` (personal accounts), or tenant ids (GUIDs), comma-separated; never mixed. A keyword lets anyone with such an account create an account here | required with `entra` |
+| `PUSH_ENTRA_AUTHORITY_HOST` | Microsoft Entra ID's host (a sovereign cloud's); `http://` only for loopback | `https://login.microsoftonline.com/` |
+| `PUSH_ENTRA_REQUIRED_SCOPE` | the delegated scope tokens must carry; `*` for any scope of the API | `access_as_user` |
+| `PUSH_ENTRA_REQUIRED_ROLE` | an app role tokens must carry | none |
+| `PUSH_ENTRA_ALLOWED_CLIENT_APPS` | client app ids allowed to present tokens (`azp`), comma-separated | any |
+| `PUSH_ENTRA_MAX_SESSION_HOURS` | maximum session age of an Entra-backed device, 1 to 720; refresh fails after it until the user signs in with Entra ID again | `24` |
 
 `push-worker`:
 

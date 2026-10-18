@@ -20,10 +20,11 @@ use crate::api::{Api, router};
 use crate::config::{Config, MigrateConfig};
 use crate::db::{MIGRATOR, grant_worker_access_on};
 use crate::directory::{Directory, GrpcDirectory, NoDirectory};
+use crate::entra::EntraSignIn;
 use crate::limits::{Limits, RedisCounter};
 use crate::links::LinkSigner;
 use crate::password::Passwords;
-use crate::service::{Auth, Settings};
+use crate::service::{Auth, Settings, SignIn};
 use crate::tokens::AccessTokens;
 
 /// How long to wait before trying an unreachable dependency again.
@@ -69,6 +70,11 @@ pub async fn serve(
     );
 
     push_credentials::install_crypto_provider();
+    // Built before the datastores, so a bad Entra ID setting stops start-up at once.
+    let entra = match &config.entra {
+        Some(settings) => Some(EntraSignIn::new(settings.clone()).map_err(anyhow::Error::msg)?),
+        None => None,
+    };
     let azure = config
         .azure
         .as_ref()
@@ -122,6 +128,17 @@ pub async fn serve(
     };
     let _ = ready.pool.set(pool.clone());
 
+    if let Some(entra) = &entra {
+        // Fetched now so the first sign-in is quick; a failure only warns: readiness never
+        // depends on Entra ID (spec D4).
+        let warming = entra.clone();
+        tokio::spawn(async move { warming.warm().await });
+    }
+    if !config.providers.password {
+        tracing::info!(
+            "email and password sign-in is off: only Microsoft Entra ID sign-in is served"
+        );
+    }
     let auth = Auth::new(
         pool.clone(),
         Settings {
@@ -133,7 +150,11 @@ pub async fn serve(
             hash_queue: config.hash_queue,
             hash_wait: HASH_WAIT,
         },
-    );
+    )
+    .with_sign_in(SignIn {
+        password: config.providers.password,
+        entra,
+    });
     let api = router(Api {
         auth,
         limits: Limits::new(Arc::new(counter)),

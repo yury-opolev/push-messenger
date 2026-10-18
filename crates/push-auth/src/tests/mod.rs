@@ -5,6 +5,7 @@
 
 mod entra_accounts;
 mod entra_api;
+mod entra_server;
 
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
