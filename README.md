@@ -162,9 +162,9 @@ chart with values. [docs/deployment-configuration.md](docs/deployment-configurat
 is the contract: a consumer-managed Secret (`secrets.existingSecret`) and its key names,
 offline rendering, the explicit Resend webhook switch, controller-neutral Ingress with
 TLS and annotation maps, trusted client-IP headers, and image digests.
-Managed PostgreSQL and Redis with Microsoft Entra ID tokens instead of passwords: see the
-[design](docs/superpowers/specs/2026-10-18-azure-entra-datastores-design.md) (the chart
-values and guide arrive with Plan 12B).
+Managed PostgreSQL and Redis with Microsoft Entra ID tokens instead of passwords:
+[docs/deployment-azure-entra.md](docs/deployment-azure-entra.md) (chart values, Azure
+prerequisites, database roles, egress and limitations).
 [docs/deployment-ingress-verification.md](docs/deployment-ingress-verification.md)
 records the routing checks against a maintained controller (Traefik).
 [docs/consumer-verification.md](docs/consumer-verification.md) gives the build, image,
