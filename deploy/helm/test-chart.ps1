@@ -516,6 +516,33 @@ Check 'entra: only the four application policies exist' {
     ($entra -split "(?m)^---\s*$" | Where-Object { $_ -match '(?m)^kind: NetworkPolicy\s*$' }).Count -eq 4 -and
         -not (Doc $entra 'NetworkPolicy' 'push-postgres') -and -not (Doc $entra 'NetworkPolicy' 'push-redis')
 }
+Check 'entra: each service gets exactly its datastore variables and no datastore secret' {
+    $envCheck = @'
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(sys.stdin.read()) if d]
+def env(name):
+    d = next(d for d in docs if d["kind"] == "Deployment" and d["metadata"]["name"] == name)
+    c = d["spec"]["template"]["spec"]["containers"][0]
+    return {e["name"]: e.get("value", e.get("valueFrom")) for e in c["env"]}
+pg = {"PUSH_POSTGRES_AUTH": "azure-entra", "PUSH_DATABASE_HOST": "pg.example.net", "PUSH_DATABASE_PORT": "5432", "PUSH_RUN_MIGRATIONS": "true"}
+redis = {"PUSH_REDIS_AUTH": "azure-entra", "PUSH_REDIS_URL": "rediss://cache.example.net:10000"}
+cases = {
+    "push-auth": {**pg, **redis, "PUSH_DATABASE_NAME": "push_auth", "PUSH_DATABASE_USER": "push-auth-id", "PUSH_AUTH_WORKER_ROLE": "push-worker-id"},
+    "push-message-svc": {**pg, **redis, "PUSH_DATABASE_NAME": "push_messaging", "PUSH_DATABASE_USER": "push-message-svc-id"},
+    "push-worker": {**pg, "PUSH_DATABASE_NAME": "push_worker", "PUSH_DATABASE_USER": "push-worker-id", "PUSH_AUTH_DATABASE_NAME": "push_auth"},
+    "push-gateway": redis,
+}
+for name, expected in cases.items():
+    actual = env(name)
+    for key, value in expected.items():
+        assert actual.get(key) == value, (name, key, actual.get(key))
+    assert "PUSH_DATABASE_URL" not in actual and "PUSH_AUTH_DATABASE_URL" not in actual, name
+    refs = [v["secretKeyRef"]["key"] for v in actual.values() if isinstance(v, dict) and "secretKeyRef" in v]
+    assert not [k for k in refs if "database" in k or "redis" in k], (name, refs)
+assert "PUSH_REDIS_AUTH" not in env("push-worker") and "PUSH_POSTGRES_AUTH" not in env("push-gateway")
+'@
+    $entra | & $python.Source -c $envCheck; $LASTEXITCODE -eq 0
+}
 
 if ($failures -gt 0) {
     Write-Output "$failures check(s) failed"

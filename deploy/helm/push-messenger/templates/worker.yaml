@@ -51,16 +51,18 @@ spec:
           env:
             # Its own database, and auth-svc's as a role that may only drain the outbox
             # and call two cleanup functions; never message-svc's database.
-            - name: PUSH_DATABASE_URL
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "push.secretName" . }}
-                  key: worker-database-url
+            {{- include "push.postgresEnv" (dict "root" . "secretKey" "worker-database-url" "database" .Values.postgres.external.databases.worker "user" .Values.postgres.external.users.worker) | trim | nindent 12 }}
+            {{- if include "push.entraPostgres" . }}
+            # auth-svc's database on the same server, as the same principal.
+            - name: PUSH_AUTH_DATABASE_NAME
+              value: {{ .Values.postgres.external.databases.auth | quote }}
+            {{- else }}
             - name: PUSH_AUTH_DATABASE_URL
               valueFrom:
                 secretKeyRef:
                   name: {{ include "push.secretName" . }}
                   key: worker-auth-database-url
+            {{- end }}
             - name: PUSH_MESSAGE_SVC_URL
               value: {{ printf "http://%s:50052" (include "push.name" (dict "root" . "component" "message-svc")) | quote }}
             - name: PUSH_ACCOUNTS_TOKEN

@@ -58,11 +58,7 @@ spec:
                 secretKeyRef:
                   name: {{ include "push.secretName" . }}
                   key: messaging-token
-            - name: PUSH_REDIS_URL
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "push.secretName" . }}
-                  key: redis-url
+            {{- include "push.redisEnv" . | trim | nindent 12 }}
             - name: PUSH_HEARTBEAT_MS
               value: {{ .Values.gateway.heartbeatMs | quote }}
             # Access tokens are checked against auth-svc's key set (GET /v1/auth/jwks)

@@ -58,16 +58,8 @@ spec:
               value: "0.0.0.0:50052"
             - name: PUSH_DIRECTORY_GRPC_ADDR
               value: "0.0.0.0:50053"
-            - name: PUSH_DATABASE_URL
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "push.secretName" . }}
-                  key: database-url
-            - name: PUSH_REDIS_URL
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "push.secretName" . }}
-                  key: redis-url
+            {{- include "push.postgresEnv" (dict "root" . "secretKey" "database-url" "database" .Values.postgres.external.databases.messaging "user" .Values.postgres.external.users.messageSvc) | trim | nindent 12 }}
+            {{- include "push.redisEnv" . | trim | nindent 12 }}
             - name: PUSH_DB_MAX_CONNECTIONS
               value: {{ .Values.messageSvc.dbMaxConnections | quote }}
             # Only the worker has this token: the Accounts API refuses calls without it.

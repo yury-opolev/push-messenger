@@ -50,16 +50,8 @@ spec:
                 seconds: 5
           env:
             # Its own database only: auth-svc never sees message-svc's credentials.
-            - name: PUSH_DATABASE_URL
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "push.secretName" . }}
-                  key: auth-database-url
-            - name: PUSH_REDIS_URL
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "push.secretName" . }}
-                  key: redis-url
+            {{- include "push.postgresEnv" (dict "root" . "secretKey" "auth-database-url" "database" .Values.postgres.external.databases.auth "user" .Values.postgres.external.users.auth) | trim | nindent 12 }}
+            {{- include "push.redisEnv" . | trim | nindent 12 }}
             - name: PUSH_AUTH_SIGNING_KEY
               valueFrom:
                 secretKeyRef:
@@ -87,7 +79,7 @@ spec:
             # The role the worker connects as: auth-svc grants it auth.outbox and the two
             # cleanup functions at start-up (the Postgres init script creates it).
             - name: PUSH_AUTH_WORKER_ROLE
-              value: push_worker
+              value: {{ if include "push.entraPostgres" . }}{{ .Values.postgres.external.users.worker | quote }}{{ else }}push_worker{{ end }}
             # GET /v1/users?ids=… asks message-svc's Directory API whose profiles the
             # caller may see, with auth-svc's own token.
             - name: PUSH_MESSAGE_SVC_URL

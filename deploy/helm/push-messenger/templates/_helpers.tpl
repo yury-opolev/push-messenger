@@ -337,3 +337,59 @@ every identity that reaches it; password mode needs a consumer-managed Secret wi
 {{- end -}}
 {{- end -}}
 {{- end -}}
+
+{{/*
+A service's PostgreSQL variables: the URL from the Secret (bundled, or external password
+mode), or the Entra ID variables of Plan 12A. Arguments: root, secretKey, database, user.
+*/}}
+{{- define "push.postgresEnv" -}}
+{{- $root := .root -}}
+{{- if include "push.entraPostgres" $root }}
+- name: PUSH_POSTGRES_AUTH
+  value: azure-entra
+- name: PUSH_DATABASE_HOST
+  value: {{ $root.Values.postgres.external.host | quote }}
+- name: PUSH_DATABASE_PORT
+  value: {{ $root.Values.postgres.external.port | quote }}
+- name: PUSH_DATABASE_NAME
+  value: {{ .database | quote }}
+- name: PUSH_DATABASE_USER
+  value: {{ .user | quote }}
+{{- if $root.Values.postgres.external.caConfigMap }}
+- name: PUSH_DATABASE_CA_FILE
+  value: /etc/push/postgres-ca/ca.crt
+{{- end }}
+- name: PUSH_RUN_MIGRATIONS
+  value: {{ ternary "false" "true" $root.Values.migrations.job.enabled | quote }}
+{{- else }}
+- name: PUSH_DATABASE_URL
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "push.secretName" $root }}
+      key: {{ .secretKey }}
+{{- end }}
+{{- end -}}
+
+{{/* A service's Redis variables: the URL from the Secret, or the Entra ID variables. */}}
+{{- define "push.redisEnv" -}}
+{{- if include "push.entraRedis" . }}
+- name: PUSH_REDIS_AUTH
+  value: azure-entra
+- name: PUSH_REDIS_URL
+  value: {{ .Values.redis.external.url | quote }}
+{{- with .Values.redis.external.user }}
+- name: PUSH_REDIS_USER
+  value: {{ . | quote }}
+{{- end }}
+{{- if .Values.redis.external.caConfigMap }}
+- name: PUSH_REDIS_CA_FILE
+  value: /etc/push/redis-ca/ca.crt
+{{- end }}
+{{- else }}
+- name: PUSH_REDIS_URL
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "push.secretName" . }}
+      key: redis-url
+{{- end }}
+{{- end -}}
