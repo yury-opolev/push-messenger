@@ -135,7 +135,7 @@ renders the webhook route.
 {{- end -}}
 
 {{/*
-Checks the worker's email settings: the sender is log or resend; resend needs a From
+Checks the worker's email settings: the sender is log, resend or none; resend needs a From
 address and is refused in dev mode, whose mailbox shows every email it sent. Dev mode needs
 at most one worker: its mailbox is in memory, per replica. Chart-managed credentials must
 exist for resend and an enabled webhook; a consumer-managed Secret is never looked up (a
@@ -149,8 +149,11 @@ missing key stops the worker with a Kubernetes configuration error instead).
 {{- if and (include "push.devMode" .) (gt (int .Values.worker.replicas) 1) -}}
 {{- fail "dev mode keeps the DEV ONLY mailbox in memory, per worker replica: use worker.replicas 1 with it" -}}
 {{- end -}}
-{{- if not (has $email.sender (list "log" "resend")) -}}
-{{- fail (printf "worker.email.sender must be log or resend, not %q" $email.sender) -}}
+{{- if not (has $email.sender (list "log" "resend" "none")) -}}
+{{- fail (printf "worker.email.sender must be log, resend or none, not %q" $email.sender) -}}
+{{- end -}}
+{{- if and (eq $email.sender "none") $email.webhook.enabled -}}
+{{- fail "worker.email.sender none sends no email: set worker.email.webhook.enabled false" -}}
 {{- end -}}
 {{- if eq $email.sender "resend" -}}
 {{- if not $email.from -}}
@@ -168,6 +171,137 @@ missing key stops the worker with a Kubernetes configuration error instead).
 {{- if and $email.webhook.enabled (not (include "push.devMode" .)) (not (or $email.webhookSecret (get $existing "resend-webhook-secret"))) -}}
 {{- fail "worker.email.webhook.enabled needs worker.email.webhookSecret or a retained resend-webhook-secret" -}}
 {{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/* "true" when Microsoft Entra ID sign-in is offered (spec 2026-10-19 D9). */}}
+{{- define "push.entraSignIn" -}}
+{{- if has "entra" (splitList "," (nospace (toString .Values.auth.signIn.providers))) -}}true{{- end -}}
+{{- end -}}
+
+{{/* "true" when email and password sign-in is off: nothing ever writes an email then. */}}
+{{- define "push.emailOff" -}}
+{{- if not (has "password" (splitList "," (nospace (toString .Values.auth.signIn.providers)))) -}}true{{- end -}}
+{{- end -}}
+
+{{/* The worker's PUSH_EMAIL_SENDER: none whenever email and password sign-in is off. */}}
+{{- define "push.emailSender" -}}
+{{- if include "push.emailOff" . -}}none{{- else -}}{{ .Values.worker.email.sender }}{{- end -}}
+{{- end -}}
+
+{{/* "1" or "0" for PUSH_DEV_MAILBOX: dev mode, and only while the worker writes email. */}}
+{{- define "push.mailboxFlag" -}}
+{{- if eq (include "push.emailSender" .) "none" -}}0{{- else -}}{{ include "push.devFlag" . }}{{- end -}}
+{{- end -}}
+
+{{/*
+Checks the sign-in settings (spec 2026-10-19 §3, D3, D9, D15) as auth-svc would at
+start-up, so a bad value stops the install instead of the pods: the providers; with entra
+the API's application id (optionally its api:// URI, at most four), the tenants (exactly
+one of common, organizations, consumers, or one to twenty distinct tenant ids; never a
+mixture), an https authority host, one scope or *, one role, client app ids, 1 to 720
+session hours, an http(s) proxy URL. Entra-only installations write no email, so the
+Resend sender and the webhook are refused with them, and the none sender without them.
+The admin listener is a boolean; its peers carry both label maps.
+*/}}
+{{- define "push.checkSignIn" -}}
+{{- $signIn := .Values.auth.signIn -}}
+{{- $providerError := printf "auth.signIn.providers must be password, entra or password,entra, not %q" (toString $signIn.providers) -}}
+{{- if not (kindIs "string" $signIn.providers) -}}
+{{- fail $providerError -}}
+{{- end -}}
+{{- if not (has (nospace $signIn.providers) (list "password" "entra" "password,entra" "entra,password")) -}}
+{{- fail $providerError -}}
+{{- end -}}
+{{- if include "push.entraSignIn" . -}}
+{{- $entra := $signIn.entra -}}
+{{- $guid := "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$" -}}
+{{- range $name := list "clientIds" "tenants" "allowedClientApps" -}}
+{{- if not (kindIs "slice" (index $entra $name)) -}}
+{{- fail (printf "auth.signIn.entra.%s must be a list" $name) -}}
+{{- end -}}
+{{- end -}}
+{{- if not $entra.clientIds -}}
+{{- fail "auth.signIn.entra.clientIds needs the API registration's application id" -}}
+{{- end -}}
+{{- $audiences := list -}}
+{{- $hasId := false -}}
+{{- range $entra.clientIds -}}
+{{- $id := toString . -}}
+{{- if regexMatch $guid $id -}}
+{{- $hasId = true -}}
+{{- $audiences = append $audiences (lower $id) -}}
+{{- else if regexMatch "^api://[!-~]{1,250}$" $id -}}
+{{- $audiences = append $audiences $id -}}
+{{- else -}}
+{{- fail (printf "auth.signIn.entra.clientIds: %q is neither an application id nor an api:// URI" $id) -}}
+{{- end -}}
+{{- end -}}
+{{- if not $hasId -}}
+{{- fail "auth.signIn.entra.clientIds must include the application id: v2.0 access tokens carry it as their audience" -}}
+{{- end -}}
+{{- if gt (len (uniq $audiences)) 4 -}}
+{{- fail "auth.signIn.entra.clientIds: at most four audiences" -}}
+{{- end -}}
+{{- if not $entra.tenants -}}
+{{- fail "auth.signIn.entra.tenants needs [common], [organizations], [consumers] or your tenant ids" -}}
+{{- end -}}
+{{- $keywords := list "common" "organizations" "consumers" -}}
+{{- $tenants := list -}}
+{{- range $entra.tenants -}}{{- $tenants = append $tenants (lower (toString .)) -}}{{- end -}}
+{{- if not (and (eq (len $tenants) 1) (has (first $tenants) $keywords)) -}}
+{{- range $tenants -}}
+{{- if has . $keywords -}}
+{{- fail "auth.signIn.entra.tenants: common, organizations and consumers stand alone, never combined" -}}
+{{- end -}}
+{{- if or (not (regexMatch $guid .)) (eq . "00000000-0000-0000-0000-000000000000") -}}
+{{- fail (printf "auth.signIn.entra.tenants: %q is neither a tenant id nor common, organizations or consumers" .) -}}
+{{- end -}}
+{{- end -}}
+{{- if ne (len $tenants) (len (uniq $tenants)) -}}
+{{- fail "auth.signIn.entra.tenants lists a tenant id twice" -}}
+{{- end -}}
+{{- if gt (len $tenants) 20 -}}
+{{- fail "auth.signIn.entra.tenants: at most 20 tenant ids" -}}
+{{- end -}}
+{{- end -}}
+{{- range $entra.allowedClientApps -}}
+{{- if not (regexMatch $guid (toString .)) -}}
+{{- fail (printf "auth.signIn.entra.allowedClientApps: %q is not an application id" (toString .)) -}}
+{{- end -}}
+{{- end -}}
+{{- if gt (len $entra.allowedClientApps) 20 -}}
+{{- fail "auth.signIn.entra.allowedClientApps: at most 20 application ids" -}}
+{{- end -}}
+{{- if not (regexMatch "^https://[^/@?#\\s]+/?$" (toString $entra.authorityHost)) -}}
+{{- fail "auth.signIn.entra.authorityHost must be https://host/ (scheme and host only)" -}}
+{{- end -}}
+{{- if not (regexMatch "^[!-~]{1,128}$" (toString $entra.requiredScope)) -}}
+{{- fail "auth.signIn.entra.requiredScope must be one scope name or *" -}}
+{{- end -}}
+{{- if and $entra.requiredRole (not (regexMatch "^[!-~]{1,128}$" (toString $entra.requiredRole))) -}}
+{{- fail "auth.signIn.entra.requiredRole must be one app role value" -}}
+{{- end -}}
+{{- $hours := int $entra.maxSessionHours -}}
+{{- if or (lt $hours 1) (gt $hours 720) (ne (toString $hours) (toString $entra.maxSessionHours)) -}}
+{{- fail "auth.signIn.entra.maxSessionHours must be a whole number of hours from 1 to 720" -}}
+{{- end -}}
+{{- if and $entra.httpsProxy (not (regexMatch "^https?://[^\\s]+$" (toString $entra.httpsProxy))) -}}
+{{- fail "auth.signIn.entra.httpsProxy must be an http:// or https:// URL" -}}
+{{- end -}}
+{{- if and $entra.caConfigMap (not (regexMatch "^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$" (toString $entra.caConfigMap))) -}}
+{{- fail "auth.signIn.entra.caConfigMap must be a ConfigMap name" -}}
+{{- end -}}
+{{- end -}}
+{{- if include "push.emailOff" . -}}
+{{- if eq .Values.worker.email.sender "resend" -}}
+{{- fail "auth.signIn.providers entra writes no email: use worker.email.sender log or none (the chart renders none)" -}}
+{{- end -}}
+{{- if .Values.worker.email.webhook.enabled -}}
+{{- fail "auth.signIn.providers entra writes no email: set worker.email.webhook.enabled false" -}}
+{{- end -}}
+{{- else if eq .Values.worker.email.sender "none" -}}
+{{- fail "worker.email.sender none sends no email, but password sign-in needs its verification and reset emails: use log or resend, or auth.signIn.providers entra" -}}
 {{- end -}}
 {{- end -}}
 

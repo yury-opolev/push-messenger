@@ -702,6 +702,79 @@ Check 'egress: CIDRs, DNS peers and extra rules are validated' {
         (Render @('--set', 'networkPolicy.egress.enabled=true', '--set', 'networkPolicy.egress.httpsCidrs={0.0.0.0/0}')) -eq 0
 }
 
+# ---- Entra ID sign-in (Plan 13B) ----
+$signInArgs = @(
+    '--set', 'auth.signIn.providers=entra',
+    '--set', 'auth.signIn.entra.clientIds={11111111-0000-4000-8000-000000000001}',
+    '--set', 'auth.signIn.entra.tenants={33333333-0000-4000-8000-000000000003}'
+)
+Check 'sign-in: a complete Entra-only configuration renders' { (Render $signInArgs) -eq 0 }
+Check 'sign-in: both providers render, in either order' {
+    (Render ($signInArgs + @('--set', 'auth.signIn.providers=password\,entra'))) -eq 0 -and
+        (Render ($signInArgs + @('--set', 'auth.signIn.providers=entra\, password'))) -eq 0
+}
+Check 'sign-in: unknown providers and incomplete Entra settings are refused' {
+    (Render @('--set', 'auth.signIn.providers=ldap')) -ne 0 -and
+        (Render @('--set', 'auth.signIn.providers=entra\,entra')) -ne 0 -and
+        (Render @('--set', 'auth.signIn.providers=entra')) -ne 0 -and
+        (Render $signInArgs[0..3]) -ne 0 -and
+        (Render ($signInArgs[0..1] + $signInArgs[4..5])) -ne 0
+}
+Check 'sign-in: tenants are one keyword or tenant ids, never a mixture' {
+    $ok = foreach ($tenants in '{common}', '{Organizations}', '{consumers}',
+        '{33333333-0000-4000-8000-000000000003,44444444-0000-4000-8000-000000000004}') {
+        Render ($signInArgs + @('--set', "auth.signIn.entra.tenants=$tenants"))
+    }
+    $bad = foreach ($tenants in '{common,33333333-0000-4000-8000-000000000003}', '{organizations,consumers}',
+        '{common,common}', '{33333333-0000-4000-8000-000000000003,33333333-0000-4000-8000-000000000003}',
+        '{33333333-0000-4000-8000-000000000003,33333333-0000-4000-8000-00000000000A,33333333-0000-4000-8000-00000000000a}',
+        '{contoso.onmicrosoft.com}', '{00000000-0000-0000-0000-000000000000}', '{""}') {
+        Render ($signInArgs + @('--set', "auth.signIn.entra.tenants=$tenants"))
+    }
+    $many = '{' + ((1..21 | ForEach-Object { '33333333-0000-4000-8000-{0:d12}' -f $_ }) -join ',') + '}'
+    $twenty = '{' + ((1..20 | ForEach-Object { '33333333-0000-4000-8000-{0:d12}' -f $_ }) -join ',') + '}'
+    (@($ok | Where-Object { $_ -ne 0 }).Count -eq 0) -and (@($bad | Where-Object { $_ -eq 0 }).Count -eq 0) -and
+        (Render ($signInArgs + @('--set', "auth.signIn.entra.tenants=$twenty"))) -eq 0 -and
+        (Render ($signInArgs + @('--set', "auth.signIn.entra.tenants=$many"))) -ne 0
+}
+Check 'sign-in: the audience must include the application id; at most four' {
+    (Render ($signInArgs + @('--set', 'auth.signIn.entra.clientIds={api://push-api}'))) -ne 0 -and
+        (Render ($signInArgs + @('--set', 'auth.signIn.entra.clientIds={https://push.example.com,11111111-0000-4000-8000-000000000001}'))) -ne 0 -and
+        (Render ($signInArgs + @('--set', 'auth.signIn.entra.clientIds={api://push-api,11111111-0000-4000-8000-000000000001}'))) -eq 0 -and
+        (Render ($signInArgs + @('--set', 'auth.signIn.entra.clientIds={api://a,api://b,api://c,api://d,11111111-0000-4000-8000-000000000001}'))) -ne 0
+}
+Check 'sign-in: authority, scope, role, client apps, session age and proxy are checked' {
+    (Render ($signInArgs + @('--set', 'auth.signIn.entra.authorityHost=http://login.microsoftonline.com/'))) -ne 0 -and
+        (Render ($signInArgs + @('--set', 'auth.signIn.entra.authorityHost=https://login.microsoftonline.com/tenant/'))) -ne 0 -and
+        (Render ($signInArgs + @('--set', 'auth.signIn.entra.authorityHost=https://login.microsoftonline.us'))) -eq 0 -and
+        (Render ($signInArgs + @('--set', 'auth.signIn.entra.requiredScope=two scopes'))) -ne 0 -and
+        (Render ($signInArgs + @('--set', 'auth.signIn.entra.requiredScope=*'))) -eq 0 -and
+        (Render ($signInArgs + @('--set', 'auth.signIn.entra.requiredRole=two roles'))) -ne 0 -and
+        (Render ($signInArgs + @('--set', 'auth.signIn.entra.allowedClientApps={not-a-guid}'))) -ne 0 -and
+        (Render ($signInArgs + @('--set', 'auth.signIn.entra.maxSessionHours=0'))) -ne 0 -and
+        (Render ($signInArgs + @('--set', 'auth.signIn.entra.maxSessionHours=721'))) -ne 0 -and
+        (Render ($signInArgs + @('--set', 'auth.signIn.entra.maxSessionHours=720'))) -eq 0 -and
+        (Render ($signInArgs + @('--set', 'auth.signIn.entra.httpsProxy=proxy:3128'))) -ne 0 -and
+        (Render ($signInArgs + @('--set', 'auth.signIn.entra.httpsProxy=http://proxy.corp.example:3128'))) -eq 0
+}
+Check 'sign-in: Entra-only refuses the Resend sender and the webhook' {
+    (Render ($signInArgs + @('--set', 'worker.email.sender=resend', '--set', 'worker.email.resendApiKey=re_x',
+        '--set', 'worker.email.from=a@example.com'))) -ne 0 -and
+        (Render ($signInArgs + @('--set', 'worker.email.webhook.enabled=true',
+            '--set', 'worker.email.webhookSecret=whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw'))) -ne 0
+}
+Check 'email: the none sender is for Entra-only installations and refuses the webhook' {
+    (Render ($signInArgs + @('--set', 'worker.email.sender=none'))) -eq 0 -and
+        (Render @('--set', 'worker.email.sender=none')) -ne 0 -and
+        (Render ($signInArgs + @('--set', 'auth.signIn.providers=password\,entra', '--set', 'worker.email.sender=none'))) -ne 0 -and
+        (Render @('--set', 'worker.email.sender=smtp')) -ne 0
+}
+Check 'default: the render is unchanged by Plan 13B' {
+    # Saved before the work started; absent on CI, where this passes trivially.
+    $baseline = Join-Path ([IO.Path]::GetTempPath()) 'push-default-before-13b.yaml'
+    (-not (Test-Path $baseline)) -or ((Normalized (Get-Content $baseline -Raw)) -eq (Normalized (helm template push $chart | Out-String)))
+}
+
 if ($failures -gt 0) {
     Write-Output "$failures check(s) failed"
     exit 1
