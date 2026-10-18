@@ -214,7 +214,9 @@ stops start-up with a message naming the datastore and never the token.
 The repository proves the chart in this mode without Azure on minikube:
 `deploy/minikube/entra-rehearsal.ps1` (TLS datastores that accept only tokens from a
 DEV ONLY in-cluster stub issuer, `injection: chart`, the migration Job, egress policies
-on Calico, token rotations and killed Redis connections).
+on Calico, 60-second tokens under `push-load` traffic, killed Redis connections and
+restarted pods), and `deploy/minikube/test-network-policy.ps1 -Egress` proves the egress
+rules there with live allowed and denied connections.
 
 ## 8. Limitations
 
@@ -223,6 +225,11 @@ on Calico, token rotations and killed Redis connections).
 - No automatic linking of datastores to identities: the Azure-side setup of section 2 is
   the consumer's, as are private endpoints and DNS.
 - Tokens are cached in memory only; a restarted pod requests new ones.
+- A Redis connection the server closes (a failover, `CLIENT KILL`) is noticed on its next
+  command, which fails once: auth-svc answers that request with a retryable 503, the
+  gateway refuses that connection attempt's rate-limit check, message-svc misses that
+  notification (clients catch up at their next sync). The connection then reconnects
+  with the current token; the gateway's subscriber reconnects at once.
 - The bundled datastores take passwords only; Entra ID applies to external ones.
 - NetworkPolicies cannot match host names: Entra ID egress needs its IP ranges or a
   firewall with FQDN rules.

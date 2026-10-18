@@ -1,0 +1,372 @@
+# DEV ONLY: the datastores and the Microsoft Entra ID stand-in of the Entra ID rehearsal
+# (Plan 12B), applied by deploy/minikube/entra-rehearsal.ps1 to its own minikube profile.
+# Never for real data, never in a shared cluster.
+#
+# PostgreSQL and Redis accept only TLS and passwords; the issuer makes every token it
+# issues the principal's password before answering (push-dev-entra issuer), so the
+# services' Entra ID tokens are the only credentials they ever hold. The script creates
+# the Secrets push-ds-tls (ca.crt, server.crt, server.key from the dev-entra-certs
+# example) and push-ds-admin (password: the administrator's, used only by the issuer and
+# by the script's checks).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: push-ds-postgres
+  namespace: push-ds
+  labels:
+    app.kubernetes.io/part-of: push-entra-rehearsal
+data:
+  # The image's init scripts use the socket; every TCP client needs TLS and a password.
+  pg_hba.conf: |
+    local all all trust
+    hostssl all all all scram-sha-256
+  # As an Entra administrator would (docs/deployment-azure-entra.md): one role per
+  # principal, without a password until the issuer sets its token; the migration
+  # principal owns the databases, the services get only CONNECT here (and the rest from
+  # the migration Job's grants).
+  10-principals.sql: |
+    CREATE ROLE "push-migrator-id" LOGIN;
+    CREATE ROLE "push-auth-id" LOGIN;
+    CREATE ROLE "push-message-svc-id" LOGIN;
+    CREATE ROLE "push-worker-id" LOGIN;
+    CREATE DATABASE push_auth OWNER "push-migrator-id";
+    CREATE DATABASE push_messaging OWNER "push-migrator-id";
+    CREATE DATABASE push_worker OWNER "push-migrator-id";
+    REVOKE ALL ON DATABASE push_auth, push_messaging, push_worker FROM PUBLIC;
+    GRANT CONNECT ON DATABASE push_auth TO "push-auth-id", "push-worker-id";
+    GRANT CONNECT ON DATABASE push_messaging TO "push-message-svc-id";
+    GRANT CONNECT ON DATABASE push_worker TO "push-worker-id";
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: push-ds-postgres
+  namespace: push-ds
+  labels:
+    app.kubernetes.io/part-of: push-entra-rehearsal
+spec:
+  selector:
+    app.kubernetes.io/name: push-ds-postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: push-ds-postgres
+  namespace: push-ds
+  labels:
+    app.kubernetes.io/part-of: push-entra-rehearsal
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: push-ds-postgres
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: push-ds-postgres
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: postgres
+          # The chart's image (postgres.image), pinned by digest.
+          image: postgres:17-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24
+          # The key must belong to postgres with mode 0600: copy it into place, then hand
+          # over to the image's entrypoint (as Plan 12A's TLS test container does).
+          command: ["sh", "-c"]
+          args:
+            - >-
+              install -o postgres -m 0600 /tls/server.key /run/tls/server.key &&
+              install -o postgres -m 0644 /tls/server.crt /run/tls/server.crt &&
+              exec docker-entrypoint.sh postgres -c ssl=on
+              -c ssl_cert_file=/run/tls/server.crt -c ssl_key_file=/run/tls/server.key
+              -c hba_file=/etc/push-ds/pg_hba.conf
+          # The chart's PostgreSQL context: the entrypoint starts as root only to hand
+          # PGDATA, the socket directory and the key to the postgres user.
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+              add: ["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"]
+          env:
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: push-ds-admin
+                  key: password
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - name: postgres
+              containerPort: 5432
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgres", "-h", "127.0.0.1"]
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: run
+              mountPath: /var/run/postgresql
+            - name: tmp
+              mountPath: /tmp
+            - name: tls-run
+              mountPath: /run/tls
+            - name: tls
+              mountPath: /tls
+              readOnly: true
+            - name: config
+              mountPath: /etc/push-ds
+              readOnly: true
+            - name: init
+              mountPath: /docker-entrypoint-initdb.d
+              readOnly: true
+      volumes:
+        # Throwaway: the rehearsal starts from empty databases.
+        - name: data
+          emptyDir: {}
+        - name: run
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+        - name: tls-run
+          emptyDir: {}
+        - name: tls
+          secret:
+            secretName: push-ds-tls
+        - name: config
+          configMap:
+            name: push-ds-postgres
+            items:
+              - key: pg_hba.conf
+                path: pg_hba.conf
+        - name: init
+          configMap:
+            name: push-ds-postgres
+            items:
+              - key: 10-principals.sql
+                path: 10-principals.sql
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: push-ds-redis
+  namespace: push-ds
+  labels:
+    app.kubernetes.io/part-of: push-entra-rehearsal
+spec:
+  selector:
+    app.kubernetes.io/name: push-ds-redis
+  ports:
+    - name: redis
+      port: 6380
+      targetPort: redis
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: push-ds-redis
+  namespace: push-ds
+  labels:
+    app.kubernetes.io/part-of: push-entra-rehearsal
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: push-ds-redis
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: push-ds-redis
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: redis
+          # The chart's image (redis.image), pinned by digest.
+          image: redis:7-alpine@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499
+          # TLS only (no plain port); the default user is the administrator. The
+          # principals' ACL users (their object ids) appear when the issuer sets a token.
+          args:
+            - --port
+            - "0"
+            - --tls-port
+            - "6380"
+            - --tls-cert-file
+            - /tls/server.crt
+            - --tls-key-file
+            - /tls/server.key
+            - --tls-ca-cert-file
+            - /tls/ca.crt
+            - --tls-auth-clients
+            - "no"
+            - --requirepass
+            - $(REDIS_PASSWORD)
+            - --save
+            - ""
+            - --appendonly
+            - "no"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: push-ds-admin
+                  key: password
+          ports:
+            - name: redis
+              containerPort: 6380
+          readinessProbe:
+            tcpSocket:
+              port: redis
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 50m
+              memory: 32Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tls
+              mountPath: /tls
+              readOnly: true
+      volumes:
+        - name: data
+          emptyDir: {}
+        - name: tls
+          secret:
+            secretName: push-ds-tls
+            defaultMode: 0440
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: push-ds-issuer
+  namespace: push-ds
+  labels:
+    app.kubernetes.io/part-of: push-entra-rehearsal
+spec:
+  selector:
+    app.kubernetes.io/name: push-ds-issuer
+  ports:
+    - name: https
+      port: 443
+      targetPort: https
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: push-ds-issuer
+  namespace: push-ds
+  labels:
+    app.kubernetes.io/part-of: push-entra-rehearsal
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: push-ds-issuer
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: push-ds-issuer
+    spec:
+      automountServiceAccountToken: false
+      # The tool does not handle SIGTERM; nothing to drain.
+      terminationGracePeriodSeconds: 2
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: issuer
+          # The DEV ONLY smoke image, which also carries push-dev-entra.
+          image: push-messenger/smoke:dev
+          imagePullPolicy: IfNotPresent
+          command: ["/usr/local/bin/push-dev-entra", "issuer"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          env:
+            - name: PUSH_DEV_ENTRA_TLS_DIR
+              value: /tls
+            - name: PUSH_DEV_ENTRA_TENANT
+              value: 11111111-2222-3333-4444-555555555555
+            # client id:PostgreSQL role:object id, matching values-entra-rehearsal.yaml.
+            - name: PUSH_DEV_ENTRA_PRINCIPALS
+              value: >-
+                0a000000-0000-4000-8000-000000000001:push-auth-id:0b000000-0000-4000-8000-000000000001,0a000000-0000-4000-8000-000000000002:push-message-svc-id:0b000000-0000-4000-8000-000000000002,0a000000-0000-4000-8000-000000000003:push-gateway-id:0b000000-0000-4000-8000-000000000003,0a000000-0000-4000-8000-000000000004:push-worker-id:0b000000-0000-4000-8000-000000000004,0a000000-0000-4000-8000-000000000005:push-migrator-id:0b000000-0000-4000-8000-000000000005
+            # Short tokens: the services refresh them every 45 s.
+            - name: PUSH_DEV_ENTRA_LIFETIME_S
+              value: "60"
+            - name: PUSH_DEV_ENTRA_POSTGRES_HOST
+              value: push-ds-postgres.push-ds.svc
+            - name: PUSH_DEV_ENTRA_REDIS_HOST
+              value: push-ds-redis.push-ds.svc
+            - name: PUSH_DEV_ENTRA_REDIS_PORT
+              value: "6380"
+            - name: PUSH_DEV_ENTRA_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: push-ds-admin
+                  key: password
+          ports:
+            - name: https
+              containerPort: 8443
+          readinessProbe:
+            tcpSocket:
+              port: https
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 20m
+              memory: 32Mi
+            limits:
+              cpu: 500m
+              memory: 128Mi
+          volumeMounts:
+            - name: tls
+              mountPath: /tls
+              readOnly: true
+      volumes:
+        - name: tls
+          secret:
+            secretName: push-ds-tls
+            defaultMode: 0440

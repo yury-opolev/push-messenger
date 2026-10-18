@@ -1,0 +1,53 @@
+# DEV ONLY rehearsal of the Entra ID datastore mode on minikube (Plan 12B), layered after
+# values-minikube.yaml by deploy/minikube/entra-rehearsal.ps1. The datastores and the
+# Entra ID stand-in are deploy/minikube/entra/datastores.yaml in namespace push-ds.
+postgres:
+  enabled: false
+  external:
+    host: push-ds-postgres.push-ds.svc
+    auth: azure-entra
+    users:
+      messageSvc: push-message-svc-id
+      auth: push-auth-id
+      worker: push-worker-id
+      migrate: push-migrator-id
+    caConfigMap: push-ds-ca
+redis:
+  enabled: false
+  external:
+    url: rediss://push-ds-redis.push-ds.svc:6380
+    auth: azure-entra
+    caConfigMap: push-ds-ca
+azure:
+  workloadIdentity:
+    # No AKS webhook here: the chart projects the service-account token itself.
+    injection: chart
+    tenantId: 11111111-2222-3333-4444-555555555555
+    authorityHost: https://push-ds-issuer.push-ds.svc/
+    authorityCaConfigMap: push-ds-ca
+    clientIds:
+      auth: 0a000000-0000-4000-8000-000000000001
+      messageSvc: 0a000000-0000-4000-8000-000000000002
+      gateway: 0a000000-0000-4000-8000-000000000003
+      worker: 0a000000-0000-4000-8000-000000000004
+      migrate: 0a000000-0000-4000-8000-000000000005
+migrations:
+  job:
+    enabled: true
+networkPolicy:
+  egress:
+    enabled: true
+    # Stands in for the private endpoints' CIDRs and Entra ID's ranges: in-cluster
+    # Services are reached through pod IPs, which ipBlocks do not describe.
+    extra:
+      - to:
+          - namespaceSelector:
+              matchLabels:
+                kubernetes.io/metadata.name: push-ds
+# The rehearsal runs the smoke test several times on one auth-svc pod; its Argon2id
+# buffers (19 MiB each) stay with the allocator's per-thread arenas, and 256Mi was seen to
+# run out (OOMKilled) after about four runs. A rehearsal allowance, not a recommendation.
+auth:
+  resources:
+    limits:
+      memory: 512Mi

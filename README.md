@@ -106,6 +106,15 @@ a separate fresh profile started with `minikube start -p push11a --driver=docker
 `.\deploy\minikube\up.ps1 -Cluster push11a -Smoke`. Do not install the new chart on
 an existing data-bearing profile as part of this test.
 
+The Entra ID datastore mode ([docs/deployment-azure-entra.md](docs/deployment-azure-entra.md))
+is rehearsed without Azure by `.\deploy\minikube\entra-rehearsal.ps1` on its own
+profile (default `push12b-entra`, Calico; it refuses the `push` profile): TLS-only
+PostgreSQL and Redis and a DEV ONLY stand-in of Entra ID whose 60-second tokens are the
+only datastore credentials, the migration Job, egress policies, the smoke test, `push-load`
+traffic over many token rotations, killed Redis connections and restarted pods. With
+`-Keep` the profile stays up for
+`.\deploy\minikube\test-network-policy.ps1 -Context push12b-entra -Egress`.
+
 The minikube values switch on a DEV ONLY shortcut: the worker, which logs emails instead
 of sending them, shows them at `/dev/mailbox`, which the ingress does not route (it
 reaches the worker only at `/v1/webhooks/resend`). Clients, the smoke test included,

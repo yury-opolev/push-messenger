@@ -20,10 +20,13 @@
 //! | `PUSH_DEV_ENTRA_ADMIN_PASSWORD` | their administrator's password (`postgres`, Redis `default`) |
 //!
 //! Before answering, it makes every token it issues the principal's PostgreSQL role
-//! password (PostgreSQL scope) or its Redis ACL user's password (Redis scope, the user
-//! being the object id), as Azure accepts its own tokens. It accepts any non-empty
-//! federated token: in the cluster that is the pod's projected service-account token. It
-//! logs one line per token, never the token.
+//! password (PostgreSQL scope) or one of its Redis ACL user's passwords until the token
+//! expires (Redis scope, the user being the object id), as Azure accepts its own tokens.
+//! PostgreSQL keeps one password per role, so there only a principal's latest token opens
+//! new connections: two pods of one principal (during a rollout) can briefly fail to
+//! connect, which Azure would not do; the rehearsal waits for rollouts to settle. It
+//! accepts any non-empty federated token: in the cluster that is the pod's projected
+//! service-account token. It logs one line per token, never the token.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,7 +35,6 @@ use anyhow::Context;
 use futures_util::future::BoxFuture;
 use push_credentials::stub::{
     IssueHook, Issued, StubIssuer, StubPrincipal, serve_tls, try_set_postgres_password,
-    try_set_redis_password,
 };
 use sqlx::ConnectOptions;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
@@ -140,9 +142,10 @@ async fn issuer() -> anyhow::Result<()> {
     })
     .await?;
 
+    let lifetime = Duration::from_secs(var("PUSH_DEV_ENTRA_LIFETIME_S")?.parse()?);
     let roles = Arc::clone(&principals);
     let hook: IssueHook = Arc::new(move |issued: Issued| {
-        let (postgres, mut redis, roles) = (postgres.clone(), redis.clone(), Arc::clone(&roles));
+        let (postgres, redis, roles) = (postgres.clone(), redis.clone(), Arc::clone(&roles));
         Box::pin(async move {
             let set = if issued.scope == POSTGRES_SCOPE {
                 match roles.iter().find(|p| p.client_id == issued.client_id) {
@@ -154,7 +157,7 @@ async fn issuer() -> anyhow::Result<()> {
                     None => Err("no PostgreSQL role for this client".to_owned()),
                 }
             } else {
-                try_set_redis_password(&mut redis, &issued.object_id, &issued.token)
+                add_redis_password(redis, &issued.object_id, &issued.token, lifetime)
                     .await
                     .map_err(|error| error.to_string())
             };
@@ -168,7 +171,6 @@ async fn issuer() -> anyhow::Result<()> {
         }) as BoxFuture<'static, ()>
     });
 
-    let lifetime = Duration::from_secs(var("PUSH_DEV_ENTRA_LIFETIME_S")?.parse()?);
     let stub_principals = principals
         .iter()
         .map(|p| StubPrincipal {
@@ -183,5 +185,39 @@ async fn issuer() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8443").await?;
     println!("serving the DEV ONLY Entra ID stub on :8443");
     serve_tls(listener, router, &cert, &key).await;
+    Ok(())
+}
+
+/// Adds `token` to the passwords of ACL user `user` (all keys, channels, commands) and
+/// removes it once it expires: as on Azure, every unexpired token opens connections.
+async fn add_redis_password(
+    mut redis: redis::aio::ConnectionManager,
+    user: &str,
+    token: &str,
+    lifetime: Duration,
+) -> redis::RedisResult<()> {
+    redis::cmd("ACL")
+        .arg("SETUSER")
+        .arg(user)
+        .arg("on")
+        .arg(format!(">{token}"))
+        .arg("~*")
+        .arg("&*")
+        .arg("+@all")
+        .exec_async(&mut redis)
+        .await?;
+    let (user, token) = (user.to_owned(), token.to_owned());
+    tokio::spawn(async move {
+        tokio::time::sleep(lifetime).await;
+        let removed = redis::cmd("ACL")
+            .arg("SETUSER")
+            .arg(&user)
+            .arg(format!("<{token}"))
+            .exec_async(&mut redis)
+            .await;
+        if let Err(error) = removed {
+            println!("could not remove an expired Redis password of {user}: {error}");
+        }
+    });
     Ok(())
 }
