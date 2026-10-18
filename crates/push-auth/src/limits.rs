@@ -222,8 +222,17 @@ impl RedisCounter {
     /// Connects to Redis at `url`; the connection reconnects by itself. Calls give up
     /// when `shutdown` is cancelled.
     pub async fn connect(url: &str, shutdown: CancellationToken) -> redis::RedisResult<Self> {
-        let client = redis::Client::open(url)?;
-        let connection = client.get_connection_manager().await?;
+        Self::with_connector(&push_credentials::RedisConnector::password(url)?, shutdown).await
+    }
+
+    /// Counters through `connector` (password or Entra ID).
+    pub async fn with_connector(
+        connector: &push_credentials::RedisConnector,
+        shutdown: CancellationToken,
+    ) -> redis::RedisResult<Self> {
+        let connection = connector
+            .connection_manager(redis::aio::ConnectionManagerConfig::new())
+            .await?;
         Ok(Self {
             connection,
             shutdown,

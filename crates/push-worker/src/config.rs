@@ -3,7 +3,8 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use push_store::{StoreOptions, check_database_url};
+use push_credentials::{AzureConfig, ConfigProblem, azure_for};
+use push_store::{DatabaseTarget, DatabaseVars, StoreOptions, postgres_auth};
 
 /// Which sender delivers email.
 #[derive(Clone, PartialEq, Eq)]
@@ -31,8 +32,18 @@ impl std::fmt::Debug for Sender {
 ///
 /// | Variable | Meaning | Default |
 /// |---|---|---|
-/// | `PUSH_DATABASE_URL` | Postgres URL of the `push_worker` database, as its owner | required |
-/// | `PUSH_AUTH_DATABASE_URL` | Postgres URL of auth-svc's `push_auth` database, as the worker's role | required |
+/// | `PUSH_POSTGRES_AUTH` | `password` (the URLs below) or `azure-entra` (Entra ID tokens) | `password` |
+/// | `PUSH_DATABASE_URL` | Postgres URL of the `push_worker` database, as its owner | required for `password` |
+/// | `PUSH_AUTH_DATABASE_URL` | Postgres URL of auth-svc's `push_auth` database, as the worker's role | required for `password` |
+/// | `PUSH_DATABASE_HOST` | the PostgreSQL server (`azure-entra`) | required for `azure-entra` |
+/// | `PUSH_DATABASE_PORT` | its port | `5432` |
+/// | `PUSH_DATABASE_NAME` | the worker's database | `push_worker` |
+/// | `PUSH_DATABASE_USER` | the Entra principal the token belongs to | required for `azure-entra` |
+/// | `PUSH_DATABASE_CA_FILE` | a PEM bundle trusted instead of the system's roots | system roots |
+/// | `PUSH_AUTH_DATABASE_HOST`, `_PORT`, `_USER`, `_CA_FILE` | auth-svc's server (`azure-entra`) | the worker's own |
+/// | `PUSH_AUTH_DATABASE_NAME` | auth-svc's database (`azure-entra`) | `push_auth` |
+/// | `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_FEDERATED_TOKEN_FILE`, `AZURE_AUTHORITY_HOST` | the workload identity (or managed identity without the file) | see the deployment guide |
+/// | `PUSH_RUN_MIGRATIONS` | `false` leaves the migrations to `push-worker migrate` | `true` |
 /// | `PUSH_MESSAGE_SVC_URL` | Accounts gRPC URL of message-svc, `http://host:50052` (plain `http://` only: the worker is built without TLS) | required |
 /// | `PUSH_ACCOUNTS_TOKEN` | the token message-svc requires for its `Accounts` API, 32 to 256 visible ASCII characters | required |
 /// | `PUSH_EMAIL_SENDER` | `log` (logs instead of sending) or `resend` | `log` |
@@ -50,8 +61,10 @@ impl std::fmt::Debug for Sender {
 /// | `PUSH_DEV_MAILBOX` | `1` serves the DEV ONLY `GET /dev/mailbox` (log sender only) | off |
 #[derive(Clone, PartialEq, Eq)]
 pub struct Config {
-    pub database_url: String,
-    pub auth_database_url: String,
+    pub database: DatabaseTarget,
+    pub auth_database: DatabaseTarget,
+    pub azure: Option<AzureConfig>,
+    pub run_migrations: bool,
     pub message_svc_url: String,
     pub accounts_token: String,
     pub sender: Sender,
@@ -71,8 +84,10 @@ impl std::fmt::Debug for Config {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("Config")
-            .field("database_url", &"<redacted>")
-            .field("auth_database_url", &"<redacted>")
+            .field("database", &self.database)
+            .field("auth_database", &self.auth_database)
+            .field("azure", &self.azure)
+            .field("run_migrations", &self.run_migrations)
             .field("message_svc_url", &self.message_svc_url)
             .field("accounts_token", &"<redacted>")
             .field("sender", &self.sender)
@@ -126,12 +141,24 @@ impl Config {
             value: store.max_connections.to_string(),
             reason,
         })?;
-        let database_url = required("PUSH_DATABASE_URL")?;
-        check_database_url(&database_url)
-            .map_err(|reason| redacted("PUSH_DATABASE_URL", reason))?;
-        let auth_database_url = required("PUSH_AUTH_DATABASE_URL")?;
-        check_database_url(&auth_database_url)
-            .map_err(|reason| redacted("PUSH_AUTH_DATABASE_URL", reason))?;
+        let lookup_dyn: &dyn Fn(&str) -> Option<String> = &lookup;
+        let mode = postgres_auth(lookup_dyn).map_err(problem)?;
+        let database =
+            DatabaseTarget::from_lookup(lookup_dyn, mode, &DatabaseVars::own("push_worker"), None)
+                .map_err(problem)?;
+        let own = match &database {
+            DatabaseTarget::Entra(own) => Some(own.clone()),
+            DatabaseTarget::Url(_) => None,
+        };
+        let auth_database = DatabaseTarget::from_lookup(
+            lookup_dyn,
+            mode,
+            &DatabaseVars::AUTH_FOR_WORKER,
+            own.as_ref(),
+        )
+        .map_err(problem)?;
+        let azure = azure_for(lookup_dyn, &[mode]).map_err(problem)?;
+        let run_migrations = flag(&lookup, "PUSH_RUN_MIGRATIONS", true)?;
         let message_svc_url = required("PUSH_MESSAGE_SVC_URL")?;
         if !message_svc_url.starts_with("http://") {
             return Err(ConfigError::Invalid {
@@ -232,8 +259,10 @@ impl Config {
             });
         }
         Ok(Self {
-            database_url,
-            auth_database_url,
+            database,
+            auth_database,
+            azure,
+            run_migrations,
             message_svc_url,
             accounts_token,
             sender,
@@ -248,6 +277,78 @@ impl Config {
             store,
             dev_mailbox,
         })
+    }
+}
+
+/// What `push-worker migrate` reads: the worker's database variables above, the identity,
+/// and `PUSH_DATABASE_RUNTIME_ROLE`, a role granted the use of the `worker` schema when
+/// the migrating identity is not the one the worker runs as.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrateConfig {
+    pub database: DatabaseTarget,
+    pub azure: Option<AzureConfig>,
+    pub runtime_role: Option<String>,
+}
+
+impl MigrateConfig {
+    pub fn from_env() -> Result<Self, ConfigError> {
+        Self::from_lookup(|name| std::env::var(name).ok())
+    }
+
+    pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
+        let lookup_dyn: &dyn Fn(&str) -> Option<String> = &lookup;
+        let mode = postgres_auth(lookup_dyn).map_err(problem)?;
+        let database =
+            DatabaseTarget::from_lookup(lookup_dyn, mode, &DatabaseVars::own("push_worker"), None)
+                .map_err(problem)?;
+        let azure = azure_for(lookup_dyn, &[database.mode()]).map_err(problem)?;
+        let runtime_role = runtime_role(&lookup)?;
+        Ok(Self {
+            database,
+            azure,
+            runtime_role,
+        })
+    }
+}
+
+/// `PUSH_DATABASE_RUNTIME_ROLE`: a principal name, or unset.
+fn runtime_role(lookup: &impl Fn(&str) -> Option<String>) -> Result<Option<String>, ConfigError> {
+    match lookup("PUSH_DATABASE_RUNTIME_ROLE").filter(|role| !role.trim().is_empty()) {
+        None => Ok(None),
+        Some(role) if push_store::is_principal_name(role.trim()) => {
+            Ok(Some(role.trim().to_owned()))
+        }
+        Some(role) => Err(ConfigError::Invalid {
+            name: "PUSH_DATABASE_RUNTIME_ROLE",
+            value: role,
+            reason: "expected 1 to 63 ASCII letters, digits, _ - . or @".to_owned(),
+        }),
+    }
+}
+
+/// A datastore or identity variable that is missing or invalid; values are never shown.
+fn problem(problem: ConfigProblem) -> ConfigError {
+    match problem {
+        ConfigProblem::Missing(name) => ConfigError::Missing(name),
+        ConfigProblem::Invalid { name, reason } => redacted(name, reason),
+    }
+}
+
+/// `true` or `false`; `default` when unset or empty.
+fn flag(
+    lookup: &impl Fn(&str) -> Option<String>,
+    name: &'static str,
+    default: bool,
+) -> Result<bool, ConfigError> {
+    match lookup(name).as_deref().map(str::trim) {
+        None | Some("") => Ok(default),
+        Some("true") => Ok(true),
+        Some("false") => Ok(false),
+        Some(other) => Err(ConfigError::Invalid {
+            name,
+            value: other.to_owned(),
+            reason: "expected true or false".to_owned(),
+        }),
     }
 }
 
@@ -361,6 +462,34 @@ mod tests {
         assert_eq!(config.health_addr, "0.0.0.0:8081".parse().unwrap());
         assert_eq!(config.store.max_connections, 5);
         assert!(!config.dev_mailbox);
+    }
+
+    #[test]
+    fn in_entra_mode_the_auth_database_defaults_to_the_workers_server_and_principal() {
+        let mut variables = REQUIRED.to_vec();
+        variables.retain(|(name, _)| !name.ends_with("DATABASE_URL"));
+        variables.extend([
+            ("PUSH_POSTGRES_AUTH", "azure-entra"),
+            ("PUSH_DATABASE_HOST", "pg.example.net"),
+            ("PUSH_DATABASE_USER", "push-worker-id"),
+            ("AZURE_CLIENT_ID", "00000000-0000-0000-0000-000000000001"),
+        ]);
+        let config = config(&variables).unwrap();
+        let DatabaseTarget::Entra(own) = &config.database else {
+            panic!("Entra")
+        };
+        let DatabaseTarget::Entra(auth) = &config.auth_database else {
+            panic!("Entra")
+        };
+        assert_eq!(
+            (own.name.as_str(), auth.name.as_str()),
+            ("push_worker", "push_auth")
+        );
+        assert_eq!(
+            (auth.host.as_str(), auth.user.as_str()),
+            ("pg.example.net", "push-worker-id")
+        );
+        assert!(config.azure.is_some() && config.run_migrations);
     }
 
     #[test]

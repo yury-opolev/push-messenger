@@ -30,11 +30,13 @@
 //! older than a password reset.
 
 use std::collections::{HashMap, HashSet};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use prost::Message;
+use push_credentials::{AccessToken, RedisConnector};
 use push_proto::internal::v1::{
     ContactChanged, Kick, KickReason, Notification, ReadPositionChanged, ReceiptChanged,
     notification::Kind, receipt_changed,
@@ -57,6 +59,10 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 /// How often the subscriber pings Redis: a connection that died without a word (a
 /// half-open TCP connection) would otherwise look idle forever.
 const PING_INTERVAL: Duration = Duration::from_secs(30);
+/// How long a replaced subscriber keeps being read after the swap: what Redis sent it
+/// before the new one was subscribed is still delivered (duplicates are harmless: rings
+/// coalesce, kicks close once, frames carry state).
+const RETIRE_GRACE: Duration = Duration::from_secs(2);
 /// Server frames waiting for a busy connection; more are dropped (the client recovers
 /// them with `ListConversations` and `ListContacts`).
 const EVENT_BACKLOG: usize = 64;
@@ -113,13 +119,14 @@ pub enum Signal {
 }
 
 impl Hub {
-    /// A hub whose subscriber task listens on Redis through `client` until `shutdown`.
-    pub fn start(client: redis::Client, shutdown: CancellationToken) -> (Self, JoinHandle<()>) {
-        Self::start_with(client, shutdown, PING_INTERVAL)
+    /// A hub whose subscriber task listens on Redis through `redis` until `shutdown`. With
+    /// Entra ID tokens the subscriber is replaced after each new token, without a gap.
+    pub fn start(redis: RedisConnector, shutdown: CancellationToken) -> (Self, JoinHandle<()>) {
+        Self::start_with(redis, shutdown, PING_INTERVAL)
     }
 
     fn start_with(
-        client: redis::Client,
+        redis: RedisConnector,
         shutdown: CancellationToken,
         ping_interval: Duration,
     ) -> (Self, JoinHandle<()>) {
@@ -130,7 +137,7 @@ impl Hub {
             connected: Arc::default(),
         };
         let subscriber = tokio::spawn(subscribe(
-            client,
+            redis,
             hub.clone(),
             receiver,
             shutdown,
@@ -461,23 +468,70 @@ async fn bounded(
     }
 }
 
+/// Resolves when the Redis token changed; never in password mode.
+async fn rotated(rotations: &mut Option<watch::Receiver<AccessToken>>) {
+    match rotations {
+        Some(receiver) => {
+            if receiver.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        }
+        None => std::future::pending::<()>().await,
+    }
+}
+
+type Subscriber = (redis::aio::PubSubSink, redis::aio::PubSubStream);
+
+/// A new subscriber, signed in with the current token and subscribed to the hub's
+/// channels at this moment; `None` when it failed or `shutdown` came. The caller
+/// reconciles the channels again before swapping.
+async fn prepare(
+    redis: RedisConnector,
+    hub: Hub,
+    shutdown: CancellationToken,
+) -> Option<Subscriber> {
+    let connect = tokio::select! {
+        () = shutdown.cancelled() => return None,
+        connect = tokio::time::timeout(COMMAND_TIMEOUT, redis.pubsub()) => connect,
+    };
+    let (mut sink, messages) = connect.ok()?.ok()?.split();
+    for channel in hub.channels() {
+        if bounded(&shutdown, sink.subscribe(&channel)).await != Some(true) {
+            return None;
+        }
+    }
+    Some((sink, messages))
+}
+
 /// The subscriber task: keeps one Redis pub/sub connection, follows the hub's subscribe
 /// and unsubscribe commands, and dispatches what arrives. Pings Redis every
 /// `ping_interval` and reconnects when it does not answer within 5 s, as after any break:
 /// it subscribes again to every channel with a member and rings every connection.
 /// Connecting is retried while Redis is unavailable, and `shutdown` interrupts both the
 /// connection attempt and the wait between attempts at once.
+///
+/// With Entra ID tokens a subscribed connection cannot take a new token, so after each
+/// rotation a replacement is prepared while the current subscriber keeps serving, and
+/// swapped in once it holds every channel the hub has (make-before-break). A replacement
+/// that fails keeps the current subscriber; when Azure closes it at token expiry, the
+/// reconnect below takes over with the newest token.
 async fn subscribe(
-    client: redis::Client,
+    redis: RedisConnector,
     hub: Hub,
     mut commands: mpsc::UnboundedReceiver<Command>,
     shutdown: CancellationToken,
     ping_interval: Duration,
 ) {
+    let mut rotations = redis.rotations();
     loop {
+        // Marked seen before signing in, so the connection's token is at least this new
+        // and a token sent while it connects and resubscribes still rotates it.
+        if let Some(receiver) = rotations.as_mut() {
+            receiver.borrow_and_update();
+        }
         let connection = tokio::select! {
             () = shutdown.cancelled() => return,
-            connection = client.get_async_pubsub() => connection,
+            connection = redis.pubsub() => connection,
         };
         match connection {
             Ok(pubsub) => {
@@ -505,10 +559,65 @@ async fn subscribe(
                     hub.connected.store(true, Ordering::SeqCst);
                     tracing::info!("subscribed to Redis");
                     hub.ring_all();
+                    let mut replacement: Option<
+                        Pin<Box<dyn Future<Output = Option<Subscriber>> + Send>>,
+                    > = None;
+                    let mut retiring: Option<Subscriber> = None;
+                    let mut retire_at = tokio::time::Instant::now();
                     let mut ping_at = tokio::time::Instant::now() + ping_interval;
                     loop {
                         tokio::select! {
                             () = shutdown.cancelled() => return,
+                            () = rotated(&mut rotations), if replacement.is_none() => {
+                                // The new token cannot reach a subscribed connection: prepare
+                                // a new subscriber while this one keeps serving.
+                                replacement = Some(Box::pin(prepare(
+                                    redis.clone(),
+                                    hub.clone(),
+                                    shutdown.clone(),
+                                )));
+                            }
+                            prepared = async { replacement.as_mut().expect("guarded").await }, if replacement.is_some() => {
+                                replacement = None;
+                                match prepared {
+                                    Some((mut new_sink, new_messages)) => {
+                                        // Channels joined while it was prepared: make the new
+                                        // subscriber match the hub now (subscribing twice is
+                                        // harmless).
+                                        let mut complete = true;
+                                        for channel in hub.channels() {
+                                            match bounded(&shutdown, new_sink.subscribe(&channel)).await {
+                                                None => return,
+                                                Some(true) => {}
+                                                Some(false) => {
+                                                    complete = false;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        if complete {
+                                            let old_sink = std::mem::replace(&mut sink, new_sink);
+                                            let old_messages = std::mem::replace(&mut messages, new_messages);
+                                            retiring = Some((old_sink, old_messages));
+                                            retire_at = tokio::time::Instant::now() + RETIRE_GRACE;
+                                            ping_at = tokio::time::Instant::now() + ping_interval;
+                                            tracing::info!("replaced the Redis subscriber for a new token");
+                                        } else {
+                                            tracing::warn!("could not complete the new Redis subscriber; keeping the current one");
+                                        }
+                                    }
+                                    None => tracing::warn!("could not prepare a new Redis subscriber; keeping the current one"),
+                                }
+                            }
+                            retired = async { retiring.as_mut().expect("guarded").1.next().await }, if retiring.is_some() => match retired {
+                                None => retiring = None,
+                                Some(message) => {
+                                    hub.dispatch(message.get_channel_name(), message.get_payload_bytes());
+                                }
+                            },
+                            () = tokio::time::sleep_until(retire_at), if retiring.is_some() => {
+                                retiring = None;
+                            }
                             () = tokio::time::sleep_until(ping_at) => {
                                 let ping = async { sink.ping::<redis::Value>().await.map(|_| ()) };
                                 let Some(alive) = bounded(&shutdown, ping).await else {
@@ -910,10 +1019,14 @@ mod tests {
             .await
             .expect("start Redis (is Docker running?)");
         let port = container.get_host_port_ipv4(6379).await.unwrap();
-        let client = redis::Client::open(format!("redis://127.0.0.1:{port}")).unwrap();
+        let url = format!("redis://127.0.0.1:{port}");
+        let client = redis::Client::open(url.as_str()).unwrap();
         let shutdown = CancellationToken::new();
-        let (hub, subscriber) =
-            Hub::start_with(client.clone(), shutdown.clone(), Duration::from_millis(500));
+        let (hub, subscriber) = Hub::start_with(
+            RedisConnector::password(&url).unwrap(),
+            shutdown.clone(),
+            Duration::from_millis(500),
+        );
         for _ in 0..100 {
             if hub.is_connected() {
                 break;

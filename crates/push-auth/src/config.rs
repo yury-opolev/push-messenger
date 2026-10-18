@@ -5,7 +5,8 @@ use std::net::SocketAddr;
 use axum::http::HeaderName;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use push_store::{StoreOptions, check_database_url};
+use push_credentials::{AuthMode, AzureConfig, ConfigProblem, RedisTarget, azure_for};
+use push_store::{DatabaseTarget, DatabaseVars, StoreOptions, postgres_auth};
 
 use crate::db::is_role_name;
 
@@ -13,8 +14,14 @@ use crate::db::is_role_name;
 ///
 /// | Variable | Meaning | Default |
 /// |---|---|---|
-/// | `PUSH_DATABASE_URL` | Postgres URL of the `push_auth` database, as its owner | required |
-/// | `PUSH_REDIS_URL` | Redis URL for rate limits, `redis://:password@host:6379` | required |
+/// | `PUSH_POSTGRES_AUTH` | `password` or `azure-entra` (Microsoft Entra ID tokens, spec 2026-10-18) | `password` |
+/// | `PUSH_DATABASE_URL` | password mode: Postgres URL of the `push_auth` database, as its owner | required |
+/// | `PUSH_DATABASE_HOST`, `_PORT`, `_NAME`, `_USER`, `_CA_FILE` | Entra mode: the server, port (`5432`), database (`push_auth`), the principal's role and an optional CA bundle | host and user required |
+/// | `PUSH_REDIS_AUTH` | `password` or `azure-entra` | `password` |
+/// | `PUSH_REDIS_URL` | rate limits; password mode `redis://:password@host:6379`, Entra mode `rediss://host:port` | required |
+/// | `PUSH_REDIS_USER`, `PUSH_REDIS_CA_FILE` | Entra mode: the ACL user (default: the token's `oid`) and an optional CA bundle | none |
+/// | `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_FEDERATED_TOKEN_FILE`, `AZURE_AUTHORITY_HOST` | Entra mode: the identity (workload identity with the token file, else managed identity) | set by the AKS webhook |
+/// | `PUSH_RUN_MIGRATIONS` | `true` or `false`: migrate and grant at start-up (else `push-auth migrate` does) | `true` |
 /// | `PUSH_AUTH_PUBLIC_URL` | base URL of email links, `https://api.example.com` | required |
 /// | `PUSH_AUTH_TOKEN_AUDIENCE` | the gateway's URL, the access tokens' `aud` | required |
 /// | `PUSH_AUTH_SIGNING_KEY` | base64 of the 32-byte Ed25519 seed that signs access tokens | required |
@@ -25,7 +32,7 @@ use crate::db::is_role_name;
 /// | `PUSH_HTTP_ADDR` | address of the API | `0.0.0.0:8080` |
 /// | `PUSH_HEALTH_ADDR` | address of `/healthz` and `/readyz` | `0.0.0.0:8081` |
 /// | `PUSH_DB_MAX_CONNECTIONS` | pool size, at least 1 | `10` |
-/// | `PUSH_AUTH_WORKER_ROLE` | role the worker connects as: granted the outbox and the cleanups at start-up | none |
+/// | `PUSH_AUTH_WORKER_ROLE` | role the worker connects as: granted the outbox and the cleanups at start-up (or by `migrate`); a plain role name, or an Entra principal name in Entra mode | none |
 /// | `PUSH_MESSAGE_SVC_URL` | Directory gRPC URL of message-svc, `http://host:50053` (plain `http://` only), asked whose profiles a caller may see; without it `GET /v1/users` answers 503 | none |
 /// | `PUSH_DIRECTORY_TOKEN` | the token message-svc requires for its `Directory` API, 32 to 256 visible ASCII characters; required with `PUSH_MESSAGE_SVC_URL` | none |
 ///
@@ -33,8 +40,11 @@ use crate::db::is_role_name;
 /// (`localhost`, `127.0.0.1`, `*.local`, `*.localhost`, `*.test`), like the chart's guard.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Config {
-    pub database_url: String,
-    pub redis_url: String,
+    pub database: DatabaseTarget,
+    pub redis: RedisTarget,
+    /// The identity, when a datastore uses Entra ID.
+    pub azure: Option<AzureConfig>,
+    pub run_migrations: bool,
     pub public_url: String,
     pub token_audience: String,
     pub signing_key: Vec<u8>,
@@ -54,8 +64,10 @@ impl std::fmt::Debug for Config {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("Config")
-            .field("database_url", &"<redacted>")
-            .field("redis_url", &"<redacted>")
+            .field("database", &self.database)
+            .field("redis", &self.redis)
+            .field("azure", &self.azure)
+            .field("run_migrations", &self.run_migrations)
             .field("public_url", &self.public_url)
             .field("token_audience", &self.token_audience)
             .field("signing_key", &"<redacted>")
@@ -110,16 +122,14 @@ impl Config {
             value: store.max_connections.to_string(),
             reason,
         })?;
-        let database_url = required("PUSH_DATABASE_URL")?;
-        check_database_url(&database_url)
-            .map_err(|reason| redacted("PUSH_DATABASE_URL", reason))?;
-        let redis_url = required("PUSH_REDIS_URL")?;
-        redis::Client::open(redis_url.as_str()).map_err(|_| {
-            redacted(
-                "PUSH_REDIS_URL",
-                "not a valid Redis URL, expected redis://[:password@]host:6379".to_owned(),
-            )
-        })?;
+        let lookup_dyn: &dyn Fn(&str) -> Option<String> = &lookup;
+        let mode = postgres_auth(lookup_dyn).map_err(problem)?;
+        let database =
+            DatabaseTarget::from_lookup(lookup_dyn, mode, &DatabaseVars::own("push_auth"), None)
+                .map_err(problem)?;
+        let redis = RedisTarget::from_lookup(lookup_dyn).map_err(problem)?;
+        let azure = azure_for(lookup_dyn, &[database.mode(), redis.mode()]).map_err(problem)?;
+        let run_migrations = flag(&lookup, "PUSH_RUN_MIGRATIONS", true)?;
         let public_url = required("PUSH_AUTH_PUBLIC_URL")?;
         check_url(&public_url, "https://", "http://").map_err(|reason| ConfigError::Invalid {
             name: "PUSH_AUTH_PUBLIC_URL",
@@ -165,19 +175,7 @@ impl Config {
                 reason: "must be at least 1".to_owned(),
             });
         }
-        let worker_role = match lookup("PUSH_AUTH_WORKER_ROLE").filter(|v| !v.is_empty()) {
-            None => None,
-            Some(role) if is_role_name(&role) => Some(role),
-            Some(role) => {
-                return Err(ConfigError::Invalid {
-                    name: "PUSH_AUTH_WORKER_ROLE",
-                    value: role,
-                    reason:
-                        "a role name: lower-case letters, digits and _, not starting with a digit"
-                            .to_owned(),
-                });
-            }
-        };
+        let worker_role = worker_role(&lookup, mode)?;
         let message_svc_url = lookup("PUSH_MESSAGE_SVC_URL").filter(|v| !v.is_empty());
         if let Some(url) = &message_svc_url {
             if !url.starts_with("http://") {
@@ -205,8 +203,10 @@ impl Config {
             }
         }
         Ok(Self {
-            database_url,
-            redis_url,
+            database,
+            redis,
+            azure,
+            run_migrations,
             public_url,
             token_audience,
             signing_key,
@@ -273,6 +273,109 @@ fn is_local_host(host: &str) -> bool {
 }
 
 /// An invalid secret variable; the value is never shown.
+/// What `push-auth migrate` reads: the database variables, the identity,
+/// `PUSH_DATABASE_RUNTIME_ROLE` (granted the use of the `auth` schema) and
+/// `PUSH_AUTH_WORKER_ROLE` (granted the worker's narrow access, as at start-up).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrateConfig {
+    pub database: DatabaseTarget,
+    pub azure: Option<AzureConfig>,
+    pub runtime_role: Option<String>,
+    pub worker_role: Option<String>,
+}
+
+impl MigrateConfig {
+    pub fn from_env() -> Result<Self, ConfigError> {
+        Self::from_lookup(|name| std::env::var(name).ok())
+    }
+
+    pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
+        let lookup_dyn: &dyn Fn(&str) -> Option<String> = &lookup;
+        let mode = postgres_auth(lookup_dyn).map_err(problem)?;
+        let database =
+            DatabaseTarget::from_lookup(lookup_dyn, mode, &DatabaseVars::own("push_auth"), None)
+                .map_err(problem)?;
+        let azure = azure_for(lookup_dyn, &[database.mode()]).map_err(problem)?;
+        Ok(Self {
+            database,
+            azure,
+            runtime_role: runtime_role(&lookup)?,
+            worker_role: worker_role(&lookup, mode)?,
+        })
+    }
+}
+
+/// `PUSH_AUTH_WORKER_ROLE`: a plain role name in password mode (as before), an Entra
+/// principal name in Entra mode; unset is `None`.
+fn worker_role(
+    lookup: &impl Fn(&str) -> Option<String>,
+    mode: AuthMode,
+) -> Result<Option<String>, ConfigError> {
+    let Some(role) = lookup("PUSH_AUTH_WORKER_ROLE").filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    let (valid, reason) = match mode {
+        AuthMode::Password => (
+            is_role_name(&role),
+            "a role name: lower-case letters, digits and _, not starting with a digit",
+        ),
+        AuthMode::AzureEntra => (
+            push_store::is_principal_name(&role),
+            "an Entra principal name: 1 to 63 ASCII letters, digits, _ - . or @",
+        ),
+    };
+    if valid {
+        Ok(Some(role))
+    } else {
+        Err(ConfigError::Invalid {
+            name: "PUSH_AUTH_WORKER_ROLE",
+            value: role,
+            reason: reason.to_owned(),
+        })
+    }
+}
+
+/// `PUSH_DATABASE_RUNTIME_ROLE`: a principal name, or unset.
+fn runtime_role(lookup: &impl Fn(&str) -> Option<String>) -> Result<Option<String>, ConfigError> {
+    match lookup("PUSH_DATABASE_RUNTIME_ROLE").filter(|role| !role.trim().is_empty()) {
+        None => Ok(None),
+        Some(role) if push_store::is_principal_name(role.trim()) => {
+            Ok(Some(role.trim().to_owned()))
+        }
+        Some(role) => Err(ConfigError::Invalid {
+            name: "PUSH_DATABASE_RUNTIME_ROLE",
+            value: role,
+            reason: "expected 1 to 63 ASCII letters, digits, _ - . or @".to_owned(),
+        }),
+    }
+}
+
+/// A datastore or identity variable that is missing or invalid; values are never shown.
+fn problem(problem: ConfigProblem) -> ConfigError {
+    match problem {
+        ConfigProblem::Missing(name) => ConfigError::Missing(name),
+        ConfigProblem::Invalid { name, reason } => redacted(name, reason),
+    }
+}
+
+/// `true` or `false`; `default` when unset or empty.
+fn flag(
+    lookup: &impl Fn(&str) -> Option<String>,
+    name: &'static str,
+    default: bool,
+) -> Result<bool, ConfigError> {
+    match lookup(name).as_deref().map(str::trim) {
+        None | Some("") => Ok(default),
+        Some("true") => Ok(true),
+        Some("false") => Ok(false),
+        Some(other) => Err(ConfigError::Invalid {
+            name,
+            value: other.to_owned(),
+            reason: "expected true or false".to_owned(),
+        }),
+    }
+}
+
 fn redacted(name: &'static str, reason: String) -> ConfigError {
     ConfigError::Invalid {
         name,
@@ -445,6 +548,35 @@ mod tests {
         assert!(!shown.contains("hunter2"), "{shown}");
         assert!(!shown.contains("[7, 7"), "{shown}");
         assert!(shown.contains("https://api.example.com"), "{shown}");
+    }
+
+    #[test]
+    fn entra_mode_needs_the_parts_and_accepts_principal_names() {
+        let mut variables = REQUIRED.to_vec();
+        variables.retain(|(name, _)| *name != "PUSH_DATABASE_URL");
+        variables.extend([
+            ("PUSH_POSTGRES_AUTH", "azure-entra"),
+            ("PUSH_DATABASE_HOST", "pg.example.net"),
+            ("PUSH_DATABASE_USER", "push-auth-id"),
+            ("PUSH_AUTH_WORKER_ROLE", "push-worker-id"),
+        ]);
+        let entra = config(&variables).unwrap();
+        assert!(
+            matches!(entra.database, DatabaseTarget::Entra(ref database) if database.name == "push_auth")
+        );
+        assert_eq!(entra.worker_role.as_deref(), Some("push-worker-id"));
+        assert!(
+            entra.azure.is_some(),
+            "the identity is read (managed identity here)"
+        );
+        // Password mode keeps the plain role names it always accepted.
+        assert!(matches!(
+            config(&with("PUSH_AUTH_WORKER_ROLE", "push-worker-id")),
+            Err(ConfigError::Invalid {
+                name: "PUSH_AUTH_WORKER_ROLE",
+                ..
+            })
+        ));
     }
 
     #[test]

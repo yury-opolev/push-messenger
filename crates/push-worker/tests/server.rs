@@ -34,8 +34,10 @@ const ACCOUNTS_TOKEN: &str = "accounts-token-for-the-server-tests";
 
 fn config(database_url: String, auth_database_url: String, message_svc_url: String) -> Config {
     Config {
-        database_url,
-        auth_database_url,
+        database: push_store::DatabaseTarget::Url(database_url),
+        auth_database: push_store::DatabaseTarget::Url(auth_database_url),
+        azure: None,
+        run_migrations: true,
         message_svc_url,
         accounts_token: ACCOUNTS_TOKEN.to_owned(),
         sender: Sender::Log,

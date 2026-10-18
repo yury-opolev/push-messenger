@@ -3,6 +3,7 @@
 use std::time::Duration;
 
 use prost::Message;
+use push_credentials::RedisConnector;
 use push_gateway::{Hub, Membership, Signal};
 use push_proto::internal::v1::{
     EntriesAvailable, Kick, KickReason, Notification, notification::Kind,
@@ -15,15 +16,16 @@ use testcontainers_modules::testcontainers::{ContainerAsync, ImageExt};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-async fn redis() -> (ContainerAsync<Redis>, redis::Client) {
+async fn redis() -> (ContainerAsync<Redis>, redis::Client, RedisConnector) {
     let container = Redis::default()
         .with_tag("7-alpine")
         .start()
         .await
         .expect("start a Redis container (is Docker running?)");
     let port = container.get_host_port_ipv4(6379).await.unwrap();
-    let client = redis::Client::open(format!("redis://127.0.0.1:{port}")).unwrap();
-    (container, client)
+    let url = format!("redis://127.0.0.1:{port}");
+    let client = redis::Client::open(url.as_str()).unwrap();
+    (container, client, RedisConnector::password(&url).unwrap())
 }
 
 async fn connected(hub: &Hub) {
@@ -64,9 +66,9 @@ async fn subscribers(client: &redis::Client, channel: &str) -> i64 {
 
 #[tokio::test]
 async fn a_notification_published_on_redis_rings_the_users_session() {
-    let (_container, client) = redis().await;
+    let (_container, client, connector) = redis().await;
     let shutdown = CancellationToken::new();
-    let (hub, subscriber) = Hub::start(client.clone(), shutdown.clone());
+    let (hub, subscriber) = Hub::start(connector, shutdown.clone());
     connected(&hub).await;
 
     let user = Uuid::now_v7();
@@ -102,9 +104,9 @@ async fn a_notification_published_on_redis_rings_the_users_session() {
 
 #[tokio::test]
 async fn a_session_is_rung_again_after_the_subscription_is_reestablished() {
-    let (_container, client) = redis().await;
+    let (_container, client, connector) = redis().await;
     let shutdown = CancellationToken::new();
-    let (hub, subscriber) = Hub::start(client.clone(), shutdown.clone());
+    let (hub, subscriber) = Hub::start(connector, shutdown.clone());
     connected(&hub).await;
 
     let user = Uuid::now_v7();
@@ -142,9 +144,9 @@ async fn a_session_is_rung_again_after_the_subscription_is_reestablished() {
 
 #[tokio::test]
 async fn the_channel_is_unsubscribed_when_the_last_session_leaves() {
-    let (_container, client) = redis().await;
+    let (_container, client, connector) = redis().await;
     let shutdown = CancellationToken::new();
-    let (hub, _subscriber) = Hub::start(client.clone(), shutdown.clone());
+    let (hub, _subscriber) = Hub::start(connector, shutdown.clone());
     connected(&hub).await;
 
     let user = Uuid::now_v7();

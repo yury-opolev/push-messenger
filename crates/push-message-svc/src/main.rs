@@ -1,11 +1,14 @@
 use push_message_svc::{Config, Listeners, init_logging, serve, terminated};
 use tokio_util::sync::CancellationToken;
 
-// `serve` runs the migrations itself, with `push_store::migrate_database(url)` on a
-// dedicated connection at start-up (not `PgStore::migrate` on the request pool).
+// `serve` migrates at start-up unless PUSH_RUN_MIGRATIONS=false; `push-message-svc migrate`
+// only migrates (and grants a runtime role), for a separate migration job.
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     init_logging();
+    if std::env::args().nth(1).as_deref() == Some("migrate") {
+        return push_message_svc::migrate(push_message_svc::MigrateConfig::from_env()?).await;
+    }
     let config = Config::from_env()?;
     let listeners = Listeners::bind(&config).await?;
     let shutdown = CancellationToken::new();

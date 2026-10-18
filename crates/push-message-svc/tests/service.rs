@@ -86,8 +86,14 @@ async fn start() -> Running {
         health_listener.local_addr().unwrap(),
     );
     let config = Config {
-        database_url: format!("postgres://postgres:postgres@127.0.0.1:{postgres_port}/postgres"),
-        redis_url: redis_url.clone(),
+        database: push_store::DatabaseTarget::Url(format!(
+            "postgres://postgres:postgres@127.0.0.1:{postgres_port}/postgres"
+        )),
+        redis: push_credentials::RedisTarget::Password {
+            url: redis_url.clone(),
+        },
+        azure: None,
+        run_migrations: true,
         grpc_addr: grpc,
         accounts_grpc_addr: accounts,
         directory_grpc_addr: directory,
@@ -215,8 +221,14 @@ async fn shutdown_is_honoured_while_the_database_is_unreachable() {
     let health = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let health_addr = health.local_addr().unwrap();
     let config = Config {
-        database_url: "postgres://postgres:postgres@127.0.0.1:1/postgres".to_owned(),
-        redis_url: "redis://127.0.0.1:1".to_owned(),
+        database: push_store::DatabaseTarget::Url(
+            "postgres://postgres:postgres@127.0.0.1:1/postgres".to_owned(),
+        ),
+        redis: push_credentials::RedisTarget::Password {
+            url: "redis://127.0.0.1:1".to_owned(),
+        },
+        azure: None,
+        run_migrations: true,
         grpc_addr: grpc.local_addr().unwrap(),
         accounts_grpc_addr: accounts.local_addr().unwrap(),
         directory_grpc_addr: directory.local_addr().unwrap(),

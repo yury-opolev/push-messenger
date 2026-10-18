@@ -4,6 +4,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use axum::http::HeaderName;
+use push_credentials::{AzureConfig, ConfigProblem, RedisTarget, azure_for};
 
 /// How the gateway runs. Read from the environment by [`Config::from_env`]:
 ///
@@ -11,7 +12,11 @@ use axum::http::HeaderName;
 /// |---|---|---|
 /// | `PUSH_MESSAGE_SVC_URL` | gRPC URL of message-svc | required |
 /// | `PUSH_MESSAGING_TOKEN` | message-svc's token for its `Messaging` API, the same value as message-svc's: 32 to 256 visible ASCII characters | required |
-/// | `PUSH_REDIS_URL` | Redis URL, `redis://:password@host:6379` | required |
+/// | `PUSH_REDIS_AUTH` | `password` (the URL's password) or `azure-entra` (Entra ID tokens) | `password` |
+/// | `PUSH_REDIS_URL` | Redis URL: `redis://:password@host:6379`; for `azure-entra` `rediss://host:10000` without credentials | required |
+/// | `PUSH_REDIS_USER` | Entra mode: the Redis user, when it is not the token's object id | the token's `oid` |
+/// | `PUSH_REDIS_CA_FILE` | Entra mode: a PEM bundle trusted instead of the system's roots | system roots |
+/// | `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_FEDERATED_TOKEN_FILE`, `AZURE_AUTHORITY_HOST` | Entra mode: the identity (workload identity with the token file, else managed identity) | set by the AKS webhook |
 /// | `PUSH_AUTH_URL` | base URL of auth-svc, whose `/v1/auth/jwks` holds the token keys | required |
 /// | `PUSH_TOKEN_AUDIENCE` | the gateway's public URL (`wss://…/v1/socket`): the `aud` of the access tokens it accepts | required |
 /// | `PUSH_LISTEN_ADDR` | address of the WebSocket endpoint `/v1/socket` | `0.0.0.0:8080` |
@@ -27,7 +32,8 @@ pub struct Config {
     pub message_svc_url: String,
     /// The gateway's token for message-svc's `Messaging` API. Never shown.
     pub messaging_token: String,
-    pub redis_url: String,
+    pub redis: RedisTarget,
+    pub azure: Option<AzureConfig>,
     pub auth_url: String,
     pub token_audience: String,
     pub listen_addr: SocketAddr,
@@ -48,7 +54,8 @@ impl std::fmt::Debug for Config {
             .debug_struct("Config")
             .field("message_svc_url", &self.message_svc_url)
             .field("messaging_token", &"<redacted>")
-            .field("redis_url", &"<redacted>")
+            .field("redis", &self.redis)
+            .field("azure", &self.azure)
             .field("auth_url", &self.auth_url)
             .field("token_audience", &self.token_audience)
             .field("listen_addr", &self.listen_addr)
@@ -124,6 +131,9 @@ impl Config {
                 reason: "use an http:// or https:// URL".to_owned(),
             });
         }
+        let lookup_dyn: &dyn Fn(&str) -> Option<String> = &lookup;
+        let redis = RedisTarget::from_lookup(lookup_dyn).map_err(problem)?;
+        let azure = azure_for(lookup_dyn, &[redis.mode()]).map_err(problem)?;
         let messaging_token = required("PUSH_MESSAGING_TOKEN")?;
         if !((32..=256).contains(&messaging_token.len())
             && messaging_token.bytes().all(|byte| byte.is_ascii_graphic()))
@@ -137,7 +147,8 @@ impl Config {
         Ok(Self {
             message_svc_url: required("PUSH_MESSAGE_SVC_URL")?,
             messaging_token,
-            redis_url: required("PUSH_REDIS_URL")?,
+            redis,
+            azure,
             auth_url,
             token_audience: required("PUSH_TOKEN_AUDIENCE")?,
             listen_addr: parsed(&lookup, "PUSH_LISTEN_ADDR", ([0, 0, 0, 0], 8080).into())?,
@@ -151,6 +162,18 @@ impl Config {
     /// auth-svc's JSON Web Key Set: the keys that sign access tokens.
     pub fn jwks_url(&self) -> String {
         format!("{}/v1/auth/jwks", self.auth_url.trim_end_matches('/'))
+    }
+}
+
+/// A datastore or identity variable that is missing or invalid; values are never shown.
+fn problem(problem: ConfigProblem) -> ConfigError {
+    match problem {
+        ConfigProblem::Missing(name) => ConfigError::Missing(name),
+        ConfigProblem::Invalid { name, reason } => ConfigError::Invalid {
+            name,
+            value: "<redacted>".to_owned(),
+            reason,
+        },
     }
 }
 
@@ -217,7 +240,13 @@ mod tests {
     fn defaults_apply_when_only_the_urls_are_set() {
         let config = config(&REQUIRED).unwrap();
         assert_eq!(config.message_svc_url, "http://message-svc:50051");
-        assert_eq!(config.redis_url, "redis://:secret@redis:6379");
+        assert_eq!(
+            config.redis,
+            RedisTarget::Password {
+                url: "redis://:secret@redis:6379".to_owned()
+            }
+        );
+        assert_eq!(config.azure, None);
         assert_eq!(config.jwks_url(), "http://auth:8080/v1/auth/jwks");
         assert_eq!(config.token_audience, "wss://push.example.com/v1/socket");
         assert_eq!(config.listen_addr, "0.0.0.0:8080".parse().unwrap());
