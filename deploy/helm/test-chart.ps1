@@ -647,6 +647,60 @@ for d in services:
 Check 'default and plain Entra: no migration Job' {
     $default -notmatch '(?m)^kind: Job' -and $entra -notmatch '(?m)^kind: Job' -and $entra -notmatch 'push-migrate'
 }
+Check 'egress: opt-in rules per component (DNS, release peers, datastores, HTTPS, extra)' {
+    $egressArgs = $jobArgs + @('--set', 'networkPolicy.egress.enabled=true',
+        '--set', 'networkPolicy.egress.postgresCidrs={10.1.0.4/32}',
+        '--set', 'networkPolicy.egress.redisCidrs={10.1.0.5/32}',
+        '--set', 'networkPolicy.egress.httpsCidrs={20.190.128.0/18}',
+        '--set', 'networkPolicy.egress.extra[0].to[0].ipBlock.cidr=10.9.0.0/16')
+    $rendered = helm template push $chart @egressArgs | Out-String
+    $egress = @'
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(sys.stdin.read()) if d]
+policies = {d["metadata"]["name"]: d["spec"] for d in docs if d["kind"] == "NetworkPolicy"}
+def peers(rule):
+    return [p.get("ipBlock", {}).get("cidr") or p["podSelector"]["matchLabels"].get("push-messenger/network-peer") or "dns" for p in rule["to"]]
+def ports(rule):
+    return sorted((p["protocol"], p["port"]) for p in rule.get("ports", []))
+extra = {"to": [{"ipBlock": {"cidr": "10.9.0.0/16"}}]}
+expected = {
+    "push-auth": {("message-svc", 50053), ("10.1.0.4/32", 5432), ("10.1.0.5/32", 10000), ("20.190.128.0/18", 443)},
+    "push-message-svc": {("10.1.0.4/32", 5432), ("10.1.0.5/32", 10000), ("20.190.128.0/18", 443)},
+    "push-gateway": {("auth", 8080), ("message-svc", 50051), ("10.1.0.5/32", 10000), ("20.190.128.0/18", 443)},
+    "push-worker": {("message-svc", 50052), ("10.1.0.4/32", 5432), ("20.190.128.0/18", 443)},
+    "push-migrate": {("10.1.0.4/32", 5432), ("20.190.128.0/18", 443)},
+}
+assert set(policies) == set(expected), sorted(policies)
+for name, wanted in expected.items():
+    spec = policies[name]
+    assert spec["policyTypes"] == ["Ingress", "Egress"], name
+    rules = spec["egress"]
+    assert rules[-1] == extra, name
+    rules = rules[:-1]
+    dns = [r for r in rules if ports(r) == [("TCP", 53), ("UDP", 53)]]
+    assert len(dns) == 1, name
+    assert dns[0]["to"] == [{"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "kube-system"}},
+                             "podSelector": {"matchLabels": {"k8s-app": "kube-dns"}}}], name
+    got = {(peer, port) for r in rules if r not in dns for peer in peers(r) for (_, port) in ports(r)}
+    assert got == wanted, (name, got)
+assert policies["push-migrate"]["ingress"] == []
+assert policies["push-migrate"]["podSelector"]["matchLabels"]["app.kubernetes.io/name"] == "migrate"
+'@
+    $rendered | & $python.Source -c $egress; $LASTEXITCODE -eq 0
+}
+Check 'egress: with bundled datastores the rules name their pods; the datastores get no egress' {
+    $bundled = helm template push $chart --set networkPolicy.egress.enabled=true | Out-String
+    $policy = Doc $bundled 'NetworkPolicy' 'push-auth'
+    $policy -match 'Egress' -and $policy -match 'network-peer: postgres' -and $policy -match 'network-peer: redis' -and
+        (Doc $bundled 'NetworkPolicy' 'push-postgres') -match '(?s)policyTypes:\s+- Ingress\s+- Egress.*egress: \[\]' -and
+        (Doc $bundled 'NetworkPolicy' 'push-redis') -match '(?s)policyTypes:\s+- Ingress\s+- Egress.*egress: \[\]'
+}
+Check 'egress: CIDRs, DNS peers and extra rules are validated' {
+    (Render @('--set', 'networkPolicy.egress.enabled=true', '--set', 'networkPolicy.egress.httpsCidrs={login.microsoftonline.com}')) -ne 0 -and
+        (Render @('--set', 'networkPolicy.egress.enabled=true', '--set', 'networkPolicy.egress.dns[0].podSelector.k8s-app=kube-dns')) -ne 0 -and
+        (Render @('--set', 'networkPolicy.egress.enabled=true', '--set', 'networkPolicy.egress.extra[0]=everything')) -ne 0 -and
+        (Render @('--set', 'networkPolicy.egress.enabled=true', '--set', 'networkPolicy.egress.httpsCidrs={0.0.0.0/0}')) -eq 0
+}
 
 if ($failures -gt 0) {
     Write-Output "$failures check(s) failed"

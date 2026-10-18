@@ -327,6 +327,38 @@ every identity that reaches it; password mode needs a consumer-managed Secret wi
 {{- end -}}
 {{- end -}}
 {{- end -}}
+{{- with .Values.networkPolicy.egress -}}
+{{- if .enabled -}}
+{{- range $name := list "postgresCidrs" "redisCidrs" "httpsCidrs" -}}
+{{- $cidrs := index $.Values.networkPolicy.egress $name -}}
+{{- if not (kindIs "slice" $cidrs) -}}
+{{- fail (printf "networkPolicy.egress.%s must be a list of CIDRs" $name) -}}
+{{- end -}}
+{{- range $cidrs -}}
+{{- if not (and (kindIs "string" .) (regexMatch "^[0-9a-fA-F:.]+/[0-9]{1,3}$" .)) -}}
+{{- fail (printf "networkPolicy.egress.%s must hold CIDRs such as 10.1.0.4/32, not %v" $name .) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- $dnsError := "networkPolicy.egress.dns requires namespaceSelector and podSelector as non-empty label maps on every peer" -}}
+{{- if not (and (kindIs "slice" .dns) .dns) -}}
+{{- fail $dnsError -}}
+{{- end -}}
+{{- range .dns -}}
+{{- if not (and (kindIs "map" .) (kindIs "map" .namespaceSelector) .namespaceSelector (kindIs "map" .podSelector) .podSelector) -}}
+{{- fail $dnsError -}}
+{{- end -}}
+{{- end -}}
+{{- if not (kindIs "slice" .extra) -}}
+{{- fail "networkPolicy.egress.extra must be a list of NetworkPolicyEgressRule objects" -}}
+{{- end -}}
+{{- range .extra -}}
+{{- if not (kindIs "map" .) -}}
+{{- fail "networkPolicy.egress.extra must be a list of NetworkPolicyEgressRule objects" -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
 {{- if .Values.migrations.job.enabled -}}
 {{- if not (include "push.entraPostgres" .) -}}
 {{- fail "migrations.job.enabled needs an external PostgreSQL with postgres.external.auth azure-entra" -}}

@@ -276,7 +276,9 @@ networkPolicy:
           kubernetes.io/metadata.name: kube-system
         podSelector:
           k8s-app: kube-dns
-    # CIDRs of the external datastores' private endpoints.
+    # CIDRs of the external datastores' private endpoints, on postgres.external.port and
+    # the port of redis.external.url (6379 without one). The bundled datastores are
+    # reached by their pods' labels instead and get no egress themselves.
     postgresCidrs: []
     redisCidrs: []
     # CIDRs allowed on port 443 for token requests (Entra ID) and anything else HTTPS
