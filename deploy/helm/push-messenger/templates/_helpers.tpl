@@ -238,3 +238,102 @@ annotations:
   {{- toYaml . | nindent 2 }}
 {{- end -}}
 {{- end -}}
+
+{{/* "true" when the services reach an external PostgreSQL with Entra ID tokens. */}}
+{{- define "push.entraPostgres" -}}
+{{- if and (not .Values.postgres.enabled) (eq .Values.postgres.external.auth "azure-entra") -}}true{{- end -}}
+{{- end -}}
+
+{{/* "true" when the services reach an external Redis with Entra ID tokens. */}}
+{{- define "push.entraRedis" -}}
+{{- if and (not .Values.redis.enabled) (eq .Values.redis.external.auth "azure-entra") -}}true{{- end -}}
+{{- end -}}
+
+{{/* "true" when any datastore uses Entra ID: identities and ServiceAccounts are needed. */}}
+{{- define "push.anyEntra" -}}
+{{- if or (include "push.entraPostgres" .) (include "push.entraRedis" .) -}}true{{- end -}}
+{{- end -}}
+
+{{/* A PostgreSQL role or database name the services accept: 1-63 of A-Z a-z 0-9 _ - . @ */}}
+{{- define "push.checkPrincipal" -}}
+{{- if not (and (kindIs "string" .value) (regexMatch "^[A-Za-z0-9_.@-]{1,63}$" .value)) -}}
+{{- fail (printf "%s must be an Entra principal name (1 to 63 ASCII letters, digits, _ - . or @)" .name) -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Checks the datastore and identity settings (spec 2026-10-18). Bundled datastores ignore
+the external blocks. An external datastore needs its address; azure-entra needs a role
+per identity (PostgreSQL), a rediss:// URL without credentials (Redis) and a client id for
+every identity that reaches it; password mode needs a consumer-managed Secret with the URLs.
+*/}}
+{{- define "push.checkDatastores" -}}
+{{- $pg := .Values.postgres -}}
+{{- $redis := .Values.redis -}}
+{{- $wi := .Values.azure.workloadIdentity -}}
+{{- range $name, $value := dict "postgres.enabled" $pg.enabled "redis.enabled" $redis.enabled "migrations.job.enabled" .Values.migrations.job.enabled "networkPolicy.egress.enabled" .Values.networkPolicy.egress.enabled -}}
+{{- if not (kindIs "bool" $value) -}}
+{{- fail (printf "%s must be a boolean" $name) -}}
+{{- end -}}
+{{- end -}}
+{{- if not $pg.enabled -}}
+{{- if not $pg.external.host -}}
+{{- fail "postgres.enabled false needs postgres.external.host" -}}
+{{- end -}}
+{{- $port := int $pg.external.port -}}
+{{- if or (lt $port 1) (gt $port 65535) -}}
+{{- fail "postgres.external.port must be a TCP port (1 to 65535)" -}}
+{{- end -}}
+{{- if not (has $pg.external.auth (list "azure-entra" "password")) -}}
+{{- fail (printf "postgres.external.auth must be azure-entra or password, not %q" (toString $pg.external.auth)) -}}
+{{- end -}}
+{{- if and (eq $pg.external.auth "password") (not .Values.secrets.existingSecret) -}}
+{{- fail "postgres.external.auth password needs secrets.existingSecret holding the database URLs" -}}
+{{- end -}}
+{{- if eq $pg.external.auth "azure-entra" -}}
+{{- range $key := list "messageSvc" "auth" "worker" -}}
+{{- include "push.checkPrincipal" (dict "name" (printf "postgres.external.users.%s" $key) "value" (index $pg.external.users $key)) -}}
+{{- end -}}
+{{- range $key := list "messaging" "auth" "worker" -}}
+{{- include "push.checkPrincipal" (dict "name" (printf "postgres.external.databases.%s" $key) "value" (index $pg.external.databases $key)) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if not $redis.enabled -}}
+{{- if not (has $redis.external.auth (list "azure-entra" "password")) -}}
+{{- fail (printf "redis.external.auth must be azure-entra or password, not %q" (toString $redis.external.auth)) -}}
+{{- end -}}
+{{- if eq $redis.external.auth "azure-entra" -}}
+{{- if not (regexMatch "^rediss://[^@/:]+(:[0-9]+)?/?$" $redis.external.url) -}}
+{{- fail "redis.external.url must be rediss://host:port without credentials for azure-entra" -}}
+{{- end -}}
+{{- else if not .Values.secrets.existingSecret -}}
+{{- fail "redis.external.auth password needs secrets.existingSecret holding redis-url" -}}
+{{- end -}}
+{{- end -}}
+{{- if include "push.anyEntra" . -}}
+{{- if not (has $wi.injection (list "webhook" "chart")) -}}
+{{- fail (printf "azure.workloadIdentity.injection must be webhook or chart, not %q" (toString $wi.injection)) -}}
+{{- end -}}
+{{- if and (eq $wi.injection "chart") (not $wi.tenantId) -}}
+{{- fail "azure.workloadIdentity.injection chart needs azure.workloadIdentity.tenantId" -}}
+{{- end -}}
+{{- $needs := list -}}
+{{- if include "push.entraPostgres" . -}}{{- $needs = concat $needs (list "auth" "messageSvc" "worker") -}}{{- end -}}
+{{- if include "push.entraRedis" . -}}{{- $needs = concat $needs (list "auth" "messageSvc" "gateway") -}}{{- end -}}
+{{- range $key := uniq $needs -}}
+{{- if not (index $wi.clientIds $key) -}}
+{{- fail (printf "azure.workloadIdentity.clientIds.%s is required: that workload reaches an Entra ID datastore" $key) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if .Values.migrations.job.enabled -}}
+{{- if not (include "push.entraPostgres" .) -}}
+{{- fail "migrations.job.enabled needs an external PostgreSQL with postgres.external.auth azure-entra" -}}
+{{- end -}}
+{{- include "push.checkPrincipal" (dict "name" "postgres.external.users.migrate" "value" $pg.external.users.migrate) -}}
+{{- if not $wi.clientIds.migrate -}}
+{{- fail "migrations.job.enabled needs azure.workloadIdentity.clientIds.migrate" -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}

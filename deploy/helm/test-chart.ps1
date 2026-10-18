@@ -431,6 +431,71 @@ Check 'portable chart interface matrix' {
     $LASTEXITCODE -eq 0
 }
 
+# ---- Entra ID datastores (Plan 12B) ----
+$entraArgs = @(
+    '--set', 'postgres.enabled=false',
+    '--set', 'postgres.external.host=pg.example.net',
+    '--set', 'postgres.external.users.messageSvc=push-message-svc-id',
+    '--set', 'postgres.external.users.auth=push-auth-id',
+    '--set', 'postgres.external.users.worker=push-worker-id',
+    '--set', 'redis.enabled=false',
+    '--set', 'redis.external.url=rediss://cache.example.net:10000',
+    '--set', 'azure.workloadIdentity.clientIds.auth=00000000-0000-0000-0000-00000000000a',
+    '--set', 'azure.workloadIdentity.clientIds.messageSvc=00000000-0000-0000-0000-00000000000b',
+    '--set', 'azure.workloadIdentity.clientIds.gateway=00000000-0000-0000-0000-00000000000c',
+    '--set', 'azure.workloadIdentity.clientIds.worker=00000000-0000-0000-0000-00000000000d'
+)
+Check 'entra: a complete external configuration renders' { (Render $entraArgs) -eq 0 }
+Check 'entra: an external PostgreSQL needs a host and every user' {
+    (Render ($entraArgs + @('--set', 'postgres.external.host='))) -ne 0 -and
+        (Render ($entraArgs + @('--set', 'postgres.external.users.worker='))) -ne 0
+}
+Check 'entra: an Entra Redis needs a rediss:// URL without credentials' {
+    (Render ($entraArgs + @('--set', 'redis.external.url=redis://cache:6379'))) -ne 0 -and
+        (Render ($entraArgs + @('--set', 'redis.external.url=rediss://:pw@cache:10000'))) -ne 0
+}
+Check 'entra: every identity that reaches an Entra datastore needs a client id' {
+    (Render ($entraArgs + @('--set', 'azure.workloadIdentity.clientIds.gateway='))) -ne 0
+}
+Check 'entra: the bundled datastores ignore the external settings' {
+    $bundled = helm template push $chart --set postgres.external.auth=azure-entra --set redis.external.auth=azure-entra | Out-String
+    (Doc $bundled 'Deployment' 'push-auth') -match 'key: auth-database-url' -and $bundled -notmatch 'PUSH_POSTGRES_AUTH'
+}
+Check 'entra: an external password-mode datastore needs a consumer-managed Secret' {
+    (Render @('--set', 'postgres.enabled=false', '--set', 'postgres.external.host=pg',
+        '--set', 'postgres.external.auth=password')) -ne 0 -and
+    (Render @('--set', 'postgres.enabled=false', '--set', 'postgres.external.host=pg',
+        '--set', 'postgres.external.auth=password', '--set', 'secrets.existingSecret=creds')) -eq 0
+}
+Check 'entra: chart injection needs a tenant; unknown modes are refused' {
+    (Render ($entraArgs + @('--set', 'azure.workloadIdentity.injection=chart'))) -ne 0 -and
+        (Render ($entraArgs + @('--set', 'azure.workloadIdentity.injection=chart',
+            '--set', 'azure.workloadIdentity.tenantId=11111111-2222-3333-4444-555555555555'))) -eq 0 -and
+        (Render ($entraArgs + @('--set', 'azure.workloadIdentity.injection=magic'))) -ne 0 -and
+        (Render ($entraArgs + @('--set', 'postgres.external.auth=kerberos'))) -ne 0
+}
+Check 'entra: the migration Job needs an Entra PostgreSQL, its user and its client id' {
+    (Render @('--set', 'migrations.job.enabled=true')) -ne 0 -and
+        (Render ($entraArgs + @('--set', 'migrations.job.enabled=true'))) -ne 0 -and
+        (Render ($entraArgs + @('--set', 'migrations.job.enabled=true',
+            '--set', 'postgres.external.users.migrate=push-migrator-id',
+            '--set', 'azure.workloadIdentity.clientIds.migrate=00000000-0000-0000-0000-00000000000e'))) -eq 0
+}
+Check 'entra: role names are Entra principal names' {
+    (Render ($entraArgs + @('--set', 'postgres.external.users.auth=bad"name'))) -ne 0
+}
+# The default render with the Secret's generated values masked: they are random per render.
+function Normalized([string] $rendered) {
+    ($rendered -replace "`r`n", "`n" -split "(?m)^---\s*$" | ForEach-Object {
+        if ($_ -match '(?m)^kind: Secret\s*$') { $_ -replace '(?m)^(  [a-z0-9-]+): ".*"$', '$1: "<generated>"' } else { $_ }
+    }) -join '---'
+}
+Check 'default: the render is unchanged by Plan 12B' {
+    # The baseline is saved before the work starts; absent on CI, where this passes trivially.
+    $baseline = Join-Path ([IO.Path]::GetTempPath()) 'push-default-before.yaml'
+    (-not (Test-Path $baseline)) -or ((Normalized (Get-Content $baseline -Raw)) -eq (Normalized $default))
+}
+
 if ($failures -gt 0) {
     Write-Output "$failures check(s) failed"
     exit 1
