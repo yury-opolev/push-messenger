@@ -80,13 +80,16 @@ pub async fn serve(
     let accounts = Accounts::new(&config.message_svc_url, &config.accounts_token)
         .map_err(anyhow::Error::msg)?;
     let mailbox = config.dev_mailbox.then(Mailbox::default);
-    let sender: Arc<dyn EmailSender> = match (&config.sender, &mailbox) {
-        (Sender::Log, Some(mailbox)) => Arc::new(MailboxSender::new(LogSender, mailbox.clone())),
-        (Sender::Log, None) => Arc::new(LogSender),
-        (Sender::Resend { api_url, api_key }, _) => Arc::new(
+    let sender: Option<Arc<dyn EmailSender>> = match (&config.sender, &mailbox) {
+        (Sender::Off, _) => None,
+        (Sender::Log, Some(mailbox)) => {
+            Some(Arc::new(MailboxSender::new(LogSender, mailbox.clone())))
+        }
+        (Sender::Log, None) => Some(Arc::new(LogSender)),
+        (Sender::Resend { api_url, api_key }, _) => Some(Arc::new(
             ResendSender::new(api_url, api_key.clone(), config.from.clone())
                 .map_err(anyhow::Error::msg)?,
-        ),
+        )),
     };
     let webhooks = match &config.webhook_secret {
         Some(secret) => Some(ResendWebhooks::new(secret).map_err(anyhow::Error::msg)?),
@@ -149,11 +152,6 @@ pub async fn serve(
 
     let queue = Queue::new(pool.clone(), LEASE);
     queue.enqueue(&periodic_jobs()).await?;
-    let mailer = Mailer::new(
-        pool.clone(),
-        sender,
-        Templates::new(config.product_name.clone()),
-    );
     let cleanup = Cleanup::new(
         auth.clone(),
         pool.clone(),
@@ -164,7 +162,21 @@ pub async fn serve(
             interval: CLEANUP_INTERVAL,
         },
     );
-    let jobs = Jobs::new(accounts, mailer).with_cleanup(cleanup);
+    let jobs = match sender {
+        Some(sender) => Jobs::new(
+            accounts,
+            Mailer::new(
+                pool.clone(),
+                sender,
+                Templates::new(config.product_name.clone()),
+            ),
+        ),
+        None => {
+            tracing::info!("email is off (PUSH_EMAIL_SENDER=none)");
+            Jobs::without_email(accounts)
+        }
+    };
+    let jobs = jobs.with_cleanup(cleanup);
     let relay = OutboxRelay::new(auth.clone(), queue.clone(), OUTBOX_BATCH);
     let deliveries = webhooks.map(|webhooks| Deliveries::new(pool.clone(), Arc::new(webhooks)));
     let _ = ready.pool.set(pool.clone());

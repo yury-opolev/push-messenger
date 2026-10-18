@@ -256,7 +256,7 @@ at start-up.
 | `PUSH_AUTH_DATABASE_URL` | Postgres URL of auth-svc's `push_auth` database, as the worker's role | required |
 | `PUSH_MESSAGE_SVC_URL` | Accounts gRPC URL of message-svc, `http://host:50052` (plain `http://` only: the worker is built without TLS) | required |
 | `PUSH_ACCOUNTS_TOKEN` | message-svc's token for its `Accounts` API, the same value as message-svc's | required |
-| `PUSH_EMAIL_SENDER` | `log` (logs instead of sending) or `resend` | `log` |
+| `PUSH_EMAIL_SENDER` | `log` (logs instead of sending), `resend`, or `none` (no email at all, for Microsoft Entra ID-only installations: an `email.send` job is buried unsent; refused with `PUSH_RESEND_WEBHOOK_SECRET` or the mailbox) | `log` |
 | `PUSH_EMAIL_FROM` | the From of every email, `Push Messenger <no-reply@push.kubegames.dk>` | required for `resend` |
 | `PUSH_EMAIL_PRODUCT_NAME` | the name emails sign with | `Push Messenger` |
 | `PUSH_RESEND_API_KEY` | Resend API key | required for `resend` |

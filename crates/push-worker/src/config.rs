@@ -11,6 +11,9 @@ use push_store::{DatabaseTarget, DatabaseVars, StoreOptions, postgres_auth};
 pub enum Sender {
     /// Logs each email instead of sending it (local development).
     Log,
+    /// No email at all (`none`): Microsoft Entra ID-only installations write none. An
+    /// `email.send` job is buried unsent.
+    Off,
     /// Resend's API.
     Resend { api_url: String, api_key: String },
 }
@@ -19,6 +22,7 @@ impl std::fmt::Debug for Sender {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Log => formatter.write_str("Log"),
+            Self::Off => formatter.write_str("Off"),
             Self::Resend { api_url, .. } => formatter
                 .debug_struct("Resend")
                 .field("api_url", api_url)
@@ -46,7 +50,7 @@ impl std::fmt::Debug for Sender {
 /// | `PUSH_RUN_MIGRATIONS` | `false` leaves the migrations to `push-worker migrate` | `true` |
 /// | `PUSH_MESSAGE_SVC_URL` | Accounts gRPC URL of message-svc, `http://host:50052` (plain `http://` only: the worker is built without TLS) | required |
 /// | `PUSH_ACCOUNTS_TOKEN` | the token message-svc requires for its `Accounts` API, 32 to 256 visible ASCII characters | required |
-/// | `PUSH_EMAIL_SENDER` | `log` (logs instead of sending) or `resend` | `log` |
+/// | `PUSH_EMAIL_SENDER` | `log` (logs instead of sending), `resend`, or `none` (no email: an `email.send` job is buried unsent; no webhook, no mailbox) | `log` |
 /// | `PUSH_EMAIL_FROM` | the From of every email, `Push Messenger <no-reply@push.kubegames.dk>` | required for `resend` |
 /// | `PUSH_EMAIL_PRODUCT_NAME` | the name emails sign with; no control characters, since it goes into the subject | `Push Messenger` |
 /// | `PUSH_RESEND_API_KEY` | Resend API key | required for `resend` |
@@ -180,6 +184,7 @@ impl Config {
         }
         let sender = match set("PUSH_EMAIL_SENDER").as_deref() {
             None | Some("log") => Sender::Log,
+            Some("none") => Sender::Off,
             Some("resend") => {
                 let api_url = set("PUSH_RESEND_API_URL")
                     .unwrap_or_else(|| push_email::RESEND_API_URL.to_owned());
@@ -201,12 +206,12 @@ impl Config {
                 return Err(ConfigError::Invalid {
                     name: "PUSH_EMAIL_SENDER",
                     value: other.to_owned(),
-                    reason: "use log or resend".to_owned(),
+                    reason: "use log, resend or none".to_owned(),
                 });
             }
         };
         let from = match sender {
-            Sender::Log => set("PUSH_EMAIL_FROM").unwrap_or_default(),
+            Sender::Log | Sender::Off => set("PUSH_EMAIL_FROM").unwrap_or_default(),
             Sender::Resend { .. } => required("PUSH_EMAIL_FROM")?,
         };
         if from.chars().any(char::is_control) {
@@ -231,6 +236,12 @@ impl Config {
         if let Some(secret) = &webhook_secret {
             push_email::ResendWebhooks::new(secret)
                 .map_err(|reason| redacted("PUSH_RESEND_WEBHOOK_SECRET", reason))?;
+        }
+        if webhook_secret.is_some() && sender == Sender::Off {
+            return Err(redacted(
+                "PUSH_RESEND_WEBHOOK_SECRET",
+                "no email is sent with PUSH_EMAIL_SENDER=none, so there is no webhook".to_owned(),
+            ));
         }
         let poll_ms: u64 = parsed(&lookup, "PUSH_WORKER_POLL_MS", 1000)?;
         let unverified_days: u64 = parsed(&lookup, "PUSH_UNVERIFIED_ACCOUNT_DAYS", 7)?;
@@ -692,5 +703,22 @@ mod tests {
         assert!(!shown.contains("MfKQ"), "{shown}");
         assert!(!shown.contains(TOKEN), "{shown}");
         assert!(shown.contains("http://message-svc:50051"), "{shown}");
+    }
+
+    #[test]
+    fn email_can_be_off_without_a_webhook_or_a_mailbox() {
+        let off = config(&with(&[("PUSH_EMAIL_SENDER", "none")])).unwrap();
+        assert_eq!(off.sender, Sender::Off);
+        assert_eq!(format!("{:?}", off.sender), "Off");
+        for extra in [
+            ("PUSH_RESEND_WEBHOOK_SECRET", SECRET),
+            ("PUSH_DEV_MAILBOX", "1"),
+        ] {
+            let result = config(&with(&[("PUSH_EMAIL_SENDER", "none"), extra]));
+            assert!(
+                matches!(result, Err(ConfigError::Invalid { name, .. }) if name == extra.0),
+                "{extra:?}"
+            );
+        }
     }
 }

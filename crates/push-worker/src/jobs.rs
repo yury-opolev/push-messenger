@@ -10,7 +10,7 @@ use crate::queue::{Job, Outcome};
 #[derive(Debug, Clone)]
 pub struct Jobs {
     accounts: Accounts,
-    mailer: Mailer,
+    mailer: Option<Mailer>,
     cleanup: Option<Cleanup>,
 }
 
@@ -18,7 +18,16 @@ impl Jobs {
     pub fn new(accounts: Accounts, mailer: Mailer) -> Self {
         Self {
             accounts,
-            mailer,
+            mailer: Some(mailer),
+            cleanup: None,
+        }
+    }
+
+    /// The jobs of a worker that sends no email (`PUSH_EMAIL_SENDER=none`).
+    pub fn without_email(accounts: Accounts) -> Self {
+        Self {
+            accounts,
+            mailer: None,
             cleanup: None,
         }
     }
@@ -35,7 +44,14 @@ impl Jobs {
     /// kind, is poison.
     pub async fn run(&self, job: &Job) -> Outcome {
         if job.kind == "email.send" {
-            return self.mailer.send(job).await;
+            return match &self.mailer {
+                Some(mailer) => mailer.send(job).await,
+                // Buried without its link, like any poison (queue.rs).
+                None => Outcome::Poison(
+                    "email.send: email is off (PUSH_EMAIL_SENDER=none); nothing sends it"
+                        .to_owned(),
+                ),
+            };
         }
         if let Some(cleanup) = &self.cleanup {
             if let Some(outcome) = cleanup.run(&job.kind).await {
@@ -47,5 +63,36 @@ impl Jobs {
             Some(Err(reason)) => Outcome::Poison(reason),
             None => Outcome::Poison(format!("no handler for jobs of kind {:?}", job.kind)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::Utc;
+    use serde_json::json;
+    use uuid::Uuid;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn without_email_an_email_job_is_buried_unsent() {
+        let accounts =
+            Accounts::new("http://127.0.0.1:1", "accounts-token-of-the-jobs-tests").unwrap();
+        let job = Job {
+            id: Uuid::now_v7(),
+            kind: "email.send".to_owned(),
+            payload: json!({
+                "to": "a@example.com",
+                "template": "verify_email",
+                "params": {"link": "https://push.example/v1/auth/verify?token=t"},
+            }),
+            attempts: 1,
+            claimed_at: Utc::now(),
+        };
+        let outcome = Jobs::without_email(accounts).run(&job).await;
+        assert!(
+            matches!(&outcome, Outcome::Poison(reason) if reason.contains("PUSH_EMAIL_SENDER=none")),
+            "{outcome:?}"
+        );
     }
 }
