@@ -26,11 +26,13 @@ pub fn spawn<E: std::fmt::Debug + Send + 'static>(
     tokio::spawn(async move { server.await.map_err(|error| format!("{error:?}")) })
 }
 
-/// A variable lookup over `variables`, as each service's `Config::from_lookup` takes.
+/// A variable lookup over `variables`, as each service's `Config::from_lookup` takes. A
+/// later entry wins, so a test can override what `Stack` sets.
 pub fn lookup(variables: Vec<(String, String)>) -> impl Fn(&str) -> Option<String> {
     move |name| {
         variables
             .iter()
+            .rev()
             .find(|(key, _)| key == name)
             .map(|(_, value)| value.clone())
     }
@@ -50,6 +52,73 @@ pub struct Datastores {
     pub message_svc: Vec<(String, String)>,
     pub gateway: Vec<(String, String)>,
     pub worker: Vec<(String, String)>,
+}
+
+/// The containers the stack runs on; they stop when dropped.
+pub type Containers = (
+    testcontainers_modules::testcontainers::ContainerAsync<
+        testcontainers_modules::postgres::Postgres,
+    >,
+    testcontainers_modules::testcontainers::ContainerAsync<testcontainers_modules::redis::Redis>,
+);
+
+/// Password-mode PostgreSQL and Redis in containers (Docker must be running), with
+/// databases for auth-svc and the worker as the chart creates them.
+pub async fn password_datastores() -> (Datastores, Containers) {
+    use testcontainers_modules::postgres::Postgres;
+    use testcontainers_modules::redis::Redis;
+    use testcontainers_modules::testcontainers::ImageExt;
+    use testcontainers_modules::testcontainers::runners::AsyncRunner;
+
+    let postgres = Postgres::default()
+        .with_tag("17-alpine")
+        .start()
+        .await
+        .expect("start Postgres (is Docker running?)");
+    let redis = Redis::default()
+        .with_tag("7-alpine")
+        .start()
+        .await
+        .expect("start Redis");
+    let port = postgres.get_host_port_ipv4(5432).await.unwrap();
+    let database_url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+    let redis_url = format!(
+        "redis://127.0.0.1:{}",
+        redis.get_host_port_ipv4(6379).await.unwrap()
+    );
+    // auth-svc and the worker have databases of their own in the same server, as in the
+    // chart; the worker's role may also drain auth-svc's outbox, which auth-svc grants.
+    let admin = sqlx::PgPool::connect(&database_url).await.unwrap();
+    for statement in [
+        "CREATE DATABASE push_auth",
+        "CREATE ROLE push_worker LOGIN PASSWORD 'worker-secret'",
+        "CREATE DATABASE push_worker OWNER push_worker",
+    ] {
+        sqlx::query(statement).execute(&admin).await.unwrap();
+    }
+    admin.close().await;
+    let auth_database_url = format!("postgres://postgres:postgres@127.0.0.1:{port}/push_auth");
+    let worker_server = format!("postgres://push_worker:worker-secret@127.0.0.1:{port}");
+    let datastores = Datastores {
+        auth: owned(&[
+            ("PUSH_DATABASE_URL", &auth_database_url),
+            ("PUSH_REDIS_URL", &redis_url),
+            ("PUSH_AUTH_WORKER_ROLE", "push_worker"),
+        ]),
+        message_svc: owned(&[
+            ("PUSH_DATABASE_URL", &database_url),
+            ("PUSH_REDIS_URL", &redis_url),
+        ]),
+        gateway: owned(&[("PUSH_REDIS_URL", &redis_url)]),
+        worker: owned(&[
+            ("PUSH_DATABASE_URL", &format!("{worker_server}/push_worker")),
+            (
+                "PUSH_AUTH_DATABASE_URL",
+                &format!("{worker_server}/push_auth"),
+            ),
+        ]),
+    };
+    (datastores, (postgres, redis))
 }
 
 pub struct Stack {

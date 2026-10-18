@@ -8,82 +8,16 @@ mod common;
 
 use std::time::Duration;
 
-use common::{Datastores, Stack};
+use common::{Containers, Stack};
 use push_load::config::{PrepareOptions, RunOptions, Target as LoadTarget};
 use push_load::report::Status;
 use push_load::state::State;
 use push_smoke::run;
-use testcontainers_modules::postgres::Postgres;
-use testcontainers_modules::redis::Redis;
-use testcontainers_modules::testcontainers::runners::AsyncRunner;
-use testcontainers_modules::testcontainers::{ContainerAsync, ImageExt};
-
-/// The containers the stack runs on; they stop when dropped.
-type Containers = (ContainerAsync<Postgres>, ContainerAsync<Redis>);
 
 /// The stack on password-mode datastores in containers.
 async fn start() -> (Stack, Containers) {
-    let postgres = Postgres::default()
-        .with_tag("17-alpine")
-        .start()
-        .await
-        .expect("start Postgres (is Docker running?)");
-    let redis = Redis::default()
-        .with_tag("7-alpine")
-        .start()
-        .await
-        .expect("start Redis");
-    let database_url = format!(
-        "postgres://postgres:postgres@127.0.0.1:{}/postgres",
-        postgres.get_host_port_ipv4(5432).await.unwrap()
-    );
-    let redis_url = format!(
-        "redis://127.0.0.1:{}",
-        redis.get_host_port_ipv4(6379).await.unwrap()
-    );
-
-    // auth-svc and the worker have databases of their own in the same server, as in the
-    // chart; the worker's role may also drain auth-svc's outbox, which auth-svc grants.
-    let admin = sqlx::PgPool::connect(&database_url).await.unwrap();
-    for statement in [
-        "CREATE DATABASE push_auth",
-        "CREATE ROLE push_worker LOGIN PASSWORD 'worker-secret'",
-        "CREATE DATABASE push_worker OWNER push_worker",
-    ] {
-        sqlx::query(statement).execute(&admin).await.unwrap();
-    }
-    admin.close().await;
-    let (server_url, _) = database_url.rsplit_once('/').unwrap();
-    let auth_database_url = format!("{server_url}/push_auth");
-    let worker_server = format!(
-        "postgres://push_worker:worker-secret@127.0.0.1:{}",
-        postgres.get_host_port_ipv4(5432).await.unwrap()
-    );
-    let pairs = |variables: &[(&str, &str)]| -> Vec<(String, String)> {
-        variables
-            .iter()
-            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
-            .collect()
-    };
-    let worker_database_url = format!("{worker_server}/push_worker");
-    let worker_auth_database_url = format!("{worker_server}/push_auth");
-    let datastores = Datastores {
-        auth: pairs(&[
-            ("PUSH_DATABASE_URL", &auth_database_url),
-            ("PUSH_REDIS_URL", &redis_url),
-            ("PUSH_AUTH_WORKER_ROLE", "push_worker"),
-        ]),
-        message_svc: pairs(&[
-            ("PUSH_DATABASE_URL", &database_url),
-            ("PUSH_REDIS_URL", &redis_url),
-        ]),
-        gateway: pairs(&[("PUSH_REDIS_URL", &redis_url)]),
-        worker: pairs(&[
-            ("PUSH_DATABASE_URL", &worker_database_url),
-            ("PUSH_AUTH_DATABASE_URL", &worker_auth_database_url),
-        ]),
-    };
-    (Stack::start(datastores).await, (postgres, redis))
+    let (datastores, containers) = common::password_datastores().await;
+    (Stack::start(datastores).await, containers)
 }
 
 #[tokio::test]

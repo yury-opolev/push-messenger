@@ -31,7 +31,7 @@ uuid.workspace = true
 [dev-dependencies]
 push-credentials = { workspace = true, features = ["testing"] }
 tokio = { workspace = true, features = ["io-util"] }
-push-auth.workspace = true
+push-auth = { workspace = true, features = ["testing"] }
 push-gateway.workspace = true
 push-message-svc.workspace = true
 push-store.workspace = true
