@@ -4,12 +4,14 @@
 //! email addresses are never logged.
 
 mod claims;
+mod keys;
 mod settings;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 
 use uuid::Uuid;
 
+pub use keys::KeyTiming;
 pub use settings::{
     CONSUMERS_TENANT, DEFAULT_AUTHORITY_HOST, DEFAULT_REQUIRED_SCOPE, EntraSettings, Providers,
     Tenants,
