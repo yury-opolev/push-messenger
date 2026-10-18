@@ -206,6 +206,17 @@ int32_t push_client_sign_in(const PushClient *client,
                             char **account_json,
                             PushError **error);
 
+// Signs in on this device with a Microsoft Entra ID access token the app obtained (MSAL);
+// `handle_name` (may be NULL) names the account on its first sign-in only. `*account_json`
+// gets `{"userId", "deviceId"}`. Then connect. The token is never stored or logged.
+int32_t push_client_sign_in_with_entra(const PushClient *client,
+                                       const char *access_token,
+                                       const char *handle_name,
+                                       const char *device_name,
+                                       const char *platform,
+                                       char **account_json,
+                                       PushError **error);
+
 // The signed-in account as `{"userId", "deviceId"}`, or `null`.
 int32_t push_client_account(const PushClient *client, char **account_json, PushError **error);
 
@@ -380,6 +391,14 @@ int32_t push_client_lookup(const PushClient *client,
                            const char *handle_name,
                            char **profile_json,
                            PushError **error);
+
+// Changes the user's display name, handle or both; NULL leaves one as it is (at least
+// one must be given). `*profile_json` gets the profile after the change.
+int32_t push_client_update_profile(const PushClient *client,
+                                   const char *display_name,
+                                   const char *handle_name,
+                                   char **profile_json,
+                                   PushError **error);
 
 // The account's devices, as a JSON array.
 int32_t push_client_devices(const PushClient *client, char **devices_json, PushError **error);

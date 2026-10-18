@@ -95,6 +95,45 @@ pub unsafe extern "C" fn push_client_sign_in(
     })
 }
 
+/// Signs in on this device with a Microsoft Entra ID access token the app obtained (MSAL);
+/// `handle_name` (may be NULL) names the account on its first sign-in only. `*account_json`
+/// gets `{"userId", "deviceId"}`. Then connect. The token is never stored or logged.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn push_client_sign_in_with_entra(
+    client: *const PushClient,
+    access_token: *const c_char,
+    handle_name: *const c_char,
+    device_name: *const c_char,
+    platform: *const c_char,
+    account_json: *mut *mut c_char,
+    error: *mut *mut PushError,
+) -> i32 {
+    guard(error, || {
+        let out = place(account_json, "account_json")?;
+        let this = unsafe { handle(client) }?;
+        let access_token = unsafe { text(access_token, "access_token") }?;
+        let handle_name = if handle_name.is_null() {
+            None
+        } else {
+            Some(unsafe { text(handle_name, "handle_name") }?)
+        };
+        let (device_name, platform) = unsafe {
+            (
+                text(device_name, "device_name")?,
+                text(platform, "platform")?,
+            )
+        };
+        let platform = json::platform(platform)?;
+        let account =
+            wait(
+                this.client
+                    .sign_in_with_entra(access_token, handle_name, device_name, platform),
+            )?;
+        put_json(out, &json::account(&account));
+        Ok(())
+    })
+}
+
 /// The signed-in account as `{"userId", "deviceId"}`, or `null`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn push_client_account(
@@ -649,6 +688,35 @@ pub unsafe extern "C" fn push_client_lookup(
         let this = unsafe { handle(client) }?;
         let handle_name = unsafe { text(handle_name, "handle_name") }?;
         let profile = wait(this.client.lookup(handle_name))?;
+        put_json(out, &json::profile(&profile));
+        Ok(())
+    })
+}
+
+/// Changes the user's display name, handle or both; NULL leaves one as it is (at least
+/// one must be given). `*profile_json` gets the profile after the change.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn push_client_update_profile(
+    client: *const PushClient,
+    display_name: *const c_char,
+    handle_name: *const c_char,
+    profile_json: *mut *mut c_char,
+    error: *mut *mut PushError,
+) -> i32 {
+    guard(error, || {
+        let out = place(profile_json, "profile_json")?;
+        let this = unsafe { handle(client) }?;
+        let display_name = if display_name.is_null() {
+            None
+        } else {
+            Some(unsafe { text(display_name, "display_name") }?)
+        };
+        let handle_name = if handle_name.is_null() {
+            None
+        } else {
+            Some(unsafe { text(handle_name, "handle_name") }?)
+        };
+        let profile = wait(this.client.update_profile(display_name, handle_name))?;
         put_json(out, &json::profile(&profile));
         Ok(())
     })

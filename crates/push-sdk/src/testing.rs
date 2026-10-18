@@ -11,7 +11,7 @@ use axum::Json;
 use axum::Router;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::routing::{delete, post};
+use axum::routing::{delete, patch, post};
 use futures_util::{SinkExt, StreamExt};
 use push_domain::{ConversationId, DeviceId, UserId};
 use push_proto::v1::frame::Body;
@@ -135,10 +135,18 @@ pub struct FakeAuth {
     pub registration_ids: Arc<Mutex<Vec<String>>>,
     /// Sign-ups answered.
     pub signups: Arc<AtomicUsize>,
+    /// Every `POST /v1/auth/entra` body, in order.
+    pub entra_bodies: Arc<Mutex<Vec<Value>>>,
 }
 
 /// The password [`FakeAuth`] refuses with `invalid_credentials`; it accepts any other.
 pub const WRONG_PASSWORD: &str = "wrong password";
+
+/// The Entra ID token [`FakeAuth`] refuses with `entra_token_invalid`; it accepts any other.
+pub const WRONG_ENTRA_TOKEN: &str = "refused-entra-token";
+
+/// The handle [`FakeAuth`] refuses with `handle_taken`; it accepts any other.
+pub const TAKEN_HANDLE: &str = "taken";
 
 impl FakeAuth {
     pub async fn start() -> Self {
@@ -153,6 +161,8 @@ impl FakeAuth {
         let registration_ids = Arc::new(Mutex::new(Vec::new()));
         let signups = Arc::new(AtomicUsize::new(0));
         let signed_up = signups.clone();
+        let entra_bodies = Arc::new(Mutex::new(Vec::new()));
+        let bodies = entra_bodies.clone();
         let identity = Arc::new(Mutex::new((user, device)));
         let current = identity.clone();
         let tokens = move |n: usize| {
@@ -177,8 +187,8 @@ impl FakeAuth {
             spend_next_registration.clone(),
             registration_ids.clone(),
         );
-        let (login_tokens, device_tokens, refresh_tokens) =
-            (tokens.clone(), tokens.clone(), tokens);
+        let (login_tokens, device_tokens, entra_tokens, refresh_tokens) =
+            (tokens.clone(), tokens.clone(), tokens.clone(), tokens);
         let router = Router::new()
             .route(
                 "/v1/auth/login",
@@ -192,6 +202,25 @@ impl FakeAuth {
                         if body.get("device_id").is_some() {
                             let n = logins.fetch_add(1, Ordering::SeqCst) + 100;
                             Json(tokens(n)).into_response()
+                        } else {
+                            Json(json!({"registration_token": "registration", "expires_in_s": 300}))
+                                .into_response()
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/v1/auth/entra",
+                post(move |Json(body): Json<Value>| {
+                    let (bodies, tokens) = (bodies.clone(), entra_tokens.clone());
+                    async move {
+                        bodies.lock().unwrap().push(body.clone());
+                        if body["token"] == WRONG_ENTRA_TOKEN {
+                            let error = json!({"error": {"code": "entra_token_invalid", "message": "the Microsoft Entra ID token is not accepted", "retryable": false}});
+                            return (StatusCode::UNAUTHORIZED, Json(error)).into_response();
+                        }
+                        if body.get("device_id").is_some() {
+                            Json(tokens(200)).into_response()
                         } else {
                             Json(json!({"registration_token": "registration", "expires_in_s": 300}))
                                 .into_response()
@@ -254,6 +283,27 @@ impl FakeAuth {
             )
             .route("/v1/auth/verify/resend", post(|| async { StatusCode::ACCEPTED }))
             .route("/v1/auth/password/forgot", post(|| async { StatusCode::ACCEPTED }));
+        let current_user = identity.clone();
+        let router = router.route(
+            "/v1/users/me",
+            patch(move |Json(body): Json<Value>| {
+                let current_user = current_user.clone();
+                async move {
+                    if body["handle"] == TAKEN_HANDLE {
+                        let error = json!({"error": {"code": "handle_taken", "message": "this handle is taken", "retryable": false}});
+                        return (StatusCode::CONFLICT, Json(error)).into_response();
+                    }
+                    let (user, _) = *current_user.lock().unwrap();
+                    Json(json!({
+                        "user_id": user,
+                        "handle": body["handle"].as_str().unwrap_or("alice"),
+                        "display_name": body["display_name"].as_str().unwrap_or("Alice"),
+                        "email": null,
+                    }))
+                    .into_response()
+                }
+            }),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
@@ -271,6 +321,7 @@ impl FakeAuth {
             spend_next_registration,
             registration_ids,
             signups,
+            entra_bodies,
         }
     }
 }

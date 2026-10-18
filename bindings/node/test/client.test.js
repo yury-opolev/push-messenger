@@ -108,6 +108,29 @@ test('errors carry the SDK codes', async () => {
   await assert.rejects(Client.open(config(), { load() {} }), code('invalid'));
 });
 
+test('signs in with an Entra ID access token the app obtained', async () => {
+  const client = await Client.open(config(), memoryStore());
+  const account = await client.signInWithEntra('entra-access-token', 'erin', 'node test', 'desktop');
+  assert.equal(account.userId, fakes.userId);
+  await assert.rejects(
+    client.signInWithEntra('refused-entra-token', null, 'node test', 'desktop'),
+    code('entra_token_invalid'),
+  );
+  await client.close();
+});
+
+test('changes the handle and the display name, and reports a taken handle', async () => {
+  const client = await Client.open(config(), memoryStore());
+  await client.signIn('a@example.com', 'password', 'node test', 'desktop');
+  const profile = await client.updateProfile(null, 'erin');
+  assert.equal(profile.handle, 'erin');
+  assert.equal(profile.userId, fakes.userId);
+  assert.equal((await client.updateProfile('Erin E.', null)).displayName, 'Erin E.');
+  await assert.rejects(client.updateProfile(null, 'taken'), code('handle_taken'));
+  await assert.rejects(client.updateProfile(null, null), code('invalid'));
+  await client.close();
+});
+
 test('an encrypted database opens only with its key', async () => {
   const salt = newSalt();
   assert.equal(salt.length, 16);

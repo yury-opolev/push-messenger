@@ -6,16 +6,22 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use sqlx::{PgConnection, Row};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::error::AuthError;
-use crate::links::{Purpose, password_stamp};
+use crate::links::{LinkClaims, Purpose, password_stamp};
 use crate::outbox::{self, Event};
 use crate::rules::{self, Platform};
 use crate::service::{Auth, unix_now};
 use crate::tokens::{
     ACCESS_TOKEN_TTL, REFRESH_TOKEN_TTL, TokenError, new_refresh_token, refresh_hash,
 };
+
+/// Devices revoked per transaction by the Entra ID-only sweep.
+const SWEEP_BATCH: i64 = 500;
+/// How soon the sweep looks again at password devices another transaction held.
+const SWEEP_RETRY: Duration = Duration::from_millis(250);
 
 /// Most active devices per account (spec §5.3).
 pub const MAX_ACTIVE_DEVICES: i64 = 10;
@@ -59,20 +65,25 @@ impl Auth {
     /// first (after the account row, where that is locked): the caller holds it, so the
     /// `last_seen_at` update below takes no second lock, and a revocation, which sees
     /// the tokens as of after it got the lock, cannot miss a token inserted here.
-    async fn issue(
+    pub(crate) async fn issue(
         &self,
         connection: &mut PgConnection,
         user_id: Uuid,
         device_id: Uuid,
+        session_expires_at: Option<i64>,
     ) -> Result<Tokens, AuthError> {
         let refresh_token = new_refresh_token();
+        let full = REFRESH_TOKEN_TTL.as_secs() as i64;
+        // A refresh token never outlives the device's session (spec D8).
+        let refresh_seconds =
+            session_expires_at.map_or(full, |end| (end - unix_now()).clamp(0, full));
         sqlx::query(
             "INSERT INTO auth.refresh_token (token_hash, device_id, expires_at) \
              VALUES ($1, $2, now() + make_interval(secs => $3))",
         )
         .bind(refresh_hash(&refresh_token).as_slice())
         .bind(device_id)
-        .bind(REFRESH_TOKEN_TTL.as_secs() as f64)
+        .bind(refresh_seconds as f64)
         .execute(&mut *connection)
         .await?;
         sqlx::query("UPDATE auth.device SET last_seen_at = now() WHERE device_id = $1")
@@ -86,7 +97,7 @@ impl Auth {
             access_token,
             access_expires_in_s: ACCESS_TOKEN_TTL.as_secs() as i64,
             refresh_token,
-            refresh_expires_in_s: REFRESH_TOKEN_TTL.as_secs() as i64,
+            refresh_expires_in_s: refresh_seconds,
         })
     }
 
@@ -102,8 +113,9 @@ impl Auth {
     /// [`MAX_ACTIVE_DEVICES`] active devices. The account row is locked, so concurrent
     /// registrations cannot pass the limit together and retries of one are serialised.
     ///
-    /// The token binds the password hash of the sign-in that made it: after a password
-    /// reset it registers nothing.
+    /// The token binds the password hash of the sign-in that made it (after a password
+    /// reset it registers nothing), or the Entra ID identity that signed in, whose session
+    /// end the device takes (spec D7, D8).
     pub async fn register_device(
         &self,
         registration_token: &str,
@@ -115,7 +127,6 @@ impl Auth {
             .links
             .verify(registration_token, Purpose::Register, unix_now())
             .map_err(|_| AuthError::Unauthorized)?;
-        let stamp = claims.pw.ok_or(AuthError::Unauthorized)?;
         let name = rules::device_name(name)?;
         let platform = Platform::parse(platform)?;
         let mut tx = self.pool.begin().await?;
@@ -129,10 +140,9 @@ impl Auth {
         let Some(account) = account else {
             return Err(AuthError::Unauthorized);
         };
-        let password_hash: String = account.get(0);
-        if password_stamp(&password_hash) != stamp {
-            return Err(AuthError::Unauthorized);
-        }
+        let session = self
+            .registration_binding(&mut tx, &claims, account.get(0))
+            .await?;
         if !account.get::<bool, _>(1) {
             return Err(AuthError::EmailNotVerified);
         }
@@ -149,8 +159,9 @@ impl Auth {
             if !earlier.get::<bool, _>(1) {
                 return Err(AuthError::DeviceNotFound);
             }
+            set_session(&mut tx, device_id, session).await?;
             revoke_refresh_tokens(&mut tx, device_id).await?;
-            let tokens = self.issue(&mut tx, claims.sub, device_id).await?;
+            let tokens = self.issue(&mut tx, claims.sub, device_id, session).await?;
             tx.commit().await?;
             return Ok(tokens);
         }
@@ -165,17 +176,19 @@ impl Auth {
         }
         let device_id = Uuid::now_v7();
         sqlx::query(
-            "INSERT INTO auth.device (device_id, user_id, name, platform, registration_id) \
-             VALUES ($1, $2, $3, $4, $5)",
+            "INSERT INTO auth.device \
+             (device_id, user_id, name, platform, registration_id, session_expires_at) \
+             VALUES ($1, $2, $3, $4, $5, $6)",
         )
         .bind(device_id)
         .bind(claims.sub)
         .bind(&name)
         .bind(platform.as_str())
         .bind(registration_id)
+        .bind(session)
         .execute(&mut *tx)
         .await?;
-        let tokens = self.issue(&mut tx, claims.sub, device_id).await?;
+        let tokens = self.issue(&mut tx, claims.sub, device_id, session).await?;
         let event = Event::DeviceRegistered {
             user_id: claims.sub,
             device_id,
@@ -208,7 +221,7 @@ impl Auth {
             return Err(AuthError::DeviceNotFound);
         }
         revoke_refresh_tokens(&mut tx, device_id).await?;
-        let tokens = self.issue(&mut tx, user_id, device_id).await?;
+        let tokens = self.issue(&mut tx, user_id, device_id, None).await?;
         tx.commit().await?;
         Ok(tokens)
     }
@@ -237,7 +250,10 @@ impl Auth {
             return Err(AuthError::Unauthorized);
         };
         let device = sqlx::query(
-            "SELECT user_id, revoked_at IS NULL FROM auth.device WHERE device_id = $1 FOR UPDATE",
+            "SELECT device.user_id, device.revoked_at IS NULL, device.session_expires_at, \
+             account.password_hash IS NOT NULL \
+             FROM auth.device AS device JOIN auth.user_account AS account USING (user_id) \
+             WHERE device.device_id = $1 FOR UPDATE OF device",
         )
         .bind(device_id)
         .fetch_optional(&mut *tx)
@@ -247,6 +263,20 @@ impl Auth {
         };
         let user_id: Uuid = device.get(0);
         if !device.get::<bool, _>(1) {
+            return Err(AuthError::Unauthorized);
+        }
+        // An Entra-backed device past its maximum age signs in with Entra ID again; the
+        // device and its tokens stay as they are (spec D8).
+        let session: Option<i64> = device.get(2);
+        if session.is_some_and(|end| end <= unix_now()) {
+            return Err(AuthError::SessionExpired);
+        }
+        // Entra ID only: password sessions ended with the switch (spec D16). The sweep
+        // may not have reached this device (it skips rows that are locked, as this one is
+        // now), so it is revoked here, with `device.revoked` to close its connections.
+        if device.get::<bool, _>(3) && !self.password_enabled() {
+            revoke_devices(&mut tx, &[(user_id, device_id)]).await?;
+            tx.commit().await?;
             return Err(AuthError::Unauthorized);
         }
         // Read again under the device lock: what the first look saw may have changed. The
@@ -270,7 +300,7 @@ impl Auth {
             return Err(AuthError::Unauthorized);
         }
         let Some(successor) = rotated_to else {
-            let tokens = self.issue(&mut tx, user_id, device_id).await?;
+            let tokens = self.issue(&mut tx, user_id, device_id, session).await?;
             sqlx::query(
                 "UPDATE auth.refresh_token SET rotated_to = $2, rotated_at = statement_timestamp() \
                  WHERE token_hash = $1",
@@ -305,7 +335,7 @@ impl Auth {
             tx.commit().await?;
             return Err(AuthError::Unauthorized);
         }
-        let tokens = self.issue(&mut tx, user_id, device_id).await?;
+        let tokens = self.issue(&mut tx, user_id, device_id, session).await?;
         let new_hash = refresh_hash(&tokens.refresh_token);
         sqlx::query(
             "UPDATE auth.refresh_token SET rotated_to = $2, rotated_at = NULL \
@@ -336,8 +366,9 @@ impl Auth {
                 TokenError::Expired => AuthError::TokenExpired,
                 TokenError::Invalid => AuthError::Unauthorized,
             })?;
-        let reset_at: Option<Option<i64>> = sqlx::query_scalar(
-            "SELECT account.password_reset_at FROM auth.device AS device \
+        let account: Option<(Option<i64>, bool)> = sqlx::query_as(
+            "SELECT account.password_reset_at, account.password_hash IS NOT NULL \
+             FROM auth.device AS device \
              JOIN auth.user_account AS account ON account.user_id = device.user_id \
              WHERE device.device_id = $1 AND device.user_id = $2 \
              AND device.revoked_at IS NULL",
@@ -346,9 +377,14 @@ impl Auth {
         .bind(claims.sub)
         .fetch_optional(&self.pool)
         .await?;
-        match reset_at {
+        match account {
             None => return Err(AuthError::Unauthorized),
-            Some(Some(reset_at)) if claims.iat <= reset_at => return Err(AuthError::Unauthorized),
+            Some((Some(reset_at), _)) if claims.iat <= reset_at => {
+                return Err(AuthError::Unauthorized);
+            }
+            // Entra ID only: a password device the sweep has not reached yet is refused
+            // all the same (spec D16).
+            Some((_, true)) if !self.password_enabled() => return Err(AuthError::Unauthorized),
             Some(_) => {}
         }
         Ok(Caller {
@@ -405,9 +441,129 @@ impl Auth {
         tx.commit().await?;
         Ok(())
     }
+
+    /// What a registration token is bound to (spec D7): the password hash of its sign-in
+    /// (`None`: no session end), or the Entra ID identity that signed in (`Some`: the
+    /// session end it carries). A token bound to neither or to both, to a changed password,
+    /// to another account's identity, or to a way of signing in the service no longer
+    /// offers registers nothing.
+    async fn registration_binding(
+        &self,
+        connection: &mut PgConnection,
+        claims: &LinkClaims,
+        password_hash: Option<String>,
+    ) -> Result<Option<i64>, AuthError> {
+        match (&claims.pw, claims.xid, claims.sx) {
+            (Some(stamp), None, None) if self.password_enabled() => {
+                if password_hash.is_some_and(|hash| password_stamp(&hash) == *stamp) {
+                    Ok(None)
+                } else {
+                    Err(AuthError::Unauthorized)
+                }
+            }
+            (None, Some(identity), Some(session)) if self.entra().is_some() => {
+                let bound = sqlx::query(
+                    "SELECT 1 FROM auth.external_identity WHERE identity_id = $1 AND user_id = $2",
+                )
+                .bind(identity)
+                .bind(claims.sub)
+                .fetch_optional(&mut *connection)
+                .await?;
+                if bound.is_some() {
+                    Ok(Some(session))
+                } else {
+                    Err(AuthError::Unauthorized)
+                }
+            }
+            _ => Err(AuthError::Unauthorized),
+        }
+    }
+
+    /// Signs `user_id` out of every device (spec D15): each active device is revoked with
+    /// its refresh tokens, and `device.revoked` closes its connections through the usual
+    /// relay. Returns how many devices were active. The account stays.
+    pub async fn revoke_user_sessions(&self, user_id: Uuid) -> Result<u64, AuthError> {
+        let mut tx = self.pool.begin().await?;
+        // The account row first, as registration locks it: a device registered meanwhile
+        // is either seen here or registered after this sign-out, never missed.
+        sqlx::query("SELECT 1 FROM auth.user_account WHERE user_id = $1 FOR UPDATE")
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+        // Device rows next, in a fixed order, like every other change to a device's tokens.
+        let devices: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT device_id FROM auth.device WHERE user_id = $1 AND revoked_at IS NULL \
+             ORDER BY device_id FOR UPDATE",
+        )
+        .bind(user_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        let pairs: Vec<(Uuid, Uuid)> = devices.iter().map(|device| (user_id, *device)).collect();
+        revoke_devices(&mut tx, &pairs).await?;
+        tx.commit().await?;
+        Ok(pairs.len() as u64)
+    }
+
+    /// Entra ID only (spec D16): revokes, in batches, the active devices of accounts that
+    /// sign in with a password, as an admin revocation does, until none is left. Rows
+    /// another transaction holds (another replica's sweep, a refresh, an old replica's
+    /// sign-in during a rolling update) are skipped and tried again shortly after, until a
+    /// look that skips nothing finds no such device; so several replicas share the work,
+    /// each device is revoked once, and none is missed. Returns how many this call revoked
+    /// (0 once nothing is left); when `shutdown` is cancelled it stops and returns what it
+    /// revoked so far.
+    pub async fn revoke_password_devices(
+        &self,
+        shutdown: &CancellationToken,
+    ) -> Result<u64, AuthError> {
+        let mut total = self.revoke_unlocked_password_devices().await?;
+        loop {
+            let left: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM auth.device AS device \
+                 JOIN auth.user_account AS account USING (user_id) \
+                 WHERE device.revoked_at IS NULL AND account.password_hash IS NOT NULL)",
+            )
+            .fetch_one(&self.pool)
+            .await?;
+            if !left {
+                return Ok(total);
+            }
+            tokio::select! {
+                () = shutdown.cancelled() => return Ok(total),
+                () = tokio::time::sleep(SWEEP_RETRY) => {}
+            }
+            total += self.revoke_unlocked_password_devices().await?;
+        }
+    }
+
+    /// One pass of [`Auth::revoke_password_devices`] over the rows nobody holds.
+    async fn revoke_unlocked_password_devices(&self) -> Result<u64, AuthError> {
+        let mut total = 0;
+        loop {
+            let mut tx = self.pool.begin().await?;
+            let rows = sqlx::query(
+                "SELECT device.user_id, device.device_id FROM auth.device AS device \
+                 JOIN auth.user_account AS account USING (user_id) \
+                 WHERE device.revoked_at IS NULL AND account.password_hash IS NOT NULL \
+                 ORDER BY device.device_id LIMIT $1 FOR UPDATE OF device SKIP LOCKED",
+            )
+            .bind(SWEEP_BATCH)
+            .fetch_all(&mut *tx)
+            .await?;
+            if rows.is_empty() {
+                tx.commit().await?;
+                return Ok(total);
+            }
+            let devices: Vec<(Uuid, Uuid)> =
+                rows.iter().map(|row| (row.get(0), row.get(1))).collect();
+            revoke_devices(&mut tx, &devices).await?;
+            tx.commit().await?;
+            total += devices.len() as u64;
+        }
+    }
 }
 
-async fn revoke_refresh_tokens(
+pub(crate) async fn revoke_refresh_tokens(
     connection: &mut PgConnection,
     device_id: Uuid,
 ) -> Result<(), AuthError> {
@@ -418,5 +574,56 @@ async fn revoke_refresh_tokens(
     .bind(device_id)
     .execute(connection)
     .await?;
+    Ok(())
+}
+
+/// Revokes `devices` (`(user, device)` pairs whose rows the caller has locked) and their
+/// refresh tokens, and writes `device.revoked` for each: message-svc then refuses their
+/// access tokens and the gateway closes their connections (4003).
+pub(crate) async fn revoke_devices(
+    connection: &mut PgConnection,
+    devices: &[(Uuid, Uuid)],
+) -> Result<(), AuthError> {
+    if devices.is_empty() {
+        return Ok(());
+    }
+    let ids: Vec<Uuid> = devices.iter().map(|(_, device)| *device).collect();
+    sqlx::query(
+        "UPDATE auth.device SET revoked_at = now() \
+         WHERE device_id = ANY($1) AND revoked_at IS NULL",
+    )
+    .bind(&ids)
+    .execute(&mut *connection)
+    .await?;
+    sqlx::query(
+        "UPDATE auth.refresh_token SET revoked_at = now() \
+         WHERE device_id = ANY($1) AND revoked_at IS NULL",
+    )
+    .bind(&ids)
+    .execute(&mut *connection)
+    .await?;
+    for (user_id, device_id) in devices {
+        let event = Event::DeviceRevoked {
+            user_id: *user_id,
+            device_id: *device_id,
+        };
+        outbox::write(&mut *connection, &event).await?;
+    }
+    Ok(())
+}
+
+/// Starts a new session for an Entra-backed device; nothing for a password device.
+pub(crate) async fn set_session(
+    connection: &mut PgConnection,
+    device_id: Uuid,
+    session: Option<i64>,
+) -> Result<(), AuthError> {
+    if let Some(session) = session {
+        sqlx::query("UPDATE auth.device SET session_expires_at = $2 WHERE device_id = $1")
+            .bind(device_id)
+            .bind(session)
+            .execute(connection)
+            .await?;
+    }
     Ok(())
 }

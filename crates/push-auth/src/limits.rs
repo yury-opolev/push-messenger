@@ -1,5 +1,5 @@
 //! Rate limits (spec §5.6): per account and per IP, on signup, login, verification resend,
-//! password reset, opening email links and handle lookup. Accounts are never locked; a
+//! password reset, opening email links and handle lookup, and on Entra ID sign-in. Accounts are never locked; a
 //! request over a limit is refused with `rate_limited` and a retry delay.
 //!
 //! Counters are fixed windows in Redis (`INCR`, then `EXPIRE … NX`), keyed by a hash of
@@ -36,6 +36,17 @@ pub enum Action {
     /// Opening a verification or reset link.
     OpenLink,
     HandleLookup,
+    /// `POST /v1/auth/entra`, counted per IP before the token is checked.
+    EntraSignIn,
+    /// `POST /v1/auth/entra`, counted per Entra ID identity once the token is accepted.
+    EntraAccount,
+    /// `PATCH /v1/users/me` with a handle: per IP and per user.
+    HandleChange,
+    /// The admin API with the admin token, per IP.
+    Admin,
+    /// Calls of the admin API without the right token, per IP; counted apart from
+    /// [`Action::Admin`], so they never lock the token's holder out.
+    AdminAuthFailure,
 }
 
 /// Whom a limit counts.
@@ -61,6 +72,7 @@ impl Scope {
 
 const HOUR: u64 = 3600;
 const QUARTER: u64 = 900;
+const DAY: u64 = 24 * HOUR;
 
 /// At most `max` requests per `seconds`.
 const fn per(max: u32, seconds: u64) -> Limit {
@@ -79,6 +91,11 @@ impl Action {
             Self::ForgotPassword => "forgot",
             Self::OpenLink => "link",
             Self::HandleLookup => "lookup",
+            Self::EntraSignIn => "entra",
+            Self::EntraAccount => "entra_account",
+            Self::HandleChange => "handle_change",
+            Self::Admin => "admin",
+            Self::AdminAuthFailure => "admin_auth_failure",
         }
     }
 
@@ -99,12 +116,25 @@ impl Action {
         // Spec §5.5: 20 lookups per hour per user.
         const LOOKUP: &[(Scope, Limit)] =
             &[(Scope::Ip, per(120, HOUR)), (Scope::Account, per(20, HOUR))];
+        // Like login per IP; per identity once the token is known to be good.
+        const ENTRA: &[(Scope, Limit)] = &[(Scope::Ip, per(60, QUARTER))];
+        const ENTRA_ACCOUNT: &[(Scope, Limit)] = &[(Scope::Account, per(20, QUARTER))];
+        // Handles are public names: a few changes a day, so nobody cycles through them.
+        const HANDLE_CHANGE: &[(Scope, Limit)] =
+            &[(Scope::Ip, per(30, HOUR)), (Scope::Account, per(5, DAY))];
+        const ADMIN: &[(Scope, Limit)] = &[(Scope::Ip, per(60, QUARTER))];
+        const ADMIN_AUTH_FAILURE: &[(Scope, Limit)] = &[(Scope::Ip, per(20, QUARTER))];
         match self {
             Self::Signup => SIGNUP,
             Self::Login => LOGIN,
             Self::ResendVerification | Self::ForgotPassword => EMAIL,
             Self::OpenLink => LINK,
             Self::HandleLookup => LOOKUP,
+            Self::EntraSignIn => ENTRA,
+            Self::EntraAccount => ENTRA_ACCOUNT,
+            Self::HandleChange => HANDLE_CHANGE,
+            Self::Admin => ADMIN,
+            Self::AdminAuthFailure => ADMIN_AUTH_FAILURE,
         }
     }
 }

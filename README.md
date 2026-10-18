@@ -35,6 +35,10 @@ survive a restart and are stored once, and the UI follows one stream of events:
     client.send(chat.id, "hello")?;
     while let Some(event) = events.next().await { /* update the UI */ }
 
+Where auth-svc offers Microsoft Entra ID sign-in, `client.sign_in_with_entra(token, handle,
+device_name, platform)` takes an access token the app got with MSAL instead
+([guide](docs/entra-sign-in.md)).
+
 Given a `DatabaseKey` (`Config::database_key`), the client encrypts the whole database;
 an app derives the key from a PIN or password the user enters (`DatabaseKey::derive`), so
 without it nobody can read the history, not even the app. The encryption is SQLite3
@@ -180,6 +184,8 @@ Managed PostgreSQL and Redis with Microsoft Entra ID tokens instead of passwords
 prerequisites, database roles, egress and limitations).
 [docs/deployment-ingress-verification.md](docs/deployment-ingress-verification.md)
 records the routing checks against a maintained controller (Traefik).
+Microsoft Entra ID sign-in (opt-in, also Entra-only without email):
+[docs/entra-sign-in.md](docs/entra-sign-in.md) (chart values arrive with Plan 13B).
 [docs/consumer-verification.md](docs/consumer-verification.md) gives the build, image,
 chart packaging and verification commands, and `push-load`, an explicitly targeted,
 bounded harness for connection, heartbeat, message-latency and reconnect checks with
@@ -239,6 +245,16 @@ at start-up.
 | `PUSH_AUTH_WORKER_ROLE` | the worker's role: granted `auth.outbox` and the two cleanup functions at start-up | none |
 | `PUSH_MESSAGE_SVC_URL` | Directory gRPC URL of message-svc, `http://host:50053` (plain `http://` only), asked whose profiles a caller may see; without it `GET /v1/users` answers 503 | none |
 | `PUSH_DIRECTORY_TOKEN` | message-svc's token for its `Directory` API, the same value as message-svc's, 32 to 256 visible ASCII characters; required with `PUSH_MESSAGE_SVC_URL` | none |
+| `PUSH_AUTH_PROVIDERS` | `password`, `entra` or `password,entra`; without `password` the signup, verification, login and password-reset routes answer 404 ([Entra ID sign-in](docs/entra-sign-in.md)) | `password` |
+| `PUSH_ENTRA_CLIENT_ID` | accepted audiences: the API registration's application id, optionally with its `api://` identifier URI | required with `entra` |
+| `PUSH_ENTRA_ALLOWED_TENANTS` | exactly one of `common` (any tenant and personal accounts), `organizations` (any work or school tenant), `consumers` (personal accounts), or tenant ids (GUIDs), comma-separated; never mixed. A keyword lets anyone with such an account create an account here | required with `entra` |
+| `PUSH_ENTRA_AUTHORITY_HOST` | Microsoft Entra ID's host (a sovereign cloud's); `http://` only for loopback | `https://login.microsoftonline.com/` |
+| `PUSH_ENTRA_REQUIRED_SCOPE` | the delegated scope tokens must carry; `*` for any scope of the API | `access_as_user` |
+| `PUSH_ENTRA_REQUIRED_ROLE` | an app role tokens must carry | none |
+| `PUSH_ENTRA_ALLOWED_CLIENT_APPS` | client app ids allowed to present tokens (`azp`), comma-separated | any |
+| `PUSH_ENTRA_MAX_SESSION_HOURS` | maximum session age of an Entra-backed device, 1 to 720; refresh fails after it until the user signs in with Entra ID again | `24` |
+| `PUSH_AUTH_ADMIN_TOKEN` | the admin API's bearer token, 32 to 256 visible ASCII characters; with it, `POST /v1/admin/users/revoke-sessions` (sign a user out of every device by `user_id`, `handle` or `entra` tenant and object id) is served on `PUSH_AUTH_ADMIN_ADDR` only; unset: no admin listener ([guide](docs/entra-sign-in.md#admin-api)) | none |
+| `PUSH_AUTH_ADMIN_ADDR` | address of the admin listener; never route it publicly | `0.0.0.0:8082` |
 
 `push-worker`:
 
@@ -248,7 +264,7 @@ at start-up.
 | `PUSH_AUTH_DATABASE_URL` | Postgres URL of auth-svc's `push_auth` database, as the worker's role | required |
 | `PUSH_MESSAGE_SVC_URL` | Accounts gRPC URL of message-svc, `http://host:50052` (plain `http://` only: the worker is built without TLS) | required |
 | `PUSH_ACCOUNTS_TOKEN` | message-svc's token for its `Accounts` API, the same value as message-svc's | required |
-| `PUSH_EMAIL_SENDER` | `log` (logs instead of sending) or `resend` | `log` |
+| `PUSH_EMAIL_SENDER` | `log` (logs instead of sending), `resend`, or `none` (no email at all, for Microsoft Entra ID-only installations: an `email.send` job is buried unsent; refused with `PUSH_RESEND_WEBHOOK_SECRET` or the mailbox) | `log` |
 | `PUSH_EMAIL_FROM` | the From of every email, `Push Messenger <no-reply@push.kubegames.dk>` | required for `resend` |
 | `PUSH_EMAIL_PRODUCT_NAME` | the name emails sign with | `Push Messenger` |
 | `PUSH_RESEND_API_KEY` | Resend API key | required for `resend` |

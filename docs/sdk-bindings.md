@@ -42,6 +42,21 @@ later (`retryable`). A refusal by a server keeps the server's own code (`not_con
 | `closed` | no | The client was closed. |
 | `panic` | no | A bug in the SDK, caught at the C boundary. Exists only in C: Node never reports it. Close the client. |
 
+### Signing in with Microsoft Entra ID
+
+Where auth-svc offers Entra ID sign-in ([guide](entra-sign-in.md)), the app gets an access
+token for auth-svc's API with MSAL and passes it on: `client.sign_in_with_entra(token,
+handle, device_name, platform)` in Rust, `client.signInWithEntra(token, handle, deviceName,
+platform)` in Node and `push_client_sign_in_with_entra(client, token, handle_name /* or NULL */,
+device_name, platform, &account_json, &error)` in C. `handle` names the account on its
+first sign-in only. The device is kept as with email and password. New codes:
+`entra_token_invalid` (get a new token; it was for another API, tenant or app, expired, or
+lacked the scope), `entra_unavailable` (retryable), and `session_expired`, after which the SDK
+reports `SignedOut` and the app signs in with Entra ID again.
+Any signed-in user changes the handle or display name with `update_profile(display_name,
+handle)` (`updateProfile`, `push_client_update_profile`); `handle_taken` when someone else
+holds it.
+
 ### Data
 
 Data is JSON-shaped: field names and enum values are camelCase, ids are UUID strings, times

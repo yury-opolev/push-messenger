@@ -164,6 +164,8 @@ async fn each_token_does_only_its_own_job() {
         exp: 1,
         email: None,
         pw: None,
+        xid: None,
+        sx: None,
     });
     let verify_link = signer.sign(&LinkClaims {
         sub: tokens.user_id,
@@ -171,6 +173,8 @@ async fn each_token_does_only_its_own_job() {
         exp: i64::MAX,
         email: Some("alice@example.com".to_owned()),
         pw: None,
+        xid: None,
+        sx: None,
     });
     let unstamped = signer.sign(&LinkClaims {
         sub: tokens.user_id,
@@ -178,6 +182,8 @@ async fn each_token_does_only_its_own_job() {
         exp: i64::MAX,
         email: None,
         pw: None,
+        xid: None,
+        sx: None,
     });
     for token in [&tokens.access_token, &expired, &verify_link, &unstamped] {
         assert_eq!(
@@ -568,7 +574,7 @@ async fn profiles_show_handles_and_only_the_owner_sees_the_email() {
     let own = world.auth.own_profile(caller(&phone)).await.unwrap();
     assert_eq!(own.handle, "alice");
     assert_eq!(own.display_name, "ALICE");
-    assert_eq!(own.email, "alice@example.com");
+    assert_eq!(own.email.as_deref(), Some("alice@example.com"));
     let renamed = world
         .auth
         .set_display_name(caller(&phone), "  Alice A. ")

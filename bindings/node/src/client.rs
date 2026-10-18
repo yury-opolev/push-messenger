@@ -224,6 +224,24 @@ impl NativeClient {
         })
     }
 
+    #[napi(catch_unwind)]
+    pub fn sign_in_with_entra<'env>(
+        &self,
+        env: &'env Env,
+        access_token: String,
+        handle: Option<String>,
+        device_name: String,
+        platform: String,
+    ) -> napi::Result<Object<'env>> {
+        self.promise(env, |client| async move {
+            let platform = json::platform(&platform)?;
+            let account = client
+                .sign_in_with_entra(&access_token, handle.as_deref(), &device_name, platform)
+                .await?;
+            Ok(json::account(&account))
+        })
+    }
+
     /// The signed-in account, or null: from the bridge's cache, so it never waits.
     #[napi(catch_unwind)]
     pub fn account(&self) -> napi::Result<Value> {
@@ -517,6 +535,22 @@ impl NativeClient {
     pub fn lookup<'env>(&self, env: &'env Env, handle: String) -> napi::Result<Object<'env>> {
         self.promise(env, |client| async move {
             Ok(json::profile(&client.lookup(&handle).await?))
+        })
+    }
+
+    #[napi(catch_unwind)]
+    pub fn update_profile<'env>(
+        &self,
+        env: &'env Env,
+        display_name: Option<String>,
+        handle: Option<String>,
+    ) -> napi::Result<Object<'env>> {
+        self.promise(env, |client| async move {
+            Ok(json::profile(
+                &client
+                    .update_profile(display_name.as_deref(), handle.as_deref())
+                    .await?,
+            ))
         })
     }
 

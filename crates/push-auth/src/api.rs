@@ -1,5 +1,6 @@
-//! The public HTTP API (spec §2, §5): `/v1/auth/*`, `/v1/devices/*` and `/v1/users*`,
-//! JSON in and out, plus the two small pages that email links open.
+//! The public HTTP API (spec §2, §5; Entra ID sign-in: spec 2026-10-19 §4): `/v1/auth/*`,
+//! `/v1/devices/*` and `/v1/users*`, JSON in and out, plus the two small pages that email
+//! links open.
 //!
 //! Errors are `{"error": {"code", "message", "retryable"}}` with the status of
 //! [`AuthError::status`]; 429 answers carry `Retry-After`, 401 answers
@@ -30,6 +31,7 @@ use uuid::Uuid;
 use crate::audit::{self, ErrorCode, Subject};
 use crate::devices::{Caller, Tokens};
 use crate::directory::Directory;
+use crate::entra::EntraError;
 use crate::error::AuthError;
 use crate::limits::{Action, Limits};
 use crate::rules::{self, Invalid};
@@ -51,21 +53,29 @@ pub struct Api {
     pub directory: Arc<dyn Directory>,
 }
 
-/// The router of the public API.
+/// The router of the public API. Without email and password sign-in its routes do not
+/// exist (404), and without Entra ID sign-in neither does `/v1/auth/entra` (spec D9).
 pub fn router(api: Api) -> Router {
-    Router::new()
-        .route("/v1/auth/signup", post(signup))
-        .route("/v1/auth/verify", get(verify_page).post(verify))
-        .route("/v1/auth/verify/resend", post(resend))
-        .route("/v1/auth/login", post(login))
+    let mut routes: Router<Api> = Router::new();
+    if api.auth.password_enabled() {
+        routes = routes
+            .route("/v1/auth/signup", post(signup))
+            .route("/v1/auth/verify", get(verify_page).post(verify))
+            .route("/v1/auth/verify/resend", post(resend))
+            .route("/v1/auth/login", post(login))
+            .route("/v1/auth/password/forgot", post(forgot))
+            .route("/v1/auth/password/reset", get(reset_page).post(reset));
+    }
+    if api.auth.entra().is_some() {
+        routes = routes.route("/v1/auth/entra", post(entra));
+    }
+    routes
         .route("/v1/auth/refresh", post(refresh))
-        .route("/v1/auth/password/forgot", post(forgot))
-        .route("/v1/auth/password/reset", get(reset_page).post(reset))
         .route("/v1/auth/jwks", get(jwks))
         .route("/v1/devices", post(register_device).get(list_devices))
         .route("/v1/devices/{device_id}", delete(revoke_device))
         .route("/v1/users", get(profiles))
-        .route("/v1/users/me", get(own_profile).patch(set_display_name))
+        .route("/v1/users/me", get(own_profile).patch(update_profile))
         .route("/v1/users/lookup", get(lookup))
         .route_layer(axum::middleware::from_fn_with_state(
             api.clone(),
@@ -104,7 +114,14 @@ impl IntoResponse for AuthError {
             Self::Unavailable => {
                 headers.insert(RETRY_AFTER, HeaderValue::from_static("1"));
             }
-            Self::Unauthorized | Self::TokenExpired | Self::InvalidCredentials => {
+            Self::EntraUnavailable => {
+                headers.insert(RETRY_AFTER, HeaderValue::from_static("5"));
+            }
+            Self::Unauthorized
+            | Self::TokenExpired
+            | Self::InvalidCredentials
+            | Self::EntraTokenInvalid
+            | Self::SessionExpired => {
                 headers.insert(WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
             }
             _ => {}
@@ -359,6 +376,64 @@ async fn login(
 }
 
 #[derive(Deserialize)]
+struct EntraBody {
+    /// The Entra ID access token for this API, as MSAL returned it.
+    token: String,
+    /// The handle of a new account; ignored once the account exists.
+    #[serde(default)]
+    handle: Option<String>,
+    #[serde(default)]
+    device_id: Option<Uuid>,
+}
+
+/// `POST /v1/auth/entra {token, handle?, device_id?}` (spec D10): without `device_id` a
+/// registration token, as `POST /v1/auth/login` answers; with it, new tokens for that
+/// active device and a new session. Every refused token is `entra_token_invalid`; the
+/// reason goes to the security log only.
+async fn entra(
+    State(api): State<Api>,
+    ClientIp(ip): ClientIp,
+    JsonBody(body): JsonBody<EntraBody>,
+) -> Result<Response, AuthError> {
+    api.limits.check(Action::EntraSignIn, ip, None).await?;
+    let checker = api.auth.entra().ok_or(AuthError::Unauthorized)?;
+    let identity = checker
+        .verify(&body.token)
+        .await
+        .map_err(|error| match error {
+            EntraError::Rejected(_) => AuthError::EntraTokenInvalid,
+            EntraError::Unavailable(_) => AuthError::EntraUnavailable,
+        })?;
+    let account = format!("entra:{}:{}", identity.tenant_id, identity.object_id);
+    api.limits
+        .check(Action::EntraAccount, None, Some(&account))
+        .await?;
+    let handle = body.handle.as_deref();
+    Ok(match body.device_id {
+        None => {
+            let signed_in = api.auth.sign_in_entra(&identity, handle).await?;
+            let mut response = Json(json!({
+                "registration_token": signed_in.registration.token,
+                "expires_in_s": signed_in.registration.expires_in_s,
+            }))
+            .into_response();
+            response.extensions_mut().insert(Subject {
+                user: Some(signed_in.user_id),
+                device: None,
+            });
+            response
+        }
+        Some(device_id) => {
+            let tokens = api
+                .auth
+                .sign_in_entra_device(&identity, handle, device_id)
+                .await?;
+            tokens_response(StatusCode::OK, &tokens)
+        }
+    })
+}
+
+#[derive(Deserialize)]
 struct RefreshBody {
     refresh_token: String,
 }
@@ -520,21 +595,38 @@ async fn own_profile(State(api): State<Api>, headers: HeaderMap) -> Result<Respo
 }
 
 #[derive(Deserialize)]
-struct DisplayNameBody {
-    display_name: String,
+struct ProfileBody {
+    #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default)]
+    handle: Option<String>,
 }
 
-async fn set_display_name(
+/// `PATCH /v1/users/me {display_name?, handle?}`: the access token is the only proof
+/// needed (spec D14); a handle change is rate limited per IP and per user.
+async fn update_profile(
     State(api): State<Api>,
     headers: HeaderMap,
-    JsonBody(body): JsonBody<DisplayNameBody>,
+    ClientIp(ip): ClientIp,
+    JsonBody(body): JsonBody<ProfileBody>,
 ) -> Result<Response, AuthError> {
     let caller = caller(&api, &headers).await?;
+    if body.handle.is_some() {
+        let user = caller.user_id.to_string();
+        api.limits
+            .check(Action::HandleChange, ip, Some(&user))
+            .await?;
+    }
     let profile = api
         .auth
-        .set_display_name(caller, &body.display_name)
+        .update_profile(caller, body.display_name.as_deref(), body.handle.as_deref())
         .await?;
-    Ok(Json(own_profile_json(&profile)).into_response())
+    let mut response = Json(own_profile_json(&profile)).into_response();
+    response.extensions_mut().insert(Subject {
+        user: Some(caller.user_id),
+        device: Some(caller.device_id),
+    });
+    Ok(response)
 }
 
 #[derive(Deserialize)]
@@ -663,6 +755,12 @@ mod tests {
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(response.headers()[RETRY_AFTER], "42");
         let response = AuthError::Unauthorized.into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.headers()[WWW_AUTHENTICATE], "Bearer");
+        let response = AuthError::EntraUnavailable.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[RETRY_AFTER], "5");
+        let response = AuthError::SessionExpired.into_response();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(response.headers()[WWW_AUTHENTICATE], "Bearer");
     }

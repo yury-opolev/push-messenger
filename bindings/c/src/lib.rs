@@ -1019,6 +1019,85 @@ mod tests {
         unsafe { push_string_free(account) };
     }
 
+    #[test]
+    fn an_entra_access_token_signs_in_and_a_refused_one_reports_its_code() {
+        let servers = servers();
+        let client = open(&servers, memory_store());
+        let (mut account, mut error) = (ptr::null_mut(), ptr::null_mut());
+        let status = unsafe {
+            push_client_sign_in_with_entra(
+                client,
+                c"entra-access-token".as_ptr(),
+                ptr::null(),
+                c"c app".as_ptr(),
+                c"desktop".as_ptr(),
+                &mut account,
+                &mut error,
+            )
+        };
+        assert_eq!(status, PUSH_OK);
+        let json = unsafe { CStr::from_ptr(account) }
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert!(json.contains("userId"), "{json}");
+        unsafe { push_string_free(account) };
+        let (mut account, mut error) = (ptr::null_mut(), ptr::null_mut());
+        let status = unsafe {
+            push_client_sign_in_with_entra(
+                client,
+                c"refused-entra-token".as_ptr(),
+                c"erin".as_ptr(),
+                c"c app".as_ptr(),
+                c"desktop".as_ptr(),
+                &mut account,
+                &mut error,
+            )
+        };
+        assert_eq!(status, PUSH_ERROR);
+        assert!(account.is_null());
+        assert_eq!(code(error), "entra_token_invalid");
+        unsafe { push_client_destroy(client) };
+    }
+
+    #[test]
+    fn the_profile_changes_from_c() {
+        let servers = servers();
+        let client = open(&servers, memory_store());
+        sign_in(client);
+        let (mut profile, mut error) = (ptr::null_mut(), ptr::null_mut());
+        let status = unsafe {
+            push_client_update_profile(
+                client,
+                ptr::null(),
+                c"erin".as_ptr(),
+                &mut profile,
+                &mut error,
+            )
+        };
+        assert_eq!(status, PUSH_OK);
+        let json = unsafe { CStr::from_ptr(profile) }
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert!(json.contains("\"erin\""), "{json}");
+        unsafe { push_string_free(profile) };
+        let (mut profile, mut error) = (ptr::null_mut(), ptr::null_mut());
+        let status = unsafe {
+            push_client_update_profile(
+                client,
+                ptr::null(),
+                c"taken".as_ptr(),
+                &mut profile,
+                &mut error,
+            )
+        };
+        assert_eq!(status, PUSH_ERROR);
+        assert!(profile.is_null());
+        assert_eq!(code(error), "handle_taken");
+        unsafe { push_client_destroy(client) };
+    }
+
     static DESTROY_CLIENT: AtomicPtr<PushClient> = AtomicPtr::new(ptr::null_mut());
     static DESTROY_RELEASED: AtomicUsize = AtomicUsize::new(0);
 

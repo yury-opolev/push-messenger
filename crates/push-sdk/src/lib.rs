@@ -1,7 +1,8 @@
 //! push-sdk: the client core of push-messenger, which third-party apps embed (spec §8).
 //!
-//! It owns everything below the user interface: signing up and in through auth-svc,
-//! the device's credentials (in a [`SecretStore`] the app provides), the WebSocket
+//! It owns everything below the user interface: signing up and in through auth-svc
+//! (email and password, or a Microsoft Entra ID access token the app obtained), the
+//! device's credentials (in a [`SecretStore`] the app provides), the WebSocket
 //! connection to the gateway with its reconnects, a local SQLite store of conversations,
 //! messages and contacts (encrypted as a whole when the app gives a key), the outbox that
 //! sends messages, edits and deletes exactly once, and one stream of events for the UI.

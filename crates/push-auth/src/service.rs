@@ -12,6 +12,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
+use crate::entra::EntraSignIn;
 use crate::error::AuthError;
 use crate::links::{LinkClaims, LinkError, LinkSigner, Purpose, password_stamp};
 use crate::outbox::{self, Email, Event, LINK_MINUTES};
@@ -57,6 +58,25 @@ pub struct RegistrationToken {
     pub expires_in_s: i64,
 }
 
+/// Which ways to sign in the service offers (spec 2026-10-19 D9).
+#[derive(Debug, Clone)]
+pub struct SignIn {
+    /// Email and password: signup, links, login.
+    pub password: bool,
+    /// Microsoft Entra ID, with its token checker.
+    pub entra: Option<EntraSignIn>,
+}
+
+impl Default for SignIn {
+    /// Email and password only: today's behaviour.
+    fn default() -> Self {
+        Self {
+            password: true,
+            entra: None,
+        }
+    }
+}
+
 /// The auth service.
 #[derive(Debug, Clone)]
 pub struct Auth {
@@ -66,6 +86,7 @@ pub struct Auth {
     pub(crate) links: LinkSigner,
     pub(crate) tokens: AccessTokens,
     public_url: String,
+    sign_in: SignIn,
 }
 
 /// Seconds since the Unix epoch.
@@ -99,6 +120,7 @@ impl Auth {
             links: settings.links,
             tokens: settings.tokens,
             public_url: settings.public_url.trim_end_matches('/').to_owned(),
+            sign_in: SignIn::default(),
         }
     }
 
@@ -110,6 +132,22 @@ impl Auth {
     /// The database pool, for readiness checks.
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// The service offering `sign_in` instead of email and password only.
+    pub fn with_sign_in(mut self, sign_in: SignIn) -> Self {
+        self.sign_in = sign_in;
+        self
+    }
+
+    /// Whether email and password sign-in is offered.
+    pub fn password_enabled(&self) -> bool {
+        self.sign_in.password
+    }
+
+    /// The Entra ID token checker, when Entra ID sign-in is offered.
+    pub fn entra(&self) -> Option<&EntraSignIn> {
+        self.sign_in.entra.as_ref()
     }
 
     // The permit moves into the blocking closure: a cancelled request must not free the
@@ -163,6 +201,8 @@ impl Auth {
             exp: unix_now() + LINK_SECONDS,
             email: Some(email.to_owned()),
             pw: Some(password_stamp(password_hash)),
+            xid: None,
+            sx: None,
         });
         format!("{}/v1/auth/verify?token={token}", self.public_url)
     }
@@ -353,7 +393,11 @@ impl Auth {
         .bind(&email)
         .fetch_optional(&self.pool)
         .await?;
-        let stored: Option<String> = account.as_ref().map(|row| row.get(1));
+        // An account without a password (Entra ID) has no address either, so the email
+        // never finds it; NULL is read safely all the same.
+        let stored: Option<String> = account
+            .as_ref()
+            .and_then(|row| row.get::<Option<String>, _>(1));
         let checked = self
             .check_password(password.to_owned(), stored.clone())
             .await?;
@@ -397,6 +441,8 @@ impl Auth {
             exp: unix_now() + REGISTRATION_TOKEN_SECONDS,
             email: None,
             pw: Some(password_stamp(&password_hash)),
+            xid: None,
+            sx: None,
         });
         Ok(RegistrationToken {
             token,
@@ -424,6 +470,8 @@ impl Auth {
                 exp: unix_now() + LINK_SECONDS,
                 email: None,
                 pw: Some(password_stamp(account.get(2))),
+                xid: None,
+                sx: None,
             });
             let link = format!("{}/v1/auth/password/reset?token={token}", self.public_url);
             let event = Event::EmailSend {
@@ -460,8 +508,12 @@ impl Auth {
         let Some(account) = account else {
             return Err(AuthError::LinkInvalid);
         };
-        let current: String = account.get(0);
-        if claims.pw.as_deref() != Some(password_stamp(&current).as_str()) {
+        let current: Option<String> = account.get(0);
+        let matches = match (&claims.pw, &current) {
+            (Some(stamp), Some(current)) => *stamp == password_stamp(current),
+            _ => false,
+        };
+        if !matches {
             return Err(AuthError::LinkInvalid);
         }
         // The clock that sets the access tokens' `iat`: auth-svc (in `authenticate`) and

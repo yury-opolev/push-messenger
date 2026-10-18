@@ -16,20 +16,24 @@ use sqlx::PgPool;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
+use crate::admin::{AdminApi, admin_router};
 use crate::api::{Api, router};
 use crate::config::{Config, MigrateConfig};
 use crate::db::{MIGRATOR, grant_worker_access_on};
 use crate::directory::{Directory, GrpcDirectory, NoDirectory};
+use crate::entra::EntraSignIn;
 use crate::limits::{Limits, RedisCounter};
 use crate::links::LinkSigner;
 use crate::password::Passwords;
-use crate::service::{Auth, Settings};
+use crate::service::{Auth, Settings, SignIn};
 use crate::tokens::AccessTokens;
 
 /// How long to wait before trying an unreachable dependency again.
 const RETRY_DELAY: Duration = Duration::from_secs(2);
 /// Longest wait for a password-hash slot before a request is refused as `unavailable`.
 const HASH_WAIT: Duration = Duration::from_secs(2);
+/// How often an Entra ID-only service signs out password devices created since.
+const PASSWORD_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Runs the service until `shutdown` is cancelled, then finishes the requests in
 /// progress and closes the database pool.
@@ -69,6 +73,11 @@ pub async fn serve(
     );
 
     push_credentials::install_crypto_provider();
+    // Built before the datastores, so a bad Entra ID setting stops start-up at once.
+    let entra = match &config.entra {
+        Some(settings) => Some(EntraSignIn::new(settings.clone()).map_err(anyhow::Error::msg)?),
+        None => None,
+    };
     let azure = config
         .azure
         .as_ref()
@@ -120,8 +129,18 @@ pub async fn serve(
         pool.close().await;
         return finish(health_server).await;
     };
-    let _ = ready.pool.set(pool.clone());
 
+    if let Some(entra) = &entra {
+        // Fetched now so the first sign-in is quick; a failure only warns: readiness never
+        // depends on Entra ID (spec D4).
+        let warming = entra.clone();
+        tokio::spawn(async move { warming.warm().await });
+    }
+    if !config.providers.password {
+        tracing::info!(
+            "email and password sign-in is off: only Microsoft Entra ID sign-in is served"
+        );
+    }
     let auth = Auth::new(
         pool.clone(),
         Settings {
@@ -133,13 +152,65 @@ pub async fn serve(
             hash_queue: config.hash_queue,
             hash_wait: HASH_WAIT,
         },
-    );
+    )
+    .with_sign_in(SignIn {
+        password: config.providers.password,
+        entra,
+    });
+    let sweeper = if config.providers.password {
+        None
+    } else {
+        // Entra ID only: every password session ends now, before this replica is ready
+        // (spec D16). Idempotent; replicas share the work.
+        let revoked = auth
+            .revoke_password_devices(&shutdown)
+            .await
+            .context("sign out the password devices")?;
+        tracing::info!(
+            target: "security",
+            event = "auth.password_sessions.revoked",
+            devices = revoked,
+            "email and password sign-in is off: password devices were signed out"
+        );
+        if shutdown.is_cancelled() {
+            pool.close().await;
+            return finish(health_server).await;
+        }
+        // Replicas of the previous version (password still on) may sign password devices
+        // in during a rolling update: they are signed out again periodically.
+        Some(password_sweeper(
+            auth.clone(),
+            PASSWORD_SWEEP_INTERVAL,
+            shutdown.clone(),
+        ))
+    };
+    let _ = ready.pool.set(pool.clone());
+    let limits = Limits::new(Arc::new(counter));
     let api = router(Api {
-        auth,
-        limits: Limits::new(Arc::new(counter)),
+        auth: auth.clone(),
+        limits: limits.clone(),
         client_ip_header: config.client_ip_header.clone(),
         directory,
     });
+    // The admin listener exists only with its token (spec D15).
+    let admin_server = match &config.admin_token {
+        Some(token) => {
+            let listener = TcpListener::bind(config.admin_addr)
+                .await
+                .with_context(|| format!("bind the admin listener {}", config.admin_addr))?;
+            tracing::info!(addr = %config.admin_addr, "serving the admin API");
+            let admin = admin_router(AdminApi::new(auth.clone(), limits.clone(), token));
+            Some(tokio::spawn(
+                axum::serve(
+                    listener,
+                    admin.into_make_service_with_connect_info::<SocketAddr>(),
+                )
+                .with_graceful_shutdown(shutdown.clone().cancelled_owned())
+                .into_future(),
+            ))
+        }
+        None => None,
+    };
     tracing::info!(addr = %config.http_addr, "serving HTTP");
     let result = axum::serve(
         http,
@@ -147,7 +218,13 @@ pub async fn serve(
     )
     .with_graceful_shutdown(shutdown.clone().cancelled_owned())
     .await;
+    if let Some(sweeper) = sweeper {
+        let _ = sweeper.await;
+    }
     pool.close().await;
+    if let Some(admin_server) = admin_server {
+        admin_server.await??;
+    }
     tracing::info!("stopped");
     result?;
     finish(health_server).await
@@ -258,4 +335,34 @@ pub async fn terminated() {
         () = interrupt => {}
         () = terminate => {}
     }
+}
+
+/// While password sign-in is off, signs out every `every` the password devices that
+/// appeared since the last sweep (an older replica's sign-in during a rolling update),
+/// until `shutdown`. Failures are logged and tried again at the next round.
+pub(crate) fn password_sweeper(
+    auth: Auth,
+    every: Duration,
+    shutdown: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                () = shutdown.cancelled() => return,
+                () = tokio::time::sleep(every) => {}
+            }
+            match auth.revoke_password_devices(&shutdown).await {
+                Ok(0) => {}
+                Ok(revoked) => tracing::info!(
+                    target: "security",
+                    event = "auth.password_sessions.revoked",
+                    devices = revoked,
+                    "password devices created since the last sweep were signed out"
+                ),
+                Err(error) => {
+                    tracing::warn!(%error, "signing out password devices failed; trying again");
+                }
+            }
+        }
+    })
 }

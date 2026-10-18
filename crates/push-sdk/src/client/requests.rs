@@ -283,6 +283,35 @@ impl Client {
         .await
     }
 
+    /// Changes the user's display name, handle or both (at least one); the profile after
+    /// the change. A handle someone else holds is `handle_taken`; the old handle is free
+    /// at once. Any signed-in user may do this, with an Entra ID account too.
+    pub async fn update_profile(
+        &self,
+        display_name: Option<&str>,
+        handle: Option<&str>,
+    ) -> Result<Profile, SdkError> {
+        if display_name.is_none() && handle.is_none() {
+            return Err(SdkError::Invalid(
+                "give a display name, a handle or both".to_owned(),
+            ));
+        }
+        let inner = self.inner.clone();
+        let (display_name, handle) = (display_name.map(str::to_owned), handle.map(str::to_owned));
+        self.run(async move {
+            let session = inner.credentials.fresh().await?;
+            inner
+                .auth
+                .update_profile(
+                    &session.access_token,
+                    display_name.as_deref(),
+                    handle.as_deref(),
+                )
+                .await
+        })
+        .await
+    }
+
     /// The user's devices.
     pub async fn devices(&self) -> Result<Vec<Device>, SdkError> {
         let inner = self.inner.clone();
