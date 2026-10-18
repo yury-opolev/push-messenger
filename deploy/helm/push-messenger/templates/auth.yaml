@@ -12,6 +12,12 @@ spec:
     - name: http
       port: 8080
       targetPort: http
+    {{- if .Values.auth.admin.enabled }}
+    # The admin API. Never named in an Ingress: they route the port named http only.
+    - name: admin
+      port: 8082
+      targetPort: admin
+    {{- end }}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -102,11 +108,25 @@ spec:
             # Sign-in beyond email and password (auth.signIn, docs/entra-sign-in.md).
             {{- . | nindent 12 }}
             {{- end }}
+            {{- if .Values.auth.admin.enabled }}
+            # The admin API on its own listener, reachable only from networkPolicy.adminPeers.
+            - name: PUSH_AUTH_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "push.secretName" . }}
+                  key: auth-admin-token
+            - name: PUSH_AUTH_ADMIN_ADDR
+              value: "0.0.0.0:8082"
+            {{- end }}
           ports:
             - name: http
               containerPort: 8080
             - name: health
               containerPort: 8081
+            {{- if .Values.auth.admin.enabled }}
+            - name: admin
+              containerPort: 8082
+            {{- end }}
           readinessProbe:
             httpGet:
               path: /readyz

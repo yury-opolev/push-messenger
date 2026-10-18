@@ -881,6 +881,53 @@ Check 'sign-in egress: without Entra sign-in the list adds nothing' {
     $rendered -notmatch '20\.190\.128\.0/18'
 }
 
+Check 'admin: off by default' {
+    (helm template push $chart | Out-String) -notmatch 'PUSH_AUTH_ADMIN|auth-admin-token|name: admin|8082'
+}
+$adminPeer = '[{"namespaceSelector":{"kubernetes.io/metadata.name":"ops"},"podSelector":{"app":"admin-shell"}}]'
+Check 'admin: the listener, its Secret key, and a NetworkPolicy rule for its peers only' {
+    $rendered = helm template push $chart --set auth.admin.enabled=true --set-json "networkPolicy.adminPeers=$adminPeer" | Out-String
+    $auth = Doc $rendered 'Deployment' 'push-auth'
+    $rules = @'
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(sys.stdin.read()) if d]
+policy = next(d for d in docs if d["kind"] == "NetworkPolicy" and d["metadata"]["name"] == "push-auth")
+rules = {rule["ports"][0]["port"]: rule["from"] for rule in policy["spec"]["ingress"]}
+assert set(rules) == {8080, 8082}, rules
+assert rules[8082] == [{"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "ops"}},
+                        "podSelector": {"matchLabels": {"app": "admin-shell"}}}], rules[8082]
+assert rules[8080] == [{"podSelector": {"matchLabels": {"app.kubernetes.io/instance": "push",
+                                                         "push-messenger/network-peer": "gateway"}}}], rules[8080]
+for d in docs:
+    if d["kind"] == "Ingress":
+        for rule in d["spec"]["rules"]:
+            for path in rule["http"]["paths"]:
+                assert path["backend"]["service"]["port"] == {"name": "http"}, d["metadata"]["name"]
+'@
+    $rendered | & $python.Source -c $rules
+    $LASTEXITCODE -eq 0 -and
+        $auth -match '(?s)name: PUSH_AUTH_ADMIN_TOKEN\s+valueFrom:\s+secretKeyRef:\s+name: push-secrets\s+key: auth-admin-token' -and
+        $auth -match '(?s)name: PUSH_AUTH_ADMIN_ADDR\s+value: "0.0.0.0:8082"' -and
+        $auth -match '(?s)name: admin\s+containerPort: 8082' -and
+        (Doc $rendered 'Service' 'push-auth') -match '(?s)name: admin\s+port: 8082\s+targetPort: admin' -and
+        (Doc $rendered 'Secret' 'push-secrets') -match 'auth-admin-token: "[A-Za-z0-9]{48}"' -and
+        @($rendered -split "(?m)^---\s*$" | Where-Object {
+            $_ -match '(?m)^kind: (Deployment|StatefulSet|Job|Pod)\s*$' -and $_ -notmatch '(?m)^  name: push-auth\s*$' -and
+                $_ -match 'auth-admin-token|PUSH_AUTH_ADMIN' }).Count -eq 0
+}
+Check 'admin: without peers no rule opens the port; peers need both label maps' {
+    (Doc (helm template push $chart --set auth.admin.enabled=true | Out-String) 'NetworkPolicy' 'push-auth') -notmatch '8082' -and
+        (Doc (helm template push $chart --set-json "networkPolicy.adminPeers=$adminPeer" | Out-String) 'NetworkPolicy' 'push-auth') -notmatch '8082' -and
+        (Render @('--set', 'auth.admin.enabled=true', '--set-json', 'networkPolicy.adminPeers=[{"podSelector":{"a":"b"}}]')) -ne 0 -and
+        (Render @('--set', 'auth.admin.enabled=true', '--set-json', 'networkPolicy.adminPeers=[{"namespaceSelector":{},"podSelector":{"a":"b"}}]')) -ne 0 -and
+        (Render @('--set', 'auth.admin.enabled=yes')) -ne 0
+}
+Check 'admin: a consumer-managed Secret is referenced, never generated' {
+    $rendered = helm template push $chart --set auth.admin.enabled=true --set secrets.existingSecret=push-creds | Out-String
+    (Doc $rendered 'Deployment' 'push-auth') -match '(?s)name: push-creds\s+key: auth-admin-token' -and
+        $rendered -notmatch '(?m)^kind: Secret'
+}
+
 if ($failures -gt 0) {
     Write-Output "$failures check(s) failed"
     exit 1

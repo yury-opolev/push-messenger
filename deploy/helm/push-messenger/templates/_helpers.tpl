@@ -213,6 +213,18 @@ The admin listener is a boolean; its peers carry both label maps.
 {{- if not (has (nospace $signIn.providers) (list "password" "entra" "password,entra" "entra,password")) -}}
 {{- fail $providerError -}}
 {{- end -}}
+{{- if not (kindIs "bool" .Values.auth.admin.enabled) -}}
+{{- fail "auth.admin.enabled must be a boolean" -}}
+{{- end -}}
+{{- $adminPeerError := "networkPolicy.adminPeers requires namespaceSelector and podSelector as non-empty label maps on every peer" -}}
+{{- if not (kindIs "slice" .Values.networkPolicy.adminPeers) -}}
+{{- fail $adminPeerError -}}
+{{- end -}}
+{{- range .Values.networkPolicy.adminPeers -}}
+{{- if not (and (kindIs "map" .) (kindIs "map" .namespaceSelector) .namespaceSelector (kindIs "map" .podSelector) .podSelector) -}}
+{{- fail $adminPeerError -}}
+{{- end -}}
+{{- end -}}
 {{- if include "push.entraSignIn" . -}}
 {{- $entra := $signIn.entra -}}
 {{- $guid := "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$" -}}

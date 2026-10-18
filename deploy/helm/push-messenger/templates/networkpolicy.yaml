@@ -44,9 +44,13 @@
 {{- $policies = append $policies (dict "component" "redis" "rules" (list
     (dict "port" 6379 "callers" (list "message-svc" "auth" "gateway")))) -}}
 {{- end -}}
+{{- /* auth-svc's admin port: only the listed admin peers, never the ingress controllers. */ -}}
+{{- $authRules := list (dict "port" 8080 "callers" (list "gateway") "controllers" $controllers) -}}
+{{- if and .Values.auth.admin.enabled .Values.networkPolicy.adminPeers -}}
+{{- $authRules = append $authRules (dict "port" 8082 "controllers" .Values.networkPolicy.adminPeers) -}}
+{{- end -}}
 {{- $policies = concat $policies (list
-  (dict "component" "auth" "rules" (list
-    (dict "port" 8080 "callers" (list "gateway") "controllers" $controllers)))
+  (dict "component" "auth" "rules" $authRules)
   (dict "component" "gateway" "rules" $gatewayRules)
   (dict "component" "worker" "rules" $workerRules)) -}}
 

@@ -74,6 +74,7 @@ Each workload receives only the keys it uses, as individual `secretKeyRef`s (nev
 | `messaging-token` | gateway, message-svc | 32-256 visible ASCII characters, distinct from both other API tokens |
 | `resend-api-key` | worker when `worker.email.sender: resend` | Resend API key |
 | `resend-webhook-secret` | worker when `worker.email.webhook.enabled: true` | Svix signing secret `whsec_...` |
+| `auth-admin-token` | auth-svc when `auth.admin.enabled: true` | the admin API's bearer token, 32 to 256 visible ASCII characters |
 
 Kubernetes `data` values carry an outer base64 encoding; the decoded auth keys are
 themselves standard base64. Do not double-encode values given as `stringData`.
@@ -102,6 +103,13 @@ optional migration Job and opt-in egress NetworkPolicies: see
 [deployment-azure-entra.md](deployment-azure-entra.md). The Secret's database and Redis
 keys (`postgres-password`, `*-db-password`, `*database-url`, `redis-password`,
 `redis-url`) are then unused and not rendered; the application keys stay.
+
+### Microsoft Entra ID sign-in
+
+`auth.admin.enabled` serves auth-svc's admin API on port 8082 (sign a user out of every
+device; [guide](entra-sign-in.md#admin-api)). It is never routed by the chart's Ingresses;
+`networkPolicy.adminPeers` lists who may reach it (none by default: use
+`kubectl port-forward`).
 
 ## Email and the Resend webhook
 
