@@ -3,7 +3,7 @@
 Date: 2026-10-19
 
 Implementation status: **13A** done, #37 ([plan](../plans/2026-10-19-plan-13a-entra-sign-in.md)),
-**13B** in progress ([plan](../plans/2026-10-19-plan-13b-entra-sign-in-chart.md)). Design
+**13B** done, #38 ([plan](../plans/2026-10-19-plan-13b-entra-sign-in-chart.md)). Design
 approved with the owner's final decisions of 2026-10-18.
 
 This answers the downstream change request "opt-in Microsoft Entra ID sign-in" (based on
