@@ -11,6 +11,7 @@ mod config;
 mod db;
 mod devices;
 mod directory;
+pub mod entra;
 mod error;
 pub mod limits;
 pub mod links;

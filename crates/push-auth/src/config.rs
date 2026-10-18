@@ -9,6 +9,7 @@ use push_credentials::{AuthMode, AzureConfig, ConfigProblem, RedisTarget, azure_
 use push_store::{DatabaseTarget, DatabaseVars, StoreOptions, postgres_auth};
 
 use crate::db::is_role_name;
+use crate::entra::{EntraSettings, Providers};
 
 /// How the service runs. Read from the environment by [`Config::from_env`]:
 ///
@@ -35,6 +36,14 @@ use crate::db::is_role_name;
 /// | `PUSH_AUTH_WORKER_ROLE` | role the worker connects as: granted the outbox and the cleanups at start-up (or by `migrate`); a plain role name, or an Entra principal name in Entra mode | none |
 /// | `PUSH_MESSAGE_SVC_URL` | Directory gRPC URL of message-svc, `http://host:50053` (plain `http://` only), asked whose profiles a caller may see; without it `GET /v1/users` answers 503 | none |
 /// | `PUSH_DIRECTORY_TOKEN` | the token message-svc requires for its `Directory` API, 32 to 256 visible ASCII characters; required with `PUSH_MESSAGE_SVC_URL` | none |
+/// | `PUSH_AUTH_PROVIDERS` | `password`, `entra` or `password,entra` (spec 2026-10-19) | `password` |
+/// | `PUSH_ENTRA_CLIENT_ID` | accepted audiences: the API registration's application id, optionally with its `api://` URI | required with `entra` |
+/// | `PUSH_ENTRA_ALLOWED_TENANTS` | exactly one of `common`, `organizations`, `consumers`, or tenant ids (GUIDs), comma-separated; never mixed | required with `entra` |
+/// | `PUSH_ENTRA_AUTHORITY_HOST` | the Entra ID host; `http://` only for loopback (tests) | `https://login.microsoftonline.com/` |
+/// | `PUSH_ENTRA_REQUIRED_SCOPE` | the delegated scope `scp` must contain; `*` for any | `access_as_user` |
+/// | `PUSH_ENTRA_REQUIRED_ROLE` | an app role `roles` must contain | none |
+/// | `PUSH_ENTRA_ALLOWED_CLIENT_APPS` | client app ids allowed in `azp` | any |
+/// | `PUSH_ENTRA_MAX_SESSION_HOURS` | maximum session age of an Entra-backed device, 1 to 720 | `24` |
 ///
 /// `http://` public URLs and `ws://` audiences are accepted only for local hosts
 /// (`localhost`, `127.0.0.1`, `*.local`, `*.localhost`, `*.test`), like the chart's guard.
@@ -58,6 +67,10 @@ pub struct Config {
     pub worker_role: Option<String>,
     pub message_svc_url: Option<String>,
     pub directory_token: Option<String>,
+    /// The ways to sign in.
+    pub providers: Providers,
+    /// How Entra ID tokens are checked, when `entra` is a provider.
+    pub entra: Option<EntraSettings>,
 }
 
 impl std::fmt::Debug for Config {
@@ -84,6 +97,8 @@ impl std::fmt::Debug for Config {
                 "directory_token",
                 &self.directory_token.as_ref().map(|_| "<redacted>"),
             )
+            .field("providers", &self.providers)
+            .field("entra", &self.entra)
             .finish()
     }
 }
@@ -202,6 +217,20 @@ impl Config {
                 ));
             }
         }
+        let providers_value = lookup("PUSH_AUTH_PROVIDERS");
+        let providers = Providers::parse(providers_value.as_deref()).map_err(|reason| {
+            ConfigError::Invalid {
+                name: "PUSH_AUTH_PROVIDERS",
+                value: providers_value.clone().unwrap_or_default(),
+                reason,
+            }
+        })?;
+        // The PUSH_ENTRA_* variables are read only with the provider.
+        let entra = if providers.entra {
+            Some(EntraSettings::from_lookup(lookup_dyn)?)
+        } else {
+            None
+        };
         Ok(Self {
             database,
             redis,
@@ -220,6 +249,8 @@ impl Config {
             worker_role,
             message_svc_url,
             directory_token,
+            providers,
+            entra,
         })
     }
 }
@@ -636,5 +667,61 @@ mod tests {
     #[test]
     fn zero_hash_concurrency_is_refused() {
         assert!(config(&with("PUSH_AUTH_HASH_CONCURRENCY", "0")).is_err());
+    }
+
+    #[test]
+    fn sign_in_is_email_and_password_unless_entra_is_chosen() {
+        let default = config(&REQUIRED).unwrap();
+        assert_eq!(
+            default.providers,
+            Providers {
+                password: true,
+                entra: false
+            }
+        );
+        assert_eq!(default.entra, None);
+        // The Entra variables are not read without the provider.
+        assert!(config(&with("PUSH_ENTRA_ALLOWED_TENANTS", "common")).is_ok());
+        let mut entra_only = REQUIRED.to_vec();
+        entra_only.extend([
+            ("PUSH_AUTH_PROVIDERS", "entra"),
+            (
+                "PUSH_ENTRA_ALLOWED_TENANTS",
+                "33333333-0000-4000-8000-000000000003",
+            ),
+            (
+                "PUSH_ENTRA_CLIENT_ID",
+                "11111111-0000-4000-8000-000000000001",
+            ),
+        ]);
+        let entra = config(&entra_only).unwrap();
+        assert_eq!(
+            entra.providers,
+            Providers {
+                password: false,
+                entra: true
+            }
+        );
+        assert_eq!(
+            entra
+                .entra
+                .as_ref()
+                .map(|settings| settings.tenants.clone()),
+            Some(crate::entra::Tenants::Ids(vec![
+                uuid::Uuid::parse_str("33333333-0000-4000-8000-000000000003").unwrap()
+            ]))
+        );
+        entra_only.retain(|(name, _)| *name != "PUSH_ENTRA_CLIENT_ID");
+        assert_eq!(
+            config(&entra_only),
+            Err(ConfigError::Missing("PUSH_ENTRA_CLIENT_ID"))
+        );
+        assert!(matches!(
+            config(&with("PUSH_AUTH_PROVIDERS", "ldap")),
+            Err(ConfigError::Invalid {
+                name: "PUSH_AUTH_PROVIDERS",
+                ..
+            })
+        ));
     }
 }

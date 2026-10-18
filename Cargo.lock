@@ -2214,6 +2214,7 @@ dependencies = [
  "push-store",
  "rand 0.9.5",
  "redis",
+ "reqwest",
  "ring",
  "serde",
  "serde_json",
