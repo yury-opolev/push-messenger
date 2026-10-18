@@ -1,5 +1,5 @@
 //! Rate limits (spec §5.6): per account and per IP, on signup, login, verification resend,
-//! password reset, opening email links and handle lookup. Accounts are never locked; a
+//! password reset, opening email links and handle lookup, and on Entra ID sign-in. Accounts are never locked; a
 //! request over a limit is refused with `rate_limited` and a retry delay.
 //!
 //! Counters are fixed windows in Redis (`INCR`, then `EXPIRE … NX`), keyed by a hash of
@@ -36,6 +36,10 @@ pub enum Action {
     /// Opening a verification or reset link.
     OpenLink,
     HandleLookup,
+    /// `POST /v1/auth/entra`, counted per IP before the token is checked.
+    EntraSignIn,
+    /// `POST /v1/auth/entra`, counted per Entra ID identity once the token is accepted.
+    EntraAccount,
 }
 
 /// Whom a limit counts.
@@ -79,6 +83,8 @@ impl Action {
             Self::ForgotPassword => "forgot",
             Self::OpenLink => "link",
             Self::HandleLookup => "lookup",
+            Self::EntraSignIn => "entra",
+            Self::EntraAccount => "entra_account",
         }
     }
 
@@ -99,12 +105,17 @@ impl Action {
         // Spec §5.5: 20 lookups per hour per user.
         const LOOKUP: &[(Scope, Limit)] =
             &[(Scope::Ip, per(120, HOUR)), (Scope::Account, per(20, HOUR))];
+        // Like login per IP; per identity once the token is known to be good.
+        const ENTRA: &[(Scope, Limit)] = &[(Scope::Ip, per(60, QUARTER))];
+        const ENTRA_ACCOUNT: &[(Scope, Limit)] = &[(Scope::Account, per(20, QUARTER))];
         match self {
             Self::Signup => SIGNUP,
             Self::Login => LOGIN,
             Self::ResendVerification | Self::ForgotPassword => EMAIL,
             Self::OpenLink => LINK,
             Self::HandleLookup => LOOKUP,
+            Self::EntraSignIn => ENTRA,
+            Self::EntraAccount => ENTRA_ACCOUNT,
         }
     }
 }

@@ -1,7 +1,8 @@
 //! Security events: one structured log line, under the `security` target, for every
-//! security-relevant outcome of the public API — sign-ins, refused tokens, rate limits,
-//! bad links, password resets, device changes. A middleware classifies each answer by
-//! its route, status and error code, so no handler can forget to log.
+//! security-relevant outcome of the public API — sign-ins (email and password, or Entra
+//! ID), refused tokens, rate limits, bad links, password resets, device changes. A
+//! middleware classifies each answer by its route, status and error code, so no handler
+//! can forget to log.
 //!
 //! The line carries the event name, the route, the status, the error code, the client IP
 //! and, where the answer knows them, the user and device ids; never an email address, a
@@ -92,6 +93,8 @@ pub(crate) fn event(
         ("POST", "/v1/auth/signup") if ok => "auth.signup",
         ("POST", "/v1/auth/login") if ok => "auth.login.success",
         ("POST", "/v1/auth/login") if status != StatusCode::BAD_REQUEST => "auth.login.failure",
+        ("POST", "/v1/auth/entra") if ok => "auth.entra.success",
+        ("POST", "/v1/auth/entra") if status != StatusCode::BAD_REQUEST => "auth.entra.failure",
         ("POST", "/v1/auth/refresh") if ok => return None,
         ("POST", "/v1/auth/refresh") => "auth.refresh.refused",
         ("POST", "/v1/auth/verify") if ok => "auth.email.verified",
@@ -115,6 +118,35 @@ mod tests {
     fn answers_are_classified_by_route_status_and_code() {
         let post = Method::POST;
         let cases = [
+            (
+                &post,
+                "/v1/auth/entra",
+                200,
+                None,
+                Some("auth.entra.success"),
+            ),
+            (
+                &post,
+                "/v1/auth/entra",
+                401,
+                Some("entra_token_invalid"),
+                Some("auth.entra.failure"),
+            ),
+            (&post, "/v1/auth/entra", 400, Some("invalid"), None),
+            (
+                &post,
+                "/v1/auth/entra",
+                503,
+                Some("entra_unavailable"),
+                None,
+            ),
+            (
+                &post,
+                "/v1/auth/refresh",
+                401,
+                Some("session_expired"),
+                Some("auth.refresh.refused"),
+            ),
             (
                 &post,
                 "/v1/auth/login",

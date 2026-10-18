@@ -4,8 +4,9 @@
 //! the crate's `testing` feature, which the crate's own integration tests cannot enable.
 
 mod entra_accounts;
+mod entra_api;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use axum::Router;
@@ -127,4 +128,50 @@ impl World {
             .await
             .unwrap()
     }
+}
+
+/// Every log line of this test binary, as JSON.
+static LINES: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+
+struct Capture;
+
+impl std::io::Write for Capture {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        LINES.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Captures every log line of the process from now on, as JSON: the global subscriber,
+/// since a thread's own misses events while other tests run in parallel. Several tests
+/// share it, so each looks for its own values.
+pub(crate) fn capture_logs() {
+    static INSTALLED: OnceLock<()> = OnceLock::new();
+    INSTALLED.get_or_init(|| {
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(|| Capture)
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        tracing::subscriber::set_global_default(subscriber).expect("one global subscriber");
+    });
+}
+
+/// What was captured so far.
+pub(crate) fn captured_logs() -> String {
+    String::from_utf8_lossy(&LINES.lock().unwrap()).into_owned()
+}
+
+/// The fields of every captured `security` event.
+pub(crate) fn security_events() -> Vec<Value> {
+    captured_logs()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|line| line["target"] == "security")
+        .map(|line| line["fields"].clone())
+        .collect()
 }
