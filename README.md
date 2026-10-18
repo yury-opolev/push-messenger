@@ -100,6 +100,10 @@ It accepts `-Namespace` and `-Release` (both default to `push`) and `-ProbeImage
 then test gateway/worker/auth, unrelated and cross-release callers against all three
 message-svc ports. Only timeouts count as denied connections; refusals and exec errors
 fail the check. It deletes only its own named probe pods, including on failure.
+With `-Egress` (a release with `networkPolicy.egress.enabled`) it then checks the egress
+rules from probes carrying each component's labels but never Ready: DNS, the allowed
+peers and datastores, and denied targets, including ones only egress rules can block
+(the internet, CoreDNS's metrics port, the ingress controller) after positive controls.
 The script neither provisions a CNI nor changes policies. For local acceptance, use
 a separate fresh profile started with `minikube start -p push11a --driver=docker
 --cni=calico --cpus=4 --memory=6g`, then

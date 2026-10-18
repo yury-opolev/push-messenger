@@ -49,7 +49,7 @@ chart-managed render contains credentials and must not reach shared logs.
 | Tool | Where | What it proves | Safe on production? |
 |---|---|---|---|
 | `pwsh deploy/helm/test-chart.ps1` | contributor machine | chart structure and guards | n/a (no cluster) |
-| `deploy/minikube/test-network-policy.ps1 -Context <ctx>` | existing cluster with an enforcing CNI | internal API isolation, by live allowed/denied connections | deploys short-lived probe pods; run deliberately |
+| `deploy/minikube/test-network-policy.ps1 -Context <ctx> [-Egress]` | existing cluster with an enforcing CNI | internal API isolation, by live allowed/denied connections; with `-Egress` also the egress rules (`networkPolicy.egress.enabled`) | deploys short-lived probe pods; run deliberately |
 | `push-smoke` (`helm test` in dev mode) | local cluster only | the whole flow with the DEV ONLY mailbox and signing key | **no** |
 | `push-load` | any target you own or are authorized to test | connections, heartbeats, message/receipt latency, reconnects | yes, with dedicated test accounts and the limits below |
 
