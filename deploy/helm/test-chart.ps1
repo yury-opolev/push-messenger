@@ -601,6 +601,52 @@ Check 'default: no ServiceAccount and no identity wiring' {
     $default -notmatch '(?m)^kind: ServiceAccount' -and $default -notmatch 'azure.workload.identity' -and
         $default -notmatch 'serviceAccountName'
 }
+$jobArgs = $entraArgs + @('--set', 'migrations.job.enabled=true',
+    '--set', 'postgres.external.users.migrate=push-migrator-id',
+    '--set', 'azure.workloadIdentity.clientIds.migrate=00000000-0000-0000-0000-00000000000e')
+Check 'entra: the migration hook Job migrates all three databases as its own identity' {
+    $rendered = helm template push $chart @jobArgs | Out-String
+    $job = @'
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(sys.stdin.read()) if d]
+job = next(d for d in docs if d["kind"] == "Job" and d["metadata"]["name"] == "push-migrate")
+account = next(d for d in docs if d["kind"] == "ServiceAccount" and d["metadata"]["name"] == "push-migrate")
+hooks = lambda d: d["metadata"]["annotations"]
+assert hooks(job)["helm.sh/hook"] == "pre-install,pre-upgrade"
+assert hooks(account)["helm.sh/hook"] == "pre-install,pre-upgrade"
+assert int(hooks(account)["helm.sh/hook-weight"]) < int(hooks(job)["helm.sh/hook-weight"])
+assert account["metadata"]["annotations"]["azure.workload.identity/client-id"].endswith("e")
+assert account["automountServiceAccountToken"] is False
+template = job["spec"]["template"]
+assert template["metadata"]["labels"]["azure.workload.identity/use"] == "true"
+pod = template["spec"]
+assert pod["serviceAccountName"] == "push-migrate" and pod["restartPolicy"] == "Never"
+assert pod["automountServiceAccountToken"] is False
+steps = pod["initContainers"] + pod["containers"]
+assert [c["name"] for c in steps] == ["message-svc", "auth", "worker"]
+assert [c["image"] for c in steps] == ["push-messenger/message-svc:dev", "push-messenger/auth:dev", "push-messenger/worker:dev"]
+expected = {"message-svc": ("push_messaging", "push-message-svc-id"), "auth": ("push_auth", "push-auth-id"), "worker": ("push_worker", "push-worker-id")}
+for c in steps:
+    env = {e["name"]: e.get("value") for e in c["env"]}
+    assert c["args"] == ["migrate"], c["name"]
+    assert env["PUSH_POSTGRES_AUTH"] == "azure-entra" and env["PUSH_DATABASE_HOST"] == "pg.example.net"
+    assert (env["PUSH_DATABASE_NAME"], env["PUSH_DATABASE_RUNTIME_ROLE"]) == expected[c["name"]]
+    assert env["PUSH_DATABASE_USER"] == "push-migrator-id"
+    assert not [e for e in c["env"] if "valueFrom" in e], c["name"]
+    assert c["securityContext"]["readOnlyRootFilesystem"] is True
+    assert c["securityContext"]["runAsNonRoot"] is True
+assert {e["name"]: e.get("value") for e in steps[1]["env"]}["PUSH_AUTH_WORKER_ROLE"] == "push-worker-id"
+services = [d for d in docs if d["kind"] == "Deployment" and d["metadata"]["name"] in ("push-auth", "push-message-svc", "push-worker")]
+assert len(services) == 3
+for d in services:
+    env = {e["name"]: e.get("value") for e in d["spec"]["template"]["spec"]["containers"][0]["env"]}
+    assert env["PUSH_RUN_MIGRATIONS"] == "false", d["metadata"]["name"]
+'@
+    $rendered | & $python.Source -c $job; $LASTEXITCODE -eq 0
+}
+Check 'default and plain Entra: no migration Job' {
+    $default -notmatch '(?m)^kind: Job' -and $entra -notmatch '(?m)^kind: Job' -and $entra -notmatch 'push-migrate'
+}
 
 if ($failures -gt 0) {
     Write-Output "$failures check(s) failed"

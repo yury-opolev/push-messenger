@@ -487,3 +487,49 @@ datastores this workload reaches. Arguments: root, key, postgres, redis (boolean
     name: {{ $root.Values.redis.external.caConfigMap }}
 {{- end }}
 {{- end -}}
+
+{{/* One `migrate` step of the migration Job (migrate-job.yaml). Arguments: root, step. */}}
+{{- define "push.migrateStep" -}}
+{{- $root := .root -}}
+{{- $step := .step -}}
+- name: {{ $step.name }}
+  image: {{ include "push.image" $step.image }}
+  imagePullPolicy: {{ $root.Values.images.pullPolicy }}
+  args: ["migrate"]
+  {{- include "push.containerSecurity" $root | nindent 2 }}
+  env:
+    {{- with include "push.identityEnv" (dict "root" $root "key" "migrate") }}
+    {{- . | trim | nindent 4 }}
+    {{- end }}
+    - name: PUSH_POSTGRES_AUTH
+      value: azure-entra
+    - name: PUSH_DATABASE_HOST
+      value: {{ $root.Values.postgres.external.host | quote }}
+    - name: PUSH_DATABASE_PORT
+      value: {{ $root.Values.postgres.external.port | quote }}
+    - name: PUSH_DATABASE_NAME
+      value: {{ $step.database | quote }}
+    - name: PUSH_DATABASE_USER
+      value: {{ $root.Values.postgres.external.users.migrate | quote }}
+    - name: PUSH_DATABASE_RUNTIME_ROLE
+      value: {{ $step.runtime | quote }}
+    {{- with $step.worker }}
+    - name: PUSH_AUTH_WORKER_ROLE
+      value: {{ . | quote }}
+    {{- end }}
+    {{- if $root.Values.postgres.external.caConfigMap }}
+    - name: PUSH_DATABASE_CA_FILE
+      value: /etc/push/postgres-ca/ca.crt
+    {{- end }}
+  {{- with include "push.identityMounts" (dict "root" $root "key" "migrate" "postgres" true "redis" false) }}
+  volumeMounts:
+    {{- . | trim | nindent 4 }}
+  {{- end }}
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+{{- end -}}
