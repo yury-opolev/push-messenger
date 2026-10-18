@@ -775,6 +775,56 @@ Check 'default: the render is unchanged by Plan 13B' {
     (-not (Test-Path $baseline)) -or ((Normalized (Get-Content $baseline -Raw)) -eq (Normalized (helm template push $chart | Out-String)))
 }
 
+Check 'sign-in: the default renders no sign-in variable' {
+    (helm template push $chart | Out-String) -notmatch 'PUSH_AUTH_PROVIDERS|PUSH_ENTRA_|HTTPS_PROXY|NO_PROXY|entra-ca'
+}
+Check 'sign-in: Entra-only renders auth-svc''s variables' {
+    $auth = Doc (helm template push $chart @signInArgs | Out-String) 'Deployment' 'push-auth'
+    $auth -match '(?s)name: PUSH_AUTH_PROVIDERS\s+value: "entra"' -and
+        $auth -match '(?s)name: PUSH_ENTRA_CLIENT_ID\s+value: "11111111-0000-4000-8000-000000000001"' -and
+        $auth -match '(?s)name: PUSH_ENTRA_ALLOWED_TENANTS\s+value: "33333333-0000-4000-8000-000000000003"' -and
+        $auth -match '(?s)name: PUSH_ENTRA_AUTHORITY_HOST\s+value: "https://login.microsoftonline.com/"' -and
+        $auth -match '(?s)name: PUSH_ENTRA_REQUIRED_SCOPE\s+value: "access_as_user"' -and
+        $auth -match '(?s)name: PUSH_ENTRA_MAX_SESSION_HOURS\s+value: "24"' -and
+        $auth -notmatch 'PUSH_ENTRA_REQUIRED_ROLE|PUSH_ENTRA_ALLOWED_CLIENT_APPS|HTTPS_PROXY|SSL_CERT_FILE'
+}
+Check 'sign-in: a keyword reaches auth-svc alone, lower-cased; tenant ids joined by commas' {
+    $auth = Doc (helm template push $chart @signInArgs --set 'auth.signIn.entra.tenants={Organizations}' | Out-String) 'Deployment' 'push-auth'
+    $two = Doc (helm template push $chart @signInArgs --set 'auth.signIn.entra.tenants={33333333-0000-4000-8000-000000000003,44444444-0000-4000-8000-000000000004}' | Out-String) 'Deployment' 'push-auth'
+    $auth -match '(?s)name: PUSH_ENTRA_ALLOWED_TENANTS\s+value: "organizations"' -and
+        $two -match '(?s)name: PUSH_ENTRA_ALLOWED_TENANTS\s+value: "33333333-0000-4000-8000-000000000003,44444444-0000-4000-8000-000000000004"'
+}
+Check 'sign-in: optional settings, a proxy and a CA bundle reach auth-svc only' {
+    $rendered = helm template push $chart @signInArgs `
+        --set auth.signIn.entra.requiredRole=Messenger.User `
+        --set 'auth.signIn.entra.allowedClientApps={22222222-0000-4000-8000-000000000002}' `
+        --set auth.signIn.entra.httpsProxy=http://proxy.corp.example:3128 `
+        --set auth.signIn.entra.caConfigMap=corp-ca | Out-String
+    $auth = Doc $rendered 'Deployment' 'push-auth'
+    $auth -match '(?s)name: PUSH_ENTRA_REQUIRED_ROLE\s+value: "Messenger.User"' -and
+        $auth -match '(?s)name: PUSH_ENTRA_ALLOWED_CLIENT_APPS\s+value: "22222222-0000-4000-8000-000000000002"' -and
+        $auth -match '(?s)name: HTTPS_PROXY\s+value: "http://proxy.corp.example:3128"' -and
+        $auth -match '(?s)name: NO_PROXY\s+value: "localhost,127.0.0.1,.svc,.cluster.local"' -and
+        $auth -match '(?s)name: SSL_CERT_FILE\s+value: "/etc/push/entra-ca/ca.crt"' -and
+        $auth -match '(?s)configMap:\s+name: corp-ca' -and $auth -match 'mountPath: /etc/push/entra-ca' -and
+        @($rendered -split "(?m)^---\s*$" | Where-Object {
+            $_ -match '(?m)^kind: (Deployment|StatefulSet|Job|Pod)\s*$' -and $_ -notmatch '(?m)^  name: push-auth\s*$' -and
+                $_ -match 'HTTPS_PROXY|entra-ca|PUSH_ENTRA_' }).Count -eq 0
+}
+Check 'sign-in: password,entra offers both' {
+    $auth = Doc (helm template push $chart @signInArgs --set 'auth.signIn.providers=password\,entra' | Out-String) 'Deployment' 'push-auth'
+    $auth -match '(?s)name: PUSH_AUTH_PROVIDERS\s+value: "password,entra"'
+}
+Check 'sign-in: auth-svc trusts one CA bundle when Plan 12B''s authority bundle is set too' {
+    $chartInjection = $entraArgs + $signInArgs + @('--set', 'azure.workloadIdentity.injection=chart',
+        '--set', 'azure.workloadIdentity.tenantId=11111111-2222-3333-4444-555555555555',
+        '--set', 'azure.workloadIdentity.authorityCaConfigMap=corp-ca')
+    $auth = Doc (helm template push $chart @chartInjection --set auth.signIn.entra.caConfigMap=corp-ca | Out-String) 'Deployment' 'push-auth'
+    (Render ($chartInjection + @('--set', 'auth.signIn.entra.caConfigMap=other-ca'))) -ne 0 -and
+        ([regex]::Matches($auth, 'name: SSL_CERT_FILE')).Count -eq 1 -and
+        $auth -match '(?s)name: SSL_CERT_FILE\s+value: /etc/push/authority-ca/ca.crt' -and $auth -notmatch 'entra-ca'
+}
+
 if ($failures -gt 0) {
     Write-Output "$failures check(s) failed"
     exit 1

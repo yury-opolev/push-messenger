@@ -292,6 +292,10 @@ The admin listener is a boolean; its peers carry both label maps.
 {{- if and $entra.caConfigMap (not (regexMatch "^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$" (toString $entra.caConfigMap))) -}}
 {{- fail "auth.signIn.entra.caConfigMap must be a ConfigMap name" -}}
 {{- end -}}
+{{- $authorityCa := .Values.azure.workloadIdentity.authorityCaConfigMap -}}
+{{- if and $entra.caConfigMap (include "push.authorityCa" (dict "root" . "key" "auth")) (ne $entra.caConfigMap $authorityCa) -}}
+{{- fail "auth-svc trusts one CA bundle (SSL_CERT_FILE): set auth.signIn.entra.caConfigMap to the same ConfigMap as azure.workloadIdentity.authorityCaConfigMap, holding every root auth-svc needs" -}}
+{{- end -}}
 {{- end -}}
 {{- if include "push.emailOff" . -}}
 {{- if eq .Values.worker.email.sender "resend" -}}
@@ -303,6 +307,90 @@ The admin listener is a boolean; its peers carry both label maps.
 {{- else if eq .Values.worker.email.sender "none" -}}
 {{- fail "worker.email.sender none sends no email, but password sign-in needs its verification and reset emails: use log or resend, or auth.signIn.providers entra" -}}
 {{- end -}}
+{{- end -}}
+
+{{/*
+"true" when the chart itself points a workload's SSL_CERT_FILE at Plan 12B's authority CA
+bundle (injection chart). Arguments: root, key.
+*/}}
+{{- define "push.authorityCa" -}}
+{{- $wi := .root.Values.azure.workloadIdentity -}}
+{{- if and (include "push.anyEntra" .root) (eq $wi.injection "chart") (index $wi.clientIds .key) $wi.authorityCaConfigMap -}}true{{- end -}}
+{{- end -}}
+
+{{/*
+"true" when auth-svc mounts the sign-in CA bundle. When Plan 12B's authority bundle already
+sets its SSL_CERT_FILE, push.checkSignIn insists on the same ConfigMap and that mount serves.
+*/}}
+{{- define "push.signInCa" -}}
+{{- if and (include "push.entraSignIn" .) .Values.auth.signIn.entra.caConfigMap (not (include "push.authorityCa" (dict "root" . "key" "auth"))) -}}true{{- end -}}
+{{- end -}}
+
+{{/*
+auth-svc's sign-in variables (spec 2026-10-19 §3), as env list entries; nothing for the
+default (password only). The proxy serves only auth-svc's requests to Entra ID (reqwest):
+gRPC and the datastores never read it. A CA bundle replaces the system roots for every TLS
+connection auth-svc makes (rustls-native-certs reads SSL_CERT_FILE alone).
+*/}}
+{{- define "push.signInEnv" -}}
+{{- $signIn := .Values.auth.signIn -}}
+{{- $providers := nospace (toString $signIn.providers) -}}
+{{- if ne $providers "password" }}
+- name: PUSH_AUTH_PROVIDERS
+  value: {{ $providers | quote }}
+{{- end }}
+{{- if include "push.entraSignIn" . }}
+{{- $entra := $signIn.entra }}
+- name: PUSH_ENTRA_CLIENT_ID
+  value: {{ join "," $entra.clientIds | quote }}
+- name: PUSH_ENTRA_ALLOWED_TENANTS
+  value: {{ join "," $entra.tenants | lower | quote }}
+- name: PUSH_ENTRA_AUTHORITY_HOST
+  value: {{ $entra.authorityHost | quote }}
+- name: PUSH_ENTRA_REQUIRED_SCOPE
+  value: {{ $entra.requiredScope | quote }}
+{{- with $entra.requiredRole }}
+- name: PUSH_ENTRA_REQUIRED_ROLE
+  value: {{ . | quote }}
+{{- end }}
+{{- with $entra.allowedClientApps }}
+- name: PUSH_ENTRA_ALLOWED_CLIENT_APPS
+  value: {{ join "," . | quote }}
+{{- end }}
+- name: PUSH_ENTRA_MAX_SESSION_HOURS
+  value: {{ int $entra.maxSessionHours | quote }}
+{{- with $entra.httpsProxy }}
+- name: HTTPS_PROXY
+  value: {{ . | quote }}
+- name: NO_PROXY
+  value: "localhost,127.0.0.1,.svc,.cluster.local"
+{{- end }}
+{{- if include "push.signInCa" . }}
+- name: SSL_CERT_FILE
+  value: "/etc/push/entra-ca/ca.crt"
+{{- end }}
+{{- end }}
+{{- end -}}
+
+{{/* auth-svc's container mount of the sign-in CA bundle (push.signInCa). */}}
+{{- define "push.signInMounts" -}}
+{{- if include "push.signInCa" . }}
+- name: entra-ca
+  mountPath: /etc/push/entra-ca
+  readOnly: true
+{{- end }}
+{{- end -}}
+
+{{/* auth-svc's pod volume of the sign-in CA bundle (push.signInCa). */}}
+{{- define "push.signInVolumes" -}}
+{{- if include "push.signInCa" . }}
+- name: entra-ca
+  configMap:
+    name: {{ .Values.auth.signIn.entra.caConfigMap }}
+    items:
+      - key: ca.crt
+        path: ca.crt
+{{- end }}
 {{- end -}}
 
 {{/* Hardened container settings for our own images (distroless, uid 65532). */}}
