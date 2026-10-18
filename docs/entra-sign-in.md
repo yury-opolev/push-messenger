@@ -101,6 +101,57 @@ assignment, consent and Conditional Access, and `PUSH_ENTRA_REQUIRED_ROLE` /
 issuer is still checked against the tenant in the token, and auth-svc fetches the keyword's
 one shared key set, never one per tenant.
 
+### With the Helm chart
+
+```yaml
+auth:
+  signIn:
+    providers: entra            # or "password,entra"
+    entra:
+      clientIds:
+        - 11111111-0000-4000-8000-000000000001   # the API's application id
+      tenants:
+        - 33333333-0000-4000-8000-000000000003   # your tenant id(s); or exactly one of
+                                                 # common, organizations, consumers
+      maxSessionHours: 24
+      # requiredRole: Messenger.User
+      # allowedClientApps: [22222222-0000-4000-8000-000000000002]
+      # httpsProxy: http://proxy.corp.example:3128
+      # caConfigMap: corp-ca      # ca.crt: every root auth-svc must trust
+  admin:
+    enabled: true               # the admin API on port 8082 (Secret key auth-admin-token)
+networkPolicy:
+  adminPeers:                   # who may reach port 8082; empty: port-forward only
+    - namespaceSelector: {kubernetes.io/metadata.name: ops}
+      podSelector: {app: admin-shell}
+  egress:
+    enabled: true               # opt-in egress policies (deployment-azure-entra.md)
+    entraSignInCidrs: []        # AzureActiveDirectory service tag ranges, or use a proxy
+```
+
+The chart checks these values before it installs anything, as auth-svc does at start-up:
+the tenant forms above (a mixture, a duplicate or anything else is refused), the
+application id among `clientIds`, an `https://` authority host, 1 to 720 session hours.
+
+With `providers: entra` the chart renders `PUSH_EMAIL_SENDER=none` for the worker, no link
+page Ingress, and references no Resend key: a consumer-managed Secret needs no email keys.
+`worker.email.sender: resend` and `worker.email.webhook.enabled: true` are refused then, and
+`worker.email.sender: none` is refused while `password` is on (its verification and reset
+emails would never arrive). The `/v1/auth` Ingress route already carries `/v1/auth/entra`.
+Changing `providers` from `password` or `password,entra` to `entra` signs every password
+device out when the new auth-svc pods start (see [Modes](#modes)).
+
+`httpsProxy` applies to auth-svc's requests to Entra ID only (`NO_PROXY` keeps in-cluster
+names direct). `caConfigMap` replaces the system roots for **every** TLS connection auth-svc
+makes, so its `ca.crt` must hold every root auth-svc needs (a TLS-inspecting proxy's root
+plus the public roots); with the datastore mode's
+`azure.workloadIdentity.authorityCaConfigMap` it must name the same ConfigMap.
+
+With `admin.enabled`, reach the admin port with `kubectl port-forward deploy/push-auth
+8082:8082` or from the peers in `networkPolicy.adminPeers`; it is never routed by the
+chart's Ingresses. The token is the `auth-admin-token` key of the release's Secret
+(generated and kept for the chart-managed Secret; yours with `secrets.existingSecret`).
+
 ## Handles
 
 A new Entra ID account gets the handle the app asked for at its first sign-in, or a random
@@ -215,7 +266,9 @@ and the key set it names (`https://login.microsoftonline.com/<tid>/discovery/v2.
 start-up, about daily and when Microsoft rotates keys. Allow HTTPS (443) from auth-svc to
 `login.microsoftonline.com` (FQDN rules in your firewall, or Microsoft's
 `AzureActiveDirectory` service tag ranges), or set `HTTPS_PROXY` (and `NO_PROXY` for
-in-cluster names) on auth-svc. Nothing else calls Entra ID. When Entra ID cannot be reached
+in-cluster names) on auth-svc. With the chart's opt-in egress policies,
+`networkPolicy.egress.entraSignInCidrs` opens 443 to those ranges for auth-svc alone.
+Nothing else calls Entra ID. When Entra ID cannot be reached
 and no keys are cached, Entra sign-ins answer 503 `entra_unavailable`; refresh, devices and
 messaging keep working.
 

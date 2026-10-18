@@ -185,7 +185,7 @@ prerequisites, database roles, egress and limitations).
 [docs/deployment-ingress-verification.md](docs/deployment-ingress-verification.md)
 records the routing checks against a maintained controller (Traefik).
 Microsoft Entra ID sign-in (opt-in, also Entra-only without email):
-[docs/entra-sign-in.md](docs/entra-sign-in.md) (chart values arrive with Plan 13B).
+[docs/entra-sign-in.md](docs/entra-sign-in.md) (chart: `auth.signIn`).
 [docs/consumer-verification.md](docs/consumer-verification.md) gives the build, image,
 chart packaging and verification commands, and `push-load`, an explicitly targeted,
 bounded harness for connection, heartbeat, message-latency and reconnect checks with

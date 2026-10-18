@@ -106,12 +106,23 @@ keys (`postgres-password`, `*-db-password`, `*database-url`, `redis-password`,
 
 ### Microsoft Entra ID sign-in
 
+`auth.signIn` turns on Entra ID sign-in beside or instead of email and password
+([guide](entra-sign-in.md#with-the-helm-chart)). Entra-only (`providers: entra`) needs no
+`resend-api-key` or `resend-webhook-secret` in a consumer-managed Secret and no email
+provider at all (the worker runs with `PUSH_EMAIL_SENDER=none` and no link-page Ingress is
+rendered); every other key is unchanged. With egress policies auth-svc then needs HTTPS to
+`login.microsoftonline.com`: `networkPolicy.egress.entraSignInCidrs` (auth-svc only) or a
+proxy (`auth.signIn.entra.httpsProxy`).
+
 `auth.admin.enabled` serves auth-svc's admin API on port 8082 (sign a user out of every
 device; [guide](entra-sign-in.md#admin-api)). It is never routed by the chart's Ingresses;
 `networkPolicy.adminPeers` lists who may reach it (none by default: use
 `kubectl port-forward`).
 
 ## Email and the Resend webhook
+
+`worker.email.sender` is `log` (default), `resend`, or `none` (no email at all; only for
+Entra-only installations, which render it anyway).
 
 `worker.email.webhook.enabled` (default `false`) is an explicit decision, never
 inferred from a Secret. When `true` the worker references `resend-webhook-secret`,
