@@ -393,3 +393,97 @@ mode), or the Entra ID variables of Plan 12A. Arguments: root, secretKey, databa
       key: redis-url
 {{- end }}
 {{- end -}}
+
+{{/* Pod label: the AKS webhook mutates only pods that opt in. Arguments: root, key. */}}
+{{- define "push.identityLabels" -}}
+{{- $root := .root -}}
+{{- if and (include "push.anyEntra" $root) (eq $root.Values.azure.workloadIdentity.injection "webhook") (index $root.Values.azure.workloadIdentity.clientIds .key) }}
+azure.workload.identity/use: "true"
+{{- end }}
+{{- end -}}
+
+{{/* Pod spec line: the workload's ServiceAccount in Entra ID mode. Arguments: root, component. */}}
+{{- define "push.serviceAccount" -}}
+{{- if include "push.anyEntra" .root }}
+serviceAccountName: {{ include "push.name" (dict "root" .root "component" .component) }}
+{{- end }}
+{{- end -}}
+
+{{/* Container env: the AZURE_* variables when the chart injects the identity itself. */}}
+{{- define "push.identityEnv" -}}
+{{- $root := .root -}}
+{{- $wi := $root.Values.azure.workloadIdentity -}}
+{{- if and (include "push.anyEntra" $root) (eq $wi.injection "chart") (index $wi.clientIds .key) }}
+- name: AZURE_CLIENT_ID
+  value: {{ index $wi.clientIds .key | quote }}
+- name: AZURE_TENANT_ID
+  value: {{ $wi.tenantId | quote }}
+- name: AZURE_FEDERATED_TOKEN_FILE
+  value: /var/run/secrets/azure/tokens/azure-identity-token
+- name: AZURE_AUTHORITY_HOST
+  value: {{ $wi.authorityHost | quote }}
+{{- if $wi.authorityCaConfigMap }}
+- name: SSL_CERT_FILE
+  value: /etc/push/authority-ca/ca.crt
+{{- end }}
+{{- end }}
+{{- end -}}
+
+{{/*
+Container volume mounts: the projected token (injection chart) and the CA bundles of the
+datastores this workload reaches. Arguments: root, key, postgres, redis (booleans).
+*/}}
+{{- define "push.identityMounts" -}}
+{{- $root := .root -}}
+{{- $wi := $root.Values.azure.workloadIdentity -}}
+{{- if and (include "push.anyEntra" $root) (eq $wi.injection "chart") (index $wi.clientIds .key) }}
+- name: azure-identity-token
+  mountPath: /var/run/secrets/azure/tokens
+  readOnly: true
+{{- if $wi.authorityCaConfigMap }}
+- name: authority-ca
+  mountPath: /etc/push/authority-ca
+  readOnly: true
+{{- end }}
+{{- end }}
+{{- if and (include "push.entraPostgres" $root) $root.Values.postgres.external.caConfigMap .postgres }}
+- name: postgres-ca
+  mountPath: /etc/push/postgres-ca
+  readOnly: true
+{{- end }}
+{{- if and (include "push.entraRedis" $root) $root.Values.redis.external.caConfigMap .redis }}
+- name: redis-ca
+  mountPath: /etc/push/redis-ca
+  readOnly: true
+{{- end }}
+{{- end -}}
+
+{{/* Pod volumes matching push.identityMounts. */}}
+{{- define "push.identityVolumes" -}}
+{{- $root := .root -}}
+{{- $wi := $root.Values.azure.workloadIdentity -}}
+{{- if and (include "push.anyEntra" $root) (eq $wi.injection "chart") (index $wi.clientIds .key) }}
+- name: azure-identity-token
+  projected:
+    sources:
+      - serviceAccountToken:
+          audience: api://AzureADTokenExchange
+          expirationSeconds: 3600
+          path: azure-identity-token
+{{- if $wi.authorityCaConfigMap }}
+- name: authority-ca
+  configMap:
+    name: {{ $wi.authorityCaConfigMap }}
+{{- end }}
+{{- end }}
+{{- if and (include "push.entraPostgres" $root) $root.Values.postgres.external.caConfigMap .postgres }}
+- name: postgres-ca
+  configMap:
+    name: {{ $root.Values.postgres.external.caConfigMap }}
+{{- end }}
+{{- if and (include "push.entraRedis" $root) $root.Values.redis.external.caConfigMap .redis }}
+- name: redis-ca
+  configMap:
+    name: {{ $root.Values.redis.external.caConfigMap }}
+{{- end }}
+{{- end -}}

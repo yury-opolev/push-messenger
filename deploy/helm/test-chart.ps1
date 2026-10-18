@@ -543,6 +543,64 @@ assert "PUSH_REDIS_AUTH" not in env("push-worker") and "PUSH_POSTGRES_AUTH" not 
 '@
     $entra | & $python.Source -c $envCheck; $LASTEXITCODE -eq 0
 }
+Check 'entra webhook: one ServiceAccount per workload with its client id; pods opt in' {
+    $sa = @'
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(sys.stdin.read()) if d]
+ids = {"push-auth": "a", "push-message-svc": "b", "push-gateway": "c", "push-worker": "d"}
+for name, suffix in ids.items():
+    account = next(d for d in docs if d["kind"] == "ServiceAccount" and d["metadata"]["name"] == name)
+    assert account["metadata"]["annotations"]["azure.workload.identity/client-id"].endswith(suffix), name
+    assert account["automountServiceAccountToken"] is False
+    pod = next(d for d in docs if d["kind"] == "Deployment" and d["metadata"]["name"] == name)["spec"]["template"]
+    assert pod["metadata"]["labels"]["azure.workload.identity/use"] == "true", name
+    assert pod["spec"]["serviceAccountName"] == name and pod["spec"]["automountServiceAccountToken"] is False
+    assert not [e for e in pod["spec"]["containers"][0]["env"] if e["name"].startswith("AZURE_")], name
+    assert "volumes" not in pod["spec"] and "volumeMounts" not in pod["spec"]["containers"][0], name
+'@
+    $entra | & $python.Source -c $sa; $LASTEXITCODE -eq 0
+}
+Check 'entra chart injection: the chart projects the token, sets AZURE_* and mounts the CAs' {
+    $chartInjection = helm template push $chart @entraArgs `
+        --set azure.workloadIdentity.injection=chart `
+        --set azure.workloadIdentity.tenantId=11111111-2222-3333-4444-555555555555 `
+        --set azure.workloadIdentity.authorityCaConfigMap=authority-ca `
+        --set postgres.external.caConfigMap=pg-ca --set redis.external.caConfigMap=redis-ca | Out-String
+    $projection = @'
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(sys.stdin.read()) if d]
+def pod(name):
+    return next(d for d in docs if d["kind"] == "Deployment" and d["metadata"]["name"] == name)["spec"]["template"]
+auth = pod("push-auth")
+assert "azure.workload.identity/use" not in auth["metadata"]["labels"]
+volumes = {v["name"]: v for v in auth["spec"]["volumes"]}
+source = volumes["azure-identity-token"]["projected"]["sources"][0]["serviceAccountToken"]
+assert source == {"audience": "api://AzureADTokenExchange", "expirationSeconds": 3600, "path": "azure-identity-token"}
+assert volumes["postgres-ca"]["configMap"]["name"] == "pg-ca" and volumes["redis-ca"]["configMap"]["name"] == "redis-ca"
+assert volumes["authority-ca"]["configMap"]["name"] == "authority-ca"
+container = auth["spec"]["containers"][0]
+env = {e["name"]: e.get("value") for e in container["env"]}
+assert env["AZURE_CLIENT_ID"].endswith("a") and env["AZURE_TENANT_ID"].startswith("1111")
+assert env["AZURE_FEDERATED_TOKEN_FILE"] == "/var/run/secrets/azure/tokens/azure-identity-token"
+assert env["AZURE_AUTHORITY_HOST"] == "https://login.microsoftonline.com/"
+assert env["SSL_CERT_FILE"] == "/etc/push/authority-ca/ca.crt"
+assert env["PUSH_DATABASE_CA_FILE"] == "/etc/push/postgres-ca/ca.crt"
+assert env["PUSH_REDIS_CA_FILE"] == "/etc/push/redis-ca/ca.crt"
+mounts = {m["mountPath"]: m for m in container["volumeMounts"]}
+for path in ["/var/run/secrets/azure/tokens", "/etc/push/postgres-ca", "/etc/push/redis-ca", "/etc/push/authority-ca"]:
+    assert mounts[path]["readOnly"] is True, path
+# Each workload mounts only the CA bundles of the datastores it reaches.
+gateway = {v["name"] for v in pod("push-gateway")["spec"]["volumes"]}
+worker = {v["name"] for v in pod("push-worker")["spec"]["volumes"]}
+assert gateway == {"azure-identity-token", "authority-ca", "redis-ca"}, gateway
+assert worker == {"azure-identity-token", "authority-ca", "postgres-ca"}, worker
+'@
+    $chartInjection | & $python.Source -c $projection; $LASTEXITCODE -eq 0
+}
+Check 'default: no ServiceAccount and no identity wiring' {
+    $default -notmatch '(?m)^kind: ServiceAccount' -and $default -notmatch 'azure.workload.identity' -and
+        $default -notmatch 'serviceAccountName'
+}
 
 if ($failures -gt 0) {
     Write-Output "$failures check(s) failed"

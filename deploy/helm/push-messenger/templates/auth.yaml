@@ -28,12 +28,18 @@ spec:
     metadata:
       labels:
         {{- include "push.labels" (dict "root" . "component" "auth") | nindent 8 }}
+        {{- with include "push.identityLabels" (dict "root" . "key" "auth") }}
+        {{- . | trim | nindent 8 }}
+        {{- end }}
       {{- with .Values.buildId }}
       annotations:
         push-messenger/build-id: {{ . | quote }}
       {{- end }}
     spec:
       automountServiceAccountToken: false
+      {{- with include "push.serviceAccount" (dict "root" . "component" "auth") }}
+      {{- . | trim | nindent 6 }}
+      {{- end }}
       # Shutdown budget, as for the gateway: the 5 s preStop sleep lets Kubernetes take
       # the pod out of the Service and Ingress endpoints before SIGTERM, on which
       # auth-svc stops accepting, finishes the requests in progress and closes its pool.
@@ -49,6 +55,9 @@ spec:
               sleep:
                 seconds: 5
           env:
+            {{- with include "push.identityEnv" (dict "root" . "key" "auth") }}
+            {{- . | trim | nindent 12 }}
+            {{- end }}
             # Its own database only: auth-svc never sees message-svc's credentials.
             {{- include "push.postgresEnv" (dict "root" . "secretKey" "auth-database-url" "database" .Values.postgres.external.databases.auth "user" .Values.postgres.external.users.auth) | trim | nindent 12 }}
             {{- include "push.redisEnv" . | trim | nindent 12 }}
@@ -107,3 +116,11 @@ spec:
             periodSeconds: 10
           resources:
             {{- toYaml .Values.auth.resources | nindent 12 }}
+          {{- with include "push.identityMounts" (dict "root" . "key" "auth" "postgres" true "redis" true) }}
+          volumeMounts:
+            {{- . | trim | nindent 12 }}
+          {{- end }}
+      {{- with include "push.identityVolumes" (dict "root" . "key" "auth" "postgres" true "redis" true) }}
+      volumes:
+        {{- . | trim | nindent 8 }}
+      {{- end }}

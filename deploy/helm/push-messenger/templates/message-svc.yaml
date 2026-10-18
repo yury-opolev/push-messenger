@@ -37,12 +37,18 @@ spec:
     metadata:
       labels:
         {{- include "push.labels" (dict "root" . "component" "message-svc") | nindent 8 }}
+        {{- with include "push.identityLabels" (dict "root" . "key" "messageSvc") }}
+        {{- . | trim | nindent 8 }}
+        {{- end }}
       {{- with .Values.buildId }}
       annotations:
         push-messenger/build-id: {{ . | quote }}
       {{- end }}
     spec:
       automountServiceAccountToken: false
+      {{- with include "push.serviceAccount" (dict "root" . "component" "message-svc") }}
+      {{- . | trim | nindent 6 }}
+      {{- end }}
       # Set explicitly (the Kubernetes default is also 30 s) so a graceful stop is a
       # deliberate budget, not an accident.
       terminationGracePeriodSeconds: {{ .Values.messageSvc.terminationGracePeriodSeconds }}
@@ -52,6 +58,9 @@ spec:
           imagePullPolicy: {{ .Values.images.pullPolicy }}
           {{- include "push.containerSecurity" . | nindent 10 }}
           env:
+            {{- with include "push.identityEnv" (dict "root" . "key" "messageSvc") }}
+            {{- . | trim | nindent 12 }}
+            {{- end }}
             - name: PUSH_GRPC_ADDR
               value: "0.0.0.0:50051"
             - name: PUSH_ACCOUNTS_GRPC_ADDR
@@ -102,3 +111,11 @@ spec:
             periodSeconds: 10
           resources:
             {{- toYaml .Values.messageSvc.resources | nindent 12 }}
+          {{- with include "push.identityMounts" (dict "root" . "key" "messageSvc" "postgres" true "redis" true) }}
+          volumeMounts:
+            {{- . | trim | nindent 12 }}
+          {{- end }}
+      {{- with include "push.identityVolumes" (dict "root" . "key" "messageSvc" "postgres" true "redis" true) }}
+      volumes:
+        {{- . | trim | nindent 8 }}
+      {{- end }}
