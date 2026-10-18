@@ -495,6 +495,27 @@ Check 'default: the render is unchanged by Plan 12B' {
     $baseline = Join-Path ([IO.Path]::GetTempPath()) 'push-default-before.yaml'
     (-not (Test-Path $baseline)) -or ((Normalized (Get-Content $baseline -Raw)) -eq (Normalized $default))
 }
+$entra = helm template push $chart @entraArgs | Out-String
+Check 'entra: no bundled datastore, and no datastore credential in any Secret or ConfigMap' {
+    $noCredentials = @'
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(sys.stdin.read()) if d]
+names = {(d["kind"], d["metadata"]["name"]) for d in docs}
+assert ("StatefulSet", "push-postgres") not in names and ("Deployment", "push-redis") not in names
+assert ("Service", "push-postgres") not in names and ("Service", "push-redis") not in names
+assert ("ConfigMap", "push-postgres-init") not in names
+for d in docs:
+    if d["kind"] in ("Secret", "ConfigMap"):
+        data = {**(d.get("data") or {}), **(d.get("stringData") or {})}
+        bad = [k for k in data if "database" in k or "redis" in k or "db-password" in k or k == "postgres-password"]
+        assert not bad, (d["metadata"]["name"], bad)
+'@
+    $entra | & $python.Source -c $noCredentials; $LASTEXITCODE -eq 0
+}
+Check 'entra: only the four application policies exist' {
+    ($entra -split "(?m)^---\s*$" | Where-Object { $_ -match '(?m)^kind: NetworkPolicy\s*$' }).Count -eq 4 -and
+        -not (Doc $entra 'NetworkPolicy' 'push-postgres') -and -not (Doc $entra 'NetworkPolicy' 'push-redis')
+}
 
 if ($failures -gt 0) {
     Write-Output "$failures check(s) failed"

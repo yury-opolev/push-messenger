@@ -1,3 +1,4 @@
+{{- if .Values.redis.enabled -}}
 {{- $name := include "push.name" (dict "root" . "component" "redis") -}}
 apiVersion: v1
 kind: Service
@@ -74,3 +75,4 @@ spec:
       volumes:
         - name: data
           emptyDir: {}
+{{- end }}

@@ -35,15 +35,20 @@
     (dict "port" 50051 "callers" (list "gateway"))
     (dict "port" 50052 "callers" (list "worker"))
     (dict "port" 50053 "callers" (list "auth"))))
-  (dict "component" "postgres" "rules" (list
-    (dict "port" 5432 "callers" (list "message-svc" "auth" "worker"))))
-  (dict "component" "redis" "rules" (list
-    (dict "port" 6379 "callers" (list "message-svc" "auth" "gateway"))))
+-}}
+{{- if .Values.postgres.enabled -}}
+{{- $policies = append $policies (dict "component" "postgres" "rules" (list
+    (dict "port" 5432 "callers" (list "message-svc" "auth" "worker")))) -}}
+{{- end -}}
+{{- if .Values.redis.enabled -}}
+{{- $policies = append $policies (dict "component" "redis" "rules" (list
+    (dict "port" 6379 "callers" (list "message-svc" "auth" "gateway")))) -}}
+{{- end -}}
+{{- $policies = concat $policies (list
   (dict "component" "auth" "rules" (list
     (dict "port" 8080 "callers" (list "gateway") "controllers" $controllers)))
   (dict "component" "gateway" "rules" $gatewayRules)
-  (dict "component" "worker" "rules" $workerRules)
--}}
+  (dict "component" "worker" "rules" $workerRules)) -}}
 {{- range $policies -}}
 {{- $context := dict "root" $ "component" .component -}}
 {{- printf "\n---\n" }}
