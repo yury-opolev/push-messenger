@@ -5,6 +5,8 @@
 
 mod claims;
 mod settings;
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 
 use uuid::Uuid;
 
