@@ -129,8 +129,8 @@ impl Auth {
         let Some(account) = account else {
             return Err(AuthError::Unauthorized);
         };
-        let password_hash: String = account.get(0);
-        if password_stamp(&password_hash) != stamp {
+        let password_hash: Option<String> = account.get(0);
+        if !password_hash.is_some_and(|hash| password_stamp(&hash) == stamp) {
             return Err(AuthError::Unauthorized);
         }
         if !account.get::<bool, _>(1) {

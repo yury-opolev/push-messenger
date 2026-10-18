@@ -317,6 +317,8 @@ async fn forged_expired_and_mismatched_links_are_refused() {
         exp,
         email: Some(email.to_owned()),
         pw: Some(stamp.clone()),
+        xid: None,
+        sx: None,
     };
     let far = i64::MAX;
     let cases = [
@@ -631,4 +633,47 @@ async fn a_login_flood_fails_fast_with_a_retryable_error() {
     }
     assert!((1..8).contains(&busy), "{busy} of 8 refused");
     assert!(AuthError::Unavailable.retryable());
+}
+
+#[tokio::test]
+async fn an_account_without_a_password_takes_no_password_link_or_token() {
+    let world = world().await;
+    let user = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO auth.user_account (user_id, handle, display_name, email_verified_at) \
+         VALUES ($1, 'erin', 'Erin', now())",
+    )
+    .bind(user)
+    .execute(&world.pool)
+    .await
+    .unwrap();
+    let signer = LinkSigner::new(LINK_KEY.to_vec()).unwrap();
+    let claims = |purpose| LinkClaims {
+        sub: user,
+        purpose,
+        exp: i64::MAX,
+        email: None,
+        pw: Some(password_stamp("")),
+        xid: None,
+        sx: None,
+    };
+    assert_eq!(
+        world
+            .auth
+            .reset_password(&signer.sign(&claims(Purpose::Reset)), "a new password")
+            .await,
+        Err(AuthError::LinkInvalid)
+    );
+    assert_eq!(
+        world
+            .auth
+            .register_device(
+                &signer.sign(&claims(Purpose::Register)),
+                Uuid::now_v7(),
+                "Phone",
+                "ios"
+            )
+            .await,
+        Err(AuthError::Unauthorized)
+    );
 }

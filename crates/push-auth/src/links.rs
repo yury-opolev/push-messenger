@@ -3,7 +3,8 @@
 //! A token is `payload.signature`: the payload is base64url JSON claims, the signature
 //! an HMAC-SHA256 over the payload under the service's link key. Nothing is stored:
 //! a verification link binds the email it was sent to, and every token binds a
-//! fingerprint of the account's password hash when it was made, so changing the password
+//! fingerprint of the account's password hash when it was made (or, for an Entra ID
+//! registration token, the identity that signed in, spec 2026-10-19 D7), so changing the password
 //! (a reset, or a new signup over an unverified account) makes every earlier token
 //! worthless, and a used reset link with it. Every token has a purpose, so one kind can
 //! never stand in for another.
@@ -39,9 +40,17 @@ pub struct LinkClaims {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
     /// [`password_stamp`] of the account's password hash when the token was made. Every
-    /// token the service signs carries it; a token without it is refused.
+    /// email link and every email/password registration token carries it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pw: Option<String>,
+    /// Entra ID registration tokens: the `auth.external_identity` row that signed in. A
+    /// registration token carries either `pw` or `xid` with `sx`, never both.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xid: Option<Uuid>,
+    /// Entra ID registration tokens: when the device's session ends, in seconds since the
+    /// Unix epoch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sx: Option<i64>,
 }
 
 /// Why a token was refused.
@@ -150,6 +159,8 @@ mod tests {
             exp: 1_000,
             email: Some("alice@example.com".to_owned()),
             pw: None,
+            xid: None,
+            sx: None,
         }
     }
 

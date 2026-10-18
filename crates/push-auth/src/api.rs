@@ -104,7 +104,14 @@ impl IntoResponse for AuthError {
             Self::Unavailable => {
                 headers.insert(RETRY_AFTER, HeaderValue::from_static("1"));
             }
-            Self::Unauthorized | Self::TokenExpired | Self::InvalidCredentials => {
+            Self::EntraUnavailable => {
+                headers.insert(RETRY_AFTER, HeaderValue::from_static("5"));
+            }
+            Self::Unauthorized
+            | Self::TokenExpired
+            | Self::InvalidCredentials
+            | Self::EntraTokenInvalid
+            | Self::SessionExpired => {
                 headers.insert(WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
             }
             _ => {}
@@ -663,6 +670,12 @@ mod tests {
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(response.headers()[RETRY_AFTER], "42");
         let response = AuthError::Unauthorized.into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.headers()[WWW_AUTHENTICATE], "Bearer");
+        let response = AuthError::EntraUnavailable.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[RETRY_AFTER], "5");
+        let response = AuthError::SessionExpired.into_response();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(response.headers()[WWW_AUTHENTICATE], "Bearer");
     }

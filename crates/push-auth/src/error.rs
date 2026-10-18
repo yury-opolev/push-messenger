@@ -27,6 +27,12 @@ pub enum AuthError {
     DeviceNotFound,
     #[error("no such user")]
     UserNotFound,
+    #[error("the Microsoft Entra ID token is not accepted")]
+    EntraTokenInvalid,
+    #[error("Microsoft Entra ID cannot be reached to check the token; try again")]
+    EntraUnavailable,
+    #[error("the session has reached its maximum age; sign in again")]
+    SessionExpired,
     #[error("too many requests; try again in {retry_after_s} s")]
     RateLimited { retry_after_s: u64 },
     #[error("the service is unavailable; try again")]
@@ -48,6 +54,9 @@ impl AuthError {
             Self::TooManyDevices => "too_many_devices",
             Self::DeviceNotFound => "device_not_found",
             Self::UserNotFound => "user_not_found",
+            Self::EntraTokenInvalid => "entra_token_invalid",
+            Self::EntraUnavailable => "entra_unavailable",
+            Self::SessionExpired => "session_expired",
             Self::RateLimited { .. } => "rate_limited",
             Self::Unavailable => "unavailable",
         }
@@ -57,18 +66,25 @@ impl AuthError {
     pub fn status(&self) -> u16 {
         match self {
             Self::Invalid(_) | Self::LinkInvalid | Self::LinkExpired => 400,
-            Self::InvalidCredentials | Self::Unauthorized | Self::TokenExpired => 401,
+            Self::InvalidCredentials
+            | Self::Unauthorized
+            | Self::TokenExpired
+            | Self::EntraTokenInvalid
+            | Self::SessionExpired => 401,
             Self::EmailNotVerified => 403,
             Self::DeviceNotFound | Self::UserNotFound => 404,
             Self::HandleTaken | Self::TooManyDevices => 409,
             Self::RateLimited { .. } => 429,
-            Self::Unavailable => 503,
+            Self::Unavailable | Self::EntraUnavailable => 503,
         }
     }
 
     /// Whether the same request may succeed later without changes.
     pub fn retryable(&self) -> bool {
-        matches!(self, Self::RateLimited { .. } | Self::Unavailable)
+        matches!(
+            self,
+            Self::RateLimited { .. } | Self::Unavailable | Self::EntraUnavailable
+        )
     }
 }
 

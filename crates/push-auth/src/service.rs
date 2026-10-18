@@ -163,6 +163,8 @@ impl Auth {
             exp: unix_now() + LINK_SECONDS,
             email: Some(email.to_owned()),
             pw: Some(password_stamp(password_hash)),
+            xid: None,
+            sx: None,
         });
         format!("{}/v1/auth/verify?token={token}", self.public_url)
     }
@@ -353,7 +355,11 @@ impl Auth {
         .bind(&email)
         .fetch_optional(&self.pool)
         .await?;
-        let stored: Option<String> = account.as_ref().map(|row| row.get(1));
+        // An account without a password (Entra ID) has no address either, so the email
+        // never finds it; NULL is read safely all the same.
+        let stored: Option<String> = account
+            .as_ref()
+            .and_then(|row| row.get::<Option<String>, _>(1));
         let checked = self
             .check_password(password.to_owned(), stored.clone())
             .await?;
@@ -397,6 +403,8 @@ impl Auth {
             exp: unix_now() + REGISTRATION_TOKEN_SECONDS,
             email: None,
             pw: Some(password_stamp(&password_hash)),
+            xid: None,
+            sx: None,
         });
         Ok(RegistrationToken {
             token,
@@ -424,6 +432,8 @@ impl Auth {
                 exp: unix_now() + LINK_SECONDS,
                 email: None,
                 pw: Some(password_stamp(account.get(2))),
+                xid: None,
+                sx: None,
             });
             let link = format!("{}/v1/auth/password/reset?token={token}", self.public_url);
             let event = Event::EmailSend {
@@ -460,8 +470,12 @@ impl Auth {
         let Some(account) = account else {
             return Err(AuthError::LinkInvalid);
         };
-        let current: String = account.get(0);
-        if claims.pw.as_deref() != Some(password_stamp(&current).as_str()) {
+        let current: Option<String> = account.get(0);
+        let matches = match (&claims.pw, &current) {
+            (Some(stamp), Some(current)) => *stamp == password_stamp(current),
+            _ => false,
+        };
+        if !matches {
             return Err(AuthError::LinkInvalid);
         }
         // The clock that sets the access tokens' `iat`: auth-svc (in `authenticate`) and

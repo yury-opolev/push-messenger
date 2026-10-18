@@ -24,16 +24,21 @@ pub struct OwnProfile {
     pub user_id: Uuid,
     pub handle: String,
     pub display_name: String,
-    pub email: String,
+    /// The account's address; for an Entra ID account the latest address its token
+    /// carried (informational), if any.
+    pub email: Option<String>,
 }
 
 impl Auth {
     /// `GET /v1/users/me`.
     pub async fn own_profile(&self, caller: Caller) -> Result<OwnProfile, AuthError> {
         let row = sqlx::query(
-            "SELECT handle::text, display_name, email::text FROM auth.user_account \
-             WHERE user_id = $1",
-        )
+                    "SELECT account.handle::text, account.display_name, \
+                     coalesce(account.email::text, identity.email) \
+                     FROM auth.user_account AS account \
+                     LEFT JOIN auth.external_identity AS identity ON identity.user_id = account.user_id \
+                     WHERE account.user_id = $1",
+                )
         .bind(caller.user_id)
         .fetch_optional(&self.pool)
         .await?
