@@ -22,13 +22,15 @@ mod server;
 mod service;
 pub mod tokens;
 
-pub use config::{Config, ConfigError};
-pub use db::{MIGRATOR, grant_worker_access, is_role_name, migrate_database};
+pub use config::{Config, ConfigError, MigrateConfig};
+pub use db::{
+    MIGRATOR, grant_worker_access, grant_worker_access_on, is_role_name, migrate_database,
+};
 pub use devices::{Caller, DeviceInfo, MAX_ACTIVE_DEVICES, REFRESH_GRACE, Tokens};
 pub use directory::{Directory, GrpcDirectory, NoDirectory};
 pub use error::AuthError;
 pub use profiles::{OwnProfile, PublicProfile};
-pub use server::{init_logging, serve, terminated};
+pub use server::{init_logging, migrate, serve, terminated};
 pub use service::{
     Auth, LINK_SECONDS, REGISTRATION_TOKEN_SECONDS, RegistrationToken, Settings, Signup,
 };

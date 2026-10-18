@@ -19,23 +19,31 @@ pub async fn migrate_database(url: &str) -> Result<(), sqlx::migrate::MigrateErr
 /// lets several workers drain at once; and `EXECUTE` on
 /// `auth.delete_expired_refresh_tokens` and `auth.delete_unverified_accounts`. Idempotent.
 /// Run it as the owner, after [`migrate_database`], on a connection of its own. `role`
-/// must be a valid role name ([`is_role_name`]) of an existing role.
+/// must be a role name the service accepts ([`is_role_name`], or an Entra principal name) of
+/// an existing role.
 pub async fn grant_worker_access(url: &str, role: &str) -> Result<(), sqlx::Error> {
-    if !is_role_name(role) {
+    let pool = PgPoolOptions::new().max_connections(1).connect(url).await?;
+    let result = grant_worker_access_on(&pool, role).await;
+    pool.close().await;
+    result
+}
+
+/// [`grant_worker_access`] on an open connection to the `auth` schema's owner, e.g. the
+/// migration identity's. `role` may also be an Entra principal name
+/// ([`push_store::is_principal_name`]); it is quoted into SQL.
+pub async fn grant_worker_access_on(pool: &sqlx::PgPool, role: &str) -> Result<(), sqlx::Error> {
+    if !push_store::is_principal_name(role) {
         return Err(sqlx::Error::Configuration(
             "the worker's role name is not valid".into(),
         ));
     }
-    let pool = PgPoolOptions::new().max_connections(1).connect(url).await?;
     let grants = format!(
         "GRANT USAGE ON SCHEMA auth TO \"{role}\"; \
          GRANT SELECT, DELETE, UPDATE (created_at) ON auth.outbox TO \"{role}\"; \
          GRANT EXECUTE ON FUNCTION auth.delete_expired_refresh_tokens(integer), \
          auth.delete_unverified_accounts(interval, integer) TO \"{role}\""
     );
-    let result = sqlx::raw_sql(&grants).execute(&pool).await;
-    pool.close().await;
-    result.map(|_| ())
+    sqlx::raw_sql(&grants).execute(pool).await.map(drop)
 }
 
 /// A plain PostgreSQL role name: a lower-case letter or `_`, then up to 62 lower-case

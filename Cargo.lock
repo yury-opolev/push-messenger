@@ -2209,6 +2209,7 @@ dependencies = [
  "hmac",
  "http-body-util",
  "jsonwebtoken",
+ "push-credentials",
  "push-proto",
  "push-store",
  "rand 0.9.5",

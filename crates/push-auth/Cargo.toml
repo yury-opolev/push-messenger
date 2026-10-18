@@ -17,6 +17,7 @@ base64.workspace = true
 chrono.workspace = true
 hmac.workspace = true
 jsonwebtoken.workspace = true
+push-credentials.workspace = true
 push-proto.workspace = true
 push-store.workspace = true
 rand.workspace = true
