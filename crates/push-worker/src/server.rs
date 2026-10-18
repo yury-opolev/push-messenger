@@ -1,15 +1,18 @@
 //! Running the worker: the relay and job loops, the HTTP API, the health endpoints and
 //! graceful shutdown.
 
-use std::future::Future;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use anyhow::Context;
 use axum::Router;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::get;
+use push_credentials::AzureConfig;
+use push_credentials::startup::retry;
 use push_email::{EmailSender, LogSender, ResendSender, ResendWebhooks, Templates};
+use push_store::{Connector, grant_runtime_access, is_permanent_startup, tokens_for};
 use sqlx::PgPool;
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
@@ -17,8 +20,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::accounts::Accounts;
 use crate::cleanup::{Cleanup, Retention, periodic_jobs};
-use crate::config::{Config, Sender};
-use crate::db::migrate_database;
+use crate::config::{Config, MigrateConfig, Sender};
+use crate::db::MIGRATOR;
 use crate::deliveries::Deliveries;
 use crate::email::{Mailbox, MailboxSender, Mailer};
 use crate::http::{Http, router};
@@ -90,30 +93,55 @@ pub async fn serve(
         None => None,
     };
 
-    let Some(pool) = retry("postgres", &shutdown, || async {
-        // Migrations run on a dedicated connection, not on the pool, whose statement and
-        // lock timeouts are sized for jobs.
-        migrate_database(&config.database_url).await?;
-        let pool = push_store::connect_pool(&config.database_url, &config.store).await?;
-        anyhow::Ok(pool)
+    push_credentials::install_crypto_provider();
+    let azure = config
+        .azure
+        .as_ref()
+        .map(AzureConfig::source)
+        .transpose()
+        .context("the Azure identity")?;
+    // One identity, one scope: both databases share the token.
+    let pg_tokens = tokens_for(&config.database, azure.as_ref(), shutdown.clone())
+        .await
+        .context("PostgreSQL credentials")?;
+    let own = Connector::for_target(&config.database, pg_tokens.as_ref())?;
+    let auth_side = Connector::for_target(&config.auth_database, pg_tokens.as_ref())?;
+    // A refused token or certificate is configuration in Entra mode only, so password mode
+    // keeps retrying exactly as before.
+    let entra = own.is_entra();
+    let permanent = move |error: &anyhow::Error| entra && is_permanent_startup(error);
+    let Some(pool) = retry("postgres", RETRY_DELAY, &shutdown, &permanent, || async {
+        if config.run_migrations {
+            // Migrations run on a dedicated connection, not on the pool, whose statement
+            // and lock timeouts are sized for jobs.
+            own.migrate(&MIGRATOR, &["citext"]).await?;
+        }
+        anyhow::Ok(own.pool(&config.store).await?)
     })
-    .await
+    .await?
     else {
         return finish(health_server).await;
     };
-    let Some(auth) = retry("auth-svc's database", &shutdown, || async {
-        let auth = push_store::connect_pool(&config.auth_database_url, &config.store).await?;
-        // Until auth-svc has migrated and granted the worker's role its access, this fails.
-        if let Err(error) = sqlx::query("SELECT 1 FROM auth.outbox LIMIT 0")
-            .execute(&auth)
-            .await
-        {
-            auth.close().await;
-            return Err(anyhow::Error::from(error));
-        }
-        anyhow::Ok(auth)
-    })
-    .await
+    let Some(auth) = retry(
+        "auth-svc's database",
+        RETRY_DELAY,
+        &shutdown,
+        &permanent,
+        || async {
+            let auth = auth_side.pool(&config.store).await?;
+            // Until auth-svc (or its migration job) has migrated and granted the worker's
+            // role its access, this fails; permission denied here is retried, not fatal.
+            if let Err(error) = sqlx::query("SELECT 1 FROM auth.outbox LIMIT 0")
+                .execute(&auth)
+                .await
+            {
+                auth.close().await;
+                return Err(anyhow::Error::from(error));
+            }
+            anyhow::Ok(auth)
+        },
+    )
+    .await?
     else {
         pool.close().await;
         return finish(health_server).await;
@@ -276,39 +304,38 @@ fn log(job: &Job, outcome: &Outcome) {
     }
 }
 
+/// `push-worker migrate`: applies the migrations of `push_worker` (checking that `citext`
+/// is allow-listed) and, with `PUSH_DATABASE_RUNTIME_ROLE`, grants that role the use of
+/// the `worker` schema, then returns. For a migration job (`PUSH_RUN_MIGRATIONS=false`).
+pub async fn migrate(config: MigrateConfig) -> anyhow::Result<()> {
+    push_credentials::install_crypto_provider();
+    let shutdown = CancellationToken::new();
+    let azure = config
+        .azure
+        .as_ref()
+        .map(AzureConfig::source)
+        .transpose()
+        .context("the Azure identity")?;
+    let tokens = tokens_for(&config.database, azure.as_ref(), shutdown.clone())
+        .await
+        .context("PostgreSQL credentials")?;
+    let connector = Connector::for_target(&config.database, tokens.as_ref())?;
+    connector.migrate(&MIGRATOR, &["citext"]).await?;
+    if let Some(role) = &config.runtime_role {
+        let pool = connector.single().await?;
+        let granted = grant_runtime_access(&pool, "worker", role).await;
+        pool.close().await;
+        granted?;
+    }
+    shutdown.cancel();
+    tracing::info!("push_worker is migrated");
+    Ok(())
+}
+
 /// Waits for the health server to stop.
 async fn finish(health_server: tokio::task::JoinHandle<std::io::Result<()>>) -> anyhow::Result<()> {
     health_server.await??;
     Ok(())
-}
-
-/// Calls `connect` until it succeeds, logging each failure. `None` if `shutdown` came
-/// first.
-async fn retry<T, E, F, Fut>(what: &str, shutdown: &CancellationToken, connect: F) -> Option<T>
-where
-    E: std::fmt::Display,
-    F: Fn() -> Fut,
-    Fut: Future<Output = Result<T, E>>,
-{
-    loop {
-        let attempt = tokio::select! {
-            () = shutdown.cancelled() => return None,
-            attempt = connect() => attempt,
-        };
-        match attempt {
-            Ok(value) => {
-                tracing::info!(dependency = what, "connected");
-                return Some(value);
-            }
-            Err(error) => {
-                tracing::warn!(dependency = what, %error, "not reachable yet; retrying");
-            }
-        }
-        tokio::select! {
-            () = shutdown.cancelled() => return None,
-            () = tokio::time::sleep(RETRY_DELAY) => {}
-        }
-    }
 }
 
 #[derive(Clone)]

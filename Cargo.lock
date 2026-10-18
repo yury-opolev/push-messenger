@@ -2499,6 +2499,7 @@ dependencies = [
  "chrono",
  "http-body-util",
  "push-auth",
+ "push-credentials",
  "push-domain",
  "push-email",
  "push-message-svc",

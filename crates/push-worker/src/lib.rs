@@ -16,6 +16,6 @@ pub mod queue;
 pub mod relay;
 mod server;
 
-pub use config::{Config, ConfigError, Sender};
+pub use config::{Config, ConfigError, MigrateConfig, Sender};
 pub use db::{MIGRATOR, migrate_database};
-pub use server::{init_logging, serve, terminated};
+pub use server::{init_logging, migrate, serve, terminated};

@@ -190,8 +190,12 @@ impl Stack {
         let worker_url = format!("http://{}", worker_http.local_addr().unwrap());
         let worker = spawn(push_worker::serve(
             push_worker::Config {
-                database_url: format!("{worker_server}/push_worker"),
-                auth_database_url: format!("{worker_server}/push_auth"),
+                database: push_store::DatabaseTarget::Url(format!("{worker_server}/push_worker")),
+                auth_database: push_store::DatabaseTarget::Url(format!(
+                    "{worker_server}/push_auth"
+                )),
+                azure: None,
+                run_migrations: true,
                 message_svc_url: accounts_url,
                 accounts_token,
                 sender: push_worker::Sender::Log,
