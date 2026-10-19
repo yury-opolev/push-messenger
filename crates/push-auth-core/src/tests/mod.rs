@@ -8,6 +8,7 @@ mod entra_accounts;
 mod entra_api;
 mod entra_server;
 mod identity;
+mod identity_accounts;
 mod switch;
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

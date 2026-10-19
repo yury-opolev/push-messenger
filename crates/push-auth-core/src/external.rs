@@ -1,30 +1,37 @@
-//! Entra ID accounts (spec 2026-10-19 D5 to D8): found by `(tenant, object id)`, created
-//! on the first sign-in with `user.verified` in the same transaction, never linked to an
-//! email/password account; registration tokens bound to the identity; device sign-ins that
-//! renew the session.
+//! External accounts (spec 2026-10-19 Entra ID sign-in D5 to D8; pluggable identity D2,
+//! D8): found by `(provider, issuer, subject)`, created on the first sign-in with
+//! `user.verified` in the same transaction, never linked to an email/password account;
+//! registration tokens bound to the identity; device sign-ins that renew the session.
 
 use rand::RngCore;
+use serde_json::Map;
 use sqlx::Row;
 use uuid::Uuid;
 
 use crate::devices::{Tokens, revoke_refresh_tokens, set_session};
 use crate::entra::EntraIdentity;
 use crate::error::AuthError;
+use crate::identity::{
+    ENTRA_PROVIDER, MAX_ISSUER_CHARS, MAX_SUBJECT_CHARS, Principal, informational, is_provider_id,
+};
 use crate::links::{LinkClaims, Purpose};
 use crate::outbox::{self, Event};
 use crate::rules;
 use crate::service::{Auth, REGISTRATION_TOKEN_SECONDS, RegistrationToken, unix_now};
 
-/// What an Entra ID sign-in without a device gives: the account and a registration token.
+/// What an external sign-in without a device gives: the account and a registration token.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EntraRegistration {
+pub struct ExternalRegistration {
     pub user_id: Uuid,
     pub registration: RegistrationToken,
 }
 
-/// An Entra ID account: the user and the identity row that names it.
+/// Plan 13A's name of [`ExternalRegistration`].
+pub type EntraRegistration = ExternalRegistration;
+
+/// An external account: the user and the identity row that names it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct EntraAccount {
+struct ExternalAccount {
     user_id: Uuid,
     identity_id: Uuid,
 }
@@ -32,18 +39,44 @@ struct EntraAccount {
 /// Attempts at a free generated handle.
 const HANDLE_ATTEMPTS: usize = 5;
 
+impl Principal {
+    /// The principal as the account store takes it, if it names `provider` and keeps the
+    /// rules (spec D2): a provider id, an issuer of 1 to 256 and a subject of 1 to 128
+    /// characters without control characters. A name or an address that is not
+    /// informational is dropped.
+    pub(crate) fn checked(&self, provider: &str) -> Option<Self> {
+        let fits = |value: &str, most: usize| {
+            let count = value.chars().count();
+            (1..=most).contains(&count) && !value.chars().any(char::is_control)
+        };
+        let keeps = self.provider == provider
+            && is_provider_id(&self.provider)
+            && fits(&self.issuer, MAX_ISSUER_CHARS)
+            && fits(&self.subject, MAX_SUBJECT_CHARS);
+        keeps.then(|| Self {
+            provider: self.provider.clone(),
+            issuer: self.issuer.clone(),
+            subject: self.subject.clone(),
+            name: informational(self.name.as_deref()),
+            email: informational(self.email.as_deref()),
+            claims: self.claims.clone(),
+        })
+    }
+}
+
 impl Auth {
-    /// `POST /v1/auth/entra {token}`: the account of `identity`, created on its first
+    /// `POST /v1/auth/{provider} {token}`: the account of `principal`, created on its first
     /// sign-in, and a registration token bound to the identity and to the end of the
     /// session it starts. `handle` names a new account (it is ignored afterwards); without
-    /// it a random `u…` handle is chosen.
-    pub async fn sign_in_entra(
+    /// it a random `u…` handle is chosen. `Unauthorized` unless the principal's provider is
+    /// offered and the principal keeps the rules.
+    pub async fn sign_in_external(
         &self,
-        identity: &EntraIdentity,
+        principal: &Principal,
         handle: Option<&str>,
-    ) -> Result<EntraRegistration, AuthError> {
-        let max_session = self.max_session()?;
-        let account = self.entra_account(identity, handle).await?;
+    ) -> Result<ExternalRegistration, AuthError> {
+        let (principal, max_session) = self.offered(principal)?;
+        let account = self.external_account(&principal, handle).await?;
         let now = unix_now();
         let token = self.links.sign(&LinkClaims {
             sub: account.user_id,
@@ -54,7 +87,7 @@ impl Auth {
             xid: Some(account.identity_id),
             sx: Some(now + max_session),
         });
-        Ok(EntraRegistration {
+        Ok(ExternalRegistration {
             user_id: account.user_id,
             registration: RegistrationToken {
                 token,
@@ -63,16 +96,16 @@ impl Auth {
         })
     }
 
-    /// `POST /v1/auth/entra {token, device_id}` for an active device of the account: a new
-    /// session for it and new tokens; its earlier refresh tokens are revoked.
-    pub async fn sign_in_entra_device(
+    /// `POST /v1/auth/{provider} {token, device_id}` for an active device of the account:
+    /// a new session for it and new tokens; its earlier refresh tokens are revoked.
+    pub async fn sign_in_external_device(
         &self,
-        identity: &EntraIdentity,
+        principal: &Principal,
         handle: Option<&str>,
         device_id: Uuid,
     ) -> Result<Tokens, AuthError> {
-        let max_session = self.max_session()?;
-        let account = self.entra_account(identity, handle).await?;
+        let (principal, max_session) = self.offered(principal)?;
+        let account = self.external_account(&principal, handle).await?;
         let session = Some(unix_now() + max_session);
         let mut tx = self.pool.begin().await?;
         // Locks the device row first, like every change to a device's tokens.
@@ -96,26 +129,51 @@ impl Auth {
         Ok(tokens)
     }
 
-    /// The configured maximum session age in seconds; `Unauthorized` when Entra ID
-    /// sign-in is not offered.
-    fn max_session(&self) -> Result<i64, AuthError> {
-        self.entra()
-            .map(|entra| entra.max_session().as_secs() as i64)
-            .ok_or(AuthError::Unauthorized)
-    }
-
-    /// The account of `identity`, created if it has none. A concurrent first sign-in of
-    /// the same identity may win the race once; then its account is the one.
-    async fn entra_account(
+    /// Plan 13A's entry point: [`Auth::sign_in_external`] for an Entra ID identity.
+    pub async fn sign_in_entra(
         &self,
         identity: &EntraIdentity,
         handle: Option<&str>,
-    ) -> Result<EntraAccount, AuthError> {
+    ) -> Result<EntraRegistration, AuthError> {
+        self.sign_in_external(&identity.principal(Map::new()), handle)
+            .await
+    }
+
+    /// Plan 13A's entry point: [`Auth::sign_in_external_device`] for an Entra ID identity.
+    pub async fn sign_in_entra_device(
+        &self,
+        identity: &EntraIdentity,
+        handle: Option<&str>,
+        device_id: Uuid,
+    ) -> Result<Tokens, AuthError> {
+        self.sign_in_external_device(&identity.principal(Map::new()), handle, device_id)
+            .await
+    }
+
+    /// The checked principal and its provider's maximum session age in seconds;
+    /// `Unauthorized` when the provider is not offered or the principal breaks the rules.
+    fn offered(&self, principal: &Principal) -> Result<(Principal, i64), AuthError> {
+        let authenticator = self
+            .authenticator(&principal.provider)
+            .ok_or(AuthError::Unauthorized)?;
+        let principal = principal
+            .checked(authenticator.provider())
+            .ok_or(AuthError::Unauthorized)?;
+        Ok((principal, authenticator.max_session().as_secs() as i64))
+    }
+
+    /// The account of `principal`, created if it has none. A concurrent first sign-in of
+    /// the same identity may win the race once; then its account is the one.
+    async fn external_account(
+        &self,
+        principal: &Principal,
+        handle: Option<&str>,
+    ) -> Result<ExternalAccount, AuthError> {
         for _ in 0..2 {
-            if let Some(found) = self.find_entra(identity).await? {
+            if let Some(found) = self.find_external(principal).await? {
                 return Ok(found);
             }
-            if let Some(created) = self.create_entra(identity, handle).await? {
+            if let Some(created) = self.create_external(principal, handle).await? {
                 return Ok(created);
             }
         }
@@ -123,40 +181,41 @@ impl Auth {
     }
 
     /// The identity's account, recording this sign-in and the address the token carried.
-    async fn find_entra(
+    async fn find_external(
         &self,
-        identity: &EntraIdentity,
-    ) -> Result<Option<EntraAccount>, AuthError> {
+        principal: &Principal,
+    ) -> Result<Option<ExternalAccount>, AuthError> {
         let row = sqlx::query(
-            "UPDATE auth.external_identity SET last_sign_in_at = now(), email = $3 \
-             WHERE provider = 'entra' AND issuer = $1 AND subject = $2 \
+            "UPDATE auth.external_identity SET last_sign_in_at = now(), email = $4 \
+             WHERE provider = $1 AND issuer = $2 AND subject = $3 \
              RETURNING identity_id, user_id",
         )
-        .bind(identity.tenant_id.to_string())
-        .bind(identity.object_id.to_string())
-        .bind(identity.email.as_deref())
+        .bind(&principal.provider)
+        .bind(&principal.issuer)
+        .bind(&principal.subject)
+        .bind(principal.email.as_deref())
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(|row| EntraAccount {
+        Ok(row.map(|row| ExternalAccount {
             identity_id: row.get(0),
             user_id: row.get(1),
         }))
     }
 
-    /// A new account for `identity`; `None` if another sign-in created one meanwhile
+    /// A new account for `principal`; `None` if another sign-in created one meanwhile
     /// (this transaction is then rolled back, the account it made included).
-    async fn create_entra(
+    async fn create_external(
         &self,
-        identity: &EntraIdentity,
+        principal: &Principal,
         handle: Option<&str>,
-    ) -> Result<Option<EntraAccount>, AuthError> {
+    ) -> Result<Option<ExternalAccount>, AuthError> {
         let requested = handle.map(rules::handle).transpose()?;
         let user_id = Uuid::now_v7();
         let mut tx = self.pool.begin().await?;
         let mut created = false;
         for _ in 0..HANDLE_ATTEMPTS {
             let candidate = requested.clone().unwrap_or_else(generated_handle);
-            let display_name = identity
+            let display_name = principal
                 .name
                 .as_deref()
                 .and_then(|name| rules::display_name(name).ok())
@@ -188,14 +247,15 @@ impl Auth {
         let linked = sqlx::query(
             "INSERT INTO auth.external_identity \
              (identity_id, provider, issuer, subject, user_id, email) \
-             VALUES ($1, 'entra', $2, $3, $4, $5) \
+             VALUES ($1, $2, $3, $4, $5, $6) \
              ON CONFLICT (provider, issuer, subject) DO NOTHING RETURNING 1",
         )
         .bind(identity_id)
-        .bind(identity.tenant_id.to_string())
-        .bind(identity.object_id.to_string())
+        .bind(&principal.provider)
+        .bind(&principal.issuer)
+        .bind(&principal.subject)
         .bind(user_id)
-        .bind(identity.email.as_deref())
+        .bind(principal.email.as_deref())
         .fetch_optional(&mut *tx)
         .await?;
         if linked.is_none() {
@@ -204,14 +264,25 @@ impl Auth {
         }
         outbox::write(&mut tx, &Event::UserVerified { user_id }).await?;
         tx.commit().await?;
-        tracing::info!(
-            target: "security",
-            event = "auth.entra.provisioned",
-            %user_id,
-            tenant = %identity.tenant_id,
-            "an account was created for an Entra ID user"
-        );
-        Ok(Some(EntraAccount {
+        if principal.provider == ENTRA_PROVIDER {
+            tracing::info!(
+                target: "security",
+                event = "auth.entra.provisioned",
+                %user_id,
+                tenant = %principal.issuer,
+                "an account was created for an Entra ID user"
+            );
+        } else {
+            tracing::info!(
+                target: "security",
+                event = "auth.external.provisioned",
+                %user_id,
+                provider = %principal.provider,
+                issuer = %principal.issuer,
+                "an account was created for an external identity"
+            );
+        }
+        Ok(Some(ExternalAccount {
             user_id,
             identity_id,
         }))

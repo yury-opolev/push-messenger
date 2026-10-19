@@ -37,7 +37,7 @@ pub use db::{
 pub use devices::{Caller, DeviceInfo, MAX_ACTIVE_DEVICES, REFRESH_GRACE, Tokens};
 pub use directory::{Directory, GrpcDirectory, NoDirectory};
 pub use error::AuthError;
-pub use external::EntraRegistration;
+pub use external::{EntraRegistration, ExternalRegistration};
 pub use identity::{
     Admission, AdmissionDecision, AuthenticationError, Authenticator, ENTRA_PROVIDER, Principal,
 };

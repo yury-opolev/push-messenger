@@ -443,10 +443,11 @@ impl Auth {
     }
 
     /// What a registration token is bound to (spec D7): the password hash of its sign-in
-    /// (`None`: no session end), or the Entra ID identity that signed in (`Some`: the
-    /// session end it carries). A token bound to neither or to both, to a changed password,
-    /// to another account's identity, or to a way of signing in the service no longer
-    /// offers registers nothing.
+    /// (`None`: no session end), or the external identity (Entra ID or another provider)
+    /// that signed in (`Some`: the session end it carries). A token bound to neither or to
+    /// both, to a changed password, to another account's identity, or to a way of signing
+    /// in the service no longer offers (password, or the identity's provider) registers
+    /// nothing.
     async fn registration_binding(
         &self,
         connection: &mut PgConnection,
@@ -461,18 +462,18 @@ impl Auth {
                     Err(AuthError::Unauthorized)
                 }
             }
-            (None, Some(identity), Some(session)) if self.entra().is_some() => {
-                let bound = sqlx::query(
-                    "SELECT 1 FROM auth.external_identity WHERE identity_id = $1 AND user_id = $2",
+            (None, Some(identity), Some(session)) if !self.authenticators().is_empty() => {
+                let provider: Option<String> = sqlx::query_scalar(
+                    "SELECT provider FROM auth.external_identity \
+                     WHERE identity_id = $1 AND user_id = $2",
                 )
                 .bind(identity)
                 .bind(claims.sub)
                 .fetch_optional(&mut *connection)
                 .await?;
-                if bound.is_some() {
-                    Ok(Some(session))
-                } else {
-                    Err(AuthError::Unauthorized)
+                match provider {
+                    Some(provider) if self.authenticator(&provider).is_some() => Ok(Some(session)),
+                    _ => Err(AuthError::Unauthorized),
                 }
             }
             _ => Err(AuthError::Unauthorized),
