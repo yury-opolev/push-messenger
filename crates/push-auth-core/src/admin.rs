@@ -1,5 +1,5 @@
 //! The admin API (spec D15): `POST /v1/admin/users/revoke-sessions` signs a user out of
-//! every device. It is served only on its own listener (`PUSH_AUTH_ADMIN_ADDR`), and only
+//! every device, named by id, handle, Entra ID identity or external identity. It is served only on its own listener (`PUSH_AUTH_ADMIN_ADDR`), and only
 //! when `PUSH_AUTH_ADMIN_TOKEN` is set; the chart never routes it through the Ingress. The
 //! token is compared in constant time over SHA-256 digests and never logged. Calls with the
 //! token are rate limited per IP; failed attempts have a limit of their own per IP, so they
@@ -20,6 +20,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::error::AuthError;
+use crate::identity::{MAX_ISSUER_CHARS, MAX_SUBJECT_CHARS, is_provider_id};
 use crate::limits::{Action, Limits};
 use crate::rules::{self, Invalid};
 use crate::service::Auth;
@@ -37,6 +38,12 @@ pub enum UserSelector {
         tenant_id: Uuid,
         object_id: Uuid,
     },
+    /// An identity of any provider (spec 2026-10-19 pluggable identity, D8).
+    External {
+        provider: String,
+        issuer: String,
+        subject: String,
+    },
 }
 
 impl UserSelector {
@@ -46,6 +53,7 @@ impl UserSelector {
             Self::Id(_) => "user_id",
             Self::Handle(_) => "handle",
             Self::Entra { .. } => "entra",
+            Self::External { .. } => "external",
         }
     }
 }
@@ -113,6 +121,16 @@ struct RevokeBody {
     handle: Option<String>,
     #[serde(default)]
     entra: Option<EntraSubject>,
+    #[serde(default)]
+    external: Option<ExternalSubject>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExternalSubject {
+    provider: String,
+    issuer: String,
+    subject: String,
 }
 
 #[derive(Deserialize)]
@@ -130,7 +148,8 @@ fn invalid(reason: &'static str) -> AuthError {
 }
 
 /// `POST /v1/admin/users/revoke-sessions` with exactly one of `{user_id}`, `{handle}`,
-/// `{entra: {tenant_id, object_id}}`: `{user_id, devices_revoked}`.
+/// `{entra: {tenant_id, object_id}}`, `{external: {provider, issuer, subject}}`:
+/// `{user_id, devices_revoked}`.
 async fn revoke_sessions(
     State(admin): State<AdminApi>,
     request: Request,
@@ -166,15 +185,20 @@ async fn revoke_sessions(
         .await
         .map_err(|_| invalid("expected a JSON object of at most 4 KiB"))?;
     let body: RevokeBody = serde_json::from_slice(&bytes)
-        .map_err(|_| invalid("expected exactly one of user_id, handle or entra"))?;
-    let selector = match (body.user_id, body.handle, body.entra) {
-        (Some(id), None, None) => UserSelector::Id(id),
-        (None, Some(handle), None) => UserSelector::Handle(rules::handle(&handle)?),
-        (None, None, Some(entra)) => UserSelector::Entra {
+        .map_err(|_| invalid("expected exactly one of user_id, handle, entra or external"))?;
+    let selector = match (body.user_id, body.handle, body.entra, body.external) {
+        (Some(id), None, None, None) => UserSelector::Id(id),
+        (None, Some(handle), None, None) => UserSelector::Handle(rules::handle(&handle)?),
+        (None, None, Some(entra), None) => UserSelector::Entra {
             tenant_id: entra.tenant_id,
             object_id: entra.object_id,
         },
-        _ => return Err(invalid("give exactly one of user_id, handle or entra")),
+        (None, None, None, Some(external)) => external_selector(external)?,
+        _ => {
+            return Err(invalid(
+                "give exactly one of user_id, handle, entra or external",
+            ));
+        }
     };
     let user_id = admin.auth.find_user(&selector).await?;
     let revoked = admin.auth.revoke_user_sessions(user_id).await?;
@@ -188,6 +212,25 @@ async fn revoke_sessions(
         "an operator signed a user out of every device"
     );
     Ok(Json(json!({"user_id": user_id, "devices_revoked": revoked})).into_response())
+}
+
+/// An `external` selector that can name an identity: a provider id, an issuer of 1 to 256
+/// and a subject of 1 to 128 characters.
+fn external_selector(external: ExternalSubject) -> Result<UserSelector, AuthError> {
+    let fits = |value: &str, most: usize| (1..=most).contains(&value.chars().count());
+    if !is_provider_id(&external.provider)
+        || !fits(&external.issuer, MAX_ISSUER_CHARS)
+        || !fits(&external.subject, MAX_SUBJECT_CHARS)
+    {
+        return Err(invalid(
+            "external needs a provider id, an issuer of 1 to 256 and a subject of 1 to 128 characters",
+        ));
+    }
+    Ok(UserSelector::External {
+        provider: external.provider,
+        issuer: external.issuer,
+        subject: external.subject,
+    })
 }
 
 impl Auth {
@@ -218,6 +261,21 @@ impl Auth {
                 )
                 .bind(tenant_id.to_string())
                 .bind(object_id.to_string())
+                .fetch_optional(&self.pool)
+                .await?
+            }
+            UserSelector::External {
+                provider,
+                issuer,
+                subject,
+            } => {
+                sqlx::query_scalar(
+                    "SELECT user_id FROM auth.external_identity \
+                     WHERE provider = $1 AND issuer = $2 AND subject = $3",
+                )
+                .bind(provider)
+                .bind(issuer)
+                .bind(subject)
                 .fetch_optional(&self.pool)
                 .await?
             }

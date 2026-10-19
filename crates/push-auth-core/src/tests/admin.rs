@@ -14,7 +14,8 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 use super::{
-    Offer, World, capture_logs, captured_logs, entra_user, password_user, security_events, world,
+    FakeIdentity, Offer, World, capture_logs, captured_logs, entra_user, password_user,
+    security_events, world, world_with,
 };
 use crate::admin::{AdminApi, admin_router};
 use crate::entra::testing::TENANT;
@@ -197,4 +198,78 @@ async fn the_admin_api_refuses_wrong_tokens_and_bodies_and_is_rate_limited() {
     }
     let (status, _) = revoke(&router, Some(ADMIN_TOKEN), json!({"handle": "alice"})).await;
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn an_operator_signs_out_an_external_identity() {
+    capture_logs();
+    let world = world_with(Offer::Password, Some(FakeIdentity::new("acme")), None).await;
+    let router = admin(&world);
+    let issuer = "https://id.acme.test/";
+    let subject = format!("s-{}", Uuid::now_v7());
+    let principal = crate::identity::Principal {
+        provider: "acme".to_owned(),
+        issuer: issuer.to_owned(),
+        subject: subject.clone(),
+        name: None,
+        email: None,
+        claims: serde_json::Map::new(),
+    };
+    let signed_in = world.auth.sign_in_external(&principal, None).await.unwrap();
+    let tokens = world
+        .auth
+        .register_device(
+            &signed_in.registration.token,
+            Uuid::now_v7(),
+            "Laptop",
+            "web",
+        )
+        .await
+        .unwrap();
+
+    let selector = json!({"external": {"provider": "acme", "issuer": issuer, "subject": subject}});
+    let (status, answer) = revoke(&router, Some(ADMIN_TOKEN), selector).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(
+        answer,
+        json!({"user_id": signed_in.user_id, "devices_revoked": 1})
+    );
+    assert_eq!(
+        world.auth.refresh(&tokens.refresh_token).await,
+        Err(AuthError::Unauthorized)
+    );
+    let user = signed_in.user_id.to_string();
+    let event = security_events()
+        .into_iter()
+        .find(|event| {
+            event["event"] == "auth.admin.sessions_revoked" && event["user_id"] == user.as_str()
+        })
+        .expect("the revocation is a security event");
+    assert_eq!(event["selector"], "external");
+    assert!(!captured_logs().contains(&subject));
+
+    let long_subject = "s".repeat(129);
+    let long_issuer = "i".repeat(257);
+    for body in [
+        json!({"external": {"provider": "Acme", "issuer": issuer, "subject": "s"}}),
+        json!({"external": {"provider": "acme", "issuer": issuer, "subject": long_subject}}),
+        json!({"external": {"provider": "acme", "issuer": long_issuer, "subject": "s"}}),
+        json!({"external": {"provider": "acme", "issuer": "", "subject": "s"}}),
+        json!({"external": {"provider": "acme", "issuer": issuer, "subject": ""}}),
+        json!({"external": {"provider": "acme", "issuer": issuer}}),
+        json!({"external": {"provider": "acme", "issuer": issuer, "subject": "s", "x": 1}}),
+        json!({"external": {"provider": "acme", "issuer": issuer, "subject": "s"}, "handle": "x"}),
+    ] {
+        let (status, answer) = revoke(&router, Some(ADMIN_TOKEN), body.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(answer["error"]["code"], "invalid", "{body}");
+    }
+    let (status, answer) = revoke(
+        &router,
+        Some(ADMIN_TOKEN),
+        json!({"external": {"provider": "acme", "issuer": issuer, "subject": "nobody"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(answer["error"]["code"], "user_not_found");
 }
