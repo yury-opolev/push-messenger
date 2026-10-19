@@ -383,11 +383,11 @@ async fn an_external_account_has_no_email_or_password_and_the_cleanup_keeps_it()
         async move {
             sqlx::query(
                 "INSERT INTO auth.external_identity \
-                 (identity_id, provider, tenant_id, subject, user_id) \
+                 (identity_id, provider, issuer, subject, user_id) \
                  VALUES ($1, 'entra', $2, $3, $4)",
             )
             .bind(Uuid::now_v7())
-            .bind(tenant)
+            .bind(tenant.to_string())
             .bind(subject)
             .bind(user)
             .execute(&pool)
@@ -398,7 +398,7 @@ async fn an_external_account_has_no_email_or_password_and_the_cleanup_keeps_it()
     let ivy = account("ivy", None, None, true).await.expect("ivy");
     assert_eq!(
         constraint(identity(ivy, "oid-1").await.expect_err("the same subject")),
-        "external_identity_provider_tenant_id_subject_key"
+        "external_identity_provider_issuer_subject_key"
     );
     assert_eq!(
         constraint(
@@ -428,4 +428,143 @@ async fn an_external_account_has_no_email_or_password_and_the_cleanup_keeps_it()
             .await
             .expect("the accounts");
     assert_eq!(left, ["erin", "ivy"]);
+}
+
+/// Plan 13A's Entra identities survive migration 0005 unchanged (spec D8, AC6), and the
+/// new rules hold: any provider id of the pattern, an issuer of 1 to 256 characters, one
+/// identity per (provider, issuer, subject).
+#[tokio::test]
+async fn migration_0005_keeps_entra_identities_and_admits_other_providers() {
+    const TENANT: &str = "33333333-0000-4000-8000-000000000003";
+    const OID: &str = "55555555-0000-4000-8000-000000000005";
+    let (_container, url) = auth_database().await;
+    // Versions 1 to 4 only: the database as Plan 13A left it. (sqlx's `Migrator` fields
+    // are public but semver-exempt; the version is pinned by Cargo.lock.)
+    let before = sqlx::migrate::Migrator {
+        migrations: std::borrow::Cow::Owned(
+            MIGRATOR
+                .iter()
+                .filter(|migration| migration.version <= 4)
+                .cloned()
+                .collect(),
+        ),
+        ignore_missing: false,
+        locking: true,
+        no_tx: false,
+    };
+    let pool = PgPool::connect(&url).await.expect("connect");
+    before.run(&pool).await.expect("migrations 1 to 4");
+    let account = |pool: PgPool| async move {
+        let user = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO auth.user_account \
+             (user_id, email, handle, display_name, password_hash, email_verified_at) \
+             VALUES ($1, NULL, $2, 'Someone', NULL, now())",
+        )
+        .bind(user)
+        .bind(format!("u{}", &user.simple().to_string()[20..]))
+        .execute(&pool)
+        .await
+        .expect("an external account");
+        user
+    };
+    let erin = account(pool.clone()).await;
+    let identity = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO auth.external_identity \
+         (identity_id, provider, tenant_id, subject, user_id, email) \
+         VALUES ($1, 'entra', $2, $3, $4, 'erin@contoso.test')",
+    )
+    .bind(identity)
+    .bind(Uuid::parse_str(TENANT).unwrap())
+    .bind(OID)
+    .bind(erin)
+    .execute(&pool)
+    .await
+    .expect("a Plan 13A identity");
+
+    migrate_database(&url).await.expect("migration 0005");
+    let row: (Uuid, String, String, String, Uuid, Option<String>) = sqlx::query_as(
+        "SELECT identity_id, provider, issuer, subject, user_id, email \
+         FROM auth.external_identity",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("the identity");
+    assert_eq!(
+        row,
+        (
+            identity,
+            "entra".to_owned(),
+            TENANT.to_owned(),
+            OID.to_owned(),
+            erin,
+            Some("erin@contoso.test".to_owned())
+        )
+    );
+
+    let link = |provider: String, issuer: String| {
+        let pool = pool.clone();
+        async move {
+            let user = account(pool.clone()).await;
+            sqlx::query(
+                "INSERT INTO auth.external_identity \
+                 (identity_id, provider, issuer, subject, user_id) VALUES ($1, $2, $3, $4, $5)",
+            )
+            .bind(Uuid::now_v7())
+            .bind(provider)
+            .bind(issuer)
+            .bind(OID)
+            .bind(user)
+            .execute(&pool)
+            .await
+        }
+    };
+    let issuer = "https://id.example.com/".to_owned();
+    // Another provider with a URL issuer, and the same subject: another identity.
+    link("acme-id".to_owned(), issuer.clone())
+        .await
+        .expect("another provider");
+    link("acme-id".to_owned(), TENANT.to_owned())
+        .await
+        .expect("another issuer");
+    assert_eq!(
+        constraint(
+            link("acme-id".to_owned(), issuer.clone())
+                .await
+                .expect_err("the same identity")
+        ),
+        "external_identity_provider_issuer_subject_key"
+    );
+    assert_eq!(
+        constraint(
+            link("entra".to_owned(), TENANT.to_owned())
+                .await
+                .expect_err("erin's identity")
+        ),
+        "external_identity_provider_issuer_subject_key"
+    );
+    for provider in ["Acme", "9acme", "acme_id", &"a".repeat(33)] {
+        assert_eq!(
+            constraint(
+                link(provider.to_owned(), issuer.clone())
+                    .await
+                    .expect_err(provider)
+            ),
+            "external_identity_provider_check",
+            "{provider}"
+        );
+    }
+    for issuer in [String::new(), "x".repeat(257)] {
+        assert_eq!(
+            constraint(
+                link("acme-id".to_owned(), issuer.clone())
+                    .await
+                    .expect_err("issuer length")
+            ),
+            "external_identity_issuer_check",
+            "{} characters",
+            issuer.len()
+        );
+    }
 }

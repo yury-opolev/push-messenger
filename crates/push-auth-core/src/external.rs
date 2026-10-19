@@ -129,10 +129,10 @@ impl Auth {
     ) -> Result<Option<EntraAccount>, AuthError> {
         let row = sqlx::query(
             "UPDATE auth.external_identity SET last_sign_in_at = now(), email = $3 \
-             WHERE provider = 'entra' AND tenant_id = $1 AND subject = $2 \
+             WHERE provider = 'entra' AND issuer = $1 AND subject = $2 \
              RETURNING identity_id, user_id",
         )
-        .bind(identity.tenant_id)
+        .bind(identity.tenant_id.to_string())
         .bind(identity.object_id.to_string())
         .bind(identity.email.as_deref())
         .fetch_optional(&self.pool)
@@ -187,12 +187,12 @@ impl Auth {
         let identity_id = Uuid::now_v7();
         let linked = sqlx::query(
             "INSERT INTO auth.external_identity \
-             (identity_id, provider, tenant_id, subject, user_id, email) \
+             (identity_id, provider, issuer, subject, user_id, email) \
              VALUES ($1, 'entra', $2, $3, $4, $5) \
-             ON CONFLICT (provider, tenant_id, subject) DO NOTHING RETURNING 1",
+             ON CONFLICT (provider, issuer, subject) DO NOTHING RETURNING 1",
         )
         .bind(identity_id)
-        .bind(identity.tenant_id)
+        .bind(identity.tenant_id.to_string())
         .bind(identity.object_id.to_string())
         .bind(user_id)
         .bind(identity.email.as_deref())

@@ -214,9 +214,9 @@ impl Auth {
             } => {
                 sqlx::query_scalar(
                     "SELECT user_id FROM auth.external_identity \
-                     WHERE provider = 'entra' AND tenant_id = $1 AND subject = $2",
+                     WHERE provider = 'entra' AND issuer = $1 AND subject = $2",
                 )
-                .bind(tenant_id)
+                .bind(tenant_id.to_string())
                 .bind(object_id.to_string())
                 .fetch_optional(&self.pool)
                 .await?
