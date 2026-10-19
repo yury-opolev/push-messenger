@@ -2,7 +2,7 @@
 
 Date: 2026-10-19
 
-Implementation status: **14** in progress ([plan](../plans/2026-10-19-plan-14-pluggable-identity.md)).
+Implementation status: **14** done, #40 ([plan](../plans/2026-10-19-plan-14-pluggable-identity.md)).
 
 The owner asked that the Entra ID authentication be substitutable by the repository's
 consumers, the way safeexchange splits `SafeExchange.Core` (the logic, behind
