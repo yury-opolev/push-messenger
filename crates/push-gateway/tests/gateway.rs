@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use push_auth::tokens::AccessTokens;
+use push_auth_core::tokens::AccessTokens;
 use push_domain::{
     ConversationId, DeviceId, InMemoryStore, MAX_SYNC_BATCH, Messaging, SystemClock, UserId,
 };
@@ -382,7 +382,7 @@ async fn an_invalid_token_is_closed_with_4001_and_an_expired_one_with_4002() {
                 &stack,
                 user,
                 device,
-                now() - push_auth::tokens::ACCESS_TOKEN_TTL.as_secs() as i64 - expired,
+                now() - push_auth_core::tokens::ACCESS_TOKEN_TTL.as_secs() as i64 - expired,
             ),
         )
         .await;
@@ -469,7 +469,7 @@ async fn an_expiring_token_is_announced_and_renewed_by_reauth() {
     let (other, other_device) = person(&stack).await;
     // Expired 22 s ago, within the leeway: 8 s left to send ReAuth (the lapsed socket's
     // close then comes inside close_code's 10 s wait).
-    let issued_at = now() - push_auth::tokens::ACCESS_TOKEN_TTL.as_secs() as i64 - 22;
+    let issued_at = now() - push_auth_core::tokens::ACCESS_TOKEN_TTL.as_secs() as i64 - 22;
     let mut renewed = connect(&stack).await;
     let mut lapsed = connect(&stack).await;
     for (socket, user, device) in [

@@ -40,8 +40,8 @@ async fn the_cleanups_delete_what_has_expired_and_keep_the_rest() {
     }
     admin.close().await;
     let auth_url = format!("postgres://postgres:postgres@{server}/push_auth");
-    push_auth::migrate_database(&auth_url).await.unwrap();
-    push_auth::grant_worker_access(&auth_url, "push_worker")
+    push_auth_core::migrate_database(&auth_url).await.unwrap();
+    push_auth_core::grant_worker_access(&auth_url, "push_worker")
         .await
         .unwrap();
     let worker_url = format!("postgres://push_worker:worker-secret@{server}/push_worker");

@@ -5,10 +5,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use push_auth::links::{LinkClaims, LinkSigner, Purpose, password_stamp};
-use push_auth::password::Passwords;
-use push_auth::tokens::{AccessTokens, refresh_hash};
-use push_auth::{
+use push_auth_core::links::{LinkClaims, LinkSigner, Purpose, password_stamp};
+use push_auth_core::password::Passwords;
+use push_auth_core::tokens::{AccessTokens, refresh_hash};
+use push_auth_core::{
     Auth, AuthError, Caller, MAX_ACTIVE_DEVICES, REFRESH_GRACE, Settings, Signup, migrate_database,
 };
 use serde_json::Value;
@@ -96,7 +96,7 @@ async fn verified(world: &World, name: &str) -> String {
         .token
 }
 
-fn caller(tokens: &push_auth::Tokens) -> Caller {
+fn caller(tokens: &push_auth_core::Tokens) -> Caller {
     Caller {
         user_id: tokens.user_id,
         device_id: tokens.device_id,

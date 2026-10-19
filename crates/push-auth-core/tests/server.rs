@@ -4,7 +4,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use push_auth::{Config, serve};
+use push_auth_core::{Config, serve};
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::redis::Redis;
 use testcontainers_modules::testcontainers::ImageExt;

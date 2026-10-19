@@ -11,7 +11,7 @@ use std::time::Duration;
 use axum::routing::post;
 use axum::{Json, Router};
 use common::Stack;
-use push_auth::entra::testing::StubOpenId;
+use push_auth_core::entra::testing::StubOpenId;
 use serde_json::{Value, json};
 
 #[tokio::test]

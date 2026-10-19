@@ -329,7 +329,7 @@ mod tests {
     use axum::Router;
     use axum::routing::get;
     use jsonwebtoken::{EncodingKey, Header};
-    use push_auth::tokens::AccessTokens;
+    use push_auth_core::tokens::AccessTokens;
     use serde_json::json;
     use tokio::net::TcpListener;
 
@@ -436,7 +436,7 @@ mod tests {
         let verifier = verifier_for(&issuer).await;
         let user = Uuid::now_v7();
         // Expired 30 s ago: within the 60 s leeway.
-        let lifetime = push_auth::tokens::ACCESS_TOKEN_TTL.as_secs() as i64;
+        let lifetime = push_auth_core::tokens::ACCESS_TOKEN_TTL.as_secs() as i64;
         let (fresh_enough, _) = issuer.issue(user, user, now() - lifetime - 30);
         assert!(verifier.verify(&fresh_enough).await.is_ok());
         let (expired, _) = issuer.issue(user, user, now() - lifetime - 90);

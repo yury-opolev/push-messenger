@@ -16,7 +16,7 @@ futures-util.workspace = true
 jsonwebtoken.workspace = true
 # DEV ONLY: push-dev-entra's sign-in mode serves the stub OpenID issuer and mints user
 # tokens with its public test key (Plan 13B). Never in a service image.
-push-auth = { workspace = true, features = ["testing"] }
+push-auth-core = { workspace = true, features = ["testing"] }
 # DEV ONLY: push-dev-entra uses the stub issuer (never the `testing` feature, which
 # needs Rust 1.88).
 push-credentials = { workspace = true, features = ["stub"] }

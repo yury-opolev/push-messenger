@@ -6,7 +6,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use push_auth::outbox::{Email, Event};
+use push_auth_core::outbox::{Email, Event};
 use push_domain::{InMemoryStore, Messaging, RecordingNotifier, SystemClock};
 use push_email::ResendWebhooks;
 use push_message_svc::{AccountsApi, InternalToken, MessagingApi};
@@ -131,8 +131,8 @@ async fn the_worker_relays_sends_takes_webhooks_and_stops_cleanly() {
     admin.close().await;
     // auth-svc migrates and grants the worker's role its access at start-up.
     let auth_url = format!("postgres://postgres:postgres@{server}/push_auth");
-    push_auth::migrate_database(&auth_url).await.unwrap();
-    push_auth::grant_worker_access(&auth_url, "push_worker")
+    push_auth_core::migrate_database(&auth_url).await.unwrap();
+    push_auth_core::grant_worker_access(&auth_url, "push_worker")
         .await
         .unwrap();
     let auth = PgPool::connect(&auth_url).await.unwrap();

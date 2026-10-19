@@ -4,8 +4,8 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use push_auth::AuthError;
-use push_auth::limits::{Action, Counter, Limit, Limits, Outcome, RedisCounter};
+use push_auth_core::AuthError;
+use push_auth_core::limits::{Action, Counter, Limit, Limits, Outcome, RedisCounter};
 use testcontainers_modules::redis::Redis;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::{ContainerAsync, ImageExt};

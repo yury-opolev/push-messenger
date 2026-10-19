@@ -3,10 +3,10 @@
 
 use std::time::Duration;
 
-use push_auth::links::{LinkClaims, LinkSigner, Purpose, password_stamp};
-use push_auth::password::Passwords;
-use push_auth::tokens::AccessTokens;
-use push_auth::{Auth, AuthError, Settings, Signup, migrate_database};
+use push_auth_core::links::{LinkClaims, LinkSigner, Purpose, password_stamp};
+use push_auth_core::password::Passwords;
+use push_auth_core::tokens::AccessTokens;
+use push_auth_core::{Auth, AuthError, Settings, Signup, migrate_database};
 use serde_json::Value;
 use sqlx::PgPool;
 use testcontainers_modules::postgres::Postgres;

@@ -184,7 +184,7 @@ impl Azure {
         };
         let mut auth = migrator("push-auth-id");
         auth.push(("PUSH_AUTH_WORKER_ROLE".into(), "push-worker-id".into()));
-        push_auth::migrate(push_auth::MigrateConfig::from_lookup(lookup(auth)).unwrap())
+        push_auth_core::migrate(push_auth_core::MigrateConfig::from_lookup(lookup(auth)).unwrap())
             .await
             .unwrap();
         push_message_svc::migrate(
@@ -356,9 +356,10 @@ async fn start_up_stops_clearly_without_a_token_a_role_or_trust() {
         .unwrap();
     let mut auth = azure.postgres("migrator", "push-migrator-id");
     auth.push(("PUSH_DATABASE_NAME".into(), "push_auth".into()));
-    let error = push_auth::migrate(push_auth::MigrateConfig::from_lookup(lookup(auth)).unwrap())
-        .await
-        .unwrap_err();
+    let error =
+        push_auth_core::migrate(push_auth_core::MigrateConfig::from_lookup(lookup(auth)).unwrap())
+            .await
+            .unwrap_err();
     assert!(
         format!("{error:#}").contains("azure.extensions"),
         "{error:#}"

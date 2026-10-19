@@ -177,8 +177,8 @@ impl Stack {
             ("PUSH_HEALTH_ADDR", &auth_health_addr.to_string()),
         ]);
         auth_variables.extend(datastores.auth);
-        let auth_config = push_auth::Config::from_lookup(lookup(auth_variables)).unwrap();
-        let auth = spawn(push_auth::serve(
+        let auth_config = push_auth_core::Config::from_lookup(lookup(auth_variables)).unwrap();
+        let auth = spawn(push_auth_core::serve(
             auth_config,
             auth_http,
             auth_health,

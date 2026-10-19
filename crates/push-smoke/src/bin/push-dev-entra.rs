@@ -30,7 +30,7 @@
 //! accepts any non-empty federated token: in the cluster that is the pod's projected
 //! service-account token. It logs one line per token, never the token.
 //!
-//! `sign-in` serves Plan 13A's stub OpenID metadata and key set (`push_auth::entra::testing`)
+//! `sign-in` serves Plan 13A's stub OpenID metadata and key set (`push_auth_core::entra::testing`)
 //! over TLS for auth-svc, and `POST /dev/token {"oid", "tenant"?}` over plain HTTP, which
 //! mints a delegated user token for the stub's API with the **public** test key: whoever
 //! reaches it signs in as anyone. It reads:
@@ -220,7 +220,7 @@ async fn sign_in() -> anyhow::Result<()> {
     use axum::http::StatusCode;
     use axum::routing::post;
     use axum::{Json, Router};
-    use push_auth::entra::testing::{KEY_A, StubOpenId, TENANT, sign};
+    use push_auth_core::entra::testing::{KEY_A, StubOpenId, TENANT, sign};
     use serde_json::{Value, json};
 
     let authority = var("PUSH_DEV_SIGN_IN_AUTHORITY")?;

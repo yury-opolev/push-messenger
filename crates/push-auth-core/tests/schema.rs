@@ -2,7 +2,7 @@
 //! the database's owner, a plain role like the chart's, the constraints hold, and the
 //! worker's role may drain the outbox and run the cleanups, and nothing else.
 
-use push_auth::{MIGRATOR, grant_worker_access, migrate_database};
+use push_auth_core::{MIGRATOR, grant_worker_access, migrate_database};
 use sqlx::PgPool;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
