@@ -7,7 +7,7 @@ auth:
   signIn:
     providers: entra
     entra:
-      # push_auth::entra::testing's API_CLIENT_ID and TENANT, which the issuer's tokens carry.
+      # push_auth_core::entra::testing's API_CLIENT_ID and TENANT, which the issuer's tokens carry.
       clientIds:
         - 11111111-0000-4000-8000-000000000001
       tenants:

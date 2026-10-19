@@ -5,6 +5,7 @@ members = [
     "bindings/ffi",
     "bindings/node",
     "crates/push-auth",
+    "crates/push-auth-core",
     "crates/push-credentials",
     "crates/push-domain",
     "crates/push-email",
@@ -42,7 +43,7 @@ jsonwebtoken = { version = "9", default-features = false }
 libtest-mimic = "0.8"
 prost = "0.14"
 protoc-bin-vendored = "3"
-push-auth = { path = "crates/push-auth" }
+push-auth-core = { path = "crates/push-auth-core" }
 push-credentials = { path = "crates/push-credentials" }
 push-domain = { path = "crates/push-domain" }
 push-email = { path = "crates/push-email" }

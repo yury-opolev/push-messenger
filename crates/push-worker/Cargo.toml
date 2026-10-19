@@ -30,7 +30,7 @@ uuid.workspace = true
 
 [dev-dependencies]
 http-body-util.workspace = true
-push-auth.workspace = true
+push-auth-core.workspace = true
 push-domain.workspace = true
 push-message-svc.workspace = true
 testcontainers-modules.workspace = true

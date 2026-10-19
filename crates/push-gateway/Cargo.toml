@@ -36,7 +36,7 @@ uuid.workspace = true
 
 [dev-dependencies]
 futures-util.workspace = true
-push-auth.workspace = true
+push-auth-core.workspace = true
 push-credentials = { workspace = true, features = ["testing"] }
 push-domain.workspace = true
 push-message-svc.workspace = true

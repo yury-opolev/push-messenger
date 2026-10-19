@@ -64,7 +64,7 @@ $idpNamespace = 'push-idp'
 $adminNamespace = 'push-admin'
 $release = 'push'
 $hostName = 'push.local'
-# push_auth::entra::testing::TENANT: the tenant the issuer's tokens name.
+# push_auth_core::entra::testing::TENANT: the tenant the issuer's tokens name.
 $tenant = '33333333-0000-4000-8000-000000000003'
 $k = @('--context', $Cluster)
 $summary = [System.Collections.Generic.List[string]]::new()

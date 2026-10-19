@@ -19,7 +19,7 @@ COPY . .
 # The registry and target caches survive between builds on the same Docker daemon; the
 # binaries are copied out of the cache into the image layer. Two builds: Cargo unifies
 # features within one, and the services must not be built with push-credentials' DEV
-# ONLY `stub` feature or push-auth's `testing` feature (its public test keys), which
+# ONLY `stub` feature or push-auth-core's `testing` feature (its public test keys), which
 # push-smoke's push-dev-entra uses.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \

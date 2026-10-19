@@ -1,4 +1,4 @@
-use push_auth::{Config, init_logging, serve, terminated};
+use push_auth_core::{Config, init_logging, serve, terminated};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
@@ -8,7 +8,7 @@ use tokio_util::sync::CancellationToken;
 async fn main() -> anyhow::Result<()> {
     init_logging();
     if std::env::args().nth(1).as_deref() == Some("migrate") {
-        return push_auth::migrate(push_auth::MigrateConfig::from_env()?).await;
+        return push_auth_core::migrate(push_auth_core::MigrateConfig::from_env()?).await;
     }
     let config = Config::from_env()?;
     let http = TcpListener::bind(config.http_addr).await?;

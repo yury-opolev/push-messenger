@@ -2201,6 +2201,18 @@ name = "push-auth"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "push-auth-core",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "push-auth-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
  "argon2",
  "async-trait",
  "axum",
@@ -2301,7 +2313,7 @@ dependencies = [
  "futures-util",
  "jsonwebtoken",
  "prost",
- "push-auth",
+ "push-auth-core",
  "push-credentials",
  "push-domain",
  "push-message-svc",
@@ -2445,7 +2457,7 @@ dependencies = [
  "base64 0.22.1",
  "futures-util",
  "jsonwebtoken",
- "push-auth",
+ "push-auth-core",
  "push-credentials",
  "push-gateway",
  "push-load",
@@ -2508,7 +2520,7 @@ dependencies = [
  "axum",
  "chrono",
  "http-body-util",
- "push-auth",
+ "push-auth-core",
  "push-credentials",
  "push-domain",
  "push-email",

@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use common::Stack;
-use push_auth::entra::testing::StubOpenId;
+use push_auth_core::entra::testing::StubOpenId;
 use push_sdk::{
     Client, Config, ConnectionState, ContactState, Event, Events, MemorySecretStore, MessageStatus,
     Platform, UserId,
