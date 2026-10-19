@@ -8,6 +8,9 @@
 //! provider id `entra`, so users still sign in at `POST /v1/auth/entra` and the SDK's
 //! `sign_in_with_entra` works unchanged. See docs/entra-sign-in.md, "Your own wrapper".
 //!
+//! For an image, copy it into a binary crate of your own: Cargo builds examples with the
+//! package's dev-dependencies, which enable push-auth-core's `testing` feature.
+//!
 //! ```text
 //! cargo run -p push-auth --example custom_identity
 //! cargo run -p push-auth --example custom_identity -- migrate

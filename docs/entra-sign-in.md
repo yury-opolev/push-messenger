@@ -17,6 +17,7 @@ yours.
 | `password` (default) | Today's email and password sign-up and sign-in, with email confirmation and password reset by email (an email provider is needed) |
 | `entra` | Entra ID only: no email confirmation, no passwords, no email provider. The signup, verification, login and password-reset routes answer 404; no email is ever written, so the worker runs with `PUSH_EMAIL_SENDER=none` |
 | `password,entra` | Both; the two kinds of accounts are never linked, even with the same address |
+| `external`, alone or with the others | The sign-in of a push-auth of your own: its authenticator at `/v1/auth/{its provider id}` ([Your own wrapper](#your-own-wrapper)) |
 
 **Switching an existing installation to `entra` is destructive for password sessions.**
 When auth-svc starts without `password`, it signs every device of every email/password
@@ -175,6 +176,7 @@ Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8082/v1/admin/users/revoke-
   -Headers $headers -ContentType application/json `
   -Body '{"entra": {"tenant_id": "<tid>", "object_id": "<oid>"}}'
 # or {"handle": "erin"} or {"user_id": "<uuid>"}
+# or {"external": {"provider": "<id>", "issuer": "<issuer>", "subject": "<subject>"}}
 ```
 
 The answer is `{"user_id", "devices_revoked"}`. Every device is revoked, refresh fails, and
@@ -303,3 +305,71 @@ auth-svc logs every refused token as `auth.entra.rejected` with a reason (never 
 9. The admin API signs a test user out: their apps report `DeviceRemoved` within seconds.
 10. Switching a test installation from `password,entra` to `entra`: every password device is
     signed out at start-up (`auth.password_sessions.revoked` in the log); Entra users are not.
+
+## Your own wrapper
+
+auth-svc is two crates ([spec](superpowers/specs/2026-10-19-pluggable-identity-design.md)):
+`crates/push-auth-core`, the library (accounts, devices, tokens, the API, the admin API, the
+Entra ID check, the migrations), and `crates/push-auth`, a thin binary that reads the
+configuration and calls `push_auth_core::serve`. The image, the chart and this guide use
+the binary. To change who may sign in, or how tokens are checked, write your own binary
+of ~40 lines that calls `serve_with` with:
+
+- an **`Authenticator`** (`provider()`, `max_session()`, `authenticate(token)` giving a
+  `Principal { provider, issuer, subject, name, email, claims }`): served at
+  `/v1/auth/{provider}` when `PUSH_AUTH_PROVIDERS` names `external`. Accounts are found by
+  `(provider, issuer, subject)`, never by the address;
+- an **`Admission`** (`admit(principal)` giving `Admit`, `Refuse` or `Unavailable`): asked
+  after the token is accepted and before any account is found or created, for every
+  sign-in by token, Entra ID's included.
+
+`crates/push-auth/examples/custom_identity.rs` is a tested starting point: it wraps the
+built-in Entra ID check (keeping the provider id `entra`, so `/v1/auth/entra` and the SDK's
+`sign_in_with_entra` keep working), refuses guest accounts, and admits only the members of
+the group `EXAMPLE_REQUIRED_GROUP` (the API registration must emit the `groups` claim). It
+runs with `PUSH_AUTH_PROVIDERS=external` (plus `password` if wanted) and the usual
+`PUSH_ENTRA_*` variables, which the wrapper reads itself (`EntraSettings::from_env`).
+
+Rules the service enforces at start-up: `external` needs an authenticator and an
+authenticator needs `external`; its id is 1 to 32 lower-case letters, digits or `-`, not a
+route of auth-svc (`signup`, `verify`, `login`, `password`, `refresh`, `jwks`), and not
+`entra` beside `PUSH_AUTH_PROVIDERS=entra`; its maximum session is 1 s to 720 h; an
+admission needs `entra` or `external`. Anything else stops start-up with a message that
+says what to change.
+
+**Building an image.** Copy the example into a binary crate of your own that depends on
+`push-auth-core` (by path, with this repository as a submodule), build it in the builder
+stage of `deploy/docker/Dockerfile`, and put the binary at `/usr/local/bin/push-auth` in
+the `auth` target, for example:
+
+```dockerfile
+RUN cargo build --release --locked -p my-push-auth \
+    && cp target/release/my-push-auth /out/push-auth
+```
+
+Do not ship the example itself: Cargo builds examples with the package's
+dev-dependencies, which enable `push-auth-core`'s `testing` feature (the stub issuer's
+public test keys). For the same reason, never build your crate together with
+`push-smoke`. Then set `images.auth` in the chart to your
+image and `auth.signIn.providers` (`PUSH_AUTH_PROVIDERS`) to include `external`; nothing
+else in the chart changes.
+
+**Duties of a custom authenticator.** It is the only check between a token and an
+account. It must verify the signature with the issuer's published keys and pin the
+algorithm (never `none` or a symmetric one with a public key); check the issuer, the
+audience (your API, not Graph or an ID token), `exp` and `nbf`; accept only delegated user
+tokens (no client-credentials tokens); give a `subject` that is stable and immutable at
+that `issuer` (Entra ID: `oid`, never the UPN or the address), at most 128 characters,
+and an issuer of at most 256; and never log the token or its claims (an `Unavailable` text
+must not hold them either). A principal that breaks these limits, or names another
+provider, is refused as a rejected token.
+
+**Answers and events.** The token comes from `Authorization: Bearer` or the JSON body's
+`token` (both present and different: 400 `invalid`); the per-IP rate limit runs before the
+authenticator. For provider `entra` the answers and events are those above. For another
+provider: a rejected token is 401 `token_invalid` and `auth.external.rejected` (provider,
+reason); an unavailable provider 503 `identity_unavailable`; sign-ins
+`auth.external.success`/`auth.external.failure` and `auth.external.provisioned`. For every
+provider, an admission's `Refuse` is 403 `sign_in_not_permitted` with
+`auth.external.not_permitted` (provider, issuer) and creates no account, also on a device
+renewal; its `Unavailable` is 503 `identity_unavailable`.
