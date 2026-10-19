@@ -7,14 +7,17 @@ mod admin;
 mod entra_accounts;
 mod entra_api;
 mod entra_server;
+mod identity;
 mod switch;
 
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use axum::Router;
 use axum::http::HeaderName;
-use serde_json::Value;
+use serde_json::{Map, Value, json};
 use sqlx::PgPool;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
@@ -27,6 +30,9 @@ use crate::devices::Tokens;
 use crate::directory::NoDirectory;
 use crate::entra::testing::{StubOpenId, TENANT};
 use crate::entra::{EntraIdentity, EntraSignIn, KeyTiming};
+use crate::identity::{
+    Admission, AdmissionDecision, AuthenticationError, Authenticator, Principal,
+};
 use crate::limits::{Limits, MemoryCounter};
 use crate::links::LinkSigner;
 use crate::password::Passwords;
@@ -196,6 +202,111 @@ impl World {
             .fetch_one(&self.pool)
             .await
             .unwrap()
+    }
+}
+
+/// A test authenticator: `ok|issuer|subject|email|group,group` names that user (name
+/// `Acme User`, claims `iss`, `sub` and `groups`), `foreign|…` the same user of the
+/// provider `foreign`, `down` is unavailable, anything else is refused (`signature`). It
+/// counts its calls; its sessions last two hours.
+#[derive(Debug)]
+pub(crate) struct FakeIdentity {
+    pub provider: String,
+    pub calls: AtomicUsize,
+}
+
+impl FakeIdentity {
+    pub fn new(provider: &str) -> Arc<Self> {
+        Arc::new(Self {
+            provider: provider.to_owned(),
+            calls: AtomicUsize::new(0),
+        })
+    }
+
+    pub fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+/// A token [`FakeIdentity`] accepts; `groups` is comma-separated.
+pub(crate) fn fake_token(issuer: &str, subject: &str, email: &str, groups: &str) -> String {
+    format!("ok|{issuer}|{subject}|{email}|{groups}")
+}
+
+#[async_trait]
+impl Authenticator for FakeIdentity {
+    fn provider(&self) -> &str {
+        &self.provider
+    }
+
+    fn max_session(&self) -> Duration {
+        Duration::from_secs(2 * 3600)
+    }
+
+    async fn authenticate(&self, token: &str) -> Result<Principal, AuthenticationError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let parts: Vec<&str> = token.split('|').collect();
+        match parts.as_slice() {
+            [kind @ ("ok" | "foreign"), issuer, subject, email, groups] => {
+                let groups: Vec<&str> = groups.split(',').filter(|g| !g.is_empty()).collect();
+                let claims = json!({"iss": issuer, "sub": subject, "groups": groups});
+                Ok(Principal {
+                    provider: if *kind == "ok" {
+                        self.provider.clone()
+                    } else {
+                        "foreign".to_owned()
+                    },
+                    issuer: (*issuer).to_owned(),
+                    subject: (*subject).to_owned(),
+                    name: Some("Acme User".to_owned()),
+                    email: (!email.is_empty()).then(|| (*email).to_owned()),
+                    claims: claims.as_object().cloned().unwrap_or_default(),
+                })
+            }
+            ["down"] => Err(AuthenticationError::Unavailable(
+                "the fake provider is down".to_owned(),
+            )),
+            _ => Err(AuthenticationError::Rejected("signature")),
+        }
+    }
+}
+
+/// An admission requiring `group` in the `groups` claim, `Unavailable` while `down`. It
+/// keeps the claims it saw.
+#[derive(Debug)]
+pub(crate) struct RequireGroup {
+    pub group: String,
+    pub down: AtomicBool,
+    pub seen: Mutex<Vec<Map<String, Value>>>,
+}
+
+impl RequireGroup {
+    pub fn new(group: &str) -> Arc<Self> {
+        Arc::new(Self {
+            group: group.to_owned(),
+            down: AtomicBool::new(false),
+            seen: Mutex::new(Vec::new()),
+        })
+    }
+}
+
+#[async_trait]
+impl Admission for RequireGroup {
+    async fn admit(&self, principal: &Principal) -> AdmissionDecision {
+        self.seen.lock().unwrap().push(principal.claims.clone());
+        if self.down.load(Ordering::SeqCst) {
+            return AdmissionDecision::Unavailable;
+        }
+        let member = principal
+            .claims
+            .get("groups")
+            .and_then(Value::as_array)
+            .is_some_and(|groups| groups.iter().any(|group| group == self.group.as_str()));
+        if member {
+            AdmissionDecision::Admit
+        } else {
+            AdmissionDecision::Refuse
+        }
     }
 }
 

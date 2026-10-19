@@ -79,6 +79,24 @@ pub trait Authenticator: Send + Sync + fmt::Debug {
     async fn warm(&self) {}
 }
 
+/// Whether a principal may sign in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmissionDecision {
+    Admit,
+    /// Answered 403 `sign_in_not_permitted`; no account is found or created.
+    Refuse,
+    /// The decision cannot be made now: answered 503, retryable.
+    Unavailable,
+}
+
+/// Decides, after authentication and before any account is found or created, whether a
+/// principal may sign in (spec D4): membership of an Entra group, an app role, an
+/// allow-list in one's own store. It sees every verified claim.
+#[async_trait]
+pub trait Admission: Send + Sync + fmt::Debug {
+    async fn admit(&self, principal: &Principal) -> AdmissionDecision;
+}
+
 /// A provider id: a lower-case letter, then up to 31 lower-case letters, digits or `-`.
 pub fn is_provider_id(id: &str) -> bool {
     let mut chars = id.chars();

@@ -14,6 +14,7 @@ use uuid::Uuid;
 
 use crate::entra::EntraSignIn;
 use crate::error::AuthError;
+use crate::identity::{Admission, Authenticator};
 use crate::links::{LinkClaims, LinkError, LinkSigner, Purpose, password_stamp};
 use crate::outbox::{self, Email, Event, LINK_MINUTES};
 use crate::password::{Checked, HashGate, Passwords};
@@ -77,6 +78,14 @@ impl Default for SignIn {
     }
 }
 
+/// The substitutable parts of sign-in (spec D6): an external authenticator and an
+/// admission.
+#[derive(Debug, Clone, Default)]
+struct Identity {
+    external: Option<Arc<dyn Authenticator>>,
+    admission: Option<Arc<dyn Admission>>,
+}
+
 /// The auth service.
 #[derive(Debug, Clone)]
 pub struct Auth {
@@ -87,6 +96,7 @@ pub struct Auth {
     pub(crate) tokens: AccessTokens,
     public_url: String,
     sign_in: SignIn,
+    identity: Identity,
 }
 
 /// Seconds since the Unix epoch.
@@ -121,6 +131,7 @@ impl Auth {
             tokens: settings.tokens,
             public_url: settings.public_url.trim_end_matches('/').to_owned(),
             sign_in: SignIn::default(),
+            identity: Identity::default(),
         }
     }
 
@@ -148,6 +159,43 @@ impl Auth {
     /// The Entra ID token checker, when Entra ID sign-in is offered.
     pub fn entra(&self) -> Option<&EntraSignIn> {
         self.sign_in.entra.as_ref()
+    }
+
+    /// The service also offering `authenticator`'s sign-in at
+    /// `/v1/auth/{its provider id}` (spec D6, D7).
+    pub fn with_external(mut self, authenticator: Arc<dyn Authenticator>) -> Self {
+        self.identity.external = Some(authenticator);
+        self
+    }
+
+    /// The service asking `admission` before any account is found or created (spec D4).
+    pub fn with_admission(mut self, admission: Arc<dyn Admission>) -> Self {
+        self.identity.admission = Some(admission);
+        self
+    }
+
+    /// Every authenticator offered: Entra ID first, then the external one.
+    pub fn authenticators(&self) -> Vec<Arc<dyn Authenticator>> {
+        let mut offered: Vec<Arc<dyn Authenticator>> = Vec::new();
+        if let Some(entra) = &self.sign_in.entra {
+            offered.push(Arc::new(entra.clone()));
+        }
+        if let Some(external) = &self.identity.external {
+            offered.push(external.clone());
+        }
+        offered
+    }
+
+    /// The authenticator of `provider`, if it is offered.
+    pub fn authenticator(&self, provider: &str) -> Option<Arc<dyn Authenticator>> {
+        self.authenticators()
+            .into_iter()
+            .find(|authenticator| authenticator.provider() == provider)
+    }
+
+    /// The admission every sign-in by token passes, if any.
+    pub fn admission(&self) -> Option<&Arc<dyn Admission>> {
+        self.identity.admission.as_ref()
     }
 
     // The permit moves into the blocking closure: a cancelled request must not free the
