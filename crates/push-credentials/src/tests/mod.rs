@@ -1,6 +1,7 @@
 //! The crate's tests against the stub issuer and TLS containers (Docker must be running).
 
 mod azure;
+mod redis_dropped;
 mod redis_entra;
 mod stub_tls;
 mod tls;
