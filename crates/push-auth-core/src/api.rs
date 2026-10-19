@@ -114,13 +114,14 @@ impl IntoResponse for AuthError {
             Self::Unavailable => {
                 headers.insert(RETRY_AFTER, HeaderValue::from_static("1"));
             }
-            Self::EntraUnavailable => {
+            Self::EntraUnavailable | Self::IdentityUnavailable => {
                 headers.insert(RETRY_AFTER, HeaderValue::from_static("5"));
             }
             Self::Unauthorized
             | Self::TokenExpired
             | Self::InvalidCredentials
             | Self::EntraTokenInvalid
+            | Self::TokenInvalid
             | Self::SessionExpired => {
                 headers.insert(WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
             }
@@ -763,6 +764,26 @@ mod tests {
         let response = AuthError::SessionExpired.into_response();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(response.headers()[WWW_AUTHENTICATE], "Bearer");
+    }
+
+    #[test]
+    fn identity_refusals_answer_their_codes() {
+        for (error, status, code) in [
+            (AuthError::TokenInvalid, 401, "token_invalid"),
+            (AuthError::IdentityUnavailable, 503, "identity_unavailable"),
+            (AuthError::SignInNotPermitted, 403, "sign_in_not_permitted"),
+        ] {
+            assert_eq!((error.status(), error.code()), (status, code));
+        }
+        let response = AuthError::TokenInvalid.into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.headers()[WWW_AUTHENTICATE], "Bearer");
+        let response = AuthError::IdentityUnavailable.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[RETRY_AFTER], "5");
+        assert!(AuthError::IdentityUnavailable.retryable());
+        assert!(!AuthError::SignInNotPermitted.retryable());
+        assert!(!AuthError::TokenInvalid.retryable());
     }
 
     #[test]

@@ -43,7 +43,12 @@ pub(crate) async fn audit(State(api): State<Api>, request: Request, next: Next) 
     let response = next.run(request).await;
     let status = response.status();
     let code = response.extensions().get::<ErrorCode>().map(|code| code.0);
-    if let Some(event) = event(&method, &route, status, code) {
+    let event = if api.auth.is_external_route(&route) {
+        external_event(status)
+    } else {
+        event(&method, &route, status, code)
+    };
+    if let Some(event) = event {
         let subject = response
             .extensions()
             .get::<Subject>()
@@ -108,6 +113,24 @@ pub(crate) fn event(
         _ => return None,
     };
     Some(event)
+}
+
+/// The event of an answer of the external authenticator's route,
+/// `POST /v1/auth/{provider}` (spec 2026-10-19 pluggable identity, D9), by its status
+/// alone; the error code is logged beside it. A provider that
+/// keeps the id `entra` keeps Entra ID's events instead.
+pub(crate) fn external_event(status: StatusCode) -> Option<&'static str> {
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        return Some("auth.rate_limited");
+    }
+    if status == StatusCode::SERVICE_UNAVAILABLE || status == StatusCode::BAD_REQUEST {
+        return None;
+    }
+    Some(if status.is_success() {
+        "auth.external.success"
+    } else {
+        "auth.external.failure"
+    })
 }
 
 #[cfg(test)]
@@ -235,6 +258,13 @@ mod tests {
                 Some("auth.token.refused"),
             ),
             (&Method::GET, "/v1/users/me", 200, None, None),
+            (
+                &post,
+                "/v1/auth/entra",
+                403,
+                Some("sign_in_not_permitted"),
+                Some("auth.entra.failure"),
+            ),
         ];
         for (method, route, status, code, expected) in cases {
             let status = StatusCode::from_u16(status).unwrap();
@@ -243,6 +273,27 @@ mod tests {
                 expected,
                 "{method} {route} {status}"
             );
+        }
+    }
+
+    #[test]
+    fn external_sign_ins_have_events_of_their_own() {
+        let cases = [
+            (200, None, Some("auth.external.success")),
+            (401, Some("token_invalid"), Some("auth.external.failure")),
+            (
+                403,
+                Some("sign_in_not_permitted"),
+                Some("auth.external.failure"),
+            ),
+            (404, Some("device_not_found"), Some("auth.external.failure")),
+            (400, Some("invalid"), None),
+            (503, Some("identity_unavailable"), None),
+            (429, Some("rate_limited"), Some("auth.rate_limited")),
+        ];
+        for (status, code, expected) in cases {
+            let status = StatusCode::from_u16(status).unwrap();
+            assert_eq!(external_event(status), expected, "{status} {code:?}");
         }
     }
 }

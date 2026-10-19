@@ -193,6 +193,15 @@ impl Auth {
             .find(|authenticator| authenticator.provider() == provider)
     }
 
+    /// Whether `route` is the external authenticator's sign-in route, unless its provider
+    /// id is `entra` (whose route keeps Entra ID's events).
+    pub(crate) fn is_external_route(&self, route: &str) -> bool {
+        self.identity.external.as_ref().is_some_and(|external| {
+            external.provider() != crate::identity::ENTRA_PROVIDER
+                && route.strip_prefix("/v1/auth/") == Some(external.provider())
+        })
+    }
+
     /// The admission every sign-in by token passes, if any.
     pub fn admission(&self) -> Option<&Arc<dyn Admission>> {
         self.identity.admission.as_ref()

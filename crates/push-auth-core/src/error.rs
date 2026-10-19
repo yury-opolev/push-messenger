@@ -31,6 +31,15 @@ pub enum AuthError {
     EntraTokenInvalid,
     #[error("Microsoft Entra ID cannot be reached to check the token; try again")]
     EntraUnavailable,
+    /// A token another identity provider issued is not accepted (spec 2026-10-19
+    /// pluggable identity, D9); Entra ID's is `EntraTokenInvalid`.
+    #[error("the identity token is not accepted")]
+    TokenInvalid,
+    #[error("the identity provider cannot check the token now; try again")]
+    IdentityUnavailable,
+    /// The admission refused an authenticated user (spec D4).
+    #[error("this account may not sign in here")]
+    SignInNotPermitted,
     #[error("the session has reached its maximum age; sign in again")]
     SessionExpired,
     #[error("too many requests; try again in {retry_after_s} s")]
@@ -56,6 +65,9 @@ impl AuthError {
             Self::UserNotFound => "user_not_found",
             Self::EntraTokenInvalid => "entra_token_invalid",
             Self::EntraUnavailable => "entra_unavailable",
+            Self::TokenInvalid => "token_invalid",
+            Self::IdentityUnavailable => "identity_unavailable",
+            Self::SignInNotPermitted => "sign_in_not_permitted",
             Self::SessionExpired => "session_expired",
             Self::RateLimited { .. } => "rate_limited",
             Self::Unavailable => "unavailable",
@@ -70,12 +82,13 @@ impl AuthError {
             | Self::Unauthorized
             | Self::TokenExpired
             | Self::EntraTokenInvalid
+            | Self::TokenInvalid
             | Self::SessionExpired => 401,
-            Self::EmailNotVerified => 403,
+            Self::EmailNotVerified | Self::SignInNotPermitted => 403,
             Self::DeviceNotFound | Self::UserNotFound => 404,
             Self::HandleTaken | Self::TooManyDevices => 409,
             Self::RateLimited { .. } => 429,
-            Self::Unavailable | Self::EntraUnavailable => 503,
+            Self::Unavailable | Self::EntraUnavailable | Self::IdentityUnavailable => 503,
         }
     }
 
@@ -83,7 +96,10 @@ impl AuthError {
     pub fn retryable(&self) -> bool {
         matches!(
             self,
-            Self::RateLimited { .. } | Self::Unavailable | Self::EntraUnavailable
+            Self::RateLimited { .. }
+                | Self::Unavailable
+                | Self::EntraUnavailable
+                | Self::IdentityUnavailable
         )
     }
 }
