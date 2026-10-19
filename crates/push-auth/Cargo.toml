@@ -15,5 +15,15 @@ tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }
 tokio-util.workspace = true
 tracing.workspace = true
 
+[dev-dependencies]
+push-auth-core = { workspace = true, features = ["testing"] }
+serde_json.workspace = true
+
+# A push-auth of one's own (spec 2026-10-19 pluggable identity, D10). Its tests run with
+# `cargo test`; `cargo build -p push-auth` (the image) never builds it.
+[[example]]
+name = "custom_identity"
+test = true
+
 [lints]
 workspace = true

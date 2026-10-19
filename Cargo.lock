@@ -2202,6 +2202,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "push-auth-core",
+ "serde_json",
  "tokio",
  "tokio-util",
  "tracing",
