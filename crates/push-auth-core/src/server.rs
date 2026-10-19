@@ -21,7 +21,11 @@ use crate::api::{Api, router};
 use crate::config::{Config, MigrateConfig};
 use crate::db::{MIGRATOR, grant_worker_access_on};
 use crate::directory::{Directory, GrpcDirectory, NoDirectory};
-use crate::entra::EntraSignIn;
+use crate::entra::{EntraSignIn, Providers};
+use crate::identity::{
+    Admission, Authenticator, ENTRA_PROVIDER, MAX_SESSION_LIMIT, RESERVED_PROVIDER_IDS,
+    is_provider_id,
+};
 use crate::limits::{Limits, RedisCounter};
 use crate::links::LinkSigner;
 use crate::password::Passwords;
@@ -35,18 +39,42 @@ const HASH_WAIT: Duration = Duration::from_secs(2);
 /// How often an Entra ID-only service signs out password devices created since.
 const PASSWORD_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Runs the service until `shutdown` is cancelled, then finishes the requests in
-/// progress and closes the database pool.
-///
-/// The health endpoints answer at once: `/healthz` always, `/readyz` only once the
-/// database is migrated and answers a ping, and never after shutdown began. Postgres and
-/// Redis are retried until they answer, so the service may start before them.
+/// What a binary of one's own substitutes (spec 2026-10-19 pluggable identity, D6): an
+/// authenticator, served at `/v1/auth/{its provider id}` when `PUSH_AUTH_PROVIDERS` names
+/// `external`, and an admission asked on every sign-in by token (Entra ID's included).
+#[derive(Debug, Clone, Default)]
+pub struct Overrides {
+    pub authenticator: Option<Arc<dyn Authenticator>>,
+    pub admission: Option<Arc<dyn Admission>>,
+}
+
+/// Runs the service with the built-in sign-in until `shutdown` is cancelled:
+/// [`serve_with`] and no overrides.
 pub async fn serve(
     config: Config,
     http: TcpListener,
     health: TcpListener,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
+    serve_with(config, http, health, shutdown, Overrides::default()).await
+}
+
+/// Runs the service until `shutdown` is cancelled, then finishes the requests in
+/// progress and closes the database pool. `overrides` must agree with
+/// `PUSH_AUTH_PROVIDERS` (spec D7): anything else stops start-up at once, before a
+/// datastore is contacted.
+///
+/// The health endpoints answer at once: `/healthz` always, `/readyz` only once the
+/// database is migrated and answers a ping, and never after shutdown began. Postgres and
+/// Redis are retried until they answer, so the service may start before them.
+pub async fn serve_with(
+    config: Config,
+    http: TcpListener,
+    health: TcpListener,
+    shutdown: CancellationToken,
+    overrides: Overrides,
+) -> anyhow::Result<()> {
+    check_overrides(&config.providers, &overrides).map_err(anyhow::Error::msg)?;
     let tokens = AccessTokens::from_seed(&config.signing_key, config.token_audience.clone())
         .map_err(anyhow::Error::msg)?;
     let links = LinkSigner::new(config.link_key.clone()).map_err(anyhow::Error::msg)?;
@@ -130,16 +158,14 @@ pub async fn serve(
         return finish(health_server).await;
     };
 
-    if let Some(entra) = &entra {
-        // Fetched now so the first sign-in is quick; a failure only warns: readiness never
-        // depends on Entra ID (spec D4).
-        let warming = entra.clone();
-        tokio::spawn(async move { warming.warm().await });
-    }
     if !config.providers.password {
-        tracing::info!(
-            "email and password sign-in is off: only Microsoft Entra ID sign-in is served"
-        );
+        if config.providers.external {
+            tracing::info!("email and password sign-in is off: only sign-in by token is served");
+        } else {
+            tracing::info!(
+                "email and password sign-in is off: only Microsoft Entra ID sign-in is served"
+            );
+        }
     }
     let auth = Auth::new(
         pool.clone(),
@@ -157,6 +183,19 @@ pub async fn serve(
         password: config.providers.password,
         entra,
     });
+    let auth = match overrides.authenticator {
+        Some(authenticator) => auth.with_external(authenticator),
+        None => auth,
+    };
+    let auth = match overrides.admission {
+        Some(admission) => auth.with_admission(admission),
+        None => auth,
+    };
+    for authenticator in auth.authenticators() {
+        // Keys are fetched now so the first sign-in is quick; a failure only warns:
+        // readiness never depends on an identity provider (spec 2026-10-19 D4).
+        tokio::spawn(async move { authenticator.warm().await });
+    }
     let sweeper = if config.providers.password {
         None
     } else {
@@ -228,6 +267,69 @@ pub async fn serve(
     tracing::info!("stopped");
     result?;
     finish(health_server).await
+}
+
+/// Whether `overrides` agree with `providers` (spec D7): `external` exactly with an
+/// authenticator, whose id is a provider id, no route of its own, not `entra` beside the
+/// built-in Entra ID check, with a maximum session of 1 s to 720 h; an admission only with
+/// a sign-in by token to ask it. The error says what to change.
+pub(crate) fn check_overrides(providers: &Providers, overrides: &Overrides) -> Result<(), String> {
+    match (&overrides.authenticator, providers.external) {
+        (None, true) => {
+            return Err(
+                "PUSH_AUTH_PROVIDERS names external, but no authenticator was \
+                        supplied: external needs a push-auth of one's own that passes \
+                        Overrides.authenticator to serve_with"
+                    .to_owned(),
+            );
+        }
+        (Some(_), false) => {
+            return Err(
+                "an authenticator was supplied in Overrides, but PUSH_AUTH_PROVIDERS \
+                        does not name external: add external to it, or supply none"
+                    .to_owned(),
+            );
+        }
+        (Some(authenticator), true) => {
+            let id = authenticator.provider();
+            if !is_provider_id(id) {
+                return Err(format!(
+                    "the provider id {id:?} of the authenticator in Overrides is not a \
+                     provider id: 1 to 32 lower-case letters, digits or -, starting with a \
+                     letter (PUSH_AUTH_PROVIDERS names external)"
+                ));
+            }
+            if RESERVED_PROVIDER_IDS.contains(&id) {
+                return Err(format!(
+                    "the provider id {id:?} of the authenticator in Overrides is a route of \
+                     push-auth (/v1/auth/{id}): choose another (PUSH_AUTH_PROVIDERS names \
+                     external)"
+                ));
+            }
+            if providers.entra && id == ENTRA_PROVIDER {
+                return Err("PUSH_AUTH_PROVIDERS names entra and external, but the \
+                            authenticator in Overrides has the id entra too: drop entra \
+                            from PUSH_AUTH_PROVIDERS or give it another id"
+                    .to_owned());
+            }
+            let session = authenticator.max_session();
+            if session < Duration::from_secs(1) || session > MAX_SESSION_LIMIT {
+                return Err(format!(
+                    "the maximum session of the authenticator {id:?} in Overrides must be \
+                     1 s to 720 h (PUSH_AUTH_PROVIDERS names external)"
+                ));
+            }
+        }
+        (None, false) => {}
+    }
+    if overrides.admission.is_some() && !providers.entra && !providers.external {
+        return Err(
+            "an admission was supplied in Overrides, but PUSH_AUTH_PROVIDERS names \
+                    neither entra nor external: no sign-in would ask it"
+                .to_owned(),
+        );
+    }
+    Ok(())
 }
 
 /// `push-auth migrate`: applies the `auth` migrations (checking that `citext` is
@@ -365,4 +467,116 @@ pub(crate) fn password_sweeper(
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::tests::RequireGroup;
+
+    /// An authenticator of `provider` whose sessions last `session`.
+    #[derive(Debug)]
+    struct Fixed(&'static str, Duration);
+
+    #[async_trait::async_trait]
+    impl Authenticator for Fixed {
+        fn provider(&self) -> &str {
+            self.0
+        }
+
+        fn max_session(&self) -> Duration {
+            self.1
+        }
+
+        async fn authenticate(
+            &self,
+            _token: &str,
+        ) -> Result<crate::Principal, crate::AuthenticationError> {
+            Err(crate::AuthenticationError::Rejected("fixed"))
+        }
+    }
+
+    fn providers(names: &str) -> Providers {
+        Providers::parse(Some(names)).unwrap()
+    }
+
+    fn with(provider: &'static str, session: Duration) -> Overrides {
+        Overrides {
+            authenticator: Some(Arc::new(Fixed(provider, session))),
+            admission: None,
+        }
+    }
+
+    #[test]
+    fn overrides_and_providers_must_agree() {
+        let hour = Duration::from_secs(3600);
+        for (names, overrides) in [
+            ("password", Overrides::default()),
+            ("password,entra", Overrides::default()),
+            ("external", with("acme", hour)),
+            ("entra,external", with("acme-id", hour)),
+            ("external", with("entra", Duration::from_secs(720 * 3600))),
+            ("password,external", with("a", Duration::from_secs(1))),
+            (
+                "entra",
+                Overrides {
+                    authenticator: None,
+                    admission: Some(RequireGroup::new("staff")),
+                },
+            ),
+        ] {
+            assert_eq!(
+                check_overrides(&providers(names), &overrides),
+                Ok(()),
+                "{names}"
+            );
+        }
+        let refused = [
+            ("external", Overrides::default(), "Overrides.authenticator"),
+            (
+                "password,entra",
+                with("acme", hour),
+                "does not name external",
+            ),
+            ("external", with("Acme", hour), "is not a provider id"),
+            ("external", with("a b", hour), "is not a provider id"),
+            (
+                "external",
+                with("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", hour),
+                "is not a provider id",
+            ),
+            ("entra,external", with("entra", hour), "entra too"),
+            ("external", with("acme", Duration::ZERO), "1 s to 720 h"),
+            (
+                "external",
+                with("acme", Duration::from_secs(720 * 3600 + 1)),
+                "1 s to 720 h",
+            ),
+            (
+                "password",
+                Overrides {
+                    authenticator: None,
+                    admission: Some(RequireGroup::new("staff")),
+                },
+                "neither entra nor external",
+            ),
+        ];
+        for (names, overrides, expected) in refused {
+            let message = check_overrides(&providers(names), &overrides).unwrap_err();
+            assert!(message.contains(expected), "{names}: {message}");
+            assert!(
+                message.contains("PUSH_AUTH_PROVIDERS") || message.contains("Overrides"),
+                "{message}"
+            );
+        }
+        for route in ["signup", "verify", "login", "password", "refresh", "jwks"] {
+            let message = check_overrides(&providers("external"), &with(route, hour)).unwrap_err();
+            assert!(
+                message.contains("is a route of push-auth"),
+                "{route}: {message}"
+            );
+        }
+    }
 }

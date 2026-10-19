@@ -19,11 +19,15 @@ const MAX_TENANTS: usize = 20;
 const MAX_AUDIENCES: usize = 4;
 const MAX_SESSION_HOURS: u64 = 720;
 
-/// The ways to sign in: email and password, Microsoft Entra ID, or both.
+/// The ways to sign in: email and password, Microsoft Entra ID, the external
+/// authenticator a binary of one's own supplies (spec 2026-10-19 pluggable identity, D7),
+/// or several of them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Providers {
     pub password: bool,
     pub entra: bool,
+    /// The authenticator in `Overrides` (`serve_with`), at `/v1/auth/{its provider id}`.
+    pub external: bool,
 }
 
 impl Default for Providers {
@@ -32,13 +36,14 @@ impl Default for Providers {
         Self {
             password: true,
             entra: false,
+            external: false,
         }
     }
 }
 
 impl Providers {
-    /// A `PUSH_AUTH_PROVIDERS` value: `password`, `entra` or both, comma-separated, each
-    /// once; unset or empty is `password`.
+    /// A `PUSH_AUTH_PROVIDERS` value: `password`, `entra`, `external`, comma-separated,
+    /// each once; unset or empty is `password`.
     pub fn parse(value: Option<&str>) -> Result<Self, String> {
         let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
             return Ok(Self::default());
@@ -46,12 +51,19 @@ impl Providers {
         let mut providers = Self {
             password: false,
             entra: false,
+            external: false,
         };
         for name in value.split(',').map(str::trim) {
             match name {
                 "password" if !providers.password => providers.password = true,
                 "entra" if !providers.entra => providers.entra = true,
-                _ => return Err("expected password, entra or password,entra".to_owned()),
+                "external" if !providers.external => providers.external = true,
+                _ => {
+                    return Err(
+                        "expected password, entra, external or a comma-separated combination"
+                            .to_owned(),
+                    );
+                }
             }
         }
         Ok(providers)
@@ -79,6 +91,12 @@ pub struct EntraSettings {
 }
 
 impl EntraSettings {
+    /// [`EntraSettings::from_lookup`] on the process's environment: for a binary of one's
+    /// own that builds [`crate::entra::EntraSignIn`] itself (spec D7).
+    pub fn from_env() -> Result<Self, ConfigError> {
+        Self::from_lookup(&|name: &str| std::env::var(name).ok())
+    }
+
     /// Reads the `PUSH_ENTRA_*` variables. Their values are configuration, not secrets, so
     /// errors show them.
     pub fn from_lookup(lookup: &dyn Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
@@ -372,7 +390,8 @@ mod tests {
             Providers::parse(None),
             Ok(Providers {
                 password: true,
-                entra: false
+                entra: false,
+                external: false
             })
         );
         assert_eq!(Providers::parse(Some(" ")), Ok(Providers::default()));
@@ -380,17 +399,42 @@ mod tests {
             Providers::parse(Some("entra")),
             Ok(Providers {
                 password: false,
-                entra: true
+                entra: true,
+                external: false
             })
         );
         assert_eq!(
             Providers::parse(Some("entra, password")),
             Ok(Providers {
                 password: true,
-                entra: true
+                entra: true,
+                external: false
             })
         );
         for bad in ["Entra", "oidc", "password,password", "password,", ","] {
+            assert!(Providers::parse(Some(bad)).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn external_is_a_provider_of_its_own() {
+        assert_eq!(
+            Providers::parse(Some("external")),
+            Ok(Providers {
+                password: false,
+                entra: false,
+                external: true
+            })
+        );
+        assert_eq!(
+            Providers::parse(Some("password, entra, external")),
+            Ok(Providers {
+                password: true,
+                entra: true,
+                external: true
+            })
+        );
+        for bad in ["external,external", "External", "external,"] {
             assert!(Providers::parse(Some(bad)).is_err(), "{bad}");
         }
     }

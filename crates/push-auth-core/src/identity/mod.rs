@@ -22,6 +22,10 @@ pub const ENTRA_PROVIDER: &str = "entra";
 /// The longest session an authenticator may grant: 30 days, as for Entra ID.
 pub const MAX_SESSION_LIMIT: Duration = Duration::from_secs(720 * 3600);
 
+/// Provider ids that are routes of their own under `/v1/auth/`.
+pub(crate) const RESERVED_PROVIDER_IDS: &[&str] =
+    &["signup", "verify", "login", "password", "refresh", "jwks"];
+
 /// The longest issuer the account store keeps, in characters.
 pub const MAX_ISSUER_CHARS: usize = 256;
 /// The longest subject the account store keeps, in characters.

@@ -42,7 +42,7 @@ pub use identity::{
     Admission, AdmissionDecision, AuthenticationError, Authenticator, ENTRA_PROVIDER, Principal,
 };
 pub use profiles::{OwnProfile, PublicProfile};
-pub use server::{init_logging, migrate, serve, terminated};
+pub use server::{Overrides, init_logging, migrate, serve, serve_with, terminated};
 pub use service::{
     Auth, LINK_SECONDS, REGISTRATION_TOKEN_SECONDS, RegistrationToken, Settings, SignIn, Signup,
 };

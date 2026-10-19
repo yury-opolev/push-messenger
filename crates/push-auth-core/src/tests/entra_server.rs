@@ -15,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 use crate::Config;
 use crate::entra::testing::StubOpenId;
 
-async fn ready(client: &reqwest::Client, health: SocketAddr) {
+pub(super) async fn ready(client: &reqwest::Client, health: SocketAddr) {
     for _ in 0..240 {
         let status = client
             .get(format!("http://{health}/readyz"))

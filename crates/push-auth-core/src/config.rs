@@ -36,7 +36,7 @@ use crate::entra::{EntraSettings, Providers};
 /// | `PUSH_AUTH_WORKER_ROLE` | role the worker connects as: granted the outbox and the cleanups at start-up (or by `migrate`); a plain role name, or an Entra principal name in Entra mode | none |
 /// | `PUSH_MESSAGE_SVC_URL` | Directory gRPC URL of message-svc, `http://host:50053` (plain `http://` only), asked whose profiles a caller may see; without it `GET /v1/users` answers 503 | none |
 /// | `PUSH_DIRECTORY_TOKEN` | the token message-svc requires for its `Directory` API, 32 to 256 visible ASCII characters; required with `PUSH_MESSAGE_SVC_URL` | none |
-/// | `PUSH_AUTH_PROVIDERS` | `password`, `entra` or `password,entra` (spec 2026-10-19) | `password` |
+/// | `PUSH_AUTH_PROVIDERS` | `password`, `entra`, `external`, comma-separated (spec 2026-10-19); `external` is the authenticator a binary of one's own passes to `serve_with`, and reads no `PUSH_ENTRA_*` | `password` |
 /// | `PUSH_ENTRA_CLIENT_ID` | accepted audiences: the API registration's application id, optionally with its `api://` URI | required with `entra` |
 /// | `PUSH_ENTRA_ALLOWED_TENANTS` | exactly one of `common`, `organizations`, `consumers`, or tenant ids (GUIDs), comma-separated; never mixed | required with `entra` |
 /// | `PUSH_ENTRA_AUTHORITY_HOST` | the Entra ID host; `http://` only for loopback (tests) | `https://login.microsoftonline.com/` |
@@ -698,7 +698,8 @@ mod tests {
             default.providers,
             Providers {
                 password: true,
-                entra: false
+                entra: false,
+                external: false
             }
         );
         assert_eq!(default.entra, None);
@@ -721,7 +722,8 @@ mod tests {
             entra.providers,
             Providers {
                 password: false,
-                entra: true
+                entra: true,
+                external: false
             }
         );
         assert_eq!(
@@ -745,6 +747,20 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn external_sign_in_reads_no_entra_variables() {
+        let external = config(&with("PUSH_AUTH_PROVIDERS", "external")).unwrap();
+        assert_eq!(
+            external.providers,
+            Providers {
+                password: false,
+                entra: false,
+                external: true
+            }
+        );
+        assert_eq!(external.entra, None);
     }
 
     #[test]
