@@ -743,6 +743,15 @@ Check 'sign-in: the audience must include the application id; at most four' {
         (Render ($signInArgs + @('--set', 'auth.signIn.entra.clientIds={api://push-api,11111111-0000-4000-8000-000000000001}'))) -eq 0 -and
         (Render ($signInArgs + @('--set', 'auth.signIn.entra.clientIds={api://a,api://b,api://c,api://d,11111111-0000-4000-8000-000000000001}'))) -ne 0
 }
+Check 'sign-in: each clientIds entry is one audience: a comma inside one is refused' {
+    $comma = helm template push $chart @signInArgs --set 'auth.signIn.entra.clientIds[1]=api://a\,b' 2>&1 | Out-String
+    $commaExit = $LASTEXITCODE
+    $two = helm template push $chart @signInArgs --set 'auth.signIn.entra.clientIds[1]=api://a' --set 'auth.signIn.entra.clientIds[2]=api://b' 2>&1 | Out-String
+    $twoExit = $LASTEXITCODE
+    $commaExit -ne 0 -and $comma -match 'one audience per entry' -and $comma -match 'api://a,b' -and
+        $twoExit -eq 0 -and $two -match 'PUSH_ENTRA_CLIENT_ID' -and
+        $two -match '11111111-0000-4000-8000-000000000001,api://a,api://b'
+}
 Check 'sign-in: authority, scope, role, client apps, session age and proxy are checked' {
     (Render ($signInArgs + @('--set', 'auth.signIn.entra.authorityHost=http://login.microsoftonline.com/'))) -ne 0 -and
         (Render ($signInArgs + @('--set', 'auth.signIn.entra.authorityHost=https://login.microsoftonline.com/tenant/'))) -ne 0 -and
