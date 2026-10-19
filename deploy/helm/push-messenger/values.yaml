@@ -90,7 +90,7 @@ auth:
     # Read only when providers include entra.
     entra:
       # The API registration's application (client) id, optionally also its api://
-      # identifier URI; at most four.
+      # identifier URI: one audience per entry (no commas), at most four.
       clientIds: []
       # Exactly one of [common], [organizations], [consumers], or one to twenty tenant ids.
       # A keyword lets anyone with such an account create an account here: the app

@@ -270,8 +270,14 @@ impl Counter for RedisCounter {
             .arg("NX")
             .ignore()
             .ttl(key);
-        let mut connection = self.connection.clone();
-        let call = pipeline.query_async::<(u64, i64)>(&mut connection);
+        // Sent again once if the connection had been closed: a hit counted twice, once,
+        // only tightens the limit a little.
+        let (pipeline, connection) = (&pipeline, &self.connection);
+        let call = push_credentials::retry_if_dropped(|| async move {
+            pipeline
+                .query_async::<(u64, i64)>(&mut connection.clone())
+                .await
+        });
         let (count, ttl) = tokio::select! {
             () = self.shutdown.cancelled() => return Err("shutting down".to_owned()),
             result = tokio::time::timeout(REDIS_TIMEOUT, call) => result

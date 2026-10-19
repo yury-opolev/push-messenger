@@ -2,7 +2,13 @@
 //! (`rediss://`), the token's `oid` (or `PUSH_REDIS_USER`) as the ACL user, managed
 //! connections that re-`AUTH` whenever the token changes, and subscribers opened with the
 //! current token (the gateway hub replaces them when the token changes).
+//!
+//! Managed connections speak RESP3 (Redis 6 or later; Azure Managed Redis documents it
+//! with Entra ID): the server closing one is then noticed at once and the manager
+//! reconnects before the next command. Subscribers keep RESP2. A command that still meets
+//! a dropped connection is retried once by its caller through [`retry_if_dropped`].
 
+use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -10,7 +16,7 @@ use std::sync::Arc;
 use futures_util::Stream;
 use redis::aio::{ConnectionManager, ConnectionManagerConfig, PubSub};
 use redis::auth::{BasicAuth, StreamingCredentialsProvider};
-use redis::{ErrorKind, RedisError, RedisResult};
+use redis::{ErrorKind, ProtocolVersion, RedisError, RedisResult};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
@@ -187,12 +193,25 @@ impl RedisConnector {
         }
     }
 
+    /// The client for managed connections: RESP3, so that redis 1.2's manager hears its
+    /// connection close (a failover, `CLIENT KILL`, an expired token) and reconnects at
+    /// once instead of failing the next command. RESP2 managers learn of it only then.
+    fn commands_client(&self) -> RedisResult<redis::Client> {
+        let info = self.client.get_connection_info().clone();
+        let settings = info
+            .redis_settings()
+            .clone()
+            .set_protocol(ProtocolVersion::RESP3);
+        // The address keeps its TLS parameters (the CA), as in `pubsub`.
+        redis::Client::open(info.set_redis_settings(settings))
+    }
+
     /// A self-reconnecting connection; in Entra mode it re-authenticates on every token.
     pub async fn connection_manager(
         &self,
         config: ConnectionManagerConfig,
     ) -> RedisResult<ConnectionManager> {
-        self.client
+        self.commands_client()?
             .get_connection_manager_with_config(self.with_credentials(config))
             .await
     }
@@ -202,7 +221,7 @@ impl RedisConnector {
         &self,
         config: ConnectionManagerConfig,
     ) -> RedisResult<ConnectionManager> {
-        self.client
+        self.commands_client()?
             .get_connection_manager_lazy(self.with_credentials(config))
     }
 
@@ -230,6 +249,33 @@ impl RedisConnector {
         self.credentials
             .as_ref()
             .map(|credentials| credentials.tokens.watch())
+    }
+}
+
+/// Whether `error` says only that the connection a command went out on had been closed
+/// (reset, aborted, a broken pipe, end of stream). A [`ConnectionManager`] has then begun
+/// to reconnect, so the command may be sent again. Not a refused connection (the manager
+/// already retried connecting), a timeout, refused credentials or a server error.
+pub fn is_dropped_connection(error: &RedisError) -> bool {
+    error.is_connection_dropped() && !error.is_connection_refusal() && !is_permanent_redis(error)
+}
+
+/// Runs `call`, and once more when it failed on a dropped connection
+/// ([`is_dropped_connection`]): redis 1.2's [`ConnectionManager`] returns that error to
+/// the command that found the connection closed and only then reconnects; it never
+/// resends the command. Use it only for commands that may run twice, and bound both
+/// attempts together with the caller's timeout.
+pub async fn retry_if_dropped<T, F, Fut>(mut call: F) -> RedisResult<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = RedisResult<T>>,
+{
+    match call().await {
+        Err(error) if is_dropped_connection(&error) => {
+            tracing::debug!(%error, "the Redis connection was closed; sending once more");
+            call().await
+        }
+        result => result,
     }
 }
 

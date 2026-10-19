@@ -24,7 +24,8 @@ pub use azure::{
 };
 pub use mode::AuthMode;
 pub use redis_connect::{
-    OpenError, REDIS_SCOPE, RedisConnector, RedisTarget, is_permanent_redis, is_refused,
+    OpenError, REDIS_SCOPE, RedisConnector, RedisTarget, is_dropped_connection, is_permanent_redis,
+    is_refused, retry_if_dropped,
 };
 pub use startup::azure_for;
 pub use token::{AccessToken, TokenError, TokenSource};

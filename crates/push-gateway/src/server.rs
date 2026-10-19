@@ -612,10 +612,14 @@ async fn take_over(app: &App, device: Uuid, connection_id: Uuid) {
         connection_id: id_bytes(connection_id),
         ..Kick::default()
     };
-    let mut redis = app.redis.clone();
     let mut command = redis::cmd("PUBLISH");
     command.arg(kick_channel(device)).arg(kick.encode_to_vec());
-    let publish = command.exec_async(&mut redis);
+    // Sent again once if the connection had been closed: a takeover kick closes only the
+    // device's connections older than this one, so hearing it twice changes nothing.
+    let command = &command;
+    let publish = push_credentials::retry_if_dropped(|| async move {
+        command.exec_async(&mut app.redis.clone()).await
+    });
     tokio::select! {
         () = app.shutdown.cancelled() => {}
         published = tokio::time::timeout(REDIS_TIMEOUT, publish) => {

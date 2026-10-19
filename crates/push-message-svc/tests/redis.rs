@@ -69,3 +69,45 @@ async fn publishing_without_redis_returns_without_failing() {
         .await
         .expect("a failed publish gives up instead of hanging");
 }
+
+#[tokio::test]
+async fn the_publish_after_redis_closed_the_connection_still_rings() {
+    let (_container, url) = redis().await;
+    let user = UserId::new();
+    let client = redis::Client::open(url.as_str()).unwrap();
+    let mut subscriber = client
+        .get_async_pubsub()
+        .await
+        .expect("connect a subscriber");
+    subscriber
+        .subscribe(notify_channel(user.0))
+        .await
+        .expect("subscribe");
+    let mut admin = client.get_multiplexed_async_connection().await.unwrap();
+    let notifier = RedisNotifier::connect(&url).await.expect("connect");
+    let events = [Event::EntriesAvailable { users: vec![user] }];
+    notifier.publish(&events).await;
+    let mut messages = subscriber.on_message();
+    for pause in [None, Some(Duration::ZERO), Some(Duration::from_millis(200))] {
+        if let Some(pause) = pause {
+            // The subscriber is a pub/sub client: only the notifier's connection closes.
+            let killed: i64 = redis::cmd("CLIENT")
+                .arg("KILL")
+                .arg("TYPE")
+                .arg("normal")
+                .arg("SKIPME")
+                .arg("yes")
+                .query_async(&mut admin)
+                .await
+                .unwrap();
+            assert_eq!(killed, 1);
+            tokio::time::sleep(pause).await;
+            notifier.publish(&events).await;
+        }
+        let message = tokio::time::timeout(Duration::from_secs(5), messages.next())
+            .await
+            .unwrap_or_else(|_| panic!("a notification within 5 s ({pause:?})"))
+            .expect("the subscription is open");
+        assert_eq!(message.get_channel_name(), notify_channel(user.0));
+    }
+}

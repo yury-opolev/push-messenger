@@ -512,6 +512,10 @@ mod tests {
             "push",
             "api://",
             "api://a b",
+            // A comma always separates audiences, each checked on its own.
+            "api://a,anything",
+            "api://a,11111111-0000-4000-8000-000000000001,anything",
+            "api://a,api://b,api://c,api://d,11111111-0000-4000-8000-000000000001",
         ] {
             assert!(refused("PUSH_ENTRA_CLIENT_ID", bad), "{bad}");
         }

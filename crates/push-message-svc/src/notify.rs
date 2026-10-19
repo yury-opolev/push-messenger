@@ -50,8 +50,15 @@ impl RedisNotifier {
         for (channel, payload) in messages {
             pipeline.publish(channel, payload).ignore();
         }
-        let mut connection = self.connection.clone();
-        pipeline.query_async::<()>(&mut connection).await
+        // Sent again once if the connection had been closed. A notification is a doorbell
+        // (the client syncs) and a kick names its reason, so one heard twice does no harm.
+        let pipeline = &pipeline;
+        push_credentials::retry_if_dropped(|| async move {
+            pipeline
+                .query_async::<()>(&mut self.connection.clone())
+                .await
+        })
+        .await
     }
 }
 

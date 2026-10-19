@@ -188,6 +188,36 @@ async fn managed_connections_and_subscribers_survive_rotations_and_kills() {
 }
 
 #[tokio::test]
+async fn the_command_after_a_kill_succeeds_and_reconnects_with_the_token() {
+    let mut setup = setup(Duration::from_secs(3600), true, None).await;
+    let manager = setup
+        .connector
+        .connection_manager(ConnectionManagerConfig::new())
+        .await
+        .unwrap();
+    let ping = || async {
+        redis::cmd("PING")
+            .query_async::<String>(&mut manager.clone())
+            .await
+    };
+    assert_eq!(ping().await.unwrap(), "PONG");
+    for pause in [Duration::ZERO, Duration::from_millis(200)] {
+        let killed: i64 = redis::cmd("CLIENT")
+            .arg("KILL")
+            .arg("USER")
+            .arg(OID)
+            .query_async(&mut setup.admin)
+            .await
+            .unwrap();
+        assert_eq!(killed, 1);
+        tokio::time::sleep(pause).await;
+        // At once: the retry; after a pause: the RESP3 manager has reconnected already.
+        let answer = crate::retry_if_dropped(ping).await;
+        assert_eq!(answer.unwrap(), "PONG", "after {pause:?}");
+    }
+}
+
+#[tokio::test]
 async fn a_principal_without_a_redis_user_is_refused() {
     let setup = setup(Duration::from_secs(3600), false, None).await;
     let Err(error) = setup

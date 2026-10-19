@@ -107,3 +107,39 @@ async fn without_redis_requests_are_refused_quickly_and_may_be_retried() {
         started.elapsed()
     );
 }
+
+#[tokio::test]
+async fn the_check_after_redis_closed_the_connection_still_counts() {
+    let (_container, url) = redis().await;
+    let counter = RedisCounter::connect(&url, CancellationToken::new())
+        .await
+        .unwrap();
+    let limit = Limit {
+        max: 5,
+        window: Duration::from_secs(60),
+    };
+    assert_eq!(counter.hit("rl:kill", limit).await, Ok(Outcome::Allowed));
+    let mut admin = redis::Client::open(url.as_str())
+        .unwrap()
+        .get_multiplexed_async_connection()
+        .await
+        .unwrap();
+    for pause in [Duration::ZERO, Duration::from_millis(200)] {
+        let killed: i64 = redis::cmd("CLIENT")
+            .arg("KILL")
+            .arg("TYPE")
+            .arg("normal")
+            .arg("SKIPME")
+            .arg("yes")
+            .query_async(&mut admin)
+            .await
+            .unwrap();
+        assert_eq!(killed, 1);
+        tokio::time::sleep(pause).await;
+        assert_eq!(
+            counter.hit("rl:kill", limit).await,
+            Ok(Outcome::Allowed),
+            "after {pause:?}"
+        );
+    }
+}

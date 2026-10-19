@@ -240,6 +240,10 @@ The admin listener is a boolean; its peers carry both label maps.
 {{- $hasId := false -}}
 {{- range $entra.clientIds -}}
 {{- $id := toString . -}}
+{{- /* PUSH_ENTRA_CLIENT_ID joins the entries with commas and auth-svc splits on them. */ -}}
+{{- if contains "," $id -}}
+{{- fail (printf "auth.signIn.entra.clientIds: %q holds a comma; give one audience per entry" $id) -}}
+{{- end -}}
 {{- if regexMatch $guid $id -}}
 {{- $hasId = true -}}
 {{- $audiences = append $audiences (lower $id) -}}

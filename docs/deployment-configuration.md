@@ -86,6 +86,8 @@ The role passwords are applied only when PostgreSQL initialises an empty volume:
 changing them later requires coordinated role changes (see
 [the upgrade runbook](deployment-upgrade.md)). The chart cannot validate credentials
 against the backing services; external datastores are configured separately (below).
+An external Redis must be version 6 or later: the services' command connections speak
+RESP3 (`HELLO 3`).
 
 Materialize the Secret before the workloads start. Helm cannot inspect it offline:
 a missing required key stops that workload with a Kubernetes

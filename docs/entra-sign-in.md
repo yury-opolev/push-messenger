@@ -110,6 +110,7 @@ auth:
     entra:
       clientIds:
         - 11111111-0000-4000-8000-000000000001   # the API's application id
+        # - api://push-api                       # optionally its URI: one per entry, no commas
       tenants:
         - 33333333-0000-4000-8000-000000000003   # your tenant id(s); or exactly one of
                                                  # common, organizations, consumers

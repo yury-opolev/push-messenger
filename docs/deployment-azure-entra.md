@@ -225,11 +225,17 @@ rules there with live allowed and denied connections.
 - No automatic linking of datastores to identities: the Azure-side setup of section 2 is
   the consumer's, as are private endpoints and DNS.
 - Tokens are cached in memory only; a restarted pod requests new ones.
-- A Redis connection the server closes (a failover, `CLIENT KILL`) is noticed on its next
-  command, which fails once: auth-svc answers that request with a retryable 503, the
-  gateway refuses that connection attempt's rate-limit check, message-svc misses that
-  notification (clients catch up at their next sync). The connection then reconnects
-  with the current token; the gateway's subscriber reconnects at once.
+- A Redis connection the server closes (a failover, `CLIENT KILL`, an expired token) is
+  replaced with the current token: the services' command connections speak RESP3, so they
+  hear the close and reconnect at once, and a command that still meets the closed
+  connection is sent once more on the new one (a rate-limit hit, a notification or kick
+  `PUBLISH`; a hit counted twice only tightens a limit, a notification heard twice is a
+  second doorbell). Only a command the server ran but whose answer was lost is counted
+  twice. If reconnecting fails as well, the request fails as before: auth-svc answers a
+  retryable 503, the gateway refuses that connection attempt's rate-limit check,
+  message-svc misses that notification (clients catch up at their next sync). The
+  gateway's subscriber stays on RESP2 and reconnects at once by itself. RESP3 needs
+  Redis 6 or later, as Azure Managed Redis and the bundled Redis 7 are.
 - The bundled datastores take passwords only; Entra ID applies to external ones.
 - NetworkPolicies cannot match host names: Entra ID egress needs its IP ranges or a
   firewall with FQDN rules.
