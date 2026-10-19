@@ -501,6 +501,15 @@ async fn migration_0005_keeps_entra_identities_and_admits_other_providers() {
 Run `cargo test -p push-auth-core --test schema -j 4`.
 Expected: fails (no column `issuer`).
 
+> **Amended during implementation (review finding):** the chart migrates in a
+> `pre-upgrade` Job before the pods roll, so Plan 13A's pods would query a renamed
+> `tenant_id` until replaced. 0005 is therefore expand-only: it adds `issuer text NOT NULL`
+> (backfilled from `tenant_id::text`) and its key and CHECK, keeps `tenant_id` (now
+> nullable) with its old key, and a `BEFORE INSERT` trigger fills `issuer` from `tenant_id`
+> (old pods) and `tenant_id` from a GUID `issuer` of an `entra` row (new pods). A later
+> migration drops `tenant_id`. The existing schema test then stays unchanged; the upgrade
+> test also runs Plan 13A's SQL beside the new code. The SQL below is the first draft.
+
 - [ ] **Step 2: The migration** `0005_external_provider.sql`:
 
 ```sql

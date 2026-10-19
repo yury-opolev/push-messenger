@@ -383,11 +383,11 @@ async fn an_external_account_has_no_email_or_password_and_the_cleanup_keeps_it()
         async move {
             sqlx::query(
                 "INSERT INTO auth.external_identity \
-                 (identity_id, provider, issuer, subject, user_id) \
+                 (identity_id, provider, tenant_id, subject, user_id) \
                  VALUES ($1, 'entra', $2, $3, $4)",
             )
             .bind(Uuid::now_v7())
-            .bind(tenant.to_string())
+            .bind(tenant)
             .bind(subject)
             .bind(user)
             .execute(&pool)
@@ -398,7 +398,7 @@ async fn an_external_account_has_no_email_or_password_and_the_cleanup_keeps_it()
     let ivy = account("ivy", None, None, true).await.expect("ivy");
     assert_eq!(
         constraint(identity(ivy, "oid-1").await.expect_err("the same subject")),
-        "external_identity_provider_issuer_subject_key"
+        "external_identity_provider_tenant_id_subject_key"
     );
     assert_eq!(
         constraint(
@@ -430,9 +430,10 @@ async fn an_external_account_has_no_email_or_password_and_the_cleanup_keeps_it()
     assert_eq!(left, ["erin", "ivy"]);
 }
 
-/// Plan 13A's Entra identities survive migration 0005 unchanged (spec D8, AC6), and the
-/// new rules hold: any provider id of the pattern, an issuer of 1 to 256 characters, one
-/// identity per (provider, issuer, subject).
+/// Plan 13A's Entra identities survive migration 0005 unchanged (spec D8, AC6), the new
+/// rules hold (any provider id of the pattern, an issuer of 1 to 256 characters, one
+/// identity per (provider, issuer, subject)), and Plan 13A's SQL keeps working beside the
+/// new code during a rolling update.
 #[tokio::test]
 async fn migration_0005_keeps_entra_identities_and_admits_other_providers() {
     const TENANT: &str = "33333333-0000-4000-8000-000000000003";
@@ -536,14 +537,72 @@ async fn migration_0005_keeps_entra_identities_and_admits_other_providers() {
         ),
         "external_identity_provider_issuer_subject_key"
     );
-    assert_eq!(
-        constraint(
-            link("entra".to_owned(), TENANT.to_owned())
-                .await
-                .expect_err("erin's identity")
-        ),
-        "external_identity_provider_issuer_subject_key"
+    // Erin's identity again: refused by either key (the trigger fills tenant_id too).
+    let again = constraint(
+        link("entra".to_owned(), TENANT.to_owned())
+            .await
+            .expect_err("erin's identity"),
     );
+    assert!(
+        again == "external_identity_provider_issuer_subject_key"
+            || again == "external_identity_provider_tenant_id_subject_key",
+        "{again}"
+    );
+
+    // During the rollout, Plan 13A's pods still run their own SQL on the new schema, and
+    // both kinds of pods see each other's Entra ID identities.
+    let gus = account(pool.clone()).await;
+    let old_tenant = Uuid::now_v7();
+    let inserted: Option<i32> = sqlx::query_scalar(
+        "INSERT INTO auth.external_identity \
+         (identity_id, provider, tenant_id, subject, user_id, email) \
+         VALUES ($1, 'entra', $2, 'oid-gus', $3, NULL) \
+         ON CONFLICT (provider, tenant_id, subject) DO NOTHING RETURNING 1",
+    )
+    .bind(Uuid::now_v7())
+    .bind(old_tenant)
+    .bind(gus)
+    .fetch_optional(&pool)
+    .await
+    .expect("Plan 13A's insert");
+    assert_eq!(inserted, Some(1));
+    let found: Option<Uuid> = sqlx::query_scalar(
+        "SELECT user_id FROM auth.external_identity \
+         WHERE provider = 'entra' AND issuer = $1 AND subject = 'oid-gus'",
+    )
+    .bind(old_tenant.to_string())
+    .fetch_optional(&pool)
+    .await
+    .unwrap();
+    assert_eq!(found, Some(gus), "a new pod finds an old pod's identity");
+    let hal = account(pool.clone()).await;
+    let new_tenant = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO auth.external_identity \
+         (identity_id, provider, issuer, subject, user_id) VALUES ($1, 'entra', $2, 'oid-hal', $3)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(new_tenant.to_string())
+    .bind(hal)
+    .execute(&pool)
+    .await
+    .expect("a new pod's insert");
+    let found: Option<Uuid> = sqlx::query_scalar(
+        "UPDATE auth.external_identity SET last_sign_in_at = now() \
+         WHERE provider = 'entra' AND tenant_id = $1 AND subject = 'oid-hal' RETURNING user_id",
+    )
+    .bind(new_tenant)
+    .fetch_optional(&pool)
+    .await
+    .unwrap();
+    assert_eq!(found, Some(hal), "an old pod finds a new pod's identity");
+    let other: Option<Uuid> = sqlx::query_scalar(
+        "SELECT tenant_id FROM auth.external_identity WHERE provider = 'acme-id' LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(other, None, "other providers have no tenant");
     for provider in ["Acme", "9acme", "acme_id", &"a".repeat(33)] {
         assert_eq!(
             constraint(
