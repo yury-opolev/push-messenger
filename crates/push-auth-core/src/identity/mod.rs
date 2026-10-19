@@ -10,6 +10,12 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::{Map, Value};
 
+use crate::error::AuthError;
+
+mod middleware;
+
+pub(crate) use middleware::{IdentityState, identify};
+
 /// The provider id of the built-in Microsoft Entra ID check.
 pub const ENTRA_PROVIDER: &str = "entra";
 
@@ -103,6 +109,67 @@ pub fn is_provider_id(id: &str) -> bool {
     matches!(chars.next(), Some('a'..='z'))
         && id.len() <= 32
         && chars.all(|c| matches!(c, 'a'..='z' | '0'..='9' | '-'))
+}
+
+/// A refused token, logged and answered (spec D9): `auth.entra.rejected` and
+/// `entra_token_invalid` for Entra ID, as before; else `auth.external.rejected` with the
+/// provider, and `token_invalid`.
+pub(crate) fn rejected(provider: &str, reason: &'static str) -> AuthError {
+    if provider == ENTRA_PROVIDER {
+        tracing::warn!(
+            target: "security",
+            event = "auth.entra.rejected",
+            reason,
+            "an Entra ID access token was refused"
+        );
+        AuthError::EntraTokenInvalid
+    } else {
+        tracing::warn!(
+            target: "security",
+            event = "auth.external.rejected",
+            provider,
+            reason,
+            "an identity token was refused"
+        );
+        AuthError::TokenInvalid
+    }
+}
+
+/// The authenticator cannot check tokens now: `entra_unavailable` for Entra ID, else
+/// `identity_unavailable`. Its own text is not logged here: it is the authenticator's to
+/// log (the built-in Entra ID check does).
+pub(crate) fn unavailable(provider: &str) -> AuthError {
+    tracing::warn!(
+        provider,
+        "a sign-in failed: the identity provider cannot check tokens now"
+    );
+    if provider == ENTRA_PROVIDER {
+        AuthError::EntraUnavailable
+    } else {
+        AuthError::IdentityUnavailable
+    }
+}
+
+/// The admission refused an authenticated user: `auth.external.not_permitted` with the
+/// provider and the issuer, and `sign_in_not_permitted`.
+pub(crate) fn not_permitted(principal: &Principal) -> AuthError {
+    tracing::warn!(
+        target: "security",
+        event = "auth.external.not_permitted",
+        provider = %principal.provider,
+        issuer = %principal.issuer,
+        "an authenticated user may not sign in here"
+    );
+    AuthError::SignInNotPermitted
+}
+
+/// The admission cannot decide now: `identity_unavailable`, whatever the provider.
+pub(crate) fn admission_unavailable(provider: &str) -> AuthError {
+    tracing::warn!(
+        provider,
+        "a sign-in failed: the admission cannot decide now"
+    );
+    AuthError::IdentityUnavailable
 }
 
 /// A claim kept for display only: trimmed, 1 to 254 characters, no control characters.

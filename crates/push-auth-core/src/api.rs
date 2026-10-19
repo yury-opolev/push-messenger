@@ -21,7 +21,7 @@ use axum::http::request::Parts;
 use axum::http::{Extensions, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{delete, get, post};
-use axum::{Form, Json, Router};
+use axum::{Extension, Form, Json, Router};
 use chrono::SecondsFormat;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -31,14 +31,14 @@ use uuid::Uuid;
 use crate::audit::{self, ErrorCode, Subject};
 use crate::devices::{Caller, Tokens};
 use crate::directory::Directory;
-use crate::entra::EntraError;
 use crate::error::AuthError;
+use crate::identity::{IdentityState, Principal, identify};
 use crate::limits::{Action, Limits};
 use crate::rules::{self, Invalid};
 use crate::service::{Auth, Signup};
 
 /// Largest request body accepted.
-const MAX_BODY_BYTES: usize = 16 * 1024;
+pub(crate) const MAX_BODY_BYTES: usize = 16 * 1024;
 
 /// What the handlers share.
 #[derive(Debug, Clone)]
@@ -54,7 +54,8 @@ pub struct Api {
 }
 
 /// The router of the public API. Without email and password sign-in its routes do not
-/// exist (404), and without Entra ID sign-in neither does `/v1/auth/entra` (spec D9).
+/// exist (404); `/v1/auth/{provider}` exists for each offered authenticator only, Entra
+/// ID's at `/v1/auth/entra` (spec 2026-10-19 D9; pluggable identity D7).
 pub fn router(api: Api) -> Router {
     let mut routes: Router<Api> = Router::new();
     if api.auth.password_enabled() {
@@ -66,8 +67,16 @@ pub fn router(api: Api) -> Router {
             .route("/v1/auth/password/forgot", post(forgot))
             .route("/v1/auth/password/reset", get(reset_page).post(reset));
     }
-    if api.auth.entra().is_some() {
-        routes = routes.route("/v1/auth/entra", post(entra));
+    for authenticator in api.auth.authenticators() {
+        let path = format!("/v1/auth/{}", authenticator.provider());
+        let state = IdentityState {
+            api: api.clone(),
+            authenticator,
+        };
+        routes = routes.route(
+            &path,
+            post(sign_in).route_layer(axum::middleware::from_fn_with_state(state, identify)),
+        );
     }
     routes
         .route("/v1/auth/refresh", post(refresh))
@@ -145,7 +154,7 @@ impl<S: Send + Sync, T: DeserializeOwned> FromRequest<S> for JsonBody<T> {
     }
 }
 
-fn bad_body() -> AuthError {
+pub(crate) fn bad_body() -> AuthError {
     AuthError::Invalid(Invalid {
         field: "body",
         reason: "expected a JSON object with the documented fields",
@@ -377,9 +386,7 @@ async fn login(
 }
 
 #[derive(Deserialize)]
-struct EntraBody {
-    /// The Entra ID access token for this API, as MSAL returned it.
-    token: String,
+struct SignInBody {
     /// The handle of a new account; ignored once the account exists.
     #[serde(default)]
     handle: Option<String>,
@@ -387,32 +394,19 @@ struct EntraBody {
     device_id: Option<Uuid>,
 }
 
-/// `POST /v1/auth/entra {token, handle?, device_id?}` (spec D10): without `device_id` a
-/// registration token, as `POST /v1/auth/login` answers; with it, new tokens for that
-/// active device and a new session. Every refused token is `entra_token_invalid`; the
-/// reason goes to the security log only.
-async fn entra(
+/// `POST /v1/auth/{provider} {token?, handle?, device_id?}` (spec 2026-10-19 Entra ID
+/// sign-in D10, pluggable identity D5), behind the identity middleware, which put the
+/// principal here: without `device_id` a registration token, as `POST /v1/auth/login`
+/// answers; with it, new tokens for that active device and a new session.
+async fn sign_in(
     State(api): State<Api>,
-    ClientIp(ip): ClientIp,
-    JsonBody(body): JsonBody<EntraBody>,
+    Extension(principal): Extension<Principal>,
+    JsonBody(body): JsonBody<SignInBody>,
 ) -> Result<Response, AuthError> {
-    api.limits.check(Action::EntraSignIn, ip, None).await?;
-    let checker = api.auth.entra().ok_or(AuthError::Unauthorized)?;
-    let identity = checker
-        .verify(&body.token)
-        .await
-        .map_err(|error| match error {
-            EntraError::Rejected(_) => AuthError::EntraTokenInvalid,
-            EntraError::Unavailable(_) => AuthError::EntraUnavailable,
-        })?;
-    let account = format!("entra:{}:{}", identity.tenant_id, identity.object_id);
-    api.limits
-        .check(Action::EntraAccount, None, Some(&account))
-        .await?;
     let handle = body.handle.as_deref();
     Ok(match body.device_id {
         None => {
-            let signed_in = api.auth.sign_in_entra(&identity, handle).await?;
+            let signed_in = api.auth.sign_in_external(&principal, handle).await?;
             let mut response = Json(json!({
                 "registration_token": signed_in.registration.token,
                 "expires_in_s": signed_in.registration.expires_in_s,
@@ -427,7 +421,7 @@ async fn entra(
         Some(device_id) => {
             let tokens = api
                 .auth
-                .sign_in_entra_device(&identity, handle, device_id)
+                .sign_in_external_device(&principal, handle, device_id)
                 .await?;
             tokens_response(StatusCode::OK, &tokens)
         }

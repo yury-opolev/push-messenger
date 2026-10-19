@@ -1,5 +1,6 @@
 //! Rate limits (spec §5.6): per account and per IP, on signup, login, verification resend,
-//! password reset, opening email links and handle lookup, and on Entra ID sign-in. Accounts are never locked; a
+//! password reset, opening email links and handle lookup, and on sign-in by token (Entra ID
+//! or an external provider). Accounts are never locked; a
 //! request over a limit is refused with `rate_limited` and a retry delay.
 //!
 //! Counters are fixed windows in Redis (`INCR`, then `EXPIRE … NX`), keyed by a hash of
@@ -36,9 +37,11 @@ pub enum Action {
     /// Opening a verification or reset link.
     OpenLink,
     HandleLookup,
-    /// `POST /v1/auth/entra`, counted per IP before the token is checked.
+    /// `POST /v1/auth/{provider}` (Entra ID or the external provider), counted per IP
+    /// before the token is checked; every provider shares the count.
     EntraSignIn,
-    /// `POST /v1/auth/entra`, counted per Entra ID identity once the token is accepted.
+    /// `POST /v1/auth/{provider}`, counted per identity `(provider, issuer, subject)` once
+    /// the token is accepted and admitted.
     EntraAccount,
     /// `PATCH /v1/users/me` with a handle: per IP and per user.
     HandleChange,

@@ -9,6 +9,7 @@ mod entra_api;
 mod entra_server;
 mod identity;
 mod identity_accounts;
+mod identity_api;
 mod switch;
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -73,6 +74,15 @@ pub(crate) fn quick() -> KeyTiming {
 /// A migrated database, the stub issuer, the service offering `offer` and its router
 /// (in-memory rate limits, the client IP in `x-real-ip`).
 pub(crate) async fn world(offer: Offer) -> World {
+    world_with(offer, None, None).await
+}
+
+/// As [`world`], also offering `external` and asking `admission`.
+pub(crate) async fn world_with(
+    offer: Offer,
+    external: Option<Arc<dyn Authenticator>>,
+    admission: Option<Arc<dyn Admission>>,
+) -> World {
     let container = Postgres::default()
         .with_tag("17-alpine")
         .start()
@@ -96,7 +106,13 @@ pub(crate) async fn world(offer: Offer) -> World {
             entra: Some(entra),
         },
     };
-    let auth = service(pool.clone(), sign_in);
+    let mut auth = service(pool.clone(), sign_in);
+    if let Some(external) = external {
+        auth = auth.with_external(external);
+    }
+    if let Some(admission) = admission {
+        auth = auth.with_admission(admission);
+    }
     let router = router(Api {
         auth: auth.clone(),
         limits: Limits::new(Arc::new(MemoryCounter::default())),
