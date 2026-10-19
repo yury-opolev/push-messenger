@@ -12,12 +12,16 @@ pub mod testing;
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use jsonwebtoken::{Algorithm, Validation};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
+use serde_json::{Map, Value};
 use uuid::Uuid;
+
+use crate::identity::{AuthenticationError, Authenticator, ENTRA_PROVIDER, Principal};
 
 pub use keys::KeyTiming;
 pub use settings::{
@@ -87,6 +91,21 @@ pub struct EntraIdentity {
     pub name: Option<String>,
     /// `email`, else `preferred_username`: informational, never used to find an account.
     pub email: Option<String>,
+}
+
+impl EntraIdentity {
+    /// The principal this identity is (spec D2): provider `entra`, the tenant id as the
+    /// issuer, the object id as the subject, with the token's verified `claims`.
+    pub fn principal(&self, claims: Map<String, Value>) -> Principal {
+        Principal {
+            provider: ENTRA_PROVIDER.to_owned(),
+            issuer: self.tenant_id.to_string(),
+            subject: self.object_id.to_string(),
+            name: self.name.clone(),
+            email: self.email.clone(),
+            claims,
+        }
+    }
 }
 
 impl std::fmt::Debug for EntraIdentity {
@@ -174,7 +193,7 @@ impl EntraSignIn {
     /// The user `token` names, if it is an acceptable access token for this API. A
     /// refusal is logged with its reason, never with the token or its claims.
     pub async fn verify(&self, token: &str) -> Result<EntraIdentity, EntraError> {
-        let checked = self.check(token).await;
+        let checked = self.check(token).await.map(|(identity, _)| identity);
         match &checked {
             Err(EntraError::Rejected(reason)) => tracing::warn!(
                 target: "security",
@@ -190,7 +209,8 @@ impl EntraSignIn {
         checked
     }
 
-    async fn check(&self, token: &str) -> Result<EntraIdentity, EntraError> {
+    /// The identity of an acceptable token, and the token's whole verified payload.
+    async fn check(&self, token: &str) -> Result<(EntraIdentity, Map<String, Value>), EntraError> {
         let malformed = EntraError::Rejected(Reason::Malformed);
         let parts: Vec<&str> = token.split('.').collect();
         if token.len() > MAX_TOKEN_BYTES || parts.len() != 3 {
@@ -226,10 +246,45 @@ impl EntraSignIn {
         validation.set_required_spec_claims(&["exp", "nbf", "iss", "aud"]);
         validation.validate_nbf = true;
         validation.leeway = LEEWAY_SECONDS;
-        let claims = jsonwebtoken::decode::<claims::EntraClaims>(token, &key, &validation)
+        let payload = jsonwebtoken::decode::<Map<String, Value>>(token, &key, &validation)
             .map_err(|error| EntraError::Rejected(reason_of(&error)))?
             .claims;
-        claims::check(&claims, tenant, &self.settings).map_err(EntraError::Rejected)
+        // A claim of the wrong JSON type makes the whole token malformed, as before.
+        let claims: claims::EntraClaims = serde_json::from_value(Value::Object(payload.clone()))
+            .map_err(|_| EntraError::Rejected(Reason::Malformed))?;
+        let identity =
+            claims::check(&claims, tenant, &self.settings).map_err(EntraError::Rejected)?;
+        Ok((identity, payload))
+    }
+}
+
+/// The built-in Microsoft Entra ID check as an [`Authenticator`] (spec D3): provider
+/// `entra`. A refusal is logged by the identity middleware, not here.
+#[async_trait]
+impl Authenticator for EntraSignIn {
+    fn provider(&self) -> &str {
+        ENTRA_PROVIDER
+    }
+
+    fn max_session(&self) -> Duration {
+        self.settings.max_session
+    }
+
+    async fn authenticate(&self, token: &str) -> Result<Principal, AuthenticationError> {
+        match self.check(token).await {
+            Ok((identity, claims)) => Ok(identity.principal(claims)),
+            Err(EntraError::Rejected(reason)) => {
+                Err(AuthenticationError::Rejected(reason.as_str()))
+            }
+            Err(EntraError::Unavailable(error)) => {
+                tracing::warn!(%error, "an Entra ID sign-in failed: no usable signing keys");
+                Err(AuthenticationError::Unavailable(error))
+            }
+        }
+    }
+
+    async fn warm(&self) {
+        self.keys.warm().await;
     }
 }
 
@@ -310,6 +365,40 @@ mod tests {
         let other = stub.user_claims(OTHER_TENANT, USER);
         let identity = entra.verify(&sign(KEY_A, &other)).await.unwrap();
         assert_eq!(identity.tenant_id.to_string(), OTHER_TENANT);
+    }
+
+    #[tokio::test]
+    async fn as_an_authenticator_it_names_the_tenant_and_object_id_with_every_claim() {
+        use crate::identity::{AuthenticationError, Authenticator};
+
+        let (stub, entra) = verifier().await;
+        let checker: &dyn Authenticator = &entra;
+        assert_eq!(checker.provider(), "entra");
+        assert_eq!(checker.max_session(), Duration::from_secs(24 * 3600));
+        let principal = checker.authenticate(&stub.token(USER)).await.unwrap();
+        assert_eq!(principal.provider, "entra");
+        assert_eq!(principal.issuer, TENANT);
+        assert_eq!(principal.subject, USER);
+        assert_eq!(principal.name.as_deref(), Some("Test User"));
+        assert_eq!(principal.email.as_deref(), Some("test.user@contoso.test"));
+        assert_eq!(principal.claims["scp"], "access_as_user");
+        assert_eq!(principal.claims["azp"], CLIENT_APP);
+        let shown = format!("{principal:?}");
+        assert!(shown.contains(TENANT) && !shown.contains(USER), "{shown}");
+        assert!(!shown.contains("Test User"), "{shown}");
+
+        let mut claims = stub.user_claims(TENANT, USER);
+        claims["aud"] = json!(CLIENT_APP);
+        assert_eq!(
+            checker.authenticate(&sign(KEY_A, &claims)).await,
+            Err(AuthenticationError::Rejected("audience"))
+        );
+        let (down, cold) = verifier().await;
+        down.set_failing(true);
+        assert!(matches!(
+            cold.authenticate(&down.token(USER)).await,
+            Err(AuthenticationError::Unavailable(_))
+        ));
     }
 
     #[tokio::test]

@@ -15,6 +15,7 @@ mod directory;
 pub mod entra;
 mod error;
 mod external;
+pub mod identity;
 pub mod limits;
 pub mod links;
 pub mod outbox;
@@ -26,6 +27,9 @@ mod service;
 pub mod tokens;
 
 pub use admin::{AdminApi, UserSelector, admin_router};
+/// The attribute an [`Authenticator`] or `Admission` implementation needs, so a binary of
+/// one's own uses the same version.
+pub use async_trait::async_trait;
 pub use config::{Config, ConfigError, MigrateConfig};
 pub use db::{
     MIGRATOR, grant_worker_access, grant_worker_access_on, is_role_name, migrate_database,
@@ -34,6 +38,7 @@ pub use devices::{Caller, DeviceInfo, MAX_ACTIVE_DEVICES, REFRESH_GRACE, Tokens}
 pub use directory::{Directory, GrpcDirectory, NoDirectory};
 pub use error::AuthError;
 pub use external::EntraRegistration;
+pub use identity::{AuthenticationError, Authenticator, ENTRA_PROVIDER, Principal};
 pub use profiles::{OwnProfile, PublicProfile};
 pub use server::{init_logging, migrate, serve, terminated};
 pub use service::{

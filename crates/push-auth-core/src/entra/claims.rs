@@ -6,6 +6,7 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use super::{EntraIdentity, EntraSettings, Reason};
+use crate::identity::informational;
 
 /// The claims read from an access token. A claim of the wrong JSON type makes the whole
 /// token malformed. No `Debug`: it holds the name and the address.
@@ -92,14 +93,6 @@ pub(crate) fn check(
 
 fn guid(value: &str) -> Option<Uuid> {
     Uuid::try_parse(value).ok()
-}
-
-/// A claim kept for display only: trimmed, 1 to 254 characters, no control characters.
-fn informational(value: Option<&str>) -> Option<String> {
-    let value = value?.trim();
-    let fits =
-        !value.is_empty() && value.chars().count() <= 254 && !value.chars().any(char::is_control);
-    fits.then(|| value.to_owned())
 }
 
 #[cfg(test)]
