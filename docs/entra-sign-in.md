@@ -150,6 +150,13 @@ access and refresh tokens are refused. Deletion atomically revokes every device 
 refresh token and frees the owner's slot. Live sockets close **4003** after the durable
 revocation relay; no messages or account history are deleted. The disabled handle remains
 reserved, but disabled/pending accounts are absent from public lookups and batch profiles.
+Profile edits serialize with deletion: a `PATCH /v1/users/me` that loses to deletion
+returns 401 without changing the tombstone's display name or reserved handle.
+
+The first `agent.enrolled` projection accepts the owner/agent contact pair only if neither
+side has already blocked the other, including when device registration was projected first.
+Its durable receipt is recorded even across an existing block, so neither delayed initial
+delivery nor replay can accept or unblock the pair.
 
 Own, public, batch and handle-lookup profiles add `kind:"user"|"agent"` and nullable
 `owner_user_id` (null for humans). Rust SDK profiles expose those fields; Node/C/FFI JSON

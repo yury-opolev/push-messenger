@@ -715,6 +715,7 @@ async fn a_block_keeps_the_sight_the_blocker_had<B: Backend>(backend: &B) {
 pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
     case_list![
         agent_enrollment_projects_users_and_accepts_contacts_once,
+        first_agent_enrollment_preserves_existing_blocks,
         request_then_accept_makes_both_sides_accepted,
         crossing_requests_become_accepted,
         only_the_recipient_can_accept_a_request,
@@ -770,4 +771,55 @@ async fn agent_enrollment_projects_users_and_accepts_contacts_once<B: Backend>(b
         world.svc.enroll_agent(owner, owner).await,
         Err(ValidationError::SelfTarget.into())
     );
+}
+
+async fn first_agent_enrollment_preserves_existing_blocks<B: Backend>(backend: &B) {
+    for owner_blocks in [true, false] {
+        let world = World::new(backend).await;
+        let owner = world.person().await;
+        let agent = world.person().await;
+        let (blocker, blocked) = if owner_blocks {
+            (owner.user, agent.user)
+        } else {
+            (agent.user, owner.user)
+        };
+        world.svc.contact_block(blocker, blocked).await.unwrap();
+        world.notifier.take();
+
+        world
+            .svc
+            .enroll_agent(owner.user, agent.user)
+            .await
+            .unwrap();
+        world
+            .svc
+            .enroll_agent(owner.user, agent.user)
+            .await
+            .unwrap();
+        assert_eq!(
+            world.svc.contact_state(blocker, blocked).await.unwrap(),
+            Some(ContactState::Blocked)
+        );
+        assert_eq!(
+            world.svc.contact_state(blocked, blocker).await.unwrap(),
+            None
+        );
+        assert!(world.notifier.take().is_empty());
+        assert!(world.svc.open_direct(blocker, blocked).await.is_err());
+
+        world.svc.contact_unblock(blocker, blocked).await.unwrap();
+        world.notifier.take();
+        world
+            .svc
+            .enroll_agent(owner.user, agent.user)
+            .await
+            .unwrap();
+        for (a, b) in [(blocker, blocked), (blocked, blocker)] {
+            assert_eq!(world.svc.contact_state(a, b).await.unwrap(), None);
+        }
+        assert!(
+            world.notifier.take().is_empty(),
+            "receipt survives the block"
+        );
+    }
 }

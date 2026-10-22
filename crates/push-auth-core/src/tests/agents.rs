@@ -34,6 +34,114 @@ fn principal(object: Uuid) -> Principal {
     }
 }
 
+async fn wait_for_account_waiters(pool: &sqlx::PgPool, count: i64) {
+    use std::time::Duration;
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity \
+                 WHERE datname = current_database() AND wait_event_type = 'Lock' \
+                 AND query LIKE '%auth.user_account%'",
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            if waiting >= count {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("requests reach the account lock");
+}
+
+#[tokio::test]
+async fn profile_patch_losing_to_agent_deletion_preserves_the_tombstone() {
+    let (world, auth, routes, owner) = setup().await;
+    let reservation = auth
+        .reserve_agent(caller(&owner), "profile_agent", "Original")
+        .await
+        .unwrap();
+    let registration = auth
+        .enroll_agent(&principal(Uuid::new_v4()), &reservation.enrollment_code)
+        .await
+        .unwrap();
+    let agent = auth
+        .register_device(
+            &registration.registration.token,
+            Uuid::now_v7(),
+            "Worker",
+            "other",
+        )
+        .await
+        .unwrap();
+    for tokens in [&owner, &agent] {
+        let (status, body) = call(
+            &routes,
+            "PATCH",
+            "/v1/users/me",
+            &tokens.access_token,
+            json!({"display_name":"Enabled"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["display_name"], "Enabled");
+    }
+
+    let mut holder = world.pool.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM auth.user_account WHERE user_id = $1 FOR UPDATE")
+        .bind(agent.user_id)
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+    let deleting = auth.clone();
+    let owner_caller = caller(&owner);
+    let agent_id = agent.user_id;
+    let deletion = tokio::spawn(async move {
+        deleting
+            .change_agent(owner_caller, agent_id, None, None, true)
+            .await
+    });
+    wait_for_account_waiters(&world.pool, 1).await;
+    let patch = tokio::spawn(async move {
+        call(
+            &routes,
+            "PATCH",
+            "/v1/users/me",
+            &agent.access_token,
+            json!({"handle":"stolen_tombstone","display_name":"Changed after deletion"}),
+        )
+        .await
+    });
+    wait_for_account_waiters(&world.pool, 2).await;
+    holder.commit().await.unwrap();
+    let (deleted, patched) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::join!(deletion, patch)
+    })
+    .await
+    .expect("deletion and profile editing finish without a lock cycle");
+    deleted.unwrap().unwrap();
+    let (status, body) = patched.unwrap();
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    let tombstone: (String, String, bool) = sqlx::query_as(
+        "SELECT handle::text, display_name, disabled_at IS NOT NULL \
+         FROM auth.user_account WHERE user_id = $1",
+    )
+    .bind(agent_id)
+    .fetch_one(&world.pool)
+    .await
+    .unwrap();
+    assert_eq!(tombstone, ("profile_agent".into(), "Enabled".into(), true));
+    assert_eq!(
+        auth.reserve_agent(owner_caller, "profile_agent", "Replacement")
+            .await
+            .err(),
+        Some(AuthError::HandleTaken)
+    );
+}
+
 #[tokio::test]
 async fn profile_edit_and_agent_management_do_not_invert_expired_reservation_locks() {
     use std::time::Duration;
@@ -54,41 +162,18 @@ async fn profile_edit_and_agent_management_do_not_invert_expired_reservation_loc
         .execute(&mut *holder)
         .await
         .unwrap();
-    let wait_for_waiters = |count: i64| {
-        let pool = world.pool.clone();
-        async move {
-            tokio::time::timeout(Duration::from_secs(3), async {
-                loop {
-                    let waiting: i64 = sqlx::query_scalar(
-                        "SELECT count(*) FROM pg_stat_activity \
-                         WHERE datname = current_database() AND wait_event_type = 'Lock' \
-                         AND query LIKE '%auth.user_account%'",
-                    )
-                    .fetch_one(&pool)
-                    .await
-                    .unwrap();
-                    if waiting >= count {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            })
-            .await
-            .expect("requests reach the account lock");
-        }
-    };
     // Queue management first so it takes the owner lock before the profile edit.
     let managing = auth.clone();
     let owner_caller = caller(&owner);
     let management = tokio::spawn(async move { managing.owned_agents(owner_caller).await });
-    wait_for_waiters(1).await;
+    wait_for_account_waiters(&world.pool, 1).await;
     let editing = auth.clone();
     let profile = tokio::spawn(async move {
         editing
             .update_profile(owner_caller, Some("Updated"), None)
             .await
     });
-    wait_for_waiters(2).await;
+    wait_for_account_waiters(&world.pool, 2).await;
     holder.commit().await.unwrap();
 
     let (management, profile) = tokio::time::timeout(Duration::from_secs(3), async {
@@ -895,61 +980,123 @@ async fn agent_devices_have_an_independent_limit_session_and_admin_external_sele
 
 #[tokio::test]
 async fn deletion_serializes_with_registration_refresh_and_reauthentication() {
-    let (world, auth, _, owner) = setup().await;
-    let reservation = auth
-        .reserve_agent(caller(&owner), "racing_agent", "Race")
-        .await
-        .unwrap();
-    let app = principal(Uuid::new_v4());
-    let registration = auth
-        .enroll_agent(&app, &reservation.enrollment_code)
-        .await
-        .unwrap();
-    let device = auth
-        .register_device(
-            &registration.registration.token,
-            Uuid::now_v7(),
-            "Worker",
-            "other",
-        )
-        .await
-        .unwrap();
-    let (deleted, registered, refreshed, reauthenticated) = tokio::join!(
-        auth.change_agent(caller(&owner), device.user_id, None, None, true),
-        auth.register_device(
-            &registration.registration.token,
-            Uuid::now_v7(),
-            "Race",
-            "other"
-        ),
-        auth.refresh(&device.refresh_token),
-        auth.sign_in_external_device(&app, None, device.device_id),
-    );
-    deleted.unwrap();
-    for token in [registered, refreshed, reauthenticated]
-        .into_iter()
-        .flatten()
-    {
-        assert!(auth.authenticate(&token.access_token).await.is_err());
-        assert!(auth.refresh(&token.refresh_token).await.is_err());
+    use std::time::Duration;
+
+    for operation in ["registration", "refresh", "reauthentication"] {
+        for deletion_first in [true, false] {
+            let (world, auth, _, owner) = setup().await;
+            let reservation = auth
+                .reserve_agent(caller(&owner), "racing_agent", "Race")
+                .await
+                .unwrap();
+            let app = principal(Uuid::new_v4());
+            let registration = auth
+                .enroll_agent(&app, &reservation.enrollment_code)
+                .await
+                .unwrap();
+            let device = auth
+                .register_device(
+                    &registration.registration.token,
+                    Uuid::now_v7(),
+                    "Worker",
+                    "other",
+                )
+                .await
+                .unwrap();
+            let mut holder = world.pool.begin().await.unwrap();
+            sqlx::query("SELECT 1 FROM auth.user_account WHERE user_id = $1 FOR UPDATE")
+                .bind(device.user_id)
+                .execute(&mut *holder)
+                .await
+                .unwrap();
+
+            let deleting = auth.clone();
+            let owner_caller = caller(&owner);
+            let agent_id = device.user_id;
+            let delete = async move {
+                deleting
+                    .change_agent(owner_caller, agent_id, None, None, true)
+                    .await
+            };
+            let issuing = auth.clone();
+            let app_identity = app.clone();
+            let initial = device.clone();
+            let issue = async move {
+                match operation {
+                    "registration" => {
+                        issuing
+                            .register_device(
+                                &registration.registration.token,
+                                Uuid::now_v7(),
+                                "Race",
+                                "other",
+                            )
+                            .await
+                    }
+                    "refresh" => issuing.refresh(&initial.refresh_token).await,
+                    "reauthentication" => {
+                        issuing
+                            .sign_in_external_device(&app_identity, None, initial.device_id)
+                            .await
+                    }
+                    _ => unreachable!(),
+                }
+            };
+            // Observe each waiter before starting the next, forcing both lock orders.
+            let (deletion, issuance) = if deletion_first {
+                let deletion = tokio::spawn(delete);
+                wait_for_account_waiters(&world.pool, 1).await;
+                let issuance = tokio::spawn(issue);
+                (deletion, issuance)
+            } else {
+                let issuance = tokio::spawn(issue);
+                wait_for_account_waiters(&world.pool, 1).await;
+                let deletion = tokio::spawn(delete);
+                (deletion, issuance)
+            };
+            wait_for_account_waiters(&world.pool, 2).await;
+            holder.commit().await.unwrap();
+            let (deleted, issued) = tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(deletion, issuance)
+            })
+            .await
+            .expect("deletion and token issuance finish without a lock cycle");
+            deleted.unwrap().unwrap();
+            match issued.unwrap() {
+                Ok(tokens) if !deletion_first => {
+                    assert_eq!(
+                        auth.authenticate(&tokens.access_token).await,
+                        Err(AuthError::Unauthorized)
+                    );
+                    assert_eq!(
+                        auth.refresh(&tokens.refresh_token).await,
+                        Err(AuthError::Unauthorized)
+                    );
+                }
+                Err(AuthError::Unauthorized) if deletion_first => {}
+                unexpected => panic!(
+                    "{operation}, deletion_first={deletion_first}: unexpected result {unexpected:?}"
+                ),
+            }
+            let live: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM auth.device WHERE user_id = $1 AND revoked_at IS NULL",
+            )
+            .bind(device.user_id)
+            .fetch_one(&world.pool)
+            .await
+            .unwrap();
+            assert_eq!(live, 0);
+            assert_eq!(
+                auth.enroll_agent(&app, &reservation.enrollment_code)
+                    .await
+                    .err(),
+                Some(AuthError::IdentityInUse)
+            );
+            assert!(
+                auth.reserve_agent(caller(&owner), "replacement_agent", "Replacement")
+                    .await
+                    .is_ok()
+            );
+        }
     }
-    let live: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM auth.device WHERE user_id = $1 AND revoked_at IS NULL",
-    )
-    .bind(device.user_id)
-    .fetch_one(&world.pool)
-    .await
-    .unwrap();
-    assert_eq!(live, 0);
-    assert_eq!(
-        auth.enroll_agent(&app, &reservation.enrollment_code)
-            .await
-            .err(),
-        Some(AuthError::IdentityInUse)
-    );
-    assert!(
-        auth.reserve_agent(caller(&owner), "replacement_agent", "Replacement")
-            .await
-            .is_ok()
-    );
 }
