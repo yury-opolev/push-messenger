@@ -32,7 +32,7 @@ anyhow = "1"
 argon2 = { version = "0.5", features = ["std"] }
 async-trait = "0.1"
 axum = "0.8"
-base64 = "0.22"
+base64 = "0.23"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 hmac = "0.12"
