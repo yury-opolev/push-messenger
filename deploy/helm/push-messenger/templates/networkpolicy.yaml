@@ -105,7 +105,8 @@ datastores (bundled: their pods; external: their CIDRs), HTTPS and extra rules. 
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: {{ include "push.name" $context }}
+  {{- /* Keep the retained hook distinct from the legacy ordinary policy, which Helm deletes on upgrade. */}}
+  name: {{ include "push.name" $context }}{{ if eq .component "migrate" }}-egress{{ end }}
   labels:
     {{- include "push.labels" $context | nindent 4 }}
   {{- if eq .component "migrate" }}

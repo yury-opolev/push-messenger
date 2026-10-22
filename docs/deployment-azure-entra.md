@@ -167,6 +167,9 @@ a namespace default-deny policy. It persists after the Job finishes and is repla
 before the next hook run (`before-hook-creation`, not `hook-succeeded`); the regular
 application policies remain normal release resources. As a Helm hook resource, the
 migration policy may need explicit removal when permanently removing the release.
+The hook is named `<release>-migrate-egress`, distinct from the legacy ordinary
+`<release>-migrate` policy, so Helm's upgrade cleanup can remove the old resource
+without deleting the retained hook. Its migration-pod selector is unchanged.
 
 NetworkPolicies match IP blocks, not names:
 

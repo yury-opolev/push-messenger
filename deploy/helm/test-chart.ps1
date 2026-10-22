@@ -508,12 +508,17 @@ Check 'entra: migration egress policy is a persistent pre-install/pre-upgrade ho
     $validate = @'
 import sys, yaml
 docs = [d for d in yaml.safe_load_all(sys.stdin.read()) if d]
-policy = next(d for d in docs if d["kind"] == "NetworkPolicy" and d["metadata"]["name"] == "push-migrate")
+policies = [d for d in docs if d["kind"] == "NetworkPolicy"]
+assert not any(d["metadata"]["name"] == "push-migrate" for d in policies), "legacy ordinary policy name must not collide with the retained hook during upgrade cleanup"
+policy = next(d for d in policies if d["metadata"]["name"] == "push-migrate-egress")
 job = next(d for d in docs if d["kind"] == "Job" and d["metadata"]["name"] == "push-migrate")
 a = policy["metadata"].get("annotations", {})
 assert a.get("helm.sh/hook") == "pre-install,pre-upgrade", "migration policy must precede ordinary release resources"
+assert job["metadata"]["annotations"]["helm.sh/hook"] == a["helm.sh/hook"], "policy must run on both Job lifecycle events"
 assert int(a["helm.sh/hook-weight"]) < int(job["metadata"]["annotations"]["helm.sh/hook-weight"])
-assert a["helm.sh/hook-delete-policy"] == "before-hook-creation", "policy must persist while Job runs"
+assert a["helm.sh/hook-delete-policy"] == "before-hook-creation", "policy must persist through Job completion and upgrade cleanup"
+assert policy["spec"]["podSelector"] == {"matchLabels": {
+    "app.kubernetes.io/name": "migrate", "app.kubernetes.io/instance": "push"}}, "renaming the policy must preserve the legacy pod selector"
 assert policy["spec"]["podSelector"]["matchLabels"].items() <= job["spec"]["template"]["metadata"]["labels"].items()
 ports = {p["port"] for r in policy["spec"]["egress"] for p in r["ports"]}
 assert ports == {53, 443, 5432}
@@ -708,7 +713,7 @@ expected = {
     "push-message-svc": {("10.1.0.4/32", 5432), ("10.1.0.5/32", 10000), ("20.190.128.0/18", 443)},
     "push-gateway": {("auth", 8080), ("message-svc", 50051), ("10.1.0.5/32", 10000), ("20.190.128.0/18", 443)},
     "push-worker": {("message-svc", 50052), ("10.1.0.4/32", 5432), ("20.190.128.0/18", 443)},
-    "push-migrate": {("10.1.0.4/32", 5432), ("20.190.128.0/18", 443)},
+    "push-migrate-egress": {("10.1.0.4/32", 5432), ("20.190.128.0/18", 443)},
 }
 assert set(policies) == set(expected), sorted(policies)
 for name, wanted in expected.items():
@@ -723,8 +728,8 @@ for name, wanted in expected.items():
                              "podSelector": {"matchLabels": {"k8s-app": "kube-dns"}}}], name
     got = {(peer, port) for r in rules if r not in dns for peer in peers(r) for (_, port) in ports(r)}
     assert got == wanted, (name, got)
-assert policies["push-migrate"]["ingress"] == []
-assert policies["push-migrate"]["podSelector"]["matchLabels"]["app.kubernetes.io/name"] == "migrate"
+assert policies["push-migrate-egress"]["ingress"] == []
+assert policies["push-migrate-egress"]["podSelector"]["matchLabels"]["app.kubernetes.io/name"] == "migrate"
 '@
     $rendered | & $python.Source -c $egress; $LASTEXITCODE -eq 0
 }

@@ -81,7 +81,7 @@ fn classify(error: ApiError) -> Failure {
         ApiError::Rejected { status: 401, .. } => {
             Failure::Account("invalid_credentials: password or Entra token was refused".to_owned())
         }
-        ApiError::Rejected { status: 403, .. } => {
+        ApiError::Rejected { status: 403, code } if code == "email_not_verified" => {
             Failure::Account("email_not_verified: verify the account before using it".to_owned())
         }
         ApiError::Rejected { status: 409, .. } => Failure::Account(
@@ -527,6 +527,33 @@ mod operator_tests {
     use super::*;
     use axum::{Json, Router, extract::Request, routing::post};
     use serde_json::{Value, json};
+
+    #[test]
+    fn password_email_not_verified_keeps_verification_advice() {
+        let failure = classify(ApiError::Rejected {
+            status: 403,
+            code: "email_not_verified".to_owned(),
+        });
+        assert!(matches!(
+            failure,
+            Failure::Account(message)
+                if message == "email_not_verified: verify the account before using it"
+        ));
+    }
+
+    #[test]
+    fn forbidden_codes_do_not_imply_unverified_email() {
+        for code in ["sign_in_not_permitted", "request_refused"] {
+            let failure = classify(ApiError::Rejected {
+                status: 403,
+                code: code.to_owned(),
+            });
+            assert!(
+                matches!(failure, Failure::Account(message) if message == format!("{code} (HTTP 403)")),
+                "{code} must not be reported as email_not_verified"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn server_account_aliases_are_refused_before_pairing() {
