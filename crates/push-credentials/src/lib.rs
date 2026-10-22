@@ -3,7 +3,11 @@
 //! refreshed before they expire and handed to PostgreSQL (by `push-store`) and Redis (by
 //! [`RedisConnector`]). Tokens are fetched with plain OAuth 2.0 requests over rustls: no
 //! Azure SDK and no OpenSSL. Tokens and assertions are never logged.
+//!
+//! [`application_secret`] separately supports startup-only mounted application keys;
+//! it does not change datastore authentication or identity-token refresh.
 
+mod application;
 mod azure;
 mod mode;
 mod redis_connect;
@@ -19,6 +23,7 @@ pub mod testing;
 #[cfg(test)]
 mod tests;
 
+pub use application::{application_secret, required_application_secret};
 pub use azure::{
     AzureConfig, DEFAULT_AUTHORITY_HOST, IMDS_ENDPOINT, ManagedIdentity, WorkloadIdentity,
 };

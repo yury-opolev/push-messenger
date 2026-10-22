@@ -82,6 +82,10 @@ pub trait Tx: Send {
 
     /// Records a verified user. Idempotent.
     async fn insert_user(&mut self, user: UserId) -> DomainResult<()>;
+    /// Records the immutable owner once. Returns true only on the first enrollment;
+    /// replay must not restore contacts subsequently blocked by either party.
+    /// Both users must exist; a different existing owner is a storage error.
+    async fn record_agent_owner(&mut self, agent: UserId, owner: UserId) -> DomainResult<bool>;
     async fn user_exists(&mut self, user: UserId) -> DomainResult<bool>;
     /// Records that `user`'s password was reset at `at`, keeping the latest time, and
     /// returns the time kept. The user must exist.

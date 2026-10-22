@@ -69,7 +69,8 @@ impl Auth {
     /// sign-in, and a registration token bound to the identity and to the end of the
     /// session it starts. `handle` names a new account (it is ignored afterwards); without
     /// it a random `u…` handle is chosen. `Unauthorized` unless the principal's provider is
-    /// offered and the principal keeps the rules.
+    /// offered and the principal keeps the rules. `entra-app` is linked-only: an
+    /// unlinked principal is refused before any account insertion.
     pub async fn sign_in_external(
         &self,
         principal: &Principal,
@@ -77,6 +78,8 @@ impl Auth {
     ) -> Result<ExternalRegistration, AuthError> {
         let (principal, max_session) = self.offered(principal)?;
         let account = self.external_account(&principal, handle).await?;
+        let mut tx = self.pool.begin().await?;
+        self.lock_enabled_account(&mut tx, account.user_id).await?;
         let now = unix_now();
         let token = self.links.sign(&LinkClaims {
             sub: account.user_id,
@@ -87,6 +90,7 @@ impl Auth {
             xid: Some(account.identity_id),
             sx: Some(now + max_session),
         });
+        tx.commit().await?;
         Ok(ExternalRegistration {
             user_id: account.user_id,
             registration: RegistrationToken {
@@ -108,7 +112,8 @@ impl Auth {
         let account = self.external_account(&principal, handle).await?;
         let session = Some(unix_now() + max_session);
         let mut tx = self.pool.begin().await?;
-        // Locks the device row first, like every change to a device's tokens.
+        self.lock_enabled_account(&mut tx, account.user_id).await?;
+        // The account lock serializes disabling; the device lock orders token changes.
         let active = sqlx::query(
             "SELECT 1 FROM auth.device WHERE device_id = $1 AND user_id = $2 \
              AND revoked_at IS NULL FOR UPDATE",
@@ -185,6 +190,14 @@ impl Auth {
         &self,
         principal: &Principal,
     ) -> Result<Option<ExternalAccount>, AuthError> {
+        let disabled: Option<bool> = sqlx::query_scalar(
+            "SELECT a.disabled_at IS NOT NULL FROM auth.external_identity e \
+             JOIN auth.user_account a USING (user_id) WHERE e.provider = $1 AND e.issuer = $2 AND e.subject = $3",
+        ).bind(&principal.provider).bind(&principal.issuer).bind(&principal.subject)
+            .fetch_optional(&self.pool).await?;
+        if disabled == Some(true) {
+            return Err(AuthError::SignInNotPermitted);
+        }
         let row = sqlx::query(
             "UPDATE auth.external_identity SET last_sign_in_at = now(), email = $4 \
              WHERE provider = $1 AND issuer = $2 AND subject = $3 \
@@ -209,8 +222,13 @@ impl Auth {
         principal: &Principal,
         handle: Option<&str>,
     ) -> Result<Option<ExternalAccount>, AuthError> {
+        // App identities must be bound by enrollment, never by first sign-in.
+        if principal.provider == crate::identity::ENTRA_APP_PROVIDER {
+            return Err(crate::identity::not_permitted(principal));
+        }
         let requested = handle.map(rules::handle).transpose()?;
         let user_id = Uuid::now_v7();
+        crate::agents::expire(&self.pool).await?;
         let mut tx = self.pool.begin().await?;
         let mut created = false;
         for _ in 0..HANDLE_ATTEMPTS {

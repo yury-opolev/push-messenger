@@ -105,6 +105,28 @@ fn read_all<T>(
 
 #[async_trait]
 impl Tx for PgTx {
+    async fn record_agent_owner(&mut self, agent: UserId, owner: UserId) -> DomainResult<bool> {
+        let inserted = sqlx::query(
+            "INSERT INTO messaging.agent_owner (agent_user_id, owner_user_id) VALUES ($1, $2) \
+             ON CONFLICT DO NOTHING RETURNING 1",
+        )
+        .bind(agent.0)
+        .bind(owner.0)
+        .fetch_optional(self.conn())
+        .await
+        .map_err(store_error)?;
+        let existing: Uuid = sqlx::query_scalar(
+            "SELECT owner_user_id FROM messaging.agent_owner WHERE agent_user_id = $1",
+        )
+        .bind(agent.0)
+        .fetch_one(self.conn())
+        .await
+        .map_err(store_error)?;
+        if existing != owner.0 {
+            return Err(DomainError::Store("agent owner mismatch".into()));
+        }
+        Ok(inserted.is_some())
+    }
     async fn commit(self) -> DomainResult<()> {
         self.tx.commit().await.map_err(store_error)
     }

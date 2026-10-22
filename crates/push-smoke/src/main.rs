@@ -19,7 +19,37 @@ async fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let target = match Target::parse(args, |name| std::env::var(name).ok()) {
+    let entra_accounts = match take_flag(&mut args, "--entra-accounts") {
+        Ok(path) => path
+            .or_else(|| std::env::var("PUSH_SMOKE_ENTRA_ACCOUNTS").ok())
+            .filter(|path| !path.is_empty()),
+        Err(message) => {
+            eprintln!("{message}");
+            return ExitCode::from(2);
+        }
+    };
+    if entra_accounts.is_some() && entra_token_url.is_some() {
+        eprintln!(
+            "--entra-accounts and --entra-token-url (including environment settings) are mutually exclusive"
+        );
+        return ExitCode::from(2);
+    }
+    let accounts = match entra_accounts {
+        Some(path) => match push_load::accounts::read(std::path::Path::new(&path)) {
+            Ok(accounts) => Some(accounts),
+            Err(error) => {
+                eprintln!("smoke: invalid accounts: {error}");
+                return ExitCode::from(2);
+            }
+        },
+        None => None,
+    };
+    let parse = if accounts.is_some() || entra_token_url.is_some() {
+        Target::parse_entra
+    } else {
+        Target::parse
+    };
+    let target = match parse(args, |name: &str| std::env::var(name).ok()) {
         Ok(target) => target,
         Err(message) => {
             eprintln!("{message}");
@@ -27,9 +57,10 @@ async fn main() -> ExitCode {
         }
     };
     let smoke = async {
-        match &entra_token_url {
-            Some(url) => push_smoke::entra::run(&target, url).await,
-            None => run(&target).await,
+        match (&accounts, &entra_token_url) {
+            (Some(accounts), None) => push_smoke::entra::run_accounts(&target, accounts).await,
+            (None, Some(url)) => push_smoke::entra::run(&target, url).await,
+            _ => run(&target).await,
         }
     };
     match tokio::time::timeout(TOTAL_TIMEOUT, smoke).await {
@@ -51,7 +82,10 @@ fn take_flag(args: &mut Vec<String>, flag: &str) -> Result<Option<String>, Strin
         return Ok(None);
     };
     args.remove(index);
-    if index < args.len() {
+    if args.iter().any(|arg| arg == flag) {
+        return Err(format!("{flag} may only appear once"));
+    }
+    if index < args.len() && !args[index].starts_with("--") && !args[index].trim().is_empty() {
         Ok(Some(args.remove(index)))
     } else {
         Err(format!("{flag} needs a value"))

@@ -16,14 +16,50 @@ expiry (at 75% of the lifetime). No datastore password exists anywhere: not in v
 not in a Secret, not in an environment variable. Each workload gets its own
 ServiceAccount, so each can have its own identity.
 
-The application keys still come from the Secret (chart-managed or
-`secrets.existingSecret`): `auth-signing-key`, `auth-link-key`, the three internal API
-tokens and, with Resend, `resend-api-key` and `resend-webhook-secret`. The database and
-Redis keys of that Secret are then unused and not rendered.
+The application keys come from a Secret (chart-managed or `secrets.existingSecret`)
+by default: `auth-signing-key`, `auth-link-key`, the three internal API tokens,
+`auth-admin-token` when enabled and, with Resend, `resend-api-key` and
+`resend-webhook-secret`. Alternatively, `secrets.volume` mounts consumer-delivered
+files (for example Secrets Store CSI with a `SecretProviderClass`, **without Secret
+sync**): see [mounted application keys](deployment-configuration.md#consumer-mounted-application-keys-csi-without-secret-sync)
+for the complete values, filenames and Azure CSI example. With external Entra
+datastores and mounted application keys the chart renders no credential Secret.
+Each workload mounts only its consumed files through read-only `subPath` binds.
+CSI rotation updates do not propagate to existing binds, and files load at startup
+only: rotate by coordinating the backing values and rolling out their consumers.
+Datastore tokens still refresh independently.
 
 The chart provisions nothing outside the release namespace: the Azure resources,
 identities, federated credentials, role assignments, private endpoints and DNS below are
 the consumer's.
+
+### Application agents (separate from datastore identities)
+
+For user-owned app agents, enable `auth.signIn.providers: entra,entra-app` (or
+`password,entra-app`) with explicit `auth.signIn.entra.tenants` and the API audience.
+`auth.agentsPerUser` defaults to two active/unexpired pending agents per human (zero
+disables reservation and redemption, not existing agent sign-in);
+`auth.signIn.entraApp.maxSessionHours` defaults to 24.
+The optional `requiredRole` and `allowedClientApps` are independent of delegated policy.
+Normal self-service `POST /v1/agents` needs only the human's messenger device bearer token,
+not an additional delegated permission. If required, define an Agent application role
+with `allowedMemberTypes: ["Application"]`; assignment requires administrator approval.
+Managed identities and federated app workloads request
+`api://<API application client ID>/.default` (not the datastore scopes).
+
+Follow [enrollment and management](entra-sign-in.md#enroll-and-operate-an-agent):
+the owner reserves a handle/display name and receives a single-use ten-minute code;
+the workload redeems it with its verified app-only token, then uses normal device,
+refresh and socket APIs as a separate account. Entra owners must match the app tenant;
+password/custom-provider owners need exactly one explicit allowed tenant. Profiles
+identify `kind:"agent"` and `owner_user_id`. Owner/agent accepted contacts and device
+readiness arrive through the durable worker relay, usually about a second later.
+Owner deletion permanently disables the app binding, revokes its tokens/devices,
+closes sockets with 4003 through that relay, frees its slot, and retains message history.
+No cloud application, role assignment or credential is created by enrollment.
+Apply the additive auth/messaging migrations and upgrade message-svc and the worker
+before enabling agent enrollment on auth-svc: older workers do not understand the new
+`agent.enrolled` event. This is especially important for rolling upgrades.
 
 ## 2. Azure prerequisites (consumer-owned)
 
@@ -49,10 +85,22 @@ SELECT * FROM pgaadauth_create_principal('push-migrator-id', false, false);
 SELECT * FROM pgaadauth_create_principal('push-auth-id', false, false);
 SELECT * FROM pgaadauth_create_principal('push-message-svc-id', false, false);
 SELECT * FROM pgaadauth_create_principal('push-worker-id', false, false);
+-- PostgreSQL 16+ requires membership before assigning another role as database owner.
+GRANT "push-migrator-id" TO CURRENT_USER;
 CREATE DATABASE push_auth OWNER "push-migrator-id";
 CREATE DATABASE push_messaging OWNER "push-migrator-id";
 CREATE DATABASE push_worker OWNER "push-migrator-id";
 ```
+
+Then, still as the **Entra administrator**, connect to **each** of `push_auth`,
+`push_messaging` and `push_worker` and run:
+
+```sql
+GRANT USAGE, CREATE ON SCHEMA public TO "push-migrator-id";
+```
+
+These are per-database schema privileges, not a grant on the `postgres` database.
+They let the migration identity create the SQLx migration table in `public`.
 
 Two models:
 
@@ -149,8 +197,15 @@ release's own peers (gateway to auth-svc and message-svc, auth-svc and the worke
 message-svc), the datastores, HTTPS (443) to `httpsCidrs` and any raw rules in `extra`.
 The bundled datastores, when enabled, are reached by their pod labels and get
 `egress: []` themselves. With the migration Job the chart adds a policy for the Job's
-pod (DNS, PostgreSQL, HTTPS); it takes effect from the first upgrade, since a
-pre-install hook runs before the release's policies exist.
+pod (DNS, PostgreSQL, HTTPS). That migrate-only policy is a `pre-install,pre-upgrade`
+hook with a lower weight than the Job, so it exists even on the first install under
+a namespace default-deny policy. It persists after the Job finishes and is replaced
+before the next hook run (`before-hook-creation`, not `hook-succeeded`); the regular
+application policies remain normal release resources. As a Helm hook resource, the
+migration policy may need explicit removal when permanently removing the release.
+The hook is named `<release>-migrate-egress`, distinct from the legacy ordinary
+`<release>-migrate` policy, so Helm's upgrade cleanup can remove the old resource
+without deleting the retained hook. Its migration-pod selector is unchanged.
 
 NetworkPolicies match IP blocks, not names:
 
@@ -199,8 +254,9 @@ Token scopes: PostgreSQL `https://ossrdbms-aad.database.windows.net/.default`, R
    application keys of section 1 (no `*database*`, `redis*` or `*password*` key), and no
    container has a `PUSH_DATABASE_URL`, `PUSH_AUTH_DATABASE_URL` or a `PUSH_REDIS_URL`
    with credentials.
-3. Run your own probes, or `helm test` with the DEV ONLY smoke test in an isolated
-   namespace that may use dev mode (never in production).
+3. Run the [operator Entra smoke test](consumer-verification.md#operator-entra-smoke-test)
+   with two dedicated preexisting identities, or your own probes. Run the DEV ONLY
+   smoke test only in an isolated namespace that may use dev mode (never in production).
 4. Keep traffic running for at least 3 hours, several token lifetimes, with
    `push-load` ([consumer verification](consumer-verification.md)): no failed requests,
    no dropped WebSocket sessions and no lost messages.

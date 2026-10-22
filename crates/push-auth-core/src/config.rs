@@ -1,4 +1,7 @@
 //! Configuration from environment variables.
+//!
+//! Application keys also accept `_FILE` alternatives, read once at startup through
+//! `push_credentials`; see `docs/deployment-configuration.md` for formats and rotation.
 
 use std::net::SocketAddr;
 
@@ -9,7 +12,7 @@ use push_credentials::{AuthMode, AzureConfig, ConfigProblem, RedisTarget, azure_
 use push_store::{DatabaseTarget, DatabaseVars, StoreOptions, postgres_auth};
 
 use crate::db::is_role_name;
-use crate::entra::{EntraSettings, Providers};
+use crate::entra::{EntraAppSettings, EntraSettings, Providers};
 
 /// How the service runs. Read from the environment by [`Config::from_env`]:
 ///
@@ -36,14 +39,18 @@ use crate::entra::{EntraSettings, Providers};
 /// | `PUSH_AUTH_WORKER_ROLE` | role the worker connects as: granted the outbox and the cleanups at start-up (or by `migrate`); a plain role name, or an Entra principal name in Entra mode | none |
 /// | `PUSH_MESSAGE_SVC_URL` | Directory gRPC URL of message-svc, `http://host:50053` (plain `http://` only), asked whose profiles a caller may see; without it `GET /v1/users` answers 503 | none |
 /// | `PUSH_DIRECTORY_TOKEN` | the token message-svc requires for its `Directory` API, 32 to 256 visible ASCII characters; required with `PUSH_MESSAGE_SVC_URL` | none |
-/// | `PUSH_AUTH_PROVIDERS` | `password`, `entra`, `external`, comma-separated (spec 2026-10-19); `external` is the authenticator a binary of one's own passes to `serve_with`, and reads no `PUSH_ENTRA_*` | `password` |
-/// | `PUSH_ENTRA_CLIENT_ID` | accepted audiences: the API registration's application id, optionally with its `api://` URI | required with `entra` |
-/// | `PUSH_ENTRA_ALLOWED_TENANTS` | exactly one of `common`, `organizations`, `consumers`, or tenant ids (GUIDs), comma-separated; never mixed | required with `entra` |
+/// | `PUSH_AUTH_PROVIDERS` | `password`, `entra`, `entra-app`, `external`, comma-separated; `external` is the authenticator a binary of one's own passes to `serve_with`, and reads no `PUSH_ENTRA_*` | `password` |
+/// | `PUSH_ENTRA_CLIENT_ID` | accepted audiences: the API registration's application id, optionally with its `api://` URI | required with `entra` or `entra-app` |
+/// | `PUSH_ENTRA_ALLOWED_TENANTS` | exactly one of `common`, `organizations`, `consumers`, or tenant ids (GUIDs), comma-separated; `entra-app` requires explicit tenant GUIDs | required with either Entra provider |
 /// | `PUSH_ENTRA_AUTHORITY_HOST` | the Entra ID host; `http://` only for loopback (tests) | `https://login.microsoftonline.com/` |
 /// | `PUSH_ENTRA_REQUIRED_SCOPE` | the delegated scope `scp` must contain; `*` for any | `access_as_user` |
 /// | `PUSH_ENTRA_REQUIRED_ROLE` | an app role `roles` must contain | none |
 /// | `PUSH_ENTRA_ALLOWED_CLIENT_APPS` | client app ids allowed in `azp` | any |
 /// | `PUSH_ENTRA_MAX_SESSION_HOURS` | maximum session age of an Entra-backed device, 1 to 720 | `24` |
+/// | `PUSH_ENTRA_APP_REQUIRED_ROLE` | app-only role, independent of delegated-user policy | none |
+/// | `PUSH_ENTRA_APP_ALLOWED_CLIENT_APPS` | app-only client ids (`azp`), comma-separated | any valid client id |
+/// | `PUSH_ENTRA_APP_MAX_SESSION_HOURS` | app-only maximum session age, 1 to 720 | `24` |
+/// | `PUSH_AGENTS_PER_USER` | active + unexpired pending agents per human owner, 0 to 100; 0 disables reservation/redemption | `2` |
 /// | `PUSH_AUTH_ADMIN_TOKEN` | the admin API's bearer token, 32 to 256 visible ASCII characters; unset: no admin listener (spec 2026-10-19 D15) | none |
 /// | `PUSH_AUTH_ADMIN_ADDR` | address of the admin listener; never expose it publicly | `0.0.0.0:8082` |
 ///
@@ -71,8 +78,12 @@ pub struct Config {
     pub directory_token: Option<String>,
     /// The ways to sign in.
     pub providers: Providers,
-    /// How Entra ID tokens are checked, when `entra` is a provider.
+    /// Common Entra token settings for either provider; delegated policy is used only by `entra`.
     pub entra: Option<EntraSettings>,
+    /// App-only sign-in policy, read only with explicit `entra-app` opt-in.
+    pub entra_app: Option<EntraAppSettings>,
+    /// Maximum active + unexpired pending agents per human owner (0 disables enrollment).
+    pub agents_per_user: u32,
     /// The admin API's bearer token; without it there is no admin listener.
     pub admin_token: Option<String>,
     /// Where the admin listener listens.
@@ -105,6 +116,8 @@ impl std::fmt::Debug for Config {
             )
             .field("providers", &self.providers)
             .field("entra", &self.entra)
+            .field("entra_app", &self.entra_app)
+            .field("agents_per_user", &self.agents_per_user)
             .field(
                 "admin_token",
                 &self.admin_token.as_ref().map(|_| "<redacted>"),
@@ -168,14 +181,22 @@ impl Config {
             value: token_audience.clone(),
             reason,
         })?;
-        let signing_key = key(&required("PUSH_AUTH_SIGNING_KEY")?, "PUSH_AUTH_SIGNING_KEY")?;
+        let signing_key = key(
+            &push_credentials::required_application_secret(&lookup, "PUSH_AUTH_SIGNING_KEY")
+                .map_err(problem)?,
+            "PUSH_AUTH_SIGNING_KEY",
+        )?;
         if signing_key.len() != 32 {
             return Err(redacted(
                 "PUSH_AUTH_SIGNING_KEY",
                 "must be base64 of a 32-byte Ed25519 seed".to_owned(),
             ));
         }
-        let link_key = key(&required("PUSH_AUTH_LINK_KEY")?, "PUSH_AUTH_LINK_KEY")?;
+        let link_key = key(
+            &push_credentials::required_application_secret(&lookup, "PUSH_AUTH_LINK_KEY")
+                .map_err(problem)?,
+            "PUSH_AUTH_LINK_KEY",
+        )?;
         if link_key.len() < 32 {
             return Err(redacted(
                 "PUSH_AUTH_LINK_KEY",
@@ -214,7 +235,8 @@ impl Config {
                 });
             }
         }
-        let directory_token = lookup("PUSH_DIRECTORY_TOKEN").filter(|v| !v.is_empty());
+        let directory_token = push_credentials::application_secret(&lookup, "PUSH_DIRECTORY_TOKEN")
+            .map_err(problem)?;
         match (&message_svc_url, &directory_token) {
             (Some(_), None) => return Err(ConfigError::Missing("PUSH_DIRECTORY_TOKEN")),
             (None, Some(_)) => return Err(ConfigError::Missing("PUSH_MESSAGE_SVC_URL")),
@@ -237,12 +259,50 @@ impl Config {
             }
         })?;
         // The PUSH_ENTRA_* variables are read only with the provider.
-        let entra = if providers.entra {
-            Some(EntraSettings::from_lookup(lookup_dyn)?)
+        let entra = if providers.entra || providers.entra_app {
+            Some(EntraSettings::from_lookup(&|name| {
+                if !providers.entra {
+                    match name {
+                        "PUSH_ENTRA_REQUIRED_SCOPE" => return Some("*".to_owned()),
+                        "PUSH_ENTRA_REQUIRED_ROLE"
+                        | "PUSH_ENTRA_ALLOWED_CLIENT_APPS"
+                        | "PUSH_ENTRA_MAX_SESSION_HOURS" => return None,
+                        _ => {}
+                    }
+                }
+                lookup_dyn(name)
+            })?)
         } else {
             None
         };
-        let admin_token = lookup("PUSH_AUTH_ADMIN_TOKEN").filter(|v| !v.is_empty());
+        let entra_app = if providers.entra_app {
+            if !matches!(
+                entra.as_ref().map(|settings| &settings.tenants),
+                Some(crate::entra::Tenants::Ids(_))
+            ) {
+                return Err(ConfigError::Invalid {
+                    name: "PUSH_ENTRA_ALLOWED_TENANTS",
+                    value: lookup("PUSH_ENTRA_ALLOWED_TENANTS").unwrap_or_default(),
+                    reason: "entra-app requires an explicit list of tenant GUIDs".to_owned(),
+                });
+            }
+            Some(EntraAppSettings::from_lookup(lookup_dyn)?)
+        } else {
+            None
+        };
+        let agents_value = lookup("PUSH_AGENTS_PER_USER").unwrap_or_else(|| "2".to_owned());
+        let agents_per_user = agents_value
+            .trim()
+            .parse::<u32>()
+            .ok()
+            .filter(|count| *count <= 100)
+            .ok_or_else(|| ConfigError::Invalid {
+                name: "PUSH_AGENTS_PER_USER",
+                value: agents_value,
+                reason: "use a whole number from 0 to 100".to_owned(),
+            })?;
+        let admin_token = push_credentials::application_secret(&lookup, "PUSH_AUTH_ADMIN_TOKEN")
+            .map_err(problem)?;
         if let Some(token) = &admin_token {
             if !((32..=256).contains(&token.len()) && token.bytes().all(|b| b.is_ascii_graphic())) {
                 return Err(redacted(
@@ -271,6 +331,8 @@ impl Config {
             directory_token,
             providers,
             entra,
+            entra_app,
+            agents_per_user,
             admin_token,
             admin_addr: parsed(&lookup, "PUSH_AUTH_ADMIN_ADDR", ([0, 0, 0, 0], 8082).into())?,
         })
@@ -511,6 +573,60 @@ mod tests {
     }
 
     #[test]
+    fn mounted_application_keys_match_direct_values_and_fail_closed() {
+        let directory = std::path::PathBuf::from("target")
+            .join(format!("auth-mounted-keys-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("key");
+        let path_text = path.to_str().unwrap();
+        for (name, value) in [
+            ("PUSH_AUTH_SIGNING_KEY", SIGNING_KEY),
+            ("PUSH_AUTH_LINK_KEY", LINK_KEY),
+            (
+                "PUSH_DIRECTORY_TOKEN",
+                "directory-token-of-the-config-tests",
+            ),
+            (
+                "PUSH_AUTH_ADMIN_TOKEN",
+                "admin-token-of-the-configuration-tests",
+            ),
+        ] {
+            let mut direct = REQUIRED.to_vec();
+            direct.retain(|(key, _)| *key != name);
+            direct.push((name, value));
+            if name == "PUSH_DIRECTORY_TOKEN" {
+                direct.push(("PUSH_MESSAGE_SVC_URL", "http://message:50053"));
+            }
+            let expected = config(&direct).unwrap();
+            let file_name = format!("{name}_FILE");
+            let mut mounted = direct.clone();
+            mounted.retain(|(key, _)| *key != name);
+            mounted.push((&file_name, path_text));
+            std::fs::write(&path, format!("{value}\r\n")).unwrap();
+            assert_eq!(config(&mounted).unwrap(), expected, "{name}");
+            mounted.push((name, value));
+            let error = config(&mounted).unwrap_err();
+            assert!(!format!("{error:?} {error}").contains(value));
+            mounted.pop();
+            for content in ["", "\r\n", "sensitive-invalid-content", " leading-space\n"] {
+                std::fs::write(&path, content).unwrap();
+                let error = config(&mounted).unwrap_err();
+                assert!(!format!("{error:?} {error}").contains("sensitive-invalid-content"));
+            }
+            std::fs::remove_file(&path).unwrap();
+            assert!(config(&mounted).is_err(), "missing {name} file");
+            std::fs::create_dir(&path).unwrap();
+            assert!(config(&mounted).is_err(), "unreadable {name} directory");
+            std::fs::remove_dir(&path).unwrap();
+            std::fs::write(&path, [0xff, 0xfe]).unwrap();
+            assert!(config(&mounted).is_err(), "invalid UTF-8");
+            std::fs::remove_file(&path).unwrap();
+        }
+        std::fs::remove_dir(&directory).unwrap();
+        assert!(config(&REQUIRED).unwrap().admin_token.is_none());
+    }
+
+    #[test]
     fn every_required_variable_is_required() {
         for (index, (name, _)) in REQUIRED.iter().enumerate() {
             let mut variables = REQUIRED.to_vec();
@@ -692,6 +808,76 @@ mod tests {
     }
 
     #[test]
+    fn app_sign_in_is_explicit_and_requires_bounded_tenants() {
+        assert!(Providers::parse(Some("entra-app")).is_ok());
+        let mut variables = REQUIRED.to_vec();
+        variables.extend([
+            ("PUSH_AUTH_PROVIDERS", "entra-app"),
+            (
+                "PUSH_ENTRA_CLIENT_ID",
+                "11111111-0000-4000-8000-000000000001",
+            ),
+            (
+                "PUSH_ENTRA_ALLOWED_TENANTS",
+                "33333333-0000-4000-8000-000000000003",
+            ),
+        ]);
+        assert!(config(&variables).is_ok());
+        let configured = config(&variables).unwrap();
+        assert!(!configured.providers.entra);
+        assert!(configured.providers.entra_app);
+        assert_eq!(configured.agents_per_user, 2);
+        assert_eq!(configured.entra_app, Some(EntraAppSettings::default()));
+        let mut policies = variables.clone();
+        policies.extend([
+            ("PUSH_ENTRA_REQUIRED_SCOPE", "bad user scope ignored"),
+            ("PUSH_ENTRA_REQUIRED_ROLE", "bad user role ignored"),
+            ("PUSH_ENTRA_ALLOWED_CLIENT_APPS", "bad user client ignored"),
+            ("PUSH_ENTRA_MAX_SESSION_HOURS", "bad user hours ignored"),
+            ("PUSH_ENTRA_APP_REQUIRED_ROLE", "Agent.Run"),
+            (
+                "PUSH_ENTRA_APP_ALLOWED_CLIENT_APPS",
+                "22222222-0000-4000-8000-000000000002",
+            ),
+            ("PUSH_ENTRA_APP_MAX_SESSION_HOURS", "720"),
+            ("PUSH_AGENTS_PER_USER", "0"),
+        ]);
+        let configured = config(&policies).unwrap();
+        let app = configured.entra_app.unwrap();
+        assert_eq!(app.required_role.as_deref(), Some("Agent.Run"));
+        assert_eq!(app.client_apps.len(), 1);
+        assert_eq!(app.max_session, std::time::Duration::from_secs(720 * 3600));
+        assert_eq!(configured.agents_per_user, 0);
+        assert_eq!(config(&REQUIRED).unwrap().entra_app, None);
+        assert!(
+            config(&with(
+                "PUSH_ENTRA_APP_MAX_SESSION_HOURS",
+                "invalid but disabled"
+            ))
+            .is_ok()
+        );
+        for tenants in ["common", "organizations", "consumers"] {
+            let mut unrestricted = variables.clone();
+            unrestricted.retain(|(key, _)| *key != "PUSH_ENTRA_ALLOWED_TENANTS");
+            unrestricted.push(("PUSH_ENTRA_ALLOWED_TENANTS", tenants));
+            assert!(config(&unrestricted).is_err());
+        }
+        for (key, bad) in [
+            ("PUSH_ENTRA_APP_MAX_SESSION_HOURS", "0"),
+            ("PUSH_ENTRA_APP_MAX_SESSION_HOURS", "721"),
+            ("PUSH_ENTRA_APP_MAX_SESSION_HOURS", "1.5"),
+            ("PUSH_ENTRA_APP_ALLOWED_CLIENT_APPS", "not-a-guid"),
+            ("PUSH_ENTRA_APP_REQUIRED_ROLE", "two roles"),
+            ("PUSH_AGENTS_PER_USER", "-1"),
+            ("PUSH_AGENTS_PER_USER", "101"),
+        ] {
+            let mut invalid = variables.clone();
+            invalid.push((key, bad));
+            assert!(config(&invalid).is_err(), "{key}");
+        }
+    }
+
+    #[test]
     fn sign_in_is_email_and_password_unless_entra_is_chosen() {
         let default = config(&REQUIRED).unwrap();
         assert_eq!(
@@ -699,6 +885,7 @@ mod tests {
             Providers {
                 password: true,
                 entra: false,
+                entra_app: false,
                 external: false
             }
         );
@@ -723,6 +910,7 @@ mod tests {
             Providers {
                 password: false,
                 entra: true,
+                entra_app: false,
                 external: false
             }
         );
@@ -757,6 +945,7 @@ mod tests {
             Providers {
                 password: false,
                 entra: false,
+                entra_app: false,
                 external: true
             }
         );

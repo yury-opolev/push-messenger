@@ -1,4 +1,6 @@
 //! Configuration from environment variables.
+//!
+//! Accounts and Resend keys also accept `_FILE` alternatives, read once at startup.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -173,7 +175,9 @@ impl Config {
                     .to_owned(),
             });
         }
-        let accounts_token = required("PUSH_ACCOUNTS_TOKEN")?;
+        let accounts_token =
+            push_credentials::required_application_secret(&lookup, "PUSH_ACCOUNTS_TOKEN")
+                .map_err(problem)?;
         if !((32..=256).contains(&accounts_token.len())
             && accounts_token.bytes().all(|byte| byte.is_ascii_graphic()))
         {
@@ -182,6 +186,8 @@ impl Config {
                 "use 32 to 256 visible ASCII characters".to_owned(),
             ));
         }
+        let resend_api_key = push_credentials::application_secret(&lookup, "PUSH_RESEND_API_KEY")
+            .map_err(problem)?;
         let sender = match set("PUSH_EMAIL_SENDER").as_deref() {
             None | Some("log") => Sender::Log,
             Some("none") => Sender::Off,
@@ -199,7 +205,7 @@ impl Config {
                 }
                 Sender::Resend {
                     api_url,
-                    api_key: required("PUSH_RESEND_API_KEY")?,
+                    api_key: resend_api_key.ok_or(ConfigError::Missing("PUSH_RESEND_API_KEY"))?,
                 }
             }
             Some(other) => {
@@ -232,7 +238,9 @@ impl Config {
                     .to_owned(),
             });
         }
-        let webhook_secret = set("PUSH_RESEND_WEBHOOK_SECRET");
+        let webhook_secret =
+            push_credentials::application_secret(&lookup, "PUSH_RESEND_WEBHOOK_SECRET")
+                .map_err(problem)?;
         if let Some(secret) = &webhook_secret {
             push_email::ResendWebhooks::new(secret)
                 .map_err(|reason| redacted("PUSH_RESEND_WEBHOOK_SECRET", reason))?;
@@ -426,6 +434,47 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+
+    #[test]
+    fn mounted_application_keys_match_direct_configuration() {
+        let directory = std::path::PathBuf::from("target")
+            .join(format!("worker-mounted-keys-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("key");
+        for (name, value) in [
+            ("PUSH_ACCOUNTS_TOKEN", TOKEN),
+            ("PUSH_RESEND_API_KEY", "resend-api-key-of-the-config-tests"),
+            ("PUSH_RESEND_WEBHOOK_SECRET", SECRET),
+        ] {
+            let mut direct = with(&[
+                ("PUSH_EMAIL_SENDER", "resend"),
+                ("PUSH_EMAIL_FROM", "Push <no-reply@example.test>"),
+                ("PUSH_RESEND_API_KEY", "resend-api-key-of-the-config-tests"),
+                ("PUSH_RESEND_WEBHOOK_SECRET", SECRET),
+            ]);
+            direct.retain(|(key, _)| *key != name);
+            direct.push((name, value));
+            let expected = config(&direct).unwrap();
+            direct.retain(|(key, _)| *key != name);
+            let file_name = format!("{name}_FILE");
+            direct.push((&file_name, path.to_str().unwrap()));
+            std::fs::write(&path, format!("{value}\r\n")).unwrap();
+            assert_eq!(config(&direct).unwrap(), expected, "{name}");
+            direct.push((name, value));
+            let error = config(&direct).unwrap_err();
+            assert!(!format!("{error:?} {error}").contains(value));
+        }
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn explicitly_configured_email_key_file_fails_closed_even_when_email_is_off() {
+        let variables = with(&[
+            ("PUSH_EMAIL_SENDER", "none"),
+            ("PUSH_RESEND_API_KEY_FILE", "missing-application-key-file"),
+        ]);
+        assert!(config(&variables).is_err());
+    }
 
     fn config(variables: &[(&str, &str)]) -> Result<Config, ConfigError> {
         let variables: HashMap<String, String> = variables

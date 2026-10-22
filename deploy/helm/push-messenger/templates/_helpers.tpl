@@ -30,6 +30,7 @@ A consumer-managed Secret (secrets.existingSecret) is only referenced: inline cr
 values would be silently ignored, so they are refused by name, never by value.
 */}}
 {{- define "push.checkSecretSelection" -}}
+{{- include "push.checkSecretVolume" . -}}
 {{- $name := .Values.secrets.existingSecret -}}
 {{- if not (kindIs "string" $name) -}}
 {{- fail "secrets.existingSecret must be a string" -}}
@@ -54,6 +55,152 @@ values would be silently ignored, so they are refused by name, never by value.
 {{- end -}}
 {{- end -}}
 {{- end -}}
+{{- end -}}
+
+{{/* The volume is consumer-owned; workloads bind only their consumed key files. */}}
+{{- define "push.checkSecretVolume" -}}
+{{- $secrets := .Values.secrets -}}
+{{- if not (kindIs "map" $secrets.volume) -}}
+{{- fail "secrets.volume must be a Kubernetes VolumeSource object without name" -}}
+{{- end -}}
+{{- if $secrets.volume -}}
+{{- if $secrets.existingSecret -}}
+{{- fail "secrets.existingSecret conflicts with secrets.volume" -}}
+{{- end -}}
+{{- if or (ne (len $secrets.volume) 1) (hasKey $secrets.volume "name") -}}
+{{- fail "secrets.volume must contain exactly one Kubernetes volume source, without name" -}}
+{{- end -}}
+{{- $sources := list "csi" "secret" "projected" "configMap" "nfs" "persistentVolumeClaim" "hostPath" "emptyDir" "ephemeral" "downwardAPI" "azureFile" "azureDisk" "cephfs" "cinder" "fc" "flexVolume" "flocker" "gcePersistentDisk" "gitRepo" "glusterfs" "iscsi" "photonPersistentDisk" "portworxVolume" "quobyte" "rbd" "scaleIO" "storageos" "vsphereVolume" "awsElasticBlockStore" -}}
+{{- range $source, $spec := $secrets.volume -}}
+{{- if or (not (has $source $sources)) (not (kindIs "map" $spec)) -}}
+{{- fail "secrets.volume must contain a Kubernetes volume source object" -}}
+{{- end -}}
+{{- if eq $source "csi" -}}
+{{- if not (and (kindIs "string" $spec.driver) $spec.driver) -}}
+{{- fail "secrets.volume.csi.driver must be a nonempty string" -}}
+{{- end -}}
+{{- if and (hasKey $spec "volumeAttributes") (not (kindIs "map" $spec.volumeAttributes)) -}}
+{{- fail "secrets.volume.csi.volumeAttributes must be a string map" -}}
+{{- end -}}
+{{- range $key, $value := $spec.volumeAttributes -}}
+{{- if not (kindIs "string" $value) -}}
+{{- fail "secrets.volume.csi.volumeAttributes must be a string map" -}}
+{{- end -}}
+{{- end -}}
+{{- if and (eq $spec.driver "secrets-store.csi.k8s.io") (not (get ($spec.volumeAttributes | default dict) "secretProviderClass")) -}}
+{{- fail "secrets.volume.csi.volumeAttributes.secretProviderClass is required" -}}
+{{- end -}}
+{{- end -}}
+{{- $nameField := get (dict "secret" "secretName" "configMap" "name" "persistentVolumeClaim" "claimName" "hostPath" "path") $source -}}
+{{- if $nameField -}}
+{{- $value := get $spec $nameField -}}
+{{- if not (and (kindIs "string" $value) $value) -}}
+{{- fail (printf "secrets.volume.%s.%s must be a nonempty string" $source $nameField) -}}
+{{- end -}}
+{{- end -}}
+{{- if eq $source "projected" -}}
+{{- if not (and (kindIs "slice" $spec.sources) $spec.sources) -}}
+{{- fail "secrets.volume.projected.sources must be a nonempty list" -}}
+{{- end -}}
+{{- range $spec.sources -}}
+{{- if not (and (kindIs "map" .) .) -}}
+{{- fail "secrets.volume.projected.sources must contain volume projection objects" -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if not (and (kindIs "string" $secrets.mountPath) (regexMatch "^/([A-Za-z0-9_-][A-Za-z0-9._-]*)(/[A-Za-z0-9_-][A-Za-z0-9._-]*)*$" $secrets.mountPath)) -}}
+{{- fail "secrets.mountPath must be an absolute non-root path without traversal or trailing slash" -}}
+{{- end -}}
+{{- if not (kindIs "map" $secrets.files) -}}
+{{- fail "secrets.files must be a map of application key names to filenames" -}}
+{{- end -}}
+{{- $keys := list "auth-signing-key" "auth-link-key" "accounts-token" "directory-token" "messaging-token" "auth-admin-token" "resend-api-key" "resend-webhook-secret" -}}
+{{- $filenames := dict -}}
+{{- range $key, $filename := $secrets.files -}}
+{{- if or (not (has $key $keys)) (not (kindIs "string" $filename)) -}}
+{{- fail "secrets.files must contain only known application keys and string filenames" -}}
+{{- end -}}
+{{- if and $filename (or (not (regexMatch "^[A-Za-z0-9._-]+$" $filename)) (eq $filename ".") (hasPrefix ".." $filename)) -}}
+{{- fail "secrets.files values must be filenames without traversal or Kubernetes internal directory names" -}}
+{{- end -}}
+{{- if $filename -}}
+{{- if hasKey $filenames $filename -}}
+{{- fail "secrets.files must use distinct filenames for every application key" -}}
+{{- end -}}
+{{- $_ := set $filenames $filename true -}}
+{{- $path := printf "%s/%s" $secrets.mountPath $filename -}}
+{{- range list "/etc/push/entra-ca" "/etc/push/authority-ca" "/etc/push/postgres-ca" "/etc/push/redis-ca" "/var/run/secrets" "/data" "/operator-accounts" -}}
+{{- if or (eq $path .) (hasPrefix (printf "%s/" .) $path) (hasPrefix (printf "%s/" $path) .) -}}
+{{- fail "secrets.files mount paths must not overlap chart-reserved volume paths" -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- $required := list "auth-signing-key" "auth-link-key" "accounts-token" "directory-token" "messaging-token" -}}
+{{- if .Values.auth.admin.enabled -}}{{- $required = append $required "auth-admin-token" -}}{{- end -}}
+{{- if eq .Values.worker.email.sender "resend" -}}{{- $required = append $required "resend-api-key" -}}{{- end -}}
+{{- if include "push.hasWebhook" . -}}{{- $required = append $required "resend-webhook-secret" -}}{{- end -}}
+{{- range $required -}}
+{{- if not (index $secrets.files .) -}}
+{{- fail (printf "secrets.files.%s needs a filename" .) -}}
+{{- end -}}
+{{- end -}}
+{{- range $key, $value := dict "auth.signingKey" .Values.auth.signingKey "auth.linkKey" .Values.auth.linkKey "worker.email.resendApiKey" .Values.worker.email.resendApiKey "worker.email.webhookSecret" .Values.worker.email.webhookSecret -}}
+{{- if $value -}}{{- fail (printf "%s conflicts with secrets.volume" $key) -}}{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/* Arguments: root, name (environment variable), key (existing Secret key). */}}
+{{- define "push.applicationEnv" -}}
+{{- if .root.Values.secrets.volume }}
+- name: {{ .name }}_FILE
+  value: {{ printf "%s/%s" .root.Values.secrets.mountPath (index .root.Values.secrets.files .key) | quote }}
+{{- else }}
+- name: {{ .name }}
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "push.secretName" .root }}
+      key: {{ .key }}
+{{- end }}
+{{- end -}}
+
+{{- define "push.applicationMounts" -}}
+{{- $root := .root -}}
+{{- if $root.Values.secrets.volume -}}
+{{- $keys := index (dict
+  "auth" (list "auth-signing-key" "auth-link-key" "directory-token")
+  "message-svc" (list "accounts-token" "directory-token" "messaging-token")
+  "gateway" (list "messaging-token")
+  "worker" (list "accounts-token")
+  "smoke" (list "auth-signing-key")) .component -}}
+{{- if and (eq .component "auth") $root.Values.auth.admin.enabled -}}
+{{- $keys = append $keys "auth-admin-token" -}}
+{{- end -}}
+{{- if eq .component "worker" -}}
+{{- if eq $root.Values.worker.email.sender "resend" -}}
+{{- $keys = append $keys "resend-api-key" -}}
+{{- end -}}
+{{- if include "push.hasWebhook" $root -}}
+{{- $keys = append $keys "resend-webhook-secret" -}}
+{{- end -}}
+{{- end -}}
+{{- range $keys -}}
+{{- $filename := index $root.Values.secrets.files . }}
+- name: application-keys
+  mountPath: {{ printf "%s/%s" $root.Values.secrets.mountPath $filename | quote }}
+  subPath: {{ $filename | quote }}
+  readOnly: true
+{{- end }}
+{{- end }}
+{{- end -}}
+
+{{- define "push.applicationVolumes" -}}
+{{- if .Values.secrets.volume }}
+- name: application-keys
+  {{- toYaml .Values.secrets.volume | nindent 2 }}
+{{- end }}
 {{- end -}}
 
 {{/* Checks a chart-managed auth key: canonical standard base64 of 32 (or at least 32) bytes. */}}
@@ -163,7 +310,7 @@ missing key stops the worker with a Kubernetes configuration error instead).
 {{- fail "dev mode shows every email the worker sends at /dev/mailbox: use worker.email.sender log with it" -}}
 {{- end -}}
 {{- end -}}
-{{- if not .Values.secrets.existingSecret -}}
+{{- if not (or .Values.secrets.existingSecret .Values.secrets.volume) -}}
 {{- $existing := (lookup "v1" "Secret" .Release.Namespace (include "push.secretName" .)).data | default dict -}}
 {{- if and (eq $email.sender "resend") (not (or $email.resendApiKey (get $existing "resend-api-key"))) -}}
 {{- fail "worker.email.sender resend needs worker.email.resendApiKey or a retained resend-api-key" -}}
@@ -176,7 +323,8 @@ missing key stops the worker with a Kubernetes configuration error instead).
 
 {{/* "true" when Microsoft Entra ID sign-in is offered (spec 2026-10-19 D9). */}}
 {{- define "push.entraSignIn" -}}
-{{- if has "entra" (splitList "," (nospace (toString .Values.auth.signIn.providers))) -}}true{{- end -}}
+{{- $providers := splitList "," (nospace (toString .Values.auth.signIn.providers)) -}}
+{{- if or (has "entra" $providers) (has "entra-app" $providers) -}}true{{- end -}}
 {{- end -}}
 
 {{/* "true" when email and password sign-in is off: nothing ever writes an email then. */}}
@@ -206,12 +354,20 @@ The admin listener is a boolean; its peers carry both label maps.
 */}}
 {{- define "push.checkSignIn" -}}
 {{- $signIn := .Values.auth.signIn -}}
-{{- $providerError := printf "auth.signIn.providers must be password, entra or password,entra, not %q" (toString $signIn.providers) -}}
+{{- $providerError := printf "auth.signIn.providers must list password, entra, entra-app, each at most once, not %q" (toString $signIn.providers) -}}
 {{- if not (kindIs "string" $signIn.providers) -}}
 {{- fail $providerError -}}
 {{- end -}}
-{{- if not (has (nospace $signIn.providers) (list "password" "entra" "password,entra" "entra,password")) -}}
+{{- $providers := splitList "," (nospace $signIn.providers) -}}
+{{- if ne (len $providers) (len (uniq $providers)) -}}
 {{- fail $providerError -}}
+{{- end -}}
+{{- range $providers -}}
+{{- if not (has . (list "password" "entra" "entra-app")) -}}{{- fail $providerError -}}{{- end -}}
+{{- end -}}
+{{- $agents := int .Values.auth.agentsPerUser -}}
+{{- if or (lt $agents 0) (gt $agents 100) (ne (toString $agents) (toString .Values.auth.agentsPerUser)) -}}
+{{- fail "auth.agentsPerUser must be a whole number from 0 to 100" -}}
 {{- end -}}
 {{- if not (kindIs "bool" .Values.auth.admin.enabled) -}}
 {{- fail "auth.admin.enabled must be a boolean" -}}
@@ -228,7 +384,7 @@ The admin listener is a boolean; its peers carry both label maps.
 {{- if include "push.entraSignIn" . -}}
 {{- $entra := $signIn.entra -}}
 {{- $guid := "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$" -}}
-{{- range $name := list "clientIds" "tenants" "allowedClientApps" -}}
+{{- range $name := list "clientIds" "tenants" -}}
 {{- if not (kindIs "slice" (index $entra $name)) -}}
 {{- fail (printf "auth.signIn.entra.%s must be a list" $name) -}}
 {{- end -}}
@@ -265,6 +421,9 @@ The admin listener is a boolean; its peers carry both label maps.
 {{- $keywords := list "common" "organizations" "consumers" -}}
 {{- $tenants := list -}}
 {{- range $entra.tenants -}}{{- $tenants = append $tenants (lower (toString .)) -}}{{- end -}}
+{{- if and (has "entra-app" $providers) (has (first $tenants) $keywords) -}}
+{{- fail "entra-app requires auth.signIn.entra.tenants to list explicit tenant GUIDs, not common, organizations or consumers" -}}
+{{- end -}}
 {{- if not (and (eq (len $tenants) 1) (has (first $tenants) $keywords)) -}}
 {{- range $tenants -}}
 {{- if has . $keywords -}}
@@ -281,6 +440,10 @@ The admin listener is a boolean; its peers carry both label maps.
 {{- fail "auth.signIn.entra.tenants: at most 20 tenant ids" -}}
 {{- end -}}
 {{- end -}}
+{{- if has "entra" $providers -}}
+{{- if not (kindIs "slice" $entra.allowedClientApps) -}}
+{{- fail "auth.signIn.entra.allowedClientApps must be a list" -}}
+{{- end -}}
 {{- range $entra.allowedClientApps -}}
 {{- if not (regexMatch $guid (toString .)) -}}
 {{- fail (printf "auth.signIn.entra.allowedClientApps: %q is not an application id" (toString .)) -}}
@@ -289,9 +452,11 @@ The admin listener is a boolean; its peers carry both label maps.
 {{- if gt (len $entra.allowedClientApps) 20 -}}
 {{- fail "auth.signIn.entra.allowedClientApps: at most 20 application ids" -}}
 {{- end -}}
+{{- end -}}
 {{- if not (regexMatch "^https://[^/@?#\\s]+/?$" (toString $entra.authorityHost)) -}}
 {{- fail "auth.signIn.entra.authorityHost must be https://host/ (scheme and host only)" -}}
 {{- end -}}
+{{- if has "entra" $providers -}}
 {{- if not (regexMatch "^[!-~]{1,128}$" (toString $entra.requiredScope)) -}}
 {{- fail "auth.signIn.entra.requiredScope must be one scope name or *" -}}
 {{- end -}}
@@ -301,6 +466,26 @@ The admin listener is a boolean; its peers carry both label maps.
 {{- $hours := int $entra.maxSessionHours -}}
 {{- if or (lt $hours 1) (gt $hours 720) (ne (toString $hours) (toString $entra.maxSessionHours)) -}}
 {{- fail "auth.signIn.entra.maxSessionHours must be a whole number of hours from 1 to 720" -}}
+{{- end -}}
+{{- end -}}
+{{- if has "entra-app" $providers -}}
+{{- $app := $signIn.entraApp -}}
+{{- if not (kindIs "slice" $app.allowedClientApps) -}}
+{{- fail "auth.signIn.entraApp.allowedClientApps must be a list" -}}
+{{- end -}}
+{{- range $app.allowedClientApps -}}
+{{- if not (regexMatch $guid (toString .)) -}}
+{{- fail "auth.signIn.entraApp.allowedClientApps must contain application GUIDs" -}}
+{{- end -}}
+{{- end -}}
+{{- if gt (len $app.allowedClientApps) 20 -}}{{- fail "auth.signIn.entraApp.allowedClientApps: at most 20 application ids" -}}{{- end -}}
+{{- if and $app.requiredRole (not (regexMatch "^[!-~]{1,128}$" (toString $app.requiredRole))) -}}
+{{- fail "auth.signIn.entraApp.requiredRole must be one app role value" -}}
+{{- end -}}
+{{- $hours := int $app.maxSessionHours -}}
+{{- if or (lt $hours 1) (gt $hours 720) (ne (toString $hours) (toString $app.maxSessionHours)) -}}
+{{- fail "auth.signIn.entraApp.maxSessionHours must be a whole number of hours from 1 to 720" -}}
+{{- end -}}
 {{- end -}}
 {{- if and $entra.httpsProxy (not (regexMatch "^https?://[^\\s]+$" (toString $entra.httpsProxy))) -}}
 {{- fail "auth.signIn.entra.httpsProxy must be an http:// or https:// URL" -}}
@@ -365,6 +550,8 @@ connection auth-svc makes (rustls-native-certs reads SSL_CERT_FILE alone).
 {{- define "push.signInEnv" -}}
 {{- $signIn := .Values.auth.signIn -}}
 {{- $providers := nospace (toString $signIn.providers) -}}
+- name: PUSH_AGENTS_PER_USER
+  value: {{ int .Values.auth.agentsPerUser | quote }}
 {{- if ne $providers "password" }}
 - name: PUSH_AUTH_PROVIDERS
   value: {{ $providers | quote }}
@@ -377,6 +564,7 @@ connection auth-svc makes (rustls-native-certs reads SSL_CERT_FILE alone).
   value: {{ join "," $entra.tenants | lower | quote }}
 - name: PUSH_ENTRA_AUTHORITY_HOST
   value: {{ $entra.authorityHost | quote }}
+{{- if has "entra" (splitList "," $providers) }}
 - name: PUSH_ENTRA_REQUIRED_SCOPE
   value: {{ $entra.requiredScope | quote }}
 {{- with $entra.requiredRole }}
@@ -389,6 +577,19 @@ connection auth-svc makes (rustls-native-certs reads SSL_CERT_FILE alone).
 {{- end }}
 - name: PUSH_ENTRA_MAX_SESSION_HOURS
   value: {{ int $entra.maxSessionHours | quote }}
+{{- end }}
+{{- if has "entra-app" (splitList "," $providers) }}
+{{- with $signIn.entraApp.requiredRole }}
+- name: PUSH_ENTRA_APP_REQUIRED_ROLE
+  value: {{ . | quote }}
+{{- end }}
+{{- with $signIn.entraApp.allowedClientApps }}
+- name: PUSH_ENTRA_APP_ALLOWED_CLIENT_APPS
+  value: {{ join "," . | quote }}
+{{- end }}
+- name: PUSH_ENTRA_APP_MAX_SESSION_HOURS
+  value: {{ int $signIn.entraApp.maxSessionHours | quote }}
+{{- end }}
 {{- with $entra.httpsProxy }}
 - name: HTTPS_PROXY
   value: {{ . | quote }}

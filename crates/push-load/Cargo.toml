@@ -10,6 +10,7 @@ repository.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+base64.workspace = true
 futures-util.workspace = true
 push-proto.workspace = true
 # HTTPS with rustls, ring and the webpki roots, as push-sdk.
@@ -20,6 +21,9 @@ tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sig
 tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }
 tokio-util.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
 
 [lints]
 workspace = true

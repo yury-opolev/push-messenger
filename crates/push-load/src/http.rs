@@ -159,8 +159,33 @@ impl AuthApi {
         if status == StatusCode::TOO_MANY_REQUESTS || status == StatusCode::SERVICE_UNAVAILABLE {
             return Err(ApiError::RetryAfter(retry_delay(retry_after.as_deref())));
         }
+        // A server/proxy may echo credentials even in its code field.
         let code = answer["error"]["code"]
             .as_str()
+            .filter(|code| {
+                matches!(
+                    *code,
+                    "invalid"
+                        | "handle_taken"
+                        | "invalid_credentials"
+                        | "email_not_verified"
+                        | "link_invalid"
+                        | "link_expired"
+                        | "unauthorized"
+                        | "token_expired"
+                        | "too_many_devices"
+                        | "device_not_found"
+                        | "user_not_found"
+                        | "entra_token_invalid"
+                        | "entra_unavailable"
+                        | "token_invalid"
+                        | "identity_unavailable"
+                        | "sign_in_not_permitted"
+                        | "session_expired"
+                        | "rate_limited"
+                        | "unavailable"
+                )
+            })
             .unwrap_or("unknown")
             .to_owned();
         Err(ApiError::Rejected {
@@ -234,6 +259,45 @@ impl AuthApi {
             .ok_or_else(malformed)
     }
 
+    async fn authenticate(
+        &self,
+        account: &crate::accounts::Account,
+        device: Option<Uuid>,
+    ) -> Result<Value, ApiError> {
+        let (path, mut body) = match account.entra_token().map_err(|_| ApiError::Rejected {
+            status: 400,
+            code: "entra_token_source_unreadable_or_changed_identity".to_owned(),
+        })? {
+            Some(token) => ("/v1/auth/entra", json!({"token":token})),
+            None => (
+                "/v1/auth/login",
+                json!({"email":account.email,"password":account.password}),
+            ),
+        };
+        if let Some(device) = device {
+            body["device_id"] = json!(device);
+        }
+        self.post(path, body, None, StatusCode::OK, None).await
+    }
+
+    pub async fn login_account(
+        &self,
+        account: &crate::accounts::Account,
+    ) -> Result<String, ApiError> {
+        self.authenticate(account, None).await?["registration_token"]
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(malformed)
+    }
+
+    pub async fn login_account_device(
+        &self,
+        account: &crate::accounts::Account,
+        device: Uuid,
+    ) -> Result<DeviceTokens, ApiError> {
+        tokens(self.authenticate(account, Some(device)).await?)
+    }
+
     /// Signs a known device in again (its tokens were lost or refused).
     pub async fn login_device(
         &self,
@@ -288,6 +352,40 @@ fn malformed() -> ApiError {
     ApiError::Rejected {
         status: 200,
         code: "malformed_answer".to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod safe_error_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn http_errors_never_echo_server_supplied_credentials() {
+        let router = axum::Router::new().route(
+            "/v1/auth/login",
+            axum::routing::post(|| async {
+                (
+                    StatusCode::BAD_REQUEST,
+                    axum::Json(json!({
+                        "error": {
+                            "code": "operator-token-secret",
+                            "message": "operator-token-secret"
+                        }
+                    })),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let authority = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(axum::serve(listener, router).into_future());
+        let target = Target::new(&format!("http://{authority}"), &authority, None).unwrap();
+        let error = AuthApi::new(&target)
+            .unwrap()
+            .login("a@x.test", "operator-token-secret")
+            .await
+            .unwrap_err();
+        assert!(!format!("{error:?} {error}").contains("operator-token-secret"));
+        server.abort();
     }
 }
 

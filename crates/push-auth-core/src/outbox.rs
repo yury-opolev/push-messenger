@@ -66,6 +66,10 @@ pub enum Event {
     UserVerified {
         user_id: Uuid,
     },
+    AgentEnrolled {
+        user_id: Uuid,
+        owner_user_id: Uuid,
+    },
     UserPasswordReset {
         user_id: Uuid,
         /// When the password was reset, in seconds since the Unix epoch: the clock that
@@ -88,6 +92,7 @@ impl Event {
         match self {
             Self::EmailSend { .. } => "email.send",
             Self::UserVerified { .. } => "user.verified",
+            Self::AgentEnrolled { .. } => "agent.enrolled",
             Self::UserPasswordReset { .. } => "user.password_reset",
             Self::DeviceRegistered { .. } => "device.registered",
             Self::DeviceRevoked { .. } => "device.revoked",
@@ -104,6 +109,10 @@ impl Event {
                 "params": email.params(),
             }),
             Self::UserVerified { user_id } => json!({"user_id": user_id}),
+            Self::AgentEnrolled {
+                user_id,
+                owner_user_id,
+            } => json!({"user_id": user_id, "owner_user_id": owner_user_id}),
             Self::UserPasswordReset { user_id, reset_at } => {
                 json!({"user_id": user_id, "reset_at": reset_at})
             }

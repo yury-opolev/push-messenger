@@ -16,6 +16,8 @@ pub struct PublicProfile {
     pub user_id: Uuid,
     pub handle: String,
     pub display_name: String,
+    pub kind: String,
+    pub owner_user_id: Option<Uuid>,
 }
 
 /// The caller's own profile, with their email.
@@ -27,6 +29,8 @@ pub struct OwnProfile {
     /// The account's address; for an Entra ID account the latest address its token
     /// carried (informational), if any.
     pub email: Option<String>,
+    pub kind: String,
+    pub owner_user_id: Option<Uuid>,
 }
 
 impl Auth {
@@ -34,10 +38,10 @@ impl Auth {
     pub async fn own_profile(&self, caller: Caller) -> Result<OwnProfile, AuthError> {
         let row = sqlx::query(
                     "SELECT account.handle::text, account.display_name, \
-                     coalesce(account.email::text, identity.email) \
+                     coalesce(account.email::text, identity.email), account.kind, account.owner_user_id \
                      FROM auth.user_account AS account \
                      LEFT JOIN auth.external_identity AS identity ON identity.user_id = account.user_id \
-                     WHERE account.user_id = $1",
+                     WHERE account.user_id = $1 AND account.disabled_at IS NULL AND account.email_verified_at IS NOT NULL",
                 )
         .bind(caller.user_id)
         .fetch_optional(&self.pool)
@@ -48,6 +52,8 @@ impl Auth {
             handle: row.get(0),
             display_name: row.get(1),
             email: row.get(2),
+            kind: row.get(3),
+            owner_user_id: row.get(4),
         })
     }
 
@@ -69,7 +75,9 @@ impl Auth {
                 reason: "give display_name, handle or both",
             }));
         }
+        crate::agents::expire(&self.pool).await?;
         let mut tx = self.pool.begin().await?;
+        self.lock_enabled_account(&mut tx, caller.user_id).await?;
         if let Some(display_name) = &display_name {
             sqlx::query("UPDATE auth.user_account SET display_name = $2 WHERE user_id = $1")
                 .bind(caller.user_id)
@@ -121,8 +129,8 @@ impl Auth {
     pub async fn lookup(&self, handle: &str) -> Result<PublicProfile, AuthError> {
         let handle = rules::handle(handle)?;
         let row = sqlx::query(
-            "SELECT user_id, handle::text, display_name FROM auth.user_account \
-             WHERE handle = $1::citext AND email_verified_at IS NOT NULL",
+            "SELECT user_id, handle::text, display_name, kind, owner_user_id FROM auth.user_account \
+             WHERE handle = $1::citext AND email_verified_at IS NOT NULL AND disabled_at IS NULL",
         )
         .bind(&handle)
         .fetch_optional(&self.pool)
@@ -132,6 +140,8 @@ impl Auth {
             user_id: row.get(0),
             handle: row.get(1),
             display_name: row.get(2),
+            kind: row.get(3),
+            owner_user_id: row.get(4),
         })
     }
 
@@ -139,8 +149,8 @@ impl Auth {
     /// checks first that they may be shown (`GET /v1/users?ids=…` asks message-svc).
     pub async fn profiles(&self, users: &[Uuid]) -> Result<Vec<PublicProfile>, AuthError> {
         let rows = sqlx::query(
-            "SELECT user_id, handle::text, display_name FROM auth.user_account \
-             WHERE user_id = ANY($1) AND email_verified_at IS NOT NULL ORDER BY user_id",
+            "SELECT user_id, handle::text, display_name, kind, owner_user_id FROM auth.user_account \
+             WHERE user_id = ANY($1) AND email_verified_at IS NOT NULL AND disabled_at IS NULL ORDER BY user_id",
         )
         .bind(users)
         .fetch_all(&self.pool)
@@ -151,6 +161,8 @@ impl Auth {
                 user_id: row.get(0),
                 handle: row.get(1),
                 display_name: row.get(2),
+                kind: row.get(3),
+                owner_user_id: row.get(4),
             })
             .collect())
     }

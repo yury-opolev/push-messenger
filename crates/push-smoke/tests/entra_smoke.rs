@@ -48,6 +48,41 @@ async fn the_entra_smoke_test_passes_against_an_entra_only_stack() {
     .await
     .expect("the Entra smoke test finishes within 300 s")
     .expect("the Entra smoke test passes");
+
+    // Operator mode reuses identities enrolled through the normal API, with no issuer
+    // endpoint or DEV credentials available to the smoke tool.
+    let mut lines = Vec::new();
+    let http = reqwest::Client::new();
+    for (index, name) in ["operator_erin", "operator_finn"].iter().enumerate() {
+        let token = stub.token(&uuid::Uuid::now_v7().to_string());
+        let response = http
+            .post(format!("{}/v1/auth/entra", stack.public_url))
+            .json(&json!({"token":token, "handle":name}))
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        let entry = if index == 0 {
+            std::fs::write(data_dir.join("erin.jwt"), &token).unwrap();
+            json!({"entra_token_file":"erin.jwt"})
+        } else {
+            json!({"entra_token":token})
+        };
+        lines.push(entry.to_string());
+    }
+    let path = data_dir.join("accounts.jsonl");
+    std::fs::write(&path, lines.join("\n")).unwrap();
+    let accounts = push_load::accounts::read(&path).unwrap();
+    let mut operator_target = target.clone();
+    operator_target.signing_key.clear();
+    operator_target.mailbox_url.clear();
+    tokio::time::timeout(
+        Duration::from_secs(300),
+        push_smoke::entra::run_accounts(&operator_target, &accounts),
+    )
+    .await
+    .expect("operator smoke finishes")
+    .expect("operator smoke passes");
     stack.stop().await;
     let _ = std::fs::remove_dir_all(&data_dir);
 }

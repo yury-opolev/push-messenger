@@ -67,16 +67,8 @@ spec:
             # Its own database only: auth-svc never sees message-svc's credentials.
             {{- include "push.postgresEnv" (dict "root" . "secretKey" "auth-database-url" "database" .Values.postgres.external.databases.auth "user" .Values.postgres.external.users.auth) | trim | nindent 12 }}
             {{- include "push.redisEnv" . | trim | nindent 12 }}
-            - name: PUSH_AUTH_SIGNING_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "push.secretName" . }}
-                  key: auth-signing-key
-            - name: PUSH_AUTH_LINK_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "push.secretName" . }}
-                  key: auth-link-key
+            {{- include "push.applicationEnv" (dict "root" . "name" "PUSH_AUTH_SIGNING_KEY" "key" "auth-signing-key") | nindent 12 }}
+            {{- include "push.applicationEnv" (dict "root" . "name" "PUSH_AUTH_LINK_KEY" "key" "auth-link-key") | nindent 12 }}
             # Email links are built from this, never from a request's Host header.
             - name: PUSH_AUTH_PUBLIC_URL
               value: {{ include "push.publicUrl" . | quote }}
@@ -99,22 +91,14 @@ spec:
             # caller may see, with auth-svc's own token.
             - name: PUSH_MESSAGE_SVC_URL
               value: {{ printf "http://%s:50053" (include "push.name" (dict "root" . "component" "message-svc")) | quote }}
-            - name: PUSH_DIRECTORY_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "push.secretName" . }}
-                  key: directory-token
+            {{- include "push.applicationEnv" (dict "root" . "name" "PUSH_DIRECTORY_TOKEN" "key" "directory-token") | nindent 12 }}
             {{- with (include "push.signInEnv" . | trim) }}
             # Sign-in beyond email and password (auth.signIn, docs/entra-sign-in.md).
             {{- . | nindent 12 }}
             {{- end }}
             {{- if .Values.auth.admin.enabled }}
             # The admin API on its own listener, reachable only from networkPolicy.adminPeers.
-            - name: PUSH_AUTH_ADMIN_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "push.secretName" . }}
-                  key: auth-admin-token
+            {{- include "push.applicationEnv" (dict "root" . "name" "PUSH_AUTH_ADMIN_TOKEN" "key" "auth-admin-token") | nindent 12 }}
             - name: PUSH_AUTH_ADMIN_ADDR
               value: "0.0.0.0:8082"
             {{- end }}
@@ -140,11 +124,11 @@ spec:
             periodSeconds: 10
           resources:
             {{- toYaml .Values.auth.resources | nindent 12 }}
-          {{- with (printf "%s%s" (include "push.identityMounts" (dict "root" . "key" "auth" "postgres" true "redis" true)) (include "push.signInMounts" .)) | trim }}
+          {{- with (printf "%s%s%s" (include "push.identityMounts" (dict "root" . "key" "auth" "postgres" true "redis" true)) (include "push.signInMounts" .) (include "push.applicationMounts" (dict "root" . "component" "auth"))) | trim }}
           volumeMounts:
             {{- . | nindent 12 }}
           {{- end }}
-      {{- with (printf "%s%s" (include "push.identityVolumes" (dict "root" . "key" "auth" "postgres" true "redis" true)) (include "push.signInVolumes" .)) | trim }}
+      {{- with (printf "%s%s%s" (include "push.identityVolumes" (dict "root" . "key" "auth" "postgres" true "redis" true)) (include "push.signInVolumes" .) (include "push.applicationVolumes" .)) | trim }}
       volumes:
         {{- . | nindent 8 }}
       {{- end }}

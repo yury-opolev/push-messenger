@@ -186,8 +186,17 @@ reference and render the worker route. Preserve local DEV ONLY behaviour and its
 existing guards; never enable the mailbox outside local mode.
 
 Azure Key Vault, CSI resources and secret synchronization belong to the consumer.
-The consumer must materialize the required Secret before application startup and
-coordinate credential changes with backing services and workload rollouts.
+The consumer must materialize the required Secret before application startup, or
+select optional `secrets.volume` application-key delivery and materialize files
+instead, without Secret synchronization. Mounted mode preserves each key's value
+format and exposes only each workload's consumed files through read-only `subPath`
+binds matching its `*_FILE` variables, never the whole volume. Optional keys are
+mounted only when enabled. CSI rotation updates do not propagate to existing
+`subPath` binds, so coordinated rollouts remain required. The shared reader fails
+closed on conflicting variables or missing, unreadable or empty files. Datastore
+credentials remain separate. See the current
+[mounted-file contract](../../deployment-configuration.md#consumer-mounted-application-keys-csi-without-secret-sync).
+Consumers coordinate credential changes with backing services and workload rollouts.
 This feature does not claim automatic or zero-downtime secret rotation.
 
 ## 6. Controller-neutral public routing

@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use push_proto::id_bytes;
 use push_proto::internal::v1::accounts_client::AccountsClient;
-use push_proto::internal::v1::{AccountDevice, AccountUser};
+use push_proto::internal::v1::{AccountAgent, AccountDevice, AccountUser};
 use serde_json::Value;
 use tonic::codegen::InterceptedService;
 use tonic::metadata::{Ascii, MetadataValue};
@@ -23,6 +23,10 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 /// One of auth-svc's user and device events (spec §3.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccountEvent {
+    AgentEnrolled {
+        user: Uuid,
+        owner: Uuid,
+    },
     UserVerified {
         user: Uuid,
     },
@@ -54,6 +58,13 @@ impl AccountEvent {
         };
         let device = || -> Result<(Uuid, Uuid), String> { Ok((id("user_id")?, id("device_id")?)) };
         Some(match kind {
+            "agent.enrolled" => id("user_id").and_then(|user| {
+                let owner = id("owner_user_id")?;
+                if user == owner {
+                    return Err("agent.enrolled: self target".to_owned());
+                }
+                Ok(Self::AgentEnrolled { user, owner })
+            }),
             "user.verified" => id("user_id").map(|user| Self::UserVerified { user }),
             "user.password_reset" => {
                 let reset_at = match &payload["reset_at"] {
@@ -121,6 +132,13 @@ impl Accounts {
             device_id: id_bytes(device),
         };
         let result = match event {
+            AccountEvent::AgentEnrolled { user, owner } => client
+                .agent_enrolled(AccountAgent {
+                    user_id: id_bytes(user),
+                    owner_user_id: id_bytes(owner),
+                })
+                .await
+                .map(|_| ()),
             AccountEvent::UserVerified { user } => client
                 .user_verified(user_message(user, None))
                 .await
@@ -194,6 +212,13 @@ mod tests {
     fn account_payloads_parse_and_other_kinds_are_not_ours() {
         let (user, device) = (Uuid::now_v7(), Uuid::now_v7());
         let both = json!({"user_id": user, "device_id": device});
+        assert!(matches!(
+            AccountEvent::parse(
+                "agent.enrolled",
+                &json!({"user_id": user, "owner_user_id": device})
+            ),
+            Some(Ok(_))
+        ));
         assert_eq!(
             AccountEvent::parse("device.revoked", &both),
             Some(Ok(AccountEvent::DeviceRevoked { user, device }))

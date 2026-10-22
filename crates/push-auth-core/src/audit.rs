@@ -44,7 +44,7 @@ pub(crate) async fn audit(State(api): State<Api>, request: Request, next: Next) 
     let status = response.status();
     let code = response.extensions().get::<ErrorCode>().map(|code| code.0);
     let event = if api.auth.is_external_route(&route) {
-        external_event(status)
+        external_event(status, code)
     } else {
         event(&method, &route, status, code)
     };
@@ -107,6 +107,10 @@ pub(crate) fn event(
         ("POST", "/v1/auth/password/reset") if ok => "auth.password.reset",
         ("POST", "/v1/auth/verify" | "/v1/auth/password/reset") if bad_link => "auth.link.invalid",
         ("POST", "/v1/devices") if ok => "auth.device.registered",
+        ("POST", "/v1/agents") if ok => "auth.agent.reserved",
+        ("PATCH", "/v1/agents/{agent_id}") if ok => "auth.agent.updated",
+        ("DELETE", "/v1/agents/{agent_id}") if ok => "auth.agent.deleted",
+        (_, "/v1/agents" | "/v1/agents/{agent_id}") if !ok => "auth.agent.refused",
         ("POST", "/v1/devices") if code == Some("too_many_devices") => "auth.device.limit",
         ("DELETE", "/v1/devices/{device_id}") if ok => "auth.device.revoked",
         _ if status == StatusCode::UNAUTHORIZED => "auth.token.refused",
@@ -117,13 +121,15 @@ pub(crate) fn event(
 
 /// The event of an answer of the external authenticator's route,
 /// `POST /v1/auth/{provider}` (spec 2026-10-19 pluggable identity, D9), by its status
-/// alone; the error code is logged beside it. A provider that
+/// and security-relevant error code. Ordinary malformed bodies are not audited. A provider that
 /// keeps the id `entra` keeps Entra ID's events instead.
-pub(crate) fn external_event(status: StatusCode) -> Option<&'static str> {
+pub(crate) fn external_event(status: StatusCode, code: Option<&str>) -> Option<&'static str> {
     if status == StatusCode::TOO_MANY_REQUESTS {
         return Some("auth.rate_limited");
     }
-    if status == StatusCode::SERVICE_UNAVAILABLE || status == StatusCode::BAD_REQUEST {
+    if status == StatusCode::SERVICE_UNAVAILABLE
+        || (status == StatusCode::BAD_REQUEST && code != Some("enrollment_invalid"))
+    {
         return None;
     }
     Some(if status.is_success() {
@@ -138,9 +144,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn invalid_enrollment_codes_are_security_relevant_bad_requests() {
+        use axum::response::IntoResponse;
+
+        let response = crate::AuthError::EnrollmentInvalid.into_response();
+        let code = response.extensions().get::<ErrorCode>().unwrap().0;
+        assert_eq!(code, "enrollment_invalid");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            external_event(response.status(), Some(code)),
+            Some("auth.external.failure"),
+            "bad, expired and spent codes share the actual EnrollmentInvalid response"
+        );
+    }
+
+    #[test]
     fn answers_are_classified_by_route_status_and_code() {
         let post = Method::POST;
         let cases = [
+            (&post, "/v1/agents", 201, None, Some("auth.agent.reserved")),
+            (
+                &Method::PATCH,
+                "/v1/agents/{agent_id}",
+                204,
+                None,
+                Some("auth.agent.updated"),
+            ),
+            (
+                &Method::DELETE,
+                "/v1/agents/{agent_id}",
+                204,
+                None,
+                Some("auth.agent.deleted"),
+            ),
             (
                 &post,
                 "/v1/auth/entra",
@@ -287,13 +323,14 @@ mod tests {
                 Some("auth.external.failure"),
             ),
             (404, Some("device_not_found"), Some("auth.external.failure")),
+            (400, None, None),
             (400, Some("invalid"), None),
             (503, Some("identity_unavailable"), None),
             (429, Some("rate_limited"), Some("auth.rate_limited")),
         ];
         for (status, code, expected) in cases {
             let status = StatusCode::from_u16(status).unwrap();
-            assert_eq!(external_event(status), expected, "{status} {code:?}");
+            assert_eq!(external_event(status, code), expected, "{status} {code:?}");
         }
     }
 }

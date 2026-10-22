@@ -94,6 +94,8 @@ export interface Invite {
 }
 
 export interface Profile {
+  kind: 'user' | 'agent';
+  ownerUserId: string | null;
   userId: string;
   handle: string;
   displayName: string;

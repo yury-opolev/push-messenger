@@ -83,6 +83,11 @@ pub fn router(api: Api) -> Router {
         .route("/v1/auth/jwks", get(jwks))
         .route("/v1/devices", post(register_device).get(list_devices))
         .route("/v1/devices/{device_id}", delete(revoke_device))
+        .route("/v1/agents", post(reserve_agent).get(list_agents))
+        .route(
+            "/v1/agents/{agent_id}",
+            delete(delete_agent).patch(update_agent),
+        )
         .route("/v1/users", get(profiles))
         .route("/v1/users/me", get(own_profile).patch(update_profile))
         .route("/v1/users/lookup", get(lookup))
@@ -392,9 +397,11 @@ struct SignInBody {
     handle: Option<String>,
     #[serde(default)]
     device_id: Option<Uuid>,
+    #[serde(default)]
+    enrollment_code: Option<String>,
 }
 
-/// `POST /v1/auth/{provider} {token?, handle?, device_id?}` (spec 2026-10-19 Entra ID
+/// `POST /v1/auth/{provider} {token?, handle?, device_id?, enrollment_code?}` (spec 2026-10-19 Entra ID
 /// sign-in D10, pluggable identity D5), behind the identity middleware, which put the
 /// principal here: without `device_id` a registration token, as `POST /v1/auth/login`
 /// answers; with it, new tokens for that active device and a new session.
@@ -404,10 +411,17 @@ async fn sign_in(
     JsonBody(body): JsonBody<SignInBody>,
 ) -> Result<Response, AuthError> {
     let handle = body.handle.as_deref();
+    if body.enrollment_code.is_some() && body.device_id.is_some() {
+        return Err(bad_body());
+    }
     Ok(match body.device_id {
         None => {
-            let signed_in = api.auth.sign_in_external(&principal, handle).await?;
+            let signed_in = match body.enrollment_code.as_deref() {
+                Some(code) => api.auth.enroll_agent(&principal, code).await?,
+                None => api.auth.sign_in_external(&principal, handle).await?,
+            };
             let mut response = Json(json!({
+                "user_id": signed_in.user_id,
                 "registration_token": signed_in.registration.token,
                 "expires_in_s": signed_in.registration.expires_in_s,
             }))
@@ -428,6 +442,101 @@ async fn sign_in(
     })
 }
 
+#[derive(Deserialize)]
+struct AgentBody {
+    handle: String,
+    display_name: String,
+}
+
+async fn agent_caller(
+    api: &Api,
+    headers: &HeaderMap,
+    ip: Option<IpAddr>,
+) -> Result<Caller, AuthError> {
+    let caller = caller(api, headers).await?;
+    api.limits
+        .check(
+            Action::AgentManagement,
+            ip,
+            Some(&caller.user_id.to_string()),
+        )
+        .await?;
+    Ok(caller)
+}
+
+async fn reserve_agent(
+    State(api): State<Api>,
+    headers: HeaderMap,
+    ClientIp(ip): ClientIp,
+    JsonBody(body): JsonBody<AgentBody>,
+) -> Result<Response, AuthError> {
+    let caller = agent_caller(&api, &headers, ip).await?;
+    let reservation = api
+        .auth
+        .reserve_agent(caller, &body.handle, &body.display_name)
+        .await?;
+    let mut response = (StatusCode::CREATED, Json(json!({
+                "user_id": reservation.user_id, "enrollment_code": reservation.enrollment_code,
+                "expires_in_s": crate::agents::ENROLLMENT_SECONDS, "expires_at": reservation.expires_at.to_rfc3339(),
+            }))).into_response();
+    response.extensions_mut().insert(Subject {
+        user: Some(caller.user_id),
+        device: Some(caller.device_id),
+    });
+    Ok(response)
+}
+
+async fn list_agents(
+    State(api): State<Api>,
+    headers: HeaderMap,
+    ClientIp(ip): ClientIp,
+) -> Result<Response, AuthError> {
+    let caller = agent_caller(&api, &headers, ip).await?;
+    Ok(Json(json!({"agents": api.auth.owned_agents(caller).await?})).into_response())
+}
+
+async fn update_agent(
+    State(api): State<Api>,
+    headers: HeaderMap,
+    ClientIp(ip): ClientIp,
+    Path(id): Path<String>,
+    JsonBody(body): JsonBody<ProfileBody>,
+) -> Result<Response, AuthError> {
+    let caller = agent_caller(&api, &headers, ip).await?;
+    let id = id.parse().map_err(|_| AuthError::AgentNotFound)?;
+    api.auth
+        .change_agent(
+            caller,
+            id,
+            body.handle.as_deref(),
+            body.display_name.as_deref(),
+            false,
+        )
+        .await?;
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    response.extensions_mut().insert(Subject {
+        user: Some(caller.user_id),
+        device: Some(caller.device_id),
+    });
+    Ok(response)
+}
+
+async fn delete_agent(
+    State(api): State<Api>,
+    headers: HeaderMap,
+    ClientIp(ip): ClientIp,
+    Path(id): Path<String>,
+) -> Result<Response, AuthError> {
+    let caller = agent_caller(&api, &headers, ip).await?;
+    let id = id.parse().map_err(|_| AuthError::AgentNotFound)?;
+    api.auth.change_agent(caller, id, None, None, true).await?;
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    response.extensions_mut().insert(Subject {
+        user: Some(caller.user_id),
+        device: Some(caller.device_id),
+    });
+    Ok(response)
+}
 #[derive(Deserialize)]
 struct RefreshBody {
     refresh_token: String,
@@ -580,6 +689,8 @@ fn own_profile_json(profile: &crate::profiles::OwnProfile) -> Value {
         "handle": profile.handle,
         "display_name": profile.display_name,
         "email": profile.email,
+        "kind": profile.kind,
+        "owner_user_id": profile.owner_user_id,
     })
 }
 
@@ -646,6 +757,8 @@ async fn lookup(
         "user_id": profile.user_id,
         "handle": profile.handle,
         "display_name": profile.display_name,
+        "kind": profile.kind,
+        "owner_user_id": profile.owner_user_id,
     }))
     .into_response())
 }
@@ -677,6 +790,8 @@ async fn profiles(
                 "user_id": profile.user_id,
                 "handle": profile.handle,
                 "display_name": profile.display_name,
+                "kind": profile.kind,
+                "owner_user_id": profile.owner_user_id,
             })
         })
         .collect();

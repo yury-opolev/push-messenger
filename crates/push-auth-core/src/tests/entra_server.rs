@@ -32,6 +32,16 @@ pub(super) async fn ready(client: &reqwest::Client, health: SocketAddr) {
 
 #[tokio::test]
 async fn the_service_starts_entra_only_and_signs_in_over_a_socket() {
+    service_offer("entra").await;
+}
+
+#[tokio::test]
+async fn the_service_exposes_only_explicitly_enabled_app_and_user_routes() {
+    service_offer("entra-app").await;
+    service_offer("entra,entra-app").await;
+}
+
+async fn service_offer(providers: &str) {
     let postgres = Postgres::default()
         .with_tag("17-alpine")
         .start()
@@ -86,6 +96,8 @@ async fn the_service_starts_entra_only_and_signs_in_over_a_socket() {
         ),
     ];
     variables.extend(stub.variables());
+    variables.retain(|(key, _)| key != "PUSH_AUTH_PROVIDERS");
+    variables.push(("PUSH_AUTH_PROVIDERS".to_owned(), providers.to_owned()));
     let config = Config::from_lookup(|name| {
         variables
             .iter()
@@ -117,7 +129,30 @@ async fn the_service_starts_entra_only_and_signs_in_over_a_socket() {
         .send()
         .await
         .unwrap();
-    assert_eq!(signed_in.status(), 200);
+    let user_enabled = providers.split(',').any(|provider| provider == "entra");
+    assert_eq!(signed_in.status(), if user_enabled { 200 } else { 404 });
+    let mut app_claims = stub.user_claims(
+        crate::entra::testing::TENANT,
+        "55555555-0000-4000-8000-000000000005",
+    );
+    app_claims.as_object_mut().unwrap().remove("scp");
+    app_claims["idtyp"] = json!("app");
+    let app = client.post(format!("http://{addr}/v1/auth/entra-app"))
+        .json(&json!({"token": crate::entra::testing::sign(crate::entra::testing::KEY_A, &app_claims)}))
+        .send().await.unwrap();
+    assert_eq!(
+        app.status(),
+        if providers.contains("entra-app") {
+            403
+        } else {
+            404
+        }
+    );
+    let accounts: i64 = sqlx::query_scalar("SELECT count(*) FROM auth.user_account")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(accounts, if user_enabled { 2 } else { 1 });
     let login = client
         .post(format!("http://{addr}/v1/auth/login"))
         .json(&json!({"email": "a@example.com", "password": "correct horse"}))

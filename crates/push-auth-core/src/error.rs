@@ -27,6 +27,18 @@ pub enum AuthError {
     DeviceNotFound,
     #[error("no such user")]
     UserNotFound,
+    #[error("no such agent")]
+    AgentNotFound,
+    #[error("the owner already has the most agents allowed")]
+    TooManyAgents,
+    #[error(
+        "agent enrollment is not permitted; a human owner and an unambiguous allowed tenant are required"
+    )]
+    EnrollmentNotPermitted,
+    #[error("the enrollment code is invalid, expired or already used")]
+    EnrollmentInvalid,
+    #[error("this app identity is already bound to an account")]
+    IdentityInUse,
     #[error("the Microsoft Entra ID token is not accepted")]
     EntraTokenInvalid,
     #[error("Microsoft Entra ID cannot be reached to check the token; try again")]
@@ -63,6 +75,11 @@ impl AuthError {
             Self::TooManyDevices => "too_many_devices",
             Self::DeviceNotFound => "device_not_found",
             Self::UserNotFound => "user_not_found",
+            Self::AgentNotFound => "agent_not_found",
+            Self::TooManyAgents => "too_many_agents",
+            Self::EnrollmentNotPermitted => "enrollment_not_permitted",
+            Self::EnrollmentInvalid => "enrollment_invalid",
+            Self::IdentityInUse => "identity_in_use",
             Self::EntraTokenInvalid => "entra_token_invalid",
             Self::EntraUnavailable => "entra_unavailable",
             Self::TokenInvalid => "token_invalid",
@@ -77,16 +94,21 @@ impl AuthError {
     /// The HTTP status of the answer.
     pub fn status(&self) -> u16 {
         match self {
-            Self::Invalid(_) | Self::LinkInvalid | Self::LinkExpired => 400,
+            Self::Invalid(_) | Self::LinkInvalid | Self::LinkExpired | Self::EnrollmentInvalid => {
+                400
+            }
             Self::InvalidCredentials
             | Self::Unauthorized
             | Self::TokenExpired
             | Self::EntraTokenInvalid
             | Self::TokenInvalid
             | Self::SessionExpired => 401,
-            Self::EmailNotVerified | Self::SignInNotPermitted => 403,
-            Self::DeviceNotFound | Self::UserNotFound => 404,
-            Self::HandleTaken | Self::TooManyDevices => 409,
+            Self::EmailNotVerified | Self::SignInNotPermitted | Self::EnrollmentNotPermitted => 403,
+            Self::DeviceNotFound | Self::UserNotFound | Self::AgentNotFound => 404,
+            Self::HandleTaken
+            | Self::TooManyDevices
+            | Self::TooManyAgents
+            | Self::IdentityInUse => 409,
             Self::RateLimited { .. } => 429,
             Self::Unavailable | Self::EntraUnavailable | Self::IdentityUnavailable => 503,
         }

@@ -89,12 +89,74 @@ async fn the_owner_migrates_and_a_second_run_changes_nothing() {
     assert_eq!(
         tables,
         [
+            "agent_enrollment",
             "device",
             "external_identity",
             "outbox",
             "refresh_token",
             "user_account"
         ]
+    );
+}
+
+#[tokio::test]
+async fn agents_have_an_immutable_human_owner_and_no_human_credentials() {
+    let (_container, url) = auth_database().await;
+    let pool = migrated(&url).await;
+    let owner = insert_user(&pool, "owner@example.com", "owner")
+        .await
+        .unwrap();
+    let other = insert_user(&pool, "other@example.com", "other")
+        .await
+        .unwrap();
+    let agent = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO auth.user_account (user_id,handle,display_name,kind,owner_user_id) \
+         VALUES ($1,'agent','Agent','agent',$2)",
+    )
+    .bind(agent)
+    .bind(owner)
+    .execute(&pool)
+    .await
+    .expect("pending agent has no email or password");
+    for statement in [
+        "UPDATE auth.user_account SET owner_user_id=$2 WHERE user_id=$1",
+        "UPDATE auth.user_account SET kind='user',owner_user_id=NULL,email='agent@example.com',password_hash='hash' WHERE user_id=$1",
+        "UPDATE auth.user_account SET password_hash='hash' WHERE user_id=$1",
+        "UPDATE auth.user_account SET owner_user_id=user_id WHERE user_id=$1",
+    ] {
+        let query = sqlx::query(statement).bind(agent);
+        let query = if statement.contains("$2") {
+            query.bind(other)
+        } else {
+            query
+        };
+        let error = query.execute(&pool).await.unwrap_err();
+        assert_eq!(
+            error.as_database_error().unwrap().code().as_deref(),
+            Some("23514")
+        );
+    }
+    let error = sqlx::query(
+        "INSERT INTO auth.user_account (user_id,handle,display_name,kind,owner_user_id) \
+         VALUES ($1,'nested_agent','Nested','agent',$2)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(agent)
+    .execute(&pool)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        error.as_database_error().unwrap().code().as_deref(),
+        Some("23514")
+    );
+    assert!(
+        sqlx::query("UPDATE auth.user_account SET disabled_at=now() WHERE user_id=$1")
+            .bind(owner)
+            .execute(&pool)
+            .await
+            .is_err(),
+        "only agents have a disabled tombstone"
     );
 }
 

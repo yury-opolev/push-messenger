@@ -1,13 +1,13 @@
-//! The smoke test of a Microsoft Entra ID-only deployment (Plan 13B), run instead of the
-//! email/password one when `--entra-token-url` names the DEV ONLY issuer's token endpoint
-//! (`push-dev-entra sign-in`): the email/password routes answer 404 through the ingress;
-//! two apps built on push-sdk sign in with Entra ID tokens, register, become contacts by
-//! invite and chat; signing in again keeps the device. Tokens are never printed.
+//! Entra smoke: two SDK apps sign in, register, connect, become contacts and chat;
+//! signing in again keeps the device. Operator accounts need no DEV issuer or service
+//! credentials. The backwards-compatible DEV issuer mode also checks that password
+//! routes answer 404. Tokens and operator HTTP diagnostics are never printed.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
+use push_load::accounts::Account;
 use push_sdk::{
     Client, Config, ConnectionState, ContactState, Event, Events, MemorySecretStore, MessageStatus,
     Platform, UserId,
@@ -19,7 +19,7 @@ use crate::{STEP_TIMEOUT, Target, WORKER_TIMEOUT, step};
 
 struct App {
     name: &'static str,
-    oid: String,
+    source: Source,
     client: Client,
     events: Events,
     user: UserId,
@@ -27,35 +27,98 @@ struct App {
 
 /// Runs the Entra ID smoke test against `target`, with user tokens from `token_url`.
 pub async fn run(target: &Target, token_url: &str) -> anyhow::Result<()> {
+    run_with(
+        target,
+        [
+            Source::Dev {
+                url: token_url.to_owned(),
+                oid: Uuid::now_v7().to_string(),
+            },
+            Source::Dev {
+                url: token_url.to_owned(),
+                oid: Uuid::now_v7().to_string(),
+            },
+        ],
+        true,
+    )
+    .await
+}
+
+/// Uses two preexisting, distinct Entra accounts; never contacts a development issuer.
+pub async fn run_accounts(target: &Target, accounts: &[Account]) -> anyhow::Result<()> {
+    if accounts.len() != 2 || accounts.iter().any(|account| !account.is_entra()) {
+        bail!("operator smoke requires exactly two preexisting Entra accounts");
+    }
+    if accounts[0].email == accounts[1].email {
+        bail!("operator smoke requires two distinct Entra identities");
+    }
+    run_with(
+        target,
+        [
+            Source::Operator(accounts[0].clone()),
+            Source::Operator(accounts[1].clone()),
+        ],
+        false,
+    )
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "operator Entra smoke failed; HTTP diagnostics suppressed to protect credentials"
+        )
+    })
+}
+
+#[derive(Clone)]
+enum Source {
+    Dev { url: String, oid: String },
+    Operator(Account),
+}
+
+impl Source {
+    async fn token(&self, http: &reqwest::Client) -> anyhow::Result<String> {
+        match self {
+            Self::Dev { url, oid } => mint(http, url, oid).await,
+            Self::Operator(account) => account.entra_token()?.context("expected an Entra account"),
+        }
+    }
+}
+
+async fn run_with(target: &Target, sources: [Source; 2], dev: bool) -> anyhow::Result<()> {
     let started = Instant::now();
     let http = reqwest::Client::builder()
         .timeout(STEP_TIMEOUT)
         .no_proxy()
         .build()?;
-    for path in [
-        "/v1/auth/login",
-        "/v1/auth/signup",
-        "/v1/auth/password/forgot",
-    ] {
-        let mut request = http
-            .post(format!("{}{path}", target.auth_url.trim_end_matches('/')))
-            .json(&json!({"email": "nobody@smoke.test", "password": "not a password"}));
-        if let Some(host) = &target.host {
-            request = request.header(reqwest::header::HOST, host);
+    if dev {
+        for path in [
+            "/v1/auth/login",
+            "/v1/auth/signup",
+            "/v1/auth/password/forgot",
+        ] {
+            let mut request = http
+                .post(format!("{}{path}", target.auth_url.trim_end_matches('/')))
+                .json(&json!({"email": "nobody@smoke.test", "password": "not a password"}));
+            if let Some(host) = &target.host {
+                request = request.header(reqwest::header::HOST, host);
+            }
+            let status = request
+                .send()
+                .await
+                .with_context(|| format!("POST {path}"))?
+                .status();
+            if status != reqwest::StatusCode::NOT_FOUND {
+                bail!("POST {path} answered {status}, not 404: email and password sign-in is on");
+            }
         }
-        let status = request
-            .send()
-            .await
-            .with_context(|| format!("POST {path}"))?
-            .status();
-        if status != reqwest::StatusCode::NOT_FOUND {
-            bail!("POST {path} answered {status}, not 404: email and password sign-in is on");
-        }
+        step("email and password sign-in is off: login, signup and password reset answer 404");
     }
-    step("email and password sign-in is off: login, signup and password reset answer 404");
 
-    let mut erin = App::sign_in(target, &http, token_url, "erin").await?;
-    let mut finn = App::sign_in(target, &http, token_url, "finn").await?;
+    let [erin_source, finn_source] = sources;
+    let mut erin = App::sign_in(target, &http, erin_source, "erin").await?;
+    let mut finn = App::sign_in(target, &http, finn_source, "finn").await?;
+    if erin.user == finn.user {
+        bail!("the server mapped both Entra identities to the same account");
+    }
     let invite = erin.client.create_invite(600, 1).await?;
     if finn.client.redeem_invite(&invite.code).await? != erin.user {
         bail!("finn's redeem named someone other than erin");
@@ -90,7 +153,7 @@ pub async fn run(target: &Target, token_url: &str) -> anyhow::Result<()> {
         .account()?
         .context("erin is signed in")?
         .device_id;
-    let token = mint(&http, token_url, &erin.oid).await?;
+    let token = erin.source.token(&http).await?;
     let again = erin
         .client
         .sign_in_with_entra(&token, None, "erin's app", Platform::Other)
@@ -128,7 +191,7 @@ impl App {
     async fn sign_in(
         target: &Target,
         http: &reqwest::Client,
-        token_url: &str,
+        source: Source,
         name: &'static str,
     ) -> anyhow::Result<Self> {
         let oid = Uuid::now_v7().to_string();
@@ -142,11 +205,12 @@ impl App {
         // The smoke test reaches the cluster's Services over plain HTTP, inside the cluster.
         config.allow_insecure_transport = true;
         let (client, events) = Client::open(config, Arc::new(MemorySecretStore::new()))?;
-        let token = mint(http, token_url, &oid).await?;
+        let token = source.token(http).await?;
+        let handle = matches!(&source, Source::Dev { .. }).then(|| format!("{name}_{suffix}"));
         let account = client
             .sign_in_with_entra(
                 &token,
-                Some(&format!("{name}_{suffix}")),
+                handle.as_deref(),
                 &format!("{name}'s app"),
                 Platform::Other,
             )
@@ -155,7 +219,7 @@ impl App {
         client.connect()?;
         let mut app = Self {
             name,
-            oid,
+            source,
             client,
             events,
             user: account.user_id,

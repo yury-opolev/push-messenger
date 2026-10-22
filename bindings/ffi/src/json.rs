@@ -142,6 +142,8 @@ pub fn profile(profile: &Profile) -> Value {
         "userId": profile.user_id.to_string(),
         "handle": profile.handle,
         "displayName": profile.display_name,
+        "kind": profile.kind,
+        "ownerUserId": profile.owner_user_id.map(|id| id.to_string()),
     })
 }
 

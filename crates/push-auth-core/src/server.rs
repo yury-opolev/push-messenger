@@ -106,6 +106,13 @@ pub async fn serve_with(
         Some(settings) => Some(EntraSignIn::new(settings.clone()).map_err(anyhow::Error::msg)?),
         None => None,
     };
+    let entra_app = match (&entra, &config.entra_app) {
+        (Some(verifier), Some(settings)) => {
+            Some(verifier.app(settings.clone()).map_err(anyhow::Error::msg)?)
+        }
+        _ => None,
+    };
+    let entra = entra.filter(|_| config.providers.entra);
     let azure = config
         .azure
         .as_ref()
@@ -179,10 +186,15 @@ pub async fn serve_with(
             hash_wait: HASH_WAIT,
         },
     )
+    .with_agents_per_user(config.agents_per_user)
     .with_sign_in(SignIn {
         password: config.providers.password,
         entra,
     });
+    let auth = match entra_app {
+        Some(app) => auth.with_entra_app(app),
+        None => auth,
+    };
     let auth = match overrides.authenticator {
         Some(authenticator) => auth.with_external(authenticator),
         None => auth,
@@ -306,6 +318,9 @@ pub(crate) fn check_overrides(providers: &Providers, overrides: &Overrides) -> R
                      external)"
                 ));
             }
+            if id == crate::identity::ENTRA_APP_PROVIDER {
+                return Err("entra-app is a built-in provider: explicitly enable it in PUSH_AUTH_PROVIDERS, not an Overrides authenticator".to_owned());
+            }
             if providers.entra && id == ENTRA_PROVIDER {
                 return Err("PUSH_AUTH_PROVIDERS names entra and external, but the \
                             authenticator in Overrides has the id entra too: drop entra \
@@ -322,7 +337,11 @@ pub(crate) fn check_overrides(providers: &Providers, overrides: &Overrides) -> R
         }
         (None, false) => {}
     }
-    if overrides.admission.is_some() && !providers.entra && !providers.external {
+    if overrides.admission.is_some()
+        && !providers.entra
+        && !providers.entra_app
+        && !providers.external
+    {
         return Err(
             "an admission was supplied in Overrides, but PUSH_AUTH_PROVIDERS names \
                     neither entra nor external: no sign-in would ask it"
@@ -517,6 +536,7 @@ mod tests {
             ("password,entra", Overrides::default()),
             ("external", with("acme", hour)),
             ("entra,external", with("acme-id", hour)),
+            ("entra-app,external", with("acme-id", hour)),
             ("external", with("entra", Duration::from_secs(720 * 3600))),
             ("password,external", with("a", Duration::from_secs(1))),
             (
@@ -524,6 +544,13 @@ mod tests {
                 Overrides {
                     authenticator: None,
                     admission: Some(RequireGroup::new("staff")),
+                },
+            ),
+            (
+                "entra-app",
+                Overrides {
+                    authenticator: None,
+                    admission: Some(RequireGroup::new("agents")),
                 },
             ),
         ] {
@@ -548,6 +575,12 @@ mod tests {
                 "is not a provider id",
             ),
             ("entra,external", with("entra", hour), "entra too"),
+            ("external", with("entra-app", hour), "built-in provider"),
+            (
+                "entra-app,external",
+                with("entra-app", hour),
+                "built-in provider",
+            ),
             ("external", with("acme", Duration::ZERO), "1 s to 720 h"),
             (
                 "external",

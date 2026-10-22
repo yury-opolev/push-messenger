@@ -218,6 +218,23 @@ async fn events_move_from_the_outbox_to_the_queue_once() {
 }
 
 #[tokio::test]
+async fn owned_agent_enrollment_is_a_durable_account_event() {
+    let world = world().await;
+    let (owner, agent) = (Uuid::now_v7(), Uuid::now_v7());
+    sqlx::query(
+        "INSERT INTO auth.outbox (event_id, kind, payload) VALUES ($1, 'agent.enrolled', $2)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(json!({"user_id": agent, "owner_user_id": owner}))
+    .execute(&world.auth)
+    .await
+    .unwrap();
+    assert_eq!(world.relay.drain_once().await.unwrap(), 1);
+    let jobs = world.queue.claim(10).await.unwrap();
+    assert_eq!(run(&world, &jobs).await, vec![Outcome::Done]);
+}
+
+#[tokio::test]
 async fn relayed_events_register_and_revoke_devices_in_message_svc_in_any_order() {
     let world = world().await;
     let (user, phone, tablet) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());

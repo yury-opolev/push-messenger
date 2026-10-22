@@ -3,6 +3,7 @@
 //! redeems authorization codes and holds no client secret. Tokens, object ids, names and
 //! email addresses are never logged.
 
+mod app;
 mod claims;
 mod keys;
 mod settings;
@@ -23,6 +24,7 @@ use uuid::Uuid;
 
 use crate::identity::{AuthenticationError, Authenticator, ENTRA_PROVIDER, Principal};
 
+pub use app::{EntraAppSettings, EntraAppSignIn};
 pub use keys::KeyTiming;
 pub use settings::{
     CONSUMERS_TENANT, DEFAULT_AUTHORITY_HOST, DEFAULT_REQUIRED_SCOPE, EntraSettings, Providers,
@@ -211,6 +213,17 @@ impl EntraSignIn {
 
     /// The identity of an acceptable token, and the token's whole verified payload.
     async fn check(&self, token: &str) -> Result<(EntraIdentity, Map<String, Value>), EntraError> {
+        let (claims, tenant, payload) = self.verified(token).await?;
+        let identity =
+            claims::check(&claims, tenant, &self.settings).map_err(EntraError::Rejected)?;
+        Ok((identity, payload))
+    }
+
+    /// Cryptographic and common claim checks, shared by delegated and app-only policy.
+    async fn verified(
+        &self,
+        token: &str,
+    ) -> Result<(claims::EntraClaims, Uuid, Map<String, Value>), EntraError> {
         let malformed = EntraError::Rejected(Reason::Malformed);
         let parts: Vec<&str> = token.split('.').collect();
         if token.len() > MAX_TOKEN_BYTES || parts.len() != 3 {
@@ -252,9 +265,7 @@ impl EntraSignIn {
         // A claim of the wrong JSON type makes the whole token malformed, as before.
         let claims: claims::EntraClaims = serde_json::from_value(Value::Object(payload.clone()))
             .map_err(|_| EntraError::Rejected(Reason::Malformed))?;
-        let identity =
-            claims::check(&claims, tenant, &self.settings).map_err(EntraError::Rejected)?;
-        Ok((identity, payload))
+        Ok((claims, tenant, payload))
     }
 }
 

@@ -246,6 +246,20 @@ Check 'default: groups are refused; one switch serves them' {
 }
 Check 'default: the DevSetup switch is gone' { $default -notmatch 'PUSH_DEV_SETUP' }
 Check 'default: no smoke test' { $default -notmatch 'helm.sh/hook: test' -and $default -notmatch 'PUSH_SMOKE_SIGNING_KEY' }
+Check 'operator smoke: consumer Secret enables helm test without DEV credentials' {
+    $rendered = helm template push $chart --set smoke.entraAccountsSecret=operator-accounts | Out-String
+    $smoke = Doc $rendered 'Pod' 'push-smoke'
+    $smoke -and $smoke -match '(?s)- --entra-accounts\s+- "/operator-accounts/accounts.jsonl"' -and
+        $smoke -match 'secretName: "?operator-accounts"?' -and
+        $smoke -match 'mountPath: /operator-accounts' -and
+        $smoke -notmatch 'PUSH_SMOKE_SIGNING_KEY|--mailbox|--entra-token-url'
+}
+Check 'operator smoke: issuer input is mutually exclusive and accounts key is a filename' {
+    (Render @('--set', 'smoke.entraAccountsSecret=operator-accounts',
+        '--set', 'smoke.entraTokenUrl=http://stub/dev/token')) -ne 0 -and
+    (Render @('--set', 'smoke.entraAccountsSecret=operator-accounts',
+        '--set', 'smoke.entraAccountsKey=../accounts.jsonl')) -ne 0
+}
 Check 'default: the worker has no dev mailbox and logs email; auth-svc has no mailbox at all' {
     $worker = Doc $default 'Deployment' 'push-worker'
     $auth = Doc $default 'Deployment' 'push-auth'
@@ -325,7 +339,7 @@ Check 'default: the ingress routes the auth API, not /dev, with Exact link route
     $ingress = Doc $default 'Ingress' 'push-auth'
     $links = Doc $default 'Ingress' 'push-auth-links'
     $ingress -match 'path: /v1/auth\s' -and $ingress -match 'path: /v1/devices\s' -and
-        $ingress -match 'path: /v1/users\s' -and $default -notmatch 'path: /dev' -and
+        $ingress -match 'path: /v1/users\s' -and $ingress -match 'path: /v1/agents\s' -and $default -notmatch 'path: /dev' -and
         $default -notmatch 'nginx\.ingress\.kubernetes\.io/' -and
         $links -match 'path: /v1/auth/verify\s+pathType: Exact' -and
         $links -match 'path: /v1/auth/password/reset\s+pathType: Exact'
@@ -483,6 +497,37 @@ Check 'entra: the migration Job needs an Entra PostgreSQL, its user and its clie
 }
 Check 'entra: role names are Entra principal names' {
     (Render ($entraArgs + @('--set', 'postgres.external.users.auth=bad"name'))) -ne 0
+}
+Check 'entra: migration egress policy is a persistent pre-install/pre-upgrade hook before the Job' {
+    $rendered = helm template push $chart @entraArgs --set migrations.job.enabled=true `
+        --set postgres.external.users.migrate=push-migrator-id `
+        --set azure.workloadIdentity.clientIds.migrate=00000000-0000-0000-0000-00000000000e `
+        --set networkPolicy.egress.enabled=true `
+        --set 'networkPolicy.egress.postgresCidrs={10.20.0.4/32}' `
+        --set 'networkPolicy.egress.httpsCidrs={20.0.0.0/8}' | Out-String
+    $validate = @'
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(sys.stdin.read()) if d]
+policies = [d for d in docs if d["kind"] == "NetworkPolicy"]
+assert not any(d["metadata"]["name"] == "push-migrate" for d in policies), "legacy ordinary policy name must not collide with the retained hook during upgrade cleanup"
+policy = next(d for d in policies if d["metadata"]["name"] == "push-migrate-egress")
+job = next(d for d in docs if d["kind"] == "Job" and d["metadata"]["name"] == "push-migrate")
+a = policy["metadata"].get("annotations", {})
+assert a.get("helm.sh/hook") == "pre-install,pre-upgrade", "migration policy must precede ordinary release resources"
+assert job["metadata"]["annotations"]["helm.sh/hook"] == a["helm.sh/hook"], "policy must run on both Job lifecycle events"
+assert int(a["helm.sh/hook-weight"]) < int(job["metadata"]["annotations"]["helm.sh/hook-weight"])
+assert a["helm.sh/hook-delete-policy"] == "before-hook-creation", "policy must persist through Job completion and upgrade cleanup"
+assert policy["spec"]["podSelector"] == {"matchLabels": {
+    "app.kubernetes.io/name": "migrate", "app.kubernetes.io/instance": "push"}}, "renaming the policy must preserve the legacy pod selector"
+assert policy["spec"]["podSelector"]["matchLabels"].items() <= job["spec"]["template"]["metadata"]["labels"].items()
+ports = {p["port"] for r in policy["spec"]["egress"] for p in r["ports"]}
+assert ports == {53, 443, 5432}
+for d in docs:
+    if d["kind"] == "NetworkPolicy" and d is not policy:
+        assert "helm.sh/hook" not in d["metadata"].get("annotations", {}), "ordinary policies must remain ordinary"
+'@
+    $rendered | & $python.Source -c $validate
+    $LASTEXITCODE -eq 0
 }
 # The default render with the Secret's generated values masked: they are random per render.
 function Normalized([string] $rendered) {
@@ -668,7 +713,7 @@ expected = {
     "push-message-svc": {("10.1.0.4/32", 5432), ("10.1.0.5/32", 10000), ("20.190.128.0/18", 443)},
     "push-gateway": {("auth", 8080), ("message-svc", 50051), ("10.1.0.5/32", 10000), ("20.190.128.0/18", 443)},
     "push-worker": {("message-svc", 50052), ("10.1.0.4/32", 5432), ("20.190.128.0/18", 443)},
-    "push-migrate": {("10.1.0.4/32", 5432), ("20.190.128.0/18", 443)},
+    "push-migrate-egress": {("10.1.0.4/32", 5432), ("20.190.128.0/18", 443)},
 }
 assert set(policies) == set(expected), sorted(policies)
 for name, wanted in expected.items():
@@ -683,8 +728,8 @@ for name, wanted in expected.items():
                              "podSelector": {"matchLabels": {"k8s-app": "kube-dns"}}}], name
     got = {(peer, port) for r in rules if r not in dns for peer in peers(r) for (_, port) in ports(r)}
     assert got == wanted, (name, got)
-assert policies["push-migrate"]["ingress"] == []
-assert policies["push-migrate"]["podSelector"]["matchLabels"]["app.kubernetes.io/name"] == "migrate"
+assert policies["push-migrate-egress"]["ingress"] == []
+assert policies["push-migrate-egress"]["podSelector"]["matchLabels"]["app.kubernetes.io/name"] == "migrate"
 '@
     $rendered | & $python.Source -c $egress; $LASTEXITCODE -eq 0
 }
@@ -709,6 +754,54 @@ $signInArgs = @(
     '--set', 'auth.signIn.entra.tenants={33333333-0000-4000-8000-000000000003}'
 )
 Check 'sign-in: a complete Entra-only configuration renders' { (Render $signInArgs) -eq 0 }
+$appSignInArgs = $signInArgs + @('--set', 'auth.signIn.providers=entra-app')
+Check 'app sign-in: opt-in renders app-only and mixed modes with independent policy' {
+    $rendered = helm template push $chart @appSignInArgs `
+        --set auth.signIn.entraApp.requiredRole=Agent.Run `
+        --set 'auth.signIn.entraApp.allowedClientApps={22222222-0000-4000-8000-000000000002}' `
+        --set auth.signIn.entraApp.maxSessionHours=2 --set auth.agentsPerUser=0 2>&1 | Out-String
+    $exit = $LASTEXITCODE
+    $auth = Doc $rendered 'Deployment' 'push-auth'
+    $exit -eq 0 -and
+        $auth -match '(?s)name: PUSH_AUTH_PROVIDERS\s+value: "entra-app"' -and
+        $auth -match '(?s)name: PUSH_ENTRA_APP_REQUIRED_ROLE\s+value: "Agent.Run"' -and
+        $auth -match '(?s)name: PUSH_ENTRA_APP_ALLOWED_CLIENT_APPS\s+value: "22222222-0000-4000-8000-000000000002"' -and
+        $auth -match '(?s)name: PUSH_ENTRA_APP_MAX_SESSION_HOURS\s+value: "2"' -and
+        $auth -match '(?s)name: PUSH_AGENTS_PER_USER\s+value: "0"' -and
+        $auth -notmatch 'PUSH_ENTRA_REQUIRED_SCOPE|PUSH_ENTRA_REQUIRED_ROLE|PUSH_ENTRA_MAX_SESSION_HOURS' -and
+        (Render ($appSignInArgs + @('--set', 'auth.signIn.providers=password\,entra-app'))) -eq 0 -and
+        (Render ($appSignInArgs + @('--set', 'auth.signIn.providers=entra\,entra-app'))) -eq 0 -and
+        (Render ($appSignInArgs + @('--set', 'auth.signIn.providers=entra-app\,password\,entra'))) -eq 0
+}
+Check 'app sign-in: bounded tenants and policy validation reject unsafe modes' {
+    $bad = @(
+        'auth.signIn.entra.tenants={common}',
+        'auth.signIn.entra.tenants={organizations}',
+        'auth.signIn.entra.tenants={consumers}',
+        'auth.signIn.entraApp.requiredRole=two roles',
+        'auth.signIn.entraApp.allowedClientApps={bad}',
+        'auth.signIn.entraApp.allowedClientApps=not-a-list',
+        'auth.signIn.entraApp.maxSessionHours=0',
+        'auth.signIn.entraApp.maxSessionHours=721',
+        'auth.signIn.entraApp.maxSessionHours=1.5',
+        'auth.agentsPerUser=-1',
+        'auth.agentsPerUser=101',
+        'auth.agentsPerUser=1.5',
+        'auth.signIn.providers=entra-app\,entra-app'
+    )
+    @($bad | Where-Object { (Render ($appSignInArgs + @('--set', $_))) -eq 0 }).Count -eq 0 -and
+        (Render ($appSignInArgs + @('--set', 'auth.signIn.entraApp.maxSessionHours=720', '--set', 'auth.agentsPerUser=100'))) -eq 0
+}
+Check 'app sign-in: defaults stay off, egress and email-off rules apply' {
+    $default = helm template push $chart | Out-String
+    $app = helm template push $chart @appSignInArgs --set networkPolicy.egress.enabled=true `
+        --set 'networkPolicy.egress.entraSignInCidrs={20.190.128.0/18}' | Out-String
+    $default -notmatch 'PUSH_ENTRA_APP_|entra-app' -and
+        $app -match 'cidr: 20.190.128.0/18' -and
+        (Render ($appSignInArgs + @('--set', 'networkPolicy.egress.enabled=true'))) -ne 0 -and
+        (Render ($appSignInArgs + @('--set', 'worker.email.sender=none'))) -eq 0 -and
+        (Render ($appSignInArgs + @('--set', 'worker.email.webhook.enabled=true'))) -ne 0
+}
 Check 'sign-in: both providers render, in either order' {
     (Render ($signInArgs + @('--set', 'auth.signIn.providers=password\,entra'))) -eq 0 -and
         (Render ($signInArgs + @('--set', 'auth.signIn.providers=entra\, password'))) -eq 0

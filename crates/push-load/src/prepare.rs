@@ -79,9 +79,9 @@ impl From<anyhow::Error> for Failure {
 fn classify(error: ApiError) -> Failure {
     match error {
         ApiError::Rejected { status: 401, .. } => {
-            Failure::Account("invalid_credentials: wrong email or password".to_owned())
+            Failure::Account("invalid_credentials: password or Entra token was refused".to_owned())
         }
-        ApiError::Rejected { status: 403, .. } => {
+        ApiError::Rejected { status: 403, code } if code == "email_not_verified" => {
             Failure::Account("email_not_verified: verify the account before using it".to_owned())
         }
         ApiError::Rejected { status: 409, .. } => Failure::Account(
@@ -110,6 +110,13 @@ pub async fn prepare(
     }
     if accounts.len() * options.devices_per_account > MAX_CONNECTIONS {
         bail!("at most {MAX_CONNECTIONS} devices: use fewer accounts or devices per account");
+    }
+    let mut unique = HashSet::new();
+    if accounts
+        .iter()
+        .any(|account| !unique.insert(account.email.to_lowercase()))
+    {
+        bail!("the same account appears twice");
     }
     let mut state = State::load(state_path)?.unwrap_or_else(|| State::new(target.authority()));
     if state.target != target.authority() {
@@ -167,6 +174,20 @@ pub async fn prepare(
     }
     while let Some(joined) = workers.join_next().await {
         joined.context("a preparation worker panicked")??;
+    }
+    {
+        let state = shared.state.lock().await;
+        let mut users = HashSet::new();
+        for &index in &indices {
+            if state.accounts[index]
+                .user_id
+                .is_some_and(|user| !users.insert(user))
+            {
+                bail!(
+                    "distinct account inputs resolved to the same server account; use separate test identities"
+                );
+            }
+        }
     }
     let pairs_ready = prepare_pairs(&api, target, &shared, &indices, options.sample_pairs).await?;
     let state = shared.state.lock().await;
@@ -265,10 +286,7 @@ async fn prepare_account(
         })
         .await;
     for (device, device_id) in repairs {
-        match api
-            .login_device(&account.email, &account.password, device_id)
-            .await
-        {
+        match api.login_account_device(account, device_id).await {
             Ok(tokens) => {
                 shared
                     .update(|state| store(state, index, device, tokens))
@@ -306,10 +324,7 @@ async fn prepare_account(
         let token = match &registration {
             Some(token) => token.clone(),
             None => {
-                let token = api
-                    .login(&account.email, &account.password)
-                    .await
-                    .map_err(classify)?;
+                let token = api.login_account(account).await.map_err(classify)?;
                 registration = Some(token.clone());
                 token
             }
@@ -505,4 +520,210 @@ async fn make_pair(
     .await;
     socket::close(a).await;
     result
+}
+
+#[cfg(test)]
+mod operator_tests {
+    use super::*;
+    use axum::{Json, Router, extract::Request, routing::post};
+    use serde_json::{Value, json};
+
+    #[test]
+    fn password_email_not_verified_keeps_verification_advice() {
+        let failure = classify(ApiError::Rejected {
+            status: 403,
+            code: "email_not_verified".to_owned(),
+        });
+        assert!(matches!(
+            failure,
+            Failure::Account(message)
+                if message == "email_not_verified: verify the account before using it"
+        ));
+    }
+
+    #[test]
+    fn forbidden_codes_do_not_imply_unverified_email() {
+        for code in ["sign_in_not_permitted", "request_refused"] {
+            let failure = classify(ApiError::Rejected {
+                status: 403,
+                code: code.to_owned(),
+            });
+            assert!(
+                matches!(failure, Failure::Account(message) if message == format!("{code} (HTTP 403)")),
+                "{code} must not be reported as email_not_verified"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn server_account_aliases_are_refused_before_pairing() {
+        use base64::Engine;
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("..")
+            .join(format!(".push-alias-check-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        let mut lines = Vec::new();
+        for _ in 0..2 {
+            let token = format!(
+                "e30.{}.signature",
+                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .encode(json!({"tid": Uuid::nil(), "oid": Uuid::now_v7()}).to_string())
+            );
+            lines.push(json!({"entra_token":token}).to_string());
+        }
+        let accounts = crate::accounts::parse(&lines.join("\n")).unwrap();
+        let user = Uuid::now_v7();
+        let router = Router::new()
+            .route(
+                "/v1/auth/entra",
+                post(|| async { Json(json!({"registration_token":"registration"})) }),
+            )
+            .route(
+                "/v1/devices",
+                post(move || async move {
+                    (
+                        reqwest::StatusCode::CREATED,
+                        Json(json!({
+                            "user_id":user, "device_id":Uuid::now_v7(), "access_token":"access",
+                            "refresh_token":"refresh", "expires_in_s":1800,
+                        })),
+                    )
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let authority = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(axum::serve(listener, router).into_future());
+        let target = Target::new(&format!("http://{authority}"), &authority, None).unwrap();
+        let result = prepare(
+            &target,
+            &accounts,
+            &dir.join("state.json"),
+            &PrepareOptions {
+                devices_per_account: 1,
+                sample_pairs: 0,
+                concurrency: 1,
+            },
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "distinct inputs must not alias the same server account"
+        );
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("same server account"), "{error}");
+        server.abort();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn operator_file_auth_registers_repairs_and_preserves_refresh_state() {
+        use base64::Engine;
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("..")
+            .join(format!(".push-operator-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        let token = |nonce| {
+            format!("e30.{}.signature", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json!({
+            "tid": Uuid::nil(), "oid": "22222222-2222-2222-2222-222222222222", "nonce": nonce
+        }).to_string()))
+        };
+        let first = token("first");
+        let rotated = token("rotated");
+        std::fs::write(dir.join("token.txt"), &first).unwrap();
+        std::fs::write(
+            dir.join("accounts.jsonl"),
+            "{\"entra_token_file\":\"token.txt\"}",
+        )
+        .unwrap();
+        let accounts = crate::accounts::read(&dir.join("accounts.jsonl")).unwrap();
+        let account = &accounts[0];
+        let requests = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
+        let seen = requests.clone();
+        let user = Uuid::now_v7();
+        let device = Uuid::now_v7();
+        let router = Router::new().fallback(post(move |request: Request| {
+            let seen = seen.clone();
+            async move {
+                let path = request.uri().path().to_owned();
+                let body: Value = serde_json::from_slice(&axum::body::to_bytes(request.into_body(), 8192).await.unwrap()).unwrap();
+                seen.lock().await.push((path.clone(), body.clone()));
+                let tokens = json!({"user_id":user,"device_id":device,"access_token":"access","refresh_token":"refresh","expires_in_s":1800});
+                match path.as_str() {
+                    "/v1/auth/entra" if body.get("device_id").is_none() => (reqwest::StatusCode::OK, Json(json!({"registration_token":"registration"}))),
+                    "/v1/auth/entra" | "/v1/auth/refresh" => (reqwest::StatusCode::OK, Json(tokens)),
+                    "/v1/devices" => (reqwest::StatusCode::CREATED, Json(tokens)),
+                    _ => (reqwest::StatusCode::BAD_REQUEST, Json(json!({}))),
+                }
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let authority = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(axum::serve(listener, router).into_future());
+        let target = Target::new(&format!("http://{authority}"), &authority, None).unwrap();
+        let api = AuthApi::new(&target).unwrap();
+        let mut state = State::new(&authority);
+        state.accounts.push(AccountState::new(&account.email));
+        let shared = Shared {
+            state: Arc::new(Mutex::new(state)),
+            path: Arc::from(dir.join("state.json")),
+        };
+        assert!(
+            prepare_account(&api, &shared, 0, account, 1).await.is_ok(),
+            "operator token must sign in through /v1/auth/entra"
+        );
+        let registration_id = shared
+            .read(|s| s.accounts[0].devices[0].registration_id)
+            .await;
+        let before = std::fs::read_to_string(&*shared.path).unwrap();
+        assert!(!before.contains(&first));
+        assert!(prepare_account(&api, &shared, 0, account, 1).await.is_ok());
+        assert_eq!(
+            requests.lock().await.len(),
+            2,
+            "ready state must not sign in again"
+        );
+        std::fs::write(dir.join("token.txt"), &rotated).unwrap();
+        shared
+            .update(|s| s.accounts[0].devices[0].needs_sign_in = true)
+            .await
+            .unwrap();
+        assert!(prepare_account(&api, &shared, 0, account, 1).await.is_ok());
+        let saved = State::load(&shared.path).unwrap().unwrap();
+        assert_eq!(
+            saved.accounts[0].devices[0].registration_id,
+            registration_id
+        );
+        assert_eq!(saved.accounts[0].devices[0].device_id, Some(device));
+        assert_eq!(
+            saved.accounts[0].devices[0].refresh_token.as_deref(),
+            Some("refresh")
+        );
+        let renewed = api.refresh("refresh").await.unwrap();
+        assert_eq!(renewed.device_id, device);
+        let seen = requests.lock().await;
+        assert_eq!(
+            seen[0],
+            ("/v1/auth/entra".to_owned(), json!({"token": first}))
+        );
+        assert_eq!(
+            seen[2],
+            (
+                "/v1/auth/entra".to_owned(),
+                json!({"token": rotated, "device_id":device})
+            )
+        );
+        assert!(
+            !std::fs::read_to_string(&*shared.path)
+                .unwrap()
+                .contains(&rotated)
+        );
+        server.abort();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }
