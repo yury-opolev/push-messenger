@@ -24,8 +24,10 @@ files (for example Secrets Store CSI with a `SecretProviderClass`, **without Sec
 sync**): see [mounted application keys](deployment-configuration.md#consumer-mounted-application-keys-csi-without-secret-sync)
 for the complete values, filenames and Azure CSI example. With external Entra
 datastores and mounted application keys the chart renders no credential Secret.
-Files load at startup only: rotate by coordinating the new files and rolling out
-their consumers. Datastore tokens still refresh independently.
+Each workload mounts only its consumed files through read-only `subPath` binds.
+CSI rotation updates do not propagate to existing binds, and files load at startup
+only: rotate by coordinating the backing values and rolling out their consumers.
+Datastore tokens still refresh independently.
 
 The chart provisions nothing outside the release namespace: the Azure resources,
 identities, federated credentials, role assignments, private endpoints and DNS below are

@@ -297,10 +297,12 @@ secrets:
   existingSecret: ""
   # Optional consumer-supplied Kubernetes VolumeSource (without name), e.g. CSI.
   # Application keys only: bundled datastore credentials remain in the chart Secret.
+  # Workloads mount only consumed files via read-only subPath binds, never the root.
+  # CSI rotation does not update subPath binds; coordinate consumer rollouts.
   # Mutually exclusive with existingSecret and inline application keys.
   volume: {}
   mountPath: /etc/push/application-keys
-  # Filenames, not paths. File contents match the existing Secret stringData contract.
+  # Distinct filenames, not paths. Contents match the existing Secret stringData contract.
   files:
     auth-signing-key: auth-signing-key
     auth-link-key: auth-link-key

@@ -81,12 +81,15 @@ def mounted():
             "networkPolicy": {"egress": {"enabled": True}},
         }
 
-    for optional in (False, True):
+    for admin, resend, webhook in (
+        (False, False, False), (True, False, False), (False, True, False),
+        (False, False, True), (True, True, True),
+    ):
         case = values()
-        if optional:
-            case["auth"] = {"admin": {"enabled": True}}
-            case["worker"] = {"email": {"sender": "resend",
-                "from": "Push <no-reply@example.test>", "webhook": {"enabled": True}}}
+        case["auth"] = {"admin": {"enabled": admin}}
+        case["worker"] = {"email": {"sender": "resend" if resend else "log",
+            "from": "Push <no-reply@example.test>", "webhook": {"enabled": webhook}}}
+        if admin:
             case["azure"]["workloadIdentity"].update({
                 "injection": "chart", "tenantId": "synthetic-tenant",
                 "authorityCaConfigMap": "consumer-authority-ca"})
@@ -102,10 +105,12 @@ def mounted():
             "gateway": {"PUSH_MESSAGING_TOKEN_FILE": "messaging-token"},
             "worker": {"PUSH_ACCOUNTS_TOKEN_FILE": "accounts-token"},
         }
-        if optional:
+        if admin:
             expected["auth"]["PUSH_AUTH_ADMIN_TOKEN_FILE"] = "auth-admin-token"
-            expected["worker"].update({"PUSH_RESEND_API_KEY_FILE": "resend-api-key",
-                "PUSH_RESEND_WEBHOOK_SECRET_FILE": "resend-webhook-secret"})
+        if resend:
+            expected["worker"]["PUSH_RESEND_API_KEY_FILE"] = "resend-api-key"
+        if webhook:
+            expected["worker"]["PUSH_RESEND_WEBHOOK_SECRET_FILE"] = "resend-webhook-secret"
         application_names = {
             "PUSH_AUTH_SIGNING_KEY", "PUSH_AUTH_LINK_KEY", "PUSH_ACCOUNTS_TOKEN",
             "PUSH_DIRECTORY_TOKEN", "PUSH_MESSAGING_TOKEN", "PUSH_AUTH_ADMIN_TOKEN",
@@ -121,8 +126,16 @@ def mounted():
             assert actual == {name: "/consumer/keys/" + filename
                               for name, filename in keys.items()}, component
             assert not any(entry["name"] in application_names for entry in env)
-            assert {"name": "application-keys", "mountPath": "/consumer/keys",
-                    "readOnly": True} in container["volumeMounts"]
+            mounts = [m for m in container["volumeMounts"] if m["name"] == "application-keys"]
+            assert sorted(mounts, key=lambda m: m["mountPath"]) == sorted([
+                {"name": "application-keys", "mountPath": "/consumer/keys/" + filename,
+                 "subPath": filename, "readOnly": True} for filename in keys.values()
+            ], key=lambda m: m["mountPath"]), component + " exposes unrelated key files"
+            if component != "auth":
+                assert not any(m["subPath"] in ("signing-seed", "auth-link-key")
+                               for m in mounts), component
+            assert len({m["mountPath"] for m in container["volumeMounts"]}) == len(
+                container["volumeMounts"]), component + " has duplicate mount paths"
             volume = next(v for v in pod["volumes"] if v["name"] == "application-keys")
             assert volume == {"name": "application-keys", **case["secrets"]["volume"]}
         job = document(docs, "Job", "migrate")["spec"]["template"]["spec"]
@@ -149,7 +162,22 @@ def mounted():
         ({"mountPath": "../keys"}, "secrets.mountPath"),
         ({"mountPath": "/keys/../secret"}, "secrets.mountPath"),
         ({"mountPath": "/"}, "secrets.mountPath"),
+        ({"mountPath": "/etc/push", "files": {"auth-signing-key": "entra-ca"}},
+         "secrets.files"),
+        ({"mountPath": "/etc/push/authority-ca"}, "secrets.files"),
+        ({"mountPath": "/var/run/secrets/azure/tokens"}, "secrets.files"),
+        ({"mountPath": "/data"}, "secrets.files"),
         ({"files": {"auth-signing-key": "../seed"}}, "secrets.files"),
+        ({"files": {"auth-signing-key": "/seed"}}, "secrets.files"),
+        ({"files": {"auth-signing-key": "nested/seed"}}, "secrets.files"),
+        ({"files": {"auth-signing-key": "nested\\seed"}}, "secrets.files"),
+        ({"files": {"auth-signing-key": "."}}, "secrets.files"),
+        ({"files": {"auth-signing-key": ".."}}, "secrets.files"),
+        ({"files": {"messaging-token": "..data"}}, "secrets.files"),
+        ({"files": {"messaging-token": "..2026_10_22"}}, "secrets.files"),
+        ({"files": {"messaging-token": "auth-signing-key"}}, "secrets.files"),
+        ({"files": {"auth-link-key": "auth-signing-key"}}, "secrets.files"),
+        ({"files": {"auth-admin-token": "auth-signing-key"}}, "secrets.files"),
         ({"files": {"auth-link-key": ""}}, "secrets.files"),
         ({"files": {"unknown-key": "key"}}, "secrets.files"),
         ({"files": "key"}, "secrets.files"),
@@ -171,13 +199,16 @@ def mounted():
     smoke = document(docs, "Pod", "smoke")["spec"]
     assert smoke["containers"][0]["env"] == [
         {"name": "PUSH_SMOKE_SIGNING_KEY_FILE", "value": "/consumer/keys/signing-seed"}]
-    assert any(m["name"] == "application-keys" and m["readOnly"]
-               for m in smoke["containers"][0]["volumeMounts"])
+    assert [m for m in smoke["containers"][0]["volumeMounts"]
+            if m["name"] == "application-keys"] == [
+        {"name": "application-keys", "mountPath": "/consumer/keys/signing-seed",
+         "subPath": "signing-seed", "readOnly": True}]
     case["smoke"] = {"entraAccountsSecret": "operator-accounts"}
     smoke = document(render(case), "Pod", "smoke")["spec"]
     assert not smoke["containers"][0].get("env")
     assert not any(m["name"] == "application-keys"
                    for m in smoke["containers"][0]["volumeMounts"])
+    assert not any(v["name"] == "application-keys" for v in smoke["volumes"])
     for section, override, error in [
         ("auth", {"signingKey": "synthetic-inline"}, "auth.signingKey"),
         ("worker", {"email": {"resendApiKey": "synthetic-inline"}}, "worker.email.resendApiKey"),
@@ -205,6 +236,11 @@ def mounted():
 
 
 def secrets():
+    for mode in ({}, external()):
+        for _, container in containers(render(mode)):
+            assert not any(e["name"].endswith("_FILE") for e in container.get("env", []))
+            assert not any(m["name"] == "application-keys"
+                           for m in container.get("volumeMounts", []))
     docs = render(external())
     assert not any(doc["kind"] == "Secret" for doc in docs)
     expected = {

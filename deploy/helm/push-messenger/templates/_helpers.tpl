@@ -57,7 +57,7 @@ values would be silently ignored, so they are refused by name, never by value.
 {{- end -}}
 {{- end -}}
 
-{{/* The volume is consumer-owned; only application-key consumers mount it. */}}
+{{/* The volume is consumer-owned; workloads bind only their consumed key files. */}}
 {{- define "push.checkSecretVolume" -}}
 {{- $secrets := .Values.secrets -}}
 {{- if not (kindIs "map" $secrets.volume) -}}
@@ -116,12 +116,25 @@ values would be silently ignored, so they are refused by name, never by value.
 {{- fail "secrets.files must be a map of application key names to filenames" -}}
 {{- end -}}
 {{- $keys := list "auth-signing-key" "auth-link-key" "accounts-token" "directory-token" "messaging-token" "auth-admin-token" "resend-api-key" "resend-webhook-secret" -}}
+{{- $filenames := dict -}}
 {{- range $key, $filename := $secrets.files -}}
 {{- if or (not (has $key $keys)) (not (kindIs "string" $filename)) -}}
 {{- fail "secrets.files must contain only known application keys and string filenames" -}}
 {{- end -}}
-{{- if and $filename (or (not (regexMatch "^[A-Za-z0-9._-]+$" $filename)) (has $filename (list "." ".."))) -}}
-{{- fail "secrets.files values must be filenames without traversal" -}}
+{{- if and $filename (or (not (regexMatch "^[A-Za-z0-9._-]+$" $filename)) (eq $filename ".") (hasPrefix ".." $filename)) -}}
+{{- fail "secrets.files values must be filenames without traversal or Kubernetes internal directory names" -}}
+{{- end -}}
+{{- if $filename -}}
+{{- if hasKey $filenames $filename -}}
+{{- fail "secrets.files must use distinct filenames for every application key" -}}
+{{- end -}}
+{{- $_ := set $filenames $filename true -}}
+{{- $path := printf "%s/%s" $secrets.mountPath $filename -}}
+{{- range list "/etc/push/entra-ca" "/etc/push/authority-ca" "/etc/push/postgres-ca" "/etc/push/redis-ca" "/var/run/secrets" "/data" "/operator-accounts" -}}
+{{- if or (eq $path .) (hasPrefix (printf "%s/" .) $path) (hasPrefix (printf "%s/" $path) .) -}}
+{{- fail "secrets.files mount paths must not overlap chart-reserved volume paths" -}}
+{{- end -}}
+{{- end -}}
 {{- end -}}
 {{- end -}}
 {{- $required := list "auth-signing-key" "auth-link-key" "accounts-token" "directory-token" "messaging-token" -}}
@@ -154,10 +167,32 @@ values would be silently ignored, so they are refused by name, never by value.
 {{- end -}}
 
 {{- define "push.applicationMounts" -}}
-{{- if .Values.secrets.volume }}
+{{- $root := .root -}}
+{{- if $root.Values.secrets.volume -}}
+{{- $keys := index (dict
+  "auth" (list "auth-signing-key" "auth-link-key" "directory-token")
+  "message-svc" (list "accounts-token" "directory-token" "messaging-token")
+  "gateway" (list "messaging-token")
+  "worker" (list "accounts-token")
+  "smoke" (list "auth-signing-key")) .component -}}
+{{- if and (eq .component "auth") $root.Values.auth.admin.enabled -}}
+{{- $keys = append $keys "auth-admin-token" -}}
+{{- end -}}
+{{- if eq .component "worker" -}}
+{{- if eq $root.Values.worker.email.sender "resend" -}}
+{{- $keys = append $keys "resend-api-key" -}}
+{{- end -}}
+{{- if include "push.hasWebhook" $root -}}
+{{- $keys = append $keys "resend-webhook-secret" -}}
+{{- end -}}
+{{- end -}}
+{{- range $keys -}}
+{{- $filename := index $root.Values.secrets.files . }}
 - name: application-keys
-  mountPath: {{ .Values.secrets.mountPath | quote }}
+  mountPath: {{ printf "%s/%s" $root.Values.secrets.mountPath $filename | quote }}
+  subPath: {{ $filename | quote }}
   readOnly: true
+{{- end }}
 {{- end }}
 {{- end -}}
 

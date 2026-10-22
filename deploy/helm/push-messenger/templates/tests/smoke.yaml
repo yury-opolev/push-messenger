@@ -50,7 +50,7 @@ spec:
         - name: data
           mountPath: /data
         {{- if not .Values.smoke.entraAccountsSecret }}
-        {{- include "push.applicationMounts" . | nindent 8 }}
+        {{- include "push.applicationMounts" (dict "root" . "component" "smoke") | nindent 8 }}
         {{- end }}
         {{- if .Values.smoke.entraAccountsSecret }}
         - name: operator-accounts

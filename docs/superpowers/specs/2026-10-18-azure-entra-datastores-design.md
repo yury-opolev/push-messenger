@@ -62,7 +62,13 @@ Application-key delivery is independent of these datastore settings. Optional
 `*_FILE` alternatives for the signing/link keys, internal API tokens, admin token
 and Resend keys use the shared startup-only `push-credentials` reader; the chart's
 `secrets.volume`, `mountPath` and `files` select consumer-mounted delivery without
-Secret sync. Direct values and existing Secret delivery remain the defaults.
+Secret sync. Read-only per-file `subPath` binds preserve per-workload key isolation:
+only auth gets the signing/link keys (DEV password smoke gets only signing), and
+migrations get no application keys. Optional keys are mounted only when consumed;
+nonempty filenames must be distinct and mount paths must not overlap reserved
+volume trees. CSI rotation updates do not propagate to existing `subPath` binds;
+coordinated consumer rollouts are required. Direct values and existing Secret
+delivery remain the defaults.
 Datastore authentication, identity-token refresh and migration policy ownership do
 not change. The current contract and CSI example are in
 [deployment-configuration.md](../../deployment-configuration.md#consumer-mounted-application-keys-csi-without-secret-sync).

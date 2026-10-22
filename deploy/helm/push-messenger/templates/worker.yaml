@@ -114,7 +114,7 @@ spec:
             periodSeconds: 10
           resources:
             {{- toYaml .Values.worker.resources | nindent 12 }}
-          {{- with (printf "%s%s" (include "push.identityMounts" (dict "root" . "key" "worker" "postgres" true "redis" false)) (include "push.applicationMounts" .)) }}
+          {{- with (printf "%s%s" (include "push.identityMounts" (dict "root" . "key" "worker" "postgres" true "redis" false)) (include "push.applicationMounts" (dict "root" . "component" "worker"))) }}
           volumeMounts:
             {{- . | trim | nindent 12 }}
           {{- end }}

@@ -99,9 +99,11 @@ backing-service changes and rollouts yourself.
 ### Consumer-mounted application keys (CSI, without Secret sync)
 
 Set `secrets.volume` to a consumer-supplied Kubernetes **VolumeSource**, without a
-`name`. The chart supplies its name, `application-keys`, and read-only mounts on auth,
-message-svc, gateway and worker. It neither creates a CSI driver nor creates a
-`SecretProviderClass`. Example values:
+`name`. The chart supplies its name, `application-keys`, and read-only **individual
+file** mounts using `subPath` on auth, message-svc, gateway and worker. Each container
+can read only the application-key files it consumes, not the volume root or other
+workloads' keys. It neither creates a CSI driver nor creates a `SecretProviderClass`.
+Example values:
 
 ```yaml
 secrets:
@@ -126,11 +128,17 @@ secrets:
 
 `mountPath` defaults as shown and must be an absolute, non-root path with no traversal
 or trailing slash. `files` defaults to the existing Secret key names. Override a value
-to change its filename; filenames cannot contain directory separators or be `.` or
-`..`. Required files cannot have empty filenames. Admin and email filenames are
+to change its filename; filenames cannot contain directory separators, be `.`, or
+start with `..` (reserved Kubernetes projection directories, including `..data`).
+Nonempty filenames must be distinct across all keys, including disabled optional
+keys, so aliases cannot expose another workload's key or duplicate a mount path.
+File mount paths must not overlap chart-reserved volume trees: `/etc/push/entra-ca`,
+`/etc/push/authority-ca`, `/etc/push/postgres-ca`, `/etc/push/redis-ca`,
+`/var/run/secrets`, `/data` and `/operator-accounts`.
+Required files cannot have empty filenames. Admin and email filenames are
 required only when those features are enabled; absent admin configuration remains
-disabled and the chart does not reference its file. Inline application key values and
-`secrets.existingSecret` conflict with mounted mode and are refused.
+disabled and the chart neither references nor mounts its file. Inline application
+key values and `secrets.existingSecret` conflict with mounted mode and are refused.
 
 | Existing key / default filename | File environment variable | Consumers |
 |---|---|---|
@@ -158,10 +166,14 @@ chart. Setting both a direct variable and its `_FILE` alternative, even to empty
 strings, fails startup. Missing, unreadable, empty and non-UTF-8 files fail startup;
 there is no fallback, secret content or path in configuration errors.
 
-The whole supplied volume is mounted in each consuming pod, even though each gets
-only its relevant `_FILE` variables. Scope its contents and access policy accordingly;
-do not use this volume for unrelated credentials. Ensure the CSI driver makes its
-files readable by the non-root service user. With bundled datastores their existing
+Only the files in the consumer table are bound into each workload, at
+`<mountPath>/<filename>` matching its `_FILE` variables; the signing seed and link key
+are not mounted into gateway, message-svc or worker. The DEV password smoke hook
+mounts only the signing key. The consumer still owns the source volume's contents,
+provider aliases and access policy; configure regular key files, not directory
+aliases, and do not point different filenames at the same backing credential or
+include unrelated credentials. Ensure the CSI driver makes its files readable by
+the non-root service user. With bundled datastores their existing
 chart-managed Secret still holds **datastore keys only**. With external Entra datastores
 no credential Secret is rendered at all. Datastore password URLs, CA bundles and Azure
 identity token files are separate mechanisms, not covered by this setting.
@@ -215,11 +227,14 @@ ServiceAccount mounting this class (including a DEV smoke hook if used). This is
 independent of the datastores' identities. The chart creates no dummy workload to
 trigger synchronization and requires no Kubernetes Secret for application keys.
 
-For rotation, update the provider's backing values, verify CSI has delivered the new
-files, then roll out the affected Deployments. Running processes do not hot-reload
-files; changing a CSI object alone does not change their in-memory keys. Coordinate
-internal-token readers and callers; mixed generations can reject calls. Signing/link
-key replacement can invalidate existing tokens or links. The chart promises neither
+For rotation, update the provider's backing values and coordinate a rollout of the
+affected Deployments, verifying that replacement pods mount the new values.
+**CSI driver rotation updates are not propagated to `subPath` binds in existing
+containers**; checking an existing container's bound file does not verify delivery
+of the rotated value. Running processes also read files only at startup, not on
+changes. A coordinated rollout is required even when CSI auto-rotation is enabled.
+Coordinate internal-token readers and callers; mixed generations can reject calls.
+Signing/link key replacement can invalidate existing tokens or links. The chart promises neither
 overlapping key generations nor zero-downtime rotation.
 
 ### Managed datastores with Microsoft Entra ID

@@ -189,7 +189,10 @@ Azure Key Vault, CSI resources and secret synchronization belong to the consumer
 The consumer must materialize the required Secret before application startup, or
 select optional `secrets.volume` application-key delivery and materialize files
 instead, without Secret synchronization. Mounted mode preserves each key's value
-format and supplies only the relevant `*_FILE` variables; the shared reader fails
+format and exposes only each workload's consumed files through read-only `subPath`
+binds matching its `*_FILE` variables, never the whole volume. Optional keys are
+mounted only when enabled. CSI rotation updates do not propagate to existing
+`subPath` binds, so coordinated rollouts remain required. The shared reader fails
 closed on conflicting variables or missing, unreadable or empty files. Datastore
 credentials remain separate. See the current
 [mounted-file contract](../../deployment-configuration.md#consumer-mounted-application-keys-csi-without-secret-sync).

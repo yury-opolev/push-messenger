@@ -124,7 +124,7 @@ spec:
             periodSeconds: 10
           resources:
             {{- toYaml .Values.auth.resources | nindent 12 }}
-          {{- with (printf "%s%s%s" (include "push.identityMounts" (dict "root" . "key" "auth" "postgres" true "redis" true)) (include "push.signInMounts" .) (include "push.applicationMounts" .)) | trim }}
+          {{- with (printf "%s%s%s" (include "push.identityMounts" (dict "root" . "key" "auth" "postgres" true "redis" true)) (include "push.signInMounts" .) (include "push.applicationMounts" (dict "root" . "component" "auth"))) | trim }}
           volumeMounts:
             {{- . | nindent 12 }}
           {{- end }}
