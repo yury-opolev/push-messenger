@@ -323,7 +323,8 @@ missing key stops the worker with a Kubernetes configuration error instead).
 
 {{/* "true" when Microsoft Entra ID sign-in is offered (spec 2026-10-19 D9). */}}
 {{- define "push.entraSignIn" -}}
-{{- if has "entra" (splitList "," (nospace (toString .Values.auth.signIn.providers))) -}}true{{- end -}}
+{{- $providers := splitList "," (nospace (toString .Values.auth.signIn.providers)) -}}
+{{- if or (has "entra" $providers) (has "entra-app" $providers) -}}true{{- end -}}
 {{- end -}}
 
 {{/* "true" when email and password sign-in is off: nothing ever writes an email then. */}}
@@ -353,12 +354,20 @@ The admin listener is a boolean; its peers carry both label maps.
 */}}
 {{- define "push.checkSignIn" -}}
 {{- $signIn := .Values.auth.signIn -}}
-{{- $providerError := printf "auth.signIn.providers must be password, entra or password,entra, not %q" (toString $signIn.providers) -}}
+{{- $providerError := printf "auth.signIn.providers must list password, entra, entra-app, each at most once, not %q" (toString $signIn.providers) -}}
 {{- if not (kindIs "string" $signIn.providers) -}}
 {{- fail $providerError -}}
 {{- end -}}
-{{- if not (has (nospace $signIn.providers) (list "password" "entra" "password,entra" "entra,password")) -}}
+{{- $providers := splitList "," (nospace $signIn.providers) -}}
+{{- if ne (len $providers) (len (uniq $providers)) -}}
 {{- fail $providerError -}}
+{{- end -}}
+{{- range $providers -}}
+{{- if not (has . (list "password" "entra" "entra-app")) -}}{{- fail $providerError -}}{{- end -}}
+{{- end -}}
+{{- $agents := int .Values.auth.agentsPerUser -}}
+{{- if or (lt $agents 0) (gt $agents 100) (ne (toString $agents) (toString .Values.auth.agentsPerUser)) -}}
+{{- fail "auth.agentsPerUser must be a whole number from 0 to 100" -}}
 {{- end -}}
 {{- if not (kindIs "bool" .Values.auth.admin.enabled) -}}
 {{- fail "auth.admin.enabled must be a boolean" -}}
@@ -375,7 +384,7 @@ The admin listener is a boolean; its peers carry both label maps.
 {{- if include "push.entraSignIn" . -}}
 {{- $entra := $signIn.entra -}}
 {{- $guid := "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$" -}}
-{{- range $name := list "clientIds" "tenants" "allowedClientApps" -}}
+{{- range $name := list "clientIds" "tenants" -}}
 {{- if not (kindIs "slice" (index $entra $name)) -}}
 {{- fail (printf "auth.signIn.entra.%s must be a list" $name) -}}
 {{- end -}}
@@ -412,6 +421,9 @@ The admin listener is a boolean; its peers carry both label maps.
 {{- $keywords := list "common" "organizations" "consumers" -}}
 {{- $tenants := list -}}
 {{- range $entra.tenants -}}{{- $tenants = append $tenants (lower (toString .)) -}}{{- end -}}
+{{- if and (has "entra-app" $providers) (has (first $tenants) $keywords) -}}
+{{- fail "entra-app requires auth.signIn.entra.tenants to list explicit tenant GUIDs, not common, organizations or consumers" -}}
+{{- end -}}
 {{- if not (and (eq (len $tenants) 1) (has (first $tenants) $keywords)) -}}
 {{- range $tenants -}}
 {{- if has . $keywords -}}
@@ -428,6 +440,10 @@ The admin listener is a boolean; its peers carry both label maps.
 {{- fail "auth.signIn.entra.tenants: at most 20 tenant ids" -}}
 {{- end -}}
 {{- end -}}
+{{- if has "entra" $providers -}}
+{{- if not (kindIs "slice" $entra.allowedClientApps) -}}
+{{- fail "auth.signIn.entra.allowedClientApps must be a list" -}}
+{{- end -}}
 {{- range $entra.allowedClientApps -}}
 {{- if not (regexMatch $guid (toString .)) -}}
 {{- fail (printf "auth.signIn.entra.allowedClientApps: %q is not an application id" (toString .)) -}}
@@ -436,9 +452,11 @@ The admin listener is a boolean; its peers carry both label maps.
 {{- if gt (len $entra.allowedClientApps) 20 -}}
 {{- fail "auth.signIn.entra.allowedClientApps: at most 20 application ids" -}}
 {{- end -}}
+{{- end -}}
 {{- if not (regexMatch "^https://[^/@?#\\s]+/?$" (toString $entra.authorityHost)) -}}
 {{- fail "auth.signIn.entra.authorityHost must be https://host/ (scheme and host only)" -}}
 {{- end -}}
+{{- if has "entra" $providers -}}
 {{- if not (regexMatch "^[!-~]{1,128}$" (toString $entra.requiredScope)) -}}
 {{- fail "auth.signIn.entra.requiredScope must be one scope name or *" -}}
 {{- end -}}
@@ -448,6 +466,26 @@ The admin listener is a boolean; its peers carry both label maps.
 {{- $hours := int $entra.maxSessionHours -}}
 {{- if or (lt $hours 1) (gt $hours 720) (ne (toString $hours) (toString $entra.maxSessionHours)) -}}
 {{- fail "auth.signIn.entra.maxSessionHours must be a whole number of hours from 1 to 720" -}}
+{{- end -}}
+{{- end -}}
+{{- if has "entra-app" $providers -}}
+{{- $app := $signIn.entraApp -}}
+{{- if not (kindIs "slice" $app.allowedClientApps) -}}
+{{- fail "auth.signIn.entraApp.allowedClientApps must be a list" -}}
+{{- end -}}
+{{- range $app.allowedClientApps -}}
+{{- if not (regexMatch $guid (toString .)) -}}
+{{- fail "auth.signIn.entraApp.allowedClientApps must contain application GUIDs" -}}
+{{- end -}}
+{{- end -}}
+{{- if gt (len $app.allowedClientApps) 20 -}}{{- fail "auth.signIn.entraApp.allowedClientApps: at most 20 application ids" -}}{{- end -}}
+{{- if and $app.requiredRole (not (regexMatch "^[!-~]{1,128}$" (toString $app.requiredRole))) -}}
+{{- fail "auth.signIn.entraApp.requiredRole must be one app role value" -}}
+{{- end -}}
+{{- $hours := int $app.maxSessionHours -}}
+{{- if or (lt $hours 1) (gt $hours 720) (ne (toString $hours) (toString $app.maxSessionHours)) -}}
+{{- fail "auth.signIn.entraApp.maxSessionHours must be a whole number of hours from 1 to 720" -}}
+{{- end -}}
 {{- end -}}
 {{- if and $entra.httpsProxy (not (regexMatch "^https?://[^\\s]+$" (toString $entra.httpsProxy))) -}}
 {{- fail "auth.signIn.entra.httpsProxy must be an http:// or https:// URL" -}}
@@ -512,6 +550,8 @@ connection auth-svc makes (rustls-native-certs reads SSL_CERT_FILE alone).
 {{- define "push.signInEnv" -}}
 {{- $signIn := .Values.auth.signIn -}}
 {{- $providers := nospace (toString $signIn.providers) -}}
+- name: PUSH_AGENTS_PER_USER
+  value: {{ int .Values.auth.agentsPerUser | quote }}
 {{- if ne $providers "password" }}
 - name: PUSH_AUTH_PROVIDERS
   value: {{ $providers | quote }}
@@ -524,6 +564,7 @@ connection auth-svc makes (rustls-native-certs reads SSL_CERT_FILE alone).
   value: {{ join "," $entra.tenants | lower | quote }}
 - name: PUSH_ENTRA_AUTHORITY_HOST
   value: {{ $entra.authorityHost | quote }}
+{{- if has "entra" (splitList "," $providers) }}
 - name: PUSH_ENTRA_REQUIRED_SCOPE
   value: {{ $entra.requiredScope | quote }}
 {{- with $entra.requiredRole }}
@@ -536,6 +577,19 @@ connection auth-svc makes (rustls-native-certs reads SSL_CERT_FILE alone).
 {{- end }}
 - name: PUSH_ENTRA_MAX_SESSION_HOURS
   value: {{ int $entra.maxSessionHours | quote }}
+{{- end }}
+{{- if has "entra-app" (splitList "," $providers) }}
+{{- with $signIn.entraApp.requiredRole }}
+- name: PUSH_ENTRA_APP_REQUIRED_ROLE
+  value: {{ . | quote }}
+{{- end }}
+{{- with $signIn.entraApp.allowedClientApps }}
+- name: PUSH_ENTRA_APP_ALLOWED_CLIENT_APPS
+  value: {{ join "," . | quote }}
+{{- end }}
+- name: PUSH_ENTRA_APP_MAX_SESSION_HOURS
+  value: {{ int $signIn.entraApp.maxSessionHours | quote }}
+{{- end }}
 {{- with $entra.httpsProxy }}
 - name: HTTPS_PROXY
   value: {{ . | quote }}

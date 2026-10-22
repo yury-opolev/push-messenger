@@ -26,6 +26,7 @@ const MAX_SESSION_HOURS: u64 = 720;
 pub struct Providers {
     pub password: bool,
     pub entra: bool,
+    pub entra_app: bool,
     /// The authenticator in `Overrides` (`serve_with`), at `/v1/auth/{its provider id}`.
     pub external: bool,
 }
@@ -36,13 +37,14 @@ impl Default for Providers {
         Self {
             password: true,
             entra: false,
+            entra_app: false,
             external: false,
         }
     }
 }
 
 impl Providers {
-    /// A `PUSH_AUTH_PROVIDERS` value: `password`, `entra`, `external`, comma-separated,
+    /// A `PUSH_AUTH_PROVIDERS` value: `password`, `entra`, `entra-app`, `external`, comma-separated,
     /// each once; unset or empty is `password`.
     pub fn parse(value: Option<&str>) -> Result<Self, String> {
         let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
@@ -51,16 +53,18 @@ impl Providers {
         let mut providers = Self {
             password: false,
             entra: false,
+            entra_app: false,
             external: false,
         };
         for name in value.split(',').map(str::trim) {
             match name {
                 "password" if !providers.password => providers.password = true,
                 "entra" if !providers.entra => providers.entra = true,
+                "entra-app" if !providers.entra_app => providers.entra_app = true,
                 "external" if !providers.external => providers.external = true,
                 _ => {
                     return Err(
-                        "expected password, entra, external or a comma-separated combination"
+                        "expected password, entra, entra-app, external or a comma-separated combination"
                             .to_owned(),
                     );
                 }
@@ -139,34 +143,14 @@ impl EntraSettings {
                 ));
             }
         };
-        let required_role = match get("PUSH_ENTRA_REQUIRED_ROLE") {
-            None => None,
-            Some(role) if is_claim_value(&role) => Some(role),
-            Some(role) => {
-                return Err(invalid(
-                    "PUSH_ENTRA_REQUIRED_ROLE",
-                    &role,
-                    "use one app role value (1 to 128 visible ASCII characters)",
-                ));
-            }
-        };
-        let client_apps = match get("PUSH_ENTRA_ALLOWED_CLIENT_APPS") {
-            None => Vec::new(),
-            Some(value) => guids(&value, MAX_TENANTS)
-                .map_err(|reason| invalid("PUSH_ENTRA_ALLOWED_CLIENT_APPS", &value, reason))?,
-        };
-        let hours_value = get("PUSH_ENTRA_MAX_SESSION_HOURS").unwrap_or_else(|| "24".to_owned());
-        let hours: u64 = hours_value
-            .parse()
-            .ok()
-            .filter(|hours| (1..=MAX_SESSION_HOURS).contains(hours))
-            .ok_or_else(|| {
-                invalid(
-                    "PUSH_ENTRA_MAX_SESSION_HOURS",
-                    &hours_value,
-                    "use a whole number of hours from 1 to 720",
-                )
-            })?;
+        let (required_role, client_apps, max_session) = policy(
+            lookup,
+            [
+                "PUSH_ENTRA_REQUIRED_ROLE",
+                "PUSH_ENTRA_ALLOWED_CLIENT_APPS",
+                "PUSH_ENTRA_MAX_SESSION_HOURS",
+            ],
+        )?;
         Ok(Self {
             authority_host,
             tenants,
@@ -174,7 +158,7 @@ impl EntraSettings {
             required_scope,
             required_role,
             client_apps,
-            max_session: Duration::from_secs(hours * 3600),
+            max_session,
         })
     }
 
@@ -190,6 +174,57 @@ impl EntraSettings {
             self.authority_host
         )
     }
+}
+
+/// Shared syntax and bounds, with separate environment names for each token policy.
+pub(super) fn policy(
+    lookup: &dyn Fn(&str) -> Option<String>,
+    [role_name, clients_name, hours_name]: [&'static str; 3],
+) -> Result<(Option<String>, Vec<Uuid>, Duration), ConfigError> {
+    let get = |name| {
+        lookup(name)
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+    };
+    let invalid = |name, value: &str, reason: &str| ConfigError::Invalid {
+        name,
+        value: value.to_owned(),
+        reason: reason.to_owned(),
+    };
+    let required_role = match get(role_name) {
+        None => None,
+        Some(role) if is_claim_value(&role) => Some(role),
+        Some(role) => {
+            return Err(invalid(
+                role_name,
+                &role,
+                "use one app role value (1 to 128 visible ASCII characters)",
+            ));
+        }
+    };
+    let client_apps = match get(clients_name) {
+        None => Vec::new(),
+        Some(value) => {
+            guids(&value, MAX_TENANTS).map_err(|reason| invalid(clients_name, &value, reason))?
+        }
+    };
+    let hours_value = get(hours_name).unwrap_or_else(|| "24".to_owned());
+    let hours: u64 = hours_value
+        .parse()
+        .ok()
+        .filter(|hours| (1..=MAX_SESSION_HOURS).contains(hours))
+        .ok_or_else(|| {
+            invalid(
+                hours_name,
+                &hours_value,
+                "use a whole number of hours from 1 to 720",
+            )
+        })?;
+    Ok((
+        required_role,
+        client_apps,
+        Duration::from_secs(hours * 3600),
+    ))
 }
 
 /// `https://host/` (a sovereign cloud's too), or `http://` to a loopback host for tests.
@@ -391,6 +426,7 @@ mod tests {
             Ok(Providers {
                 password: true,
                 entra: false,
+                entra_app: false,
                 external: false
             })
         );
@@ -400,6 +436,7 @@ mod tests {
             Ok(Providers {
                 password: false,
                 entra: true,
+                entra_app: false,
                 external: false
             })
         );
@@ -408,6 +445,7 @@ mod tests {
             Ok(Providers {
                 password: true,
                 entra: true,
+                entra_app: false,
                 external: false
             })
         );
@@ -423,6 +461,7 @@ mod tests {
             Ok(Providers {
                 password: false,
                 entra: false,
+                entra_app: false,
                 external: true
             })
         );
@@ -431,6 +470,7 @@ mod tests {
             Ok(Providers {
                 password: true,
                 entra: true,
+                entra_app: false,
                 external: true
             })
         );

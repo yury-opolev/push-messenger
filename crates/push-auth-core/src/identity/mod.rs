@@ -18,6 +18,8 @@ pub(crate) use middleware::{IdentityState, identify};
 
 /// The provider id of the built-in Microsoft Entra ID check.
 pub const ENTRA_PROVIDER: &str = "entra";
+/// The opt-in, non-provisioning Entra service-principal provider.
+pub const ENTRA_APP_PROVIDER: &str = "entra-app";
 
 /// The longest session an authenticator may grant: 30 days, as for Entra ID.
 pub const MAX_SESSION_LIMIT: Duration = Duration::from_secs(720 * 3600);
@@ -75,7 +77,8 @@ pub enum AuthenticationError {
 
 /// Checks a token and names its user (spec D3). An implementation must check the
 /// signature and its algorithm, the issuer, the audience (this API), the lifetime and that
-/// the token is a delegated user token; it must name a stable, immutable subject, and
+/// the token has the provider's required identity type (delegated user for `entra`,
+/// app-only for the explicitly enabled `entra-app`); it must name a stable, immutable subject, and
 /// never log the token or its claims.
 #[async_trait]
 pub trait Authenticator: Send + Sync + fmt::Debug {

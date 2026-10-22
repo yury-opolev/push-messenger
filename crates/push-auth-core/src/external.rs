@@ -69,7 +69,8 @@ impl Auth {
     /// sign-in, and a registration token bound to the identity and to the end of the
     /// session it starts. `handle` names a new account (it is ignored afterwards); without
     /// it a random `u…` handle is chosen. `Unauthorized` unless the principal's provider is
-    /// offered and the principal keeps the rules.
+    /// offered and the principal keeps the rules. `entra-app` is linked-only: an
+    /// unlinked principal is refused before any account insertion.
     pub async fn sign_in_external(
         &self,
         principal: &Principal,
@@ -209,6 +210,10 @@ impl Auth {
         principal: &Principal,
         handle: Option<&str>,
     ) -> Result<Option<ExternalAccount>, AuthError> {
+        // App identities must be bound by enrollment, never by first sign-in.
+        if principal.provider == crate::identity::ENTRA_APP_PROVIDER {
+            return Err(crate::identity::not_permitted(principal));
+        }
         let requested = handle.map(rules::handle).transpose()?;
         let user_id = Uuid::now_v7();
         let mut tx = self.pool.begin().await?;

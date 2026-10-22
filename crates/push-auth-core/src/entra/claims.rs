@@ -40,12 +40,25 @@ pub(crate) fn check(
     tenant: Uuid,
     settings: &EntraSettings,
 ) -> Result<EntraIdentity, Reason> {
+    common(claims, tenant)?;
+    delegated(claims, tenant, settings)
+}
+
+pub(super) fn common(claims: &EntraClaims, tenant: Uuid) -> Result<(), Reason> {
     if claims.ver.as_deref() != Some("2.0") {
         return Err(Reason::Version);
     }
     if claims.tid.as_deref().and_then(guid) != Some(tenant) {
         return Err(Reason::Tenant);
     }
+    Ok(())
+}
+
+fn delegated(
+    claims: &EntraClaims,
+    tenant: Uuid,
+    settings: &EntraSettings,
+) -> Result<EntraIdentity, Reason> {
     let scopes: Vec<&str> = claims
         .scp
         .as_deref()

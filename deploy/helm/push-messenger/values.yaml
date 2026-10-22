@@ -82,12 +82,12 @@ auth:
   linkKey: ""
   # Ways to sign in (docs/entra-sign-in.md, spec 2026-10-19).
   signIn:
-    # password (default: email and password), entra (Microsoft Entra ID only), or
-    # password,entra. With entra alone the worker sends no email (sender none), the email
+    # Comma-separated: password (default), entra (delegated users), entra-app (opt-in,
+    # pre-linked service principals only; never creates accounts). Without password the worker sends no email, the email
     # and password routes answer 404 and the link pages are not routed. Switching to entra
     # alone signs every password device out when the new auth-svc pods start.
     providers: password
-    # Read only when providers include entra.
+    # Common authority/audience/tenants read for entra or entra-app. User policy only for entra.
     entra:
       # The API registration's application (client) id, optionally also its api://
       # identifier URI: one audience per entry (no commas), at most four.
@@ -113,6 +113,14 @@ auth:
       # system roots (SSL_CERT_FILE) for every TLS connection it makes, e.g. a
       # TLS-inspecting proxy's root plus the public roots it needs. Empty: system roots.
       caConfigMap: ""
+    # Independent app-only policy. Requires explicit tenant GUIDs above (no keywords).
+    entraApp:
+      requiredRole: ""
+      allowedClientApps: []
+      maxSessionHours: 24
+  # Enrollment limit reserved for owned agents: 0 disables enrollment, 0-100.
+  # This release does not implement enrollment.
+  agentsPerUser: 2
   admin:
     # Serves auth-svc's admin API (sign a user out of every device) on port 8082: never
     # through the chart's Ingresses, and only from networkPolicy.adminPeers (or a

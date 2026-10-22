@@ -58,6 +58,228 @@ async fn entra(world: &World, body: Value) -> Answer {
     call(world, Method::POST, "/v1/auth/entra", None, Some(body)).await
 }
 
+fn offer_app(world: &mut World) {
+    let app = world
+        .auth
+        .entra()
+        .unwrap()
+        .app(crate::entra::EntraAppSettings {
+            max_session: std::time::Duration::from_secs(3600),
+            ..Default::default()
+        })
+        .unwrap();
+    world.auth = world.auth.clone().with_entra_app(app);
+    world.router = crate::api::router(crate::api::Api {
+        auth: world.auth.clone(),
+        limits: crate::limits::Limits::new(std::sync::Arc::new(
+            crate::limits::MemoryCounter::default(),
+        )),
+        client_ip_header: None,
+        directory: std::sync::Arc::new(crate::directory::NoDirectory),
+    });
+}
+
+fn app_token(world: &World) -> String {
+    let mut claims = world.stub.user_claims(TENANT, USER);
+    claims.as_object_mut().unwrap().remove("scp");
+    claims["idtyp"] = json!("app");
+    sign(KEY_A, &claims)
+}
+
+#[tokio::test]
+async fn app_sign_in_never_provisions_an_unlinked_identity() {
+    capture_logs();
+    let mut world = world(Offer::Entra).await;
+    let disabled = call(
+        &world,
+        Method::POST,
+        "/v1/auth/entra-app",
+        None,
+        Some(json!({"token": app_token(&world)})),
+    )
+    .await;
+    assert_eq!(disabled.status, StatusCode::NOT_FOUND);
+    offer_app(&mut world);
+    let principal = world
+        .auth
+        .authenticator("entra-app")
+        .unwrap()
+        .authenticate(&app_token(&world))
+        .await
+        .unwrap();
+    assert!(matches!(
+        world.auth.sign_in_external(&principal, Some("agent")).await,
+        Err(crate::error::AuthError::SignInNotPermitted)
+    ));
+    for body in [
+        json!({"token": app_token(&world), "handle": "agent"}),
+        json!({"token": app_token(&world), "device_id": Uuid::new_v4()}),
+    ] {
+        let response = call(&world, Method::POST, "/v1/auth/entra-app", None, Some(body)).await;
+        assert_eq!(response.status, StatusCode::FORBIDDEN);
+        assert_eq!(response.json["error"]["code"], "sign_in_not_permitted");
+    }
+    assert_eq!(world.accounts().await, 0);
+    assert!(world.outbox().await.is_empty());
+    let identities: i64 = sqlx::query_scalar("SELECT count(*) FROM auth.external_identity")
+        .fetch_one(&world.pool)
+        .await
+        .unwrap();
+    assert_eq!(identities, 0);
+    assert!(!captured_logs().contains(&app_token(&world)));
+    assert!(
+        security_events()
+            .iter()
+            .any(|event| event["event"] == "auth.external.failure"
+                && event["route"] == "/v1/auth/entra-app")
+    );
+}
+
+#[tokio::test]
+async fn app_route_rejects_bad_crypto_before_admission_or_account_lookup() {
+    let admission = super::RequireGroup::new("agents");
+    let mut world = super::world_with(Offer::Entra, None, Some(admission.clone())).await;
+    offer_app(&mut world);
+    let mut good = world.stub.user_claims(TENANT, USER);
+    good.as_object_mut().unwrap().remove("scp");
+    good["idtyp"] = json!("app");
+    for (claim, value) in [
+        ("aud", json!(CLIENT_APP)),
+        ("exp", json!(unix_now() - 120)),
+        ("nbf", json!(unix_now() + 120)),
+        ("iss", json!("https://evil.example/v2.0")),
+        ("ver", json!("1.0")),
+        ("oid", json!("not-a-guid")),
+        ("idtyp", json!("user")),
+        ("scp", json!("access_as_user")),
+    ] {
+        let mut bad = good.clone();
+        bad[claim] = value;
+        let response = call(
+            &world,
+            Method::POST,
+            "/v1/auth/entra-app",
+            None,
+            Some(json!({"token":sign(KEY_A, &bad)})),
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::UNAUTHORIZED, "{claim}");
+        assert_eq!(response.json["error"]["code"], "token_invalid", "{claim}");
+    }
+    for bad in [
+        crate::entra::testing::sign_as(KEY_B, KEY_A.kid, &good),
+        crate::entra::testing::with_algorithm("HS256", KEY_A.kid, &good, "fake"),
+    ] {
+        assert_eq!(
+            call(
+                &world,
+                Method::POST,
+                "/v1/auth/entra-app",
+                None,
+                Some(json!({"token":bad}))
+            )
+            .await
+            .status,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    assert!(admission.seen.lock().unwrap().is_empty());
+    let refused = call(
+        &world,
+        Method::POST,
+        "/v1/auth/entra-app",
+        None,
+        Some(json!({"token":app_token(&world)})),
+    )
+    .await;
+    assert_eq!(refused.status, StatusCode::FORBIDDEN);
+    assert_eq!(admission.seen.lock().unwrap()[0]["azp"], CLIENT_APP);
+    admission
+        .down
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let unavailable = call(
+        &world,
+        Method::POST,
+        "/v1/auth/entra-app",
+        None,
+        Some(json!({"token":app_token(&world)})),
+    )
+    .await;
+    assert_eq!(unavailable.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(world.accounts().await, 0);
+    assert!(world.outbox().await.is_empty());
+}
+
+#[tokio::test]
+async fn linked_app_sign_in_reuses_registration_and_device_sessions_with_its_own_policy() {
+    let mut world = world(Offer::Entra).await;
+    offer_app(&mut world);
+    // A delegated identity with the identical tid/oid must not link the app.
+    let delegated = entra(&world, json!({"token": world.stub.token(USER)})).await;
+    assert_eq!(delegated.status, StatusCode::OK);
+    let unlinked = call(
+        &world,
+        Method::POST,
+        "/v1/auth/entra-app",
+        None,
+        Some(json!({"token": app_token(&world)})),
+    )
+    .await;
+    assert_eq!(unlinked.status, StatusCode::FORBIDDEN);
+    let user = Uuid::now_v7();
+    sqlx::query("INSERT INTO auth.user_account (user_id, handle, display_name, email_verified_at) VALUES ($1, 'agent', 'Agent', now())")
+        .bind(user).execute(&world.pool).await.unwrap();
+    // Simulate a pre-linked identity. Production enrollment is deliberately not implemented.
+    sqlx::query("INSERT INTO auth.external_identity (identity_id, provider, issuer, subject, user_id) VALUES ($1, 'entra-app', $2, $3, $4)")
+        .bind(Uuid::now_v7()).bind(TENANT).bind(USER).bind(user).execute(&world.pool).await.unwrap();
+    let linked = call(
+        &world,
+        Method::POST,
+        "/v1/auth/entra-app",
+        None,
+        Some(json!({"token": app_token(&world)})),
+    )
+    .await;
+    assert_eq!(linked.status, StatusCode::OK, "{}", linked.json);
+    let device = call(
+        &world,
+        Method::POST,
+        "/v1/devices",
+        linked.json["registration_token"].as_str(),
+        Some(json!({"name":"Agent", "platform":"web", "registration_id":Uuid::now_v7()})),
+    )
+    .await;
+    assert_eq!(device.status, StatusCode::CREATED, "{}", device.json);
+    assert!(device.json["refresh_expires_in_s"].as_i64().unwrap() <= 3600);
+    let renewed = call(
+        &world,
+        Method::POST,
+        "/v1/auth/entra-app",
+        None,
+        Some(json!({"token":app_token(&world), "device_id":device.json["device_id"]})),
+    )
+    .await;
+    assert_eq!(renewed.status, StatusCode::OK);
+    assert!(renewed.json["refresh_expires_in_s"].as_i64().unwrap() <= 3600);
+    let delegated_to_app = call(
+        &world,
+        Method::POST,
+        "/v1/auth/entra-app",
+        None,
+        Some(json!({"token":world.stub.token(USER)})),
+    )
+    .await;
+    assert_eq!(delegated_to_app.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(delegated_to_app.json["error"]["code"], "token_invalid");
+    assert_eq!(
+        entra(&world, json!({"token":app_token(&world)}))
+            .await
+            .status,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(world.accounts().await, 2);
+}
+
 /// `object_id` signs in with Entra ID and registers a device: its tokens.
 async fn with_device(world: &World, object_id: &str) -> Value {
     let signed_in = entra(world, json!({"token": world.stub.token(object_id)})).await;

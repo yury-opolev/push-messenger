@@ -24,6 +24,36 @@ use crate::limits::{Limits, MemoryCounter};
 
 const ADMIN_TOKEN: &str = "admin-token-of-the-auth-svc-tests-0123456789";
 
+#[tokio::test]
+async fn the_generic_external_selector_revokes_prelinked_entra_app_sessions() {
+    let world = world(Offer::Entra).await;
+    let object = Uuid::now_v7();
+    let device = entra_user(&world.auth, object).await;
+    // Fixture only: a pre-linked app account, not production enrollment.
+    sqlx::query("UPDATE auth.external_identity SET provider = 'entra-app' WHERE user_id = $1")
+        .bind(device.user_id)
+        .execute(&world.pool)
+        .await
+        .unwrap();
+    let (status, answer) = revoke(
+        &admin(&world),
+        Some(ADMIN_TOKEN),
+        json!({
+            "external": {"provider": "entra-app", "issuer": TENANT, "subject": object}
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(
+        answer,
+        json!({"user_id":device.user_id, "devices_revoked":1})
+    );
+    assert_eq!(
+        world.auth.refresh(&device.refresh_token).await,
+        Err(AuthError::Unauthorized)
+    );
+}
+
 fn admin(world: &World) -> Router {
     admin_router(AdminApi::new(
         world.auth.clone(),

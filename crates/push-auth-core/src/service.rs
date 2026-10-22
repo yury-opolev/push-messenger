@@ -82,6 +82,7 @@ impl Default for SignIn {
 /// admission.
 #[derive(Debug, Clone, Default)]
 struct Identity {
+    entra_app: Option<crate::entra::EntraAppSignIn>,
     external: Option<Arc<dyn Authenticator>>,
     admission: Option<Arc<dyn Admission>>,
 }
@@ -168,6 +169,12 @@ impl Auth {
         self
     }
 
+    /// Offers app-only sign-in for pre-linked identities; never auto-provisions.
+    pub fn with_entra_app(mut self, authenticator: crate::entra::EntraAppSignIn) -> Self {
+        self.identity.entra_app = Some(authenticator);
+        self
+    }
+
     /// The service asking `admission` before any account is found or created (spec D4).
     pub fn with_admission(mut self, admission: Arc<dyn Admission>) -> Self {
         self.identity.admission = Some(admission);
@@ -179,6 +186,9 @@ impl Auth {
         let mut offered: Vec<Arc<dyn Authenticator>> = Vec::new();
         if let Some(entra) = &self.sign_in.entra {
             offered.push(Arc::new(entra.clone()));
+        }
+        if let Some(app) = &self.identity.entra_app {
+            offered.push(Arc::new(app.clone()));
         }
         if let Some(external) = &self.identity.external {
             offered.push(external.clone());
@@ -196,10 +206,11 @@ impl Auth {
     /// Whether `route` is the external authenticator's sign-in route, unless its provider
     /// id is `entra` (whose route keeps Entra ID's events).
     pub(crate) fn is_external_route(&self, route: &str) -> bool {
-        self.identity.external.as_ref().is_some_and(|external| {
-            external.provider() != crate::identity::ENTRA_PROVIDER
-                && route.strip_prefix("/v1/auth/") == Some(external.provider())
-        })
+        (self.identity.entra_app.is_some() && route == "/v1/auth/entra-app")
+            || self.identity.external.as_ref().is_some_and(|external| {
+                external.provider() != crate::identity::ENTRA_PROVIDER
+                    && route.strip_prefix("/v1/auth/") == Some(external.provider())
+            })
     }
 
     /// The admission every sign-in by token passes, if any.

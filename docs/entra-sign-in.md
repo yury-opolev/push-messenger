@@ -17,6 +17,7 @@ yours.
 | `password` (default) | Today's email and password sign-up and sign-in, with email confirmation and password reset by email (an email provider is needed) |
 | `entra` | Entra ID only: no email confirmation, no passwords, no email provider. The signup, verification, login and password-reset routes answer 404; no email is ever written, so the worker runs with `PUSH_EMAIL_SENDER=none` |
 | `password,entra` | Both; the two kinds of accounts are never linked, even with the same address |
+| `entra-app`, alone or with the others | Opt-in app-only authentication for **pre-linked** service principals at `POST /v1/auth/entra-app`; never creates an account. Self-service agent enrollment/ownership is not implemented yet |
 | `external`, alone or with the others | The sign-in of a push-auth of your own: its authenticator at `/v1/auth/{its provider id}` ([Your own wrapper](#your-own-wrapper)) |
 
 **Switching an existing installation to `entra` is destructive for password sessions.**
@@ -48,6 +49,55 @@ In the Microsoft Entra admin center, **App registrations → New registration**:
 5. Do not configure custom signing keys or claims mapping on this registration (auth-svc
    reads the tenant's standard key set).
 6. Note the **Application (client) ID** and the **Directory (tenant) ID**.
+
+### App-only authentication foundation (opt-in)
+
+`entra` continues to accept delegated-user tokens only. Enable `entra-app` separately to
+verify v2 access tokens obtained with client credentials for the **same API audience**.
+Both providers share the authority, audience, explicit tenant allowlist, RS256 signature,
+issuer, lifetime checks and signing-key cache. App tokens require valid non-nil GUID
+`tid`, service-principal `oid`, and client application `azp`. Nonempty `scp` is refused,
+including contradictory `idtyp: app` plus a delegated scope; an explicit `idtyp` other
+than `app` is refused. Missing `idtyp` is accepted without a nonempty scope.
+The verified `azp` remains available in `Principal.claims` for admission/auditing/display;
+neither tokens nor object ids are logged.
+
+App identities use `(entra-app, tid, oid)`, never the delegated `(entra, tid, oid)` key.
+An unlinked app answers **403 `sign_in_not_permitted`**, with no account, identity or
+outbox insertion. A pre-linked app uses the existing registration/device-session flow
+(`{token}` or `{token, device_id}`), but its independent policy:
+
+| Variable | Default |
+|---|---|
+| `PUSH_ENTRA_APP_REQUIRED_ROLE` | unset: no required application role |
+| `PUSH_ENTRA_APP_ALLOWED_CLIENT_APPS` | unset: any valid `azp`; otherwise comma-separated application GUIDs |
+| `PUSH_ENTRA_APP_MAX_SESSION_HOURS` | `24`; whole hours, 1–720 |
+| `PUSH_AGENTS_PER_USER` | `2`; 0–100, with 0 reserved to disable future enrollment |
+
+The delegated scope, role, client filter and session duration do **not** constrain apps.
+For an application permission, define an app role with member type **Applications** and
+assign/consent it to the client service principal; use its value for the app required role.
+No client secret is stored by auth-svc.
+
+Helm uses `auth.signIn.providers: entra,entra-app` (or `entra-app` alone),
+the existing `auth.signIn.entra` authority/audience/tenant fields, and separate
+`auth.signIn.entraApp.{requiredRole,allowedClientApps,maxSessionHours}` fields.
+`auth.agentsPerUser` maps to `PUSH_AGENTS_PER_USER`. Without `password`, email-off and
+password-session revocation rules still apply; app-only deployments need the same authority
+egress/proxy/CA configuration. Existing operator smoke inputs are delegated identities and
+still require the `entra` provider.
+
+**App mode rejects `common`, `organizations` and `consumers`** at startup/chart validation:
+use explicit tenant GUIDs. Future enrollment should additionally require an authenticated
+delegated Entra owner and exact equality of the owner's tenant and the app token's tenant;
+a deployment allowlist alone is not proof of ownership. Enrollment codes, separate
+user-owned agent accounts and management endpoints are deliberately deferred.
+
+Custom `external` authenticators remain supported, but may not claim the reserved built-in
+`entra-app` id. Admissions apply to both built-in providers. App token refusals use
+`token_invalid` / `identity_unavailable` and `auth.external.*` events, while `entra` keeps
+its existing error codes and events. Admin revocation uses the existing generic selector:
+`{"external":{"provider":"entra-app","issuer":"<tid>","subject":"<oid>"}}`.
 
 ## 2. Register the client apps
 

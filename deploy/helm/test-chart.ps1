@@ -754,6 +754,54 @@ $signInArgs = @(
     '--set', 'auth.signIn.entra.tenants={33333333-0000-4000-8000-000000000003}'
 )
 Check 'sign-in: a complete Entra-only configuration renders' { (Render $signInArgs) -eq 0 }
+$appSignInArgs = $signInArgs + @('--set', 'auth.signIn.providers=entra-app')
+Check 'app sign-in: opt-in renders app-only and mixed modes with independent policy' {
+    $rendered = helm template push $chart @appSignInArgs `
+        --set auth.signIn.entraApp.requiredRole=Agent.Run `
+        --set 'auth.signIn.entraApp.allowedClientApps={22222222-0000-4000-8000-000000000002}' `
+        --set auth.signIn.entraApp.maxSessionHours=2 --set auth.agentsPerUser=0 2>&1 | Out-String
+    $exit = $LASTEXITCODE
+    $auth = Doc $rendered 'Deployment' 'push-auth'
+    $exit -eq 0 -and
+        $auth -match '(?s)name: PUSH_AUTH_PROVIDERS\s+value: "entra-app"' -and
+        $auth -match '(?s)name: PUSH_ENTRA_APP_REQUIRED_ROLE\s+value: "Agent.Run"' -and
+        $auth -match '(?s)name: PUSH_ENTRA_APP_ALLOWED_CLIENT_APPS\s+value: "22222222-0000-4000-8000-000000000002"' -and
+        $auth -match '(?s)name: PUSH_ENTRA_APP_MAX_SESSION_HOURS\s+value: "2"' -and
+        $auth -match '(?s)name: PUSH_AGENTS_PER_USER\s+value: "0"' -and
+        $auth -notmatch 'PUSH_ENTRA_REQUIRED_SCOPE|PUSH_ENTRA_REQUIRED_ROLE|PUSH_ENTRA_MAX_SESSION_HOURS' -and
+        (Render ($appSignInArgs + @('--set', 'auth.signIn.providers=password\,entra-app'))) -eq 0 -and
+        (Render ($appSignInArgs + @('--set', 'auth.signIn.providers=entra\,entra-app'))) -eq 0 -and
+        (Render ($appSignInArgs + @('--set', 'auth.signIn.providers=entra-app\,password\,entra'))) -eq 0
+}
+Check 'app sign-in: bounded tenants and policy validation reject unsafe modes' {
+    $bad = @(
+        'auth.signIn.entra.tenants={common}',
+        'auth.signIn.entra.tenants={organizations}',
+        'auth.signIn.entra.tenants={consumers}',
+        'auth.signIn.entraApp.requiredRole=two roles',
+        'auth.signIn.entraApp.allowedClientApps={bad}',
+        'auth.signIn.entraApp.allowedClientApps=not-a-list',
+        'auth.signIn.entraApp.maxSessionHours=0',
+        'auth.signIn.entraApp.maxSessionHours=721',
+        'auth.signIn.entraApp.maxSessionHours=1.5',
+        'auth.agentsPerUser=-1',
+        'auth.agentsPerUser=101',
+        'auth.agentsPerUser=1.5',
+        'auth.signIn.providers=entra-app\,entra-app'
+    )
+    @($bad | Where-Object { (Render ($appSignInArgs + @('--set', $_))) -eq 0 }).Count -eq 0 -and
+        (Render ($appSignInArgs + @('--set', 'auth.signIn.entraApp.maxSessionHours=720', '--set', 'auth.agentsPerUser=100'))) -eq 0
+}
+Check 'app sign-in: defaults stay off, egress and email-off rules apply' {
+    $default = helm template push $chart | Out-String
+    $app = helm template push $chart @appSignInArgs --set networkPolicy.egress.enabled=true `
+        --set 'networkPolicy.egress.entraSignInCidrs={20.190.128.0/18}' | Out-String
+    $default -notmatch 'PUSH_ENTRA_APP_|entra-app' -and
+        $app -match 'cidr: 20.190.128.0/18' -and
+        (Render ($appSignInArgs + @('--set', 'networkPolicy.egress.enabled=true'))) -ne 0 -and
+        (Render ($appSignInArgs + @('--set', 'worker.email.sender=none'))) -eq 0 -and
+        (Render ($appSignInArgs + @('--set', 'worker.email.webhook.enabled=true'))) -ne 0
+}
 Check 'sign-in: both providers render, in either order' {
     (Render ($signInArgs + @('--set', 'auth.signIn.providers=password\,entra'))) -eq 0 -and
         (Render ($signInArgs + @('--set', 'auth.signIn.providers=entra\, password'))) -eq 0
