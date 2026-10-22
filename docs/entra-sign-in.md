@@ -96,6 +96,7 @@ use explicit tenant GUIDs. Entra owners must have the exact same delegated ident
 as the app. Password/custom-provider human owners may enroll only when the deployment
 allows exactly one explicit tenant; that tenant is recorded at reservation time. Otherwise
 the API returns `enrollment_not_permitted` rather than guessing. Agents cannot own agents.
+Older manually linked app accounts cannot act as human owners either.
 
 ### Enroll and operate an agent
 

@@ -155,6 +155,52 @@ async fn disabling_enrollment_also_refuses_previously_reserved_codes_without_spe
 }
 
 #[tokio::test]
+async fn a_legacy_linked_app_is_not_a_human_owner_even_with_the_old_default_kind() {
+    let (world, auth, _, _) = setup().await;
+    let user = Uuid::now_v7();
+    let app = principal(Uuid::new_v4());
+    sqlx::query(
+        "INSERT INTO auth.user_account (user_id,handle,display_name,email_verified_at) \
+         VALUES ($1,'legacy_app','Legacy app',now())",
+    )
+    .bind(user)
+    .execute(&world.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO auth.external_identity (identity_id,provider,issuer,subject,user_id) \
+         VALUES ($1,'entra-app',$2,$3,$4)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(&app.issuer)
+    .bind(&app.subject)
+    .bind(user)
+    .execute(&world.pool)
+    .await
+    .unwrap();
+    let signed_in = auth.sign_in_external(&app, None).await.unwrap();
+    let device = auth
+        .register_device(
+            &signed_in.registration.token,
+            Uuid::now_v7(),
+            "Legacy",
+            "other",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        auth.reserve_agent(caller(&device), "nested_legacy_agent", "Nested")
+            .await
+            .err(),
+        Some(AuthError::EnrollmentNotPermitted)
+    );
+    assert_eq!(
+        auth.owned_agents(caller(&device)).await.err(),
+        Some(AuthError::EnrollmentNotPermitted)
+    );
+}
+
+#[tokio::test]
 async fn same_app_competing_across_distinct_owners_has_one_permanent_binding() {
     let (world, auth, _, owner) = setup().await;
     let other_owner = password_user(&auth, &world.pool, "another_owner", 1)

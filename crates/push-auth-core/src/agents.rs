@@ -36,8 +36,11 @@ pub(crate) async fn expire(connection: &mut PgConnection) -> Result<(), AuthErro
 }
 
 async fn owner(connection: &mut PgConnection, caller: Caller) -> Result<(), AuthError> {
+    // Linked-only app accounts predate kind; their default `user` is not a human.
     let human: Option<bool> = sqlx::query_scalar(
-        "SELECT kind = 'user' AND email_verified_at IS NOT NULL FROM auth.user_account \
+        "SELECT kind = 'user' AND email_verified_at IS NOT NULL AND NOT EXISTS ( \
+         SELECT 1 FROM auth.external_identity e WHERE e.user_id = a.user_id \
+         AND e.provider = 'entra-app') FROM auth.user_account a \
          WHERE user_id = $1 FOR UPDATE",
     )
     .bind(caller.user_id)
