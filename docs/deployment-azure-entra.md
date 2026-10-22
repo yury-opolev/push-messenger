@@ -49,10 +49,22 @@ SELECT * FROM pgaadauth_create_principal('push-migrator-id', false, false);
 SELECT * FROM pgaadauth_create_principal('push-auth-id', false, false);
 SELECT * FROM pgaadauth_create_principal('push-message-svc-id', false, false);
 SELECT * FROM pgaadauth_create_principal('push-worker-id', false, false);
+-- PostgreSQL 16+ requires membership before assigning another role as database owner.
+GRANT "push-migrator-id" TO CURRENT_USER;
 CREATE DATABASE push_auth OWNER "push-migrator-id";
 CREATE DATABASE push_messaging OWNER "push-migrator-id";
 CREATE DATABASE push_worker OWNER "push-migrator-id";
 ```
+
+Then, still as the **Entra administrator**, connect to **each** of `push_auth`,
+`push_messaging` and `push_worker` and run:
+
+```sql
+GRANT USAGE, CREATE ON SCHEMA public TO "push-migrator-id";
+```
+
+These are per-database schema privileges, not a grant on the `postgres` database.
+They let the migration identity create the SQLx migration table in `public`.
 
 Two models:
 
@@ -149,8 +161,12 @@ release's own peers (gateway to auth-svc and message-svc, auth-svc and the worke
 message-svc), the datastores, HTTPS (443) to `httpsCidrs` and any raw rules in `extra`.
 The bundled datastores, when enabled, are reached by their pod labels and get
 `egress: []` themselves. With the migration Job the chart adds a policy for the Job's
-pod (DNS, PostgreSQL, HTTPS); it takes effect from the first upgrade, since a
-pre-install hook runs before the release's policies exist.
+pod (DNS, PostgreSQL, HTTPS). That migrate-only policy is a `pre-install,pre-upgrade`
+hook with a lower weight than the Job, so it exists even on the first install under
+a namespace default-deny policy. It persists after the Job finishes and is replaced
+before the next hook run (`before-hook-creation`, not `hook-succeeded`); the regular
+application policies remain normal release resources. As a Helm hook resource, the
+migration policy may need explicit removal when permanently removing the release.
 
 NetworkPolicies match IP blocks, not names:
 
@@ -199,8 +215,9 @@ Token scopes: PostgreSQL `https://ossrdbms-aad.database.windows.net/.default`, R
    application keys of section 1 (no `*database*`, `redis*` or `*password*` key), and no
    container has a `PUSH_DATABASE_URL`, `PUSH_AUTH_DATABASE_URL` or a `PUSH_REDIS_URL`
    with credentials.
-3. Run your own probes, or `helm test` with the DEV ONLY smoke test in an isolated
-   namespace that may use dev mode (never in production).
+3. Run the [operator Entra smoke test](consumer-verification.md#operator-entra-smoke-test)
+   with two dedicated preexisting identities, or your own probes. Run the DEV ONLY
+   smoke test only in an isolated namespace that may use dev mode (never in production).
 4. Keep traffic running for at least 3 hours, several token lifetimes, with
    `push-load` ([consumer verification](consumer-verification.md)): no failed requests,
    no dropped WebSocket sessions and no lost messages.

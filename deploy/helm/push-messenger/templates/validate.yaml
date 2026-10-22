@@ -7,3 +7,11 @@
 {{- range $name := list "auth" "messageSvc" "gateway" "worker" "smoke" -}}
 {{- $_ := include "push.image" (index $.Values.images $name) -}}
 {{- end -}}
+{{- if .Values.smoke.entraAccountsSecret -}}
+{{- if .Values.smoke.entraTokenUrl -}}
+{{- fail "smoke.entraAccountsSecret and smoke.entraTokenUrl are mutually exclusive" -}}
+{{- end -}}
+{{- if or (not (regexMatch "^[a-zA-Z0-9._-]+$" .Values.smoke.entraAccountsKey)) (has .Values.smoke.entraAccountsKey (list "." "..")) -}}
+{{- fail "smoke.entraAccountsKey must be a Secret key filename" -}}
+{{- end -}}
+{{- end -}}

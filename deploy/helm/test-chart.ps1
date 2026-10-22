@@ -246,6 +246,20 @@ Check 'default: groups are refused; one switch serves them' {
 }
 Check 'default: the DevSetup switch is gone' { $default -notmatch 'PUSH_DEV_SETUP' }
 Check 'default: no smoke test' { $default -notmatch 'helm.sh/hook: test' -and $default -notmatch 'PUSH_SMOKE_SIGNING_KEY' }
+Check 'operator smoke: consumer Secret enables helm test without DEV credentials' {
+    $rendered = helm template push $chart --set smoke.entraAccountsSecret=operator-accounts | Out-String
+    $smoke = Doc $rendered 'Pod' 'push-smoke'
+    $smoke -and $smoke -match '(?s)- --entra-accounts\s+- "/operator-accounts/accounts.jsonl"' -and
+        $smoke -match 'secretName: "?operator-accounts"?' -and
+        $smoke -match 'mountPath: /operator-accounts' -and
+        $smoke -notmatch 'PUSH_SMOKE_SIGNING_KEY|--mailbox|--entra-token-url'
+}
+Check 'operator smoke: issuer input is mutually exclusive and accounts key is a filename' {
+    (Render @('--set', 'smoke.entraAccountsSecret=operator-accounts',
+        '--set', 'smoke.entraTokenUrl=http://stub/dev/token')) -ne 0 -and
+    (Render @('--set', 'smoke.entraAccountsSecret=operator-accounts',
+        '--set', 'smoke.entraAccountsKey=../accounts.jsonl')) -ne 0
+}
 Check 'default: the worker has no dev mailbox and logs email; auth-svc has no mailbox at all' {
     $worker = Doc $default 'Deployment' 'push-worker'
     $auth = Doc $default 'Deployment' 'push-auth'
@@ -483,6 +497,32 @@ Check 'entra: the migration Job needs an Entra PostgreSQL, its user and its clie
 }
 Check 'entra: role names are Entra principal names' {
     (Render ($entraArgs + @('--set', 'postgres.external.users.auth=bad"name'))) -ne 0
+}
+Check 'entra: migration egress policy is a persistent pre-install/pre-upgrade hook before the Job' {
+    $rendered = helm template push $chart @entraArgs --set migrations.job.enabled=true `
+        --set postgres.external.users.migrate=push-migrator-id `
+        --set azure.workloadIdentity.clientIds.migrate=00000000-0000-0000-0000-00000000000e `
+        --set networkPolicy.egress.enabled=true `
+        --set 'networkPolicy.egress.postgresCidrs={10.20.0.4/32}' `
+        --set 'networkPolicy.egress.httpsCidrs={20.0.0.0/8}' | Out-String
+    $validate = @'
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(sys.stdin.read()) if d]
+policy = next(d for d in docs if d["kind"] == "NetworkPolicy" and d["metadata"]["name"] == "push-migrate")
+job = next(d for d in docs if d["kind"] == "Job" and d["metadata"]["name"] == "push-migrate")
+a = policy["metadata"].get("annotations", {})
+assert a.get("helm.sh/hook") == "pre-install,pre-upgrade", "migration policy must precede ordinary release resources"
+assert int(a["helm.sh/hook-weight"]) < int(job["metadata"]["annotations"]["helm.sh/hook-weight"])
+assert a["helm.sh/hook-delete-policy"] == "before-hook-creation", "policy must persist while Job runs"
+assert policy["spec"]["podSelector"]["matchLabels"].items() <= job["spec"]["template"]["metadata"]["labels"].items()
+ports = {p["port"] for r in policy["spec"]["egress"] for p in r["ports"]}
+assert ports == {53, 443, 5432}
+for d in docs:
+    if d["kind"] == "NetworkPolicy" and d is not policy:
+        assert "helm.sh/hook" not in d["metadata"].get("annotations", {}), "ordinary policies must remain ordinary"
+'@
+    $rendered | & $python.Source -c $validate
+    $LASTEXITCODE -eq 0
 }
 # The default render with the Secret's generated values masked: they are random per render.
 function Normalized([string] $rendered) {

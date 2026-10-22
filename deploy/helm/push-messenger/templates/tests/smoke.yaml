@@ -1,11 +1,12 @@
-{{- if include "push.devMode" . -}}
+{{- if or (include "push.devMode" .) .Values.smoke.entraAccountsSecret -}}
 # `helm test <release>` runs the end-to-end smoke test inside the cluster: auth-svc's public
 # API and the WebSockets go through the ingress controller with the ingress host as the
 # Host header, as a client's would; only the DEV ONLY mailbox is read straight from the
 # worker, which the ingress does not route. It gets auth-svc's signing key from the Secret,
 # to sign an expired token and one for another audience that the gateway must refuse. Its
 # second half runs two apps built on push-sdk, whose SQLite databases live in an emptyDir
-# (the root filesystem is read-only).
+# (the root filesystem is read-only). Operator mode instead uses two preexisting Entra
+# identities from the consumer's Secret, with no service signing key or DEV mailbox.
 apiVersion: v1
 kind: Pod
 metadata:
@@ -26,14 +27,20 @@ spec:
       args:
         - --auth
         - {{ .Values.smoke.authUrl | quote }}
+        {{- if not .Values.smoke.entraAccountsSecret }}
         - --mailbox
         - {{ printf "http://%s:8080" (include "push.name" (dict "root" . "component" "worker")) | quote }}
+        {{- end }}
         - --socket
         - {{ .Values.smoke.socketUrl | quote }}
         - --host
         - {{ .Values.ingress.host | quote }}
         - --data-dir
         - /data
+        {{- if .Values.smoke.entraAccountsSecret }}
+        - --entra-accounts
+        - {{ printf "/operator-accounts/%s" .Values.smoke.entraAccountsKey | quote }}
+        {{- end }}
         {{- with .Values.smoke.entraTokenUrl }}
         # DEV ONLY: the rehearsal issuer's token endpoint; the Entra ID smoke test runs.
         - --entra-token-url
@@ -42,12 +49,18 @@ spec:
       volumeMounts:
         - name: data
           mountPath: /data
+        {{- if .Values.smoke.entraAccountsSecret }}
+        - name: operator-accounts
+          mountPath: /operator-accounts
+          readOnly: true
+        {{- else }}
       env:
         - name: PUSH_SMOKE_SIGNING_KEY
           valueFrom:
             secretKeyRef:
               name: {{ include "push.secretName" . }}
               key: auth-signing-key
+        {{- end }}
       resources:
         requests:
           cpu: 10m
@@ -59,4 +72,9 @@ spec:
     - name: data
       emptyDir:
         sizeLimit: 64Mi
+    {{- if .Values.smoke.entraAccountsSecret }}
+    - name: operator-accounts
+      secret:
+        secretName: {{ .Values.smoke.entraAccountsSecret | quote }}
+    {{- end }}
 {{- end }}

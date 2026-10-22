@@ -22,7 +22,7 @@ Images, one target per binary, from the repository root (BuildKit):
 |---|---|
 | `auth`, `message-svc`, `gateway`, `worker` | The services the chart deploys |
 | `load` | `push-load`, the explicitly targeted harness below |
-| `smoke` | DEV ONLY end-to-end smoke test for local clusters (needs the signing key and dev mailbox) |
+| `smoke` | End-to-end smoke test: operator Entra accounts, or DEV ONLY local mode with signing key and dev mailbox |
 
 ```text
 docker build -f deploy/docker/Dockerfile --target gateway -t <your-registry>/push-messenger/gateway:<your-version> .
@@ -50,7 +50,8 @@ chart-managed render contains credentials and must not reach shared logs.
 |---|---|---|---|
 | `pwsh deploy/helm/test-chart.ps1` | contributor machine | chart structure and guards | n/a (no cluster) |
 | `deploy/minikube/test-network-policy.ps1 -Context <ctx> [-Egress]` | existing cluster with an enforcing CNI | internal API isolation, by live allowed/denied connections; with `-Egress` also the egress rules (`networkPolicy.egress.enabled`) | deploys short-lived probe pods; run deliberately |
-| `push-smoke` (`helm test` in dev mode) | local cluster only | the whole flow with the DEV ONLY mailbox and signing key | **no** |
+| `push-smoke` (operator Entra mode, also available through `helm test`) | authorized deployment | two preexisting identities register/connect, become contacts, message and re-sign-in on the same device | yes, with dedicated test identities; creates devices, contacts and messages |
+| `push-smoke` (DEV mode) | local cluster only | the whole flow with the DEV ONLY mailbox and signing key, or the DEV Entra issuer | **no** |
 | `push-load` | any target you own or are authorized to test | connections, heartbeats, message/receipt latency, reconnects | yes, with dedicated test accounts and the limits below |
 
 ## push-load
@@ -63,8 +64,8 @@ It never prints tokens, passwords or email addresses.
 
 - Written authorization to test the target, and a maintenance or test window agreed
   with its operators.
-- **Dedicated, verified test accounts** created through your normal sign-up and email
-  verification, at least `connections / devices-per-account` of them (each account has
+- **Dedicated test accounts** created through your normal sign-up and email
+  verification or preexisting Entra identities, at least `connections / devices-per-account` of them (each account has
   at most 10 active devices). Never use real users' accounts.
 - A private directory outside every Git working tree for the accounts file, state file
   and reports (encrypted where available). The state holds refresh tokens.
@@ -73,7 +74,32 @@ It never prints tokens, passwords or email addresses.
   under the reported limit. Split very large tests across several generator hosts, each
   with its own accounts subset and state file; their reports are separate.
 
-The accounts file is JSON Lines, one `{"email": "...", "password": "..."}` per line.
+The accounts file is JSON Lines, with exactly one credential source per line:
+
+```json
+{"email":"load-test@example.com","password":"<password>"}
+{"entra_token":"<Entra-access-token>"}
+{"entra_token_file":"tokens/operator.jwt"}
+```
+
+The examples show alternative entries, not three entries for the same account.
+Password accounts keep their existing behavior. Entra entries use `/v1/auth/entra`
+and must name **preexisting** identities with handles, enrolled through your normal
+application flow. Obtain access tokens for the audience configured in
+`auth.signIn.entra.audience`, not Microsoft Graph tokens; see [Entra sign-in](entra-sign-in.md).
+Do not supply `email`/`password` together with an Entra source. Empty strings, unknown
+fields, ambiguous sources and repeated identities are refused without echoing their
+contents.
+
+Token file paths are relative to the **accounts file**, not the process directory.
+Files contain only the token (surrounding whitespace/newlines are trimmed). They are
+reread whenever sign-in or reauthentication is needed: replace an expired token with
+a fresh token for the **same** identity, then rerun `prepare` with the same state file.
+The unverified JWT `tid`/`oid` UUID claims supply a stable state key and detect
+duplicate identities or identity-changing file replacements; the server alone validates
+the token, issuer, audience and permission. Operator Entra tokens never enter state
+or reports. State continues to hold device refresh tokens; normal `run` uses those,
+not the operator tokens. Keep all input files and state private.
 
 ### Prepare (once per campaign; resumable)
 
@@ -159,6 +185,38 @@ cargo run -p push-smoke --bin push-dev-accounts -- --auth http://127.0.0.1:18080
 (with `kubectl port-forward` of the ingress controller to 18080 and of the worker to
 18081). Then prepare and run against `http://push.local:18080` with
 `--connect-to 127.0.0.1`.
+
+## Operator Entra smoke test
+
+Use an accounts JSONL file in the format above containing **exactly two distinct,
+preexisting Entra identities** (inline or token files, no passwords). It signs in
+through `/v1/auth/entra`, registers and connects two SDK clients, establishes a contact
+by invite, sends a message, and signs in again on the first client's existing device.
+It neither creates identities nor calls the DEV issuer or password endpoints, and
+needs no service signing key or mailbox:
+
+```text
+push-smoke --auth https://api.example.com --socket wss://api.example.com/v1/socket --data-dir C:\private\smoke --entra-accounts C:\private\smoke-accounts.jsonl
+```
+
+Create the private data directory first. `PUSH_SMOKE_ENTRA_ACCOUNTS` is the equivalent
+environment setting. `--entra-token-url` / `PUSH_SMOKE_ENTRA_TOKEN_URL` remains
+**DEV ONLY** and is mutually exclusive with operator accounts, including environment
+settings. Operator failures suppress HTTP diagnostic bodies to avoid credential echoes.
+Each run creates devices and persists encrypted SDK databases; revoke the test devices
+and delete that directory after the campaign (accounts have at most ten active devices).
+
+For a consumer `helm test`, provide an existing Secret in the release namespace:
+`smoke.entraAccountsSecret: operator-smoke-accounts`. Its `accounts.jsonl` key
+(`smoke.entraAccountsKey` overrides the filename) holds the two entries; relative
+`entra_token_file` paths refer to other keys in that same Secret. The chart mounts the
+whole Secret read-only and passes only the accounts filename, never token values,
+to the Pod. Provision/update it through your normal secret-management process; do
+not commit tokens in values or put them on command lines. Set `smoke.authUrl` and
+`smoke.socketUrl` for your ingress/controller, pin `images.smoke`, and run
+`helm test <release> --namespace <namespace> --timeout 6m`. Allow the Pod's ingress
+and DNS traffic in any consumer namespace-wide policies. This opt-in works without
+dev mode and does not expose the service signing key or worker mailbox.
 
 ## Local functional evidence (2026-10-17)
 

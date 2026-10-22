@@ -359,7 +359,13 @@ ingress:
   webhookAnnotations: {}
 
 smoke:
-  # DEV ONLY (`helm test` in dev mode). Defaults name minikube's local ingress-nginx addon.
+  # Helm test: DEV mode, or operator Entra accounts from a consumer-managed Secret.
+  # The Secret must hold exactly two preexisting identities in entraAccountsKey (JSONL).
+  # Relative entra_token_file paths name other keys mounted from the same Secret.
+  # No service signing key or DEV mailbox is made available in operator mode.
+  entraAccountsSecret: ""
+  entraAccountsKey: accounts.jsonl
+  # Defaults name minikube's local ingress-nginx addon; override for your controller.
   # auth-svc's public API as the smoke test reaches it: the ingress controller, with
   # `ingress.host` as the Host header.
   authUrl: http://ingress-nginx-controller.ingress-nginx.svc.cluster.local

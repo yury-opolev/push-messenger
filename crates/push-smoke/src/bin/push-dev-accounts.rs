@@ -60,7 +60,7 @@ async fn create(args: Vec<String>) -> anyhow::Result<()> {
         data_dir: String::new(),
     };
     let accounts = push_smoke::create_verified_accounts(&target, count).await?;
-    push_load::state::write_private(&out, push_load::accounts::to_lines(&accounts).as_bytes())?;
+    push_load::state::write_private(&out, push_load::accounts::to_lines(&accounts)?.as_bytes())?;
     println!(
         "push-dev-accounts: wrote {} DEV ONLY verified accounts to {}",
         accounts.len(),

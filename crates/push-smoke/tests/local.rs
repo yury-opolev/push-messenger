@@ -46,10 +46,10 @@ async fn push_load_prepares_runs_and_reports_against_the_whole_stack() {
     let mut accounts = push_smoke::create_verified_accounts(&stack.smoke_target(String::new()), 4)
         .await
         .expect("four verified accounts");
-    accounts.push(push_load::accounts::Account {
-        email: format!("nobody.{}@load.test", uuid::Uuid::now_v7().simple()),
-        password: "not-an-account".to_owned(),
-    });
+    accounts.push(push_load::accounts::Account::password(
+        format!("nobody.{}@load.test", uuid::Uuid::now_v7().simple()),
+        "not-an-account".to_owned(),
+    ));
     // Credential files outside the repository: push-load refuses a Git working tree.
     let dir = std::env::temp_dir().join(format!("push-load-{}", uuid::Uuid::now_v7()));
     std::fs::create_dir_all(&dir).unwrap();

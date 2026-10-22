@@ -31,8 +31,9 @@
 //! smoke test needs auth-svc's signing key (from the deployment's Secret) for step 6 and
 //! a writable directory for the SDK's databases.
 //!
-//! A Microsoft Entra ID-only deployment is tested by [`entra::run`] instead (DEV ONLY,
-//! with the rehearsal issuer's token endpoint).
+//! Microsoft Entra deployments can use [`entra::run_accounts`] with two preexisting
+//! operator identities and no signing key/mailbox, or [`entra::run`] (DEV ONLY, with
+//! the rehearsal issuer's token endpoint).
 
 mod auth;
 pub mod entra;
@@ -100,7 +101,7 @@ impl std::fmt::Debug for Target {
 }
 
 /// The usage line of the `push-smoke` binary.
-pub const USAGE: &str = "usage: push-smoke --auth <url> --mailbox <url> --socket <ws-url> --data-dir <dir> [--host <host>], with auth-svc's signing key in PUSH_SMOKE_SIGNING_KEY";
+pub const USAGE: &str = "usage: push-smoke --auth <url> --socket <ws-url> --data-dir <dir> [--host <host>] [--entra-accounts <file.jsonl> | --entra-token-url <DEV-ONLY-url>]; password DEV mode also requires --mailbox and PUSH_SMOKE_SIGNING_KEY";
 
 impl Target {
     /// Reads `--auth`, `--mailbox`, `--socket`, `--data-dir` and `--host` from `args`;
@@ -111,6 +112,22 @@ impl Target {
     pub fn parse(
         args: impl IntoIterator<Item = String>,
         env: impl Fn(&str) -> Option<String>,
+    ) -> Result<Self, String> {
+        Self::parse_mode(args, env, false)
+    }
+
+    /// Entra smoke tests need neither a mailbox nor the service's signing key.
+    pub fn parse_entra(
+        args: impl IntoIterator<Item = String>,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> Result<Self, String> {
+        Self::parse_mode(args, env, true)
+    }
+
+    fn parse_mode(
+        args: impl IntoIterator<Item = String>,
+        env: impl Fn(&str) -> Option<String>,
+        entra: bool,
     ) -> Result<Self, String> {
         let (mut auth_url, mut mailbox_url, mut socket_url, mut host) = (None, None, None, None);
         let mut data_dir = None;
@@ -138,11 +155,15 @@ impl Target {
                 "--auth or PUSH_SMOKE_AUTH_URL",
                 "PUSH_SMOKE_AUTH_URL",
             )?,
-            mailbox_url: required(
-                mailbox_url,
-                "--mailbox or PUSH_SMOKE_MAILBOX_URL",
-                "PUSH_SMOKE_MAILBOX_URL",
-            )?,
+            mailbox_url: if entra {
+                String::new()
+            } else {
+                required(
+                    mailbox_url,
+                    "--mailbox or PUSH_SMOKE_MAILBOX_URL",
+                    "PUSH_SMOKE_MAILBOX_URL",
+                )?
+            },
             socket_url: required(
                 socket_url,
                 "--socket or PUSH_SMOKE_SOCKET_URL",
@@ -151,7 +172,11 @@ impl Target {
             host: host
                 .or_else(|| env("PUSH_SMOKE_HOST"))
                 .filter(|host| !host.is_empty()),
-            signing_key: required(None, "PUSH_SMOKE_SIGNING_KEY", "PUSH_SMOKE_SIGNING_KEY")?,
+            signing_key: if entra {
+                String::new()
+            } else {
+                required(None, "PUSH_SMOKE_SIGNING_KEY", "PUSH_SMOKE_SIGNING_KEY")?
+            },
             data_dir: required(
                 data_dir,
                 "--data-dir or PUSH_SMOKE_DATA_DIR",
@@ -343,7 +368,7 @@ pub async fn create_verified_accounts(
     let mut accounts = Vec::with_capacity(count);
     for index in 0..count {
         let (email, password) = auth.sign_up_verified(&format!("load{index}")).await?;
-        accounts.push(push_load::accounts::Account { email, password });
+        accounts.push(push_load::accounts::Account::password(email, password));
     }
     Ok(accounts)
 }
