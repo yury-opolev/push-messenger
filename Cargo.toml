@@ -39,7 +39,7 @@ hmac = "0.12"
 http-body-util = "0.1"
 hyper = "1"
 hyper-util = "0.1"
-jsonwebtoken = { version = "9", default-features = false }
+jsonwebtoken = { version = "10", default-features = false }
 libtest-mimic = "0.8"
 prost = "0.14"
 protoc-bin-vendored = "3"
