@@ -6,6 +6,7 @@
 //! knows the contacts and conversations (spec §5.5).
 
 pub mod admin;
+mod agents;
 pub mod api;
 mod audit;
 mod config;

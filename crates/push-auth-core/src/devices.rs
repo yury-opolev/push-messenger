@@ -59,6 +59,22 @@ pub struct DeviceInfo {
 }
 
 impl Auth {
+    pub(crate) async fn lock_enabled_account(
+        &self,
+        connection: &mut PgConnection,
+        user_id: Uuid,
+    ) -> Result<(), AuthError> {
+        let enabled: Option<bool> = sqlx::query_scalar(
+            "SELECT disabled_at IS NULL FROM auth.user_account WHERE user_id = $1 FOR UPDATE",
+        )
+        .bind(user_id)
+        .fetch_optional(connection)
+        .await?;
+        if enabled != Some(true) {
+            return Err(AuthError::Unauthorized);
+        }
+        Ok(())
+    }
     /// A new refresh token for `device`, stored as its hash, and a new access token.
     ///
     /// Every change to a device's tokens happens under the lock of its device row, taken
@@ -132,7 +148,7 @@ impl Auth {
         let mut tx = self.pool.begin().await?;
         let account = sqlx::query(
             "SELECT password_hash, email_verified_at IS NOT NULL FROM auth.user_account \
-             WHERE user_id = $1 FOR UPDATE",
+             WHERE user_id = $1 AND disabled_at IS NULL FOR UPDATE",
         )
         .bind(claims.sub)
         .fetch_optional(&mut *tx)
@@ -241,14 +257,17 @@ impl Auth {
     pub async fn refresh(&self, refresh_token: &str) -> Result<Tokens, AuthError> {
         let hash = refresh_hash(refresh_token);
         let mut tx = self.pool.begin().await?;
-        let device_id: Option<Uuid> =
-            sqlx::query_scalar("SELECT device_id FROM auth.refresh_token WHERE token_hash = $1")
-                .bind(hash.as_slice())
-                .fetch_optional(&mut *tx)
-                .await?;
-        let Some(device_id) = device_id else {
+        let identity: Option<(Uuid, Uuid)> = sqlx::query_as(
+            "SELECT d.device_id, d.user_id FROM auth.refresh_token r \
+                           JOIN auth.device d USING (device_id) WHERE r.token_hash = $1",
+        )
+        .bind(hash.as_slice())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((device_id, account_id)) = identity else {
             return Err(AuthError::Unauthorized);
         };
+        self.lock_enabled_account(&mut tx, account_id).await?;
         let device = sqlx::query(
             "SELECT device.user_id, device.revoked_at IS NULL, device.session_expires_at, \
              account.password_hash IS NOT NULL \
@@ -371,7 +390,7 @@ impl Auth {
              FROM auth.device AS device \
              JOIN auth.user_account AS account ON account.user_id = device.user_id \
              WHERE device.device_id = $1 AND device.user_id = $2 \
-             AND device.revoked_at IS NULL",
+             AND device.revoked_at IS NULL AND account.disabled_at IS NULL",
         )
         .bind(claims.device_id)
         .bind(claims.sub)

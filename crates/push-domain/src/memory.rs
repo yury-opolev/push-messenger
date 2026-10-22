@@ -26,6 +26,7 @@ fn missing(what: &str) -> DomainError {
 #[derive(Debug, Clone, Default)]
 struct State {
     users: HashSet<UserId>,
+    agent_owners: HashMap<UserId, UserId>,
     /// The last password reset message-svc heard of, per user.
     password_resets: HashMap<UserId, DateTime<Utc>>,
     devices: HashMap<DeviceId, DeviceRow>,
@@ -219,6 +220,22 @@ impl Store for InMemoryStore {
 
 #[async_trait]
 impl Tx for InMemoryTx {
+    async fn record_agent_owner(&mut self, agent: UserId, owner: UserId) -> DomainResult<bool> {
+        if !self.work.users.contains(&agent) || !self.work.users.contains(&owner) || agent == owner
+        {
+            return Err(missing("agent or owner"));
+        }
+        match self.work.agent_owners.get(&agent) {
+            Some(existing) if *existing != owner => {
+                Err(DomainError::Store("agent owner mismatch".into()))
+            }
+            Some(_) => Ok(false),
+            None => {
+                self.work.agent_owners.insert(agent, owner);
+                Ok(true)
+            }
+        }
+    }
     async fn commit(self) -> DomainResult<()> {
         let InMemoryTx { mut guard, work } = self;
         *guard = work;

@@ -286,7 +286,7 @@ ingress:
     secretName: messenger-tls # existing kubernetes.io/tls Secret; required for https
   annotations: {}             # on every public Ingress
   gatewayAnnotations: {}      # /v1/socket
-  authAnnotations: {}         # /v1/auth, /v1/devices, /v1/users
+  authAnnotations: {}         # /v1/auth, /v1/devices, /v1/users, /v1/agents
   authLinkAnnotations: {}     # /v1/auth/verify, /v1/auth/password/reset (token-bearing)
   webhookAnnotations: {}      # /v1/webhooks/resend
 ```

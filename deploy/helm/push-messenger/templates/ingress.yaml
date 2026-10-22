@@ -12,7 +12,7 @@ routed: every route names the Service port http.
 {{- if .Values.ingress.enabled -}}
 {{- $routes := list
   (dict "name" "gateway" "component" "gateway" "paths" (list "/v1/socket") "type" "Exact" "annotations" .Values.ingress.gatewayAnnotations)
-  (dict "name" "auth" "component" "auth" "paths" (list "/v1/auth" "/v1/devices" "/v1/users") "type" "Prefix" "annotations" .Values.ingress.authAnnotations)
+  (dict "name" "auth" "component" "auth" "paths" (list "/v1/auth" "/v1/devices" "/v1/users" "/v1/agents") "type" "Prefix" "annotations" .Values.ingress.authAnnotations)
 -}}
 {{- if not (include "push.emailOff" .) -}}
 {{- $routes = append $routes (dict "name" "auth-links" "component" "auth" "paths" (list "/v1/auth/verify" "/v1/auth/password/reset") "type" "Exact" "annotations" .Values.ingress.authLinkAnnotations) -}}

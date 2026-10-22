@@ -51,6 +51,15 @@ pub struct EntraAppSignIn {
     settings: EntraAppSettings,
 }
 
+impl EntraAppSignIn {
+    pub(crate) fn tenants(&self) -> &[Uuid] {
+        match &self.verifier.settings.tenants {
+            Tenants::Ids(ids) => ids,
+            _ => unreachable!("app construction requires explicit tenants"),
+        }
+    }
+}
+
 impl EntraSignIn {
     /// Creates a separately scoped app-only provider sharing this verifier's key cache.
     /// Unrestricted tenant keywords and sessions outside 1 to 720 hours are refused.

@@ -17,7 +17,7 @@ yours.
 | `password` (default) | Today's email and password sign-up and sign-in, with email confirmation and password reset by email (an email provider is needed) |
 | `entra` | Entra ID only: no email confirmation, no passwords, no email provider. The signup, verification, login and password-reset routes answer 404; no email is ever written, so the worker runs with `PUSH_EMAIL_SENDER=none` |
 | `password,entra` | Both; the two kinds of accounts are never linked, even with the same address |
-| `entra-app`, alone or with the others | Opt-in app-only authentication for **pre-linked** service principals at `POST /v1/auth/entra-app`; never creates an account. Self-service agent enrollment/ownership is not implemented yet |
+| `entra-app`, alone or with the others | Opt-in app-only authentication at `POST /v1/auth/entra-app`; a human must first reserve and consent to a separate owned agent account. No automatic account creation by sign-in |
 | `external`, alone or with the others | The sign-in of a push-auth of your own: its authenticator at `/v1/auth/{its provider id}` ([Your own wrapper](#your-own-wrapper)) |
 
 **Switching an existing installation to `entra` is destructive for password sessions.**
@@ -50,7 +50,7 @@ In the Microsoft Entra admin center, **App registrations → New registration**:
    reads the tenant's standard key set).
 6. Note the **Application (client) ID** and the **Directory (tenant) ID**.
 
-### App-only authentication foundation (opt-in)
+### Owned agents and app-only authentication (opt-in)
 
 `entra` continues to accept delegated-user tokens only. Enable `entra-app` separately to
 verify v2 access tokens obtained with client credentials for the **same API audience**.
@@ -60,11 +60,11 @@ issuer, lifetime checks and signing-key cache. App tokens require valid non-nil 
 including contradictory `idtyp: app` plus a delegated scope; an explicit `idtyp` other
 than `app` is refused. Missing `idtyp` is accepted without a nonempty scope.
 The verified `azp` remains available in `Principal.claims` for admission/auditing/display;
-neither tokens nor object ids are logged.
+neither tokens nor service-principal object ids are logged.
 
 App identities use `(entra-app, tid, oid)`, never the delegated `(entra, tid, oid)` key.
-An unlinked app answers **403 `sign_in_not_permitted`**, with no account, identity or
-outbox insertion. A pre-linked app uses the existing registration/device-session flow
+An unlinked app without an enrollment code answers **403 `sign_in_not_permitted`**, with no account, identity or
+outbox insertion. An enrolled app uses the existing registration/device-session flow
 (`{token}` or `{token, device_id}`), but its independent policy:
 
 | Variable | Default |
@@ -72,11 +72,15 @@ outbox insertion. A pre-linked app uses the existing registration/device-session
 | `PUSH_ENTRA_APP_REQUIRED_ROLE` | unset: no required application role |
 | `PUSH_ENTRA_APP_ALLOWED_CLIENT_APPS` | unset: any valid `azp`; otherwise comma-separated application GUIDs |
 | `PUSH_ENTRA_APP_MAX_SESSION_HOURS` | `24`; whole hours, 1–720 |
-| `PUSH_AGENTS_PER_USER` | `2`; 0–100, with 0 reserved to disable future enrollment |
+| `PUSH_AGENTS_PER_USER` | `2`; 0–100, with 0 disabling reservation and redemption (existing agents still sign in) |
 
 The delegated scope, role, client filter and session duration do **not** constrain apps.
-For an application permission, define an app role with member type **Applications** and
-assign/consent it to the client service principal; use its value for the app required role.
+Self-service API registration needs no additional delegated Entra permission: the owner's
+normal messenger device access token is sufficient. Optionally define an **Agent** app
+role (`allowedMemberTypes: ["Application"]`, for example value `Messenger.Agent`) and
+require it with `PUSH_ENTRA_APP_REQUIRED_ROLE`. Assigning that application permission to a
+service principal requires administrator approval/consent. This deployment policy is
+separate from the owner's enrollment consent.
 No client secret is stored by auth-svc.
 
 Helm uses `auth.signIn.providers: entra,entra-app` (or `entra-app` alone),
@@ -88,10 +92,67 @@ egress/proxy/CA configuration. Existing operator smoke inputs are delegated iden
 still require the `entra` provider.
 
 **App mode rejects `common`, `organizations` and `consumers`** at startup/chart validation:
-use explicit tenant GUIDs. Future enrollment should additionally require an authenticated
-delegated Entra owner and exact equality of the owner's tenant and the app token's tenant;
-a deployment allowlist alone is not proof of ownership. Enrollment codes, separate
-user-owned agent accounts and management endpoints are deliberately deferred.
+use explicit tenant GUIDs. Entra owners must have the exact same delegated identity tenant
+as the app. Password/custom-provider human owners may enroll only when the deployment
+allows exactly one explicit tenant; that tenant is recorded at reservation time. Otherwise
+the API returns `enrollment_not_permitted` rather than guessing. Agents cannot own agents.
+
+### Enroll and operate an agent
+
+1. Enable `entra-app` alongside your human sign-in provider (for example
+   `password,entra,entra-app`). Set the explicit tenant list, API audience, app role/client
+   policy if needed, `PUSH_ENTRA_APP_MAX_SESSION_HOURS` and `PUSH_AGENTS_PER_USER`.
+2. As a signed-in human, call `POST /v1/agents` with your **device access token** and
+   `{"handle":"build_agent","display_name":"Build agent"}`. HTTP 201 returns
+   `{user_id, enrollment_code, expires_at, expires_in_s:600}`. The random single-use code
+   is returned only once, stored only as a SHA-256 hash, and never listed or logged.
+   Treat it as a secret. The pending reservation immediately counts against the cap and
+   holds its handle for exactly ten minutes. Expired reservations are cleaned up when
+   management or handle allocation runs; they no longer consume a slot or handle.
+3. Obtain an app-only v2 access token for this API. Client credentials, a **managed
+   identity**, or **workload identity federation** must request
+   **`api://<API application client ID>/.default`**, not Graph or `access_as_user`.
+   Keep secrets/certificates/federated assertions in your workload's credential store.
+4. Call `POST /v1/auth/entra-app` with
+   `{"token":"<app access token>","enrollment_code":"<one-use code>"}`. This proves both app
+   control and owner consent. It returns `{user_id, registration_token, expires_in_s}`.
+   The agent has a different user id, its own normal quota/rate limits and ten-device
+   limit; messages are authored by that id, never by the owner.
+5. Use the registration token at the normal `POST /v1/devices`; use its access/refresh
+   tokens and `/v1/socket` normally. Owner and agent become reciprocal **accepted**
+   contacts through the durable outbox/worker/Accounts relay, without invites. Until the
+   relay arrives (usually about a second, longer during outages), contact/profile visibility
+   or device readiness may lag; retry retryable `device_not_ready` (socket close 4006).
+6. Later call `POST /v1/auth/entra-app {"token":"..."}` without a code, or include
+   `device_id` to reauthenticate the same active device. Reauthentication invalidates its
+   old refresh tokens and renews its app session. Refresh past the maximum session age
+   returns `session_expired`. A second enrollment of the same `(entra-app,tid,oid)` returns
+   **409 `identity_in_use`**, without consuming an unrelated reservation.
+
+### Agent management API contract
+
+All these routes require a human owner's normal device bearer access token; another
+owner's agent and human user ids return 404 `agent_not_found` for modifications.
+Management is rate limited per IP (300/15 minutes) and user (120/15 minutes), fail-closed.
+
+| Method/path | Body | Response |
+|---|---|---|
+| `POST /v1/agents` | `{handle,display_name}` | 201 reservation above; 409 `too_many_agents` / `handle_taken` |
+| `GET /v1/agents` | none | `{agents:[{user_id,handle,display_name,kind:"agent",owner_user_id,state:"pending"\|"active",expires_at,client_app_id,devices:[{device_id,name,platform,created_at,last_seen_at}]}]}`; expiry null for active agents, client app id null until enrollment; no credentials or hashes |
+| `PATCH /v1/agents/{user_id}` | `{handle?,display_name?}`, at least one | 204; same profile validation/handle uniqueness as human profiles |
+| `DELETE /v1/agents/{user_id}` | none | 204; removes a pending reservation, or permanently disables the active agent |
+
+Bad/expired/spent codes return 400 `enrollment_invalid`; ambiguous/cross-tenant enrollment
+or agent ownership returns 403 `enrollment_not_permitted`. Disabled bindings are
+tombstones: sign-in cannot revive them, even with a fresh code; old registration,
+access and refresh tokens are refused. Deletion atomically revokes every device and
+refresh token and frees the owner's slot. Live sockets close **4003** after the durable
+revocation relay; no messages or account history are deleted. The disabled handle remains
+reserved, but disabled/pending accounts are absent from public lookups and batch profiles.
+
+Own, public, batch and handle-lookup profiles add `kind:"user"|"agent"` and nullable
+`owner_user_id` (null for humans). Rust SDK profiles expose those fields; Node/C/FFI JSON
+uses `kind` and `ownerUserId`. No agent-management SDK surface or consumer UI is supplied.
 
 Custom `external` authenticators remain supported, but may not claim the reserved built-in
 `entra-app` id. Admissions apply to both built-in providers. App token refusals use

@@ -9,10 +9,10 @@ use push_domain::{
 };
 use push_proto::id_bytes;
 use push_proto::internal::v1::{
-    AccountDevice, AccountUser, AccountsResponse, AckRequest, AckResponse, DeleteRequest,
-    EditRequest, IdentifyRequest, IdentifyResponse, ReadUpToRequest, ReadUpToResponse, RequestCall,
-    SendRequest, SyncRequest, SyncResponse, VisibleUsersRequest, VisibleUsersResponse,
-    accounts_server, directory_server, messaging_server,
+    AccountAgent, AccountDevice, AccountUser, AccountsResponse, AckRequest, AckResponse,
+    DeleteRequest, EditRequest, IdentifyRequest, IdentifyResponse, ReadUpToRequest,
+    ReadUpToResponse, RequestCall, SendRequest, SyncRequest, SyncResponse, VisibleUsersRequest,
+    VisibleUsersResponse, accounts_server, directory_server, messaging_server,
 };
 use push_proto::v1::{ContentType, SendAck};
 use tonic::service::Interceptor;
@@ -162,6 +162,20 @@ where
     C: Clock + 'static,
     N: Notifier + 'static,
 {
+    async fn agent_enrolled(
+        &self,
+        request: Request<AccountAgent>,
+    ) -> Result<Response<AccountsResponse>, Status> {
+        let request = request.into_inner();
+        let agent = parse_id(&request.user_id, "user_id", UserId)?;
+        let owner = parse_id(&request.owner_user_id, "owner_user_id", UserId)?;
+        self.messaging
+            .enroll_agent(owner, agent)
+            .await
+            .map_err(domain_error)?;
+        Ok(Response::new(AccountsResponse {}))
+    }
+
     async fn user_verified(
         &self,
         request: Request<AccountUser>,

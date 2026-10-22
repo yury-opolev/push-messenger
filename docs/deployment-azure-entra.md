@@ -33,6 +33,34 @@ The chart provisions nothing outside the release namespace: the Azure resources,
 identities, federated credentials, role assignments, private endpoints and DNS below are
 the consumer's.
 
+### Application agents (separate from datastore identities)
+
+For user-owned app agents, enable `auth.signIn.providers: entra,entra-app` (or
+`password,entra-app`) with explicit `auth.signIn.entra.tenants` and the API audience.
+`auth.agentsPerUser` defaults to two active/unexpired pending agents per human (zero
+disables reservation and redemption, not existing agent sign-in);
+`auth.signIn.entraApp.maxSessionHours` defaults to 24.
+The optional `requiredRole` and `allowedClientApps` are independent of delegated policy.
+Normal self-service `POST /v1/agents` needs only the human's messenger device bearer token,
+not an additional delegated permission. If required, define an Agent application role
+with `allowedMemberTypes: ["Application"]`; assignment requires administrator approval.
+Managed identities and federated app workloads request
+`api://<API application client ID>/.default` (not the datastore scopes).
+
+Follow [enrollment and management](entra-sign-in.md#enroll-and-operate-an-agent):
+the owner reserves a handle/display name and receives a single-use ten-minute code;
+the workload redeems it with its verified app-only token, then uses normal device,
+refresh and socket APIs as a separate account. Entra owners must match the app tenant;
+password/custom-provider owners need exactly one explicit allowed tenant. Profiles
+identify `kind:"agent"` and `owner_user_id`. Owner/agent accepted contacts and device
+readiness arrive through the durable worker relay, usually about a second later.
+Owner deletion permanently disables the app binding, revokes its tokens/devices,
+closes sockets with 4003 through that relay, frees its slot, and retains message history.
+No cloud application, role assignment or credential is created by enrollment.
+Apply the additive auth/messaging migrations and upgrade message-svc and the worker
+before enabling agent enrollment on auth-svc: older workers do not understand the new
+`agent.enrolled` event. This is especially important for rolling upgrades.
+
 ## 2. Azure prerequisites (consumer-owned)
 
 | Item | Requirement |

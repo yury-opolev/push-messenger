@@ -13,6 +13,33 @@ where
     C: Clock,
     N: Notifier,
 {
+    /// Trusted auth-svc enrollment, never a public contact API. Projects both verified
+    /// accounts and accepts their relationship in one transaction. The durable receipt
+    /// makes replays harmless, including after a later block.
+    pub async fn enroll_agent(&self, owner: UserId, agent: UserId) -> DomainResult<()> {
+        if owner == agent {
+            return Err(ValidationError::SelfTarget.into());
+        }
+        let mut tx = self.store.begin().await?;
+        tx.lock_contact_pair(owner, agent).await?;
+        let mut users = [owner, agent];
+        users.sort();
+        for user in users {
+            tx.insert_user(user).await?;
+        }
+        let mut events = Vec::new();
+        if tx.record_agent_owner(agent, owner).await? {
+            for (me, peer) in [(owner, agent), (agent, owner)] {
+                if set_contact(&mut tx, me, peer, Some(ContactState::Accepted)).await? {
+                    events.push(contact_changed(me, peer, Some(ContactState::Accepted)));
+                }
+            }
+        }
+        tx.commit().await?;
+        self.publish(events).await;
+        Ok(())
+    }
+
     /// Sends a contact request. Returns the requester's resulting state. A request to an
     /// id that is not a verified user looks like a request nobody answered yet: it stores
     /// nothing and answers `RequestedOut`, so requests never reveal which ids exist.

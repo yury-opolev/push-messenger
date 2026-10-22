@@ -98,6 +98,7 @@ pub struct Auth {
     public_url: String,
     sign_in: SignIn,
     identity: Identity,
+    pub(crate) agents_per_user: u32,
 }
 
 /// Seconds since the Unix epoch.
@@ -133,6 +134,7 @@ impl Auth {
             public_url: settings.public_url.trim_end_matches('/').to_owned(),
             sign_in: SignIn::default(),
             identity: Identity::default(),
+            agents_per_user: 2,
         }
     }
 
@@ -169,10 +171,20 @@ impl Auth {
         self
     }
 
-    /// Offers app-only sign-in for pre-linked identities; never auto-provisions.
+    /// Offers app-only sign-in for human-enrolled identities; never auto-provisions.
     pub fn with_entra_app(mut self, authenticator: crate::entra::EntraAppSignIn) -> Self {
         self.identity.entra_app = Some(authenticator);
         self
+    }
+
+    /// Maximum active and unexpired pending agents per human owner; zero disables enrollment.
+    pub fn with_agents_per_user(mut self, maximum: u32) -> Self {
+        self.agents_per_user = maximum;
+        self
+    }
+
+    pub(crate) fn app_tenants(&self) -> Option<&[Uuid]> {
+        self.identity.entra_app.as_ref().map(|app| app.tenants())
     }
 
     /// The service asking `admission` before any account is found or created (spec D4).
@@ -294,6 +306,7 @@ impl Auth {
         let password_hash = self.hash(signup.password).await?;
 
         let mut tx = self.pool.begin().await?;
+        crate::agents::expire(&mut tx).await?;
         let taken: bool = sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM auth.user_account WHERE handle = $1::citext)",
         )

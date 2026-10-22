@@ -714,6 +714,7 @@ async fn a_block_keeps_the_sight_the_blocker_had<B: Backend>(backend: &B) {
 
 pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
     case_list![
+        agent_enrollment_projects_users_and_accepts_contacts_once,
         request_then_accept_makes_both_sides_accepted,
         crossing_requests_become_accepted,
         only_the_recipient_can_accept_a_request,
@@ -743,4 +744,30 @@ pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
         blocking_someone_gives_no_sight_of_a_peer_the_blocker_never_saw,
         a_block_keeps_the_sight_the_blocker_had,
     ]
+}
+
+async fn agent_enrollment_projects_users_and_accepts_contacts_once<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
+    let (owner, agent) = (UserId::new(), UserId::new());
+    world.svc.enroll_agent(owner, agent).await.unwrap();
+    for (a, b) in [(owner, agent), (agent, owner)] {
+        assert_eq!(
+            world.svc.contact_state(a, b).await.unwrap(),
+            Some(ContactState::Accepted)
+        );
+        assert_eq!(world.svc.visible_users(a, &[b]).await.unwrap(), vec![b]);
+    }
+    world.svc.open_direct(owner, agent).await.unwrap();
+    world.svc.enroll_agent(owner, agent).await.unwrap();
+    world.svc.contact_block(owner, agent).await.unwrap();
+    world.svc.enroll_agent(owner, agent).await.unwrap();
+    assert_eq!(
+        world.svc.contact_state(owner, agent).await.unwrap(),
+        Some(ContactState::Blocked)
+    );
+    assert!(world.svc.enroll_agent(UserId::new(), agent).await.is_err());
+    assert_eq!(
+        world.svc.enroll_agent(owner, owner).await,
+        Err(ValidationError::SelfTarget.into())
+    );
 }

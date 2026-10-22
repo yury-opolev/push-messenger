@@ -107,6 +107,10 @@ pub(crate) fn event(
         ("POST", "/v1/auth/password/reset") if ok => "auth.password.reset",
         ("POST", "/v1/auth/verify" | "/v1/auth/password/reset") if bad_link => "auth.link.invalid",
         ("POST", "/v1/devices") if ok => "auth.device.registered",
+        ("POST", "/v1/agents") if ok => "auth.agent.reserved",
+        ("PATCH", "/v1/agents/{agent_id}") if ok => "auth.agent.updated",
+        ("DELETE", "/v1/agents/{agent_id}") if ok => "auth.agent.deleted",
+        (_, "/v1/agents" | "/v1/agents/{agent_id}") if !ok => "auth.agent.refused",
         ("POST", "/v1/devices") if code == Some("too_many_devices") => "auth.device.limit",
         ("DELETE", "/v1/devices/{device_id}") if ok => "auth.device.revoked",
         _ if status == StatusCode::UNAUTHORIZED => "auth.token.refused",
@@ -141,6 +145,21 @@ mod tests {
     fn answers_are_classified_by_route_status_and_code() {
         let post = Method::POST;
         let cases = [
+            (&post, "/v1/agents", 201, None, Some("auth.agent.reserved")),
+            (
+                &Method::PATCH,
+                "/v1/agents/{agent_id}",
+                204,
+                None,
+                Some("auth.agent.updated"),
+            ),
+            (
+                &Method::DELETE,
+                "/v1/agents/{agent_id}",
+                204,
+                None,
+                Some("auth.agent.deleted"),
+            ),
             (
                 &post,
                 "/v1/auth/entra",

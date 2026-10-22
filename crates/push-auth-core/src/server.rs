@@ -186,6 +186,7 @@ pub async fn serve_with(
             hash_wait: HASH_WAIT,
         },
     )
+    .with_agents_per_user(config.agents_per_user)
     .with_sign_in(SignIn {
         password: config.providers.password,
         entra,

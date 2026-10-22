@@ -50,7 +50,7 @@ use crate::entra::{EntraAppSettings, EntraSettings, Providers};
 /// | `PUSH_ENTRA_APP_REQUIRED_ROLE` | app-only role, independent of delegated-user policy | none |
 /// | `PUSH_ENTRA_APP_ALLOWED_CLIENT_APPS` | app-only client ids (`azp`), comma-separated | any valid client id |
 /// | `PUSH_ENTRA_APP_MAX_SESSION_HOURS` | app-only maximum session age, 1 to 720 | `24` |
-/// | `PUSH_AGENTS_PER_USER` | reserved enrollment limit, 0 to 100; 0 disables enrollment when implemented | `2` |
+/// | `PUSH_AGENTS_PER_USER` | active + unexpired pending agents per human owner, 0 to 100; 0 disables reservation/redemption | `2` |
 /// | `PUSH_AUTH_ADMIN_TOKEN` | the admin API's bearer token, 32 to 256 visible ASCII characters; unset: no admin listener (spec 2026-10-19 D15) | none |
 /// | `PUSH_AUTH_ADMIN_ADDR` | address of the admin listener; never expose it publicly | `0.0.0.0:8082` |
 ///
@@ -82,7 +82,7 @@ pub struct Config {
     pub entra: Option<EntraSettings>,
     /// App-only sign-in policy, read only with explicit `entra-app` opt-in.
     pub entra_app: Option<EntraAppSettings>,
-    /// Maximum owned agents per user (0 disables enrollment); reserved for enrollment.
+    /// Maximum active + unexpired pending agents per human owner (0 disables enrollment).
     pub agents_per_user: u32,
     /// The admin API's bearer token; without it there is no admin listener.
     pub admin_token: Option<String>,

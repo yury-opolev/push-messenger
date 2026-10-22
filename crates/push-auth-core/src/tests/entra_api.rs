@@ -229,7 +229,7 @@ async fn linked_app_sign_in_reuses_registration_and_device_sessions_with_its_own
     let user = Uuid::now_v7();
     sqlx::query("INSERT INTO auth.user_account (user_id, handle, display_name, email_verified_at) VALUES ($1, 'agent', 'Agent', now())")
         .bind(user).execute(&world.pool).await.unwrap();
-    // Simulate a pre-linked identity. Production enrollment is deliberately not implemented.
+    // Fixture for linked-only sign-in; production owner consent is tested in agents.
     sqlx::query("INSERT INTO auth.external_identity (identity_id, provider, issuer, subject, user_id) VALUES ($1, 'entra-app', $2, $3, $4)")
         .bind(Uuid::now_v7()).bind(TENANT).bind(USER).bind(user).execute(&world.pool).await.unwrap();
     let linked = call(

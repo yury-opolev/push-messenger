@@ -83,7 +83,7 @@ auth:
   # Ways to sign in (docs/entra-sign-in.md, spec 2026-10-19).
   signIn:
     # Comma-separated: password (default), entra (delegated users), entra-app (opt-in,
-    # pre-linked service principals only; never creates accounts). Without password the worker sends no email, the email
+    # human-enrolled owned agents only; never auto-provisions). Without password the worker sends no email, the email
     # and password routes answer 404 and the link pages are not routed. Switching to entra
     # alone signs every password device out when the new auth-svc pods start.
     providers: password
@@ -118,8 +118,7 @@ auth:
       requiredRole: ""
       allowedClientApps: []
       maxSessionHours: 24
-  # Enrollment limit reserved for owned agents: 0 disables enrollment, 0-100.
-  # This release does not implement enrollment.
+  # Active + unexpired pending agents per human owner, 0-100; 0 disables reservation/redemption.
   agentsPerUser: 2
   admin:
     # Serves auth-svc's admin API (sign a user out of every device) on port 8082: never

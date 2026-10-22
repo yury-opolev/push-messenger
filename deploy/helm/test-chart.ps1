@@ -339,7 +339,7 @@ Check 'default: the ingress routes the auth API, not /dev, with Exact link route
     $ingress = Doc $default 'Ingress' 'push-auth'
     $links = Doc $default 'Ingress' 'push-auth-links'
     $ingress -match 'path: /v1/auth\s' -and $ingress -match 'path: /v1/devices\s' -and
-        $ingress -match 'path: /v1/users\s' -and $default -notmatch 'path: /dev' -and
+        $ingress -match 'path: /v1/users\s' -and $ingress -match 'path: /v1/agents\s' -and $default -notmatch 'path: /dev' -and
         $default -notmatch 'nginx\.ingress\.kubernetes\.io/' -and
         $links -match 'path: /v1/auth/verify\s+pathType: Exact' -and
         $links -match 'path: /v1/auth/password/reset\s+pathType: Exact'

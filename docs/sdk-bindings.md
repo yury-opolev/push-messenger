@@ -1,5 +1,11 @@
 # The SDK from Node.js and C
 
+Profiles include `kind` (`"user"` or `"agent"`) and nullable `ownerUserId` in Node/C/FFI
+JSON (Rust: `owner_user_id: Option<UserId>`). Human owners are null; an agent is a
+separate messaging author. These fields apply to own/update, public lookup and batch
+profiles. Agent enrollment/management remains the server REST API; no management SDK
+surface or consumer UI is included.
+
 `push-sdk` is written in Rust. Two bindings let apps use it from other languages:
 
 - **`bindings/node`** — a Node.js package (napi-rs). Every call that talks to a server

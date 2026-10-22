@@ -618,7 +618,7 @@ relay nor a redelivered event closes a session that signed in after the reset.
 ### 5.5 Connecting users
 
 - **@handle.** Every user picks a unique handle at signup. Handles reveal no email.
-  `GET /v1/users/lookup?handle=…` returns `{user_id, handle, display_name}`; rate limited
+  `GET /v1/users/lookup?handle=…` returns `{user_id, handle, display_name, kind, owner_user_id}`; rate limited
   to 20 per hour per user. Email lookup is not offered.
 - **Contact request.** `ContactRequest{user_id}` creates `requested_out` /
   `requested_in` rows. The other user can `Accept`, `Decline` or `Block`. If both send a
@@ -686,7 +686,14 @@ Implementation notes (push-auth, Plan 5A):
   `POST /v1/auth/verify/resend` (202), `POST /v1/auth/login`, `POST /v1/auth/refresh`,
   `POST /v1/auth/password/forgot` (202), `GET|POST /v1/auth/password/reset`,
   `GET /v1/auth/jwks`, `POST|GET /v1/devices`, `DELETE /v1/devices/{id}`,
-  `GET|PATCH /v1/users/me` and `GET /v1/users/lookup?handle=…`. Errors are
+  `GET|PATCH /v1/users/me` and `GET /v1/users/lookup?handle=…`. Profiles include
+  `kind:"user"|"agent"` and nullable `owner_user_id` (null for humans).
+  The [owned-agent extension](2026-10-19-entra-sign-in-design.md#4-api) adds
+  `POST|GET /v1/agents`, `PATCH|DELETE /v1/agents/{id}` and opt-in
+  `POST /v1/auth/entra-app` with single-use owner-consent enrollment codes. Agents are
+  separate authors with ordinary limits, never automatically provisioned by sign-in;
+  deletion disables their bindings and relays socket close 4003 without deleting history.
+  Pending and disabled agents are not returned by public/batch profile lookup. Errors are
   `{"error": {"code", "message", "retryable"}}`; 429 carries `Retry-After`; 503
   `unavailable` is retryable and carries `Retry-After: 1`. No answer may be cached except
   the JWKS.

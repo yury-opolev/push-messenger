@@ -50,6 +50,7 @@ pub enum Action {
     /// Calls of the admin API without the right token, per IP; counted apart from
     /// [`Action::Admin`], so they never lock the token's holder out.
     AdminAuthFailure,
+    AgentManagement,
 }
 
 /// Whom a limit counts.
@@ -99,6 +100,7 @@ impl Action {
             Self::HandleChange => "handle_change",
             Self::Admin => "admin",
             Self::AdminAuthFailure => "admin_auth_failure",
+            Self::AgentManagement => "agents",
         }
     }
 
@@ -127,6 +129,10 @@ impl Action {
             &[(Scope::Ip, per(30, HOUR)), (Scope::Account, per(5, DAY))];
         const ADMIN: &[(Scope, Limit)] = &[(Scope::Ip, per(60, QUARTER))];
         const ADMIN_AUTH_FAILURE: &[(Scope, Limit)] = &[(Scope::Ip, per(20, QUARTER))];
+        const AGENTS: &[(Scope, Limit)] = &[
+            (Scope::Ip, per(300, QUARTER)),
+            (Scope::Account, per(120, QUARTER)),
+        ];
         match self {
             Self::Signup => SIGNUP,
             Self::Login => LOGIN,
@@ -138,6 +144,7 @@ impl Action {
             Self::HandleChange => HANDLE_CHANGE,
             Self::Admin => ADMIN,
             Self::AdminAuthFailure => ADMIN_AUTH_FAILURE,
+            Self::AgentManagement => AGENTS,
         }
     }
 }

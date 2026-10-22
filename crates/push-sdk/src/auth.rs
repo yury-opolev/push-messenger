@@ -63,6 +63,9 @@ pub struct Profile {
     pub user_id: UserId,
     pub handle: String,
     pub display_name: String,
+    /// `user` or `agent`.
+    pub kind: String,
+    pub owner_user_id: Option<UserId>,
 }
 
 /// One of the user's devices.
@@ -126,6 +129,13 @@ struct ProfileBody {
     user_id: Uuid,
     handle: String,
     display_name: String,
+    #[serde(default = "user_kind")]
+    kind: String,
+    owner_user_id: Option<Uuid>,
+}
+
+fn user_kind() -> String {
+    "user".to_owned()
 }
 
 impl From<ProfileBody> for Profile {
@@ -134,7 +144,27 @@ impl From<ProfileBody> for Profile {
             user_id: UserId(body.user_id),
             handle: body.handle,
             display_name: body.display_name,
+            kind: body.kind,
+            owner_user_id: body.owner_user_id.map(UserId),
         }
+    }
+}
+
+#[cfg(test)]
+mod profile_contract {
+    use super::*;
+
+    #[test]
+    fn agent_identity_and_nullable_owner_survive_profile_conversion() {
+        let (user, owner) = (Uuid::new_v4(), Uuid::new_v4());
+        let body: ProfileBody = serde_json::from_value(json!({
+            "user_id":user, "handle":"my_agent", "display_name":"Agent",
+            "kind":"agent", "owner_user_id":owner,
+        }))
+        .unwrap();
+        let profile = Profile::from(body);
+        assert_eq!(profile.kind, "agent");
+        assert_eq!(profile.owner_user_id, Some(UserId(owner)));
     }
 }
 
