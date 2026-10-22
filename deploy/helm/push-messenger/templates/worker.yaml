@@ -74,11 +74,7 @@ spec:
             {{- end }}
             - name: PUSH_MESSAGE_SVC_URL
               value: {{ printf "http://%s:50052" (include "push.name" (dict "root" . "component" "message-svc")) | quote }}
-            - name: PUSH_ACCOUNTS_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "push.secretName" . }}
-                  key: accounts-token
+            {{- include "push.applicationEnv" (dict "root" . "name" "PUSH_ACCOUNTS_TOKEN" "key" "accounts-token") | nindent 12 }}
             {{- /* none when email and password sign-in is off: nothing writes an email then. */}}
             - name: PUSH_EMAIL_SENDER
               value: {{ include "push.emailSender" . | quote }}
@@ -87,18 +83,10 @@ spec:
             - name: PUSH_EMAIL_PRODUCT_NAME
               value: {{ .Values.worker.email.productName | quote }}
             {{- if eq .Values.worker.email.sender "resend" }}
-            - name: PUSH_RESEND_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "push.secretName" . }}
-                  key: resend-api-key
+            {{- include "push.applicationEnv" (dict "root" . "name" "PUSH_RESEND_API_KEY" "key" "resend-api-key") | nindent 12 }}
             {{- end }}
             {{- if include "push.hasWebhook" . }}
-            - name: PUSH_RESEND_WEBHOOK_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "push.secretName" . }}
-                  key: resend-webhook-secret
+            {{- include "push.applicationEnv" (dict "root" . "name" "PUSH_RESEND_WEBHOOK_SECRET" "key" "resend-webhook-secret") | nindent 12 }}
             {{- end }}
             - name: PUSH_UNVERIFIED_ACCOUNT_DAYS
               value: {{ .Values.worker.unverifiedAccountDays | quote }}
@@ -126,11 +114,11 @@ spec:
             periodSeconds: 10
           resources:
             {{- toYaml .Values.worker.resources | nindent 12 }}
-          {{- with include "push.identityMounts" (dict "root" . "key" "worker" "postgres" true "redis" false) }}
+          {{- with (printf "%s%s" (include "push.identityMounts" (dict "root" . "key" "worker" "postgres" true "redis" false)) (include "push.applicationMounts" .)) }}
           volumeMounts:
             {{- . | trim | nindent 12 }}
           {{- end }}
-      {{- with include "push.identityVolumes" (dict "root" . "key" "worker" "postgres" true "redis" false) }}
+      {{- with (printf "%s%s" (include "push.identityVolumes" (dict "root" . "key" "worker" "postgres" true "redis" false)) (include "push.applicationVolumes" .)) }}
       volumes:
         {{- . | trim | nindent 8 }}
       {{- end }}

@@ -30,6 +30,7 @@ A consumer-managed Secret (secrets.existingSecret) is only referenced: inline cr
 values would be silently ignored, so they are refused by name, never by value.
 */}}
 {{- define "push.checkSecretSelection" -}}
+{{- include "push.checkSecretVolume" . -}}
 {{- $name := .Values.secrets.existingSecret -}}
 {{- if not (kindIs "string" $name) -}}
 {{- fail "secrets.existingSecret must be a string" -}}
@@ -54,6 +55,117 @@ values would be silently ignored, so they are refused by name, never by value.
 {{- end -}}
 {{- end -}}
 {{- end -}}
+{{- end -}}
+
+{{/* The volume is consumer-owned; only application-key consumers mount it. */}}
+{{- define "push.checkSecretVolume" -}}
+{{- $secrets := .Values.secrets -}}
+{{- if not (kindIs "map" $secrets.volume) -}}
+{{- fail "secrets.volume must be a Kubernetes VolumeSource object without name" -}}
+{{- end -}}
+{{- if $secrets.volume -}}
+{{- if $secrets.existingSecret -}}
+{{- fail "secrets.existingSecret conflicts with secrets.volume" -}}
+{{- end -}}
+{{- if or (ne (len $secrets.volume) 1) (hasKey $secrets.volume "name") -}}
+{{- fail "secrets.volume must contain exactly one Kubernetes volume source, without name" -}}
+{{- end -}}
+{{- $sources := list "csi" "secret" "projected" "configMap" "nfs" "persistentVolumeClaim" "hostPath" "emptyDir" "ephemeral" "downwardAPI" "azureFile" "azureDisk" "cephfs" "cinder" "fc" "flexVolume" "flocker" "gcePersistentDisk" "gitRepo" "glusterfs" "iscsi" "photonPersistentDisk" "portworxVolume" "quobyte" "rbd" "scaleIO" "storageos" "vsphereVolume" "awsElasticBlockStore" -}}
+{{- range $source, $spec := $secrets.volume -}}
+{{- if or (not (has $source $sources)) (not (kindIs "map" $spec)) -}}
+{{- fail "secrets.volume must contain a Kubernetes volume source object" -}}
+{{- end -}}
+{{- if eq $source "csi" -}}
+{{- if not (and (kindIs "string" $spec.driver) $spec.driver) -}}
+{{- fail "secrets.volume.csi.driver must be a nonempty string" -}}
+{{- end -}}
+{{- if and (hasKey $spec "volumeAttributes") (not (kindIs "map" $spec.volumeAttributes)) -}}
+{{- fail "secrets.volume.csi.volumeAttributes must be a string map" -}}
+{{- end -}}
+{{- range $key, $value := $spec.volumeAttributes -}}
+{{- if not (kindIs "string" $value) -}}
+{{- fail "secrets.volume.csi.volumeAttributes must be a string map" -}}
+{{- end -}}
+{{- end -}}
+{{- if and (eq $spec.driver "secrets-store.csi.k8s.io") (not (get ($spec.volumeAttributes | default dict) "secretProviderClass")) -}}
+{{- fail "secrets.volume.csi.volumeAttributes.secretProviderClass is required" -}}
+{{- end -}}
+{{- end -}}
+{{- $nameField := get (dict "secret" "secretName" "configMap" "name" "persistentVolumeClaim" "claimName" "hostPath" "path") $source -}}
+{{- if $nameField -}}
+{{- $value := get $spec $nameField -}}
+{{- if not (and (kindIs "string" $value) $value) -}}
+{{- fail (printf "secrets.volume.%s.%s must be a nonempty string" $source $nameField) -}}
+{{- end -}}
+{{- end -}}
+{{- if eq $source "projected" -}}
+{{- if not (and (kindIs "slice" $spec.sources) $spec.sources) -}}
+{{- fail "secrets.volume.projected.sources must be a nonempty list" -}}
+{{- end -}}
+{{- range $spec.sources -}}
+{{- if not (and (kindIs "map" .) .) -}}
+{{- fail "secrets.volume.projected.sources must contain volume projection objects" -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if not (and (kindIs "string" $secrets.mountPath) (regexMatch "^/([A-Za-z0-9_-][A-Za-z0-9._-]*)(/[A-Za-z0-9_-][A-Za-z0-9._-]*)*$" $secrets.mountPath)) -}}
+{{- fail "secrets.mountPath must be an absolute non-root path without traversal or trailing slash" -}}
+{{- end -}}
+{{- if not (kindIs "map" $secrets.files) -}}
+{{- fail "secrets.files must be a map of application key names to filenames" -}}
+{{- end -}}
+{{- $keys := list "auth-signing-key" "auth-link-key" "accounts-token" "directory-token" "messaging-token" "auth-admin-token" "resend-api-key" "resend-webhook-secret" -}}
+{{- range $key, $filename := $secrets.files -}}
+{{- if or (not (has $key $keys)) (not (kindIs "string" $filename)) -}}
+{{- fail "secrets.files must contain only known application keys and string filenames" -}}
+{{- end -}}
+{{- if and $filename (or (not (regexMatch "^[A-Za-z0-9._-]+$" $filename)) (has $filename (list "." ".."))) -}}
+{{- fail "secrets.files values must be filenames without traversal" -}}
+{{- end -}}
+{{- end -}}
+{{- $required := list "auth-signing-key" "auth-link-key" "accounts-token" "directory-token" "messaging-token" -}}
+{{- if .Values.auth.admin.enabled -}}{{- $required = append $required "auth-admin-token" -}}{{- end -}}
+{{- if eq .Values.worker.email.sender "resend" -}}{{- $required = append $required "resend-api-key" -}}{{- end -}}
+{{- if include "push.hasWebhook" . -}}{{- $required = append $required "resend-webhook-secret" -}}{{- end -}}
+{{- range $required -}}
+{{- if not (index $secrets.files .) -}}
+{{- fail (printf "secrets.files.%s needs a filename" .) -}}
+{{- end -}}
+{{- end -}}
+{{- range $key, $value := dict "auth.signingKey" .Values.auth.signingKey "auth.linkKey" .Values.auth.linkKey "worker.email.resendApiKey" .Values.worker.email.resendApiKey "worker.email.webhookSecret" .Values.worker.email.webhookSecret -}}
+{{- if $value -}}{{- fail (printf "%s conflicts with secrets.volume" $key) -}}{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/* Arguments: root, name (environment variable), key (existing Secret key). */}}
+{{- define "push.applicationEnv" -}}
+{{- if .root.Values.secrets.volume }}
+- name: {{ .name }}_FILE
+  value: {{ printf "%s/%s" .root.Values.secrets.mountPath (index .root.Values.secrets.files .key) | quote }}
+{{- else }}
+- name: {{ .name }}
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "push.secretName" .root }}
+      key: {{ .key }}
+{{- end }}
+{{- end -}}
+
+{{- define "push.applicationMounts" -}}
+{{- if .Values.secrets.volume }}
+- name: application-keys
+  mountPath: {{ .Values.secrets.mountPath | quote }}
+  readOnly: true
+{{- end }}
+{{- end -}}
+
+{{- define "push.applicationVolumes" -}}
+{{- if .Values.secrets.volume }}
+- name: application-keys
+  {{- toYaml .Values.secrets.volume | nindent 2 }}
+{{- end }}
 {{- end -}}
 
 {{/* Checks a chart-managed auth key: canonical standard base64 of 32 (or at least 32) bytes. */}}
@@ -163,7 +275,7 @@ missing key stops the worker with a Kubernetes configuration error instead).
 {{- fail "dev mode shows every email the worker sends at /dev/mailbox: use worker.email.sender log with it" -}}
 {{- end -}}
 {{- end -}}
-{{- if not .Values.secrets.existingSecret -}}
+{{- if not (or .Values.secrets.existingSecret .Values.secrets.volume) -}}
 {{- $existing := (lookup "v1" "Secret" .Release.Namespace (include "push.secretName" .)).data | default dict -}}
 {{- if and (eq $email.sender "resend") (not (or $email.resendApiKey (get $existing "resend-api-key"))) -}}
 {{- fail "worker.email.sender resend needs worker.email.resendApiKey or a retained resend-api-key" -}}

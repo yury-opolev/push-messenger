@@ -1,4 +1,7 @@
 //! Configuration from environment variables.
+//!
+//! Application keys also accept `_FILE` alternatives, read once at startup through
+//! `push_credentials`; see `docs/deployment-configuration.md` for formats and rotation.
 
 use std::net::SocketAddr;
 
@@ -168,14 +171,22 @@ impl Config {
             value: token_audience.clone(),
             reason,
         })?;
-        let signing_key = key(&required("PUSH_AUTH_SIGNING_KEY")?, "PUSH_AUTH_SIGNING_KEY")?;
+        let signing_key = key(
+            &push_credentials::required_application_secret(&lookup, "PUSH_AUTH_SIGNING_KEY")
+                .map_err(problem)?,
+            "PUSH_AUTH_SIGNING_KEY",
+        )?;
         if signing_key.len() != 32 {
             return Err(redacted(
                 "PUSH_AUTH_SIGNING_KEY",
                 "must be base64 of a 32-byte Ed25519 seed".to_owned(),
             ));
         }
-        let link_key = key(&required("PUSH_AUTH_LINK_KEY")?, "PUSH_AUTH_LINK_KEY")?;
+        let link_key = key(
+            &push_credentials::required_application_secret(&lookup, "PUSH_AUTH_LINK_KEY")
+                .map_err(problem)?,
+            "PUSH_AUTH_LINK_KEY",
+        )?;
         if link_key.len() < 32 {
             return Err(redacted(
                 "PUSH_AUTH_LINK_KEY",
@@ -214,7 +225,8 @@ impl Config {
                 });
             }
         }
-        let directory_token = lookup("PUSH_DIRECTORY_TOKEN").filter(|v| !v.is_empty());
+        let directory_token = push_credentials::application_secret(&lookup, "PUSH_DIRECTORY_TOKEN")
+            .map_err(problem)?;
         match (&message_svc_url, &directory_token) {
             (Some(_), None) => return Err(ConfigError::Missing("PUSH_DIRECTORY_TOKEN")),
             (None, Some(_)) => return Err(ConfigError::Missing("PUSH_MESSAGE_SVC_URL")),
@@ -242,7 +254,8 @@ impl Config {
         } else {
             None
         };
-        let admin_token = lookup("PUSH_AUTH_ADMIN_TOKEN").filter(|v| !v.is_empty());
+        let admin_token = push_credentials::application_secret(&lookup, "PUSH_AUTH_ADMIN_TOKEN")
+            .map_err(problem)?;
         if let Some(token) = &admin_token {
             if !((32..=256).contains(&token.len()) && token.bytes().all(|b| b.is_ascii_graphic())) {
                 return Err(redacted(
@@ -508,6 +521,60 @@ mod tests {
         assert_eq!(config.worker_role, None);
         assert_eq!(config.message_svc_url, None);
         assert_eq!(config.directory_token, None);
+    }
+
+    #[test]
+    fn mounted_application_keys_match_direct_values_and_fail_closed() {
+        let directory = std::path::PathBuf::from("target")
+            .join(format!("auth-mounted-keys-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("key");
+        let path_text = path.to_str().unwrap();
+        for (name, value) in [
+            ("PUSH_AUTH_SIGNING_KEY", SIGNING_KEY),
+            ("PUSH_AUTH_LINK_KEY", LINK_KEY),
+            (
+                "PUSH_DIRECTORY_TOKEN",
+                "directory-token-of-the-config-tests",
+            ),
+            (
+                "PUSH_AUTH_ADMIN_TOKEN",
+                "admin-token-of-the-configuration-tests",
+            ),
+        ] {
+            let mut direct = REQUIRED.to_vec();
+            direct.retain(|(key, _)| *key != name);
+            direct.push((name, value));
+            if name == "PUSH_DIRECTORY_TOKEN" {
+                direct.push(("PUSH_MESSAGE_SVC_URL", "http://message:50053"));
+            }
+            let expected = config(&direct).unwrap();
+            let file_name = format!("{name}_FILE");
+            let mut mounted = direct.clone();
+            mounted.retain(|(key, _)| *key != name);
+            mounted.push((&file_name, path_text));
+            std::fs::write(&path, format!("{value}\r\n")).unwrap();
+            assert_eq!(config(&mounted).unwrap(), expected, "{name}");
+            mounted.push((name, value));
+            let error = config(&mounted).unwrap_err();
+            assert!(!format!("{error:?} {error}").contains(value));
+            mounted.pop();
+            for content in ["", "\r\n", "sensitive-invalid-content", " leading-space\n"] {
+                std::fs::write(&path, content).unwrap();
+                let error = config(&mounted).unwrap_err();
+                assert!(!format!("{error:?} {error}").contains("sensitive-invalid-content"));
+            }
+            std::fs::remove_file(&path).unwrap();
+            assert!(config(&mounted).is_err(), "missing {name} file");
+            std::fs::create_dir(&path).unwrap();
+            assert!(config(&mounted).is_err(), "unreadable {name} directory");
+            std::fs::remove_dir(&path).unwrap();
+            std::fs::write(&path, [0xff, 0xfe]).unwrap();
+            assert!(config(&mounted).is_err(), "invalid UTF-8");
+            std::fs::remove_file(&path).unwrap();
+        }
+        std::fs::remove_dir(&directory).unwrap();
+        assert!(config(&REQUIRED).unwrap().admin_token.is_none());
     }
 
     #[test]

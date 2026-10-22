@@ -49,17 +49,16 @@ spec:
       volumeMounts:
         - name: data
           mountPath: /data
+        {{- if not .Values.smoke.entraAccountsSecret }}
+        {{- include "push.applicationMounts" . | nindent 8 }}
+        {{- end }}
         {{- if .Values.smoke.entraAccountsSecret }}
         - name: operator-accounts
           mountPath: /operator-accounts
           readOnly: true
         {{- else }}
       env:
-        - name: PUSH_SMOKE_SIGNING_KEY
-          valueFrom:
-            secretKeyRef:
-              name: {{ include "push.secretName" . }}
-              key: auth-signing-key
+        {{- include "push.applicationEnv" (dict "root" . "name" "PUSH_SMOKE_SIGNING_KEY" "key" "auth-signing-key") | nindent 8 }}
         {{- end }}
       resources:
         requests:
@@ -72,6 +71,9 @@ spec:
     - name: data
       emptyDir:
         sizeLimit: 64Mi
+    {{- if not .Values.smoke.entraAccountsSecret }}
+    {{- include "push.applicationVolumes" . | nindent 4 }}
+    {{- end }}
     {{- if .Values.smoke.entraAccountsSecret }}
     - name: operator-accounts
       secret:

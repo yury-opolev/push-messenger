@@ -72,23 +72,11 @@ spec:
             - name: PUSH_DB_MAX_CONNECTIONS
               value: {{ .Values.messageSvc.dbMaxConnections | quote }}
             # Only the worker has this token: the Accounts API refuses calls without it.
-            - name: PUSH_ACCOUNTS_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "push.secretName" . }}
-                  key: accounts-token
+            {{- include "push.applicationEnv" (dict "root" . "name" "PUSH_ACCOUNTS_TOKEN" "key" "accounts-token") | nindent 12 }}
             # Only auth-svc has this one: the Directory API refuses calls without it.
-            - name: PUSH_DIRECTORY_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "push.secretName" . }}
-                  key: directory-token
+            {{- include "push.applicationEnv" (dict "root" . "name" "PUSH_DIRECTORY_TOKEN" "key" "directory-token") | nindent 12 }}
             # Only the gateway has this one: the Messaging API refuses calls without it.
-            - name: PUSH_MESSAGING_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "push.secretName" . }}
-                  key: messaging-token
+            {{- include "push.applicationEnv" (dict "root" . "name" "PUSH_MESSAGING_TOKEN" "key" "messaging-token") | nindent 12 }}
           ports:
             - name: messaging
               containerPort: 50051
@@ -111,11 +99,11 @@ spec:
             periodSeconds: 10
           resources:
             {{- toYaml .Values.messageSvc.resources | nindent 12 }}
-          {{- with include "push.identityMounts" (dict "root" . "key" "messageSvc" "postgres" true "redis" true) }}
+          {{- with (printf "%s%s" (include "push.identityMounts" (dict "root" . "key" "messageSvc" "postgres" true "redis" true)) (include "push.applicationMounts" .)) }}
           volumeMounts:
             {{- . | trim | nindent 12 }}
           {{- end }}
-      {{- with include "push.identityVolumes" (dict "root" . "key" "messageSvc" "postgres" true "redis" true) }}
+      {{- with (printf "%s%s" (include "push.identityVolumes" (dict "root" . "key" "messageSvc" "postgres" true "redis" true)) (include "push.applicationVolumes" .)) }}
       volumes:
         {{- . | trim | nindent 8 }}
       {{- end }}

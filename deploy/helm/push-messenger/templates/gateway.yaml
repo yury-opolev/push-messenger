@@ -62,11 +62,7 @@ spec:
             - name: PUSH_MESSAGE_SVC_URL
               value: {{ printf "http://%s:50051" (include "push.name" (dict "root" . "component" "message-svc")) | quote }}
             # message-svc's Messaging API takes calls only with this token.
-            - name: PUSH_MESSAGING_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "push.secretName" . }}
-                  key: messaging-token
+            {{- include "push.applicationEnv" (dict "root" . "name" "PUSH_MESSAGING_TOKEN" "key" "messaging-token") | nindent 12 }}
             {{- include "push.redisEnv" . | trim | nindent 12 }}
             - name: PUSH_HEARTBEAT_MS
               value: {{ .Values.gateway.heartbeatMs | quote }}
@@ -102,11 +98,11 @@ spec:
             periodSeconds: 10
           resources:
             {{- toYaml .Values.gateway.resources | nindent 12 }}
-          {{- with include "push.identityMounts" (dict "root" . "key" "gateway" "postgres" false "redis" true) }}
+          {{- with (printf "%s%s" (include "push.identityMounts" (dict "root" . "key" "gateway" "postgres" false "redis" true)) (include "push.applicationMounts" .)) }}
           volumeMounts:
             {{- . | trim | nindent 12 }}
           {{- end }}
-      {{- with include "push.identityVolumes" (dict "root" . "key" "gateway" "postgres" false "redis" true) }}
+      {{- with (printf "%s%s" (include "push.identityVolumes" (dict "root" . "key" "gateway" "postgres" false "redis" true)) (include "push.applicationVolumes" .)) }}
       volumes:
         {{- . | trim | nindent 8 }}
       {{- end }}

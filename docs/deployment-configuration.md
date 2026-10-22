@@ -32,7 +32,7 @@ socket directory to the `postgres` user, so it keeps just `CHOWN`, `DAC_OVERRIDE
 
 ### Chart-managed (default, local development)
 
-With `secrets.existingSecret: ""` the chart generates every credential on install,
+With `secrets.existingSecret: ""` and `secrets.volume: {}` the chart generates every credential on install,
 stores them in `<release>-secrets` (`helm.sh/resource-policy: keep`) and reads them back
 with `lookup` on upgrades. A render therefore **contains credentials** and needs cluster
 access to reuse them: never send its output to shared logs or artifacts.
@@ -96,6 +96,132 @@ start-up or readiness. Neither falls back to generated credentials. Changing the
 Secret's content does not roll workloads or rotate database roles; coordinate
 backing-service changes and rollouts yourself.
 
+### Consumer-mounted application keys (CSI, without Secret sync)
+
+Set `secrets.volume` to a consumer-supplied Kubernetes **VolumeSource**, without a
+`name`. The chart supplies its name, `application-keys`, and read-only mounts on auth,
+message-svc, gateway and worker. It neither creates a CSI driver nor creates a
+`SecretProviderClass`. Example values:
+
+```yaml
+secrets:
+  existingSecret: ""
+  volume:
+    csi:
+      driver: secrets-store.csi.k8s.io
+      readOnly: true
+      volumeAttributes:
+        secretProviderClass: push-application-keys
+  mountPath: /etc/push/application-keys
+  files:
+    auth-signing-key: auth-signing-key
+    auth-link-key: auth-link-key
+    accounts-token: accounts-token
+    directory-token: directory-token
+    messaging-token: messaging-token
+    auth-admin-token: auth-admin-token
+    resend-api-key: resend-api-key
+    resend-webhook-secret: resend-webhook-secret
+```
+
+`mountPath` defaults as shown and must be an absolute, non-root path with no traversal
+or trailing slash. `files` defaults to the existing Secret key names. Override a value
+to change its filename; filenames cannot contain directory separators or be `.` or
+`..`. Required files cannot have empty filenames. Admin and email filenames are
+required only when those features are enabled; absent admin configuration remains
+disabled and the chart does not reference its file. Inline application key values and
+`secrets.existingSecret` conflict with mounted mode and are refused.
+
+| Existing key / default filename | File environment variable | Consumers |
+|---|---|---|
+| `auth-signing-key` | `PUSH_AUTH_SIGNING_KEY_FILE` | auth |
+| `auth-link-key` | `PUSH_AUTH_LINK_KEY_FILE` | auth |
+| `accounts-token` | `PUSH_ACCOUNTS_TOKEN_FILE` | worker, message-svc |
+| `directory-token` | `PUSH_DIRECTORY_TOKEN_FILE` | auth, message-svc |
+| `messaging-token` | `PUSH_MESSAGING_TOKEN_FILE` | gateway, message-svc |
+| `auth-admin-token` | `PUSH_AUTH_ADMIN_TOKEN_FILE` | auth, when admin enabled |
+| `resend-api-key` | `PUSH_RESEND_API_KEY_FILE` | worker, when Resend selected |
+| `resend-webhook-secret` | `PUSH_RESEND_WEBHOOK_SECRET_FILE` | worker, when webhook enabled |
+
+The DEV password smoke hook also uses `auth-signing-key`, via
+`PUSH_SMOKE_SIGNING_KEY_FILE`. Operator Entra smoke receives **no application keys**.
+The migration Job and its init containers receive neither the volume nor key
+variables; its distinct `-migrate-egress` hook policy is unchanged.
+
+Contents are the **decoded values** in the earlier table: notably, signing and link
+key files contain standard base64 text, not decoded binary seeds and not an extra
+Kubernetes `data` encoding. The shared `push-credentials` reader reads files **once at
+startup**, removes terminal CR/LF characters only, and otherwise preserves contents
+(including spaces and embedded newlines, which the existing format validators may
+reject). Direct environment values are not trimmed and continue working outside the
+chart. Setting both a direct variable and its `_FILE` alternative, even to empty
+strings, fails startup. Missing, unreadable, empty and non-UTF-8 files fail startup;
+there is no fallback, secret content or path in configuration errors.
+
+The whole supplied volume is mounted in each consuming pod, even though each gets
+only its relevant `_FILE` variables. Scope its contents and access policy accordingly;
+do not use this volume for unrelated credentials. Ensure the CSI driver makes its
+files readable by the non-root service user. With bundled datastores their existing
+chart-managed Secret still holds **datastore keys only**. With external Entra datastores
+no credential Secret is rendered at all. Datastore password URLs, CA bundles and Azure
+identity token files are separate mechanisms, not covered by this setting.
+External password-mode datastores still require `secrets.existingSecret`; this
+mutually exclusive mounted mode supports bundled datastores or external Entra
+datastores, not a hybrid external password Secret plus mounted application keys.
+
+For example, the consumer may create this Azure provider resource in the release
+namespace (placeholders are consumer-owned; **no `secretObjects` Secret sync**):
+
+```yaml
+apiVersion: secrets-store.csi.x-k8s.io/v1
+kind: SecretProviderClass
+metadata:
+  name: push-application-keys
+spec:
+  provider: azure
+  parameters:
+    usePodIdentity: "false"
+    clientID: "<key-vault-workload-identity-client-id>"
+    tenantId: "<tenant-id>"
+    keyvaultName: "<vault-name>"
+    objects: |
+      array:
+        - |
+          objectName: auth-signing-key
+          objectType: secret
+          objectAlias: auth-signing-key
+        - |
+          objectName: auth-link-key
+          objectType: secret
+          objectAlias: auth-link-key
+        - |
+          objectName: accounts-token
+          objectType: secret
+          objectAlias: accounts-token
+        - |
+          objectName: directory-token
+          objectType: secret
+          objectAlias: directory-token
+        - |
+          objectName: messaging-token
+          objectType: secret
+          objectAlias: messaging-token
+```
+
+Add objects for admin and Resend only when needed, matching the filenames above.
+The consumer installs/configures Secrets Store CSI and its Azure provider, grants
+vault access, and configures workload identity federation/token projection for each
+ServiceAccount mounting this class (including a DEV smoke hook if used). This is
+independent of the datastores' identities. The chart creates no dummy workload to
+trigger synchronization and requires no Kubernetes Secret for application keys.
+
+For rotation, update the provider's backing values, verify CSI has delivered the new
+files, then roll out the affected Deployments. Running processes do not hot-reload
+files; changing a CSI object alone does not change their in-memory keys. Coordinate
+internal-token readers and callers; mixed generations can reject calls. Signing/link
+key replacement can invalidate existing tokens or links. The chart promises neither
+overlapping key generations nor zero-downtime rotation.
+
 ### Managed datastores with Microsoft Entra ID
 
 With `postgres.enabled: false` / `redis.enabled: false` and `auth: azure-entra` the
@@ -104,7 +230,8 @@ Microsoft Entra ID tokens from workload identity, one ServiceAccount per workloa
 optional migration Job and opt-in egress NetworkPolicies: see
 [deployment-azure-entra.md](deployment-azure-entra.md). The Secret's database and Redis
 keys (`postgres-password`, `*-db-password`, `*database-url`, `redis-password`,
-`redis-url`) are then unused and not rendered; the application keys stay.
+`redis-url`) are then unused and not rendered; application keys use the selected
+Secret or mounted-volume mode above.
 
 ### Microsoft Entra ID sign-in
 

@@ -16,10 +16,16 @@ expiry (at 75% of the lifetime). No datastore password exists anywhere: not in v
 not in a Secret, not in an environment variable. Each workload gets its own
 ServiceAccount, so each can have its own identity.
 
-The application keys still come from the Secret (chart-managed or
-`secrets.existingSecret`): `auth-signing-key`, `auth-link-key`, the three internal API
-tokens and, with Resend, `resend-api-key` and `resend-webhook-secret`. The database and
-Redis keys of that Secret are then unused and not rendered.
+The application keys come from a Secret (chart-managed or `secrets.existingSecret`)
+by default: `auth-signing-key`, `auth-link-key`, the three internal API tokens,
+`auth-admin-token` when enabled and, with Resend, `resend-api-key` and
+`resend-webhook-secret`. Alternatively, `secrets.volume` mounts consumer-delivered
+files (for example Secrets Store CSI with a `SecretProviderClass`, **without Secret
+sync**): see [mounted application keys](deployment-configuration.md#consumer-mounted-application-keys-csi-without-secret-sync)
+for the complete values, filenames and Azure CSI example. With external Entra
+datastores and mounted application keys the chart renders no credential Secret.
+Files load at startup only: rotate by coordinating the new files and rolling out
+their consumers. Datastore tokens still refresh independently.
 
 The chart provisions nothing outside the release namespace: the Azure resources,
 identities, federated credentials, role assignments, private endpoints and DNS below are

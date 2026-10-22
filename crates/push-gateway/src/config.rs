@@ -1,4 +1,6 @@
 //! Configuration from environment variables.
+//!
+//! `PUSH_MESSAGING_TOKEN_FILE` supplies the token from a file read once at startup.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -134,7 +136,9 @@ impl Config {
         let lookup_dyn: &dyn Fn(&str) -> Option<String> = &lookup;
         let redis = RedisTarget::from_lookup(lookup_dyn).map_err(problem)?;
         let azure = azure_for(lookup_dyn, &[redis.mode()]).map_err(problem)?;
-        let messaging_token = required("PUSH_MESSAGING_TOKEN")?;
+        let messaging_token =
+            push_credentials::required_application_secret(&lookup, "PUSH_MESSAGING_TOKEN")
+                .map_err(problem)?;
         if !((32..=256).contains(&messaging_token.len())
             && messaging_token.bytes().all(|byte| byte.is_ascii_graphic()))
         {
@@ -216,6 +220,24 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+
+    #[test]
+    fn mounted_messaging_token_matches_direct_configuration() {
+        let directory = std::path::PathBuf::from("target")
+            .join(format!("gateway-mounted-keys-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("token");
+        let expected = config(&REQUIRED).unwrap();
+        std::fs::write(&path, format!("{}\n", expected.messaging_token)).unwrap();
+        let mut variables = REQUIRED.to_vec();
+        variables.retain(|(name, _)| *name != "PUSH_MESSAGING_TOKEN");
+        variables.push(("PUSH_MESSAGING_TOKEN_FILE", path.to_str().unwrap()));
+        assert_eq!(config(&variables).unwrap(), expected);
+        variables.push(("PUSH_MESSAGING_TOKEN", &expected.messaging_token));
+        let error = config(&variables).unwrap_err();
+        assert!(!format!("{error:?} {error}").contains(&expected.messaging_token));
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
 
     fn config(variables: &[(&str, &str)]) -> Result<Config, ConfigError> {
         let variables: HashMap<String, String> = variables

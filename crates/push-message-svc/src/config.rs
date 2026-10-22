@@ -1,4 +1,6 @@
 //! Configuration from environment variables.
+//!
+//! Internal API tokens also accept `_FILE` alternatives, read once at startup.
 
 use std::net::SocketAddr;
 
@@ -163,7 +165,7 @@ fn token(
     lookup: &impl Fn(&str) -> Option<String>,
     name: &'static str,
 ) -> Result<Option<String>, ConfigError> {
-    let token = lookup(name).filter(|value| !value.is_empty());
+    let token = push_credentials::application_secret(lookup, name).map_err(problem)?;
     if let Some(token) = &token {
         check_token(token).map_err(|reason| redacted(name, reason))?;
     }
@@ -289,6 +291,33 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+
+    #[test]
+    fn mounted_internal_tokens_match_direct_configuration() {
+        let directory = std::path::PathBuf::from("target")
+            .join(format!("message-mounted-keys-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("token");
+        for name in [
+            "PUSH_ACCOUNTS_TOKEN",
+            "PUSH_DIRECTORY_TOKEN",
+            "PUSH_MESSAGING_TOKEN",
+        ] {
+            let value = "internal-token-of-the-configuration-tests";
+            std::fs::write(&path, format!("{value}\n")).unwrap();
+            let mut direct = REQUIRED.to_vec();
+            direct.push((name, value));
+            let expected = config(&direct).unwrap();
+            direct.pop();
+            let file_name = format!("{name}_FILE");
+            direct.push((&file_name, path.to_str().unwrap()));
+            assert_eq!(config(&direct).unwrap(), expected, "{name}");
+            direct.push((name, value));
+            let error = config(&direct).unwrap_err();
+            assert!(!format!("{error:?} {error}").contains(value));
+        }
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
 
     fn config(variables: &[(&str, &str)]) -> Result<Config, ConfigError> {
         let variables: HashMap<String, String> = variables

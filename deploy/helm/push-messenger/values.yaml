@@ -295,6 +295,21 @@ migrations:
 # then never creates, reads, changes or deletes it, and refuses inline credential values.
 secrets:
   existingSecret: ""
+  # Optional consumer-supplied Kubernetes VolumeSource (without name), e.g. CSI.
+  # Application keys only: bundled datastore credentials remain in the chart Secret.
+  # Mutually exclusive with existingSecret and inline application keys.
+  volume: {}
+  mountPath: /etc/push/application-keys
+  # Filenames, not paths. File contents match the existing Secret stringData contract.
+  files:
+    auth-signing-key: auth-signing-key
+    auth-link-key: auth-link-key
+    accounts-token: accounts-token
+    directory-token: directory-token
+    messaging-token: messaging-token
+    auth-admin-token: auth-admin-token
+    resend-api-key: resend-api-key
+    resend-webhook-secret: resend-webhook-secret
 
 # Ingress isolation for the application components (the bundled datastores' policies
 # only when they are enabled); egress is unrestricted unless egress.enabled.
