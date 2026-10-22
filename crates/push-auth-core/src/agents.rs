@@ -1,7 +1,7 @@
 //! Owner consent, bounded reservations and permanent app identity tombstones.
 
 use chrono::{DateTime, Utc};
-use sqlx::{PgConnection, Row};
+use sqlx::{PgConnection, PgPool, Row};
 use uuid::Uuid;
 
 use crate::devices::{Caller, revoke_devices};
@@ -22,15 +22,16 @@ pub(crate) struct Reservation {
     pub expires_at: DateTime<Utc>,
 }
 
-/// All enrollment operations lock human owner, then agent account, then devices.
-/// Expiry only deletes unverified agent rows (never human owner rows).
-pub(crate) async fn expire(connection: &mut PgConnection) -> Result<(), AuthError> {
+/// Global expiry commits before any operation takes owner, account or device locks.
+/// Keeping its agent-row locks in a caller's transaction would invert that order.
+/// Accepting a pool, not a connection, prevents cleanup inside such a transaction.
+pub(crate) async fn expire(pool: &PgPool) -> Result<(), AuthError> {
     sqlx::query(
         "DELETE FROM auth.user_account a USING auth.agent_enrollment e \
          WHERE a.user_id = e.user_id AND a.email_verified_at IS NULL \
          AND e.expires_at <= clock_timestamp()",
     )
-    .execute(connection)
+    .execute(pool)
     .await?;
     Ok(())
 }
@@ -76,9 +77,9 @@ impl Auth {
             .ok_or(AuthError::EnrollmentNotPermitted)?;
         let handle = rules::handle(handle)?;
         let display_name = rules::display_name(display_name)?;
+        expire(&self.pool).await?;
         let mut tx = self.pool.begin().await?;
         owner(&mut tx, caller).await?;
-        expire(&mut tx).await?;
         let delegated: Option<String> = sqlx::query_scalar(
             "SELECT issuer FROM auth.external_identity WHERE user_id = $1 AND provider = 'entra'",
         )
@@ -246,9 +247,9 @@ impl Auth {
         &self,
         caller: Caller,
     ) -> Result<Vec<serde_json::Value>, AuthError> {
+        expire(&self.pool).await?;
         let mut tx = self.pool.begin().await?;
         owner(&mut tx, caller).await?;
-        expire(&mut tx).await?;
         let rows = sqlx::query(
             "SELECT a.user_id, a.handle::text, a.display_name, a.email_verified_at IS NOT NULL, \
              e.expires_at, e.client_app_id FROM auth.user_account a \
@@ -302,9 +303,9 @@ impl Auth {
                 reason: "give display_name, handle or both",
             }));
         }
+        expire(&self.pool).await?;
         let mut tx = self.pool.begin().await?;
         owner(&mut tx, caller).await?;
-        expire(&mut tx).await?;
         let found: Option<bool> = sqlx::query_scalar(
             "SELECT email_verified_at IS NOT NULL FROM auth.user_account \
              WHERE user_id = $1 AND owner_user_id = $2 AND kind = 'agent' \

@@ -35,6 +35,144 @@ fn principal(object: Uuid) -> Principal {
 }
 
 #[tokio::test]
+async fn profile_edit_and_agent_management_do_not_invert_expired_reservation_locks() {
+    use std::time::Duration;
+
+    let (world, auth, _, owner) = setup().await;
+    let reserved = auth
+        .reserve_agent(caller(&owner), "expired_agent", "Expired")
+        .await
+        .unwrap();
+    sqlx::query("UPDATE auth.agent_enrollment SET expires_at = now() - interval '1 second'")
+        .execute(&world.pool)
+        .await
+        .unwrap();
+
+    let mut holder = world.pool.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM auth.user_account WHERE user_id = $1 FOR UPDATE")
+        .bind(owner.user_id)
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+    let wait_for_waiters = |count: i64| {
+        let pool = world.pool.clone();
+        async move {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let waiting: i64 = sqlx::query_scalar(
+                        "SELECT count(*) FROM pg_stat_activity \
+                         WHERE datname = current_database() AND wait_event_type = 'Lock' \
+                         AND query LIKE '%auth.user_account%'",
+                    )
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+                    if waiting >= count {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("requests reach the account lock");
+        }
+    };
+    // Queue management first so it takes the owner lock before the profile edit.
+    let managing = auth.clone();
+    let owner_caller = caller(&owner);
+    let management = tokio::spawn(async move { managing.owned_agents(owner_caller).await });
+    wait_for_waiters(1).await;
+    let editing = auth.clone();
+    let profile = tokio::spawn(async move {
+        editing
+            .update_profile(owner_caller, Some("Updated"), None)
+            .await
+    });
+    wait_for_waiters(2).await;
+    holder.commit().await.unwrap();
+
+    let (management, profile) = tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::join!(management, profile)
+    })
+    .await
+    .expect("management and profile editing must finish without a lock cycle");
+    assert!(management.unwrap().unwrap().is_empty());
+    assert_eq!(profile.unwrap().unwrap().display_name, "Updated");
+    assert!(auth.profiles(&[reserved.user_id]).await.unwrap().is_empty());
+    assert!(
+        auth.reserve_agent(owner_caller, "expired_agent", "Reclaimed")
+            .await
+            .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn expired_handles_remain_reclaimable_across_owners_and_account_paths() {
+    let (world, auth, _, owner) = setup().await;
+    let other = password_user(&auth, &world.pool, "other_owner", 1)
+        .await
+        .remove(0);
+    let target = auth
+        .reserve_agent(caller(&other), "rename_target", "Target")
+        .await
+        .unwrap();
+    for handle in [
+        "reclaim_profile",
+        "reclaim_agent",
+        "reclaim_reservation",
+        "reclaim_external",
+    ] {
+        let expired = auth
+            .reserve_agent(caller(&owner), handle, "Expired")
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE auth.agent_enrollment SET expires_at = now() - interval '1 second' \
+             WHERE user_id = $1",
+        )
+        .bind(expired.user_id)
+        .execute(&world.pool)
+        .await
+        .unwrap();
+        match handle {
+            "reclaim_profile" => {
+                auth.update_profile(caller(&other), None, Some(handle))
+                    .await
+                    .unwrap();
+            }
+            "reclaim_agent" => {
+                auth.change_agent(caller(&other), target.user_id, Some(handle), None, false)
+                    .await
+                    .unwrap();
+            }
+            "reclaim_reservation" => {
+                auth.reserve_agent(caller(&other), handle, "Reclaimed")
+                    .await
+                    .unwrap();
+            }
+            _ => {
+                let mut external = principal(Uuid::new_v4());
+                external.provider = "entra".into();
+                auth.sign_in_external(&external, Some(handle))
+                    .await
+                    .unwrap();
+            }
+        }
+        let remaining: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM auth.user_account WHERE user_id = $1)",
+        )
+        .bind(expired.user_id)
+        .fetch_one(&world.pool)
+        .await
+        .unwrap();
+        assert!(
+            !remaining,
+            "expired account is removed before reclaiming {handle}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn enrollment_preserves_admission_and_management_is_rate_limited_without_exposing_codes() {
     let (world, auth, routes, owner) = setup().await;
     assert_eq!(

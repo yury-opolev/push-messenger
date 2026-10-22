@@ -75,8 +75,8 @@ impl Auth {
                 reason: "give display_name, handle or both",
             }));
         }
+        crate::agents::expire(&self.pool).await?;
         let mut tx = self.pool.begin().await?;
-        crate::agents::expire(&mut tx).await?;
         if let Some(display_name) = &display_name {
             sqlx::query("UPDATE auth.user_account SET display_name = $2 WHERE user_id = $1")
                 .bind(caller.user_id)

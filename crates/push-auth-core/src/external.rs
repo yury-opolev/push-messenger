@@ -228,8 +228,8 @@ impl Auth {
         }
         let requested = handle.map(rules::handle).transpose()?;
         let user_id = Uuid::now_v7();
+        crate::agents::expire(&self.pool).await?;
         let mut tx = self.pool.begin().await?;
-        crate::agents::expire(&mut tx).await?;
         let mut created = false;
         for _ in 0..HANDLE_ATTEMPTS {
             let candidate = requested.clone().unwrap_or_else(generated_handle);

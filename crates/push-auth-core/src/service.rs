@@ -305,8 +305,8 @@ impl Auth {
         // Hashed before anything else, whether or not the account will be created.
         let password_hash = self.hash(signup.password).await?;
 
+        crate::agents::expire(&self.pool).await?;
         let mut tx = self.pool.begin().await?;
-        crate::agents::expire(&mut tx).await?;
         let taken: bool = sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM auth.user_account WHERE handle = $1::citext)",
         )
