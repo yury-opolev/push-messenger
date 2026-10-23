@@ -765,3 +765,29 @@ async fn a_user_changes_their_handle_and_the_old_one_is_free_at_once() {
     .await;
     assert_eq!(unauthenticated.status, StatusCode::UNAUTHORIZED);
 }
+
+#[tokio::test]
+async fn a_hyphenated_handle_signs_up_and_is_found_ignoring_case() {
+    let world = world().await;
+    let yury = with_device(&world, "yury-opolev").await;
+    let access = yury["access_token"].as_str().unwrap();
+    let found = call(
+        &world,
+        Method::GET,
+        "/v1/users/lookup?handle=%40Yury-Opolev",
+        Some(access),
+        None,
+    )
+    .await;
+    assert_eq!(found.status, StatusCode::OK, "{}", found.text);
+    assert_eq!(found.json()["user_id"], yury["user_id"]);
+    assert_eq!(found.json()["handle"], "yury-opolev");
+
+    let renamed = patch_me(&world, access, json!({"handle": "yury-o_1"})).await;
+    assert_eq!(renamed.status, StatusCode::OK, "{}", renamed.text);
+    assert_eq!(renamed.json()["handle"], "yury-o_1");
+    for bad in ["yury-", "yury--o", "-yury"] {
+        let answer = patch_me(&world, access, json!({"handle": bad})).await;
+        assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{bad}");
+    }
+}
