@@ -2,7 +2,7 @@
 
 Date: 2026-10-23
 
-Implementation status: in progress ([plan](../plans/2026-10-23-hyphenated-handles.md)).
+Implementation status: done ([plan](../plans/2026-10-23-hyphenated-handles.md)).
 
 Change request "REQUEST PUSH 42" from the consumer repository yuopolev/push-messenger (DEV
 deployment), against upstream main `826e15b`: allow `-` in handles. People (`yury-opolev`)

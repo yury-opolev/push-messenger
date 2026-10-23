@@ -135,9 +135,10 @@ Implementation notes (push-auth, migration `0001_auth.sql`, Plan 5A):
 
 - auth-svc has its own database, `push_auth`, owned by its own role. The migration creates
   the `citext` extension (trusted, so the database owner may) and the `auth` schema.
-- Handles are stored in lower case: 3–30 letters, digits and underscores, starting with a
-  letter (a `CHECK`). Display and device names have 1–64 characters; `platform` is checked
-  against the five values. A partial index on `device (user_id) where revoked_at is null`
+- Handles are stored in lower case: 3–30 letters, digits, underscores and hyphens,
+  starting with a letter, never ending with a hyphen or holding two in a row (a `CHECK`;
+  hyphens since migration `0007_hyphenated_handles.sql`). Display and device names have
+  1–64 characters; `platform` is checked against the five values. A partial index on `device (user_id) where revoked_at is null`
   serves the device limit; `unique (user_id, registration_id)` makes a retried
   registration find its device.
 - `refresh_token.rotated_at` is set when the holder exchanges the token and starts its
