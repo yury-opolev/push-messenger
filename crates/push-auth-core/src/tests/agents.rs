@@ -1100,3 +1100,38 @@ async fn deletion_serializes_with_registration_refresh_and_reauthentication() {
         }
     }
 }
+
+#[tokio::test]
+async fn agents_may_reserve_and_take_hyphenated_handles() {
+    let (_world, auth, router, owner) = setup().await;
+    let (status, reserved) = call(
+        &router,
+        "POST",
+        "/v1/agents",
+        &owner.access_token,
+        json!({"handle": "@Build-Bot", "display_name": "Build bot"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{reserved}");
+    let user_id: Uuid = reserved["user_id"].as_str().unwrap().parse().unwrap();
+    let (_, list) = call(&router, "GET", "/v1/agents", &owner.access_token, json!({})).await;
+    assert_eq!(list["agents"][0]["handle"], "build-bot");
+    let (status, _) = call(
+        &router,
+        "PATCH",
+        &format!("/v1/agents/{user_id}"),
+        &owner.access_token,
+        json!({"handle": "deploy-bot-2"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, list) = call(&router, "GET", "/v1/agents", &owner.access_token, json!({})).await;
+    assert_eq!(list["agents"][0]["handle"], "deploy-bot-2");
+    for bad in ["deploy-", "deploy--bot"] {
+        assert!(matches!(
+            auth.change_agent(caller(&owner), user_id, Some(bad), None, false)
+                .await,
+            Err(AuthError::Invalid(_))
+        ));
+    }
+}

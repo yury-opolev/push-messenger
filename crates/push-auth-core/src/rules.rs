@@ -52,18 +52,22 @@ pub fn email(raw: &str) -> Result<String, Invalid> {
     Ok(normalised)
 }
 
-/// A public handle, without its `@`: 3 to 30 lower-case letters, digits and underscores,
-/// starting with a letter. Input may carry the `@` and any case.
+/// A public handle, without its `@`: 3 to 30 lower-case letters, digits, underscores and
+/// hyphens, starting with a letter, not ending with a hyphen and without two hyphens in a
+/// row. Input may carry the `@` and any case. Migration 0007's CHECK says the same.
 pub fn handle(raw: &str) -> Result<String, Invalid> {
     let raw = raw.trim();
     let handle = raw.strip_prefix('@').unwrap_or(raw).to_lowercase();
     let mut chars = handle.chars();
     let starts_with_letter = chars.next().is_some_and(|c| c.is_ascii_lowercase());
-    let rest_ok = chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
-    if !(3..=30).contains(&handle.len()) || !starts_with_letter || !rest_ok {
+    let rest_ok =
+        chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-');
+    let hyphens_ok = !handle.ends_with('-') && !handle.contains("--");
+    if !(3..=30).contains(&handle.len()) || !starts_with_letter || !rest_ok || !hyphens_ok {
         return Err(invalid(
             "handle",
-            "use 3 to 30 letters, digits or underscores, starting with a letter",
+            "use 3 to 30 letters, digits, underscores or single hyphens, \
+             starting with a letter and not ending with a hyphen",
         ));
     }
     Ok(handle)
@@ -219,10 +223,35 @@ mod tests {
     fn handles_drop_the_at_sign_and_case() {
         assert_eq!(handle("@Alice_99"), Ok("alice_99".to_owned()));
         assert_eq!(handle("bob"), Ok("bob".to_owned()));
-        for bad in ["al", "9lives", "has-dash", "_bob", "émile", &"a".repeat(31)] {
-            assert!(handle(bad).is_err(), "{bad:?}");
+        for good in ["a-b", "has-dash", "@Yury-Opolev", "build-bot", "a-1_b-c"] {
+            assert!(handle(good).is_ok(), "{good:?}");
+        }
+        assert_eq!(handle("@Yury-Opolev"), Ok("yury-opolev".to_owned()));
+        for bad in [
+            "al",
+            "9lives",
+            "_bob",
+            "émile",
+            "bob-",
+            "a--b",
+            "-bob",
+            "a-",
+            "has.dot",
+            &"a".repeat(31),
+        ] {
+            assert_eq!(
+                handle(bad),
+                Err(invalid(
+                    "handle",
+                    "use 3 to 30 letters, digits, underscores or single hyphens, \
+                     starting with a letter and not ending with a hyphen",
+                )),
+                "{bad:?}"
+            );
         }
         assert!(handle(&"a".repeat(30)).is_ok());
+        assert!(handle(&format!("{}-b", "a".repeat(28))).is_ok());
+        assert!(handle(&format!("{}-b", "a".repeat(29))).is_err());
     }
 
     #[test]
