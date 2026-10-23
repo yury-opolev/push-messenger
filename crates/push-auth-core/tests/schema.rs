@@ -184,7 +184,9 @@ async fn malformed_handles_and_platforms_are_refused() {
     for handle in [
         "al",
         "9lives",
-        "has-dash",
+        "bob-",
+        "a--b",
+        "-bob",
         "Alice",
         "a_very_long_handle_over_thirty_c",
     ] {
@@ -687,5 +689,58 @@ async fn migration_0005_keeps_entra_identities_and_admits_other_providers() {
             "{} characters",
             issuer.len()
         );
+    }
+}
+
+/// Migration 0007 widens the handle CHECK to the rule of `rules::handle`: hyphens, but not
+/// at the end and never two in a row. Handles stored before it stay valid.
+#[tokio::test]
+async fn migration_0007_admits_single_hyphens_and_keeps_existing_handles() {
+    let (_container, url) = auth_database().await;
+    let before = sqlx::migrate::Migrator {
+        migrations: std::borrow::Cow::Owned(
+            MIGRATOR
+                .iter()
+                .filter(|migration| migration.version <= 6)
+                .cloned()
+                .collect(),
+        ),
+        ignore_missing: false,
+        locking: true,
+        no_tx: false,
+    };
+    let pool = PgPool::connect(&url).await.expect("connect");
+    before.run(&pool).await.expect("migrations 1 to 6");
+    let longest = "a".repeat(30);
+    for handle in ["abc", "alice_99", longest.as_str()] {
+        insert_user(&pool, &format!("{handle}@example.com"), handle)
+            .await
+            .expect(handle);
+    }
+
+    migrate_database(&url).await.expect("migration 0007");
+    let kept: i64 = sqlx::query_scalar("SELECT count(*) FROM auth.user_account")
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(kept, 3);
+    let hyphenated = format!("{}-b", "a".repeat(28));
+    for handle in [
+        "a-b",
+        "has-dash",
+        "yury-opolev",
+        "a-1_b-c",
+        hyphenated.as_str(),
+    ] {
+        insert_user(&pool, &format!("{}@example.com", Uuid::now_v7()), handle)
+            .await
+            .expect(handle);
+    }
+    let too_long = format!("{}-b", "a".repeat(29));
+    for handle in ["bob-", "a--b", "-bob", "a-", "ab", "_ab", too_long.as_str()] {
+        let error = insert_user(&pool, &format!("{}@example.com", Uuid::now_v7()), handle)
+            .await
+            .expect_err(handle);
+        assert_eq!(constraint(error), "user_account_handle_check", "{handle}");
     }
 }
