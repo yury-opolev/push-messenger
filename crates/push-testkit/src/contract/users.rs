@@ -140,6 +140,49 @@ async fn a_password_reset_keeps_the_latest_time_and_needs_the_user<B: Backend>(b
     ));
 }
 
+async fn the_presence_setting_round_trips<B: Backend>(backend: &B) {
+    let store = backend.store().await;
+    let (alice, bob, carol) = (UserId::new(), UserId::new(), UserId::new());
+    add_users(&store, &[alice, bob, carol]).await;
+    let sorted = |mut users: Vec<UserId>| {
+        users.sort();
+        users
+    };
+    let mut tx = store.begin().await.unwrap();
+    assert!(
+        tx.presence_hidden(&[alice, bob, carol])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    tx.set_presence_hidden(alice, true).await.unwrap();
+    tx.set_presence_hidden(bob, true).await.unwrap();
+    tx.set_presence_hidden(bob, true).await.unwrap();
+    let hidden = tx
+        .presence_hidden(&[alice, bob, carol, bob, UserId::new()])
+        .await
+        .unwrap();
+    assert_eq!(sorted(hidden), sorted(vec![alice, bob]));
+
+    tx.set_presence_hidden(alice, false).await.unwrap();
+    tx.set_presence_hidden(alice, false).await.unwrap();
+    tx.set_presence_hidden(carol, false).await.unwrap();
+    assert_eq!(
+        tx.presence_hidden(&[alice, bob, carol]).await.unwrap(),
+        vec![bob]
+    );
+    assert!(tx.presence_hidden(&[]).await.unwrap().is_empty());
+    tx.commit().await.unwrap();
+
+    let mut tx = store.begin().await.unwrap();
+    assert_eq!(tx.presence_hidden(&[bob]).await.unwrap(), vec![bob]);
+    assert!(matches!(
+        tx.set_presence_hidden(UserId::new(), true).await,
+        Err(DomainError::Store(_))
+    ));
+}
+
 pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
     case_list![
         inserting_a_user_twice_is_harmless,
@@ -150,5 +193,6 @@ pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
         device_user_names_the_owner_of_revoked_devices_too,
         device_state_reads_owner_activity_and_reset_together,
         a_password_reset_keeps_the_latest_time_and_needs_the_user,
+        the_presence_setting_round_trips,
     ]
 }
