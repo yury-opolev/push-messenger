@@ -128,6 +128,9 @@ pub struct Stack {
     /// auth-svc and the gateway behind one origin, routed by path.
     pub public_url: String,
     pub signing_key: &'static str,
+    /// auth-svc's admin listener, never behind `public_url`, and its bearer token.
+    pub admin_url: String,
+    pub admin_token: &'static str,
     shutdown: CancellationToken,
     servers: Vec<(&'static str, Server)>,
 }
@@ -139,6 +142,8 @@ const DIRECTORY_TOKEN: &str = "directory-token-for-the-local-smoke-test";
 const MESSAGING_TOKEN: &str = "messaging-token-for-the-local-smoke-test";
 // The worker's token for message-svc's Accounts API.
 const ACCOUNTS_TOKEN: &str = "accounts-token-for-the-local-smoke-test";
+// The bearer token of auth-svc's admin API.
+const ADMIN_TOKEN: &str = "admin-token-for-the-local-smoke-test";
 
 impl Stack {
     /// Starts the four services on `datastores` and waits until each is ready.
@@ -152,6 +157,12 @@ impl Stack {
         let auth_health_addr = auth_health.local_addr().unwrap();
         let auth_http_addr = auth_http.local_addr().unwrap();
         let auth_url = format!("http://{auth_http_addr}");
+        // auth-svc binds its admin listener itself: reserve a free port for it.
+        let admin_addr = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let admin_url = format!("http://{admin_addr}");
         let grpc = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let accounts = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let directory = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -175,6 +186,8 @@ impl Stack {
             ("PUSH_DIRECTORY_TOKEN", DIRECTORY_TOKEN),
             ("PUSH_HTTP_ADDR", &auth_http_addr.to_string()),
             ("PUSH_HEALTH_ADDR", &auth_health_addr.to_string()),
+            ("PUSH_AUTH_ADMIN_TOKEN", ADMIN_TOKEN),
+            ("PUSH_AUTH_ADMIN_ADDR", &admin_addr.to_string()),
         ]);
         auth_variables.extend(datastores.auth);
         let auth_config = push_auth_core::Config::from_lookup(lookup(auth_variables)).unwrap();
@@ -268,6 +281,8 @@ impl Stack {
             worker_url,
             public_url,
             signing_key,
+            admin_url,
+            admin_token: ADMIN_TOKEN,
             shutdown,
             servers: vec![
                 ("auth-svc", auth),
