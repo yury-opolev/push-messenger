@@ -98,6 +98,7 @@ async fn world() -> World {
         limits: Limits::new(Arc::new(MemoryCounter::default())),
         client_ip_header: Some(HeaderName::from_static("x-real-ip")),
         directory: Arc::clone(&directory) as Arc<dyn Directory>,
+        templates: Arc::new(push_auth_core::NoTemplates),
     });
     World {
         _container: container,

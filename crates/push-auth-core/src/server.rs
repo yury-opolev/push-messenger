@@ -21,7 +21,7 @@ use crate::agent_key::AgentKeySignIn;
 use crate::api::{Api, router};
 use crate::config::{Config, MigrateConfig};
 use crate::db::{MIGRATOR, grant_worker_access_on};
-use crate::directory::{Directory, GrpcDirectory, NoDirectory};
+use crate::directory::{Directory, GrpcDirectory, NoDirectory, message_svc};
 use crate::entra::{EntraSignIn, Providers};
 use crate::identity::{
     AGENT_PROVIDERS, Admission, Authenticator, ENTRA_PROVIDER, MAX_SESSION_LIMIT,
@@ -31,6 +31,7 @@ use crate::limits::{Limits, RedisCounter};
 use crate::links::LinkSigner;
 use crate::password::Passwords;
 use crate::service::{Auth, Settings, SignIn};
+use crate::templates::{GrpcTemplates, NoTemplates, TemplateRegistry};
 use crate::tokens::AccessTokens;
 
 /// How long to wait before trying an unreachable dependency again.
@@ -79,18 +80,25 @@ pub async fn serve_with(
     let tokens = AccessTokens::from_seed(&config.signing_key, config.token_audience.clone())
         .map_err(anyhow::Error::msg)?;
     let links = LinkSigner::new(config.link_key.clone()).map_err(anyhow::Error::msg)?;
-    let directory: Arc<dyn Directory> = match (&config.message_svc_url, &config.directory_token) {
-        (Some(url), Some(token)) => {
-            Arc::new(GrpcDirectory::new(url, token).map_err(anyhow::Error::msg)?)
-        }
-        _ => {
-            tracing::warn!(
-                "PUSH_MESSAGE_SVC_URL is not set: GET /v1/users answers 503, since only \
-                 message-svc knows whose profiles a user may see"
-            );
-            Arc::new(NoDirectory)
-        }
-    };
+    let (directory, templates): (Arc<dyn Directory>, Arc<dyn TemplateRegistry>) =
+        match (&config.message_svc_url, &config.directory_token) {
+            (Some(url), Some(token)) => {
+                // One channel for both APIs: they are served on the same listener.
+                let channel = message_svc(url, token).map_err(anyhow::Error::msg)?;
+                (
+                    Arc::new(GrpcDirectory::over(channel.clone())),
+                    Arc::new(GrpcTemplates::over(channel)),
+                )
+            }
+            _ => {
+                tracing::warn!(
+                    "PUSH_MESSAGE_SVC_URL is not set: GET /v1/users and the template routes \
+                     answer 503, since only message-svc knows whose profiles a user may see \
+                     and keeps the templates"
+                );
+                (Arc::new(NoDirectory), Arc::new(NoTemplates))
+            }
+        };
     let ready = Health {
         pool: Arc::new(OnceLock::new()),
         shutdown: shutdown.clone(),
@@ -253,6 +261,7 @@ pub async fn serve_with(
         limits: limits.clone(),
         client_ip_header: config.client_ip_header.clone(),
         directory,
+        templates: Arc::clone(&templates),
     });
     // The admin listener exists only with its token (spec D15).
     let admin_server = match &config.admin_token {
@@ -261,7 +270,9 @@ pub async fn serve_with(
                 .await
                 .with_context(|| format!("bind the admin listener {}", config.admin_addr))?;
             tracing::info!(addr = %config.admin_addr, "serving the admin API");
-            let admin = admin_router(AdminApi::new(auth.clone(), limits.clone(), token));
+            let admin = admin_router(
+                AdminApi::new(auth.clone(), limits.clone(), token).with_templates(templates),
+            );
             Some(tokio::spawn(
                 axum::serve(
                     listener,

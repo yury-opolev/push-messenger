@@ -296,6 +296,7 @@ async fn enrollment_preserves_admission_and_management_is_rate_limited_without_e
         limits: Limits::new(Arc::new(MemoryCounter::default())),
         client_ip_header: None,
         directory: Arc::new(NoDirectory),
+        templates: Arc::new(crate::templates::NoTemplates),
     });
     let token = app_token(&world, TENANT, Uuid::new_v4());
     let (status, _) = call(
@@ -350,6 +351,7 @@ pub(super) async fn setup() -> (World, Auth, Router, Tokens) {
         limits: Limits::new(Arc::new(MemoryCounter::default())),
         client_ip_header: None,
         directory: Arc::new(NoDirectory),
+        templates: Arc::new(crate::templates::NoTemplates),
     });
     (world, auth, router, owner)
 }

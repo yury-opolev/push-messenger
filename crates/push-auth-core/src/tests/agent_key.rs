@@ -42,6 +42,7 @@ pub(super) async fn key_world() -> (World, Auth, Router) {
         limits: Limits::new(Arc::new(MemoryCounter::default())),
         client_ip_header: None,
         directory: Arc::new(NoDirectory),
+        templates: Arc::new(crate::templates::NoTemplates),
     });
     (world, auth, router)
 }
@@ -329,6 +330,7 @@ async fn agent_key_sign_ins_are_audited() {
         limits: Limits::new(Arc::new(MemoryCounter::default())),
         client_ip_header: Some(HeaderName::from_static("x-real-ip")),
         directory: Arc::new(NoDirectory),
+        templates: Arc::new(crate::templates::NoTemplates),
     });
     let [a, b, c, _] = rand::random::<u32>().to_be_bytes();
     let success_ip = format!("10.{a}.{b}.{}", c & 0xfe);

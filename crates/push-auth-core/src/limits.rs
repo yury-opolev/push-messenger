@@ -1,5 +1,6 @@
 //! Rate limits (spec §5.6): per account and per IP, on signup, login, verification resend,
-//! password reset, opening email links and handle lookup, and on sign-in by token (Entra ID
+//! password reset, opening email links, handle lookup and template submission, and on
+//! sign-in by token (Entra ID
 //! or an external provider). Accounts are never locked; a
 //! request over a limit is refused with `rate_limited` and a retry delay.
 //!
@@ -51,6 +52,8 @@ pub enum Action {
     /// [`Action::Admin`], so they never lock the token's holder out.
     AdminAuthFailure,
     AgentManagement,
+    /// `POST /v1/templates`: per IP and per user.
+    TemplateSubmit,
 }
 
 /// Whom a limit counts.
@@ -101,6 +104,7 @@ impl Action {
             Self::Admin => "admin",
             Self::AdminAuthFailure => "admin_auth_failure",
             Self::AgentManagement => "agents",
+            Self::TemplateSubmit => "template_submit",
         }
     }
 
@@ -133,6 +137,9 @@ impl Action {
             (Scope::Ip, per(300, QUARTER)),
             (Scope::Account, per(120, QUARTER)),
         ];
+        // Each submission waits for a review (spec 2026-10-26 rich message templates, D6).
+        const TEMPLATE_SUBMIT: &[(Scope, Limit)] =
+            &[(Scope::Ip, per(60, HOUR)), (Scope::Account, per(10, HOUR))];
         match self {
             Self::Signup => SIGNUP,
             Self::Login => LOGIN,
@@ -145,6 +152,7 @@ impl Action {
             Self::Admin => ADMIN,
             Self::AdminAuthFailure => ADMIN_AUTH_FAILURE,
             Self::AgentManagement => AGENTS,
+            Self::TemplateSubmit => TEMPLATE_SUBMIT,
         }
     }
 }

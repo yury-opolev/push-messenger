@@ -56,6 +56,17 @@ pub enum AuthError {
     SessionExpired,
     #[error("too many requests; try again in {retry_after_s} s")]
     RateLimited { retry_after_s: u64 },
+    /// message-svc refused a template definition, ref or review input; its message says
+    /// which rule failed (spec 2026-10-26 rich message templates).
+    #[error("{0}")]
+    TemplateInvalid(String),
+    #[error("no such template")]
+    TemplateNotFound,
+    /// The ref exists, the status does not allow the review, the publisher belongs to
+    /// another account or too many submissions are pending; message-svc's message says
+    /// which.
+    #[error("{0}")]
+    TemplateConflict(String),
     #[error("the service is unavailable; try again")]
     Unavailable,
 }
@@ -87,6 +98,9 @@ impl AuthError {
             Self::SignInNotPermitted => "sign_in_not_permitted",
             Self::SessionExpired => "session_expired",
             Self::RateLimited { .. } => "rate_limited",
+            Self::TemplateInvalid(_) => "invalid",
+            Self::TemplateNotFound => "not_found",
+            Self::TemplateConflict(_) => "conflict",
             Self::Unavailable => "unavailable",
         }
     }
@@ -94,9 +108,11 @@ impl AuthError {
     /// The HTTP status of the answer.
     pub fn status(&self) -> u16 {
         match self {
-            Self::Invalid(_) | Self::LinkInvalid | Self::LinkExpired | Self::EnrollmentInvalid => {
-                400
-            }
+            Self::Invalid(_)
+            | Self::LinkInvalid
+            | Self::LinkExpired
+            | Self::EnrollmentInvalid
+            | Self::TemplateInvalid(_) => 400,
             Self::InvalidCredentials
             | Self::Unauthorized
             | Self::TokenExpired
@@ -104,11 +120,15 @@ impl AuthError {
             | Self::TokenInvalid
             | Self::SessionExpired => 401,
             Self::EmailNotVerified | Self::SignInNotPermitted | Self::EnrollmentNotPermitted => 403,
-            Self::DeviceNotFound | Self::UserNotFound | Self::AgentNotFound => 404,
+            Self::DeviceNotFound
+            | Self::UserNotFound
+            | Self::AgentNotFound
+            | Self::TemplateNotFound => 404,
             Self::HandleTaken
             | Self::TooManyDevices
             | Self::TooManyAgents
-            | Self::IdentityInUse => 409,
+            | Self::IdentityInUse
+            | Self::TemplateConflict(_) => 409,
             Self::RateLimited { .. } => 429,
             Self::Unavailable | Self::EntraUnavailable | Self::IdentityUnavailable => 503,
         }

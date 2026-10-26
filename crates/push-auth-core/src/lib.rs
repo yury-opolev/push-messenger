@@ -26,6 +26,7 @@ mod profiles;
 pub mod rules;
 mod server;
 mod service;
+pub mod templates;
 pub mod tokens;
 
 pub use admin::{AdminApi, UserSelector, admin_router};
@@ -50,6 +51,7 @@ pub use server::{Overrides, init_logging, migrate, serve, serve_with, terminated
 pub use service::{
     Auth, LINK_SECONDS, REGISTRATION_TOKEN_SECONDS, RegistrationToken, Settings, SignIn, Signup,
 };
+pub use templates::{GrpcTemplates, NoTemplates, TemplateRegistry};
 
 #[cfg(test)]
 mod tests;

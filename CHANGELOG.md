@@ -6,6 +6,15 @@ Notable changes for consumers of push-messenger. Newest first.
 
 ### Added
 
+- **Template submission, catalog and review on auth-svc** (REQUEST PUSH feature 8, rich
+  message templates). `POST /v1/templates` submits a tpl/1 definition for review (access
+  token, JSON up to 16 KiB, 10 per hour per user); `GET /v1/templates?since=N` serves the
+  client catalog of approved and revoked versions with an ETag (`"tpl-<since>-<seq>"`,
+  304 on `If-None-Match`). The admin listener gains `GET /v1/admin/templates`,
+  `GET /v1/admin/templates/{ref}` and `POST /v1/admin/templates/{ref}/approve|reject|revoke`.
+  New error codes `not_found` (404) and `conflict` (409); new security events
+  `auth.template.submitted`, `auth.template.refused` and `auth.admin.template_reviewed`.
+  The chart's auth Ingress routes `/v1/templates`.
 - **Agent-key sign-in for owned agents** (REQUEST PUSH feature 6). A new opt-in provider,
   `agent-key` in `PUSH_AUTH_PROVIDERS` (off by default), lets an owned agent sign in with
   a P-256 key pair of its own instead of an Entra app token: no secret, certificate or
