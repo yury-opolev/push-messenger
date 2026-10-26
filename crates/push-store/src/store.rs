@@ -2,20 +2,22 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use push_domain::templates::TemplateRef;
 use push_domain::{
     ClientMsgId, ContactState, Conversation, ConversationId, ConversationOverview, DeviceId,
     DeviceState, DomainError, DomainResult, Entry, EntryKind, GroupPositions, InsertOutcome,
-    InviteRecord, Member, MessageId, Store, Tx, UserId,
+    InviteRecord, Member, MessageId, PublisherOwner, Store, StoredTemplate, TemplateEvent,
+    TemplateStatus, Tx, UserId,
 };
 use sqlx::postgres::{PgPool, PgRow};
 use sqlx::{PgConnection, Postgres, Row, Transaction};
 use uuid::Uuid;
 
-use crate::codes::{decode, encode};
+use crate::codes::{Code, decode, encode};
 use crate::error::store_error;
 use crate::locks;
 use crate::options::StoreOptions;
-use crate::rows::{self, conversation_columns, entry_columns, member_columns};
+use crate::rows::{self, conversation_columns, entry_columns, member_columns, template_columns};
 
 /// The push-domain [`Store`] on PostgreSQL.
 #[derive(Debug, Clone)]
@@ -1079,6 +1081,272 @@ impl Tx for PgTx {
         .await
         .map_err(store_error)?;
         read_all(rows, overview)
+    }
+
+    async fn is_agent(&mut self, user: UserId) -> DomainResult<bool> {
+        sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM messaging.agent_owner WHERE agent_user_id = $1)",
+        )
+        .bind(user.0)
+        .fetch_one(self.conn())
+        .await
+        .map_err(store_error)
+    }
+
+    async fn template(&mut self, template: &TemplateRef) -> DomainResult<Option<StoredTemplate>> {
+        let row = sqlx::query(concat!(
+            "SELECT ",
+            template_columns!(),
+            " FROM messaging.template_version t \
+             WHERE t.publisher = $1 AND t.name = $2 AND t.version = $3"
+        ))
+        .bind(&template.publisher)
+        .bind(&template.name)
+        .bind(i32::from(template.version))
+        .fetch_optional(self.conn())
+        .await
+        .map_err(store_error)?;
+        row.map(|row| rows::template(&row).map_err(store_error))
+            .transpose()
+    }
+
+    async fn lock_template(
+        &mut self,
+        template: &TemplateRef,
+    ) -> DomainResult<Option<StoredTemplate>> {
+        let row = sqlx::query(concat!(
+            "SELECT ",
+            template_columns!(),
+            " FROM messaging.template_version t \
+             WHERE t.publisher = $1 AND t.name = $2 AND t.version = $3 FOR UPDATE"
+        ))
+        .bind(&template.publisher)
+        .bind(&template.name)
+        .bind(i32::from(template.version))
+        .fetch_optional(self.conn())
+        .await
+        .map_err(store_error)?;
+        row.map(|row| rows::template(&row).map_err(store_error))
+            .transpose()
+    }
+
+    async fn insert_template(&mut self, template: StoredTemplate) -> DomainResult<InsertOutcome> {
+        let inserted = sqlx::query(
+            "INSERT INTO messaging.template_version \
+             (publisher, name, version, title, definition, status, submitted_by, submitted_at, \
+              reviewed_at, change_seq) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
+             ON CONFLICT (publisher, name, version) DO NOTHING",
+        )
+        .bind(&template.template.publisher)
+        .bind(&template.template.name)
+        .bind(i32::from(template.template.version))
+        .bind(&template.title)
+        .bind(&template.definition)
+        .bind(encode(template.status))
+        .bind(template.submitted_by.map(|user| user.0))
+        .bind(template.submitted_at)
+        .bind(template.reviewed_at)
+        .bind(template.change_seq)
+        .execute(self.conn())
+        .await
+        .map_err(store_error)?
+        .rows_affected();
+        Ok(if inserted == 1 {
+            InsertOutcome::Inserted
+        } else {
+            InsertOutcome::Duplicate
+        })
+    }
+
+    async fn set_template_status(
+        &mut self,
+        template: &TemplateRef,
+        status: TemplateStatus,
+        at: DateTime<Utc>,
+        change_seq: Option<i64>,
+    ) -> DomainResult<()> {
+        let refused = || {
+            DomainError::Store(format!(
+                "no template {template} whose status may become {}",
+                status.as_str()
+            ))
+        };
+        // Each status can be reached from at most one other.
+        let from = <TemplateStatus as Code>::CODES
+            .iter()
+            .map(|(from, _)| *from)
+            .find(|from| from.can_become(status))
+            .ok_or_else(refused)?;
+        let updated = sqlx::query(
+            "UPDATE messaging.template_version \
+             SET status = $4, reviewed_at = $5, change_seq = $6 \
+             WHERE publisher = $1 AND name = $2 AND version = $3 AND status = $7",
+        )
+        .bind(&template.publisher)
+        .bind(&template.name)
+        .bind(i32::from(template.version))
+        .bind(encode(status))
+        .bind(at)
+        .bind(change_seq)
+        .bind(encode(from))
+        .execute(self.conn())
+        .await
+        .map_err(store_error)?
+        .rows_affected();
+        if updated == 0 {
+            return Err(refused());
+        }
+        Ok(())
+    }
+
+    async fn next_template_change(&mut self) -> DomainResult<i64> {
+        sqlx::query_scalar(
+            "UPDATE messaging.template_change SET last_seq = last_seq + 1 RETURNING last_seq",
+        )
+        .fetch_one(self.conn())
+        .await
+        .map_err(store_error)
+    }
+
+    async fn last_template_change(&mut self) -> DomainResult<i64> {
+        let last: Option<i64> =
+            sqlx::query_scalar("SELECT last_seq FROM messaging.template_change")
+                .fetch_optional(self.conn())
+                .await
+                .map_err(store_error)?;
+        Ok(last.unwrap_or(0))
+    }
+
+    async fn templates_changed_since(
+        &mut self,
+        since: i64,
+        limit: u32,
+    ) -> DomainResult<Vec<StoredTemplate>> {
+        let rows = sqlx::query(concat!(
+            "SELECT ",
+            template_columns!(),
+            " FROM messaging.template_version t \
+             WHERE t.change_seq > $1 AND t.status IN ($2, $3) \
+             ORDER BY t.change_seq LIMIT $4"
+        ))
+        .bind(since)
+        .bind(encode(TemplateStatus::Approved))
+        .bind(encode(TemplateStatus::Revoked))
+        .bind(i64::from(limit))
+        .fetch_all(self.conn())
+        .await
+        .map_err(store_error)?;
+        read_all(rows, rows::template)
+    }
+
+    async fn templates_with_status(
+        &mut self,
+        status: Option<TemplateStatus>,
+        limit: u32,
+    ) -> DomainResult<Vec<StoredTemplate>> {
+        // Ties sort by ref byte by byte (COLLATE "C"), as the in-memory store does.
+        let rows = sqlx::query(concat!(
+            "SELECT ",
+            template_columns!(),
+            " FROM messaging.template_version t \
+             WHERE $1::smallint IS NULL OR t.status = $1 \
+             ORDER BY t.submitted_at DESC, t.publisher COLLATE \"C\", t.name COLLATE \"C\", \
+              t.version \
+             LIMIT $2"
+        ))
+        .bind(status.map(encode))
+        .bind(i64::from(limit))
+        .fetch_all(self.conn())
+        .await
+        .map_err(store_error)?;
+        read_all(rows, rows::template)
+    }
+
+    async fn pending_templates_of(&mut self, user: UserId) -> DomainResult<u32> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM messaging.template_version \
+             WHERE submitted_by = $1 AND status = $2",
+        )
+        .bind(user.0)
+        .bind(encode(TemplateStatus::Pending))
+        .fetch_one(self.conn())
+        .await
+        .map_err(store_error)?;
+        u32::try_from(count)
+            .map_err(|_| DomainError::Store(format!("pending template count {count}")))
+    }
+
+    async fn claim_publisher(
+        &mut self,
+        publisher: &str,
+        owner: PublisherOwner,
+    ) -> DomainResult<PublisherOwner> {
+        let owner_id = match owner {
+            PublisherOwner::Server => None,
+            PublisherOwner::User(user) => Some(user.0),
+        };
+        // The insert waits for a concurrent claim of the same publisher to end; the
+        // select then locks whichever row won.
+        sqlx::query(
+            "INSERT INTO messaging.template_publisher (publisher, owner_user_id) \
+             VALUES ($1, $2) ON CONFLICT (publisher) DO NOTHING",
+        )
+        .bind(publisher)
+        .bind(owner_id)
+        .execute(self.conn())
+        .await
+        .map_err(store_error)?;
+        let recorded: Option<Uuid> = sqlx::query_scalar(
+            "SELECT owner_user_id FROM messaging.template_publisher \
+             WHERE publisher = $1 FOR UPDATE",
+        )
+        .bind(publisher)
+        .fetch_one(self.conn())
+        .await
+        .map_err(store_error)?;
+        Ok(recorded.map_or(PublisherOwner::Server, |user| {
+            PublisherOwner::User(UserId(user))
+        }))
+    }
+
+    async fn insert_template_event(&mut self, event: TemplateEvent) -> DomainResult<()> {
+        sqlx::query(
+            "INSERT INTO messaging.template_event \
+             (publisher, name, version, action, actor, reviewer, note, at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+        )
+        .bind(&event.template.publisher)
+        .bind(&event.template.name)
+        .bind(i32::from(event.template.version))
+        .bind(event.action.as_str())
+        .bind(event.actor.map(|user| user.0))
+        .bind(event.reviewer)
+        .bind(event.note)
+        .bind(event.at)
+        .execute(self.conn())
+        .await
+        .map_err(store_error)?;
+        Ok(())
+    }
+
+    async fn template_events(
+        &mut self,
+        template: &TemplateRef,
+    ) -> DomainResult<Vec<TemplateEvent>> {
+        let rows = sqlx::query(
+            "SELECT publisher, name, version, action, actor, reviewer, note, at \
+             FROM messaging.template_event \
+             WHERE publisher = $1 AND name = $2 AND version = $3 \
+             ORDER BY event_id",
+        )
+        .bind(&template.publisher)
+        .bind(&template.name)
+        .bind(i32::from(template.version))
+        .fetch_all(self.conn())
+        .await
+        .map_err(store_error)?;
+        read_all(rows, rows::template_event)
     }
 }
 

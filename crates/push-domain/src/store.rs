@@ -38,6 +38,10 @@
 //! its user locks in one call, so no two transactions wait for each other's user locks in
 //! a cycle.
 //!
+//! Template operations lock in the order publisher ([`Tx::claim_publisher`]) → version
+//! ([`Tx::lock_template`]) → change counter ([`Tx::next_template_change`]), and take no
+//! messaging locks.
+//!
 //! # Delivery positions
 //!
 //! Positions are created eagerly, so a device has one for every membership of its user:
@@ -55,8 +59,9 @@ use crate::error::DomainResult;
 use crate::ids::{ClientMsgId, ConversationId, DeviceId, MessageId, UserId};
 use crate::model::{
     ContactState, Conversation, ConversationOverview, DeviceState, Entry, GroupPositions,
-    InviteRecord, Member,
+    InviteRecord, Member, PublisherOwner, StoredTemplate, TemplateEvent, TemplateStatus,
 };
+use crate::templates::TemplateRef;
 
 /// Result of an insert guarded by a uniqueness rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -256,8 +261,8 @@ pub trait Tx: Send {
         message_id: MessageId,
     ) -> DomainResult<Option<Entry>>;
     /// Overwrites the mutable fields of the stored entry at `(conversation_id, seq)`:
-    /// `body`, `edited_at`, `edit_seq` and `deleted_at`. Every other field of `entry` is
-    /// ignored. Fails with `DomainError::Store` if no such entry exists.
+    /// `body`, `edited_at`, `edit_seq`, `deleted_at` and `answer_seq`. Every other field of
+    /// `entry` is ignored. Fails with `DomainError::Store` if no such entry exists.
     async fn update_entry(&mut self, entry: Entry) -> DomainResult<()>;
     /// Sets `body` to null on every `Edit` entry whose `target_seq` is `target_seq`.
     /// A no-op if there are none. Postgres serves it from the index on
@@ -395,4 +400,74 @@ pub trait Tx: Send {
         changed_since: Option<DateTime<Utc>>,
         unread_cap: u32,
     ) -> DomainResult<Vec<ConversationOverview>>;
+
+    // --- Templates ---------------------------------------------------------------------
+
+    /// Whether `user` is an owned agent: [`Tx::record_agent_owner`] recorded it as the
+    /// agent. Unknown users are not agents.
+    async fn is_agent(&mut self, user: UserId) -> DomainResult<bool>;
+    /// The stored version, or `None`.
+    async fn template(&mut self, template: &TemplateRef) -> DomainResult<Option<StoredTemplate>>;
+    /// The stored version, or `None`. Locks the version's row until the transaction ends
+    /// (`SELECT … FOR UPDATE`), so reviews of one version are serialised.
+    async fn lock_template(
+        &mut self,
+        template: &TemplateRef,
+    ) -> DomainResult<Option<StoredTemplate>>;
+    /// Stores a new version. Returns `Duplicate`, writing nothing, if the ref exists, so a
+    /// stored definition never changes (Postgres: `ON CONFLICT DO NOTHING`). Fails with
+    /// `DomainError::Store` if the publisher has not been claimed
+    /// ([`Tx::claim_publisher`]) or the submitter is not a known user.
+    async fn insert_template(&mut self, template: StoredTemplate) -> DomainResult<InsertOutcome>;
+    /// Moves the version to `status`, setting `reviewed_at` to `at` and `change_seq`. Only
+    /// `pending → approved`, `pending → rejected` and `approved → revoked` are allowed
+    /// (see [`TemplateStatus::can_become`]); any other move, or an unknown ref, fails with
+    /// `DomainError::Store`.
+    async fn set_template_status(
+        &mut self,
+        template: &TemplateRef,
+        status: TemplateStatus,
+        at: DateTime<Utc>,
+        change_seq: Option<i64>,
+    ) -> DomainResult<()>;
+    /// Takes the next change number of the catalog (1 first). Locks the single counter
+    /// until the transaction ends, so change numbers commit in the order they are taken
+    /// and a reader that has seen `N` never misses a change below `N`. Take it last, after
+    /// the publisher and version locks.
+    async fn next_template_change(&mut self) -> DomainResult<i64>;
+    /// The last change number handed out and committed (or taken by this transaction); 0
+    /// when none was.
+    async fn last_template_change(&mut self) -> DomainResult<i64>;
+    /// Approved and revoked versions with `change_seq > since`, by `change_seq`, at most
+    /// `limit`.
+    async fn templates_changed_since(
+        &mut self,
+        since: i64,
+        limit: u32,
+    ) -> DomainResult<Vec<StoredTemplate>>;
+    /// Versions with this status (every version for `None`), newest submission first (ties
+    /// by ref), at most `limit`.
+    async fn templates_with_status(
+        &mut self,
+        status: Option<TemplateStatus>,
+        limit: u32,
+    ) -> DomainResult<Vec<StoredTemplate>>;
+    /// How many of `user`'s submissions are pending.
+    async fn pending_templates_of(&mut self, user: UserId) -> DomainResult<u32>;
+    /// Records `owner` as the owner of `publisher` if the publisher is new, and returns the
+    /// owner recorded, which is the first claimant's. Locks the publisher until the
+    /// transaction ends, so submissions under one publisher are serialised. Take it first,
+    /// before the version and counter locks. Fails with `DomainError::Store` if a user
+    /// owner is not a known user.
+    async fn claim_publisher(
+        &mut self,
+        publisher: &str,
+        owner: PublisherOwner,
+    ) -> DomainResult<PublisherOwner>;
+    /// Appends to the version's audit trail. Fails with `DomainError::Store` if the version
+    /// does not exist.
+    async fn insert_template_event(&mut self, event: TemplateEvent) -> DomainResult<()>;
+    /// The version's audit trail, oldest first. Empty for an unknown ref.
+    async fn template_events(&mut self, template: &TemplateRef)
+    -> DomainResult<Vec<TemplateEvent>>;
 }

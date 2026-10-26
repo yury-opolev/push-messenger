@@ -1,3 +1,4 @@
+use crate::templates::TemplateError;
 use crate::validation::ValidationError;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -50,6 +51,19 @@ pub enum DomainError {
     NotAdmin,
     #[error("a group must keep at least one admin")]
     LastAdmin,
+    /// A template definition or a RICH or ANSWER body broke a tpl/1 rule.
+    #[error("invalid template: {0}")]
+    Template(#[from] TemplateError),
+    /// The card already has its answer; later answers are refused.
+    #[error("the card is already answered")]
+    CardAnswered,
+    #[error("template not found")]
+    TemplateNotFound,
+    /// A submission or review the registry's state does not allow: the version exists, its
+    /// status does not allow the review, the publisher belongs to another account, or the
+    /// account has too many pending submissions.
+    #[error("{0}")]
+    TemplateConflict(&'static str),
     #[error("a concurrent change conflicted; retry the operation")]
     Conflict,
     /// A revocation or password reset was stored, but its kick could not be delivered to

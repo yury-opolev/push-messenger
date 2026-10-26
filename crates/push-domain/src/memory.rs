@@ -15,9 +15,11 @@ use crate::error::{DomainError, DomainResult};
 use crate::ids::{ClientMsgId, ConversationId, DeviceId, MessageId, UserId};
 use crate::model::{
     ContactState, Conversation, ConversationKind, ConversationOverview, DeviceState, Entry,
-    EntryKind, GroupPositions, InviteRecord, Member, Role,
+    EntryKind, GroupPositions, InviteRecord, Member, PublisherOwner, Role, StoredTemplate,
+    TemplateEvent, TemplateStatus,
 };
 use crate::store::{InsertOutcome, Store, Tx};
+use crate::templates::TemplateRef;
 
 fn missing(what: &str) -> DomainError {
     DomainError::Store(format!("foreign key violation: {what} does not exist"))
@@ -41,6 +43,12 @@ struct State {
     client_ids: HashMap<(ConversationId, ClientMsgId), i64>,
     cursors: HashMap<(DeviceId, ConversationId), i64>,
     message_ids: HashMap<MessageId, (ConversationId, i64)>,
+    publishers: HashMap<String, PublisherOwner>,
+    templates: BTreeMap<TemplateRef, StoredTemplate>,
+    /// The last change number of the template catalog handed out.
+    template_change: i64,
+    /// Every template event, oldest first.
+    template_events: Vec<TemplateEvent>,
 }
 
 impl State {
@@ -640,6 +648,7 @@ impl Tx for InMemoryTx {
         stored.edited_at = entry.edited_at;
         stored.edit_seq = entry.edit_seq;
         stored.deleted_at = entry.deleted_at;
+        stored.answer_seq = entry.answer_seq;
         Ok(())
     }
 
@@ -856,6 +865,169 @@ impl Tx for InMemoryTx {
                 }
                 Some(state.overview(conversation, member, unread_cap))
             })
+            .collect())
+    }
+
+    async fn is_agent(&mut self, user: UserId) -> DomainResult<bool> {
+        Ok(self.work.agent_owners.contains_key(&user))
+    }
+
+    async fn template(&mut self, template: &TemplateRef) -> DomainResult<Option<StoredTemplate>> {
+        Ok(self.work.templates.get(template).cloned())
+    }
+
+    async fn lock_template(
+        &mut self,
+        template: &TemplateRef,
+    ) -> DomainResult<Option<StoredTemplate>> {
+        // Every in-memory transaction already holds the store-wide lock.
+        Ok(self.work.templates.get(template).cloned())
+    }
+
+    async fn insert_template(&mut self, template: StoredTemplate) -> DomainResult<InsertOutcome> {
+        if self.work.templates.contains_key(&template.template) {
+            return Ok(InsertOutcome::Duplicate);
+        }
+        if !self
+            .work
+            .publishers
+            .contains_key(&template.template.publisher)
+        {
+            return Err(missing("publisher"));
+        }
+        if template
+            .submitted_by
+            .is_some_and(|user| !self.work.users.contains(&user))
+        {
+            return Err(missing("user"));
+        }
+        self.work
+            .templates
+            .insert(template.template.clone(), template);
+        Ok(InsertOutcome::Inserted)
+    }
+
+    async fn set_template_status(
+        &mut self,
+        template: &TemplateRef,
+        status: TemplateStatus,
+        at: DateTime<Utc>,
+        change_seq: Option<i64>,
+    ) -> DomainResult<()> {
+        let stored = self
+            .work
+            .templates
+            .get_mut(template)
+            .filter(|stored| stored.status.can_become(status))
+            .ok_or_else(|| {
+                DomainError::Store(format!(
+                    "no template {template} whose status may become {}",
+                    status.as_str()
+                ))
+            })?;
+        stored.status = status;
+        stored.reviewed_at = Some(at);
+        stored.change_seq = change_seq;
+        Ok(())
+    }
+
+    async fn next_template_change(&mut self) -> DomainResult<i64> {
+        // Every in-memory transaction already holds the store-wide lock.
+        self.work.template_change += 1;
+        Ok(self.work.template_change)
+    }
+
+    async fn last_template_change(&mut self) -> DomainResult<i64> {
+        Ok(self.work.template_change)
+    }
+
+    async fn templates_changed_since(
+        &mut self,
+        since: i64,
+        limit: u32,
+    ) -> DomainResult<Vec<StoredTemplate>> {
+        let mut changed: Vec<StoredTemplate> = self
+            .work
+            .templates
+            .values()
+            .filter(|stored| {
+                matches!(
+                    stored.status,
+                    TemplateStatus::Approved | TemplateStatus::Revoked
+                ) && stored.change_seq.is_some_and(|seq| seq > since)
+            })
+            .cloned()
+            .collect();
+        changed.sort_by_key(|stored| stored.change_seq);
+        changed.truncate(limit as usize);
+        Ok(changed)
+    }
+
+    async fn templates_with_status(
+        &mut self,
+        status: Option<TemplateStatus>,
+        limit: u32,
+    ) -> DomainResult<Vec<StoredTemplate>> {
+        let mut found: Vec<StoredTemplate> = self
+            .work
+            .templates
+            .values()
+            .filter(|stored| status.is_none_or(|status| stored.status == status))
+            .cloned()
+            .collect();
+        // `templates` iterates in ref order, and the sort is stable: ties stay by ref.
+        found.sort_by_key(|stored| std::cmp::Reverse(stored.submitted_at));
+        found.truncate(limit as usize);
+        Ok(found)
+    }
+
+    async fn pending_templates_of(&mut self, user: UserId) -> DomainResult<u32> {
+        Ok(self
+            .work
+            .templates
+            .values()
+            .filter(|stored| {
+                stored.status == TemplateStatus::Pending && stored.submitted_by == Some(user)
+            })
+            .count() as u32)
+    }
+
+    async fn claim_publisher(
+        &mut self,
+        publisher: &str,
+        owner: PublisherOwner,
+    ) -> DomainResult<PublisherOwner> {
+        // Every in-memory transaction already holds the store-wide lock.
+        if let Some(recorded) = self.work.publishers.get(publisher) {
+            return Ok(*recorded);
+        }
+        if let PublisherOwner::User(user) = owner {
+            if !self.work.users.contains(&user) {
+                return Err(missing("user"));
+            }
+        }
+        self.work.publishers.insert(publisher.to_owned(), owner);
+        Ok(owner)
+    }
+
+    async fn insert_template_event(&mut self, event: TemplateEvent) -> DomainResult<()> {
+        if !self.work.templates.contains_key(&event.template) {
+            return Err(missing("template"));
+        }
+        self.work.template_events.push(event);
+        Ok(())
+    }
+
+    async fn template_events(
+        &mut self,
+        template: &TemplateRef,
+    ) -> DomainResult<Vec<TemplateEvent>> {
+        Ok(self
+            .work
+            .template_events
+            .iter()
+            .filter(|event| event.template == *template)
+            .cloned()
             .collect())
     }
 }

@@ -34,8 +34,8 @@ pub use memory::InMemoryStore;
 pub use model::{
     ContactState, ContactSummary, ContentType, Conversation, ConversationKind,
     ConversationOverview, ConversationState, ConversationSummary, DeviceState, Entry, EntryKind,
-    GroupPositions, Invite, InviteRecord, Member, MemberState, Positions, Receipts, Role,
-    SendReceipt, direct_key,
+    GroupPositions, Invite, InviteRecord, Member, MemberState, Positions, PublisherOwner, Receipts,
+    Role, SendReceipt, StoredTemplate, TemplateAction, TemplateEvent, TemplateStatus, direct_key,
 };
 pub use notify::{Event, KickReason, NoopNotifier, Notifier, ReceiptUpdate, RecordingNotifier};
 pub use send::SendText;

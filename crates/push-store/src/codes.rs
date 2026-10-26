@@ -1,6 +1,6 @@
 //! The smallint codes the schema stores for domain enumerations.
 
-use push_domain::{ContactState, ContentType, ConversationKind, EntryKind, Role};
+use push_domain::{ContactState, ContentType, ConversationKind, EntryKind, Role, TemplateStatus};
 
 /// A domain enumeration stored as a `smallint`.
 pub(crate) trait Code: Sized + Copy + 'static {
@@ -41,8 +41,23 @@ impl Code for EntryKind {
 }
 
 impl Code for ContentType {
-    const CODES: &'static [(Self, i16)] = &[(Self::Text, 1), (Self::SystemEvent, 2)];
+    const CODES: &'static [(Self, i16)] = &[
+        (Self::Text, 1),
+        (Self::SystemEvent, 2),
+        (Self::Rich, 3),
+        (Self::Answer, 4),
+    ];
     const COLUMN: &'static str = "message.content_type";
+}
+
+impl Code for TemplateStatus {
+    const CODES: &'static [(Self, i16)] = &[
+        (Self::Pending, 1),
+        (Self::Approved, 2),
+        (Self::Rejected, 3),
+        (Self::Revoked, 4),
+    ];
+    const COLUMN: &'static str = "template_version.status";
 }
 
 /// The code stored for `value`.
@@ -82,6 +97,7 @@ mod tests {
         round_trips::<Role>();
         round_trips::<EntryKind>();
         round_trips::<ContentType>();
+        round_trips::<TemplateStatus>();
     }
 
     #[test]
@@ -91,5 +107,7 @@ mod tests {
         assert_eq!(encode(Role::Admin), 1);
         assert_eq!(encode(EntryKind::System), 4);
         assert_eq!(encode(ContentType::SystemEvent), 2);
+        assert_eq!(encode(ContentType::Answer), 4);
+        assert_eq!(encode(TemplateStatus::Revoked), 4);
     }
 }

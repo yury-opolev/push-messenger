@@ -161,6 +161,7 @@ where
             edited_at: None,
             edit_seq: None,
             deleted_at: None,
+            answer_seq: None,
         };
         let receipt = SendReceipt::from(&entry);
         if tx.insert_entry(entry).await? == InsertOutcome::Duplicate {

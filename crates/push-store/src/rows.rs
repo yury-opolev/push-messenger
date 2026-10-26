@@ -1,8 +1,9 @@
 //! Reading domain records from result rows.
 
+use push_domain::templates::TemplateRef;
 use push_domain::{
     ClientMsgId, Conversation, ConversationId, DeviceId, Entry, InviteRecord, Member, MessageId,
-    UserId,
+    StoredTemplate, TemplateAction, TemplateEvent, UserId,
 };
 use sqlx::Row;
 use sqlx::postgres::PgRow;
@@ -35,6 +36,15 @@ macro_rules! entry_columns {
     };
 }
 pub(crate) use entry_columns;
+
+/// The columns [`template`] reads, from a table aliased `t`.
+macro_rules! template_columns {
+    () => {
+        "t.publisher, t.name, t.version, t.title, t.definition, t.status, t.submitted_by, \
+         t.submitted_at, t.reviewed_at, t.change_seq"
+    };
+}
+pub(crate) use template_columns;
 
 fn decode_error(message: String) -> sqlx::Error {
     sqlx::Error::Decode(message.into())
@@ -89,6 +99,8 @@ pub(crate) fn entry(row: &PgRow) -> Result<Entry, sqlx::Error> {
         edited_at: row.try_get("edited_at")?,
         edit_seq: row.try_get("edit_seq")?,
         deleted_at: row.try_get("deleted_at")?,
+        // Not stored on Postgres until migration 0005 adds `message.answer_seq`.
+        answer_seq: None,
     })
 }
 
@@ -104,5 +116,46 @@ pub(crate) fn invite(row: &PgRow) -> Result<InviteRecord, sqlx::Error> {
         max_uses: count("max_uses")?,
         uses: count("uses")?,
         revoked_at: row.try_get("revoked_at")?,
+    })
+}
+
+/// The version a row names, from its `publisher`, `name` and `version` columns.
+fn template_ref(row: &PgRow) -> Result<TemplateRef, sqlx::Error> {
+    let version: i32 = row.try_get("version")?;
+    Ok(TemplateRef {
+        publisher: row.try_get("publisher")?,
+        name: row.try_get("name")?,
+        version: u16::try_from(version)
+            .map_err(|_| decode_error(format!("template version is {version}")))?,
+    })
+}
+
+pub(crate) fn template(row: &PgRow) -> Result<StoredTemplate, sqlx::Error> {
+    let submitted_by: Option<uuid::Uuid> = row.try_get("submitted_by")?;
+    Ok(StoredTemplate {
+        template: template_ref(row)?,
+        title: row.try_get("title")?,
+        definition: row.try_get("definition")?,
+        status: decode(row.try_get("status")?)?,
+        submitted_by: submitted_by.map(UserId),
+        submitted_at: row.try_get("submitted_at")?,
+        reviewed_at: row.try_get("reviewed_at")?,
+        change_seq: row.try_get("change_seq")?,
+    })
+}
+
+pub(crate) fn template_event(row: &PgRow) -> Result<TemplateEvent, sqlx::Error> {
+    let action: String = row.try_get("action")?;
+    let actor: Option<uuid::Uuid> = row.try_get("actor")?;
+    Ok(TemplateEvent {
+        template: template_ref(row)?,
+        action: TemplateAction::ALL
+            .into_iter()
+            .find(|known| known.as_str() == action)
+            .ok_or_else(|| decode_error(format!("unknown template_event.action {action:?}")))?,
+        actor: actor.map(UserId),
+        reviewer: row.try_get("reviewer")?,
+        note: row.try_get("note")?,
+        at: row.try_get("at")?,
     })
 }

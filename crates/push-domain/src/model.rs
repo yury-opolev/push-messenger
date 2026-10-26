@@ -4,6 +4,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::ids::{ClientMsgId, ConversationId, DeviceId, MessageId, UserId};
+use crate::templates::TemplateRef;
 
 /// One direction of a contact relationship, as seen by its owner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,6 +101,10 @@ pub enum EntryKind {
 pub enum ContentType {
     Text,
     SystemEvent,
+    /// A card from an approved template: JSON `{tpl, params, fallback}`.
+    Rich,
+    /// An answer to a card in the same conversation: JSON `{card, values, fallback}`.
+    Answer,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,6 +164,9 @@ pub struct Entry {
     pub edited_at: Option<DateTime<Utc>>,
     pub edit_seq: Option<i64>,
     pub deleted_at: Option<DateTime<Utc>>,
+    /// Cards (RICH messages with an interactive block): the `seq` of the first valid
+    /// answer, once answered.
+    pub answer_seq: Option<i64>,
 }
 
 /// What the sender learns once its message is durably stored.
@@ -297,6 +305,106 @@ pub fn direct_key(a: UserId, b: UserId) -> [u8; 32] {
     key[..16].copy_from_slice(low.0.as_bytes());
     key[16..].copy_from_slice(high.0.as_bytes());
     key
+}
+
+/// Where a template version stands in review. `pending → approved | rejected` and
+/// `approved → revoked`; `rejected` and `revoked` are final.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TemplateStatus {
+    Pending,
+    Approved,
+    Rejected,
+    Revoked,
+}
+
+impl TemplateStatus {
+    /// Whether a version may move from this status to `to`.
+    pub fn can_become(self, to: TemplateStatus) -> bool {
+        matches!(
+            (self, to),
+            (Self::Pending, Self::Approved)
+                | (Self::Pending, Self::Rejected)
+                | (Self::Approved, Self::Revoked)
+        )
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Approved => "approved",
+            Self::Rejected => "rejected",
+            Self::Revoked => "revoked",
+        }
+    }
+}
+
+/// A template version in the registry. Its identity and definition never change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredTemplate {
+    pub template: TemplateRef,
+    pub title: String,
+    /// The canonical JSON definition.
+    pub definition: String,
+    pub status: TemplateStatus,
+    /// The submitting account; `None` for a built-in.
+    pub submitted_by: Option<UserId>,
+    pub submitted_at: DateTime<Utc>,
+    /// The last review.
+    pub reviewed_at: Option<DateTime<Utc>>,
+    /// The catalog's change number, set when the version is approved, revoked or seeded.
+    pub change_seq: Option<i64>,
+}
+
+/// What happened to a template version, in its audit trail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TemplateAction {
+    Submit,
+    Approve,
+    Reject,
+    Revoke,
+    /// A built-in was stored at start-up.
+    Seed,
+}
+
+impl TemplateAction {
+    pub const ALL: [TemplateAction; 5] = [
+        Self::Submit,
+        Self::Approve,
+        Self::Reject,
+        Self::Revoke,
+        Self::Seed,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Submit => "submit",
+            Self::Approve => "approve",
+            Self::Reject => "reject",
+            Self::Revoke => "revoke",
+            Self::Seed => "seed",
+        }
+    }
+}
+
+/// One row of a template version's audit trail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TemplateEvent {
+    pub template: TemplateRef,
+    pub action: TemplateAction,
+    /// The account that submitted.
+    pub actor: Option<UserId>,
+    /// The reviewer's label, for reviews.
+    pub reviewer: Option<String>,
+    pub note: Option<String>,
+    pub at: DateTime<Utc>,
+}
+
+/// Who owns a template publisher id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublisherOwner {
+    /// The server: the built-ins' publisher.
+    Server,
+    User(UserId),
 }
 
 #[cfg(test)]

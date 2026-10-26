@@ -41,8 +41,7 @@ pub(crate) fn invalid(message: impl Into<String>) -> Status {
 }
 
 /// The status for a failed domain operation: every [`DomainError`] has a gRPC code and a
-/// client error code of its own (this match has no catch-all, so a new error must be
-/// mapped). Storage problems are reported without their details, which the store has
+/// client error code (this match has no catch-all, so a new error must be mapped). Storage problems are reported without their details, which the store has
 /// already logged.
 pub(crate) fn domain_error(error: DomainError) -> Status {
     let (code, error_code) = match &error {
@@ -67,6 +66,10 @@ pub(crate) fn domain_error(error: DomainError) -> Status {
         DomainError::NotAGroup => (Code::FailedPrecondition, ErrorCode::NotAGroup),
         DomainError::NotAdmin => (Code::PermissionDenied, ErrorCode::NotAdmin),
         DomainError::LastAdmin => (Code::FailedPrecondition, ErrorCode::LastAdmin),
+        DomainError::Template(_) => (Code::InvalidArgument, ErrorCode::Invalid),
+        DomainError::CardAnswered => (Code::FailedPrecondition, ErrorCode::Rejected),
+        DomainError::TemplateNotFound => (Code::NotFound, ErrorCode::Rejected),
+        DomainError::TemplateConflict(_) => (Code::AlreadyExists, ErrorCode::Rejected),
         DomainError::Conflict => (Code::Aborted, ErrorCode::Unavailable),
         DomainError::KickFailed(_) => (Code::Unavailable, ErrorCode::Unavailable),
         DomainError::Store(_) => (Code::Unavailable, ErrorCode::Unavailable),
@@ -106,7 +109,7 @@ pub(crate) fn deliver(entry: Entry) -> Deliver {
         edited_at: entry.edited_at.map(micros),
         edit_seq: entry.edit_seq,
         deleted: entry.deleted_at.is_some(),
-        answer_seq: None,
+        answer_seq: entry.answer_seq,
     }
 }
 
@@ -133,6 +136,8 @@ fn content_type(content_type: ContentType) -> v1::ContentType {
     match content_type {
         ContentType::Text => v1::ContentType::Text,
         ContentType::SystemEvent => v1::ContentType::SystemEvent,
+        ContentType::Rich => v1::ContentType::Rich,
+        ContentType::Answer => v1::ContentType::Answer,
     }
 }
 
@@ -199,6 +204,7 @@ mod tests {
             edited_at: None,
             edit_seq: None,
             deleted_at: None,
+            answer_seq: None,
         };
         let deliver = deliver(entry.clone());
         assert_eq!(deliver.conversation_id, id_bytes(entry.conversation_id.0));
@@ -234,6 +240,7 @@ mod tests {
             edited_at: Some(at),
             edit_seq: Some(6),
             deleted_at: Some(at),
+            answer_seq: None,
         };
         let deliver = deliver(entry);
         assert_eq!(deliver.body, None);
@@ -243,8 +250,46 @@ mod tests {
     }
 
     #[test]
-    fn every_domain_error_has_its_own_status_and_client_error() {
+    fn an_answered_card_is_delivered_as_rich_with_its_answer_seq() {
+        let at = Utc.with_ymd_and_hms(2026, 10, 26, 9, 30, 0).unwrap();
+        let card = Entry {
+            conversation_id: ConversationId::new(),
+            seq: 4,
+            message_id: MessageId::new(),
+            client_msg_id: ClientMsgId::new(),
+            kind: EntryKind::Message,
+            target_seq: None,
+            sender_id: UserId::new(),
+            sender_device_id: None,
+            content_type: ContentType::Rich,
+            body: Some(b"{}".to_vec()),
+            client_ts: None,
+            server_ts: at,
+            edited_at: None,
+            edit_seq: None,
+            deleted_at: None,
+            answer_seq: Some(9),
+        };
+        let answer = Entry {
+            seq: 9,
+            target_seq: Some(4),
+            content_type: ContentType::Answer,
+            answer_seq: None,
+            ..card.clone()
+        };
+        let card = deliver(card);
+        assert_eq!(card.content_type(), v1::ContentType::Rich);
+        assert_eq!(card.answer_seq, Some(9));
+        let answer = deliver(answer);
+        assert_eq!(answer.content_type(), v1::ContentType::Answer);
+        assert_eq!(answer.target_seq, Some(4));
+        assert_eq!(answer.answer_seq, None);
+    }
+
+    #[test]
+    fn every_domain_error_has_a_status_and_a_client_error() {
         use push_domain::ValidationError;
+        use push_domain::templates::TemplateError;
 
         let cases = [
             (
@@ -352,6 +397,26 @@ mod tests {
                 Code::FailedPrecondition,
                 ErrorCode::LastAdmin,
             ),
+            (
+                DomainError::Template(TemplateError("unknown block".into())),
+                Code::InvalidArgument,
+                ErrorCode::Invalid,
+            ),
+            (
+                DomainError::CardAnswered,
+                Code::FailedPrecondition,
+                ErrorCode::Rejected,
+            ),
+            (
+                DomainError::TemplateNotFound,
+                Code::NotFound,
+                ErrorCode::Rejected,
+            ),
+            (
+                DomainError::TemplateConflict("the template exists"),
+                Code::AlreadyExists,
+                ErrorCode::Rejected,
+            ),
             (DomainError::Conflict, Code::Aborted, ErrorCode::Unavailable),
             (
                 DomainError::KickFailed("redis down".into()),
@@ -381,8 +446,8 @@ mod tests {
             assert_eq!(error.retryable, retryable, "{message}");
             client_codes.insert(error_code);
         }
-        // Only the retryable errors share a client code.
-        assert_eq!(client_codes.len(), 22);
+        // Only the retryable errors and the template errors share a client code.
+        assert_eq!(client_codes.len(), 23);
 
         let store = error_from_status(&domain_error(DomainError::Store("relation".into())));
         assert!(!store.message.contains("relation"), "{}", store.message);

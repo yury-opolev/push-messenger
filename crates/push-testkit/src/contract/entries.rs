@@ -258,6 +258,7 @@ async fn update_entry_changes_only_the_mutable_fields<B: Backend>(backend: &B) {
     changed.edited_at = Some(start() + TimeDelta::hours(1));
     changed.edit_seq = Some(4);
     changed.deleted_at = Some(start() + TimeDelta::hours(2));
+    changed.answer_seq = Some(5);
     changed.sender_id = UserId::new();
     changed.kind = EntryKind::Edit;
     tx.update_entry(changed.clone()).await.unwrap();
@@ -271,6 +272,7 @@ async fn update_entry_changes_only_the_mutable_fields<B: Backend>(backend: &B) {
     assert_eq!(stored.edited_at, changed.edited_at);
     assert_eq!(stored.edit_seq, Some(4));
     assert_eq!(stored.deleted_at, changed.deleted_at);
+    assert_eq!(stored.answer_seq, Some(5));
     assert_eq!(stored.sender_id, original.sender_id);
     assert_eq!(stored.kind, EntryKind::Message);
 }
