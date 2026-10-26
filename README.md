@@ -226,7 +226,9 @@ prerequisites, database roles, egress and limitations).
 [docs/deployment-ingress-verification.md](docs/deployment-ingress-verification.md)
 records the routing checks against a maintained controller (Traefik).
 Microsoft Entra ID sign-in (opt-in, also Entra-only without email):
-[docs/entra-sign-in.md](docs/entra-sign-in.md) (chart: `auth.signIn`). auth-svc is a
+[docs/entra-sign-in.md](docs/entra-sign-in.md) (chart: `auth.signIn`). Owned agents without
+an Entra credential sign in with a key pair: [docs/agent-key-sign-in.md](docs/agent-key-sign-in.md).
+auth-svc is a
 library, `push-auth-core`, and a thin binary, `push-auth`: a binary of your own can replace
 or restrict the sign-in check
 ([your own wrapper](docs/entra-sign-in.md#your-own-wrapper)).
@@ -289,7 +291,7 @@ at start-up.
 | `PUSH_AUTH_WORKER_ROLE` | the worker's role: granted `auth.outbox` and the two cleanup functions at start-up | none |
 | `PUSH_MESSAGE_SVC_URL` | Directory gRPC URL of message-svc, `http://host:50053` (plain `http://` only), asked whose profiles a caller may see; without it `GET /v1/users` answers 503 | none |
 | `PUSH_DIRECTORY_TOKEN` | message-svc's token for its `Directory` API, the same value as message-svc's, 32 to 256 visible ASCII characters; required with `PUSH_MESSAGE_SVC_URL` | none |
-| `PUSH_AUTH_PROVIDERS` | `password`, `entra`, `entra-app`, `external`, comma-separated; `entra-app` is opt-in app-only authentication for human-enrolled owned agents, never auto-provisioning; without `password` the password routes answer 404 ([guide](docs/entra-sign-in.md)); `external` supplies a custom authenticator ([wrapper](docs/entra-sign-in.md#your-own-wrapper)) | `password` |
+| `PUSH_AUTH_PROVIDERS` | `password`, `entra`, `entra-app`, `agent-key`, `external`, comma-separated; `entra-app` is opt-in app-only authentication for human-enrolled owned agents, never auto-provisioning; `agent-key` is opt-in key-pair sign-in for the same owned agents, never auto-provisioning either ([guide](docs/agent-key-sign-in.md)); without `password` the password routes answer 404 ([guide](docs/entra-sign-in.md)); `external` supplies a custom authenticator ([wrapper](docs/entra-sign-in.md#your-own-wrapper)) | `password` |
 | `PUSH_ENTRA_CLIENT_ID` | accepted audiences: the API registration's application id, optionally with its `api://` identifier URI | required with either Entra provider |
 | `PUSH_ENTRA_ALLOWED_TENANTS` | exactly one of `common`, `organizations`, `consumers`, or tenant GUIDs, comma-separated; never mixed. Keywords permit delegated self-provisioning; `entra-app` requires explicit tenant GUIDs | required with either Entra provider |
 | `PUSH_ENTRA_AUTHORITY_HOST` | Microsoft Entra ID's host (a sovereign cloud's); `http://` only for loopback | `https://login.microsoftonline.com/` |
@@ -300,6 +302,8 @@ at start-up.
 | `PUSH_ENTRA_APP_REQUIRED_ROLE` | optional app-only role; no delegated-user scope or role policy applies | none |
 | `PUSH_ENTRA_APP_ALLOWED_CLIENT_APPS` | app-only allowed client application ids (`azp`), comma-separated | any valid client id |
 | `PUSH_ENTRA_APP_MAX_SESSION_HOURS` | app-only device maximum session age, 1 to 720 hours | `24` |
+| `PUSH_AUTH_AGENT_KEY_AUDIENCE` | with `agent-key`: the `aud` every key assertion must carry, 1 to 256 visible ASCII characters | `PUSH_AUTH_PUBLIC_URL` without a trailing `/` |
+| `PUSH_AUTH_AGENT_KEY_MAX_SESSION_HOURS` | with `agent-key`: maximum session age of a key-backed device, 1 to 720 hours | `24` |
 | `PUSH_AGENTS_PER_USER` | maximum active + unexpired pending agents per human owner, 0 to 100 (0 disables reservation and redemption); [self-service API](docs/entra-sign-in.md#enroll-and-operate-an-agent) | `2` |
 | `PUSH_AUTH_ADMIN_TOKEN` | the admin API's bearer token, 32 to 256 visible ASCII characters; with it, `POST /v1/admin/users/revoke-sessions` (sign a user out of every device by `user_id`, `handle`, `entra` tenant and object id, or `external` provider, issuer and subject) is served on `PUSH_AUTH_ADMIN_ADDR` only; unset: no admin listener ([guide](docs/entra-sign-in.md#admin-api)) | none |
 | `PUSH_AUTH_ADMIN_ADDR` | address of the admin listener; never route it publicly | `0.0.0.0:8082` |
