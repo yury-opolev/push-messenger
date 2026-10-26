@@ -16,14 +16,14 @@ use crate::limits::{Limits, MemoryCounter};
 use crate::{Auth, NoDirectory, Tokens};
 use crate::{AuthError, Caller, Principal, Signup};
 
-fn caller(tokens: &Tokens) -> Caller {
+pub(super) fn caller(tokens: &Tokens) -> Caller {
     Caller {
         user_id: tokens.user_id,
         device_id: tokens.device_id,
     }
 }
 
-fn principal(object: Uuid) -> Principal {
+pub(super) fn principal(object: Uuid) -> Principal {
     Principal {
         provider: "entra-app".into(),
         issuer: TENANT.into(),
@@ -333,7 +333,7 @@ async fn enrollment_preserves_admission_and_management_is_rate_limited_without_e
     assert_eq!(error["error"]["code"], "rate_limited");
 }
 
-async fn setup() -> (World, Auth, Router, Tokens) {
+pub(super) async fn setup() -> (World, Auth, Router, Tokens) {
     let world = world(Offer::Both).await;
     let mut settings = world.stub.settings();
     settings.tenants = crate::entra::Tenants::Ids(vec![TENANT.parse().unwrap()]);
@@ -456,7 +456,7 @@ async fn same_app_competing_across_distinct_owners_has_one_live_binding() {
     assert_eq!(count, 1);
 }
 
-async fn call(
+pub(super) async fn call(
     router: &Router,
     method: &str,
     path: &str,

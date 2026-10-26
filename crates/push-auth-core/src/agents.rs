@@ -1,4 +1,4 @@
-//! Owner consent, bounded reservations, and agent deletion that releases the app identity.
+//! Owner consent, bounded reservations, and agent deletion that releases its identity.
 
 use chrono::{DateTime, Utc};
 use sqlx::{PgConnection, PgPool, Row};
@@ -7,7 +7,7 @@ use uuid::Uuid;
 use crate::devices::{Caller, revoke_devices};
 use crate::error::AuthError;
 use crate::external::ExternalRegistration;
-use crate::identity::{ENTRA_APP_PROVIDER, Principal};
+use crate::identity::{AGENT_KEY_PROVIDER, AGENT_PROVIDERS, ENTRA_APP_PROVIDER, Principal};
 use crate::outbox::{self, Event};
 use crate::rules;
 use crate::service::Auth;
@@ -37,11 +37,12 @@ pub(crate) async fn expire(pool: &PgPool) -> Result<(), AuthError> {
 }
 
 async fn owner(connection: &mut PgConnection, caller: Caller) -> Result<(), AuthError> {
-    // Linked-only app accounts predate kind; their default `user` is not a human.
+    // Linked-only app accounts predate kind; their default `user` is not a human. The
+    // provider list is `AGENT_PROVIDERS`.
     let human: Option<bool> = sqlx::query_scalar(
         "SELECT kind = 'user' AND email_verified_at IS NOT NULL AND NOT EXISTS ( \
          SELECT 1 FROM auth.external_identity e WHERE e.user_id = a.user_id \
-         AND e.provider = 'entra-app') FROM auth.user_account a \
+         AND e.provider IN ('entra-app', 'agent-key')) FROM auth.user_account a \
          WHERE user_id = $1 FOR UPDATE",
     )
     .bind(caller.user_id)
@@ -112,29 +113,37 @@ impl Auth {
         handle: &str,
         display_name: &str,
     ) -> Result<Reservation, AuthError> {
-        let tenants = self
-            .app_tenants()
-            .ok_or(AuthError::EnrollmentNotPermitted)?;
+        let tenants = self.app_tenants();
+        let keys = self.agent_key_offered();
+        if tenants.is_none() && !keys {
+            return Err(AuthError::EnrollmentNotPermitted);
+        }
         let handle = rules::handle(handle)?;
         let display_name = rules::display_name(display_name)?;
         expire(&self.pool).await?;
         let mut tx = self.pool.begin().await?;
         owner(&mut tx, caller).await?;
-        let delegated: Option<String> = sqlx::query_scalar(
-            "SELECT issuer FROM auth.external_identity WHERE user_id = $1 AND provider = 'entra'",
-        )
-        .bind(caller.user_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let tenant = match delegated {
-            Some(issuer) => issuer
-                .parse::<Uuid>()
-                .ok()
-                .filter(|id| tenants.contains(id)),
-            None if tenants.len() == 1 => Some(tenants[0]),
-            None => None,
+        let mut tenant = None;
+        if let Some(tenants) = tenants {
+            let delegated: Option<String> = sqlx::query_scalar(
+                "SELECT issuer FROM auth.external_identity WHERE user_id = $1 AND provider = 'entra'",
+            )
+            .bind(caller.user_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            tenant = match delegated {
+                Some(issuer) => issuer
+                    .parse::<Uuid>()
+                    .ok()
+                    .filter(|id| tenants.contains(id)),
+                None if tenants.len() == 1 => Some(tenants[0]),
+                None => None,
+            };
         }
-        .ok_or(AuthError::EnrollmentNotPermitted)?;
+        // Without a tenant only `agent-key` can redeem the reservation.
+        if tenant.is_none() && !keys {
+            return Err(AuthError::EnrollmentNotPermitted);
+        }
         let count: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM auth.user_account WHERE owner_user_id = $1 AND disabled_at IS NULL",
         )
@@ -183,26 +192,26 @@ impl Auth {
         principal: &Principal,
         code: &str,
     ) -> Result<ExternalRegistration, AuthError> {
-        if principal.provider != ENTRA_APP_PROVIDER || self.app_tenants().is_none() {
+        let provider = principal.provider.as_str();
+        if !AGENT_PROVIDERS.contains(&provider) || self.authenticator(provider).is_none() {
             return Err(AuthError::EnrollmentNotPermitted);
         }
-        let principal = principal
-            .checked(ENTRA_APP_PROVIDER)
-            .ok_or(AuthError::Unauthorized)?;
+        let principal = principal.checked(provider).ok_or(AuthError::Unauthorized)?;
         let mut tx = self.pool.begin().await?;
         // Identity lock precedes owner locks, serializing even redemptions of different
-        // owners' codes for the same app. The unique key remains the final authority.
+        // owners' codes for the same identity. The unique key remains the final authority.
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
             .bind(format!(
-                "entra-app:{}:{}",
-                principal.issuer, principal.subject
+                "{}:{}:{}",
+                principal.provider, principal.issuer, principal.subject
             ))
             .execute(&mut *tx)
             .await?;
         let exists: bool = sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM auth.external_identity WHERE provider = 'entra-app' \
-             AND issuer = $1 AND subject = $2)",
+            "SELECT EXISTS (SELECT 1 FROM auth.external_identity WHERE provider = $1 \
+             AND issuer = $2 AND subject = $3)",
         )
+        .bind(&principal.provider)
         .bind(&principal.issuer)
         .bind(&principal.subject)
         .fetch_one(&mut *tx)
@@ -225,7 +234,7 @@ impl Auth {
             .bind(owner_id)
             .fetch_one(&mut *tx)
             .await?;
-        let pending: Option<(Uuid, bool)> = sqlx::query_as(
+        let pending: Option<(Option<Uuid>, bool)> = sqlx::query_as(
             "SELECT e.tenant_id, e.expires_at > clock_timestamp() \
              FROM auth.user_account a JOIN auth.agent_enrollment e USING (user_id) \
              WHERE a.user_id = $1 AND a.disabled_at IS NULL AND a.email_verified_at IS NULL \
@@ -239,14 +248,18 @@ impl Auth {
         if !valid {
             return Err(AuthError::EnrollmentInvalid);
         }
-        if tenant.to_string() != principal.issuer {
+        // For `agent-key` the owner's reservation and its code are the authority.
+        if principal.provider == ENTRA_APP_PROVIDER
+            && tenant.map(|t| t.to_string()).as_deref() != Some(principal.issuer.as_str())
+        {
             return Err(AuthError::EnrollmentNotPermitted);
         }
         sqlx::query(
             "INSERT INTO auth.external_identity (identity_id, provider, issuer, subject, user_id) \
-             VALUES ($1, 'entra-app', $2, $3, $4)",
+             VALUES ($1, $2, $3, $4, $5)",
         )
         .bind(Uuid::now_v7())
+        .bind(&principal.provider)
         .bind(&principal.issuer)
         .bind(&principal.subject)
         .bind(user_id)
@@ -256,11 +269,15 @@ impl Auth {
             .bind(user_id)
             .execute(&mut *tx)
             .await?;
-        let azp = principal
-            .claims
-            .get("azp")
-            .and_then(|v| v.as_str())
-            .and_then(|v| Uuid::parse_str(v).ok());
+        let azp = if principal.provider == ENTRA_APP_PROVIDER {
+            principal
+                .claims
+                .get("azp")
+                .and_then(|v| v.as_str())
+                .and_then(|v| Uuid::parse_str(v).ok())
+        } else {
+            None
+        };
         sqlx::query(
             "UPDATE auth.agent_enrollment SET code_hash = NULL, enrolled_at = now(), client_app_id = $2 \
              WHERE user_id = $1",
@@ -277,8 +294,9 @@ impl Auth {
         tx.commit().await?;
         tracing::info!(
             target: "security", event = "auth.agent.enrolled", %user_id,
-            owner_user_id = %owner_id, tenant_id = %tenant, client_app_id = ?azp,
-            "an owned app account was enrolled"
+            owner_user_id = %owner_id, provider = %principal.provider,
+            tenant_id = tenant.map(tracing::field::display), client_app_id = ?azp,
+            "an owned agent account was enrolled"
         );
         self.sign_in_external(&principal, None).await
     }
@@ -290,10 +308,14 @@ impl Auth {
         expire(&self.pool).await?;
         let mut tx = self.pool.begin().await?;
         owner(&mut tx, caller).await?;
+        // The provider list is `AGENT_PROVIDERS`; a pending agent has no identity yet.
         let rows = sqlx::query(
             "SELECT a.user_id, a.handle::text, a.display_name, a.email_verified_at IS NOT NULL, \
-             e.expires_at, e.client_app_id FROM auth.user_account a \
+             e.expires_at, e.client_app_id, c.provider, c.subject FROM auth.user_account a \
              JOIN auth.agent_enrollment e USING (user_id) \
+             LEFT JOIN LATERAL (SELECT x.provider, x.subject FROM auth.external_identity x \
+             WHERE x.user_id = a.user_id AND x.provider IN ('entra-app', 'agent-key') \
+             ORDER BY x.created_at DESC LIMIT 1) c ON true \
              WHERE a.owner_user_id = $1 AND a.disabled_at IS NULL ORDER BY a.user_id",
         )
         .bind(caller.user_id)
@@ -314,13 +336,17 @@ impl Auth {
                 "platform": d.get::<String,_>(2), "created_at": d.get::<DateTime<Utc>,_>(3).to_rfc3339(),
                 "last_seen_at": d.get::<Option<DateTime<Utc>>,_>(4).map(|at| at.to_rfc3339())
             })).collect();
+            let credential: Option<String> = row.get(6);
+            let key_thumbprint = (credential.as_deref() == Some(AGENT_KEY_PROVIDER))
+                .then(|| row.get::<String, _>(7));
             agents.push(serde_json::json!({
                 "user_id": id, "handle": row.get::<String,_>(1),
                 "display_name": row.get::<String,_>(2), "kind": "agent",
                 "owner_user_id": caller.user_id,
                 "state": if row.get::<bool,_>(3) { "active" } else { "pending" },
                 "expires_at": if row.get::<bool,_>(3) { None } else { Some(row.get::<DateTime<Utc>,_>(4).to_rfc3339()) },
-                "client_app_id": row.get::<Option<Uuid>,_>(5), "devices": devices,
+                "client_app_id": row.get::<Option<Uuid>,_>(5), "credential": credential,
+                "key_thumbprint": key_thumbprint, "devices": devices,
             }));
         }
         tx.commit().await?;

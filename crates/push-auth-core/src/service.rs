@@ -185,10 +185,6 @@ impl Auth {
     }
 
     /// Whether `agent-key` is offered.
-    #[expect(
-        dead_code,
-        reason = "account enrollment (agent-key plan, Task 3) asks it"
-    )]
     pub(crate) fn agent_key_offered(&self) -> bool {
         self.identity.agent_key.is_some()
     }

@@ -69,8 +69,8 @@ impl Auth {
     /// sign-in, and a registration token bound to the identity and to the end of the
     /// session it starts. `handle` names a new account (it is ignored afterwards); without
     /// it a random `u…` handle is chosen. `Unauthorized` unless the principal's provider is
-    /// offered and the principal keeps the rules. `entra-app` is linked-only: an
-    /// unlinked principal is refused before any account insertion.
+    /// offered and the principal keeps the rules. `entra-app` and `agent-key` are
+    /// linked-only: an unlinked principal is refused before any account insertion.
     pub async fn sign_in_external(
         &self,
         principal: &Principal,
@@ -222,8 +222,15 @@ impl Auth {
         principal: &Principal,
         handle: Option<&str>,
     ) -> Result<Option<ExternalAccount>, AuthError> {
-        // App identities must be bound by enrollment, never by first sign-in.
-        if principal.provider == crate::identity::ENTRA_APP_PROVIDER {
+        // Agent identities must be bound by enrollment, never by a first sign-in. An unknown
+        // key is no vouched-for identity at all: an invalid credential.
+        if principal.provider == crate::identity::AGENT_KEY_PROVIDER {
+            return Err(crate::identity::rejected(
+                &principal.provider,
+                "unenrolled_key",
+            ));
+        }
+        if crate::identity::AGENT_PROVIDERS.contains(&principal.provider.as_str()) {
             return Err(crate::identity::not_permitted(principal));
         }
         let requested = handle.map(rules::handle).transpose()?;
