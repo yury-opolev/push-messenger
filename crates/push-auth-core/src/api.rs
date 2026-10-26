@@ -5,9 +5,10 @@
 //! Errors are `{"error": {"code", "message", "retryable"}}` with the status of
 //! [`AuthError::status`]; 429 answers carry `Retry-After`, 401 answers
 //! `WWW-Authenticate: Bearer`. No answer may be cached (`Cache-Control: no-store`) except
-//! the JWKS and the template catalog (`private, no-cache`, with an ETag). Pages send `Referrer-Policy: no-referrer`, so the token in their URL never
-//! leaks to another site (spec §5.6), and change nothing on `GET`: the change is the
-//! `POST` their button sends, so a mail scanner that opens links does nothing.
+//! the JWKS and the template catalog (`private, no-cache`, with an ETag). Pages send
+//! `Referrer-Policy: no-referrer`, so the token in their URL never leaks to another site
+//! (spec §5.6), and change nothing on `GET`: the change is the `POST` their button sends,
+//! so a mail scanner that opens links does nothing.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
