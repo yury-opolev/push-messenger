@@ -7,6 +7,7 @@ mod config;
 mod drain;
 mod hub;
 mod limits;
+mod presence;
 mod server;
 mod session;
 mod tokens;

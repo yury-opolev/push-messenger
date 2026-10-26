@@ -39,6 +39,7 @@ use crate::config::Config;
 use crate::drain::Drain;
 use crate::hub::{Hub, Membership, Signal};
 use crate::limits::{Action, FrameBudget, Limits, RedisCounter, Refused, Subject};
+use crate::presence::{self, PresenceContext};
 use crate::session::{RetryDelay, Session, Step, error_frame};
 use crate::tokens::{Claims, TokenError, Verifier};
 
@@ -69,12 +70,12 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(300);
 const IDLE_ON_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// message-svc's `Messaging` API, every call carrying the gateway's internal token.
-type MessagingApi = MessagingClient<InterceptedService<Channel, BearerToken>>;
+pub(crate) type MessagingApi = MessagingClient<InterceptedService<Channel, BearerToken>>;
 
 /// Puts `authorization: Bearer <token>` on every call. message-svc compares it in
 /// constant time and refuses `Messaging` calls without it: they act as any user.
 #[derive(Clone)]
-struct BearerToken(MetadataValue<Ascii>);
+pub(crate) struct BearerToken(MetadataValue<Ascii>);
 
 impl Interceptor for BearerToken {
     fn call(
@@ -97,6 +98,7 @@ struct App {
     /// Publishes takeovers on `kick:{device_id}`.
     redis: ConnectionManager,
     limits: Limits,
+    presence: PresenceContext,
     sessions: TaskTracker,
     drain: Arc<Drain>,
     shutdown: CancellationToken,
@@ -174,6 +176,13 @@ pub async fn serve(
     let verifier = Verifier::new(config.jwks_url(), &config.token_audience);
     let keys = tokio::spawn(refresh_keys(verifier.clone(), shutdown.clone()));
     let sessions = TaskTracker::new();
+    let presence = PresenceContext::new(
+        publisher.clone(),
+        messaging.clone(),
+        config.presence_grace,
+        shutdown.clone(),
+        sessions.clone(),
+    );
     let listen_addr = config.listen_addr;
     let app = App {
         config: Arc::new(config),
@@ -185,6 +194,7 @@ pub async fn serve(
             shutdown.clone(),
         ))),
         redis: publisher,
+        presence,
         sessions: sessions.clone(),
         drain: Arc::default(),
         shutdown: shutdown.clone(),
@@ -317,6 +327,7 @@ async fn connection(mut socket: WebSocket, app: App, ip: IpAddr) {
         return;
     };
     take_over(&app, claims.device, membership.connection()).await;
+    let presence = presence::track(app.presence.clone(), claims.user, membership.connection());
     let mut connected = Connected {
         socket,
         session,
@@ -333,14 +344,25 @@ async fn connection(mut socket: WebSocket, app: App, ip: IpAddr) {
         retry_at: None,
         activity: ActivityLimiter::new(Instant::now()),
     };
-    converse(&mut connected, &mut membership, &app, ready).await;
-    connected.idle_on_close(&app);
+    let kicked = converse(&mut connected, &mut membership, &app, ready).await;
+    // A newer connection of the device took over: it is live and keeps its own activity
+    // fresh, which idle from this one would overwrite.
+    if kicked != Some(KickReason::TakenOver) {
+        connected.idle_on_close(&app);
+    }
+    drop(presence);
 }
 
-/// Serves an identified connection, from `Ready` until it ends, whichever way.
-async fn converse(connected: &mut Connected, membership: &mut Membership, app: &App, ready: Body) {
+/// Serves an identified connection, from `Ready` until it ends, whichever way. Returns the
+/// kick that ended it, if one did.
+async fn converse(
+    connected: &mut Connected,
+    membership: &mut Membership,
+    app: &App,
+    ready: Body,
+) -> Option<KickReason> {
     if send(&mut connected.socket, ready).await.is_err() || connected.deliver().await.is_err() {
-        return;
+        return None;
     }
     // Clients ping every heartbeat; one silent for two and a half is gone.
     let idle = app.config.heartbeat * 5 / 2;
@@ -358,16 +380,16 @@ async fn converse(connected: &mut Connected, membership: &mut Membership, app: &
             () = app.shutdown.cancelled() => {
                 tokio::time::sleep(app.drain.next_delay()).await;
                 close_with(&mut connected.socket, close::SHUTTING_DOWN, "server shutting down").await;
-                return;
+                return None;
             }
             () = tokio::time::sleep_until(idle_at) => {
                 close_with(&mut connected.socket, close::POLICY_VIOLATION, "no frame within two and a half heartbeats").await;
-                return;
+                return None;
             }
             () = tokio::time::sleep_until(sweep_at) => {
                 sweep_at = Instant::now() + SWEEP_INTERVAL;
                 if connected.deliver().await.is_err() {
-                    return;
+                    return None;
                 }
             }
             signal = membership.next() => {
@@ -378,34 +400,34 @@ async fn converse(connected: &mut Connected, membership: &mut Membership, app: &
                         let (code, why) = kick_close(reason);
                         tracing::info!(device = %connected.device, ?reason, "connection kicked");
                         close_with(&mut connected.socket, code, why).await;
-                        Err(Closed)
+                        return Some(reason);
                     }
                 };
                 if done.is_err() {
-                    return;
+                    return None;
                 }
             }
             // The precondition disables the branch; the far-away instant is never awaited.
             () = tokio::time::sleep_until(retry_at.unwrap_or_else(far_future)), if retry_at.is_some() => {
                 if connected.deliver().await.is_err() {
-                    return;
+                    return None;
                 }
             }
             () = tokio::time::sleep_until(activity_due.unwrap_or_else(far_future)), if activity_due.is_some() => {
                 if let Some(activity) = connected.activity.take_due(Instant::now()) {
                     if connected.publish_activity(activity).await.is_err() {
-                        return;
+                        return None;
                     }
                 }
             }
             () = tokio::time::sleep_until(warn_at), if !warned => {
                 if connected.warn_expiry().await.is_err() {
-                    return;
+                    return None;
                 }
             }
             () = tokio::time::sleep_until(deadline) => {
                 close_with(&mut connected.socket, close::REAUTH_REQUIRED, "the access token expired; send ReAuth in time").await;
-                return;
+                return None;
             }
             message = connected.socket.recv() => {
                 idle_at = Instant::now() + idle;
@@ -414,7 +436,7 @@ async fn converse(connected: &mut Connected, membership: &mut Membership, app: &
                 {
                     tracing::info!(device = %connected.device, "too many frames");
                     close_with(&mut connected.socket, close::RATE_LIMITED, "too many frames; slow down").await;
-                    return;
+                    return None;
                 }
                 let step = match message {
                     Some(Ok(Message::Binary(bytes))) => connected.session.on_binary(&bytes),
@@ -423,12 +445,12 @@ async fn converse(connected: &mut Connected, membership: &mut Membership, app: &
                     Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
                     Some(Err(error)) => {
                         refuse_oversized(&mut connected.socket, error).await;
-                        return;
+                        return None;
                     }
-                    Some(Ok(Message::Close(_))) | None => return,
+                    Some(Ok(Message::Close(_))) | None => return None,
                 };
                 if connected.run(step).await.is_err() {
-                    return;
+                    return None;
                 }
                 membership.renewed(connected.issued_at);
             }
