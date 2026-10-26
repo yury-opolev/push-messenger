@@ -162,20 +162,21 @@ async fn the_read_script_reports_online_offline_and_flips_once() {
         .presence();
     let users = [online, gone, never];
     let last_seen = chrono::DateTime::from_timestamp(minute, 0);
-    let (views, flipped) = presence.states(&users).await.unwrap();
+    let read = presence.states(&users).await.unwrap();
+    assert!(!read.in_doubt);
     assert_eq!(
-        views,
+        read.views,
         [
             PresenceView::Online,
             PresenceView::Offline { last_seen },
             PresenceView::Offline { last_seen: None },
         ]
     );
-    assert_eq!(flipped, [gone]);
+    assert_eq!(read.flipped, [gone]);
 
-    let (views, flipped) = presence.states(&users).await.unwrap();
-    assert_eq!(views[1], PresenceView::Offline { last_seen });
-    assert!(flipped.is_empty(), "a user flips only once");
+    let read = presence.states(&users).await.unwrap();
+    assert_eq!(read.views[1], PresenceView::Offline { last_seen });
+    assert!(read.flipped.is_empty(), "a user flips only once");
     let expired: i64 = redis::cmd("ZCARD")
         .arg(presence_conns_key(gone.0))
         .query_async(&mut admin)
@@ -189,8 +190,9 @@ async fn the_read_script_reports_online_offline_and_flips_once() {
         .query_async(&mut admin)
         .await
         .unwrap();
-    let (views, _) = presence.states(&[online]).await.unwrap();
-    assert_eq!(views, [PresenceView::Online]);
+    let read = presence.states(&[online]).await.unwrap();
+    assert_eq!(read.views, [PresenceView::Online]);
+    assert!(!read.in_doubt, "a script Redis lost never ran: no doubt");
 }
 
 #[tokio::test]
@@ -223,7 +225,7 @@ async fn presence_reads_without_redis_answer_offline_and_push_nothing() {
     let failed = tokio::time::timeout(Duration::from_secs(30), presence.states(&users))
         .await
         .expect("a failed read gives up instead of hanging");
-    assert_eq!(failed, Err(PresenceUnavailable));
+    assert!(matches!(failed, Err(PresenceUnavailable { .. })));
 
     let get = request::Body::GetPresence(GetPresence {
         user_ids: vec![id_bytes(bob.0), id_bytes(alice.0)],

@@ -231,6 +231,15 @@ request order**. Rate limited per user: **120 per minute** across the user's dev
   of such a user after that (a `GetPresence`, or another announcement) finds no lease
   while the user is still marked online, clears the mark and announces offline, once. A
   sweeper that does this without a read is a follow-up.
+- **A presence read in doubt**: a `GetPresence` read that may have run on Redis without
+  its answer arriving (it was sent again after a dropped connection, or it failed or timed
+  out after it was sent) may have cleared a crashed gateway's user's online mark without
+  reporting it. message-svc then announces every user that read covered (at most the
+  batch of 100) from a fresh read taken under each user's lock; the viewer still gets its
+  answer as usual (`OFFLINE` without `last_seen` when the read failed). Best effort: if
+  that fresh read fails too, nothing is pushed (and the rest of the batch is skipped), so
+  such a double fault can leave contacts with a stale state until the user's next
+  transition, or until a contact reads that user's presence again.
 - **A gateway shuts down**: closed connections are not settled (reconnects normally land
   on another replica within the grace); reads stay correct.
 - **`AnnouncePresence` fails**: logged; the next transition or read corrects the state.
@@ -261,7 +270,7 @@ replica's clock.
 | **up** | gateway: connect, then every 30 s | prune ended leases, remember whether any was left, add or renew this connection's 90 s lease, set `seen` and `on=1`; returns 1 when no lease was left before (announce online) |
 | **down** | gateway: connection closed | if the connection has a lease, end it after the grace; set `seen` |
 | **settle** | gateway: grace + 100 ms after down | prune; when no lease is left and `on=1`, set `on=0` and return 1 (announce offline) |
-| **read** | message-svc: per user, in one pipeline | prune; when no lease is left and `on=1`, set `on=0` and report the flip (a crashed gateway's user); return online and `seen` |
+| **read** | message-svc: per user, in one pipeline | prune; when no lease is left and `on=1`, set `on=0` and report the flip (a crashed gateway's user); return online and `seen`. A read sent again after a dropped connection, or failed or timed out after it was sent, is in doubt: every user it covered is announced |
 
 Each connection has one presence task in the gateway that runs up, renewals, down and
 settle in order, so they cannot reorder. A script whose outcome is unknown (Redis failed or

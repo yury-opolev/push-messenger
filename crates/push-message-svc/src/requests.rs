@@ -24,7 +24,7 @@ use tonic::Status;
 use crate::convert::{
     self, contact_state, deliver, domain_error, from_micros, invalid, micros, parse_id, send_ack,
 };
-use crate::presence::{self, PresenceStates};
+use crate::presence::{self, PresenceRead, PresenceStates, PresenceUnavailable};
 
 /// `Edit`: the edit entry's receipt, after commit.
 pub(crate) async fn edit<S: Store, C: Clock, N: Notifier>(
@@ -313,8 +313,9 @@ async fn answer<S: Store, C: Clock, N: Notifier>(
 /// `GetPresence`: one presence per distinct id, in request order. Users the viewer may not
 /// see are `UNKNOWN`; the others are read from the live state, and anyone the read finds
 /// newly offline is announced before answering (with this read's view if re-reading them
-/// fails). When the state cannot be read, the others are `OFFLINE` without `last_seen` and
-/// nothing is announced.
+/// fails). When the state cannot be read, the others are `OFFLINE` without `last_seen`.
+/// When the read is in doubt (it may have run without its answer, so a flip it made may
+/// be unreported), everyone read is announced from a fresh read.
 async fn get_presence<S: Store, C: Clock, N: Notifier>(
     messaging: &Messaging<S, C, N>,
     presence: &dyn PresenceStates,
@@ -336,17 +337,32 @@ async fn get_presence<S: Store, C: Clock, N: Notifier>(
         .await
         .map_err(domain_error)?;
     // Unreadable presence answers offline (never pushed): the viewer asked, so it must
-    // get an answer, and nothing announces it.
-    let (views, flipped) = presence
-        .states(&viewable)
-        .await
-        .unwrap_or_else(|_| (presence::offline(viewable.len()), Vec::new()));
-    let views: HashMap<UserId, PresenceView> = viewable.into_iter().zip(views).collect();
-    let flipped: Vec<(UserId, PresenceView)> = flipped
-        .into_iter()
-        .filter_map(|user| Some((user, *views.get(&user)?)))
+    // get an answer. Only fresh reads are announced for a read in doubt.
+    let read =
+        presence
+            .states(&viewable)
+            .await
+            .unwrap_or_else(|PresenceUnavailable { in_doubt }| PresenceRead {
+                views: presence::offline(viewable.len()),
+                flipped: Vec::new(),
+                in_doubt,
+            });
+    let views: HashMap<UserId, PresenceView> = viewable.iter().copied().zip(read.views).collect();
+    let flipped: Vec<(UserId, PresenceView)> = read
+        .flipped
+        .iter()
+        .filter_map(|user| Some((*user, *views.get(user)?)))
         .collect();
     presence::announce_flipped(messaging, presence, &flipped).await;
+    if read.in_doubt {
+        // At most the batch: `viewable` holds at most MAX_PRESENCE_BATCH users.
+        let doubted: Vec<UserId> = viewable
+            .iter()
+            .filter(|user| !read.flipped.contains(user))
+            .copied()
+            .collect();
+        presence::announce_in_doubt(messaging, presence, &doubted).await;
+    }
     Ok(PresenceList {
         presences: distinct
             .into_iter()

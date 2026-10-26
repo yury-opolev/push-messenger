@@ -76,7 +76,10 @@ Scripts (all use Redis `TIME`, never a replica's clock):
   `on=1`, set `on=0` and return 1 (announce offline).
 - **read** (message-svc, per user): prune; if no member is left and `on=1`, set `on=0`
   and report the flip, so a crashed gateway's users are announced offline by the first
-  read after their leases ran out; return online?, `seen`.
+  read after their leases ran out; return online?, `seen`. A read whose outcome is in
+  doubt (sent again after a dropped connection, or failed or timed out after it was
+  sent) may have flipped someone without reporting it, so `GetPresence` announces every
+  user it covered from a fresh read under the user's lock (nothing when that fails too).
 
 Each connection has one presence task in the gateway that runs up, refresh, down and
 settle in order, so they cannot reorder. On gateway shutdown the settle step is skipped

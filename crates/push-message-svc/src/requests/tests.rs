@@ -920,6 +920,86 @@ async fn a_user_found_newly_offline_is_announced_even_when_the_re_read_fails() {
 }
 
 #[tokio::test]
+async fn a_read_in_doubt_announces_everyone_it_read_from_a_fresh_read() {
+    let world = world();
+    let (alice, bob, carol) = (
+        world.person().await,
+        world.person().await,
+        world.person().await,
+    );
+    world.befriend(&alice, &bob).await;
+    world.presence.set(bob.user, PresenceView::Online);
+    world.presence.answer_in_doubt();
+    world.notifier.take();
+
+    let ids = vec![id_bytes(bob.user.0), id_bytes(carol.user.0)];
+    assert_eq!(
+        get_presence(&world, &alice, ids).await.unwrap(),
+        [
+            presence(&bob, PresenceState::Online, None),
+            presence(&carol, PresenceState::Unknown, None),
+        ]
+    );
+    assert_eq!(
+        world.notifier.take(),
+        vec![Event::Presence {
+            to: vec![alice.user],
+            user: bob.user,
+            view: PresenceView::Online,
+        }]
+    );
+}
+
+#[tokio::test]
+async fn a_read_that_failed_in_doubt_answers_offline_and_announces_the_fresh_state() {
+    let world = world();
+    let (alice, bob) = (world.person().await, world.person().await);
+    world.befriend(&alice, &bob).await;
+    let last_seen = Utc.with_ymd_and_hms(2026, 10, 26, 20, 0, 0).unwrap();
+    let gone = PresenceView::Offline {
+        last_seen: Some(last_seen),
+    };
+    world.presence.set(bob.user, gone);
+    world.presence.fail_in_doubt();
+    world.notifier.take();
+
+    let ids = vec![id_bytes(bob.user.0)];
+    assert_eq!(
+        get_presence(&world, &alice, ids).await.unwrap(),
+        [presence(&bob, PresenceState::Offline, None)]
+    );
+    assert_eq!(
+        world.notifier.take(),
+        vec![Event::Presence {
+            to: vec![alice.user],
+            user: bob.user,
+            view: gone,
+        }]
+    );
+}
+
+#[tokio::test]
+async fn a_read_in_doubt_whose_re_read_fails_publishes_nothing() {
+    let world = world();
+    let (alice, bob, carol) = (
+        world.person().await,
+        world.person().await,
+        world.person().await,
+    );
+    world.befriend(&alice, &bob).await;
+    world.befriend(&alice, &carol).await;
+    world.presence.set(bob.user, PresenceView::Online);
+    world.presence.answer_in_doubt();
+    world.presence.fail_after(1);
+    world.notifier.take();
+
+    let ids = vec![id_bytes(bob.user.0), id_bytes(carol.user.0)];
+    let answered = get_presence(&world, &alice, ids).await.unwrap();
+    assert_eq!(answered[0], presence(&bob, PresenceState::Online, None));
+    assert_eq!(world.notifier.take(), vec![], "no guess is published");
+}
+
+#[tokio::test]
 async fn opting_out_answers_unknown_to_contacts_and_hides_them_from_the_hider() {
     let world = world();
     let (alice, bob) = (world.person().await, world.person().await);

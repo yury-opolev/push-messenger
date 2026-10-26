@@ -23,7 +23,8 @@ pub use grpc::{AccountsApi, DirectoryApi, InternalToken, MAX_VISIBLE_USERS, Mess
 pub use listeners::Listeners;
 pub use notify::RedisNotifier;
 pub use presence::{
-    FixedPresence, OfflinePresence, PresenceStates, PresenceUnavailable, RedisPresence,
+    FixedPresence, OfflinePresence, PresenceRead, PresenceStates, PresenceUnavailable,
+    RedisPresence,
 };
 pub use server::{init_logging, migrate, serve, terminated};
 pub use templates::{TemplatesApi, seed_builtins};
