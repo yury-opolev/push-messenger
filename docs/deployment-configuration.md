@@ -263,10 +263,19 @@ device; [guide](entra-sign-in.md#admin-api)). It is never routed by the chart's 
 `networkPolicy.adminPeers` lists who may reach it (none by default: use
 `kubectl port-forward`).
 
+### Agent key sign-in
+
+`auth.signIn.providers` may include `agent-key`: owned agents sign in with a key pair of
+their own ([guide](agent-key-sign-in.md#enable-it)). `auth.signIn.agentKey.audience`
+renders `PUSH_AUTH_AGENT_KEY_AUDIENCE` when set (default: auth-svc's public URL without a
+trailing `/`), and `auth.signIn.agentKey.maxSessionHours` (1 to 720, default 24) renders
+`PUSH_AUTH_AGENT_KEY_MAX_SESSION_HOURS`. It needs no Secret key, no Entra settings and no
+egress. Like `entra`, a `providers` list without `password` writes no email.
+
 ## Email and the Resend webhook
 
 `worker.email.sender` is `log` (default), `resend`, or `none` (no email at all; only for
-Entra-only installations, which render it anyway).
+installations without `password` sign-in, which render it anyway).
 
 `worker.email.webhook.enabled` (default `false`) is an explicit decision, never
 inferred from a Secret. When `true` the worker references `resend-webhook-secret`,

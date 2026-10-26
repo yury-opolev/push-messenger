@@ -18,6 +18,7 @@ yours.
 | `entra` | Entra ID only: no email confirmation, no passwords, no email provider. The signup, verification, login and password-reset routes answer 404; no email is ever written, so the worker runs with `PUSH_EMAIL_SENDER=none` |
 | `password,entra` | Both; the two kinds of accounts are never linked, even with the same address |
 | `entra-app`, alone or with the others | Opt-in app-only authentication at `POST /v1/auth/entra-app`; a human must first reserve and consent to a separate owned agent account. No automatic account creation by sign-in |
+| `agent-key`, alone or with the others | Opt-in key-pair sign-in for owned agents at `POST /v1/auth/agent-key`, enrolled the same way; no Entra registration or secret ([guide](agent-key-sign-in.md)) |
 | `external`, alone or with the others | The sign-in of a push-auth of your own: its authenticator at `/v1/auth/{its provider id}` ([Your own wrapper](#your-own-wrapper)) |
 
 **Switching an existing installation to `entra` is destructive for password sessions.**
@@ -51,6 +52,11 @@ In the Microsoft Entra admin center, **App registrations → New registration**:
 6. Note the **Application (client) ID** and the **Directory (tenant) ID**.
 
 ### Owned agents and app-only authentication (opt-in)
+
+An agent without an Entra app credential (a workstation or a Cloud PC without a managed
+identity, or a tenant that forbids secrets) can use a key pair instead:
+[agent-key sign-in](agent-key-sign-in.md). Reservations, ownership, listing and deletion
+below apply to both.
 
 `entra` continues to accept delegated-user tokens only. Enable `entra-app` separately to
 verify v2 access tokens obtained with client credentials for the **same API audience**.
@@ -95,7 +101,9 @@ still require the `entra` provider.
 use explicit tenant GUIDs. Entra owners must have the exact same delegated identity tenant
 as the app. Password/custom-provider human owners may enroll only when the deployment
 allows exactly one explicit tenant; that tenant is recorded at reservation time. Otherwise
-the API returns `enrollment_not_permitted` rather than guessing. Agents cannot own agents.
+the API returns `enrollment_not_permitted` rather than guessing, unless `agent-key` is also
+enabled: the reservation then has no tenant, and only a key can redeem it. Agents cannot
+own agents.
 Older manually linked app accounts cannot act as human owners either.
 
 ### Enroll and operate an agent
@@ -140,15 +148,17 @@ Management is rate limited per IP (300/15 minutes) and user (120/15 minutes), fa
 | Method/path | Body | Response |
 |---|---|---|
 | `POST /v1/agents` | `{handle,display_name}` | 201 reservation above; 409 `too_many_agents` / `handle_taken` |
-| `GET /v1/agents` | none | `{agents:[{user_id,handle,display_name,kind:"agent",owner_user_id,state:"pending"\|"active",expires_at,client_app_id,devices:[{device_id,name,platform,created_at,last_seen_at}]}]}`; expiry null for active agents, client app id null until enrollment; no credentials or hashes |
+| `GET /v1/agents` | none | `{agents:[{user_id,handle,display_name,kind:"agent",owner_user_id,state:"pending"\|"active",expires_at,client_app_id,credential,key_thumbprint,devices:[{device_id,name,platform,created_at,last_seen_at}]}]}`; expiry null for active agents, client app id null until enrollment and for key agents; `credential` is `"entra-app"`, `"agent-key"` or null while pending; `key_thumbprint` is the [key's thumbprint](agent-key-sign-in.md#the-assertion) for `agent-key`, otherwise null; no secrets or hashes |
 | `PATCH /v1/agents/{user_id}` | `{handle?,display_name?}`, at least one | 204; same profile validation/handle uniqueness as human profiles |
-| `DELETE /v1/agents/{user_id}` | none | 204; removes a pending reservation, or permanently disables the active agent and releases its app identity |
+| `DELETE /v1/agents/{user_id}` | none | 204; removes a pending reservation, or permanently disables the active agent and releases its identity (app or key) |
 
 Bad/expired/spent codes return 400 `enrollment_invalid`; ambiguous/cross-tenant enrollment
 or agent ownership returns 403 `enrollment_not_permitted`. Deleted agents stay disabled
 forever: nothing revives the account, and old registration, access and refresh tokens are
 refused. Deletion atomically revokes every device and refresh token and frees the owner's
-slot. In the same transaction it **releases** the agent's app identity: the
+slot. In the same transaction it **releases** the agent's identity, of either agent
+provider (a released key gets 401 `token_invalid`; see
+[agent-key sign-in](agent-key-sign-in.md#enroll-and-operate-an-agent)). For an app, the
 `(entra-app,tid,oid)` row moves to the audit table `auth.released_identity` (with
 `released_at`; tenant and `client_app_id` stay on `auth.agent_enrollment`), and a
 `security` log line `auth.agent.identity_released` names the agent, owner, tenant, subject
@@ -171,9 +181,9 @@ Own, public, batch and handle-lookup profiles add `kind:"user"|"agent"` and null
 uses `kind` and `ownerUserId`. No agent-management SDK surface or consumer UI is supplied.
 
 Custom `external` authenticators remain supported, but may not claim the reserved built-in
-`entra-app` id. Admissions apply to both built-in providers. App token refusals use
-`token_invalid` / `identity_unavailable` and `auth.external.*` events, while `entra` keeps
-its existing error codes and events. Admin revocation uses the existing generic selector:
+`entra-app` and `agent-key` ids. Admissions apply to every built-in provider. App token
+refusals use `token_invalid` / `identity_unavailable` and `auth.external.*` events, while
+`entra` keeps its existing error codes and events. Admin revocation uses the existing generic selector:
 `{"external":{"provider":"entra-app","issuer":"<tid>","subject":"<oid>"}}`.
 
 ## 2. Register the client apps
@@ -459,9 +469,10 @@ runs with `PUSH_AUTH_PROVIDERS=external` (plus `password` if wanted) and the usu
 
 Rules the service enforces at start-up: `external` needs an authenticator and an
 authenticator needs `external`; its id is 1 to 32 lower-case letters, digits or `-`, not a
-route of auth-svc (`signup`, `verify`, `login`, `password`, `refresh`, `jwks`), and not
-`entra` beside `PUSH_AUTH_PROVIDERS=entra`; its maximum session is 1 s to 720 h; an
-admission needs `entra` or `external`. Anything else stops start-up with a message that
+route of auth-svc (`signup`, `verify`, `login`, `password`, `refresh`, `jwks`), not the
+built-in `entra-app` or `agent-key`, and not `entra` beside `PUSH_AUTH_PROVIDERS=entra`;
+its maximum session is 1 s to 720 h; an admission needs a sign-in by token (`entra`,
+`entra-app`, `agent-key` or `external`). Anything else stops start-up with a message that
 says what to change.
 
 **Building an image.** Copy the example into a binary crate of your own that depends on

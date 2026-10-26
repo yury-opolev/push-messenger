@@ -6,6 +6,7 @@
 //! knows the contacts and conversations (spec §5.5).
 
 pub mod admin;
+pub mod agent_key;
 mod agents;
 pub mod api;
 mod audit;
@@ -28,6 +29,7 @@ mod service;
 pub mod tokens;
 
 pub use admin::{AdminApi, UserSelector, admin_router};
+pub use agent_key::{AgentKeySettings, AgentKeySignIn};
 /// The attribute an [`Authenticator`] or `Admission` implementation needs, so a binary of
 /// one's own uses the same version.
 pub use async_trait::async_trait;
@@ -40,7 +42,8 @@ pub use directory::{Directory, GrpcDirectory, NoDirectory};
 pub use error::AuthError;
 pub use external::{EntraRegistration, ExternalRegistration};
 pub use identity::{
-    Admission, AdmissionDecision, AuthenticationError, Authenticator, ENTRA_PROVIDER, Principal,
+    AGENT_KEY_PROVIDER, Admission, AdmissionDecision, AuthenticationError, Authenticator,
+    ENTRA_PROVIDER, Principal,
 };
 pub use profiles::{OwnProfile, PublicProfile};
 pub use server::{Overrides, init_logging, migrate, serve, serve_with, terminated};

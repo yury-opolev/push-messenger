@@ -83,6 +83,7 @@ impl Default for SignIn {
 #[derive(Debug, Clone, Default)]
 struct Identity {
     entra_app: Option<crate::entra::EntraAppSignIn>,
+    agent_key: Option<crate::agent_key::AgentKeySignIn>,
     external: Option<Arc<dyn Authenticator>>,
     admission: Option<Arc<dyn Admission>>,
 }
@@ -177,6 +178,17 @@ impl Auth {
         self
     }
 
+    /// Offers agent key-pair sign-in for enrolled agents; never provisions an account.
+    pub fn with_agent_key(mut self, authenticator: crate::agent_key::AgentKeySignIn) -> Self {
+        self.identity.agent_key = Some(authenticator);
+        self
+    }
+
+    /// Whether `agent-key` is offered.
+    pub(crate) fn agent_key_offered(&self) -> bool {
+        self.identity.agent_key.is_some()
+    }
+
     /// Maximum active and unexpired pending agents per human owner; zero disables enrollment.
     pub fn with_agents_per_user(mut self, maximum: u32) -> Self {
         self.agents_per_user = maximum;
@@ -193,7 +205,8 @@ impl Auth {
         self
     }
 
-    /// Every authenticator offered: Entra ID first, then the external one.
+    /// Every authenticator offered, in this order: Entra ID, `entra-app`, `agent-key`, then
+    /// the external one.
     pub fn authenticators(&self) -> Vec<Arc<dyn Authenticator>> {
         let mut offered: Vec<Arc<dyn Authenticator>> = Vec::new();
         if let Some(entra) = &self.sign_in.entra {
@@ -201,6 +214,9 @@ impl Auth {
         }
         if let Some(app) = &self.identity.entra_app {
             offered.push(Arc::new(app.clone()));
+        }
+        if let Some(key) = &self.identity.agent_key {
+            offered.push(Arc::new(key.clone()));
         }
         if let Some(external) = &self.identity.external {
             offered.push(external.clone());

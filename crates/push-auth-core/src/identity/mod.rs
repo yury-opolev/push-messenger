@@ -20,6 +20,13 @@ pub(crate) use middleware::{IdentityState, identify};
 pub const ENTRA_PROVIDER: &str = "entra";
 /// The opt-in, non-provisioning Entra service-principal provider.
 pub const ENTRA_APP_PROVIDER: &str = "entra-app";
+/// The opt-in, non-provisioning agent key-pair provider (spec 2026-10-26).
+pub const AGENT_KEY_PROVIDER: &str = "agent-key";
+/// The sign-in route of [`AGENT_KEY_PROVIDER`].
+pub(crate) const AGENT_KEY_ROUTE: &str = "/v1/auth/agent-key";
+/// The providers whose identities only an owner's enrollment binds: never a human, and
+/// never created on a first sign-in.
+pub const AGENT_PROVIDERS: &[&str] = &[ENTRA_APP_PROVIDER, AGENT_KEY_PROVIDER];
 
 /// The longest session an authenticator may grant: 30 days, as for Entra ID.
 pub const MAX_SESSION_LIMIT: Duration = Duration::from_secs(720 * 3600);
@@ -78,7 +85,8 @@ pub enum AuthenticationError {
 /// Checks a token and names its user (spec D3). An implementation must check the
 /// signature and its algorithm, the issuer, the audience (this API), the lifetime and that
 /// the token has the provider's required identity type (delegated user for `entra`,
-/// app-only for the explicitly enabled `entra-app`); it must name a stable, immutable subject, and
+/// app-only for the explicitly enabled `entra-app`, a key-pair assertion of an enrolled
+/// agent for the explicitly enabled `agent-key`); it must name a stable, immutable subject, and
 /// never log the token or its claims.
 #[async_trait]
 pub trait Authenticator: Send + Sync + fmt::Debug {
@@ -190,6 +198,11 @@ pub(crate) fn informational(value: Option<&str>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_agent_key_route_is_named_after_its_provider() {
+        assert_eq!(AGENT_KEY_ROUTE, format!("/v1/auth/{AGENT_KEY_PROVIDER}"));
+    }
 
     #[test]
     fn provider_ids_are_short_lower_case_names() {

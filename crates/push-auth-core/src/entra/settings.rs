@@ -19,7 +19,8 @@ const MAX_TENANTS: usize = 20;
 const MAX_AUDIENCES: usize = 4;
 const MAX_SESSION_HOURS: u64 = 720;
 
-/// The ways to sign in: email and password, Microsoft Entra ID, the external
+/// The ways to sign in: email and password, Microsoft Entra ID, Entra ID app-only
+/// agents, agents holding a key (`agent-key`, spec 2026-10-26), the external
 /// authenticator a binary of one's own supplies (spec 2026-10-19 pluggable identity, D7),
 /// or several of them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,6 +28,8 @@ pub struct Providers {
     pub password: bool,
     pub entra: bool,
     pub entra_app: bool,
+    /// Owned agents signing in with an ES256 assertion of their enrolled key.
+    pub agent_key: bool,
     /// The authenticator in `Overrides` (`serve_with`), at `/v1/auth/{its provider id}`.
     pub external: bool,
 }
@@ -38,14 +41,15 @@ impl Default for Providers {
             password: true,
             entra: false,
             entra_app: false,
+            agent_key: false,
             external: false,
         }
     }
 }
 
 impl Providers {
-    /// A `PUSH_AUTH_PROVIDERS` value: `password`, `entra`, `entra-app`, `external`, comma-separated,
-    /// each once; unset or empty is `password`.
+    /// A `PUSH_AUTH_PROVIDERS` value: `password`, `entra`, `entra-app`, `agent-key`,
+    /// `external`, comma-separated, each once; unset or empty is `password`.
     pub fn parse(value: Option<&str>) -> Result<Self, String> {
         let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
             return Ok(Self::default());
@@ -54,6 +58,7 @@ impl Providers {
             password: false,
             entra: false,
             entra_app: false,
+            agent_key: false,
             external: false,
         };
         for name in value.split(',').map(str::trim) {
@@ -61,10 +66,12 @@ impl Providers {
                 "password" if !providers.password => providers.password = true,
                 "entra" if !providers.entra => providers.entra = true,
                 "entra-app" if !providers.entra_app => providers.entra_app = true,
+                "agent-key" if !providers.agent_key => providers.agent_key = true,
                 "external" if !providers.external => providers.external = true,
                 _ => {
                     return Err(
-                        "expected password, entra, entra-app, external or a comma-separated combination"
+                        "expected password, entra, entra-app, agent-key, external or \
+                                a comma-separated combination"
                             .to_owned(),
                     );
                 }
@@ -427,6 +434,7 @@ mod tests {
                 password: true,
                 entra: false,
                 entra_app: false,
+                agent_key: false,
                 external: false
             })
         );
@@ -437,6 +445,7 @@ mod tests {
                 password: false,
                 entra: true,
                 entra_app: false,
+                agent_key: false,
                 external: false
             })
         );
@@ -446,6 +455,7 @@ mod tests {
                 password: true,
                 entra: true,
                 entra_app: false,
+                agent_key: false,
                 external: false
             })
         );
@@ -462,6 +472,7 @@ mod tests {
                 password: false,
                 entra: false,
                 entra_app: false,
+                agent_key: false,
                 external: true
             })
         );
@@ -471,11 +482,30 @@ mod tests {
                 password: true,
                 entra: true,
                 entra_app: false,
+                agent_key: false,
                 external: true
             })
         );
         for bad in ["external,external", "External", "external,"] {
             assert!(Providers::parse(Some(bad)).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn agent_key_is_a_provider_of_its_own() {
+        assert_eq!(
+            Providers::parse(Some("password,agent-key")),
+            Ok(Providers {
+                password: true,
+                entra: false,
+                entra_app: false,
+                agent_key: true,
+                external: false
+            })
+        );
+        for bad in ["agent-key,agent-key", "Agent-Key", "agent_key"] {
+            let message = Providers::parse(Some(bad)).unwrap_err();
+            assert!(message.contains("agent-key"), "{bad}: {message}");
         }
     }
 

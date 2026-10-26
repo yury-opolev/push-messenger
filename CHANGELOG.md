@@ -4,8 +4,44 @@ Notable changes for consumers of push-messenger. Newest first.
 
 ## Unreleased
 
+### Added
+
+- **Agent-key sign-in for owned agents** (REQUEST PUSH feature 6). A new opt-in provider,
+  `agent-key` in `PUSH_AUTH_PROVIDERS` (off by default), lets an owned agent sign in with
+  a P-256 key pair of its own instead of an Entra app token: no secret, certificate or
+  managed identity. The agent sends a single-use ES256 JWS (`typ: push-agent+jwt`, its
+  public key in the `jwk` header, `aud`/`iat`/`exp`/`jti` claims, at most 300 s of
+  lifetime) to `POST /v1/auth/agent-key`; the first one, with the owner's enrollment code
+  (`{token, enrollment_code}`), binds the key's RFC 7638 thumbprint to the reserved agent.
+  Then `{token}` and `{token, device_id}` sign in as for `entra-app`. An unenrolled key
+  gets 401 `token_invalid` and never creates an account; a reused `jti` is refused across
+  replicas. New variables `PUSH_AUTH_AGENT_KEY_AUDIENCE` (default: the public URL without
+  a trailing `/`) and `PUSH_AUTH_AGENT_KEY_MAX_SESSION_HOURS` (1 to 720, default 24); new
+  events `auth.agent-key.success` and `auth.agent-key.failure`. `POST /v1/agents` now
+  also works with `agent-key` alone (the reservation has no tenant, and only a key can
+  redeem it). Key rotation is not supported yet: delete the agent and enroll a new one.
+  Guide: [docs/agent-key-sign-in.md](docs/agent-key-sign-in.md), with a PowerShell
+  example that keeps the key in the TPM.
+- `GET /v1/agents` lists two more fields per agent: `credential` (`"entra-app"`,
+  `"agent-key"`, or `null` while pending) and `key_thumbprint` (the key's thumbprint for
+  `agent-key`, otherwise `null`).
+- Helm: `auth.signIn.providers` accepts `agent-key`, and
+  `auth.signIn.agentKey.{audience,maxSessionHours}` render the two variables (the
+  audience only when set). The chart validates both.
+- auth migration `0009_agent_key.sql` makes `auth.agent_enrollment.tenant_id` nullable
+  and adds the `auth.agent_key_assertion` replay table. It changes no existing data and
+  runs with the usual auth migrations. During a rolling upgrade an old pod fails (500)
+  only a redemption of a tenantless reservation, which only a new pod with `agent-key`
+  makes.
+
 ### Changed
 
+- `serve_with` refuses an `Overrides` authenticator with the built-in id `agent-key`, as
+  for `entra-app`. An `Overrides` admission is also accepted with `agent-key` alone, and
+  the start-up error without any sign-in by token now names all of them (`entra`,
+  `entra-app`, `agent-key`, `external`).
+- Chart: the email errors now say "without password" instead of naming `entra`, since
+  any `auth.signIn.providers` list without `password` writes no email.
 - **Deleting an agent releases its app identity** (REQUEST PUSH feature 7). `DELETE
   /v1/agents/{agent_id}` of an active agent still disables it for good and revokes its
   devices and tokens, and now also releases its app registration or managed identity in

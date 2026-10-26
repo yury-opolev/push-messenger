@@ -1,8 +1,8 @@
 //! Security events: one structured log line, under the `security` target, for every
-//! security-relevant outcome of the public API — sign-ins (email and password, or Entra
-//! ID), refused tokens, rate limits, bad links, password resets, device changes. A
-//! middleware classifies each answer by its route, status and error code, so no handler
-//! can forget to log.
+//! security-relevant outcome of the public API — sign-ins (email and password, Entra
+//! ID, an agent's key or an external authenticator), refused tokens, rate limits, bad
+//! links, password resets, device changes. A middleware classifies each answer by its
+//! route, status and error code, so no handler can forget to log.
 //!
 //! The line carries the event name, the route, the status, the error code, the client IP
 //! and, where the answer knows them, the user and device ids; never an email address, a
@@ -17,6 +17,7 @@ use axum::response::Response;
 use uuid::Uuid;
 
 use crate::api::{Api, client_ip};
+use crate::identity::AGENT_KEY_ROUTE;
 
 /// The error code of a refused request ([`crate::AuthError::code`]), attached to its
 /// answer.
@@ -43,7 +44,14 @@ pub(crate) async fn audit(State(api): State<Api>, request: Request, next: Next) 
     let response = next.run(request).await;
     let status = response.status();
     let code = response.extensions().get::<ErrorCode>().map(|code| code.0);
-    let event = if api.auth.is_external_route(&route) {
+    let event = if route == AGENT_KEY_ROUTE && api.auth.agent_key_offered() {
+        sign_in_event(
+            status,
+            code,
+            "auth.agent-key.success",
+            "auth.agent-key.failure",
+        )
+    } else if api.auth.is_external_route(&route) {
         external_event(status, code)
     } else {
         event(&method, &route, status, code)
@@ -124,6 +132,24 @@ pub(crate) fn event(
 /// and security-relevant error code. Ordinary malformed bodies are not audited. A provider that
 /// keeps the id `entra` keeps Entra ID's events instead.
 pub(crate) fn external_event(status: StatusCode, code: Option<&str>) -> Option<&'static str> {
+    sign_in_event(
+        status,
+        code,
+        "auth.external.success",
+        "auth.external.failure",
+    )
+}
+
+/// The event of an answer of a sign-in by token, `success` or `failure`, by its status
+/// and security-relevant error code: rate limits are `auth.rate_limited`, and
+/// unavailable answers and ordinary malformed bodies (400 other than
+/// `enrollment_invalid`) are not audited.
+pub(crate) fn sign_in_event(
+    status: StatusCode,
+    code: Option<&str>,
+    success: &'static str,
+    failure: &'static str,
+) -> Option<&'static str> {
     if status == StatusCode::TOO_MANY_REQUESTS {
         return Some("auth.rate_limited");
     }
@@ -133,9 +159,9 @@ pub(crate) fn external_event(status: StatusCode, code: Option<&str>) -> Option<&
         return None;
     }
     Some(if status.is_success() {
-        "auth.external.success"
+        success
     } else {
-        "auth.external.failure"
+        failure
     })
 }
 
@@ -331,6 +357,29 @@ mod tests {
         for (status, code, expected) in cases {
             let status = StatusCode::from_u16(status).unwrap();
             assert_eq!(external_event(status, code), expected, "{status} {code:?}");
+        }
+    }
+
+    #[test]
+    fn agent_key_sign_ins_have_events_of_their_own() {
+        let (success, failure) = ("auth.agent-key.success", "auth.agent-key.failure");
+        let cases = [
+            (200, None, Some(success)),
+            (401, Some("token_invalid"), Some(failure)),
+            (403, Some("sign_in_not_permitted"), Some(failure)),
+            (409, Some("identity_in_use"), Some(failure)),
+            (400, Some("enrollment_invalid"), Some(failure)),
+            (400, Some("invalid"), None),
+            (503, Some("identity_unavailable"), None),
+            (429, Some("rate_limited"), Some("auth.rate_limited")),
+        ];
+        for (status, code, expected) in cases {
+            let status = StatusCode::from_u16(status).unwrap();
+            assert_eq!(
+                sign_in_event(status, code, success, failure),
+                expected,
+                "{status} {code:?}"
+            );
         }
     }
 }

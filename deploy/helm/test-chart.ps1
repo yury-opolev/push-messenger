@@ -802,6 +802,34 @@ Check 'app sign-in: defaults stay off, egress and email-off rules apply' {
         (Render ($appSignInArgs + @('--set', 'worker.email.sender=none'))) -eq 0 -and
         (Render ($appSignInArgs + @('--set', 'worker.email.webhook.enabled=true'))) -ne 0
 }
+Check 'sign-in: agent-key renders its audience and session' {
+    $keyArgs = @('--set', 'auth.signIn.providers=password\,agent-key')
+    $rendered = helm template push $chart @keyArgs --set auth.signIn.agentKey.audience=https://api.example.com `
+        --set auth.signIn.agentKey.maxSessionHours=8 2>&1 | Out-String
+    $exit = $LASTEXITCODE
+    $auth = Doc $rendered 'Deployment' 'push-auth'
+    $plain = Doc (helm template push $chart @keyArgs 2>&1 | Out-String) 'Deployment' 'push-auth'
+    $default = helm template push $chart | Out-String
+    $bad = @(
+        'auth.signIn.agentKey.maxSessionHours=0',
+        'auth.signIn.agentKey.maxSessionHours=721',
+        'auth.signIn.agentKey.maxSessionHours=1.5',
+        'auth.signIn.agentKey.audience=a b',
+        'auth.signIn.providers=agent-key\,agent-key'
+    )
+    $exit -eq 0 -and
+        $auth -match '(?s)name: PUSH_AUTH_PROVIDERS\s+value: "password,agent-key"' -and
+        $auth -match '(?s)name: PUSH_AUTH_AGENT_KEY_AUDIENCE\s+value: "https://api.example.com"' -and
+        $auth -match '(?s)name: PUSH_AUTH_AGENT_KEY_MAX_SESSION_HOURS\s+value: "8"' -and
+        $auth -notmatch 'PUSH_ENTRA_' -and
+        $plain -match '(?s)name: PUSH_AUTH_AGENT_KEY_MAX_SESSION_HOURS\s+value: "24"' -and
+        $plain -notmatch 'PUSH_AUTH_AGENT_KEY_AUDIENCE' -and
+        $default -notmatch 'PUSH_AUTH_AGENT_KEY_' -and
+        @($bad | Where-Object { (Render ($keyArgs + @('--set', $_))) -eq 0 }).Count -eq 0 -and
+        (Render ($keyArgs + @('--set', 'auth.signIn.agentKey.maxSessionHours=720'))) -eq 0 -and
+        (Render @('--set', 'auth.signIn.providers=agent-key', '--set', 'worker.email.sender=none')) -eq 0 -and
+        (Render ($signInArgs + @('--set', 'auth.signIn.providers=entra\,agent-key'))) -eq 0
+}
 Check 'sign-in: both providers render, in either order' {
     (Render ($signInArgs + @('--set', 'auth.signIn.providers=password\,entra'))) -eq 0 -and
         (Render ($signInArgs + @('--set', 'auth.signIn.providers=entra\, password'))) -eq 0

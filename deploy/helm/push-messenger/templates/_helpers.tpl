@@ -348,13 +348,14 @@ start-up, so a bad value stops the install instead of the pods: the providers; w
 the API's application id (optionally its api:// URI, at most four), the tenants (exactly
 one of common, organizations, consumers, or one to twenty distinct tenant ids; never a
 mixture), an https authority host, one scope or *, one role, client app ids, 1 to 720
-session hours, an http(s) proxy URL. Entra-only installations write no email, so the
+session hours, an http(s) proxy URL; with agent-key 1 to 720 session hours and an optional
+audience of visible ASCII. Installations without password write no email, so the
 Resend sender and the webhook are refused with them, and the none sender without them.
 The admin listener is a boolean; its peers carry both label maps.
 */}}
 {{- define "push.checkSignIn" -}}
 {{- $signIn := .Values.auth.signIn -}}
-{{- $providerError := printf "auth.signIn.providers must list password, entra, entra-app, each at most once, not %q" (toString $signIn.providers) -}}
+{{- $providerError := printf "auth.signIn.providers must list password, entra, entra-app, agent-key, each at most once, not %q" (toString $signIn.providers) -}}
 {{- if not (kindIs "string" $signIn.providers) -}}
 {{- fail $providerError -}}
 {{- end -}}
@@ -363,7 +364,20 @@ The admin listener is a boolean; its peers carry both label maps.
 {{- fail $providerError -}}
 {{- end -}}
 {{- range $providers -}}
-{{- if not (has . (list "password" "entra" "entra-app")) -}}{{- fail $providerError -}}{{- end -}}
+{{- if not (has . (list "password" "entra" "entra-app" "agent-key")) -}}{{- fail $providerError -}}{{- end -}}
+{{- end -}}
+{{- if has "agent-key" $providers -}}
+{{- $key := $signIn.agentKey -}}
+{{- $hours := int $key.maxSessionHours -}}
+{{- if or (lt $hours 1) (gt $hours 720) (ne (toString $hours) (toString $key.maxSessionHours)) -}}
+{{- fail "auth.signIn.agentKey.maxSessionHours must be a whole number of hours from 1 to 720" -}}
+{{- end -}}
+{{- if not (kindIs "string" $key.audience) -}}
+{{- fail "auth.signIn.agentKey.audience must be a string" -}}
+{{- end -}}
+{{- if and $key.audience (not (regexMatch "^[!-~]{1,256}$" $key.audience)) -}}
+{{- fail "auth.signIn.agentKey.audience must be 1 to 256 visible ASCII characters (no spaces)" -}}
+{{- end -}}
 {{- end -}}
 {{- $agents := int .Values.auth.agentsPerUser -}}
 {{- if or (lt $agents 0) (gt $agents 100) (ne (toString $agents) (toString .Values.auth.agentsPerUser)) -}}
@@ -514,13 +528,13 @@ The admin listener is a boolean; its peers carry both label maps.
 {{- end -}}
 {{- if include "push.emailOff" . -}}
 {{- if eq .Values.worker.email.sender "resend" -}}
-{{- fail "auth.signIn.providers entra writes no email: use worker.email.sender log or none (the chart renders none)" -}}
+{{- fail "auth.signIn.providers without password writes no email: use worker.email.sender log or none (the chart renders none)" -}}
 {{- end -}}
 {{- if .Values.worker.email.webhook.enabled -}}
-{{- fail "auth.signIn.providers entra writes no email: set worker.email.webhook.enabled false" -}}
+{{- fail "auth.signIn.providers without password writes no email: set worker.email.webhook.enabled false" -}}
 {{- end -}}
 {{- else if eq .Values.worker.email.sender "none" -}}
-{{- fail "worker.email.sender none sends no email, but password sign-in needs its verification and reset emails: use log or resend, or auth.signIn.providers entra" -}}
+{{- fail "worker.email.sender none sends no email, but password sign-in needs its verification and reset emails: use log or resend, or drop password from auth.signIn.providers" -}}
 {{- end -}}
 {{- end -}}
 
@@ -555,6 +569,14 @@ connection auth-svc makes (rustls-native-certs reads SSL_CERT_FILE alone).
 {{- if ne $providers "password" }}
 - name: PUSH_AUTH_PROVIDERS
   value: {{ $providers | quote }}
+{{- end }}
+{{- if has "agent-key" (splitList "," $providers) }}
+{{- with $signIn.agentKey.audience }}
+- name: PUSH_AUTH_AGENT_KEY_AUDIENCE
+  value: {{ . | quote }}
+{{- end }}
+- name: PUSH_AUTH_AGENT_KEY_MAX_SESSION_HOURS
+  value: {{ int $signIn.agentKey.maxSessionHours | quote }}
 {{- end }}
 {{- if include "push.entraSignIn" . }}
 {{- $entra := $signIn.entra }}

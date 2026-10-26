@@ -17,14 +17,15 @@ use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
 use crate::admin::{AdminApi, admin_router};
+use crate::agent_key::AgentKeySignIn;
 use crate::api::{Api, router};
 use crate::config::{Config, MigrateConfig};
 use crate::db::{MIGRATOR, grant_worker_access_on};
 use crate::directory::{Directory, GrpcDirectory, NoDirectory};
 use crate::entra::{EntraSignIn, Providers};
 use crate::identity::{
-    Admission, Authenticator, ENTRA_PROVIDER, MAX_SESSION_LIMIT, RESERVED_PROVIDER_IDS,
-    is_provider_id,
+    AGENT_PROVIDERS, Admission, Authenticator, ENTRA_PROVIDER, MAX_SESSION_LIMIT,
+    RESERVED_PROVIDER_IDS, is_provider_id,
 };
 use crate::limits::{Limits, RedisCounter};
 use crate::links::LinkSigner;
@@ -113,6 +114,10 @@ pub async fn serve_with(
         _ => None,
     };
     let entra = entra.filter(|_| config.providers.entra);
+    // The agent-key authenticator needs the pool, but its settings are checked now too.
+    if let Some(settings) = &config.agent_key {
+        crate::agent_key::check(settings).map_err(anyhow::Error::msg)?;
+    }
     let azure = config
         .azure
         .as_ref()
@@ -166,7 +171,7 @@ pub async fn serve_with(
     };
 
     if !config.providers.password {
-        if config.providers.external {
+        if config.providers.external || config.providers.agent_key {
             tracing::info!("email and password sign-in is off: only sign-in by token is served");
         } else {
             tracing::info!(
@@ -193,6 +198,12 @@ pub async fn serve_with(
     });
     let auth = match entra_app {
         Some(app) => auth.with_entra_app(app),
+        None => auth,
+    };
+    let auth = match &config.agent_key {
+        Some(settings) => auth.with_agent_key(
+            AgentKeySignIn::new(settings.clone(), pool.clone()).map_err(anyhow::Error::msg)?,
+        ),
         None => auth,
     };
     let auth = match overrides.authenticator {
@@ -318,8 +329,11 @@ pub(crate) fn check_overrides(providers: &Providers, overrides: &Overrides) -> R
                      external)"
                 ));
             }
-            if id == crate::identity::ENTRA_APP_PROVIDER {
-                return Err("entra-app is a built-in provider: explicitly enable it in PUSH_AUTH_PROVIDERS, not an Overrides authenticator".to_owned());
+            if AGENT_PROVIDERS.contains(&id) {
+                return Err(format!(
+                    "{id} is a built-in provider: explicitly enable it in \
+                     PUSH_AUTH_PROVIDERS, not an Overrides authenticator"
+                ));
             }
             if providers.entra && id == ENTRA_PROVIDER {
                 return Err("PUSH_AUTH_PROVIDERS names entra and external, but the \
@@ -340,11 +354,13 @@ pub(crate) fn check_overrides(providers: &Providers, overrides: &Overrides) -> R
     if overrides.admission.is_some()
         && !providers.entra
         && !providers.entra_app
+        && !providers.agent_key
         && !providers.external
     {
         return Err(
             "an admission was supplied in Overrides, but PUSH_AUTH_PROVIDERS names \
-                    neither entra nor external: no sign-in would ask it"
+                    no sign-in by token (entra, entra-app, agent-key or external): no sign-in \
+                    would ask it"
                 .to_owned(),
         );
     }
@@ -553,6 +569,13 @@ mod tests {
                     admission: Some(RequireGroup::new("agents")),
                 },
             ),
+            (
+                "agent-key",
+                Overrides {
+                    authenticator: None,
+                    admission: Some(RequireGroup::new("agents")),
+                },
+            ),
         ] {
             assert_eq!(
                 check_overrides(&providers(names), &overrides),
@@ -576,6 +599,12 @@ mod tests {
             ),
             ("entra,external", with("entra", hour), "entra too"),
             ("external", with("entra-app", hour), "built-in provider"),
+            ("external", with("agent-key", hour), "built-in provider"),
+            (
+                "agent-key,external",
+                with("agent-key", hour),
+                "built-in provider",
+            ),
             (
                 "entra-app,external",
                 with("entra-app", hour),
@@ -593,12 +622,18 @@ mod tests {
                     authenticator: None,
                     admission: Some(RequireGroup::new("staff")),
                 },
-                "neither entra nor external",
+                "no sign-in by token",
             ),
         ];
         for (names, overrides, expected) in refused {
             let message = check_overrides(&providers(names), &overrides).unwrap_err();
             assert!(message.contains(expected), "{names}: {message}");
+            if expected == "no sign-in by token" {
+                assert!(
+                    message.contains("agent-key") && message.contains("entra-app"),
+                    "{message}"
+                );
+            }
             assert!(
                 message.contains("PUSH_AUTH_PROVIDERS") || message.contains("Overrides"),
                 "{message}"
