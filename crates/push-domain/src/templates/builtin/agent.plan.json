@@ -1,0 +1,18 @@
+{
+  "format": "tpl/1",
+  "publisher": "agent",
+  "name": "plan",
+  "version": 1,
+  "title": "Plan",
+  "senders": ["agent"],
+  "params": {
+    "title": {"type": "string", "max_len": 120},
+    "steps": {"type": "list", "item": {"type": "step"}, "max_items": 50},
+    "state": {"type": "enum", "values": ["draft", "running", "done", "failed"], "optional": true}
+  },
+  "layout": [
+    {"type": "heading", "param": "title"},
+    {"type": "status", "param": "state", "label": "State"},
+    {"type": "steps", "param": "steps", "label": "Steps"}
+  ]
+}

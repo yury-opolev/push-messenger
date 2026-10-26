@@ -9,14 +9,20 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
+mod body;
+mod builtin;
 mod definition;
+mod outline;
 mod strict;
 mod wording;
 
+pub use body::{AnswerBody, ListItem, ParamValue, Params, RichBody, StepStatus};
+pub use builtin::builtins;
 pub use definition::{
     Block, ButtonOption, ButtonStyle, ChoiceOption, Choices, Definition, ItemType, ParamSpec,
     ParamType, Source,
 };
+pub use outline::outline;
 pub use wording::{check_literal, check_value, looks_like_url};
 
 /// The format tag every definition carries.
