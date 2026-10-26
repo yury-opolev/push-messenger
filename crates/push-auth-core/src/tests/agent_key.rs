@@ -279,6 +279,18 @@ async fn a_key_enrolls_signs_in_and_another_key_is_refused() {
             .as_str()
             .is_some_and(|t| !t.is_empty())
     );
+    // The session is the agent-key provider's own maximum (one hour in key_world).
+    let session_end: Option<i64> =
+        sqlx::query_scalar("SELECT session_expires_at FROM auth.device WHERE device_id = $1")
+            .bind(device.device_id)
+            .fetch_one(&world.pool)
+            .await
+            .unwrap();
+    let expected = unix_now() + 3600;
+    assert!(
+        session_end.is_some_and(|end| (expected - 5..=expected).contains(&end)),
+        "{session_end:?}"
+    );
 
     let accounts = world.accounts().await;
     let other = TestKey::generate();

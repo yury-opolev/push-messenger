@@ -30,8 +30,9 @@ Notable changes for consumers of push-messenger. Newest first.
   audience only when set). The chart validates both.
 - auth migration `0009_agent_key.sql` makes `auth.agent_enrollment.tenant_id` nullable
   and adds the `auth.agent_key_assertion` replay table. It changes no existing data and
-  runs with the usual auth migrations. During a rolling upgrade an old pod fails only a
-  redemption of a tenantless reservation, which only a new pod with `agent-key` makes.
+  runs with the usual auth migrations. During a rolling upgrade an old pod fails (500)
+  only a redemption of a tenantless reservation, which only a new pod with `agent-key`
+  makes.
 
 ### Changed
 
@@ -41,7 +42,6 @@ Notable changes for consumers of push-messenger. Newest first.
   `entra-app`, `agent-key`, `external`).
 - Chart: the email errors now say "without password" instead of naming `entra`, since
   any `auth.signIn.providers` list without `password` writes no email.
-
 - **Deleting an agent releases its app identity** (REQUEST PUSH feature 7). `DELETE
   /v1/agents/{agent_id}` of an active agent still disables it for good and revokes its
   devices and tokens, and now also releases its app registration or managed identity in

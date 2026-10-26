@@ -154,12 +154,14 @@ one with the new key: that is a new account, with a new user id.
 | 400 | `enrollment_invalid` | the code is wrong, expired or spent |
 | 400 | `invalid` | a malformed body, or both `enrollment_code` and `device_id` |
 | 401 | `token_invalid` | the assertion is refused (see the reasons below), including a replay and a key that no agent has enrolled; no account is created |
+| 401 | `session_expired` | `POST /v1/auth/refresh` past the maximum session age; sign the device in again |
 | 403 | `enrollment_not_permitted` | `PUSH_AGENTS_PER_USER` is `0` |
 | 403 | `sign_in_not_permitted` | an admission of your own refused the agent |
-| 404 | | `agent-key` is not enabled |
+| 404 | | `agent-key` is not enabled (the route does not exist) |
+| 404 | `device_not_found` | `{token, device_id}` names a device that is not an active device of this agent |
 | 409 | `identity_in_use` | the key is already bound to a live agent; the code is not spent |
 | 429 | `rate_limited` | the limits below |
-| 503 | `identity_unavailable` | the replay cache (PostgreSQL) cannot be reached |
+| 503 | `identity_unavailable` | the replay cache (PostgreSQL) cannot be reached, or an admission of your own cannot decide |
 
 The route shares the token sign-in limits: 60 requests per 15 minutes per IP, and 20 per
 15 minutes per key once its assertion is accepted.
@@ -196,7 +198,10 @@ function Get-AgentKey([string] $Name) {
     $providers = 'Microsoft Platform Crypto Provider', 'Microsoft Software Key Storage Provider'
     foreach ($providerName in $providers) {
         $provider = [System.Security.Cryptography.CngProvider]::new($providerName)
-        if ([System.Security.Cryptography.CngKey]::Exists($Name, $provider)) {
+        # Opening a provider fails where it is unusable (no TPM): try the next one.
+        try { $exists = [System.Security.Cryptography.CngKey]::Exists($Name, $provider) }
+        catch { continue }
+        if ($exists) {
             return [System.Security.Cryptography.CngKey]::Open($Name, $provider)
         }
     }
