@@ -7,13 +7,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::TimeDelta;
+use push_domain::templates::TemplateRef;
 use push_domain::{
-    ContactState, DeviceId, DomainError, Event, MAX_PENDING_PER_USER, ReceiptUpdate, SendReceipt,
-    Store, TemplateStatus, Tx, UserId,
+    ContactState, ContentType, DeviceId, DomainError, Event, MAX_PENDING_PER_USER, ReceiptUpdate,
+    ReviewAction, ReviewCommand, SendReceipt, Store, TemplateStatus, Tx, UserId,
 };
 use tokio::task::JoinSet;
 
-use crate::{Backend, Case, World, case_list, seqs, text};
+use crate::{Backend, Case, World, case_list, message, seqs, text};
 
 /// Runs every future at the same time, each on its own task, and returns their results
 /// in the order given.
@@ -417,6 +418,92 @@ async fn concurrent_seeders_store_each_builtin_once<B: Backend>(backend: &B) {
     assert_eq!(catalog.seq, 4);
 }
 
+const APPROVAL: &str = r#"{"tpl":"agent.approval@1","params":{"title":"Deploy v2","details":"Ship it to production?"},"fallback":"Deploy v2 to production?"}"#;
+
+async fn concurrent_answers_to_a_card_answer_it_once<B: Backend>(backend: &B) {
+    let world = Arc::new(World::new(backend).await);
+    world.svc.seed_builtin_templates().await.unwrap();
+    let (alice, bob) = (world.person().await, world.person().await);
+    let agent = world.agent(&alice).await;
+    world.befriend(&alice, &bob).await;
+    let group = world
+        .svc
+        .create_group(alice.user, "Group", &[agent.user, bob.user])
+        .await
+        .unwrap();
+
+    for _ in 0..5 {
+        let card = world
+            .svc
+            .send_message(message(&agent, group, ContentType::Rich, APPROVAL))
+            .await
+            .unwrap();
+        let body = format!(
+            r#"{{"card":"{}","values":["approve"],"fallback":"Approved"}}"#,
+            card.message_id
+        );
+        let answers = [alice, bob]
+            .into_iter()
+            .map(|member| {
+                let (world, body) = (Arc::clone(&world), body.clone());
+                async move {
+                    world
+                        .svc
+                        .send_message(message(&member, group, ContentType::Answer, &body))
+                        .await
+                }
+            })
+            .collect();
+        let results = all(answers).await;
+
+        let answered: Vec<&SendReceipt> = results.iter().filter_map(|r| r.as_ref().ok()).collect();
+        assert_eq!(answered.len(), 1, "{results:?}");
+        assert!(
+            results.contains(&Err(DomainError::CardAnswered)),
+            "{results:?}"
+        );
+        assert_eq!(
+            world.entry(group, card.message_id).await.answer_seq,
+            Some(answered[0].seq)
+        );
+    }
+}
+
+/// A send that has read a template holds it: a revocation waits until the send ends, so
+/// it can never commit between the send's check and its message.
+async fn a_revocation_waits_for_a_send_that_read_the_template<B: Backend>(backend: &B) {
+    let world = Arc::new(World::new(backend).await);
+    world.svc.seed_builtin_templates().await.unwrap();
+    let template: TemplateRef = "agent.approval@1".parse().unwrap();
+
+    let mut send = world.store.begin().await.unwrap();
+    let read = send.template_for_send(&template).await.unwrap().unwrap();
+    assert_eq!(read.status, TemplateStatus::Approved);
+    let revoke = {
+        let (world, template) = (Arc::clone(&world), template.clone());
+        tokio::spawn(async move {
+            world
+                .svc
+                .review_template(ReviewCommand {
+                    template,
+                    action: ReviewAction::Revoke,
+                    reviewer: "ops".to_owned(),
+                    note: None,
+                })
+                .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!revoke.is_finished(), "the revocation did not wait");
+    send.commit().await.unwrap();
+    revoke.await.unwrap().unwrap();
+
+    let mut tx = world.store.begin().await.unwrap();
+    let after = tx.template_for_send(&template).await.unwrap().unwrap();
+    assert_eq!(after.status, TemplateStatus::Revoked);
+    tx.rollback().await.unwrap();
+}
+
 /// The scenarios that need a store with concurrent transactions.
 pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
     case_list![
@@ -431,6 +518,8 @@ pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
         a_deadlock_is_reported_as_a_retryable_conflict,
         concurrent_submissions_never_exceed_the_pending_cap,
         concurrent_seeders_store_each_builtin_once,
+        concurrent_answers_to_a_card_answer_it_once,
+        a_revocation_waits_for_a_send_that_read_the_template,
     ]
     .into_iter()
     .map(|case| case.within("concurrency"))

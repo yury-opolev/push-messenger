@@ -4,10 +4,10 @@
 use push_domain::templates::TemplateError;
 use push_domain::{
     ContentType, ConversationId, DomainError, EntryKind, MAX_TEXT_BYTES, MessageRef, ReviewAction,
-    ReviewCommand, SendReceipt, Store, ValidationError,
+    ReviewCommand, SendMessage, SendReceipt, Store, ValidationError,
 };
 
-use crate::{Backend, Case, Person, World, case_list, delete, edit, message};
+use crate::{Backend, Case, Person, World, case_list, delete, edit, message, text};
 
 const APPROVAL: &str = r#"{"tpl":"agent.approval@1","params":{"title":"Deploy v2","details":"Ship it to production?"},"fallback":"Deploy v2 to production?"}"#;
 
@@ -557,6 +557,70 @@ async fn a_retry_of_a_card_returns_its_receipt_after_a_revocation<B: Backend>(ba
     );
 }
 
+async fn a_client_msg_id_reused_for_another_content_type_conflicts<B: Backend>(backend: &B) {
+    let (world, person, agent, chat) = agent_chat(backend).await;
+    let card = sent(&world, &agent, chat, ContentType::Rich, APPROVAL).await;
+    let text = text(&person, chat, "approve");
+    world.svc.send_text(text.clone()).await.unwrap();
+
+    let reused = SendMessage {
+        client_msg_id: text.client_msg_id,
+        ..message(
+            &person,
+            chat,
+            ContentType::Answer,
+            &answer(&card, &["approve"]),
+        )
+    };
+    assert_eq!(
+        world.svc.send_message(reused).await,
+        Err(DomainError::ClientIdConflict)
+    );
+    assert_eq!(world.entry(chat, card.message_id).await.answer_seq, None);
+}
+
+async fn a_member_who_joined_after_a_card_cannot_answer_it<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
+    world.svc.seed_builtin_templates().await.unwrap();
+    let alice = world.person().await;
+    let agent = world.agent(&alice).await;
+    let dave = world.person().await;
+    // The agent is already its owner's contact.
+    let group = world
+        .svc
+        .create_group(alice.user, "Group", &[agent.user])
+        .await
+        .unwrap();
+    let card = sent(&world, &agent, group, ContentType::Rich, APPROVAL).await;
+    world.befriend(&alice, &dave).await;
+    world
+        .svc
+        .add_members(alice.user, group, &[dave.user])
+        .await
+        .unwrap();
+
+    assert_eq!(
+        world
+            .svc
+            .send_message(message(
+                &dave,
+                group,
+                ContentType::Answer,
+                &answer(&card, &["approve"])
+            ))
+            .await,
+        Err(DomainError::TargetNotFound)
+    );
+    sent(
+        &world,
+        &alice,
+        group,
+        ContentType::Answer,
+        &answer(&card, &["approve"]),
+    )
+    .await;
+}
+
 async fn deleting_an_answer_leaves_the_card_answered<B: Backend>(backend: &B) {
     let (world, person, agent, chat) = agent_chat(backend).await;
     let card = sent(&world, &agent, chat, ContentType::Rich, APPROVAL).await;
@@ -620,6 +684,8 @@ pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
         answered_cards_and_answers_cannot_be_edited,
         text_edits_are_still_checked_as_text,
         a_retry_of_a_card_returns_its_receipt_after_a_revocation,
+        a_client_msg_id_reused_for_another_content_type_conflicts,
+        a_member_who_joined_after_a_card_cannot_answer_it,
         deleting_an_answer_leaves_the_card_answered,
     ]
 }

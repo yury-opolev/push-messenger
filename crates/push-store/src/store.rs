@@ -74,6 +74,29 @@ impl PgTx {
     fn conn(&mut self) -> &mut PgConnection {
         &mut self.tx
     }
+
+    /// Reads a template version; `lock` is appended to the query (`""`, `" FOR SHARE"` or
+    /// `" FOR UPDATE"`).
+    async fn read_template(
+        &mut self,
+        template: &TemplateRef,
+        lock: &'static str,
+    ) -> DomainResult<Option<StoredTemplate>> {
+        let sql = format!(
+            "SELECT {} FROM messaging.template_version t \
+             WHERE t.publisher = $1 AND t.name = $2 AND t.version = $3{lock}",
+            template_columns!()
+        );
+        let row = sqlx::query(&sql)
+            .bind(&template.publisher)
+            .bind(&template.name)
+            .bind(i32::from(template.version))
+            .fetch_optional(self.conn())
+            .await
+            .map_err(store_error)?;
+        row.map(|row| rows::template(&row).map_err(store_error))
+            .transpose()
+    }
 }
 
 #[async_trait]
@@ -1096,40 +1119,21 @@ impl Tx for PgTx {
     }
 
     async fn template(&mut self, template: &TemplateRef) -> DomainResult<Option<StoredTemplate>> {
-        let row = sqlx::query(concat!(
-            "SELECT ",
-            template_columns!(),
-            " FROM messaging.template_version t \
-             WHERE t.publisher = $1 AND t.name = $2 AND t.version = $3"
-        ))
-        .bind(&template.publisher)
-        .bind(&template.name)
-        .bind(i32::from(template.version))
-        .fetch_optional(self.conn())
-        .await
-        .map_err(store_error)?;
-        row.map(|row| rows::template(&row).map_err(store_error))
-            .transpose()
+        self.read_template(template, "").await
+    }
+
+    async fn template_for_send(
+        &mut self,
+        template: &TemplateRef,
+    ) -> DomainResult<Option<StoredTemplate>> {
+        self.read_template(template, " FOR SHARE").await
     }
 
     async fn lock_template(
         &mut self,
         template: &TemplateRef,
     ) -> DomainResult<Option<StoredTemplate>> {
-        let row = sqlx::query(concat!(
-            "SELECT ",
-            template_columns!(),
-            " FROM messaging.template_version t \
-             WHERE t.publisher = $1 AND t.name = $2 AND t.version = $3 FOR UPDATE"
-        ))
-        .bind(&template.publisher)
-        .bind(&template.name)
-        .bind(i32::from(template.version))
-        .fetch_optional(self.conn())
-        .await
-        .map_err(store_error)?;
-        row.map(|row| rows::template(&row).map_err(store_error))
-            .transpose()
+        self.read_template(template, " FOR UPDATE").await
     }
 
     async fn insert_template(&mut self, template: StoredTemplate) -> DomainResult<InsertOutcome> {

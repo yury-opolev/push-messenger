@@ -111,6 +111,7 @@ where
                 command.conversation,
                 command.client_msg_id,
                 EntryKind::Message,
+                Some(command.content_type),
             )
             .await?;
         let Append {
@@ -164,6 +165,7 @@ where
                     command.client_msg_id,
                     command.sender,
                     EntryKind::Message,
+                    Some(command.content_type),
                 )
                 .await;
         }
@@ -207,7 +209,8 @@ where
 
     /// The common start of every append (spec §4.2): checks the device, locks the
     /// conversation and takes the next `seq`, answers a retry with its original receipt,
-    /// then checks that the sender may write.
+    /// then checks that the sender may write. `content_type` is the content type a send
+    /// appends, which its retry must match; `None` for an edit or delete.
     pub(crate) async fn prepare_append(
         &self,
         sender: UserId,
@@ -215,6 +218,7 @@ where
         conversation: ConversationId,
         client_msg_id: ClientMsgId,
         kind: EntryKind,
+        content_type: Option<ContentType>,
     ) -> DomainResult<Prepared<S::Tx>> {
         let mut tx = self.store.begin().await?;
         if require_device(&mut tx, device).await? != sender {
@@ -234,7 +238,7 @@ where
             .await?
         {
             tx.rollback().await?;
-            return receipt_for(&original, sender, kind).map(Prepared::Retry);
+            return receipt_for(&original, sender, kind, content_type).map(Prepared::Retry);
         }
 
         let members = tx.members(conversation.id).await?;
@@ -263,13 +267,14 @@ where
     }
 
     /// The receipt of an already stored entry, if it is the same sender's entry of the
-    /// same kind.
+    /// same kind (and, for a send, content type).
     pub(crate) async fn replay_append(
         &self,
         conversation: ConversationId,
         client_msg_id: ClientMsgId,
         sender: UserId,
         kind: EntryKind,
+        content_type: Option<ContentType>,
     ) -> DomainResult<SendReceipt> {
         let mut tx = self.store.begin().await?;
         let original = tx
@@ -279,13 +284,23 @@ where
                 DomainError::Store("duplicate entry disappeared after a conflict".into())
             })?;
         tx.rollback().await?;
-        receipt_for(&original, sender, kind)
+        receipt_for(&original, sender, kind, content_type)
     }
 }
 
-/// The receipt of a stored entry, if `sender` stored it as an entry of `kind`.
-fn receipt_for(original: &Entry, sender: UserId, kind: EntryKind) -> DomainResult<SendReceipt> {
-    if original.sender_id != sender || original.kind != kind {
+/// The receipt of a stored entry, if `sender` stored it as an entry of `kind` and, when
+/// given, of `content_type`. An edit or delete takes its target's content type, so only a
+/// send compares it.
+fn receipt_for(
+    original: &Entry,
+    sender: UserId,
+    kind: EntryKind,
+    content_type: Option<ContentType>,
+) -> DomainResult<SendReceipt> {
+    if original.sender_id != sender
+        || original.kind != kind
+        || content_type.is_some_and(|content_type| original.content_type != content_type)
+    {
         return Err(DomainError::ClientIdConflict);
     }
     Ok(SendReceipt::from(original))

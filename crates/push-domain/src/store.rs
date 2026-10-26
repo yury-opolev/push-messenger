@@ -39,12 +39,16 @@
 //! a cycle.
 //!
 //! Template operations lock in the order publisher ([`Tx::claim_publisher`]) → version
-//! ([`Tx::lock_template`]) → change counter ([`Tx::next_template_change`]), and take no
-//! messaging locks. A submission first takes its submitter's lock ([`Tx::lock_users`]),
-//! before the publisher, so one account's submissions are serialised and cannot both
-//! pass the pending cap. That puts a user lock first, unlike the messaging paths, which
-//! take user locks last; no cycle can form, because no messaging path takes a template
-//! lock and no template path takes a messaging lock other than that one user lock.
+//! ([`Tx::lock_template`]) → change counter ([`Tx::next_template_change`]). A submission
+//! first takes its submitter's lock ([`Tx::lock_users`]), before the publisher, so one
+//! account's submissions are serialised and cannot both pass the pending cap. That puts a
+//! user lock first, unlike the messaging paths, which take user locks last. A message that
+//! uses a template (a RICH send or edit, an ANSWER) takes the version's share lock
+//! ([`Tx::template_for_send`]) after its conversation lock, so a revocation cannot commit
+//! between the check and the message. No cycle can form: a review takes the version's
+//! row lock and then the counter and never a conversation lock; a submission takes no
+//! conversation lock and inserts versions nobody can use yet; and the messaging paths take
+//! the version share lock last, holding no user lock when they take it.
 //!
 //! # Delivery positions
 //!
@@ -412,6 +416,14 @@ pub trait Tx: Send {
     async fn is_agent(&mut self, user: UserId) -> DomainResult<bool>;
     /// The stored version, or `None`.
     async fn template(&mut self, template: &TemplateRef) -> DomainResult<Option<StoredTemplate>>;
+    /// The stored version, or `None`, read for a message that uses it. Holds a share lock
+    /// on the version's row until the transaction ends (`SELECT … FOR SHARE`), so a review
+    /// that revokes it waits for the message to commit, and a message read after the
+    /// revocation commits sees it revoked.
+    async fn template_for_send(
+        &mut self,
+        template: &TemplateRef,
+    ) -> DomainResult<Option<StoredTemplate>>;
     /// The stored version, or `None`. Locks the version's row until the transaction ends
     /// (`SELECT … FOR UPDATE`), so reviews of one version are serialised.
     async fn lock_template(

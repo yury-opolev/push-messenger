@@ -347,7 +347,16 @@ async fn messages_take_rich_and_answer_content_but_no_other() {
             .unwrap_or_else(|error| panic!("content_type {content_type}: {error}"));
     }
     insert(5, 3, Some(6)).await.expect("a card with its answer");
-    for (seq, content_type, answer_seq) in [(6, 5, None), (7, 0, None), (8, 3, Some(0))] {
+    for (seq, content_type, answer_seq) in [
+        (6, 5, None),
+        (7, 0, None),
+        (8, 3, Some(0)),
+        // Only a card is answered, and by a later entry.
+        (9, 1, Some(10)),
+        (10, 4, Some(11)),
+        (11, 3, Some(11)),
+        (12, 3, Some(5)),
+    ] {
         let error = insert(seq, content_type, answer_seq)
             .await
             .expect_err("refused");
@@ -357,4 +366,64 @@ async fn messages_take_rich_and_answer_content_but_no_other() {
             "content_type {content_type}, answer_seq {answer_seq:?}: {error}"
         );
     }
+}
+
+#[tokio::test]
+async fn a_card_is_answered_once_by_a_later_entry() {
+    let (_container, pool) = seeded().await;
+    sqlx::raw_sql(&format!(
+        "INSERT INTO messaging.message \
+         (conversation_id, seq, message_id, client_msg_id, kind, sender_id, content_type, body) \
+         VALUES ('{CONVERSATION}', 1, gen_random_uuid(), gen_random_uuid(), 1, '{USER}', 3, \
+                 '\\x00'), \
+                ('{CONVERSATION}', 2, gen_random_uuid(), gen_random_uuid(), 1, '{USER}', 1, \
+                 '\\x00')"
+    ))
+    .execute(&pool)
+    .await
+    .expect("a card and a text");
+    let card = "message_card_answer";
+    refused(
+        &pool,
+        "UPDATE messaging.message SET answer_seq = 3 WHERE seq = 2",
+        card,
+    )
+    .await;
+    refused(
+        &pool,
+        "UPDATE messaging.message SET answer_seq = 1 WHERE seq = 1",
+        card,
+    )
+    .await;
+    sqlx::raw_sql("UPDATE messaging.message SET answer_seq = 3 WHERE seq = 1")
+        .execute(&pool)
+        .await
+        .expect("the first answer");
+    let answered = "a card's answer never changes";
+    refused(
+        &pool,
+        "UPDATE messaging.message SET answer_seq = 4 WHERE seq = 1",
+        answered,
+    )
+    .await;
+    refused(
+        &pool,
+        "UPDATE messaging.message SET answer_seq = NULL WHERE seq = 1",
+        answered,
+    )
+    .await;
+    // Other changes to an answered card, and rewriting the same answer, are allowed.
+    sqlx::raw_sql(
+        "UPDATE messaging.message SET answer_seq = 3, deleted_at = now(), body = NULL \
+         WHERE seq = 1",
+    )
+    .execute(&pool)
+    .await
+    .expect("an update that keeps the answer");
+    let answer: Option<i64> =
+        sqlx::query_scalar("SELECT answer_seq FROM messaging.message WHERE seq = 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(answer, Some(3));
 }

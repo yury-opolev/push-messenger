@@ -8,8 +8,26 @@
 ALTER TABLE messaging.message DROP CONSTRAINT message_content_type_check;
 ALTER TABLE messaging.message ADD CONSTRAINT message_content_type_check
     CHECK (content_type BETWEEN 1 AND 4);
--- Cards: the seq of the first valid answer.
-ALTER TABLE messaging.message ADD COLUMN answer_seq bigint CHECK (answer_seq >= 1);
+-- Cards: the seq of the first valid answer. Only a card is answered, by a later entry.
+ALTER TABLE messaging.message ADD COLUMN answer_seq bigint;
+ALTER TABLE messaging.message ADD CONSTRAINT message_card_answer
+    CHECK (answer_seq IS NULL OR (content_type = 3 AND answer_seq > seq));
+
+-- A card is answered once: its answer is never replaced or cleared.
+CREATE FUNCTION messaging.message_answer_guard()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $$
+BEGIN
+    RAISE EXCEPTION 'a card''s answer never changes' USING ERRCODE = '23514';
+END
+$$;
+CREATE TRIGGER message_answer_guard
+    BEFORE UPDATE OF answer_seq ON messaging.message
+    FOR EACH ROW
+    WHEN (OLD.answer_seq IS NOT NULL AND NEW.answer_seq IS DISTINCT FROM OLD.answer_seq)
+    EXECUTE FUNCTION messaging.message_answer_guard();
 
 -- Who may publish under a name: the first account to submit claims it.
 CREATE TABLE messaging.template_publisher (

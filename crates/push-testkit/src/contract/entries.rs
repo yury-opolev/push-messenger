@@ -250,7 +250,10 @@ async fn update_entry_changes_only_the_mutable_fields<B: Backend>(backend: &B) {
     let id = conversation.id;
     let store = store_with(backend, conversation).await;
     let mut tx = store.begin().await.unwrap();
-    let original = entry(id, 1, ClientMsgId::new());
+    let original = Entry {
+        content_type: ContentType::Rich,
+        ..entry(id, 1, ClientMsgId::new())
+    };
     tx.insert_entry(original.clone()).await.unwrap();
 
     let mut changed = original.clone();
@@ -261,6 +264,7 @@ async fn update_entry_changes_only_the_mutable_fields<B: Backend>(backend: &B) {
     changed.answer_seq = Some(5);
     changed.sender_id = UserId::new();
     changed.kind = EntryKind::Edit;
+    changed.content_type = ContentType::Text;
     tx.update_entry(changed.clone()).await.unwrap();
 
     let stored = tx
@@ -275,6 +279,59 @@ async fn update_entry_changes_only_the_mutable_fields<B: Backend>(backend: &B) {
     assert_eq!(stored.answer_seq, Some(5));
     assert_eq!(stored.sender_id, original.sender_id);
     assert_eq!(stored.kind, EntryKind::Message);
+    assert_eq!(stored.content_type, ContentType::Rich);
+}
+
+async fn a_card_is_answered_once_by_a_later_entry<B: Backend>(backend: &B) {
+    let conversation = conversation();
+    let id = conversation.id;
+    let store = store_with(backend, conversation).await;
+    let text = entry(id, 1, ClientMsgId::new());
+    let card = Entry {
+        content_type: ContentType::Rich,
+        ..entry(id, 2, ClientMsgId::new())
+    };
+    let mut tx = store.begin().await.unwrap();
+    tx.insert_entry(text.clone()).await.unwrap();
+    tx.insert_entry(card.clone()).await.unwrap();
+    tx.commit().await.unwrap();
+
+    // Each refusal ends its transaction.
+    for (target, answer_seq) in [(&text, Some(3)), (&card, Some(2)), (&card, Some(1))] {
+        let mut tx = store.begin().await.unwrap();
+        let mut changed = target.clone();
+        changed.answer_seq = answer_seq;
+        assert!(
+            matches!(tx.update_entry(changed).await, Err(DomainError::Store(_))),
+            "seq {}, answer_seq {answer_seq:?}",
+            target.seq
+        );
+    }
+
+    let mut answered = card.clone();
+    answered.answer_seq = Some(3);
+    let mut tx = store.begin().await.unwrap();
+    tx.update_entry(answered.clone()).await.unwrap();
+    tx.commit().await.unwrap();
+    for answer_seq in [Some(4), None] {
+        let mut tx = store.begin().await.unwrap();
+        let mut changed = answered.clone();
+        changed.answer_seq = answer_seq;
+        assert!(
+            matches!(tx.update_entry(changed).await, Err(DomainError::Store(_))),
+            "answer_seq {answer_seq:?}"
+        );
+    }
+    // Keeping the answer, an answered card can still be deleted.
+    let mut deleted = answered.clone();
+    deleted.body = None;
+    deleted.deleted_at = Some(start() + TimeDelta::hours(1));
+    let mut tx = store.begin().await.unwrap();
+    tx.update_entry(deleted.clone()).await.unwrap();
+    assert_eq!(
+        tx.entry_by_message_id(id, card.message_id).await,
+        Ok(Some(deleted))
+    );
 }
 
 async fn updating_a_missing_entry_fails<B: Backend>(backend: &B) {
@@ -404,6 +461,7 @@ pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
         an_entry_cannot_overwrite_an_existing_seq,
         an_entry_is_found_by_message_id_only_in_its_own_conversation,
         update_entry_changes_only_the_mutable_fields,
+        a_card_is_answered_once_by_a_later_entry,
         updating_a_missing_entry_fails,
         erasing_edit_bodies_touches_only_edits_of_that_target,
         entries_after_skips_changes_to_messages_below_targets_from,

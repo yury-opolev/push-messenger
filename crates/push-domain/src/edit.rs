@@ -153,6 +153,7 @@ where
                 change.conversation,
                 change.client_msg_id,
                 kind,
+                None,
             )
             .await?;
         let Append {
@@ -197,7 +198,13 @@ where
         if tx.insert_entry(entry).await? == InsertOutcome::Duplicate {
             tx.rollback().await?;
             return self
-                .replay_append(conversation.id, change.client_msg_id, change.sender, kind)
+                .replay_append(
+                    conversation.id,
+                    change.client_msg_id,
+                    change.sender,
+                    kind,
+                    None,
+                )
                 .await;
         }
 

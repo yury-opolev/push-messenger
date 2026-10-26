@@ -38,7 +38,7 @@ pub(crate) async fn approved_definition<T: Tx>(
     template: &TemplateRef,
 ) -> DomainResult<Definition> {
     let stored = tx
-        .template(template)
+        .template_for_send(template)
         .await?
         .filter(|stored| stored.status == TemplateStatus::Approved)
         .ok_or_else(|| TemplateError(format!("template {template} is not approved")))?;

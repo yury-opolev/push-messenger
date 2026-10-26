@@ -14,8 +14,8 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 use crate::error::{DomainError, DomainResult};
 use crate::ids::{ClientMsgId, ConversationId, DeviceId, MessageId, UserId};
 use crate::model::{
-    ContactState, Conversation, ConversationKind, ConversationOverview, DeviceState, Entry,
-    EntryKind, GroupPositions, InviteRecord, Member, PublisherOwner, Role, StoredTemplate,
+    ContactState, ContentType, Conversation, ConversationKind, ConversationOverview, DeviceState,
+    Entry, EntryKind, GroupPositions, InviteRecord, Member, PublisherOwner, Role, StoredTemplate,
     TemplateEvent, TemplateStatus,
 };
 use crate::store::{InsertOutcome, Store, Tx};
@@ -697,6 +697,17 @@ impl Tx for InMemoryTx {
             .entries
             .get_mut(&(entry.conversation_id, entry.seq))
             .ok_or_else(|| DomainError::Store("update of an entry that does not exist".into()))?;
+        // As the schema's message_card_answer check and message_answer_guard trigger.
+        if stored.answer_seq.is_some() && entry.answer_seq != stored.answer_seq {
+            return Err(DomainError::Store("a card's answer never changes".into()));
+        }
+        if let Some(answer_seq) = entry.answer_seq {
+            if stored.content_type != ContentType::Rich || answer_seq <= stored.seq {
+                return Err(DomainError::Store(
+                    "only a card is answered, by a later entry".into(),
+                ));
+            }
+        }
         stored.body = entry.body;
         stored.edited_at = entry.edited_at;
         stored.edit_seq = entry.edit_seq;
@@ -926,6 +937,14 @@ impl Tx for InMemoryTx {
     }
 
     async fn template(&mut self, template: &TemplateRef) -> DomainResult<Option<StoredTemplate>> {
+        Ok(self.work.templates.get(template).cloned())
+    }
+
+    async fn template_for_send(
+        &mut self,
+        template: &TemplateRef,
+    ) -> DomainResult<Option<StoredTemplate>> {
+        // Every in-memory transaction already holds the store-wide lock.
         Ok(self.work.templates.get(template).cloned())
     }
 
