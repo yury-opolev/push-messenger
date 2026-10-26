@@ -6,15 +6,50 @@ Notable changes for consumers of push-messenger. Newest first.
 
 ### Added
 
-- **Template submission, catalog and review on auth-svc** (REQUEST PUSH feature 8, rich
-  message templates). `POST /v1/templates` submits a tpl/1 definition for review (access
-  token, JSON up to 16 KiB, 10 per hour per user); `GET /v1/templates?since=N` serves the
-  client catalog of approved and revoked versions with an ETag (`"tpl-<since>-<seq>"`,
-  304 on `If-None-Match`). The admin listener gains `GET /v1/admin/templates`,
-  `GET /v1/admin/templates/{ref}` and `POST /v1/admin/templates/{ref}/approve|reject|revoke`.
-  New error codes `not_found` (404) and `conflict` (409); new security events
-  `auth.template.submitted`, `auth.template.refused` and `auth.admin.template_reviewed`.
-  The chart's auth Ingress routes `/v1/templates`.
+- **Rich message templates and a template marketplace** (REQUEST PUSH feature 8). Two new
+  content types: `CONTENT_TYPE_RICH` (3), a card filled from an approved tpl/1 template
+  (`{tpl, params, fallback}`, up to 32 KiB), and `CONTENT_TYPE_ANSWER` (4), an answer to a
+  card (`{card, values, fallback}`, up to 4 KiB). message-svc enforces everything, since
+  bodies are not end-to-end encrypted: the template's approval, the full params schema,
+  the sender's kind (`agent` for owned agents, `human` otherwise) and every answer. The
+  first valid answer closes the card: the new `Deliver.answer_seq` carries it, the
+  answer's `Deliver.target_seq` is the card's seq, and later answers get
+  `ERROR_CODE_REJECTED`; answered cards and answers cannot be edited. Refused bodies are
+  `ERROR_CODE_INVALID`; no new frame or error code. Guide:
+  [docs/rich-messages.md](docs/rich-messages.md) (tpl/1 reference, review checklist,
+  catalog protocol).
+- auth-svc: `POST /v1/templates` submits a definition for review (access token, JSON up
+  to 16 KiB; publishers are claimed by the first submitter, `agent`, `push`, `system`,
+  `admin` and `builtin` are reserved, at most 20 pending per account);
+  `GET /v1/templates?since=N` serves the client catalog of approved and revoked versions
+  (pages of 200, `seq`/`more`, ETag `"tpl-<since>-<seq>"` with 304 on `If-None-Match`,
+  `Cache-Control: private, no-cache`). The admin listener gains `GET /v1/admin/templates`,
+  `GET /v1/admin/templates/{ref}` (definition, outline, audit trail) and
+  `POST /v1/admin/templates/{ref}/approve|reject|revoke` (`{reviewer, note?}`): holders of
+  `PUSH_AUTH_ADMIN_TOKEN` are the reviewers. New error codes `not_found` (404) and
+  `conflict` (409); new rate limits: submissions 10 per hour per user and 60 per IP, the
+  catalog 120 per minute per user and 600 per IP. New security events
+  `auth.template.submitted`, `auth.template.refused` and `auth.admin.template_reviewed`
+  (with the reviewer's IP); message-svc logs `templates.submitted`, `templates.approved`,
+  `templates.rejected`, `templates.revoked`, `templates.seeded` and
+  `templates.builtin_mismatch`.
+- Built-in templates `agent.reply@1`, `agent.approval@1`, `agent.question@1` and
+  `agent.plan@1` (agents only), seeded as approved when message-svc starts, before it is
+  ready; an admin's revocation survives restarts. Designed upstream without the
+  consumer's spec: reconcile and propose changes as new versions.
+- messaging migration `0005_templates.sql`: content types 3 and 4, `answer_seq` on
+  messages, the registry (`template_publisher`, `template_version`, the `template_change`
+  counter) and the append-only audit trail `messaging.template_event`, guarded by
+  triggers (immutable versions, one-way statuses). It changes no existing data and runs
+  with the usual messaging migrations.
+- message-svc serves a new internal gRPC service, `push.internal.v1.Templates`, on the
+  Directory port with auth-svc's existing token: **no new configuration** (auth-svc uses
+  `PUSH_MESSAGE_SVC_URL` and `PUSH_DIRECTORY_TOKEN`; without them the template routes
+  answer 503). The chart's auth Ingress routes `/v1/templates`.
+- SDK and bindings: `MessageKind::Rich`/`Answer` (`rich`/`answer`), `answerSeq` on cards
+  and `cardSeq` on answers, and `send_rich`/`send_answer` (Node `sendRich`/`sendAnswer`,
+  C `push_client_send_rich`/`push_client_send_answer`) with local envelope checks. The
+  SDK does not fetch the catalog yet.
 - **Agent-key sign-in for owned agents** (REQUEST PUSH feature 6). A new opt-in provider,
   `agent-key` in `PUSH_AUTH_PROVIDERS` (off by default), lets an owned agent sign in with
   a P-256 key pair of its own instead of an Entra app token: no secret, certificate or

@@ -110,7 +110,7 @@ One ordered stream per client, each event an object with a `type`:
 
 ### Cards and answers
 
-Rich messages ([the design](superpowers/specs/2026-10-26-rich-message-templates-design.md))
+Rich messages ([the guide](rich-messages.md))
 are sent as JSON strings:
 
 - `send_rich(conversation, body)` (`sendRich`, `push_client_send_rich`) queues a card, a

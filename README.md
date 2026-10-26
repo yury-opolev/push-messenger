@@ -228,6 +228,8 @@ records the routing checks against a maintained controller (Traefik).
 Microsoft Entra ID sign-in (opt-in, also Entra-only without email):
 [docs/entra-sign-in.md](docs/entra-sign-in.md) (chart: `auth.signIn`). Owned agents without
 an Entra credential sign in with a key pair: [docs/agent-key-sign-in.md](docs/agent-key-sign-in.md).
+Rich messages (cards from reviewed templates, answers, publishing, admin review and the
+client catalog): [docs/rich-messages.md](docs/rich-messages.md).
 auth-svc is a
 library, `push-auth-core`, and a thin binary, `push-auth`: a binary of your own can replace
 or restrict the sign-in check
