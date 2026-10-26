@@ -15,7 +15,8 @@ use push_message_svc::{InternalToken, MessagingApi, RedisNotifier};
 use push_proto::internal::v1::messaging_client::MessagingClient;
 use push_proto::internal::v1::messaging_server::{self, MessagingServer};
 use push_proto::internal::v1::{
-    AckRequest, AckResponse, DeleteRequest, EditRequest, IdentifyRequest, IdentifyResponse,
+    AckRequest, AckResponse, ActivityRequest, ActivityResponse, AnnouncePresenceRequest,
+    AnnouncePresenceResponse, DeleteRequest, EditRequest, IdentifyRequest, IdentifyResponse,
     ReadUpToRequest, ReadUpToResponse, RequestCall, SendRequest, SyncRequest, SyncResponse,
 };
 use push_proto::v1;
@@ -100,6 +101,20 @@ impl messaging_server::Messaging for FlakySync {
     ) -> Result<Response<push_proto::v1::Response>, Status> {
         self.api.request(request).await
     }
+
+    async fn activity(
+        &self,
+        request: Request<ActivityRequest>,
+    ) -> Result<Response<ActivityResponse>, Status> {
+        self.api.activity(request).await
+    }
+
+    async fn announce_presence(
+        &self,
+        request: Request<AnnouncePresenceRequest>,
+    ) -> Result<Response<AnnouncePresenceResponse>, Status> {
+        self.api.announce_presence(request).await
+    }
 }
 
 struct Stack {
@@ -118,6 +133,8 @@ struct Stack {
 const AUDIENCE: &str = "ws://push.test/v1/socket";
 /// The gateway's token for message-svc's `Messaging` API.
 const MESSAGING_TOKEN: &str = "messaging-token-for-the-gateway-tests";
+/// How long a closed connection keeps its presence lease: short, so tests see offline.
+const PRESENCE_GRACE: Duration = Duration::from_millis(300);
 
 /// Redis, message-svc's API on the in-memory store, auth-svc's key set, and the gateway,
 /// on free ports.
@@ -139,6 +156,7 @@ async fn stack_with(sync_failures: u32, heartbeat: Duration) -> Stack {
     );
 
     let notifier = RedisNotifier::connect(&redis_url).await.unwrap();
+    let presence = Arc::new(notifier.presence());
     let messaging = Arc::new(Messaging::new(
         InMemoryStore::default(),
         SystemClock,
@@ -150,7 +168,7 @@ async fn stack_with(sync_failures: u32, heartbeat: Duration) -> Stack {
         tonic::transport::Server::builder()
             .add_service(MessagingServer::with_interceptor(
                 FlakySync {
-                    api: MessagingApi::new(Arc::clone(&messaging)),
+                    api: MessagingApi::with_presence(Arc::clone(&messaging), presence),
                     sync_failures: Mutex::new(sync_failures),
                 },
                 InternalToken::messaging(Some(MESSAGING_TOKEN.to_owned())),
@@ -184,6 +202,7 @@ async fn stack_with(sync_failures: u32, heartbeat: Duration) -> Stack {
         heartbeat,
         groups: false,
         client_ip_header: None,
+        presence_grace: PRESENCE_GRACE,
     };
     let shutdown = CancellationToken::new();
     let server = tokio::spawn(serve(config, listener, health, shutdown.clone()));
@@ -329,7 +348,9 @@ async fn a_message_reaches_the_other_device_and_the_sender_gets_its_ack() {
     assert_eq!(ack.client_msg_id, client_msg_id);
     assert_eq!(ack.seq, 1);
 
-    let Body::Deliver(entry) = next(&mut bob_socket).await else {
+    // Alice's coming online may arrive first.
+    let not_presence = |frame: &Body| !matches!(frame, Body::PresenceEvent(_));
+    let Body::Deliver(entry) = wait_for(&mut bob_socket, not_presence).await else {
         panic!("expected Deliver");
     };
     assert_eq!(entry.conversation_id, conversation);
@@ -1056,4 +1077,458 @@ async fn a_failed_sync_is_retried() {
         panic!("expected Deliver");
     };
     assert_eq!(entry.seq, 1);
+}
+
+/// An `Activity` frame.
+fn activity(conversation: &[u8], state: v1::ActivityState, label: Option<&str>) -> Body {
+    Body::Activity(v1::Activity {
+        conversation_id: conversation.to_vec(),
+        state: state.into(),
+        label: label.map(str::to_owned),
+    })
+}
+
+/// The next `ActivityEvent`, skipping other frames, within 5 s each.
+async fn next_activity(socket: &mut Socket) -> v1::ActivityEvent {
+    let Body::ActivityEvent(event) =
+        wait_for(socket, |body| matches!(body, Body::ActivityEvent(_))).await
+    else {
+        unreachable!("wait_for returns what it waited for");
+    };
+    event
+}
+
+/// Every `ActivityEvent` that arrives within `window`, skipping other frames.
+async fn activities_within(socket: &mut Socket, window: Duration) -> Vec<v1::ActivityEvent> {
+    let deadline = tokio::time::Instant::now() + window;
+    let mut events = Vec::new();
+    while let Ok(message) = tokio::time::timeout_at(deadline, socket.next()).await {
+        let message = message
+            .expect("the connection is open")
+            .expect("a WebSocket message");
+        if let Message::Binary(bytes) = message {
+            if let Body::ActivityEvent(event) = decode_frame(&bytes).expect("a valid frame") {
+                events.push(event);
+            }
+        }
+    }
+    events
+}
+
+/// Alice (two devices), Bob and Carol, with direct conversations Alice–Bob and
+/// Alice–Carol.
+#[tokio::test]
+async fn an_activity_reaches_the_other_members_and_not_other_conversations() {
+    let stack = stack().await;
+    let (alice, alice_phone) = person(&stack).await;
+    let (bob, bob_device) = person(&stack).await;
+    let (carol, carol_device) = person(&stack).await;
+    let alice_laptop = Uuid::now_v7();
+    stack
+        .messaging
+        .device_registered(DeviceId(alice_laptop), UserId(alice))
+        .await
+        .unwrap();
+    let with_bob = direct_chat(&stack, alice, bob).await;
+    direct_chat(&stack, alice, carol).await;
+    let mut bob_socket = ready(&stack, bob, bob_device).await;
+    let mut carol_socket = ready(&stack, carol, carol_device).await;
+    let mut laptop_socket = ready(&stack, alice, alice_laptop).await;
+    let mut phone_socket = ready(&stack, alice, alice_phone).await;
+
+    send(
+        &mut phone_socket,
+        activity(&with_bob, v1::ActivityState::Working, Some("running tests")),
+    )
+    .await;
+    assert_eq!(
+        next_activity(&mut bob_socket).await,
+        v1::ActivityEvent {
+            conversation_id: with_bob,
+            user_id: id_bytes(alice),
+            state: v1::ActivityState::Working.into(),
+            label: Some("running tests".to_owned()),
+            ttl_ms: 30_000,
+        }
+    );
+    // Not a member of that conversation, and the sender's own other device.
+    let window = Duration::from_millis(500);
+    assert_eq!(activities_within(&mut carol_socket, window).await, []);
+    assert_eq!(activities_within(&mut laptop_socket, window).await, []);
+    // Nothing answers a good activity.
+    assert_eq!(activities_within(&mut phone_socket, window).await, []);
+    send(&mut phone_socket, Body::Ping(Ping {})).await;
+    assert_eq!(next(&mut phone_socket).await, Body::Pong(Pong {}));
+}
+
+/// A connection that ends while its activity lasts tells the others it went idle.
+#[tokio::test]
+async fn an_activity_ends_with_idle_on_disconnect() {
+    let stack = stack().await;
+    let (alice, alice_device) = person(&stack).await;
+    let (bob, bob_device) = person(&stack).await;
+    let conversation = direct_chat(&stack, alice, bob).await;
+    let mut bob_socket = ready(&stack, bob, bob_device).await;
+    let mut alice_socket = ready(&stack, alice, alice_device).await;
+    send(
+        &mut alice_socket,
+        activity(&conversation, v1::ActivityState::Working, Some("compiling")),
+    )
+    .await;
+    assert_eq!(
+        next_activity(&mut bob_socket).await.state(),
+        v1::ActivityState::Working
+    );
+
+    alice_socket.close(None).await.unwrap();
+    assert_eq!(
+        next_activity(&mut bob_socket).await,
+        v1::ActivityEvent {
+            conversation_id: conversation,
+            user_id: id_bytes(alice),
+            state: v1::ActivityState::Idle.into(),
+            label: None,
+            ttl_ms: 0,
+        }
+    );
+}
+
+/// Ten activities at once: two go out, the latest of the rest a second later, and nothing
+/// else.
+#[tokio::test]
+async fn the_activity_rate_limit_holds() {
+    let stack = stack().await;
+    let (alice, alice_device) = person(&stack).await;
+    let (bob, bob_device) = person(&stack).await;
+    let conversation = direct_chat(&stack, alice, bob).await;
+    let mut bob_socket = ready(&stack, bob, bob_device).await;
+    let mut alice_socket = ready(&stack, alice, alice_device).await;
+    let mut last = None;
+    for step in 0..10 {
+        let state = if step % 2 == 0 {
+            v1::ActivityState::Typing
+        } else {
+            v1::ActivityState::Working
+        };
+        let label = format!("step {step}");
+        send(
+            &mut alice_socket,
+            activity(&conversation, state, Some(&label)),
+        )
+        .await;
+        last = Some((state, label));
+    }
+    let events = activities_within(&mut bob_socket, Duration::from_millis(2500)).await;
+    assert!(
+        (1..=3).contains(&events.len()),
+        "at most 2 at once and 1 trailing: {events:?}"
+    );
+    let (state, label) = last.unwrap();
+    let final_event = events.last().unwrap();
+    assert_eq!(final_event.state(), state);
+    assert_eq!(final_event.label.as_deref(), Some(label.as_str()));
+}
+
+/// An activity in a conversation the sender is not in is refused, never retryable, with
+/// no ids; the connection stays open.
+#[tokio::test]
+async fn an_activity_in_a_foreign_conversation_is_refused() {
+    let stack = stack().await;
+    let (alice, alice_device) = person(&stack).await;
+    let (bob, _) = person(&stack).await;
+    let (carol, _) = person(&stack).await;
+    let theirs = direct_chat(&stack, bob, carol).await;
+    let mut socket = ready(&stack, alice, alice_device).await;
+    send(
+        &mut socket,
+        activity(&theirs, v1::ActivityState::Typing, None),
+    )
+    .await;
+    let Body::Error(error) = wait_for(&mut socket, |body| matches!(body, Body::Error(_))).await
+    else {
+        unreachable!("wait_for returns what it waited for");
+    };
+    assert_eq!(error.code(), ErrorCode::NotMember);
+    assert!(!error.retryable);
+    assert_eq!(error.client_msg_id, None);
+    assert_eq!(error.request_id, None);
+    send(&mut socket, Body::Ping(Ping {})).await;
+    assert_eq!(next(&mut socket).await, Body::Pong(Pong {}));
+}
+
+/// A connection taken over by a newer one of the same device announces no idle: the
+/// device is live again and keeps its activity fresh itself.
+#[tokio::test]
+async fn a_taken_over_connection_announces_no_idle() {
+    let stack = stack().await;
+    let (alice, alice_device) = person(&stack).await;
+    let (bob, bob_device) = person(&stack).await;
+    let conversation = direct_chat(&stack, alice, bob).await;
+    let mut bob_socket = ready(&stack, bob, bob_device).await;
+    let mut first = ready(&stack, alice, alice_device).await;
+    send(
+        &mut first,
+        activity(&conversation, v1::ActivityState::Working, Some("compiling")),
+    )
+    .await;
+    assert_eq!(
+        next_activity(&mut bob_socket).await.state(),
+        v1::ActivityState::Working
+    );
+
+    let _second = ready(&stack, alice, alice_device).await;
+    assert_eq!(close_code(&mut first).await, 4007);
+    // Answers the close, so the gateway is done with the connection at once.
+    while first.next().await.is_some() {}
+    assert_eq!(
+        activities_within(&mut bob_socket, Duration::from_secs(1)).await,
+        []
+    );
+}
+
+/// What a contact sees of `user` online.
+fn online(user: Uuid) -> v1::Presence {
+    v1::Presence {
+        user_id: id_bytes(user),
+        state: v1::PresenceState::Online.into(),
+        last_seen: None,
+    }
+}
+
+/// What a viewer who may not see `user`'s presence sees.
+fn unknown(user: Uuid) -> v1::Presence {
+    v1::Presence {
+        user_id: id_bytes(user),
+        state: v1::PresenceState::Unknown.into(),
+        last_seen: None,
+    }
+}
+
+/// The presence of the first `PresenceEvent` that arrives within `window`, skipping other
+/// frames.
+async fn next_presence(socket: &mut Socket, window: Duration) -> v1::Presence {
+    let deadline = tokio::time::Instant::now() + window;
+    loop {
+        let message = tokio::time::timeout_at(deadline, socket.next())
+            .await
+            .expect("a PresenceEvent in time")
+            .expect("the connection is open")
+            .expect("a WebSocket message");
+        if let Message::Binary(bytes) = message {
+            if let Body::PresenceEvent(event) = decode_frame(&bytes).expect("a valid frame") {
+                return event.presence.expect("a presence");
+            }
+        }
+    }
+}
+
+/// The presence of every `PresenceEvent` that arrives within `window`, skipping other
+/// frames.
+async fn presences_within(socket: &mut Socket, window: Duration) -> Vec<v1::Presence> {
+    let deadline = tokio::time::Instant::now() + window;
+    let mut presences = Vec::new();
+    while let Ok(message) = tokio::time::timeout_at(deadline, socket.next()).await {
+        let message = message
+            .expect("the connection is open")
+            .expect("a WebSocket message");
+        if let Message::Binary(bytes) = message {
+            if let Body::PresenceEvent(event) = decode_frame(&bytes).expect("a valid frame") {
+                presences.push(event.presence.expect("a presence"));
+            }
+        }
+    }
+    presences
+}
+
+/// `GetPresence` for `users`.
+async fn get_presence(socket: &mut Socket, request_id: u64, users: &[Uuid]) -> Vec<v1::Presence> {
+    let ask = request::Body::GetPresence(v1::GetPresence {
+        user_ids: users.iter().copied().map(id_bytes).collect(),
+    });
+    let Body::Response(v1::Response {
+        body: Some(response::Body::Presences(list)),
+        ..
+    }) = request(socket, request_id, ask).await
+    else {
+        panic!("GetPresence failed");
+    };
+    list.presences
+}
+
+/// `SetPresenceSharing` to `share`.
+async fn share_presence(socket: &mut Socket, request_id: u64, share: bool) {
+    let set = request::Body::SetPresenceSharing(v1::SetPresenceSharing { share: Some(share) });
+    assert_eq!(
+        request(socket, request_id, set).await,
+        Body::Response(v1::Response {
+            request_id,
+            body: Some(response::Body::PresenceSharing(v1::PresenceSharing {
+                share
+            })),
+        })
+    );
+}
+
+/// How long a positive presence wait may take.
+const PRESENCE_WAIT: Duration = Duration::from_secs(5);
+
+/// Online while any device holds a lease; offline (with the last-seen minute) once the
+/// last one's grace ended.
+#[tokio::test]
+async fn presence_flips_with_connect_and_disconnect_across_all_devices() {
+    let stack = stack().await;
+    let (alice, alice_phone) = person(&stack).await;
+    let (bob, bob_device) = person(&stack).await;
+    let alice_laptop = Uuid::now_v7();
+    stack
+        .messaging
+        .device_registered(DeviceId(alice_laptop), UserId(alice))
+        .await
+        .unwrap();
+    direct_chat(&stack, alice, bob).await;
+    let mut bob_socket = ready(&stack, bob, bob_device).await;
+    let offline_at_first = get_presence(&mut bob_socket, 1, &[alice]).await;
+    assert_eq!(offline_at_first[0].state(), v1::PresenceState::Offline);
+
+    let mut phone_socket = ready(&stack, alice, alice_phone).await;
+    assert_eq!(
+        next_presence(&mut bob_socket, PRESENCE_WAIT).await,
+        online(alice)
+    );
+    assert_eq!(
+        get_presence(&mut bob_socket, 2, &[alice]).await,
+        [online(alice)]
+    );
+
+    let mut laptop_socket = ready(&stack, alice, alice_laptop).await;
+    let quiet = Duration::from_millis(700);
+    assert_eq!(presences_within(&mut bob_socket, quiet).await, []);
+    phone_socket.close(None).await.unwrap();
+    assert_eq!(
+        presences_within(&mut bob_socket, PRESENCE_GRACE + quiet).await,
+        []
+    );
+    assert_eq!(
+        get_presence(&mut bob_socket, 3, &[alice]).await,
+        [online(alice)]
+    );
+
+    laptop_socket.close(None).await.unwrap();
+    let offline = next_presence(&mut bob_socket, PRESENCE_GRACE + Duration::from_secs(3)).await;
+    assert_eq!(offline.user_id, id_bytes(alice));
+    assert_eq!(offline.state(), v1::PresenceState::Offline);
+    let last_seen = offline.last_seen.expect("the last-seen minute");
+    assert_eq!(last_seen % 60_000_000, 0, "a whole minute: {last_seen}");
+    let now_micros = now() * 1_000_000;
+    assert!(
+        (now_micros - 120_000_000..=now_micros).contains(&last_seen),
+        "{last_seen} is recent"
+    );
+    assert_eq!(get_presence(&mut bob_socket, 4, &[alice]).await, [offline]);
+}
+
+/// A network blip: the closed connection's grace covers the reconnect.
+#[tokio::test]
+async fn a_reconnect_within_the_grace_is_not_announced() {
+    let stack = stack().await;
+    let (alice, alice_device) = person(&stack).await;
+    let (bob, bob_device) = person(&stack).await;
+    direct_chat(&stack, alice, bob).await;
+    let mut bob_socket = ready(&stack, bob, bob_device).await;
+    let mut alice_socket = ready(&stack, alice, alice_device).await;
+    assert_eq!(
+        next_presence(&mut bob_socket, PRESENCE_WAIT).await,
+        online(alice)
+    );
+
+    alice_socket.close(None).await.unwrap();
+    let _again = ready(&stack, alice, alice_device).await;
+    assert_eq!(
+        presences_within(&mut bob_socket, PRESENCE_GRACE + Duration::from_secs(1)).await,
+        []
+    );
+    assert_eq!(
+        get_presence(&mut bob_socket, 1, &[alice]).await,
+        [online(alice)]
+    );
+}
+
+#[tokio::test]
+async fn a_non_contact_sees_unknown() {
+    let stack = stack().await;
+    let (alice, alice_device) = person(&stack).await;
+    let (carol, carol_device) = person(&stack).await;
+    let mut carol_socket = ready(&stack, carol, carol_device).await;
+    let _alice_socket = ready(&stack, alice, alice_device).await;
+    assert_eq!(
+        presences_within(&mut carol_socket, Duration::from_millis(700)).await,
+        []
+    );
+    assert_eq!(
+        get_presence(&mut carol_socket, 1, &[alice]).await,
+        [unknown(alice)]
+    );
+}
+
+/// Hiding is pushed at once and is reciprocal; showing again pushes the current state.
+#[tokio::test]
+async fn opting_out_hides_presence() {
+    let stack = stack().await;
+    let (alice, alice_device) = person(&stack).await;
+    let (bob, bob_device) = person(&stack).await;
+    direct_chat(&stack, alice, bob).await;
+    let mut bob_socket = ready(&stack, bob, bob_device).await;
+    let mut alice_socket = ready(&stack, alice, alice_device).await;
+    assert_eq!(
+        next_presence(&mut bob_socket, PRESENCE_WAIT).await,
+        online(alice)
+    );
+
+    share_presence(&mut alice_socket, 1, false).await;
+    assert_eq!(
+        next_presence(&mut bob_socket, PRESENCE_WAIT).await,
+        unknown(alice)
+    );
+    assert_eq!(
+        get_presence(&mut bob_socket, 2, &[alice]).await,
+        [unknown(alice)]
+    );
+    assert_eq!(
+        get_presence(&mut alice_socket, 3, &[bob]).await,
+        [unknown(bob)]
+    );
+
+    share_presence(&mut alice_socket, 4, true).await;
+    assert_eq!(
+        next_presence(&mut bob_socket, PRESENCE_WAIT).await,
+        online(alice)
+    );
+}
+
+#[tokio::test]
+async fn a_blocked_contact_sees_unknown() {
+    let stack = stack().await;
+    let (alice, alice_device) = person(&stack).await;
+    let (bob, bob_device) = person(&stack).await;
+    direct_chat(&stack, alice, bob).await;
+    let mut bob_socket = ready(&stack, bob, bob_device).await;
+    let _alice_socket = ready(&stack, alice, alice_device).await;
+    assert_eq!(
+        next_presence(&mut bob_socket, PRESENCE_WAIT).await,
+        online(alice)
+    );
+
+    stack
+        .messaging
+        .contact_block(UserId(alice), UserId(bob))
+        .await
+        .unwrap();
+    assert_eq!(
+        next_presence(&mut bob_socket, PRESENCE_WAIT).await,
+        unknown(alice)
+    );
+    assert_eq!(
+        get_presence(&mut bob_socket, 1, &[alice]).await,
+        [unknown(alice)]
+    );
 }

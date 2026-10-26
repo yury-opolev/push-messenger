@@ -230,6 +230,8 @@ Microsoft Entra ID sign-in (opt-in, also Entra-only without email):
 an Entra credential sign in with a key pair: [docs/agent-key-sign-in.md](docs/agent-key-sign-in.md).
 Rich messages (cards from reviewed templates, answers, publishing, admin review and the
 client catalog): [docs/rich-messages.md](docs/rich-messages.md).
+Live activity (typing, working, waiting) and presence (online, last seen):
+[docs/activity-presence.md](docs/activity-presence.md).
 auth-svc is a
 library, `push-auth-core`, and a thin binary, `push-auth`: a binary of your own can replace
 or restrict the sign-in check
@@ -273,6 +275,7 @@ at start-up.
 | `PUSH_HEARTBEAT_MS` | client ping interval announced in `Ready`, 1000 to 600000 | `30000` |
 | `PUSH_GROUPS` | `1` serves group requests; `0` refuses only the six group-management requests (create, add and remove members, leave, rename, set role) with `NOT_AVAILABLE`; groups that already exist (made while it was `1`, or directly through message-svc) still reach clients, and message-svc keeps serving them | `0` |
 | `PUSH_CLIENT_IP_HEADER` | header with the client's IP, set by the ingress (`x-real-ip`), for the per-IP limits on redeeming invites and contact requests; same trust assumption as auth-svc's | the peer address |
+| `PUSH_PRESENCE_GRACE_MS` | how long a closed connection still counts as online, so a reconnect within it (a network blip, a gateway rollout) is never shown offline; 0 to 120000 | `10000` |
 
 `push-auth`:
 

@@ -1,6 +1,6 @@
 //! Rate limits of the gateway: the requests that let someone guess or probe (redeeming
-//! invites, contact requests, creating invites), `Identify` per device (spec §7.3),
-//! writes (`Send`, `Edit`, `Delete`) per user, and frames per connection.
+//! invites, contact requests, creating invites, presence reads), `Identify` per device
+//! (spec §7.3), writes (`Send`, `Edit`, `Delete`) per user, and frames per connection.
 //!
 //! Request limits are fixed windows in Redis (`INCR`, then `EXPIRE … NX`), keyed by a
 //! hash of the subject, so no user id or IP is stored in Redis; they count across every
@@ -39,6 +39,8 @@ pub enum Action {
     /// `Send`, `Edit` and `Delete`, per user across their devices: flooding conversations
     /// and storage.
     Write,
+    /// `GetPresence`, per user: probing who is online, or loading Redis with batch reads.
+    Presence,
 }
 
 /// Whom a limit counts.
@@ -74,6 +76,7 @@ impl Action {
             request::Body::RedeemInvite(_) => Some(Self::RedeemInvite),
             request::Body::ContactRequest(_) => Some(Self::ContactRequest),
             request::Body::CreateInvite(_) => Some(Self::CreateInvite),
+            request::Body::GetPresence(_) => Some(Self::Presence),
             _ => None,
         }
     }
@@ -85,6 +88,7 @@ impl Action {
             Self::CreateInvite => "invite",
             Self::Identify => "identify",
             Self::Write => "write",
+            Self::Presence => "presence",
         }
     }
 
@@ -106,12 +110,16 @@ impl Action {
             (Scope::User, per(120, MINUTE)),
             (Scope::User, per(3000, HOUR)),
         ];
+        // Two batch reads a second: a client reads its contact list on start and on
+        // reconnects, then hears changes pushed.
+        const PRESENCE: &[(Scope, Limit)] = &[(Scope::User, per(120, MINUTE))];
         match self {
             Self::RedeemInvite => REDEEM,
             Self::ContactRequest => CONTACT,
             Self::CreateInvite => INVITE,
             Self::Identify => IDENTIFY,
             Self::Write => WRITE,
+            Self::Presence => PRESENCE,
         }
     }
 }
@@ -345,7 +353,7 @@ impl Default for FrameBudget {
 mod tests {
     use std::collections::HashMap;
 
-    use push_proto::v1::{ContactRequest, CreateInvite, ListContacts, RedeemInvite};
+    use push_proto::v1::{ContactRequest, CreateInvite, GetPresence, ListContacts, RedeemInvite};
 
     use super::*;
 
@@ -406,10 +414,29 @@ mod tests {
         let ask = request::Body::ContactRequest(ContactRequest::default());
         let invite = request::Body::CreateInvite(CreateInvite::default());
         let list = request::Body::ListContacts(ListContacts {});
+        let presence = request::Body::GetPresence(GetPresence::default());
         assert_eq!(Action::of(&redeem), Some(Action::RedeemInvite));
         assert_eq!(Action::of(&ask), Some(Action::ContactRequest));
         assert_eq!(Action::of(&invite), Some(Action::CreateInvite));
+        assert_eq!(Action::of(&presence), Some(Action::Presence));
         assert_eq!(Action::of(&list), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn presence_reads_are_counted_per_user_by_the_minute() {
+        let limits = memory();
+        let reader = Subject {
+            ip: Some(IpAddr::from([10, 0, 0, 1])),
+            user: Some(Uuid::now_v7()),
+            device: None,
+        };
+        for _ in 0..120 {
+            limits.check(Action::Presence, reader).await.unwrap();
+        }
+        assert!(matches!(
+            limits.check(Action::Presence, reader).await,
+            Err(Refused::Limited { retry_after_s }) if retry_after_s <= 60
+        ));
     }
 
     #[tokio::test(start_paused = true)]

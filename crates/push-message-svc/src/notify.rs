@@ -7,10 +7,12 @@ use push_proto::internal::v1::{
     self as internal, ContactChanged, DirectReceipt, EntriesAvailable, GroupReceipt, Kick,
     Notification, ReadPositionChanged, ReceiptChanged, notification::Kind, receipt_changed,
 };
+use push_proto::v1::ActivityEvent;
 use push_proto::{id_bytes, kick_channel, notify_channel};
 use redis::aio::ConnectionManager;
 
-use crate::convert::contact_state;
+use crate::convert::{activity_state_to_wire, contact_state, presence};
+use crate::presence::RedisPresence;
 
 /// Publishes each event as small [`Notification`]s on the Redis channels of the users it
 /// concerns (`notify:{user_id}`), and kicks as [`Kick`]s on the channels of the devices
@@ -40,6 +42,11 @@ impl RedisNotifier {
             .connection_manager(redis::aio::ConnectionManagerConfig::new())
             .await?;
         Ok(Self { connection })
+    }
+
+    /// The presence reader on this notifier's connection.
+    pub fn presence(&self) -> RedisPresence {
+        RedisPresence::new(self.connection.clone())
     }
 
     async fn send(&self, messages: &[(String, Vec<u8>)]) -> redis::RedisResult<()> {
@@ -164,6 +171,34 @@ pub(crate) fn notifications(events: &[Event]) -> Vec<(String, Vec<u8>)> {
                     messages.push((kick_channel(device.0), kick.encode_to_vec()));
                 }
             }
+            Event::Activity {
+                to,
+                conversation,
+                user,
+                state,
+                label,
+                ttl,
+            } => {
+                let event = ActivityEvent {
+                    conversation_id: id_bytes(conversation.0),
+                    user_id: id_bytes(user.0),
+                    state: activity_state_to_wire(*state).into(),
+                    label: label.clone(),
+                    ttl_ms: u32::try_from(ttl.num_milliseconds().max(0)).unwrap_or(u32::MAX),
+                };
+                for recipient in to {
+                    messages.push(message(recipient.0, Kind::ActivityChanged(event.clone())));
+                }
+            }
+            Event::Presence { to, user, view } => {
+                let presence = presence(*user, *view);
+                for recipient in to {
+                    messages.push(message(
+                        recipient.0,
+                        Kind::PresenceChanged(presence.clone()),
+                    ));
+                }
+            }
             _ => {}
         }
     }
@@ -184,7 +219,8 @@ fn message(user: uuid::Uuid, kind: Kind) -> (String, Vec<u8>) {
 
 #[cfg(test)]
 mod tests {
-    use push_domain::{ConversationId, DeviceId, UserId};
+    use push_domain::{ActivityState, ConversationId, DeviceId, PresenceView, UserId};
+    use push_proto::v1;
 
     use super::*;
 
@@ -308,6 +344,105 @@ mod tests {
                         conversation_id: id_bytes(conversation.0),
                         read_seq: 9,
                     })
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_activity_goes_to_each_recipient_with_its_fields() {
+        let (alice, bob, carol) = (UserId::new(), UserId::new(), UserId::new());
+        let conversation = ConversationId::new();
+        let messages = notifications(&[
+            Event::Activity {
+                to: vec![bob, carol],
+                conversation,
+                user: alice,
+                state: ActivityState::Working,
+                label: Some("running tests".to_owned()),
+                ttl: push_domain::ACTIVITY_TTL,
+            },
+            Event::Activity {
+                to: vec![bob],
+                conversation,
+                user: alice,
+                state: ActivityState::Idle,
+                label: None,
+                ttl: chrono::TimeDelta::zero(),
+            },
+        ]);
+        let working = Kind::ActivityChanged(v1::ActivityEvent {
+            conversation_id: id_bytes(conversation.0),
+            user_id: id_bytes(alice.0),
+            state: v1::ActivityState::Working.into(),
+            label: Some("running tests".to_owned()),
+            ttl_ms: 30_000,
+        });
+        let idle = Kind::ActivityChanged(v1::ActivityEvent {
+            conversation_id: id_bytes(conversation.0),
+            user_id: id_bytes(alice.0),
+            state: v1::ActivityState::Idle.into(),
+            label: None,
+            ttl_ms: 0,
+        });
+        assert_eq!(
+            decode(&messages),
+            vec![
+                (notify_channel(bob.0), working.clone()),
+                (notify_channel(carol.0), working),
+                (notify_channel(bob.0), idle),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_presence_change_goes_to_each_recipient() {
+        let (alice, bob, carol) = (UserId::new(), UserId::new(), UserId::new());
+        let minute = chrono::DateTime::from_timestamp(1_760_000_040, 0).unwrap();
+        let messages = notifications(&[
+            Event::Presence {
+                to: vec![bob, carol],
+                user: alice,
+                view: PresenceView::Online,
+            },
+            Event::Presence {
+                to: vec![bob],
+                user: alice,
+                view: PresenceView::Offline {
+                    last_seen: Some(minute),
+                },
+            },
+            Event::Presence {
+                to: vec![carol],
+                user: alice,
+                view: PresenceView::Unknown,
+            },
+        ]);
+        let presence = |state: v1::PresenceState, last_seen| {
+            Kind::PresenceChanged(v1::Presence {
+                user_id: id_bytes(alice.0),
+                state: state.into(),
+                last_seen,
+            })
+        };
+        assert_eq!(
+            decode(&messages),
+            vec![
+                (
+                    notify_channel(bob.0),
+                    presence(v1::PresenceState::Online, None)
+                ),
+                (
+                    notify_channel(carol.0),
+                    presence(v1::PresenceState::Online, None)
+                ),
+                (
+                    notify_channel(bob.0),
+                    presence(v1::PresenceState::Offline, Some(1_760_000_040_000_000))
+                ),
+                (
+                    notify_channel(carol.0),
+                    presence(v1::PresenceState::Unknown, None)
                 ),
             ]
         );

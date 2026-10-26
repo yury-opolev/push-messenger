@@ -66,6 +66,18 @@ pub fn kick_channel(device: Uuid) -> String {
     format!("kick:{device}")
 }
 
+/// The Redis sorted set of a user's presence leases: connection id → lease end (ms). The
+/// braces are a hash tag, so a user's presence keys share a cluster slot.
+pub fn presence_conns_key(user: Uuid) -> String {
+    format!("presence:{{{user}}}:conns")
+}
+
+/// The Redis hash of a user's announced presence: `on` (1 while announced online) and
+/// `seen` (the last minute the user was online, in seconds since the Unix epoch).
+pub fn presence_state_key(user: Uuid) -> String {
+    format!("presence:{{{user}}}:state")
+}
+
 /// A gRPC status carrying `error` for the client, as message-svc answers.
 ///
 /// The details (`grpc-status-details-bin`) follow gRPC's rich error model: a
@@ -243,6 +255,14 @@ mod tests {
             kick_channel(user),
             "kick:0192f5a0-0000-7000-8000-000000000001"
         );
+    }
+
+    #[test]
+    fn both_presence_keys_of_a_user_share_one_hash_tag() {
+        let user = Uuid::parse_str("0192f5a0-0000-7000-8000-000000000001").unwrap();
+        let tag = "{0192f5a0-0000-7000-8000-000000000001}";
+        assert_eq!(presence_conns_key(user), format!("presence:{tag}:conns"));
+        assert_eq!(presence_state_key(user), format!("presence:{tag}:state"));
     }
 
     #[test]

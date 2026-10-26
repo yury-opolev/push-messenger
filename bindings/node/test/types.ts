@@ -1,6 +1,19 @@
 // Compiled by `npm run typecheck` (never run): the typings describe a real app's use.
 
-import { Account, Client, Profile, PushError, PushEvent, SecretStore, deriveDatabaseKey, newSalt, SECRET_KEYS } from '../index';
+import {
+  Account,
+  ActivityState,
+  Client,
+  Presence,
+  PresenceState,
+  Profile,
+  PushError,
+  PushEvent,
+  SecretStore,
+  deriveDatabaseKey,
+  newSalt,
+  SECRET_KEYS,
+} from '../index';
 
 const values = new Map<string, Uint8Array>();
 const store: SecretStore = {
@@ -30,6 +43,12 @@ async function app(): Promise<void> {
       case 'sendFailed':
         console.log(event.error.code);
         break;
+      case 'activityChanged':
+        if (event.activity.state !== 'idle') console.log(event.activity.label ?? event.activity.state, event.activity.expiresAtMs);
+        break;
+      case 'presenceChanged':
+        if (event.presence.state === 'offline') console.log(event.presence.lastSeenMs);
+        break;
     }
   });
   const account = await client.signIn('a@example.com', 'password', 'laptop', 'desktop');
@@ -55,6 +74,13 @@ async function app(): Promise<void> {
   }
   const history = await client.messages(conversation.id, null, 50);
   console.log(echo.seq, history.length);
+  const doing: ActivityState = 'working';
+  await client.sendActivity(conversation.id, doing, 'Running tests');
+  await client.sendActivity(conversation.id, 'idle');
+  const presences: Presence[] = await client.getPresence([conversation.peer ?? account.userId]);
+  const state: PresenceState = presences[0].state;
+  const sharing: boolean = await client.setPresenceSharing(!(await client.presenceSharing()));
+  console.log(state, sharing);
   try {
     await client.redeemInvite('NOSUCHCODE');
   } catch (error) {

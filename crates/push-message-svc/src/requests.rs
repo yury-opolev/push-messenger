@@ -2,26 +2,29 @@
 //! request frames, from protobuf to the domain and back. The gateway calls them on behalf
 //! of the user and device it verified.
 
+use std::collections::{HashMap, HashSet};
+
 use chrono::TimeDelta;
 use push_domain::{
     ClientMsgId, Clock, ConversationId, ConversationKind, ConversationSummary, DeleteMessage,
-    DeviceId, DomainResult, EditText, MAX_HISTORY_PAGE, MessageId, MessageRef, Messaging, Notifier,
-    Receipts, Role, Store, UserId,
+    DeviceId, DomainResult, EditText, MAX_HISTORY_PAGE, MAX_PRESENCE_BATCH, MessageId, MessageRef,
+    Messaging, Notifier, PresenceView, Receipts, Role, Store, UserId, ValidationError,
 };
 use push_proto::internal::v1::{
     DeleteRequest, EditRequest, ReadUpToRequest, ReadUpToResponse, RequestCall,
 };
 use push_proto::v1::{
     self, Contact, ContactList, ConversationList, DirectOpened, DirectReceipts, Done, GroupCreated,
-    GroupReceipts, HistoryPage, Invite, InviteRedeemed, ListContacts, SendAck,
-    conversation_summary, delete, edit, request, response,
+    GroupReceipts, HistoryPage, Invite, InviteRedeemed, ListContacts, PresenceList,
+    PresenceSharing, SendAck, conversation_summary, delete, edit, request, response,
 };
 use push_proto::{error_from_status, error_status, id_bytes};
 use tonic::Status;
 
 use crate::convert::{
-    contact_state, deliver, domain_error, from_micros, invalid, micros, parse_id, send_ack,
+    self, contact_state, deliver, domain_error, from_micros, invalid, micros, parse_id, send_ack,
 };
+use crate::presence::{self, PresenceRead, PresenceStates, PresenceUnavailable};
 
 /// `Edit`: the edit entry's receipt, after commit.
 pub(crate) async fn edit<S: Store, C: Clock, N: Notifier>(
@@ -108,8 +111,10 @@ pub(crate) async fn read_up_to<S: Store, C: Clock, N: Notifier>(
 }
 
 /// A request frame: its `Response`, or a status whose error carries its `request_id`.
+/// `presence` is the users' live state, for the presence requests.
 pub(crate) async fn request<S: Store, C: Clock, N: Notifier>(
     messaging: &Messaging<S, C, N>,
+    presence: &dyn PresenceStates,
     call: RequestCall,
 ) -> Result<v1::Response, Status> {
     let request = call.request.ok_or_else(|| invalid("request is required"))?;
@@ -119,7 +124,7 @@ pub(crate) async fn request<S: Store, C: Clock, N: Notifier>(
         let body = request
             .body
             .ok_or_else(|| invalid("the request has no body"))?;
-        answer(messaging, user, body).await
+        answer(messaging, presence, user, body).await
     }
     .await;
     match answered {
@@ -138,6 +143,7 @@ pub(crate) async fn request<S: Store, C: Clock, N: Notifier>(
 /// What the domain answers to one request.
 async fn answer<S: Store, C: Clock, N: Notifier>(
     messaging: &Messaging<S, C, N>,
+    presence: &dyn PresenceStates,
     user: UserId,
     body: request::Body,
 ) -> Result<response::Body, Status> {
@@ -289,6 +295,104 @@ async fn answer<S: Store, C: Clock, N: Notifier>(
                     .await,
             )?
         }
+        request::Body::GetPresence(get) => get_presence(messaging, presence, user, &get.user_ids)
+            .await
+            .map(response::Body::Presences)?,
+        request::Body::SetPresenceSharing(set) => {
+            let share = match set.share {
+                Some(share) => presence::set_sharing(messaging, presence, user, share).await,
+                None => messaging.presence_sharing(user).await,
+            };
+            response::Body::PresenceSharing(PresenceSharing {
+                share: share.map_err(domain_error)?,
+            })
+        }
+    })
+}
+
+/// `GetPresence`: one presence per distinct id, in request order. Users the viewer may not
+/// see are `UNKNOWN`; the others are read from the live state, and anyone the read finds
+/// newly offline is announced before answering (with this read's view if re-reading them
+/// fails). When the state cannot be read, the others are `OFFLINE` without `last_seen`.
+/// When the read is in doubt (it may have run without its answer, so a flip it made may
+/// be unreported), everyone read is announced from a fresh read.
+///
+/// Visibility is checked again after the read, and anyone no longer viewable is
+/// `UNKNOWN`: a hide or block publishes `UNKNOWN` after it commits, so one that committed
+/// during the read must not be overtaken by this answer. One that commits after the second
+/// check can still be overtaken, leaving the viewer with that last real state until it
+/// reads again; the window is only the time the answer takes to reach the client.
+async fn get_presence<S: Store, C: Clock, N: Notifier>(
+    messaging: &Messaging<S, C, N>,
+    presence: &dyn PresenceStates,
+    viewer: UserId,
+    ids: &[Vec<u8>],
+) -> Result<PresenceList, Status> {
+    if ids.is_empty() || ids.len() > MAX_PRESENCE_BATCH {
+        return Err(domain_error(ValidationError::PresenceBatch.into()));
+    }
+    let mut seen = HashSet::new();
+    let mut distinct = Vec::new();
+    for user in user_ids(ids, "user_ids")? {
+        if seen.insert(user) {
+            distinct.push(user);
+        }
+    }
+    let viewable = messaging
+        .presence_viewable(viewer, &distinct)
+        .await
+        .map_err(domain_error)?;
+    // Unreadable presence answers offline (never pushed): the viewer asked, so it must
+    // get an answer. Only fresh reads are announced for a read in doubt.
+    let read =
+        presence
+            .states(&viewable)
+            .await
+            .unwrap_or_else(|PresenceUnavailable { in_doubt }| PresenceRead {
+                views: presence::offline(viewable.len()),
+                flipped: Vec::new(),
+                in_doubt,
+            });
+    let views: HashMap<UserId, PresenceView> = viewable.iter().copied().zip(read.views).collect();
+    let flipped: Vec<(UserId, PresenceView)> = read
+        .flipped
+        .iter()
+        .filter_map(|user| Some((*user, *views.get(user)?)))
+        .collect();
+    presence::announce_flipped(messaging, presence, &flipped).await;
+    if read.in_doubt {
+        // At most the batch: `viewable` holds at most MAX_PRESENCE_BATCH users.
+        let doubted: Vec<UserId> = viewable
+            .iter()
+            .filter(|user| !read.flipped.contains(user))
+            .copied()
+            .collect();
+        presence::announce_in_doubt(messaging, presence, &doubted).await;
+    }
+    // A hide or block that committed since the first check publishes `UNKNOWN` after its
+    // commit, which this answer must not overtake with the real state.
+    let still_viewable: HashSet<UserId> = if viewable.is_empty() {
+        HashSet::new()
+    } else {
+        messaging
+            .presence_viewable(viewer, &viewable)
+            .await
+            .map_err(domain_error)?
+            .into_iter()
+            .collect()
+    };
+    Ok(PresenceList {
+        presences: distinct
+            .into_iter()
+            .map(|user| {
+                let view = views
+                    .get(&user)
+                    .filter(|_| still_viewable.contains(&user))
+                    .copied()
+                    .unwrap_or(PresenceView::Unknown);
+                convert::presence(user, view)
+            })
+            .collect(),
     })
 }
 

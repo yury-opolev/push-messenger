@@ -1,16 +1,25 @@
-//! `RedisNotifier` against a real Redis (Docker must be running).
+//! `RedisNotifier` and `RedisPresence` against a real Redis (Docker must be running).
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use prost::Message;
-use push_domain::{Event, Notifier, UserId};
-use push_message_svc::RedisNotifier;
-use push_proto::internal::v1::{EntriesAvailable, Notification, notification::Kind};
-use push_proto::notify_channel;
+use push_domain::{
+    DeviceId, Event, InMemoryStore, Messaging, Notifier, PresenceView, RecordingNotifier,
+    SystemClock, UserId,
+};
+use push_message_svc::{MessagingApi, PresenceStates, PresenceUnavailable, RedisNotifier};
+use push_proto::internal::v1::messaging_server::Messaging as MessagingRpc;
+use push_proto::internal::v1::{
+    AnnouncePresenceRequest, EntriesAvailable, Notification, RequestCall, notification::Kind,
+};
+use push_proto::v1::{self, GetPresence, PresenceState, request, response};
+use push_proto::{id_bytes, notify_channel, presence_conns_key, presence_state_key};
 use testcontainers_modules::redis::Redis;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::{ContainerAsync, ImageExt};
 use tokio_stream::StreamExt;
+use tonic::Request;
 
 async fn redis() -> (ContainerAsync<Redis>, String) {
     let container = Redis::default()
@@ -110,4 +119,149 @@ async fn the_publish_after_redis_closed_the_connection_still_rings() {
             .expect("the subscription is open");
         assert_eq!(message.get_channel_name(), notify_channel(user.0));
     }
+}
+
+#[tokio::test]
+async fn the_read_script_reports_online_offline_and_flips_once() {
+    let (_container, url) = redis().await;
+    let mut admin = redis::Client::open(url.as_str())
+        .unwrap()
+        .get_multiplexed_async_connection()
+        .await
+        .unwrap();
+    let (online, gone, never) = (UserId::new(), UserId::new(), UserId::new());
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let minute = 1_760_000_040_i64;
+    let _: () = redis::cmd("ZADD")
+        .arg(presence_conns_key(online.0))
+        .arg(now_ms + 60_000)
+        .arg("connection-1")
+        .query_async(&mut admin)
+        .await
+        .unwrap();
+    let _: () = redis::cmd("ZADD")
+        .arg(presence_conns_key(gone.0))
+        .arg(now_ms - 60_000)
+        .arg("connection-2")
+        .query_async(&mut admin)
+        .await
+        .unwrap();
+    let _: () = redis::cmd("HSET")
+        .arg(presence_state_key(gone.0))
+        .arg("on")
+        .arg("1")
+        .arg("seen")
+        .arg(minute)
+        .query_async(&mut admin)
+        .await
+        .unwrap();
+
+    let presence = RedisNotifier::connect(&url)
+        .await
+        .expect("connect")
+        .presence();
+    let users = [online, gone, never];
+    let last_seen = chrono::DateTime::from_timestamp(minute, 0);
+    let read = presence.states(&users).await.unwrap();
+    assert!(!read.in_doubt);
+    assert_eq!(
+        read.views,
+        [
+            PresenceView::Online,
+            PresenceView::Offline { last_seen },
+            PresenceView::Offline { last_seen: None },
+        ]
+    );
+    assert_eq!(read.flipped, [gone]);
+
+    let read = presence.states(&users).await.unwrap();
+    assert_eq!(read.views[1], PresenceView::Offline { last_seen });
+    assert!(read.flipped.is_empty(), "a user flips only once");
+    let expired: i64 = redis::cmd("ZCARD")
+        .arg(presence_conns_key(gone.0))
+        .query_async(&mut admin)
+        .await
+        .unwrap();
+    assert_eq!(expired, 0, "the expired lease is pruned");
+
+    // A Redis that lost its scripts (a restart or SCRIPT FLUSH) is loaded again.
+    let _: () = redis::cmd("SCRIPT")
+        .arg("FLUSH")
+        .query_async(&mut admin)
+        .await
+        .unwrap();
+    let read = presence.states(&[online]).await.unwrap();
+    assert_eq!(read.views, [PresenceView::Online]);
+    assert!(!read.in_doubt, "a script Redis lost never ran: no doubt");
+}
+
+#[tokio::test]
+async fn presence_reads_without_redis_answer_offline_and_push_nothing() {
+    let (container, url) = redis().await;
+    let presence = RedisNotifier::connect(&url)
+        .await
+        .expect("connect")
+        .presence();
+    let notifier = Arc::new(RecordingNotifier::default());
+    let messaging = Arc::new(Messaging::new(
+        InMemoryStore::default(),
+        SystemClock,
+        Arc::clone(&notifier),
+    ));
+    let (alice, bob) = (UserId::new(), UserId::new());
+    for user in [alice, bob] {
+        messaging
+            .device_registered(DeviceId::new(), user)
+            .await
+            .unwrap();
+    }
+    messaging.contact_request(alice, bob).await.unwrap();
+    messaging.contact_accept(bob, alice).await.unwrap();
+    let api = MessagingApi::with_presence(Arc::clone(&messaging), Arc::new(presence.clone()));
+    container.stop().await.expect("stop Redis");
+    notifier.take();
+
+    let users = [UserId::new(), UserId::new()];
+    let failed = tokio::time::timeout(Duration::from_secs(30), presence.states(&users))
+        .await
+        .expect("a failed read gives up instead of hanging");
+    assert!(matches!(failed, Err(PresenceUnavailable { .. })));
+
+    let get = request::Body::GetPresence(GetPresence {
+        user_ids: vec![id_bytes(bob.0), id_bytes(alice.0)],
+    });
+    let call = RequestCall {
+        user_id: id_bytes(alice.0),
+        request: Some(v1::Request {
+            request_id: 7,
+            body: Some(get),
+        }),
+    };
+    let answered = tokio::time::timeout(Duration::from_secs(30), api.request(Request::new(call)))
+        .await
+        .expect("GetPresence gives up instead of hanging")
+        .expect("GetPresence answers")
+        .into_inner();
+    let Some(response::Body::Presences(list)) = answered.body else {
+        panic!("not a presence list");
+    };
+    assert_eq!(
+        list.presences
+            .iter()
+            .map(|presence| (presence.state(), presence.last_seen))
+            .collect::<Vec<_>>(),
+        [(PresenceState::Offline, None); 2]
+    );
+
+    let announce = AnnouncePresenceRequest {
+        user_id: id_bytes(alice.0),
+    };
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        api.announce_presence(Request::new(announce)),
+    )
+    .await
+    .expect("an announcement gives up instead of hanging")
+    .expect("an announcement that read nothing still succeeds");
+    assert_eq!(notifier.take(), vec![], "nothing is pushed");
 }

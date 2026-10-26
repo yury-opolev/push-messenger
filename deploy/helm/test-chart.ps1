@@ -244,6 +244,11 @@ Check 'default: groups are refused; one switch serves them' {
     (Doc $default 'Deployment' 'push-gateway') -match 'name: PUSH_GROUPS\s+value: "0"' -and
         (Doc $on 'Deployment' 'push-gateway') -match 'name: PUSH_GROUPS\s+value: "1"'
 }
+Check 'default: the presence grace is 10 s and configurable' {
+    $short = helm template push $chart --set gateway.presenceGraceMs=2000 | Out-String
+    (Doc $default 'Deployment' 'push-gateway') -match 'name: PUSH_PRESENCE_GRACE_MS\s+value: "10000"' -and
+        (Doc $short 'Deployment' 'push-gateway') -match 'name: PUSH_PRESENCE_GRACE_MS\s+value: "2000"'
+}
 Check 'default: the DevSetup switch is gone' { $default -notmatch 'PUSH_DEV_SETUP' }
 Check 'default: no smoke test' { $default -notmatch 'helm.sh/hook: test' -and $default -notmatch 'PUSH_SMOKE_SIGNING_KEY' }
 Check 'operator smoke: consumer Secret enables helm test without DEV credentials' {

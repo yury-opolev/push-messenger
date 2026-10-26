@@ -66,6 +66,8 @@ spec:
             {{- include "push.redisEnv" . | trim | nindent 12 }}
             - name: PUSH_HEARTBEAT_MS
               value: {{ .Values.gateway.heartbeatMs | quote }}
+            - name: PUSH_PRESENCE_GRACE_MS
+              value: {{ .Values.gateway.presenceGraceMs | quote }}
             # Access tokens are checked against auth-svc's key set (GET /v1/auth/jwks)
             # and must name the gateway's public URL as their audience.
             - name: PUSH_AUTH_URL

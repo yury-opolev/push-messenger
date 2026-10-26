@@ -600,4 +600,63 @@ impl NativeClient {
             client.revoke_device(device).await.map(|()| Value::Null)
         })
     }
+
+    // ----- activity and presence -----
+
+    /// `typing`, `working`, `waiting` or `idle`, with an optional label; resolves once
+    /// queued (fire and forget).
+    #[napi(catch_unwind)]
+    pub fn send_activity<'env>(
+        &self,
+        env: &'env Env,
+        conversation: String,
+        state: String,
+        label: Option<String>,
+    ) -> napi::Result<Object<'env>> {
+        self.promise(env, |client| async move {
+            let id = conversation_id(&conversation)?;
+            let state = json::activity_state(&state)?;
+            client
+                .send_activity(id, state, label.as_deref())
+                .await
+                .map(|()| Value::Null)
+        })
+    }
+
+    #[napi(catch_unwind)]
+    pub fn get_presence<'env>(
+        &self,
+        env: &'env Env,
+        ids: Vec<String>,
+    ) -> napi::Result<Object<'env>> {
+        self.promise(env, |client| async move {
+            let ids = ids
+                .iter()
+                .map(|id| user_id(id))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(json::list(
+                &client.get_presence(&ids).await?,
+                json::presence,
+            ))
+        })
+    }
+
+    /// Resolves to the setting now.
+    #[napi(catch_unwind)]
+    pub fn set_presence_sharing<'env>(
+        &self,
+        env: &'env Env,
+        share: bool,
+    ) -> napi::Result<Object<'env>> {
+        self.promise(env, |client| async move {
+            Ok(Value::Bool(client.set_presence_sharing(share).await?))
+        })
+    }
+
+    #[napi(catch_unwind)]
+    pub fn presence_sharing<'env>(&self, env: &'env Env) -> napi::Result<Object<'env>> {
+        self.promise(env, |client| async move {
+            Ok(Value::Bool(client.presence_sharing().await?))
+        })
+    }
 }

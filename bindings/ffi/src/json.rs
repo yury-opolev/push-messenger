@@ -6,7 +6,8 @@
 //! Field names and enum values are camelCase (`clientMsgId`, `"requestedOut"`); error
 //! codes keep the SDK's snake_case (`"wrong_key"`). Ids are UUID strings; times are
 //! microseconds since the Unix epoch, as in the SDK (they stay below 2^53, so JavaScript
-//! numbers hold them exactly). The schema is documented in `docs/sdk-bindings.md`.
+//! numbers hold them exactly), except fields named `…Ms` (activity and presence), which
+//! are milliseconds. The schema is documented in `docs/sdk-bindings.md`.
 //!
 //! Nothing here logs. The database key never passes through JSON: the bindings take it as
 //! bytes ([`config`]).
@@ -15,9 +16,9 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use push_sdk::{
-    Account, ConnectionState, Contact, ContactState, Conversation, ConversationKind, DatabaseKey,
-    Device, Event, Invite, Message, MessageKind, MessageStatus, OutboxKind, Platform, Profile,
-    SdkError,
+    Account, Activity, ActivityState, ConnectionState, Contact, ContactState, Conversation,
+    ConversationKind, DatabaseKey, Device, Event, Invite, Message, MessageKind, MessageStatus,
+    OutboxKind, Platform, Presence, PresenceState, Profile, SdkError,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -162,6 +163,39 @@ pub fn device(device: &Device) -> Value {
     })
 }
 
+/// Another member's live activity: `{conversationId, userId, state, label, expiresAtMs}`.
+/// `expiresAtMs` is milliseconds since the Unix epoch on this device's clock.
+pub fn activity(activity: &Activity) -> Value {
+    let state = match activity.state {
+        ActivityState::Typing => "typing",
+        ActivityState::Working => "working",
+        ActivityState::Waiting => "waiting",
+        ActivityState::Idle => "idle",
+    };
+    json!({
+        "conversationId": activity.conversation_id.to_string(),
+        "userId": activity.user_id.to_string(),
+        "state": state,
+        "label": activity.label,
+        "expiresAtMs": activity.expires_at_ms,
+    })
+}
+
+/// `{userId, state, lastSeenMs}`: `state` is `unknown`, `online` or `offline`;
+/// `lastSeenMs` (offline only, else `null`) is milliseconds since the Unix epoch.
+pub fn presence(presence: &Presence) -> Value {
+    let state = match presence.state {
+        PresenceState::Unknown => "unknown",
+        PresenceState::Online => "online",
+        PresenceState::Offline => "offline",
+    };
+    json!({
+        "userId": presence.user_id.to_string(),
+        "state": state,
+        "lastSeenMs": presence.last_seen_ms,
+    })
+}
+
 /// Each of `items` with `shape`, as an array.
 pub fn list<T>(items: &[T], shape: impl Fn(&T) -> Value) -> Value {
     Value::Array(items.iter().map(shape).collect())
@@ -222,6 +256,12 @@ pub fn event(event: &Event) -> Value {
         Event::DeviceRemoved => json!({"type": "deviceRemoved"}),
         Event::OpenedElsewhere => json!({"type": "openedElsewhere"}),
         Event::EventsLost => json!({"type": "eventsLost"}),
+        Event::ActivityChanged(changed) => {
+            json!({"type": "activityChanged", "activity": activity(changed)})
+        }
+        Event::PresenceChanged(changed) => {
+            json!({"type": "presenceChanged", "presence": presence(changed)})
+        }
     }
 }
 
@@ -267,6 +307,21 @@ pub fn platform(name: &str) -> Result<Platform, SdkError> {
         "desktop" => Platform::Desktop,
         "other" => Platform::Other,
         _ => return Err(SdkError::Invalid(format!("unknown platform {name:?}"))),
+    })
+}
+
+/// `"typing"`, `"working"`, `"waiting"` or `"idle"`.
+pub fn activity_state(name: &str) -> Result<ActivityState, SdkError> {
+    Ok(match name {
+        "typing" => ActivityState::Typing,
+        "working" => ActivityState::Working,
+        "waiting" => ActivityState::Waiting,
+        "idle" => ActivityState::Idle,
+        _ => {
+            return Err(SdkError::Invalid(format!(
+                "unknown activity state {name:?}"
+            )));
+        }
     })
 }
 
@@ -392,6 +447,76 @@ mod tests {
     }
 
     #[test]
+    fn activity_and_presence_events_carry_their_fields() {
+        let (conversation_id, user_id) = (ConversationId::new(), UserId::new());
+        let typing = Activity {
+            conversation_id,
+            user_id,
+            state: ActivityState::Working,
+            label: Some("Running tests".to_owned()),
+            expires_at_ms: 1_760_000_008_000,
+        };
+        assert_eq!(
+            event(&Event::ActivityChanged(typing.clone())),
+            json!({"type": "activityChanged", "activity": {
+                "conversationId": conversation_id.to_string(),
+                "userId": user_id.to_string(),
+                "state": "working",
+                "label": "Running tests",
+                "expiresAtMs": 1_760_000_008_000_i64,
+            }})
+        );
+        let idle = activity(&Activity {
+            state: ActivityState::Idle,
+            label: None,
+            ..typing
+        });
+        assert_eq!(
+            (&idle["state"], &idle["label"]),
+            (&json!("idle"), &Value::Null)
+        );
+        let offline = Presence {
+            user_id,
+            state: PresenceState::Offline,
+            last_seen_ms: Some(1_760_000_040_000),
+        };
+        assert_eq!(
+            event(&Event::PresenceChanged(offline)),
+            json!({"type": "presenceChanged", "presence": {
+                "userId": user_id.to_string(),
+                "state": "offline",
+                "lastSeenMs": 1_760_000_040_000_i64,
+            }})
+        );
+        let unknown = presence(&Presence {
+            state: PresenceState::Unknown,
+            last_seen_ms: None,
+            ..offline
+        });
+        assert_eq!(
+            (&unknown["state"], &unknown["lastSeenMs"]),
+            (&json!("unknown"), &Value::Null)
+        );
+        let online = PresenceState::Online;
+        assert_eq!(
+            presence(&Presence {
+                state: online,
+                ..offline
+            })["state"],
+            "online"
+        );
+        for (name, state) in [
+            ("typing", ActivityState::Typing),
+            ("working", ActivityState::Working),
+            ("waiting", ActivityState::Waiting),
+            ("idle", ActivityState::Idle),
+        ] {
+            assert_eq!(activity_state(name).unwrap(), state);
+        }
+        assert_eq!(activity_state("Typing").unwrap_err().code(), "invalid");
+    }
+
+    #[test]
     fn a_config_takes_known_fields_and_the_key_as_bytes() {
         let value = json!({
             "authUrl": "http://127.0.0.1:1",
@@ -504,6 +629,18 @@ mod tests {
             Event::DeviceRemoved,
             Event::OpenedElsewhere,
             Event::EventsLost,
+            Event::ActivityChanged(Activity {
+                conversation_id,
+                user_id: user,
+                state: ActivityState::Typing,
+                label: None,
+                expires_at_ms: 0,
+            }),
+            Event::PresenceChanged(Presence {
+                user_id: user,
+                state: PresenceState::Online,
+                last_seen_ms: None,
+            }),
         ];
         for shown in events.iter().map(event) {
             let row = format!("| `{}` |", shown["type"].as_str().unwrap());

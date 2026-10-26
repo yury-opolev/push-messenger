@@ -1,7 +1,7 @@
 //! The whole service on real Postgres and Redis (Docker must be running): readiness, the
 //! worker's account events (a revocation kicks the device on Redis), a send that rings the
-//! recipient's Redis channel, sync, ack, the client's requests, auth-svc's Directory and
-//! Templates (with the built-ins seeded at startup), and graceful shutdown.
+//! recipient's Redis channel, sync, ack, activity fan-out, the client's requests, auth-svc's
+//! Directory and Templates (with the built-ins seeded at startup), and graceful shutdown.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -13,9 +13,9 @@ use push_proto::internal::v1::directory_client::DirectoryClient;
 use push_proto::internal::v1::messaging_client::MessagingClient;
 use push_proto::internal::v1::templates_client::TemplatesClient;
 use push_proto::internal::v1::{
-    AccountDevice, AckRequest, CatalogRequest, EditRequest, IdentifyRequest, Kick, KickReason,
-    Notification, ReadUpToRequest, RequestCall, SendRequest, SyncRequest, VisibleUsersRequest,
-    notification::Kind,
+    AccountDevice, AckRequest, ActivityRequest, CatalogRequest, EditRequest, IdentifyRequest, Kick,
+    KickReason, Notification, ReadUpToRequest, RequestCall, SendRequest, SyncRequest,
+    VisibleUsersRequest, notification::Kind,
 };
 use push_proto::v1::{
     self, Ack, ContactAccept, ContactRequest, ContentType, CreateGroup, CreateInvite, Edit,
@@ -744,6 +744,148 @@ async fn templates_are_seeded_at_startup_and_served_only_with_auth_svcs_token() 
             .entries
             .iter()
             .all(|entry| entry.definition.is_some())
+    );
+
+    running.shutdown.cancel();
+    running.server.await.unwrap().unwrap();
+}
+
+/// Alice and Bob, relayed with a device each, as contacts with a direct conversation.
+async fn direct_chat(running: &Running) -> ((Uuid, Uuid), (Uuid, Uuid), Vec<u8>) {
+    let mut accounts = accounts_client(format!("http://{}", running.accounts)).await;
+    let mut messaging = messaging_client(format!("http://{}", running.grpc)).await;
+    let (alice, bob) = (
+        (Uuid::now_v7(), Uuid::now_v7()),
+        (Uuid::now_v7(), Uuid::now_v7()),
+    );
+    for (user, device) in [alice, bob] {
+        accounts
+            .device_registered(AccountDevice {
+                user_id: id_bytes(user),
+                device_id: id_bytes(device),
+            })
+            .await
+            .unwrap();
+    }
+    let ask = request::Body::ContactRequest(ContactRequest {
+        user_id: id_bytes(bob.0),
+    });
+    messaging.request(call(alice.0, ask)).await.unwrap();
+    let accept = request::Body::ContactAccept(ContactAccept {
+        user_id: id_bytes(alice.0),
+    });
+    messaging.request(call(bob.0, accept)).await.unwrap();
+    let open = request::Body::OpenDirect(OpenDirect {
+        peer_user_id: id_bytes(bob.0),
+    });
+    let opened = messaging.request(call(alice.0, open)).await.unwrap();
+    let Some(response::Body::DirectOpened(opened)) = opened.into_inner().body else {
+        panic!("not an opened conversation");
+    };
+    (alice, bob, opened.conversation_id)
+}
+
+fn activity(
+    (user, device): (Uuid, Uuid),
+    conversation: &[u8],
+    state: v1::ActivityState,
+    label: Option<&str>,
+) -> ActivityRequest {
+    ActivityRequest {
+        user_id: id_bytes(user),
+        device_id: id_bytes(device),
+        activity: Some(v1::Activity {
+            conversation_id: conversation.to_vec(),
+            state: state.into(),
+            label: label.map(str::to_owned),
+        }),
+    }
+}
+
+#[tokio::test]
+async fn activity_rpc_publishes_to_members() {
+    let running = start().await;
+    let (alice, bob, conversation) = direct_chat(&running).await;
+    let mut messaging = messaging_client(format!("http://{}", running.grpc)).await;
+    let mut bell = redis::Client::open(running.redis_url.as_str())
+        .unwrap()
+        .get_async_pubsub()
+        .await
+        .unwrap();
+    bell.subscribe(notify_channel(bob.0)).await.unwrap();
+    bell.subscribe(notify_channel(alice.0)).await.unwrap();
+
+    let working = activity(
+        alice,
+        &conversation,
+        v1::ActivityState::Working,
+        Some("tests"),
+    );
+    messaging.activity(working).await.unwrap();
+
+    let rung = tokio::time::timeout(Duration::from_secs(5), bell.on_message().next())
+        .await
+        .expect("Bob's channel rings within 5 s")
+        .unwrap();
+    assert_eq!(rung.get_channel_name(), notify_channel(bob.0));
+    let notification = Notification::decode(rung.get_payload_bytes()).unwrap();
+    assert_eq!(
+        notification.kind,
+        Some(Kind::ActivityChanged(v1::ActivityEvent {
+            conversation_id: conversation.clone(),
+            user_id: id_bytes(alice.0),
+            state: v1::ActivityState::Working.into(),
+            label: Some("tests".to_owned()),
+            ttl_ms: 30_000,
+        }))
+    );
+    let quiet = tokio::time::timeout(Duration::from_millis(300), bell.on_message().next()).await;
+    assert!(quiet.is_err(), "the sender does not hear its own activity");
+
+    let unspecified = activity(alice, &conversation, v1::ActivityState::Unspecified, None);
+    let status = messaging.activity(unspecified).await.unwrap_err();
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    let mut missing = activity(alice, &conversation, v1::ActivityState::Typing, None);
+    missing.activity = None;
+    let status = messaging.activity(missing).await.unwrap_err();
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+
+    running.shutdown.cancel();
+    running.server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn activity_rpc_refuses_a_non_member() {
+    let running = start().await;
+    let (_alice, _bob, conversation) = direct_chat(&running).await;
+    let mut accounts = accounts_client(format!("http://{}", running.accounts)).await;
+    let mut messaging = messaging_client(format!("http://{}", running.grpc)).await;
+    let carol = (Uuid::now_v7(), Uuid::now_v7());
+    accounts
+        .device_registered(AccountDevice {
+            user_id: id_bytes(carol.0),
+            device_id: id_bytes(carol.1),
+        })
+        .await
+        .unwrap();
+
+    let typing = activity(carol, &conversation, v1::ActivityState::Typing, None);
+    let status = messaging.activity(typing).await.unwrap_err();
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(
+        push_proto::error_from_status(&status).code(),
+        v1::ErrorCode::NotMember
+    );
+    let elsewhere = activity(
+        carol,
+        &id_bytes(Uuid::now_v7()),
+        v1::ActivityState::Typing,
+        None,
+    );
+    let status = messaging.activity(elsewhere).await.unwrap_err();
+    assert_eq!(
+        push_proto::error_from_status(&status).code(),
+        v1::ErrorCode::ConversationNotFound
     );
 
     running.shutdown.cancel();

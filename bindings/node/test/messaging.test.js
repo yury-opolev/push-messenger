@@ -123,6 +123,34 @@ test('cards and answers: sendRich, the peer\'s card, sendAnswer, and invalid bod
   await client.close();
 });
 
+test('activity and presence: sendActivity, getPresence, presence sharing', async (t) => {
+  const { client } = await connected(t);
+  const conversation = await client.openDirect(PEER);
+  await client.sendActivity(conversation.id, 'working', 'Running tests');
+  await client.sendActivity(conversation.id, 'typing');
+  await client.sendActivity(conversation.id, 'idle', null);
+  await assert.rejects(client.sendActivity(conversation.id, 'dancing'), code('invalid'));
+  await assert.rejects(client.sendActivity(conversation.id, 'typing', 'a\nb'), code('invalid'));
+  await assert.rejects(client.sendActivity('not an id', 'typing'), code('invalid'));
+  const [offline] = await client.getPresence([PEER, PEER]);
+  assert.equal(offline.userId, PEER);
+  assert.equal(offline.state, 'offline');
+  assert.equal(offline.lastSeenMs % 60000, 0);
+  assert.ok(Math.abs(offline.lastSeenMs - Date.now()) < 120000);
+  await assert.rejects(client.getPresence([]), code('invalid'));
+  await assert.rejects(client.getPresence(['not an id']), code('invalid'));
+  assert.equal(await client.presenceSharing(), true);
+  assert.equal(await client.setPresenceSharing(false), false);
+  assert.deepEqual(await client.getPresence([PEER]), [{ userId: PEER, state: 'unknown', lastSeenMs: null }]);
+  assert.equal(await client.setPresenceSharing(true), true);
+  client.disconnect();
+  for (let i = 0; i < 250 && client.connectionState().state !== 'offline'; i++) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  await assert.rejects(client.sendActivity(conversation.id, 'typing'), code('offline'));
+  await client.close();
+});
+
 test('the typings declare every call of the client, and only those', () => {
   const declared = fs.readFileSync(path.join(__dirname, '..', 'index.d.ts'), 'utf8');
   const body = declared.slice(declared.indexOf('export class Client {'));

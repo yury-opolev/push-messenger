@@ -427,6 +427,33 @@ int32_t push_client_revoke_device(const PushClient *client,
                                   const char *device_id,
                                   PushError **error);
 
+// Tells the other members of a conversation what the user is doing there: `state` is
+// `typing`, `working`, `waiting` or `idle`; `label` (may be NULL) is a short plain text,
+// ignored with `idle`. Fire and forget: returns once queued, `offline` unless connected.
+// Send it again every 10 to 20 s while it lasts, and `idle` when it ends.
+int32_t push_client_send_activity(const PushClient *client,
+                                  const char *conversation_id_text,
+                                  const char *state,
+                                  const char *label,
+                                  PushError **error);
+
+// The presence of `count` user ids (1 to 100), one per distinct user in the order asked,
+// as a JSON array. Anyone whose presence the user may not see is `unknown`.
+int32_t push_client_get_presence(const PushClient *client,
+                                 const char *const *user_ids,
+                                 size_t count,
+                                 char **presences_json,
+                                 PushError **error);
+
+// Switches sharing the user's presence on or off; `*sharing` gets the setting now.
+int32_t push_client_set_presence_sharing(const PushClient *client,
+                                         bool share,
+                                         bool *sharing,
+                                         PushError **error);
+
+// Whether the user shares their presence (on unless switched off), in `*sharing`.
+int32_t push_client_presence_sharing(const PushClient *client, bool *sharing, PushError **error);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif  // __cplusplus

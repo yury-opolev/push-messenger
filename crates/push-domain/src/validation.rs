@@ -51,6 +51,12 @@ pub enum ValidationError {
     ReviewNote,
     #[error("this content type cannot be sent")]
     ContentType,
+    #[error("the activity label {0}")]
+    ActivityLabel(String),
+    #[error("the activity state is missing")]
+    ActivityState,
+    #[error("a presence read names 1 to 100 users")]
+    PresenceBatch,
 }
 
 /// Checks a text message body.

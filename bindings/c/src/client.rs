@@ -796,3 +796,93 @@ pub unsafe extern "C" fn push_client_revoke_device(
         wait(this.client.revoke_device(device))
     })
 }
+
+// ----- activity and presence -----
+
+/// Tells the other members of a conversation what the user is doing there: `state` is
+/// `typing`, `working`, `waiting` or `idle`; `label` (may be NULL) is a short plain text,
+/// ignored with `idle`. Fire and forget: returns once queued, `offline` unless connected.
+/// Send it again every 10 to 20 s while it lasts, and `idle` when it ends.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn push_client_send_activity(
+    client: *const PushClient,
+    conversation_id_text: *const c_char,
+    state: *const c_char,
+    label: *const c_char,
+    error: *mut *mut PushError,
+) -> i32 {
+    guard(error, || {
+        let this = unsafe { handle(client) }?;
+        let id = unsafe { conversation_id(conversation_id_text) }?;
+        let state = json::activity_state(unsafe { text(state, "state") }?)?;
+        let label = if label.is_null() {
+            None
+        } else {
+            Some(unsafe { text(label, "label") }?)
+        };
+        wait(this.client.send_activity(id, state, label))
+    })
+}
+
+/// The presence of `count` user ids (1 to 100), one per distinct user in the order asked,
+/// as a JSON array. Anyone whose presence the user may not see is `unknown`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn push_client_get_presence(
+    client: *const PushClient,
+    user_ids: *const *const c_char,
+    count: usize,
+    presences_json: *mut *mut c_char,
+    error: *mut *mut PushError,
+) -> i32 {
+    guard(error, || {
+        let out = place(presences_json, "presences_json")?;
+        let this = unsafe { handle(client) }?;
+        let ids = if count == 0 {
+            &[][..]
+        } else if user_ids.is_null() {
+            return Err(SdkError::Invalid("user_ids is NULL".to_owned()));
+        } else {
+            unsafe { std::slice::from_raw_parts(user_ids, count) }
+        };
+        let ids = ids
+            .iter()
+            .map(|id| unsafe { user_id(*id) })
+            .collect::<Result<Vec<_>, _>>()?;
+        let presences = wait(this.client.get_presence(&ids))?;
+        put_json(out, &json::list(&presences, json::presence));
+        Ok(())
+    })
+}
+
+/// Switches sharing the user's presence on or off; `*sharing` gets the setting now.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn push_client_set_presence_sharing(
+    client: *const PushClient,
+    share: bool,
+    sharing: *mut bool,
+    error: *mut *mut PushError,
+) -> i32 {
+    guard(error, || {
+        let out = buffer(sharing, "sharing")?;
+        let this = unsafe { handle(client) }?;
+        let now = wait(this.client.set_presence_sharing(share))?;
+        unsafe { *out = now };
+        Ok(())
+    })
+}
+
+/// Whether the user shares their presence (on unless switched off), in `*sharing`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn push_client_presence_sharing(
+    client: *const PushClient,
+    sharing: *mut bool,
+    error: *mut *mut PushError,
+) -> i32 {
+    guard(error, || {
+        let out = buffer(sharing, "sharing")?;
+        let this = unsafe { handle(client) }?;
+        let now = wait(this.client.presence_sharing())?;
+        unsafe { *out = now };
+        Ok(())
+    })
+}

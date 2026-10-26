@@ -79,6 +79,9 @@ pub(crate) enum Command {
     Wake,
     /// A request (spec §7.1); answered with its `Response`, or an error.
     Request { body: request::Body, reply: Reply },
+    /// A frame nothing answers (activity): sent while a connection is live, dropped
+    /// otherwise, never queued for a later connection.
+    Frame(Body),
 }
 
 /// Where the gateway is.
@@ -190,7 +193,7 @@ impl Connection {
                         let _ = ack.send(());
                         continue;
                     }
-                    Some(Command::Disconnect | Command::Wake) => continue,
+                    Some(Command::Disconnect | Command::Wake | Command::Frame(_)) => continue,
                 }
             }
             self.set_state(ConnectionState::Connecting);
@@ -288,7 +291,7 @@ impl Connection {
                         Some(Command::Request { reply, .. }) => {
                             let _ = reply.send(Err(SdkError::Offline));
                         }
-                        Some(Command::Wake) => {}
+                        Some(Command::Wake | Command::Frame(_)) => {}
                     },
                 }
             }
@@ -318,7 +321,7 @@ impl Connection {
                     Some(Command::Request { reply, .. }) => {
                         let _ = reply.send(Err(SdkError::Offline));
                     }
-                    Some(Command::Connect | Command::Wake) => {}
+                    Some(Command::Connect | Command::Wake | Command::Frame(_)) => {}
                 },
             }
         };
@@ -496,6 +499,7 @@ impl Connection {
                     }
                     Some(Command::Connect) => {}
                     Some(Command::Wake) => self.engine.wake(unix_ms(), &mut out),
+                    Some(Command::Frame(body)) => out.push(body),
                     Some(Command::Request { body, reply }) => {
                         let request_id = live.next_request;
                         live.next_request += 1;

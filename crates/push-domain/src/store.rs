@@ -34,7 +34,9 @@
 //! conversation row ([`Tx::next_seq`]) → positions → users. `add_members`
 //! takes the positions lock while it reads the group's positions, before it locks the
 //! users it adds, so never take user locks before the positions lock in a path that also
-//! takes positions. A device registration takes only its user's lock. A transaction takes
+//! takes positions. A device registration takes only its user's lock. Presence
+//! publications take the lock of the user whose presence they publish (`contact_block`
+//! after the pair lock), so they are serialised per user. A transaction takes
 //! its user locks in one call, so no two transactions wait for each other's user locks in
 //! a cycle.
 //!
@@ -178,6 +180,15 @@ pub trait Tx: Send {
         user: UserId,
         candidates: &[UserId],
     ) -> DomainResult<Vec<UserId>>;
+
+    // --- Presence ----------------------------------------------------------------------
+
+    /// The users among `users` who hide their presence. Duplicates in `users` are ignored;
+    /// unknown users hide nothing. The order of the result is unspecified.
+    async fn presence_hidden(&mut self, users: &[UserId]) -> DomainResult<Vec<UserId>>;
+    /// Hides (`true`) or shows `user`'s presence. Idempotent. Fails with
+    /// `DomainError::Store` when hiding the presence of a user who is not known.
+    async fn set_presence_hidden(&mut self, user: UserId, hidden: bool) -> DomainResult<()>;
 
     // --- Invites -----------------------------------------------------------------------
 

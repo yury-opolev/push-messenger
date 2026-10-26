@@ -17,11 +17,11 @@ use push_credentials::startup::{redis_permanent, retry};
 use push_credentials::{AuthMode, AzureConfig, RedisConnector};
 use push_proto::internal::v1::messaging_client::MessagingClient;
 use push_proto::internal::v1::{
-    AckRequest, DeleteRequest, EditRequest, IdentifyRequest, Kick, KickReason, ReadUpToRequest,
-    RequestCall, SendRequest, SyncRequest,
+    AckRequest, ActivityRequest, DeleteRequest, EditRequest, IdentifyRequest, Kick, KickReason,
+    ReadUpToRequest, RequestCall, SendRequest, SyncRequest,
 };
 use push_proto::v1::frame::Body;
-use push_proto::v1::{AuthExpiring, Error, ErrorCode, SendAck};
+use push_proto::v1::{Activity, ActivityState, AuthExpiring, Error, ErrorCode, SendAck};
 use push_proto::{MAX_FRAME_BYTES, close, encode_frame, error_from_status, id_bytes, kick_channel};
 use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 use tokio::net::TcpListener;
@@ -34,10 +34,12 @@ use tonic::service::interceptor::InterceptedService;
 use tonic::transport::{Channel, Endpoint};
 use uuid::Uuid;
 
+use crate::activity::ActivityLimiter;
 use crate::config::Config;
 use crate::drain::Drain;
 use crate::hub::{Hub, Membership, Signal};
 use crate::limits::{Action, FrameBudget, Limits, RedisCounter, Refused, Subject};
+use crate::presence::{self, PresenceContext};
 use crate::session::{RetryDelay, Session, Step, error_frame};
 use crate::tokens::{Claims, TokenError, Verifier};
 
@@ -64,14 +66,16 @@ const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Every connection syncs this often even without a ring, so entries arrive while Redis
 /// is lost or a notification was (spec §12, test 4).
 const SWEEP_INTERVAL: Duration = Duration::from_secs(300);
+/// How long each idle announcement of a closed connection may take.
+const IDLE_ON_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// message-svc's `Messaging` API, every call carrying the gateway's internal token.
-type MessagingApi = MessagingClient<InterceptedService<Channel, BearerToken>>;
+pub(crate) type MessagingApi = MessagingClient<InterceptedService<Channel, BearerToken>>;
 
 /// Puts `authorization: Bearer <token>` on every call. message-svc compares it in
 /// constant time and refuses `Messaging` calls without it: they act as any user.
 #[derive(Clone)]
-struct BearerToken(MetadataValue<Ascii>);
+pub(crate) struct BearerToken(MetadataValue<Ascii>);
 
 impl Interceptor for BearerToken {
     fn call(
@@ -94,6 +98,7 @@ struct App {
     /// Publishes takeovers on `kick:{device_id}`.
     redis: ConnectionManager,
     limits: Limits,
+    presence: PresenceContext,
     sessions: TaskTracker,
     drain: Arc<Drain>,
     shutdown: CancellationToken,
@@ -171,6 +176,13 @@ pub async fn serve(
     let verifier = Verifier::new(config.jwks_url(), &config.token_audience);
     let keys = tokio::spawn(refresh_keys(verifier.clone(), shutdown.clone()));
     let sessions = TaskTracker::new();
+    let presence = PresenceContext::new(
+        publisher.clone(),
+        messaging.clone(),
+        config.presence_grace,
+        shutdown.clone(),
+        sessions.clone(),
+    );
     let listen_addr = config.listen_addr;
     let app = App {
         config: Arc::new(config),
@@ -182,6 +194,7 @@ pub async fn serve(
             shutdown.clone(),
         ))),
         redis: publisher,
+        presence,
         sessions: sessions.clone(),
         drain: Arc::default(),
         shutdown: shutdown.clone(),
@@ -314,6 +327,7 @@ async fn connection(mut socket: WebSocket, app: App, ip: IpAddr) {
         return;
     };
     take_over(&app, claims.device, membership.connection()).await;
+    let presence = presence::track(app.presence.clone(), claims.user, membership.connection());
     let mut connected = Connected {
         socket,
         session,
@@ -328,9 +342,27 @@ async fn connection(mut socket: WebSocket, app: App, ip: IpAddr) {
         issued_at: claims.issued_at,
         retry: RetryDelay::default(),
         retry_at: None,
+        activity: ActivityLimiter::new(Instant::now()),
     };
+    let kicked = converse(&mut connected, &mut membership, &app, ready).await;
+    // A newer connection of the device took over: it is live and keeps its own activity
+    // fresh, which idle from this one would overwrite.
+    if kicked != Some(KickReason::TakenOver) {
+        connected.idle_on_close(&app);
+    }
+    drop(presence);
+}
+
+/// Serves an identified connection, from `Ready` until it ends, whichever way. Returns the
+/// kick that ended it, if one did.
+async fn converse(
+    connected: &mut Connected,
+    membership: &mut Membership,
+    app: &App,
+    ready: Body,
+) -> Option<KickReason> {
     if send(&mut connected.socket, ready).await.is_err() || connected.deliver().await.is_err() {
-        return;
+        return None;
     }
     // Clients ping every heartbeat; one silent for two and a half is gone.
     let idle = app.config.heartbeat * 5 / 2;
@@ -338,6 +370,7 @@ async fn connection(mut socket: WebSocket, app: App, ip: IpAddr) {
     let mut sweep_at = Instant::now() + first_sweep(membership.connection());
     loop {
         let retry_at = connected.retry_at;
+        let activity_due = connected.activity.next_due();
         let (warn_at, warned, deadline) = (
             connected.expiry.warn_at,
             connected.expiry.warned,
@@ -347,16 +380,16 @@ async fn connection(mut socket: WebSocket, app: App, ip: IpAddr) {
             () = app.shutdown.cancelled() => {
                 tokio::time::sleep(app.drain.next_delay()).await;
                 close_with(&mut connected.socket, close::SHUTTING_DOWN, "server shutting down").await;
-                return;
+                return None;
             }
             () = tokio::time::sleep_until(idle_at) => {
                 close_with(&mut connected.socket, close::POLICY_VIOLATION, "no frame within two and a half heartbeats").await;
-                return;
+                return None;
             }
             () = tokio::time::sleep_until(sweep_at) => {
                 sweep_at = Instant::now() + SWEEP_INTERVAL;
                 if connected.deliver().await.is_err() {
-                    return;
+                    return None;
                 }
             }
             signal = membership.next() => {
@@ -367,27 +400,34 @@ async fn connection(mut socket: WebSocket, app: App, ip: IpAddr) {
                         let (code, why) = kick_close(reason);
                         tracing::info!(device = %connected.device, ?reason, "connection kicked");
                         close_with(&mut connected.socket, code, why).await;
-                        Err(Closed)
+                        return Some(reason);
                     }
                 };
                 if done.is_err() {
-                    return;
+                    return None;
                 }
             }
             // The precondition disables the branch; the far-away instant is never awaited.
             () = tokio::time::sleep_until(retry_at.unwrap_or_else(far_future)), if retry_at.is_some() => {
                 if connected.deliver().await.is_err() {
-                    return;
+                    return None;
+                }
+            }
+            () = tokio::time::sleep_until(activity_due.unwrap_or_else(far_future)), if activity_due.is_some() => {
+                if let Some(activity) = connected.activity.take_due(Instant::now()) {
+                    if connected.publish_activity(activity).await.is_err() {
+                        return None;
+                    }
                 }
             }
             () = tokio::time::sleep_until(warn_at), if !warned => {
                 if connected.warn_expiry().await.is_err() {
-                    return;
+                    return None;
                 }
             }
             () = tokio::time::sleep_until(deadline) => {
                 close_with(&mut connected.socket, close::REAUTH_REQUIRED, "the access token expired; send ReAuth in time").await;
-                return;
+                return None;
             }
             message = connected.socket.recv() => {
                 idle_at = Instant::now() + idle;
@@ -396,7 +436,7 @@ async fn connection(mut socket: WebSocket, app: App, ip: IpAddr) {
                 {
                     tracing::info!(device = %connected.device, "too many frames");
                     close_with(&mut connected.socket, close::RATE_LIMITED, "too many frames; slow down").await;
-                    return;
+                    return None;
                 }
                 let step = match message {
                     Some(Ok(Message::Binary(bytes))) => connected.session.on_binary(&bytes),
@@ -405,12 +445,12 @@ async fn connection(mut socket: WebSocket, app: App, ip: IpAddr) {
                     Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
                     Some(Err(error)) => {
                         refuse_oversized(&mut connected.socket, error).await;
-                        return;
+                        return None;
                     }
-                    Some(Ok(Message::Close(_))) | None => return,
+                    Some(Ok(Message::Close(_))) | None => return None,
                 };
                 if connected.run(step).await.is_err() {
-                    return;
+                    return None;
                 }
                 membership.renewed(connected.issued_at);
             }
@@ -774,6 +814,8 @@ struct Connected {
     retry: RetryDelay,
     /// When to retry a failed sync; `None` while the last sync succeeded.
     retry_at: Option<Instant>,
+    /// Paces the connection's activities and remembers the live ones.
+    activity: ActivityLimiter,
 }
 
 impl Connected {
@@ -890,6 +932,10 @@ impl Connected {
                 };
                 send(&mut self.socket, body).await
             }
+            Step::Activity(activity) => match self.activity.offer(activity, Instant::now()) {
+                Some(activity) => self.publish_activity(activity).await,
+                None => Ok(()),
+            },
             Step::Close(code, reason) => {
                 close_with(&mut self.socket, code, reason).await;
                 Err(Closed)
@@ -960,6 +1006,59 @@ impl Connected {
                 Err(Closed)
             }
             None => Ok(()),
+        }
+    }
+
+    /// Hands an activity the limiter let through to message-svc, which fans it out. A
+    /// refusal is answered with an error without ids that is never retryable: SDKs read
+    /// an anonymous retryable error as "send ReAuth again", and activity is refreshed
+    /// anyway.
+    async fn publish_activity(&mut self, activity: Activity) -> Result<(), Closed> {
+        let request = ActivityRequest {
+            user_id: id_bytes(self.user),
+            device_id: id_bytes(self.device),
+            activity: Some(activity.clone()),
+        };
+        match self.messaging.activity(request).await {
+            Ok(_) => {
+                self.activity.sent(&activity, Instant::now());
+                Ok(())
+            }
+            Err(status) => {
+                self.end_if_over(&status).await?;
+                let mut error = error_from_status(&status);
+                error.retryable = false;
+                error.retry_after_s = None;
+                send(&mut self.socket, Body::Error(error)).await
+            }
+        }
+    }
+
+    /// The connection ended: tells the other members of every conversation where its
+    /// last activity still lasts that it went idle. In tasks of their own, which shutdown
+    /// waits for, so a closing connection does not wait on message-svc.
+    fn idle_on_close(&self, app: &App) {
+        for conversation in self.activity.still_live(Instant::now()) {
+            let request = ActivityRequest {
+                user_id: id_bytes(self.user),
+                device_id: id_bytes(self.device),
+                activity: Some(Activity {
+                    conversation_id: conversation,
+                    state: ActivityState::Idle.into(),
+                    label: None,
+                }),
+            };
+            let mut messaging = self.messaging.clone();
+            let device = self.device;
+            app.sessions.spawn(async move {
+                let call = messaging.activity(request);
+                if !matches!(
+                    tokio::time::timeout(IDLE_ON_CLOSE_TIMEOUT, call).await,
+                    Ok(Ok(_))
+                ) {
+                    tracing::warn!(%device, "could not announce idle for a closed connection");
+                }
+            });
         }
     }
 

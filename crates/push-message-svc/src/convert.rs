@@ -1,7 +1,10 @@
 //! Between domain values and protobuf messages.
 
 use chrono::{DateTime, Utc};
-use push_domain::{ContactState, ContentType, DomainError, Entry, EntryKind, SendReceipt};
+use push_domain::{
+    ActivityState, ContactState, ContentType, DomainError, Entry, EntryKind, PresenceView,
+    SendReceipt, UserId, ValidationError,
+};
 use push_proto::v1::{self, Deliver, ErrorCode, SendAck};
 use push_proto::{error_status, id, id_bytes};
 use tonic::{Code, Status};
@@ -150,6 +153,41 @@ pub(crate) fn contact_state(state: Option<ContactState>) -> v1::ContactState {
         Some(ContactState::RequestedIn) => v1::ContactState::RequestedIn,
         Some(ContactState::Accepted) => v1::ContactState::Accepted,
         Some(ContactState::Blocked) => v1::ContactState::Blocked,
+    }
+}
+
+/// An activity state as the client sends it; unspecified is `Invalid`.
+pub(crate) fn activity_state_from_wire(state: v1::ActivityState) -> Result<ActivityState, Status> {
+    match state {
+        v1::ActivityState::Typing => Ok(ActivityState::Typing),
+        v1::ActivityState::Working => Ok(ActivityState::Working),
+        v1::ActivityState::Waiting => Ok(ActivityState::Waiting),
+        v1::ActivityState::Idle => Ok(ActivityState::Idle),
+        v1::ActivityState::Unspecified => Err(domain_error(ValidationError::ActivityState.into())),
+    }
+}
+
+/// An activity state as the members receive it.
+pub(crate) fn activity_state_to_wire(state: ActivityState) -> v1::ActivityState {
+    match state {
+        ActivityState::Typing => v1::ActivityState::Typing,
+        ActivityState::Working => v1::ActivityState::Working,
+        ActivityState::Waiting => v1::ActivityState::Waiting,
+        ActivityState::Idle => v1::ActivityState::Idle,
+    }
+}
+
+/// `user`'s presence as a viewer is shown it: `last_seen` only with offline.
+pub(crate) fn presence(user: UserId, view: PresenceView) -> v1::Presence {
+    let (state, last_seen) = match view {
+        PresenceView::Unknown => (v1::PresenceState::Unknown, None),
+        PresenceView::Online => (v1::PresenceState::Online, None),
+        PresenceView::Offline { last_seen } => (v1::PresenceState::Offline, last_seen.map(micros)),
+    };
+    v1::Presence {
+        user_id: id_bytes(user.0),
+        state: state.into(),
+        last_seen,
     }
 }
 

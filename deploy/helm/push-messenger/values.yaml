@@ -44,6 +44,9 @@ gateway:
   replicas: 1
   # Client ping interval announced in Ready, in milliseconds.
   heartbeatMs: 30000
+  # How long a closed connection still counts as online (presence), so a reconnect within
+  # it (a network blip, a rollout) is never shown offline; 0 to 120000 milliseconds.
+  presenceGraceMs: 10000
   # Groups are not offered to apps in the first release (owner decision): the gateway
   # refuses group requests with NOT_AVAILABLE. message-svc keeps full group support;
   # true serves them.

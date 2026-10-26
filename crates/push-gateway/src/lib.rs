@@ -2,14 +2,17 @@
 //! to message-svc over gRPC, and pushes new entries to connected devices when Redis rings
 //! their user's channel. It holds no database credentials and no business rules.
 
+mod activity;
 mod config;
 mod drain;
 mod hub;
 mod limits;
+mod presence;
 mod server;
 mod session;
 mod tokens;
 
+pub use activity::{ACTIVITY_TTL, ActivityLimiter};
 pub use config::{Config, ConfigError};
 pub use hub::{Hub, Membership, Signal};
 pub use limits::{

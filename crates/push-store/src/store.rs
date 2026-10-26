@@ -416,6 +416,32 @@ impl Tx for PgTx {
         Ok(related.into_iter().map(UserId).collect())
     }
 
+    async fn presence_hidden(&mut self, users: &[UserId]) -> DomainResult<Vec<UserId>> {
+        let users: Vec<Uuid> = users.iter().map(|user| user.0).collect();
+        let hidden: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT user_id FROM messaging.presence_hidden WHERE user_id = ANY($1)",
+        )
+        .bind(users)
+        .fetch_all(self.conn())
+        .await
+        .map_err(store_error)?;
+        Ok(hidden.into_iter().map(UserId).collect())
+    }
+
+    async fn set_presence_hidden(&mut self, user: UserId, hidden: bool) -> DomainResult<()> {
+        let statement = if hidden {
+            "INSERT INTO messaging.presence_hidden (user_id) VALUES ($1) ON CONFLICT DO NOTHING"
+        } else {
+            "DELETE FROM messaging.presence_hidden WHERE user_id = $1"
+        };
+        sqlx::query(statement)
+            .bind(user.0)
+            .execute(self.conn())
+            .await
+            .map_err(store_error)?;
+        Ok(())
+    }
+
     async fn insert_invite(&mut self, invite: InviteRecord) -> DomainResult<InsertOutcome> {
         let inserted = sqlx::query(
             "INSERT INTO messaging.invite \

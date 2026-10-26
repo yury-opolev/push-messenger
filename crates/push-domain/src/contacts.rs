@@ -3,6 +3,7 @@ use crate::error::{DomainError, DomainResult};
 use crate::ids::UserId;
 use crate::model::{ContactState, ContactSummary};
 use crate::notify::{Event, Notifier};
+use crate::presence::PresenceView;
 use crate::service::Messaging;
 use crate::store::{Store, Tx};
 use crate::validation::ValidationError;
@@ -118,15 +119,26 @@ where
 
     /// Blocks `peer`. Ends any contact; `peer`'s side is removed unless they also block.
     /// `peer` is never told. Blocking an id that is not a verified user stores nothing.
+    /// Blocking an accepted contact also publishes `Unknown` presence both ways, after the
+    /// commit, so a presence read that still saw the pair as contacts cannot be answered
+    /// after it. Both users' locks are held until the commit, so no announcement can follow
+    /// it with a stale state (see [`Self::announce_presence`]): one already under way
+    /// published before the block took the lock, and a later one leaves the pair out.
     pub async fn contact_block(&self, me: UserId, peer: UserId) -> DomainResult<()> {
         let Some(mut tx) = self.begin_pair(me, peer).await? else {
             return Ok(());
         };
+        tx.lock_users(&[me, peer]).await?;
         let blocked = Some(ContactState::Blocked);
         let mut events = Vec::new();
         // The block records whether `me` could see `peer` until now, so that blocking a
         // stranger never makes them visible. A block already in place keeps its record.
         let previous = tx.get_contact(me, peer).await?;
+        let theirs = tx.get_contact(peer, me).await?;
+        // Accepted contacts saw each other's presence; the block ends that both ways. Each
+        // side gets the same `Unknown` an opt-out gives, so the blocked user learns nothing.
+        let presence_ended =
+            previous == Some(ContactState::Accepted) && theirs == Some(ContactState::Accepted);
         if previous != blocked {
             let sees_peer = matches!(
                 previous,
@@ -135,11 +147,22 @@ where
             tx.put_block(me, peer, sees_peer).await?;
             events.push(contact_changed(me, peer, blocked));
         }
-        if tx.get_contact(peer, me).await? != blocked {
+        if theirs != blocked {
             set_contact(&mut tx, peer, me, None).await?;
         }
         tx.commit().await?;
-        self.publish(events).await;
+        let mut published: Vec<Event> = Vec::new();
+        if presence_ended {
+            published.extend([(peer, me), (me, peer)].into_iter().map(|(to, user)| {
+                Event::Presence {
+                    to: vec![to],
+                    user,
+                    view: PresenceView::Unknown,
+                }
+            }));
+        }
+        published.extend(events);
+        self.publish(published).await;
         Ok(())
     }
 

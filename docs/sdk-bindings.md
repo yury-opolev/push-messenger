@@ -66,8 +66,8 @@ holds it.
 ### Data
 
 Data is JSON-shaped: field names and enum values are camelCase, ids are UUID strings, times
-are microseconds since the Unix epoch (they fit JavaScript numbers exactly), and absent
-values are `null`.
+are microseconds since the Unix epoch (they fit JavaScript numbers exactly) except fields
+ending in `Ms`, which are milliseconds, and absent values are `null`.
 
 - **Account:** `{userId, deviceId}`.
 - **Connection state:** `{state}` — `offline`, `connecting`, `connected`, `signedOut`,
@@ -87,6 +87,12 @@ values are `null`.
 - **Invite:** `{code, expiresAt, maxUses, uses}`. **Profile:** `{userId, handle,
   displayName}`. **Device:** `{deviceId, name, platform, createdAt, lastSeenAt, current}`.
 - **Error** (inside `sendFailed`): `{code, message, retryable, retryAfterS}`.
+- **Activity:** `{conversationId, userId, state, label, expiresAtMs}`; `state` is
+  `typing`, `working`, `waiting` or `idle`; `label` is plain text to show inert, or `null`;
+  `expiresAtMs` is when to stop showing it, on this device's clock (`idle`: at once).
+- **Presence:** `{userId, state, lastSeenMs}`; `state` is `online`, `offline` or `unknown`
+  (not visible: not an accepted contact, blocked, sharing off on either side, or no such
+  user — indistinguishable on purpose); `lastSeenMs` (a whole minute) only when `offline`.
 
 ### Events
 
@@ -103,6 +109,8 @@ One ordered stream per client, each event an object with a `type`:
 | `receiptChanged` | `conversationId`, `peerDeliveredSeq`, `peerReadSeq` |
 | `conversationChanged` | `conversation` |
 | `contactChanged` | `contact` |
+| `activityChanged` | `activity`: another member's activity; a newer one from the same user and conversation replaces it |
+| `presenceChanged` | `presence`: a contact's presence changed |
 | `signedOut` | sign in again |
 | `deviceRemoved` | the device was revoked |
 | `openedElsewhere` | another copy took over |
@@ -131,6 +139,29 @@ text, and show `fallback` for anything else.
 In a group any member other than the card's sender may answer, and the first answer
 closes the card: an agent must check the answer's `senderId` (for example, act only on its
 owner's answer) before acting on it.
+
+### Activity and presence
+
+The protocol, the rules and an agent recipe: [activity-presence.md](activity-presence.md).
+
+- `send_activity(conversation, state, label)` (`sendActivity`, `push_client_send_activity`)
+  tells the other members what the user is doing: `state` is `typing`, `working`, `waiting`
+  or `idle`; `label` is optional: absent or empty means none, otherwise 1–60 characters of
+  plain text without line breaks, control or invisible characters (`invalid` otherwise),
+  and it is ignored with `idle`. Fire and forget: it returns once queued and fails with
+  `offline` unless connected. Others show it for 30 s, so send it again every 10–20 s while
+  it lasts and `idle` when it ends. Others' activity arrives as `activityChanged`.
+- `get_presence(user_ids)` (`getPresence`, `push_client_get_presence`) gives 1 to 100
+  users' presence, one per distinct user in the order asked. Changes to contacts' presence
+  arrive as `presenceChanged` while connected.
+- `set_presence_sharing(share)` (`setPresenceSharing`, `push_client_set_presence_sharing`)
+  and `presence_sharing()` (`presenceSharing`, `push_client_presence_sharing`) switch and
+  read whether the user shares their presence (on by default). The opt-out is reciprocal:
+  while it is off, everyone reads as `unknown`. Nothing is reported when it changes; clear
+  the presence the app holds when switching it off. While the client knows sharing is off
+  (from either call; before either it counts as on), it drops `presenceChanged` about other
+  users, so a change the server sent just before the switch is not shown; the user's own
+  presence still arrives.
 
 ### The secret store and the database key
 
@@ -342,7 +373,7 @@ The functions are called on SDK threads and on the threads that call the SDK, so
 must be thread-safe; a call into the SDK from inside them fails with `invalid`. The store
 is the client's from `push_client_open` on and is released even when the open fails.
 `bindings/c/tests/c/flow.c` is a complete program: an in-memory store, sign-in, events by
-polling and by callback, sending, and an encrypted database.
+polling and by callback, sending, activity and presence, and an encrypted database.
 
 ## Scope of the first release
 

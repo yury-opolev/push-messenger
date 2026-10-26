@@ -301,6 +301,112 @@ impl OutboxKind {
     }
 }
 
+/// What a member is doing in a conversation, as live activity (not stored).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ActivityState {
+    Typing,
+    Working,
+    /// Waiting for the others (an agent with a card open).
+    Waiting,
+    /// Nothing any more: stop showing the activity at once.
+    Idle,
+}
+
+impl ActivityState {
+    pub(crate) fn to_wire(self) -> v1::ActivityState {
+        match self {
+            Self::Typing => v1::ActivityState::Typing,
+            Self::Working => v1::ActivityState::Working,
+            Self::Waiting => v1::ActivityState::Waiting,
+            Self::Idle => v1::ActivityState::Idle,
+        }
+    }
+
+    pub(crate) fn from_wire(state: v1::ActivityState) -> Option<Self> {
+        match state {
+            v1::ActivityState::Typing => Some(Self::Typing),
+            v1::ActivityState::Working => Some(Self::Working),
+            v1::ActivityState::Waiting => Some(Self::Waiting),
+            v1::ActivityState::Idle => Some(Self::Idle),
+            v1::ActivityState::Unspecified => None,
+        }
+    }
+}
+
+/// Another member's live activity in a conversation. A newer one from the same user and
+/// conversation replaces it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Activity {
+    pub conversation_id: ConversationId,
+    pub user_id: UserId,
+    pub state: ActivityState,
+    /// Plain text to show inert (never as links or markup).
+    pub label: Option<String>,
+    /// When to stop showing it: unix ms on this device's clock (receive time + ttl).
+    /// Idle: the receive time.
+    pub expires_at_ms: i64,
+}
+
+impl std::fmt::Debug for Activity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Activity")
+            .field("conversation_id", &self.conversation_id)
+            .field("user_id", &self.user_id)
+            .field("state", &self.state)
+            .field("label", &redacted(&self.label))
+            .field("expires_at_ms", &self.expires_at_ms)
+            .finish()
+    }
+}
+
+/// Whether a user is online, as the user may see it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PresenceState {
+    /// Not visible: not an accepted contact, blocked, sharing off on either side, or no
+    /// such user. These cases look the same on purpose.
+    Unknown,
+    /// At least one of the user's devices is connected.
+    Online,
+    Offline,
+}
+
+impl PresenceState {
+    pub(crate) fn from_wire(state: v1::PresenceState) -> Self {
+        match state {
+            v1::PresenceState::Online => Self::Online,
+            v1::PresenceState::Offline => Self::Offline,
+            v1::PresenceState::Unknown => Self::Unknown,
+        }
+    }
+}
+
+/// A user's presence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Presence {
+    pub user_id: UserId,
+    pub state: PresenceState,
+    /// Offline only: unix ms, a whole minute.
+    pub last_seen_ms: Option<i64>,
+}
+
+impl Presence {
+    /// `None` when it names no user.
+    pub(crate) fn from_wire(presence: &v1::Presence) -> Option<Self> {
+        let user_id = UserId(uuid::Uuid::from_slice(&presence.user_id).ok()?);
+        let state = PresenceState::from_wire(presence.state());
+        let last_seen_ms = presence
+            .last_seen
+            .filter(|_| state == PresenceState::Offline)
+            .map(|micros| micros.div_euclid(1_000));
+        Some(Self {
+            user_id,
+            state,
+            last_seen_ms,
+        })
+    }
+}
+
 /// The connection to the gateway (spec §7.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ConnectionState {
@@ -355,6 +461,14 @@ pub enum Event {
     /// unread count).
     ConversationChanged(Conversation),
     ContactChanged(Contact),
+    /// Another member's live activity in a conversation changed: show it until its
+    /// `expires_at_ms` unless a newer one from the same user and conversation replaces
+    /// it; [`ActivityState::Idle`] clears it at once. Only while connected; not stored.
+    ActivityChanged(Activity),
+    /// A user's presence changed, or became visible or invisible
+    /// ([`PresenceState::Unknown`]). Only while connected; not stored: read the current
+    /// presence with `get_presence` after connecting.
+    PresenceChanged(Presence),
     /// Sign in again (a password reset, or the credentials were refused). Also reported
     /// as [`ConnectionState::SignedOut`].
     SignedOut,

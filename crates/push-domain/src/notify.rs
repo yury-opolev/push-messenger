@@ -16,14 +16,22 @@
 //! - a kick through `identify`, which refuses a revoked device, and through the access
 //!   token, which a password reset stops renewing: a lost kick leaves a socket open until
 //!   the gateway next checks the device or the token (Plan 8).
+//!
+//! Activity and presence events are the exception: they announce nothing durable. A
+//! missed activity is simply gone, which costs little because it expires after
+//! [`ACTIVITY_TTL`](crate::ACTIVITY_TTL) anyway; presence is read back with the presence
+//! batch read ([`Messaging::presence_viewable`](crate::Messaging::presence_viewable) and
+//! the transport's presence states).
 
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 
+use crate::activity::ActivityState;
 use crate::ids::{ConversationId, DeviceId, UserId};
 use crate::model::ContactState;
+use crate::presence::PresenceView;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -55,6 +63,21 @@ pub enum Event {
         /// Sorted.
         devices: Vec<DeviceId>,
         reason: KickReason,
+    },
+    /// `user`'s activity in `conversation`; push to `to` (sorted). `ttl` is zero for idle.
+    Activity {
+        to: Vec<UserId>,
+        conversation: ConversationId,
+        user: UserId,
+        state: ActivityState,
+        label: Option<String>,
+        ttl: TimeDelta,
+    },
+    /// `user`'s presence as `to` (sorted) may see it.
+    Presence {
+        to: Vec<UserId>,
+        user: UserId,
+        view: PresenceView,
     },
 }
 
@@ -97,8 +120,11 @@ pub enum ReceiptUpdate {
 
 #[async_trait]
 pub trait Notifier: Send + Sync {
-    /// Called only after the triggering transaction committed. Best effort: it must not
-    /// fail the operation that triggered it.
+    /// Called only after the triggering transaction committed, except for an
+    /// `Event::Presence` from an announcement or from switching sharing on, which is
+    /// published while the publishing transaction still holds the user's lock (see
+    /// `Messaging::announce_presence`). The `Unknown` of a hide or a block comes after its
+    /// commit. Best effort: it must not fail the operation that triggered it.
     async fn publish(&self, events: &[Event]);
 
     /// Kicks devices (a revocation or a password reset), after the commit. Unlike

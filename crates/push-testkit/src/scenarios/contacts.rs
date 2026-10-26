@@ -1,5 +1,7 @@
 use crate::{Backend, Case, Person, World, case_list};
-use push_domain::{ContactState, ContactSummary, DomainError, Event, UserId, ValidationError};
+use push_domain::{
+    ContactState, ContactSummary, DomainError, Event, PresenceView, UserId, ValidationError,
+};
 
 fn changed(user: &Person, peer: &Person, state: Option<ContactState>) -> Event {
     Event::ContactChanged {
@@ -417,9 +419,23 @@ async fn a_block_is_announced_only_to_the_blocker<B: Backend>(backend: &B) {
     world.notifier.take();
 
     world.svc.contact_block(alice.user, bob.user).await.unwrap();
+    // Bob's presence events are the same `Unknown` an opt-out gives: no sign of a block.
+    // They go out after the commit, with the change.
     assert_eq!(
         world.notifier.take(),
-        [changed(&alice, &bob, Some(ContactState::Blocked))]
+        [
+            Event::Presence {
+                to: vec![bob.user],
+                user: alice.user,
+                view: PresenceView::Unknown,
+            },
+            Event::Presence {
+                to: vec![alice.user],
+                user: bob.user,
+                view: PresenceView::Unknown,
+            },
+            changed(&alice, &bob, Some(ContactState::Blocked)),
+        ]
     );
 }
 

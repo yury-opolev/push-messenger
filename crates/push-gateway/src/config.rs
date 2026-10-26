@@ -26,6 +26,7 @@ use push_credentials::{AzureConfig, ConfigProblem, RedisTarget, azure_for};
 /// | `PUSH_HEARTBEAT_MS` | client ping interval announced in `Ready` | `30000` |
 /// | `PUSH_GROUPS` | `1` serves group requests; `0` refuses only the six group-management requests (create, add and remove members, leave, rename, set role) with `NOT_AVAILABLE`; groups that already exist still reach clients | `0` |
 /// | `PUSH_CLIENT_IP_HEADER` | header with the client's IP, set by the ingress (`x-real-ip`); its last line, then last entry is used | the peer address |
+/// | `PUSH_PRESENCE_GRACE_MS` | how long a closed connection still counts as online, so a reconnect within it is never shown offline; 0 to 120000 | `10000` |
 ///
 /// `PUSH_DEV_AUTH=1` (the DEV ONLY identities without a token, removed in Plan 8) is
 /// refused, so a deployment that still expects it fails at start-up.
@@ -46,6 +47,8 @@ pub struct Config {
     /// Where the ingress puts the client's IP, for the per-IP rate limits; without it the
     /// peer address counts. Only trust a header the proxy in front overwrites.
     pub client_ip_header: Option<HeaderName>,
+    /// How long a closed connection keeps its presence lease.
+    pub presence_grace: Duration,
 }
 
 // The Redis URL carries a password and the token is a secret, so neither appears in debug
@@ -65,6 +68,7 @@ impl std::fmt::Debug for Config {
             .field("heartbeat", &self.heartbeat)
             .field("groups", &self.groups)
             .field("client_ip_header", &self.client_ip_header)
+            .field("presence_grace", &self.presence_grace)
             .finish()
     }
 }
@@ -100,6 +104,14 @@ impl Config {
                 name: "PUSH_HEARTBEAT_MS",
                 value: heartbeat_ms.to_string(),
                 reason: "use 1000 to 600000 milliseconds".to_owned(),
+            });
+        }
+        let presence_grace_ms: u64 = parsed(&lookup, "PUSH_PRESENCE_GRACE_MS", 10_000)?;
+        if presence_grace_ms > 120_000 {
+            return Err(ConfigError::Invalid {
+                name: "PUSH_PRESENCE_GRACE_MS",
+                value: presence_grace_ms.to_string(),
+                reason: "use 0 to 120000 milliseconds".to_owned(),
             });
         }
         match lookup("PUSH_DEV_AUTH").as_deref() {
@@ -160,6 +172,7 @@ impl Config {
             heartbeat: Duration::from_millis(heartbeat_ms),
             groups: flag(&lookup, "PUSH_GROUPS")?,
             client_ip_header,
+            presence_grace: Duration::from_millis(presence_grace_ms),
         })
     }
 
@@ -276,6 +289,7 @@ mod tests {
         assert_eq!(config.heartbeat, Duration::from_secs(30));
         assert!(!config.groups, "groups are off unless switched on");
         assert_eq!(config.client_ip_header, None);
+        assert_eq!(config.presence_grace, Duration::from_secs(10));
     }
 
     #[test]
@@ -357,6 +371,33 @@ mod tests {
             let mut variables = REQUIRED.to_vec();
             variables.push(("PUSH_HEARTBEAT_MS", value));
             assert_eq!(config(&variables).is_ok(), ok, "{value}");
+        }
+    }
+
+    #[test]
+    fn the_presence_grace_is_set_within_two_minutes() {
+        for (value, expected) in [
+            ("0", Duration::ZERO),
+            ("300", Duration::from_millis(300)),
+            ("120000", Duration::from_secs(120)),
+        ] {
+            let mut variables = REQUIRED.to_vec();
+            variables.push(("PUSH_PRESENCE_GRACE_MS", value));
+            assert_eq!(config(&variables).unwrap().presence_grace, expected);
+        }
+        for value in ["120001", "-1", "ten"] {
+            let mut variables = REQUIRED.to_vec();
+            variables.push(("PUSH_PRESENCE_GRACE_MS", value));
+            assert!(
+                matches!(
+                    config(&variables),
+                    Err(ConfigError::Invalid {
+                        name: "PUSH_PRESENCE_GRACE_MS",
+                        ..
+                    })
+                ),
+                "{value:?}"
+            );
         }
     }
 
