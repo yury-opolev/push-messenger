@@ -91,8 +91,9 @@ rows only, so an admin's revocation of a built-in survives restarts.
 **D13 — Audit.** Every submit, approve, reject, revoke and seed is a row in the
 append-only `messaging.template_event` (ref, action, actor account or reviewer label,
 note, time) and a `security` log event (`templates.submitted`, `templates.approved`,
-`templates.rejected`, `templates.revoked`, `templates.seeded`). Refused sends are logged
-at debug only (no body content is ever logged).
+`templates.rejected`, `templates.revoked`, `templates.seeded`). Refused sends are answered
+to the client with an error frame and not logged by message-svc; no body content or
+definition is ever logged.
 
 ## Wire changes (push-proto)
 

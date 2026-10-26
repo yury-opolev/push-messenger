@@ -68,6 +68,20 @@ impl Client {
         if card.answer_seq.is_some() {
             return Err(SdkError::Invalid("the card is already answered".to_owned()));
         }
+        let waiting = card
+            .seq
+            .map(|seq| {
+                self.inner
+                    .shared
+                    .store()
+                    .has_unsent_answer(conversation, seq)
+            })
+            .transpose()?;
+        if waiting == Some(true) {
+            return Err(SdkError::Invalid(
+                "the card already has an answer waiting to be sent".to_owned(),
+            ));
+        }
         self.queue(conversation, MessageKind::Answer, body, card.seq)
     }
 
@@ -418,6 +432,30 @@ mod tests {
                 .delete(conversation, answered.client_msg_id)
                 .is_ok()
         );
+    }
+
+    #[tokio::test]
+    async fn a_card_takes_one_answer_waiting_to_be_sent() {
+        let f = Fixture::new().await;
+        let (conversation, peer) = f.conversation();
+        let store = || f.client.inner.shared.store();
+        let card = card_entry(conversation, peer, 1);
+        store().apply_deliver(&card).unwrap();
+        let card = Uuid::from_slice(&card.message_id).unwrap();
+        let body = format!(r#"{{"card":"{card}","values":["approve"],"fallback":"Approved"}}"#);
+
+        let first = f.client.send_answer(conversation, &body).unwrap();
+        match f.client.send_answer(conversation, &body) {
+            Err(SdkError::Invalid(reason)) => {
+                assert_eq!(reason, "the card already has an answer waiting to be sent")
+            }
+            other => panic!("a second answer was not refused: {other:?}"),
+        }
+        assert_eq!(store().outbox().unwrap().len(), 1);
+
+        // Once the waiting answer is taken back, the card can be answered again.
+        assert!(f.client.cancel(conversation, first.client_msg_id).unwrap());
+        assert!(f.client.send_answer(conversation, &body).is_ok());
     }
 
     #[tokio::test]

@@ -77,10 +77,13 @@ async fn submit(
 }
 
 async fn review(http: &reqwest::Client, stack: &common::Stack, template: &str, action: &str) {
+    let admin_url = stack
+        .admin_url
+        .as_deref()
+        .expect("the stack has an admin listener");
     let (status, body) = call(
         http.post(format!(
-            "{}/v1/admin/templates/{template}/{action}",
-            stack.admin_url
+            "{admin_url}/v1/admin/templates/{template}/{action}"
         ))
         .bearer_auth(stack.admin_token)
         .json(&json!({"reviewer": "smoke-reviewer", "note": "whole-stack test"})),
@@ -264,7 +267,8 @@ async fn rich_templates_through_the_whole_stack() {
     datastores
         .auth
         .push(("PUSH_AUTH_PROVIDERS".into(), "entra,entra-app".into()));
-    let stack = common::Stack::start(datastores).await;
+    // The admin listener is accepting connections once the stack has started.
+    let stack = common::Stack::start_with_admin(datastores).await;
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
@@ -430,21 +434,32 @@ async fn rich_templates_through_the_whole_stack() {
         .collect::<serde_json::Map<_, _>>()
         .into();
     too_many_params["layout"] = json!([{"type": "text", "param": "p0"}]);
-    for (name, definition) in [
-        ("URL in a literal", url_literal),
-        ("unknown block type", unknown_block),
-        ("17 params", too_many_params),
+    for (name, definition, reason) in [
+        ("URL in a literal", url_literal, None),
+        ("unknown block type", unknown_block, None),
+        (
+            "17 params",
+            too_many_params,
+            Some("needs 0 to 16 params, not 17"),
+        ),
     ] {
         let (status, body) = submit(&http, &stack, owner_token, &definition).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{name}: {body}");
         assert_eq!(body["error"]["code"], "invalid", "{name}: {body}");
+        if let Some(reason) = reason {
+            let message = body["error"]["message"].as_str().unwrap_or_default();
+            assert!(message.contains(reason), "{name}: {body}");
+        }
     }
 
-    // 9. An approved version cannot be changed.
+    // 9. An approved version cannot be changed: the catalog still serves the approved one.
     let mut changed = notice(1);
     changed["title"] = json!("Changed notice");
     let (status, body) = submit(&http, &stack, owner_token, &changed).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let (listed, _) = catalog(&http, &stack, owner_token, 0).await;
+    let kept = entry(&listed, "acme.notice@1");
+    assert_eq!(kept["definition"]["title"], "Notice", "{kept}");
 
     // 10. A revoked template leaves the catalog as revoked and can no longer be sent.
     review(&http, &stack, "acme.notice@1", "revoke").await;
@@ -463,7 +478,7 @@ async fn rich_templates_through_the_whole_stack() {
     )
     .await;
 
-    owner_socket.close(None).await.unwrap();
-    agent_socket.close(None).await.unwrap();
+    let _ = owner_socket.close(None).await;
+    let _ = agent_socket.close(None).await;
     stack.stop().await;
 }

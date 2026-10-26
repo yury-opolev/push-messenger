@@ -138,6 +138,18 @@ impl Store {
         Ok(self.message(id, client_msg_id)?.expect("just queued"))
     }
 
+    /// Whether an answer of the user's to the card at `card_seq` still waits in the outbox.
+    pub fn has_unsent_answer(&self, id: ConversationId, card_seq: i64) -> Result<bool, SdkError> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM outbox o JOIN message m
+                 ON m.conversation_id = o.conversation_id AND m.client_msg_id = o.client_msg_id
+             WHERE o.conversation_id = ?1 AND o.kind = 1 AND m.content_type = ?2
+                 AND m.card_seq = ?3)",
+            params![bytes(id.0), MessageKind::Answer.code(), card_seq],
+            |row| row.get(0),
+        )?)
+    }
+
     /// Queues an edit or a delete of `target`, after `parent` when the target is still in
     /// the outbox.
     #[allow(clippy::too_many_arguments)]

@@ -94,10 +94,11 @@ CREATE INDEX outbox_order ON outbox (conversation_id);
 ";
 
 /// Cards and answers: a card's `answer_seq` (the answer that closed it) and an answer's
-/// `card_seq` (the card it answers).
+/// `card_seq` (the card it answers); answers find their card by its server id.
 const SCHEMA_V2: &str = "
 ALTER TABLE message ADD COLUMN answer_seq INTEGER;
 ALTER TABLE message ADD COLUMN card_seq INTEGER;
+CREATE INDEX message_by_id ON message (conversation_id, message_id);
 ";
 
 /// Refuses to go on with a key unless the linked SQLite is SQLite3 Multiple Ciphers: on a

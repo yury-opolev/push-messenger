@@ -328,8 +328,8 @@ the chart allows it only from the peers you list (`networkPolicy.adminPeers`).
 
 ### Template routes
 
-auth-svc fronts message-svc's template registry (rich message templates; the full guide
-comes in `docs/rich-messages.md`). Both need `PUSH_MESSAGE_SVC_URL` and
+auth-svc fronts message-svc's template registry (rich message templates; see the full
+guide in [`docs/rich-messages.md`](rich-messages.md)). Both need `PUSH_MESSAGE_SVC_URL` and
 `PUSH_DIRECTORY_TOKEN`; without them they answer 503 `unavailable`.
 
 | Method/path | Auth | Body | Response |
