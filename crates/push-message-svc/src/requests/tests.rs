@@ -24,7 +24,7 @@ use push_proto::{error_from_status, id_bytes};
 use tonic::{Code, Request, Status};
 
 use crate::grpc::MessagingApi;
-use crate::presence::FixedPresence;
+use crate::presence::{FixedPresence, PresenceRead, PresenceStates, PresenceUnavailable};
 
 type Svc = Messaging<InMemoryStore, Arc<ManualClock>, Arc<RecordingNotifier>>;
 
@@ -997,6 +997,54 @@ async fn a_read_in_doubt_whose_re_read_fails_publishes_nothing() {
     let answered = get_presence(&world, &alice, ids).await.unwrap();
     assert_eq!(answered[0], presence(&bob, PresenceState::Online, None));
     assert_eq!(world.notifier.take(), vec![], "no guess is published");
+}
+
+#[tokio::test]
+async fn a_hide_during_a_presence_read_answers_unknown() {
+    /// Reads everyone online, but `hider` hides while the read is under way.
+    struct HidesDuringRead {
+        svc: Arc<Svc>,
+        hider: UserId,
+    }
+
+    #[async_trait::async_trait]
+    impl PresenceStates for HidesDuringRead {
+        async fn states(&self, users: &[UserId]) -> Result<PresenceRead, PresenceUnavailable> {
+            self.svc
+                .set_presence_sharing(self.hider, false, || async { None })
+                .await
+                .unwrap();
+            Ok(PresenceRead {
+                views: vec![PresenceView::Online; users.len()],
+                ..PresenceRead::default()
+            })
+        }
+    }
+
+    let world = world();
+    let (alice, bob, carol) = (
+        world.person().await,
+        world.person().await,
+        world.person().await,
+    );
+    world.befriend(&alice, &bob).await;
+    world.befriend(&alice, &carol).await;
+    let hiding = HidesDuringRead {
+        svc: Arc::clone(&world.svc),
+        hider: bob.user,
+    };
+
+    let ids = vec![id_bytes(bob.user.0), id_bytes(carol.user.0)];
+    let answered = super::get_presence(&world.svc, &hiding, alice.user, &ids)
+        .await
+        .unwrap();
+    assert_eq!(
+        answered.presences,
+        [
+            presence(&bob, PresenceState::Unknown, None),
+            presence(&carol, PresenceState::Online, None),
+        ]
+    );
 }
 
 #[tokio::test]

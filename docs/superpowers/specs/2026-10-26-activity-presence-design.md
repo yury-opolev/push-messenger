@@ -101,11 +101,16 @@ unaffected. If Redis is flushed, `last_seen` is lost.
     is an async source of the transport's view (message-svc reads Redis).
   - `contact_block` additionally publishes `Event::Presence` UNKNOWN both ways when the
     pair were accepted contacts.
-  - Publications of a user's presence are serialized by the user's lock
-    (`Tx::lock_users`, taken last, after the pair lock in `contact_block`): each takes
-    it, computes the audience, reads `current` inside the lock and publishes before its
-    transaction ends, so a hide or block is never followed by a stale ONLINE and two
-    announcements cannot overtake each other.
+  - Publications of a user's presence are ordered by the user's lock
+    (`Tx::lock_users`, taken last, after the pair lock in `contact_block`). Announcements
+    and showing take it, compute the audience, read `current` inside the lock and publish
+    before their transaction ends; a hide or block takes it, commits, then publishes
+    UNKNOWN. So a hide or block is never followed by a stale state (an announcement under
+    way published before the hide took the lock; a later one sees the hide), and two
+    announcements cannot overtake each other. `GetPresence` re-checks visibility after
+    reading the states and answers UNKNOWN for anyone hidden or blocked meanwhile, so its
+    answer does not overtake a hide's or block's UNKNOWN (except for one committing in
+    the moment the answer is on its way).
   - Store: `presence_hidden(users) -> hidden subset`, `set_presence_hidden(user, hidden)`;
     in memory and PostgreSQL (migration `0007_presence_hidden.sql`).
 - gRPC: `Messaging.Activity(ActivityRequest) -> ActivityResponse`,

@@ -203,6 +203,11 @@ These cases are **indistinguishable** on purpose.
   so the blocked user learns nothing new.
 - A contact that becomes accepted (or an unblock) pushes no presence: read it with
   `GetPresence` after the `ContactEvent`.
+- **Ordering.** A hide or block pushes its `UNKNOWN` after it commits. `GetPresence` checks
+  visibility again after reading the states and answers `UNKNOWN` for anyone hidden or
+  blocked meanwhile, so its answer does not overtake that `UNKNOWN`; only a hide or block
+  that commits in the moment between that second check and the answer reaching the client
+  can be overtaken, leaving the viewer with the last real state until it reads again.
 
 ### Push on change
 
@@ -222,10 +227,11 @@ request order**. Rate limited per user: **120 per minute** across the user's dev
 ### Failure modes
 
 - **Redis down or slow** (a read times out after 500 ms): visible users read `OFFLINE`
-  without `last_seen` (the others still `UNKNOWN`), and **nothing is pushed**: a guess
-  would tell contacts a wrong state. Switching sharing on still changes the setting but
-  pushes nothing. Messaging is unaffected; gateways log lease failures and keep the
-  connection. Once Redis answers again, a gateway announces the user it was in doubt about.
+  without `last_seen` (the others still `UNKNOWN`), and **nothing read that way is
+  pushed**: a guess would tell contacts a wrong state. Switching sharing on still changes
+  the setting but pushes nothing. Messaging is unaffected; gateways log lease failures and
+  keep the connection. Once Redis answers again, a gateway announces the user it was in
+  doubt about.
 - **Redis flushed**: `last_seen` is lost; leases are written again within 30 s.
 - **A gateway crashes**: its leases are not ended, they expire within 90 s. The first read
   of such a user after that (a `GetPresence`, or another announcement) finds no lease
@@ -283,10 +289,13 @@ announced with the next answer, so a Redis outage causes no announcement storm.
 Internal gRPC `Messaging.AnnouncePresence{user_id}` (`push/internal/v1/messaging.proto`):
 the gateway calls it on a transition (2 s timeout); message-svc takes the user's lock,
 computes the audience (accepted contacts that share), reads the state with the read script
-inside the lock and publishes `Notification.presence_changed` (6). Holding the lock
-serializes every publication of a user's presence (announcements, opt-out, block), so a
-hide or block is never followed by a stale `ONLINE`, and two announcements cannot overtake
-each other. Activity goes through `Messaging.Activity` and
+inside the lock and publishes `Notification.presence_changed` (6), all before it releases
+the lock. A hide or block takes the same lock (both users' for a block), commits and then
+pushes `UNKNOWN`, so it is never followed by a stale state: an announcement under way when
+it took the lock has already published, and one that takes the lock after its commit leaves
+the hidden or blocked contact out. Switching sharing on publishes under the lock before it
+commits, so a following hide's `UNKNOWN` cannot be overtaken by it. Two announcements
+cannot overtake each other either. Activity goes through `Messaging.Activity` and
 `Notification.activity_changed` (5). The gateway hub turns both into `ActivityEvent` and
 `PresenceEvent`.
 

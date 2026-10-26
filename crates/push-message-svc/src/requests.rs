@@ -316,6 +316,12 @@ async fn answer<S: Store, C: Clock, N: Notifier>(
 /// fails). When the state cannot be read, the others are `OFFLINE` without `last_seen`.
 /// When the read is in doubt (it may have run without its answer, so a flip it made may
 /// be unreported), everyone read is announced from a fresh read.
+///
+/// Visibility is checked again after the read, and anyone no longer viewable is
+/// `UNKNOWN`: a hide or block publishes `UNKNOWN` after it commits, so one that committed
+/// during the read must not be overtaken by this answer. One that commits after the second
+/// check can still be overtaken, leaving the viewer with that last real state until it
+/// reads again; the window is only the time the answer takes to reach the client.
 async fn get_presence<S: Store, C: Clock, N: Notifier>(
     messaging: &Messaging<S, C, N>,
     presence: &dyn PresenceStates,
@@ -363,11 +369,27 @@ async fn get_presence<S: Store, C: Clock, N: Notifier>(
             .collect();
         presence::announce_in_doubt(messaging, presence, &doubted).await;
     }
+    // A hide or block that committed since the first check publishes `UNKNOWN` after its
+    // commit, which this answer must not overtake with the real state.
+    let still_viewable: HashSet<UserId> = if viewable.is_empty() {
+        HashSet::new()
+    } else {
+        messaging
+            .presence_viewable(viewer, &viewable)
+            .await
+            .map_err(domain_error)?
+            .into_iter()
+            .collect()
+    };
     Ok(PresenceList {
         presences: distinct
             .into_iter()
             .map(|user| {
-                let view = views.get(&user).copied().unwrap_or(PresenceView::Unknown);
+                let view = views
+                    .get(&user)
+                    .filter(|_| still_viewable.contains(&user))
+                    .copied()
+                    .unwrap_or(PresenceView::Unknown);
                 convert::presence(user, view)
             })
             .collect(),

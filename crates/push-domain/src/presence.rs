@@ -94,11 +94,16 @@ where
     /// state, and the next announcement corrects the audience. An unchanged setting
     /// publishes nothing. An unknown user is `UnknownUser`.
     ///
-    /// Publications of a user's presence are serialized by the user's lock so a hide or
-    /// block is never followed by a stale `Online`: this takes the lock before it reads
-    /// the setting, and publishes before it commits. Should the commit then fail, the
-    /// audience saw the change early: `Unknown` for a hide (harmless), or the current
-    /// state for a show until the next announcement.
+    /// This takes the user's lock before it reads the setting. A show publishes before it
+    /// commits, under the lock, so a later hide's `Unknown` cannot be overtaken by it;
+    /// should the commit then fail, the audience sees the current state until the next
+    /// announcement. A hide publishes `Unknown` after it commits, so a presence read that
+    /// still saw the user as visible cannot be answered after it (see the re-check in the
+    /// transport's presence read). An announcement cannot follow it with a stale state
+    /// either: one under way when the hide took the lock published before, and one that
+    /// takes the lock after the commit sees the hide (see [`Self::announce_presence`]).
+    /// Only a show that follows a hide at once can be overtaken by the hide's `Unknown`,
+    /// which hides the user until their next announcement (never a leak).
     pub async fn set_presence_sharing<F, Fut>(
         &self,
         user: UserId,
@@ -118,25 +123,28 @@ where
             tx.rollback().await?;
             return Ok(share);
         }
-        let to = if share {
+        if share {
             tx.set_presence_hidden(user, false).await?;
-            audience(&mut tx, user).await?
+            let to = audience(&mut tx, user).await?;
+            if !to.is_empty()
+                && let Some(view) = current().await
+            {
+                self.publish(vec![Event::Presence { to, user, view }]).await;
+            }
+            tx.commit().await?;
         } else {
             let former = audience(&mut tx, user).await?;
             tx.set_presence_hidden(user, true).await?;
-            former
-        };
-        if !to.is_empty() {
-            let view = if share {
-                current().await
-            } else {
-                Some(PresenceView::Unknown)
-            };
-            if let Some(view) = view {
-                self.publish(vec![Event::Presence { to, user, view }]).await;
+            tx.commit().await?;
+            if !former.is_empty() {
+                self.publish(vec![Event::Presence {
+                    to: former,
+                    user,
+                    view: PresenceView::Unknown,
+                }])
+                .await;
             }
         }
-        tx.commit().await?;
         Ok(share)
     }
 
@@ -144,11 +152,12 @@ where
     /// [`Self::presence_audience`]; nothing when it is empty, or when `current()` is `None`
     /// (the state cannot be read right now: a guess could push a wrong state).
     ///
-    /// Publications of a user's presence are serialized by the user's lock so a hide or
-    /// block is never followed by a stale `Online`: this takes the lock, computes the
-    /// audience, reads `current()` and publishes, all before it releases the lock. Reading
-    /// the state inside the lock also keeps two announcements in order: the later one
-    /// publishes the later state. An unknown user takes a lock nobody else needs and has
+    /// This takes the user's lock, computes the audience, reads `current()` and publishes,
+    /// all before it releases the lock, so a hide or block (which takes the same lock) is
+    /// never followed by a stale state: an announcement under way when it took the lock has
+    /// already published, and one that takes the lock after it committed leaves the hidden
+    /// or blocked contact out. Reading the state inside the lock also keeps two
+    /// announcements in order: the later one publishes the later state. An unknown user takes a lock nobody else needs and has
     /// an empty audience.
     pub async fn announce_presence<F, Fut>(&self, user: UserId, current: F) -> DomainResult<()>
     where
@@ -546,5 +555,67 @@ mod tests {
                 .any(|event| matches!(event, Event::Presence { .. })),
             "blocking a non-contact says nothing about presence"
         );
+    }
+
+    /// Checks, when an `Unknown` presence is published, that it comes after the commit:
+    /// it begins its own transaction (which would wait on the in-memory store's lock while
+    /// the publishing one is open) and records whether the recipients already lost sight.
+    struct CommitProbe {
+        store: crate::memory::InMemoryStore,
+        hidden_already: std::sync::Mutex<Vec<bool>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Notifier for CommitProbe {
+        async fn publish(&self, events: &[Event]) {
+            for event in events {
+                let Event::Presence {
+                    to,
+                    user,
+                    view: PresenceView::Unknown,
+                } = event
+                else {
+                    continue;
+                };
+                let mut tx =
+                    tokio::time::timeout(std::time::Duration::from_secs(2), self.store.begin())
+                        .await
+                        .expect("published while the transaction was still open")
+                        .unwrap();
+                let audience = audience(&mut tx, *user).await.unwrap();
+                tx.rollback().await.unwrap();
+                self.hidden_already
+                    .lock()
+                    .unwrap()
+                    .push(to.iter().all(|peer| !audience.contains(peer)));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn hiding_and_blocking_publish_unknown_only_after_the_commit() {
+        let store = crate::memory::InMemoryStore::new();
+        let probe = std::sync::Arc::new(CommitProbe {
+            store: store.clone(),
+            hidden_already: std::sync::Mutex::default(),
+        });
+        let service = Messaging::new(store, crate::clock::SystemClock, probe.clone());
+        let (alice, bob, carol) = (UserId::new(), UserId::new(), UserId::new());
+        for (a, b) in [(alice, bob), (bob, carol)] {
+            for user in [a, b] {
+                service.register_user(user).await.unwrap();
+            }
+            service.contact_request(a, b).await.unwrap();
+            service.contact_accept(b, a).await.unwrap();
+        }
+
+        service
+            .set_presence_sharing(alice, false, online)
+            .await
+            .unwrap();
+        assert_eq!(*probe.hidden_already.lock().unwrap(), [true]);
+
+        service.contact_block(bob, carol).await.unwrap();
+        assert_eq!(*probe.hidden_already.lock().unwrap(), [true, true, true]);
     }
 }

@@ -119,10 +119,11 @@ where
 
     /// Blocks `peer`. Ends any contact; `peer`'s side is removed unless they also block.
     /// `peer` is never told. Blocking an id that is not a verified user stores nothing.
-    /// Blocking an accepted contact also publishes `Unknown` presence both ways, under both
-    /// users' locks and before the commit, so no announcement already under way can follow
-    /// it with a stale `Online` (see [`Self::announce_presence`]). Should the commit fail,
-    /// the contacts only saw `Unknown` early.
+    /// Blocking an accepted contact also publishes `Unknown` presence both ways, after the
+    /// commit, so a presence read that still saw the pair as contacts cannot be answered
+    /// after it. Both users' locks are held until the commit, so no announcement can follow
+    /// it with a stale state (see [`Self::announce_presence`]): one already under way
+    /// published before the block took the lock, and a later one leaves the pair out.
     pub async fn contact_block(&self, me: UserId, peer: UserId) -> DomainResult<()> {
         let Some(mut tx) = self.begin_pair(me, peer).await? else {
             return Ok(());
@@ -149,19 +150,19 @@ where
         if theirs != blocked {
             set_contact(&mut tx, peer, me, None).await?;
         }
+        tx.commit().await?;
+        let mut published: Vec<Event> = Vec::new();
         if presence_ended {
-            let presence = [(peer, me), (me, peer)]
-                .into_iter()
-                .map(|(to, user)| Event::Presence {
+            published.extend([(peer, me), (me, peer)].into_iter().map(|(to, user)| {
+                Event::Presence {
                     to: vec![to],
                     user,
                     view: PresenceView::Unknown,
-                })
-                .collect();
-            self.publish(presence).await;
+                }
+            }));
         }
-        tx.commit().await?;
-        self.publish(events).await;
+        published.extend(events);
+        self.publish(published).await;
         Ok(())
     }
 

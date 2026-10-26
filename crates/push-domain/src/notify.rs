@@ -120,10 +120,11 @@ pub enum ReceiptUpdate {
 
 #[async_trait]
 pub trait Notifier: Send + Sync {
-    /// Called only after the triggering transaction committed, except for
-    /// `Event::Presence`, which is published while the publishing transaction still holds
-    /// the user's lock (see `Messaging::announce_presence`). Best effort: it must not
-    /// fail the operation that triggered it.
+    /// Called only after the triggering transaction committed, except for an
+    /// `Event::Presence` from an announcement or from switching sharing on, which is
+    /// published while the publishing transaction still holds the user's lock (see
+    /// `Messaging::announce_presence`). The `Unknown` of a hide or a block comes after its
+    /// commit. Best effort: it must not fail the operation that triggered it.
     async fn publish(&self, events: &[Event]);
 
     /// Kicks devices (a revocation or a password reset), after the commit. Unlike
