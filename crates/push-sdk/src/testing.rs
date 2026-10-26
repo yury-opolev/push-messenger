@@ -436,6 +436,7 @@ async fn serve(mut socket: Server, identity: &Mutex<(UserId, DeviceId)>, log: &M
                     edited_at: None,
                     edit_seq: None,
                     deleted: false,
+                    answer_seq: None,
                 };
                 vec![ack(send.client_msg_id, seq), Body::Deliver(reply)]
             }

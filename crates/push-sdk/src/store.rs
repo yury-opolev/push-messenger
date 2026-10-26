@@ -945,6 +945,7 @@ pub(crate) mod tests {
             edited_at: None,
             edit_seq: None,
             deleted: false,
+            answer_seq: None,
         }
     }
 

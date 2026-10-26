@@ -106,6 +106,7 @@ pub(crate) fn deliver(entry: Entry) -> Deliver {
         edited_at: entry.edited_at.map(micros),
         edit_seq: entry.edit_seq,
         deleted: entry.deleted_at.is_some(),
+        answer_seq: None,
     }
 }
 
