@@ -83,7 +83,9 @@ auth:
   # Ways to sign in (docs/entra-sign-in.md, spec 2026-10-19).
   signIn:
     # Comma-separated: password (default), entra (delegated users), entra-app (opt-in,
-    # human-enrolled owned agents only; never auto-provisions). Without password the worker sends no email, the email
+    # human-enrolled owned agents only; never auto-provisions), agent-key (opt-in, agents
+    # an owner enrolled with a public key sign in with a signed assertion; needs no Entra
+    # settings). Without password the worker sends no email, the email
     # and password routes answer 404 and the link pages are not routed. Switching to entra
     # alone signs every password device out when the new auth-svc pods start.
     providers: password
@@ -118,6 +120,13 @@ auth:
       requiredRole: ""
       allowedClientApps: []
       maxSessionHours: 24
+    # Read only with agent-key in providers.
+    agentKey:
+      # The audience agents' assertions must name; empty: auth-svc's public URL without a
+      # trailing slash. At most 256 visible ASCII characters.
+      audience: ""
+      # A key-backed device signs in with its key again after this many hours (1-720).
+      maxSessionHours: 24
   # Active + unexpired pending agents per human owner, 0-100; 0 disables reservation/redemption.
   agentsPerUser: 2
   admin:
@@ -146,7 +155,7 @@ worker:
   email:
     # log: logs each email instead of sending it. resend: sends through Resend, which
     # needs resendApiKey (or the resend-api-key of a consumer-managed Secret) and from.
-    # none: no email at all, only with auth.signIn.providers entra (rendered then anyway).
+    # none: no email at all, only without password in auth.signIn.providers (rendered then anyway).
     sender: log
     # The From of every email (owner decision: the push.kubegames.dk domain).
     from: "Push Messenger <no-reply@push.kubegames.dk>"
