@@ -25,6 +25,32 @@ fn missing(what: &str) -> DomainError {
     DomainError::Store(format!("foreign key violation: {what} does not exist"))
 }
 
+/// The CHECK constraints of `template_version`: a version is reviewed unless pending, and
+/// has a change number exactly when approved or revoked.
+fn check_template_status(template: &StoredTemplate) -> DomainResult<()> {
+    let status = template.status;
+    if (status == TemplateStatus::Pending) != template.reviewed_at.is_none() {
+        return Err(DomainError::Store(format!(
+            "check violation: a {} template {} a review time",
+            status.as_str(),
+            if template.reviewed_at.is_some() {
+                "has"
+            } else {
+                "lacks"
+            }
+        )));
+    }
+    let listed = matches!(status, TemplateStatus::Approved | TemplateStatus::Revoked);
+    if listed != template.change_seq.is_some() {
+        return Err(DomainError::Store(format!(
+            "check violation: a {} template {} a change number",
+            status.as_str(),
+            if listed { "lacks" } else { "has" }
+        )));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Default)]
 struct State {
     users: HashSet<UserId>,
@@ -52,6 +78,22 @@ struct State {
 }
 
 impl State {
+    /// `template_version.change_seq` is UNIQUE: no other version may hold the number.
+    fn check_change_seq_unused(&self, template: &StoredTemplate) -> DomainResult<()> {
+        let Some(change_seq) = template.change_seq else {
+            return Ok(());
+        };
+        let taken = self.templates.values().any(|other| {
+            other.template != template.template && other.change_seq == Some(change_seq)
+        });
+        if taken {
+            return Err(DomainError::Store(format!(
+                "unique violation: change number {change_seq} is taken"
+            )));
+        }
+        Ok(())
+    }
+
     fn first_live_message(
         &self,
         conversation: ConversationId,
@@ -885,9 +927,12 @@ impl Tx for InMemoryTx {
     }
 
     async fn insert_template(&mut self, template: StoredTemplate) -> DomainResult<InsertOutcome> {
+        // Postgres checks the row's CHECK constraints before it looks for a conflict.
+        check_template_status(&template)?;
         if self.work.templates.contains_key(&template.template) {
             return Ok(InsertOutcome::Duplicate);
         }
+        self.work.check_change_seq_unused(&template)?;
         if !self
             .work
             .publishers
@@ -917,7 +962,7 @@ impl Tx for InMemoryTx {
         let stored = self
             .work
             .templates
-            .get_mut(template)
+            .get(template)
             .filter(|stored| stored.status.can_become(status))
             .ok_or_else(|| {
                 DomainError::Store(format!(
@@ -925,9 +970,17 @@ impl Tx for InMemoryTx {
                     status.as_str()
                 ))
             })?;
-        stored.status = status;
-        stored.reviewed_at = Some(at);
-        stored.change_seq = change_seq;
+        let changed = StoredTemplate {
+            status,
+            reviewed_at: Some(at),
+            change_seq,
+            ..stored.clone()
+        };
+        check_template_status(&changed)?;
+        self.work.check_change_seq_unused(&changed)?;
+        self.work
+            .templates
+            .insert(changed.template.clone(), changed);
         Ok(())
     }
 

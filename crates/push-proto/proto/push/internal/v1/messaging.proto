@@ -95,9 +95,9 @@ service Directory {
 // which presents the same internal token as for Directory; without it the call is
 // UNAUTHENTICATED. auth-svc serves Submit and Catalog to signed-in clients, and List, Get
 // and Review only on its admin listener. Malformed refs and definitions are
-// INVALID_ARGUMENT; an unknown ref is NOT_FOUND; a ref that exists, a status that does not
-// allow the review, a publisher of another account and too many pending submissions are
-// ALREADY_EXISTS or FAILED_PRECONDITION.
+// INVALID_ARGUMENT; an unknown ref is NOT_FOUND; submitting a ref that exists is
+// ALREADY_EXISTS; a status that does not allow the review, a publisher of another account
+// and too many pending submissions are FAILED_PRECONDITION.
 service Templates {
   // Stores a new version as pending, claiming its publisher for the user if unclaimed.
   rpc Submit(SubmitTemplateRequest) returns (TemplateSummary);

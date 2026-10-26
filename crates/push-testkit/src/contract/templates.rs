@@ -102,7 +102,6 @@ async fn a_stored_version_is_never_replaced<B: Backend>(backend: &B) {
     submit(&mut tx, original.clone()).await;
     let other = StoredTemplate {
         title: "Other".into(),
-        status: TemplateStatus::Approved,
         submitted_at: start() + TimeDelta::hours(1),
         ..template("acme.deploy@1", None, start())
     };
@@ -247,6 +246,112 @@ async fn only_the_one_way_status_changes_are_allowed<B: Backend>(backend: &B) {
         status(tx.template(&revoked.template).await.unwrap()),
         Some(TemplateStatus::Revoked)
     );
+}
+
+async fn status_invariants_hold_in_every_write<B: Backend>(backend: &B) {
+    let store = backend.store().await;
+    let user = UserId::new();
+    add_users(&store, &[user]).await;
+    let (first, second, pending) = (
+        template("acme.first@1", Some(user), start()),
+        template("acme.second@1", Some(user), start()),
+        template("acme.pending@1", Some(user), start()),
+    );
+    let at = start() + TimeDelta::hours(1);
+    let mut tx = store.begin().await.unwrap();
+    for stored in [&first, &second, &pending] {
+        submit(&mut tx, stored.clone()).await;
+    }
+    tx.set_template_status(&first.template, TemplateStatus::Approved, at, Some(1))
+        .await
+        .unwrap();
+    tx.set_template_status(&second.template, TemplateStatus::Approved, at, Some(2))
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    let refused_moves = [
+        (&pending.template, TemplateStatus::Rejected, Some(5)),
+        (&pending.template, TemplateStatus::Approved, None),
+        (&pending.template, TemplateStatus::Approved, Some(1)),
+        (&second.template, TemplateStatus::Revoked, None),
+        (&second.template, TemplateStatus::Revoked, Some(1)),
+    ];
+    for (template, status, change_seq) in refused_moves {
+        // A failed call may end its transaction: one transaction per attempt.
+        let mut tx = store.begin().await.unwrap();
+        assert!(
+            matches!(
+                tx.set_template_status(template, status, at, change_seq)
+                    .await,
+                Err(DomainError::Store(_))
+            ),
+            "{template} -> {status:?} with change {change_seq:?}"
+        );
+    }
+
+    let new = template("acme.new@1", Some(user), start());
+    let refused_rows = [
+        StoredTemplate {
+            reviewed_at: Some(at),
+            ..new.clone()
+        },
+        StoredTemplate {
+            change_seq: Some(7),
+            ..new.clone()
+        },
+        StoredTemplate {
+            status: TemplateStatus::Approved,
+            change_seq: Some(7),
+            ..new.clone()
+        },
+        StoredTemplate {
+            status: TemplateStatus::Approved,
+            reviewed_at: Some(at),
+            ..new.clone()
+        },
+        StoredTemplate {
+            status: TemplateStatus::Rejected,
+            reviewed_at: Some(at),
+            change_seq: Some(7),
+            ..new.clone()
+        },
+        StoredTemplate {
+            status: TemplateStatus::Approved,
+            reviewed_at: Some(at),
+            change_seq: Some(1),
+            ..new.clone()
+        },
+        // An invalid row is refused even when its ref exists.
+        StoredTemplate {
+            status: TemplateStatus::Approved,
+            ..first.clone()
+        },
+    ];
+    for row in refused_rows {
+        let mut tx = store.begin().await.unwrap();
+        assert!(
+            matches!(
+                tx.insert_template(row.clone()).await,
+                Err(DomainError::Store(_))
+            ),
+            "{row:?}"
+        );
+    }
+
+    let mut tx = store.begin().await.unwrap();
+    let state = |stored: Option<StoredTemplate>| {
+        stored.map(|stored| (stored.status, stored.reviewed_at, stored.change_seq))
+    };
+    assert_eq!(
+        state(tx.template(&pending.template).await.unwrap()),
+        Some((TemplateStatus::Pending, None, None))
+    );
+    assert_eq!(
+        state(tx.template(&second.template).await.unwrap()),
+        Some((TemplateStatus::Approved, Some(at), Some(2)))
+    );
+    assert_eq!(tx.template(&new.template).await, Ok(None));
 }
 
 async fn change_numbers_count_up_from_one<B: Backend>(backend: &B) {
@@ -595,6 +700,7 @@ pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
         a_template_needs_a_claimed_publisher,
         reviews_set_the_status_the_time_and_the_change,
         only_the_one_way_status_changes_are_allowed,
+        status_invariants_hold_in_every_write,
         change_numbers_count_up_from_one,
         the_catalog_lists_approved_and_revoked_changes_in_order,
         versions_are_listed_by_status_newest_first,

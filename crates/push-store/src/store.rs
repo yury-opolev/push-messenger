@@ -1210,12 +1210,11 @@ impl Tx for PgTx {
     }
 
     async fn last_template_change(&mut self) -> DomainResult<i64> {
-        let last: Option<i64> =
-            sqlx::query_scalar("SELECT last_seq FROM messaging.template_change")
-                .fetch_optional(self.conn())
-                .await
-                .map_err(store_error)?;
-        Ok(last.unwrap_or(0))
+        // The migration inserts the single counter row: a missing row is a broken schema.
+        sqlx::query_scalar("SELECT last_seq FROM messaging.template_change")
+            .fetch_one(self.conn())
+            .await
+            .map_err(store_error)
     }
 
     async fn templates_changed_since(

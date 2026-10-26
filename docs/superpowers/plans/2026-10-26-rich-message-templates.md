@@ -336,7 +336,8 @@ pub enum PublisherOwner { Server, User(UserId) }
 #[error("invalid template: {0}")] Template(#[from] TemplateError), // INVALID
 #[error("the card is already answered")] CardAnswered,             // REJECTED
 #[error("template not found")] TemplateNotFound,
-#[error("{0}")] TemplateConflict(&'static str),                     // exists, wrong status, ...
+#[error("this template version already exists")] TemplateExists,   // ALREADY_EXISTS
+#[error("{0}")] TemplateConflict(&'static str),                     // wrong status, owner, ...
 // store.rs, Tx:
 async fn is_agent(&mut self, user: UserId) -> DomainResult<bool>;  // agent_owner row exists
 async fn template(&mut self, template: &TemplateRef) -> DomainResult<Option<StoredTemplate>>;
@@ -497,7 +498,7 @@ impl Messaging {
   /// the user exists (UnknownUser), claims the publisher for the user (another owner →
   /// TemplateConflict("the publisher belongs to another account")), refuses over
   /// MAX_PENDING_PER_USER, inserts pending with canonical JSON (Duplicate →
-  /// TemplateConflict("this template version already exists")), audits `submit`.
+  /// TemplateExists), audits `submit`.
   pub async fn submit_template(&self, user: UserId, definition: &[u8]) -> DomainResult<StoredTemplate>;
   /// reviewer 1..=64 chars, no control chars; note ≤ 500 chars, no control chars except \n.
   /// Locks the row (TemplateNotFound); approve/reject need pending, revoke needs approved
@@ -585,7 +586,8 @@ RICH send after revocation returns the original receipt.
 - `deliver()` maps `Rich`/`Answer` and `answer_seq`.
 - `domain_error`: `Template` → (InvalidArgument, Invalid); `CardAnswered` →
   (FailedPrecondition, Rejected); `TemplateNotFound` → (NotFound, Rejected);
-  `TemplateConflict` → (AlreadyExists, Rejected), so auth-svc maps them to 404 / 409.
+  `TemplateExists` → (AlreadyExists, Rejected); `TemplateConflict` → (FailedPrecondition,
+  Rejected), so auth-svc maps them to 404 / 409.
 - `TemplatesApi` implements `templates_server::Templates`, wrapped with
   `InternalToken::directory(...)` (same token as `Directory`). Converts statuses, times in
   micros, ids as 16 bytes; `Get` returns `outline(definition)` and events.

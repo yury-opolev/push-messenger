@@ -59,9 +59,12 @@ pub enum DomainError {
     CardAnswered,
     #[error("template not found")]
     TemplateNotFound,
-    /// A submission or review the registry's state does not allow: the version exists, its
-    /// status does not allow the review, the publisher belongs to another account, or the
-    /// account has too many pending submissions.
+    /// A submitted version is already stored (its definition never changes).
+    #[error("this template version already exists")]
+    TemplateExists,
+    /// A submission or review the registry's state does not allow: the version's status
+    /// does not allow the review, the publisher belongs to another account, or the account
+    /// has too many pending submissions.
     #[error("{0}")]
     TemplateConflict(&'static str),
     #[error("a concurrent change conflicted; retry the operation")]

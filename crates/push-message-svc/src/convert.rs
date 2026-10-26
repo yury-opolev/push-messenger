@@ -41,8 +41,8 @@ pub(crate) fn invalid(message: impl Into<String>) -> Status {
 }
 
 /// The status for a failed domain operation: every [`DomainError`] has a gRPC code and a
-/// client error code (this match has no catch-all, so a new error must be mapped). Storage problems are reported without their details, which the store has
-/// already logged.
+/// client error code (this match has no catch-all, so a new error must be mapped). Storage
+/// problems are reported without their details, which the store has already logged.
 pub(crate) fn domain_error(error: DomainError) -> Status {
     let (code, error_code) = match &error {
         DomainError::Invalid(_) => (Code::InvalidArgument, ErrorCode::Invalid),
@@ -69,7 +69,8 @@ pub(crate) fn domain_error(error: DomainError) -> Status {
         DomainError::Template(_) => (Code::InvalidArgument, ErrorCode::Invalid),
         DomainError::CardAnswered => (Code::FailedPrecondition, ErrorCode::Rejected),
         DomainError::TemplateNotFound => (Code::NotFound, ErrorCode::Rejected),
-        DomainError::TemplateConflict(_) => (Code::AlreadyExists, ErrorCode::Rejected),
+        DomainError::TemplateExists => (Code::AlreadyExists, ErrorCode::Rejected),
+        DomainError::TemplateConflict(_) => (Code::FailedPrecondition, ErrorCode::Rejected),
         DomainError::Conflict => (Code::Aborted, ErrorCode::Unavailable),
         DomainError::KickFailed(_) => (Code::Unavailable, ErrorCode::Unavailable),
         DomainError::Store(_) => (Code::Unavailable, ErrorCode::Unavailable),
@@ -413,8 +414,13 @@ mod tests {
                 ErrorCode::Rejected,
             ),
             (
-                DomainError::TemplateConflict("the template exists"),
+                DomainError::TemplateExists,
                 Code::AlreadyExists,
+                ErrorCode::Rejected,
+            ),
+            (
+                DomainError::TemplateConflict("the template is revoked"),
+                Code::FailedPrecondition,
                 ErrorCode::Rejected,
             ),
             (DomainError::Conflict, Code::Aborted, ErrorCode::Unavailable),
