@@ -22,6 +22,7 @@ mod service;
 pub mod store;
 mod sync;
 pub mod system;
+pub mod templates;
 pub mod validation;
 
 pub use clock::{Clock, ManualClock, SystemClock};
