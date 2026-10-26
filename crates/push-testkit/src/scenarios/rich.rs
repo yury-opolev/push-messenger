@@ -579,7 +579,9 @@ async fn a_client_msg_id_reused_for_another_content_type_conflicts<B: Backend>(b
     assert_eq!(world.entry(chat, card.message_id).await.answer_seq, None);
 }
 
-async fn a_member_who_joined_after_a_card_cannot_answer_it<B: Backend>(backend: &B) {
+async fn a_member_who_joined_after_a_card_cannot_answer_it_but_receives_its_answer<B: Backend>(
+    backend: &B,
+) {
     let world = World::new(backend).await;
     world.svc.seed_builtin_templates().await.unwrap();
     let alice = world.person().await;
@@ -611,7 +613,7 @@ async fn a_member_who_joined_after_a_card_cannot_answer_it<B: Backend>(backend: 
             .await,
         Err(DomainError::TargetNotFound)
     );
-    sent(
+    let reply = sent(
         &world,
         &alice,
         group,
@@ -619,6 +621,16 @@ async fn a_member_who_joined_after_a_card_cannot_answer_it<B: Backend>(backend: 
         &answer(&card, &["approve"]),
     )
     .await;
+
+    // The answer is a new message: Dave, who never saw the card, still receives it.
+    let batch = world.svc.sync(dave.device, 100).await.unwrap();
+    let last = batch.entries.last().unwrap();
+    assert_eq!(
+        (last.seq, last.content_type, last.target_seq),
+        (reply.seq, ContentType::Answer, Some(card.seq))
+    );
+    assert!(world.svc.ack(dave.device, group, last.seq).await.unwrap());
+    assert_eq!(world.position(dave.device, group).await, Some(reply.seq));
 }
 
 async fn deleting_an_answer_leaves_the_card_answered<B: Backend>(backend: &B) {
@@ -685,7 +697,7 @@ pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
         text_edits_are_still_checked_as_text,
         a_retry_of_a_card_returns_its_receipt_after_a_revocation,
         a_client_msg_id_reused_for_another_content_type_conflicts,
-        a_member_who_joined_after_a_card_cannot_answer_it,
+        a_member_who_joined_after_a_card_cannot_answer_it_but_receives_its_answer,
         deleting_an_answer_leaves_the_card_answered,
     ]
 }

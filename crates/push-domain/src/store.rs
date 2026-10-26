@@ -280,9 +280,10 @@ pub trait Tx: Send {
         conversation: ConversationId,
         target_seq: i64,
     ) -> DomainResult<()>;
-    /// Entries with `after < seq <= up_to`, oldest first, at most `limit`. Entries with a
-    /// `target_seq` below `targets_from` (edits and deletes of messages outside the
-    /// reader's visible range) are skipped and do not count towards `limit`.
+    /// Entries with `after < seq <= up_to`, oldest first, at most `limit`. Edits and
+    /// deletes with a `target_seq` below `targets_from` (changes to messages outside the
+    /// reader's visible range) are skipped and do not count towards `limit`. Messages that
+    /// target an older entry (answers to cards) are new messages and are always returned.
     async fn entries_after(
         &mut self,
         conversation: ConversationId,

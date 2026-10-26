@@ -749,7 +749,10 @@ impl Tx for InMemoryTx {
             .entries
             .range((conversation, after + 1)..=(conversation, up_to))
             .map(|(_, entry)| entry)
-            .filter(|entry| entry.target_seq.is_none_or(|target| target >= targets_from))
+            .filter(|entry| {
+                !matches!(entry.kind, EntryKind::Edit | EntryKind::Delete)
+                    || entry.target_seq.is_none_or(|target| target >= targets_from)
+            })
             .take(limit as usize)
             .cloned()
             .collect())

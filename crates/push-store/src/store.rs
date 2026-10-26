@@ -811,7 +811,7 @@ impl Tx for PgTx {
             entry_columns!(),
             " FROM messaging.message e \
              WHERE e.conversation_id = $1 AND e.seq > $2 AND e.seq <= $3 \
-             AND (e.target_seq IS NULL OR e.target_seq >= $4) \
+             AND (e.target_seq IS NULL OR e.kind NOT IN ($6, $7) OR e.target_seq >= $4) \
              ORDER BY e.seq LIMIT $5"
         ))
         .bind(conversation.0)
@@ -819,6 +819,8 @@ impl Tx for PgTx {
         .bind(up_to)
         .bind(targets_from)
         .bind(i64::from(limit))
+        .bind(encode(EntryKind::Edit))
+        .bind(encode(EntryKind::Delete))
         .fetch_all(self.conn())
         .await
         .map_err(store_error)?;

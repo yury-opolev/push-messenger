@@ -396,10 +396,30 @@ async fn entries_after_skips_changes_to_messages_below_targets_from<B: Backend>(
         .await
         .unwrap();
     }
+    tx.insert_entry(Entry {
+        kind: EntryKind::Delete,
+        target_seq: Some(1),
+        body: None,
+        ..entry(id, 7, ClientMsgId::new())
+    })
+    .await
+    .unwrap();
+    // An answer is a new message, even to a card the reader cannot see.
+    tx.insert_entry(Entry {
+        content_type: ContentType::Answer,
+        target_seq: Some(1),
+        ..entry(id, 8, ClientMsgId::new())
+    })
+    .await
+    .unwrap();
 
     assert_eq!(
         seqs(&tx.entries_after(id, 2, 6, 3, 10).await.unwrap()),
         vec![3, 5]
+    );
+    assert_eq!(
+        seqs(&tx.entries_after(id, 2, 8, 3, 10).await.unwrap()),
+        vec![3, 5, 8]
     );
     assert_eq!(
         seqs(&tx.entries_after(id, 0, 6, 2, 3).await.unwrap()),
