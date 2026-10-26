@@ -34,10 +34,31 @@ pub trait Directory: Send + Sync + std::fmt::Debug {
     ) -> Result<Vec<Uuid>, AuthError>;
 }
 
+/// A channel to message-svc's internal API for auth-svc (`Directory`, `Templates`) that
+/// presents auth-svc's internal token on every call.
+pub(crate) type MessageSvc = InterceptedService<Channel, Bearer>;
+
+/// A channel to message-svc at `url` (`http://host:50053`) presenting `token`, auth-svc's
+/// internal token for its APIs. It connects on first use and reconnects by itself, so
+/// auth-svc starts without waiting for message-svc. Clones share the connection.
+pub(crate) fn message_svc(url: &str, token: &str) -> Result<MessageSvc, String> {
+    let mut bearer: MetadataValue<Ascii> = format!("Bearer {token}")
+        .parse()
+        .map_err(|_| "the Directory token cannot be sent as metadata".to_owned())?;
+    // Never indexed by HTTP/2 or shown in header dumps.
+    bearer.set_sensitive(true);
+    let channel = Endpoint::from_shared(url.to_owned())
+        .map_err(|_| "not a valid message-svc URL".to_owned())?
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(CALL_TIMEOUT)
+        .connect_lazy();
+    Ok(InterceptedService::new(channel, Bearer(bearer)))
+}
+
 /// message-svc's `Directory` API over gRPC.
 #[derive(Debug, Clone)]
 pub struct GrpcDirectory {
-    client: DirectoryClient<InterceptedService<Channel, Bearer>>,
+    client: DirectoryClient<MessageSvc>,
 }
 
 impl GrpcDirectory {
@@ -45,19 +66,14 @@ impl GrpcDirectory {
     /// auth-svc's internal token for this API. It connects on first use and reconnects by
     /// itself, so auth-svc starts without waiting for message-svc.
     pub fn new(url: &str, token: &str) -> Result<Self, String> {
-        let mut bearer: MetadataValue<Ascii> = format!("Bearer {token}")
-            .parse()
-            .map_err(|_| "the Directory token cannot be sent as metadata".to_owned())?;
-        // Never indexed by HTTP/2 or shown in header dumps.
-        bearer.set_sensitive(true);
-        let channel = Endpoint::from_shared(url.to_owned())
-            .map_err(|_| "not a valid message-svc URL".to_owned())?
-            .connect_timeout(CONNECT_TIMEOUT)
-            .timeout(CALL_TIMEOUT)
-            .connect_lazy();
-        Ok(Self {
-            client: DirectoryClient::with_interceptor(channel, Bearer(bearer)),
-        })
+        Ok(Self::over(message_svc(url, token)?))
+    }
+
+    /// A client over an existing channel to message-svc.
+    pub(crate) fn over(channel: MessageSvc) -> Self {
+        Self {
+            client: DirectoryClient::new(channel),
+        }
     }
 }
 
@@ -109,7 +125,7 @@ impl Directory for NoDirectory {
 
 /// Adds auth-svc's internal token, as `authorization: Bearer <token>`, to every call.
 #[derive(Clone)]
-struct Bearer(MetadataValue<Ascii>);
+pub(crate) struct Bearer(MetadataValue<Ascii>);
 
 impl std::fmt::Debug for Bearer {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

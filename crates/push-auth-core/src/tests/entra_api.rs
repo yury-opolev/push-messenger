@@ -76,6 +76,7 @@ fn offer_app(world: &mut World) {
         )),
         client_ip_header: None,
         directory: std::sync::Arc::new(crate::directory::NoDirectory),
+        templates: std::sync::Arc::new(crate::templates::NoTemplates),
     });
 }
 

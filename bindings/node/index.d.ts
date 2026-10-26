@@ -58,7 +58,11 @@ export interface Message {
   messageId: string | null;
   seq: number | null;
   senderId: string;
-  kind: 'text' | 'system';
+  /**
+   * `rich`: a card from an approved template, its body JSON `{tpl, params, fallback}`;
+   * `answer`: an answer to a card, its body JSON `{card, values, fallback}`.
+   */
+  kind: 'text' | 'system' | 'rich' | 'answer';
   /** null once deleted. */
   body: string | null;
   clientTs: number | null;
@@ -66,6 +70,10 @@ export interface Message {
   editedAt: number | null;
   deleted: boolean;
   status: 'pending' | 'sent' | 'delivered' | 'read' | 'received';
+  /** Cards: the seq of the answer that closed the card, once answered. */
+  answerSeq: number | null;
+  /** Answers: the seq of the card they answer. */
+  cardSeq: number | null;
 }
 
 export interface Conversation {
@@ -187,6 +195,17 @@ export class Client {
   contacts(): Promise<Contact[]>;
 
   send(conversationId: string, text: string): Promise<Message>;
+  /**
+   * Queues a card: `body` is a RICH body as a JSON string. Rejects with `invalid` unless the
+   * envelope is valid; the server checks the template and may refuse it later (`sendFailed`).
+   */
+  sendRich(conversationId: string, body: string): Promise<Message>;
+  /**
+   * Queues an answer: `body` is an ANSWER body as a JSON string naming a card held in the
+   * conversation, from someone else and not answered yet; `invalid` otherwise.
+   */
+  sendAnswer(conversationId: string, body: string): Promise<Message>;
+  /** Changes a text, or a card's whole RICH body (not an answer, nor an answered card). */
   edit(conversationId: string, clientMsgId: string, text: string): Promise<string>;
   delete(conversationId: string, clientMsgId: string): Promise<string>;
   cancel(conversationId: string, clientMsgId: string): Promise<boolean>;

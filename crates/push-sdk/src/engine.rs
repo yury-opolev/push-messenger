@@ -311,11 +311,17 @@ impl Engine {
         };
         let result = {
             let mut store = self.shared.store();
-            store
-                .apply_deliver(entry)
-                .and_then(|applied| Ok((applied, store.received(conversation)?)))
+            store.apply_deliver(entry).and_then(|applied| {
+                let card = match &applied.0 {
+                    Applied::Added(message) | Applied::Confirmed(message) => {
+                        store.mark_answered(message)?
+                    }
+                    _ => None,
+                };
+                Ok((applied, card, store.received(conversation)?))
+            })
         };
-        let ((applied, changed, created), received) = match result {
+        let ((applied, changed, created), card, received) = match result {
             Ok(result) => result,
             // An entry with ids that are not ids can never be stored: skipped.
             Err(error @ SdkError::Network(_)) => {
@@ -342,6 +348,10 @@ impl Engine {
             Applied::Deleted(message) => self.shared.emit(Event::MessageDeleted(message)),
             Applied::Duplicate | Applied::Skipped => {}
         }
+        // The answer closed its card: the card shows as answered now.
+        if let Some(card) = card {
+            self.shared.emit(Event::MessageEdited(card));
+        }
         if let Some(conversation) = changed {
             self.shared.emit(Event::ConversationChanged(conversation));
         }
@@ -364,12 +374,21 @@ impl Engine {
                 return;
             }
         };
-        let event = {
+        let events = {
             let mut store = self.shared.store();
             match (row.kind, row.target_client_msg_id) {
                 (OutboxKind::Send, _) => store
                     .message(row.conversation_id, row.client_msg_id)
-                    .map(|message| message.map(Event::MessageSent)),
+                    .and_then(|message| {
+                        let Some(message) = message else {
+                            return Ok(Vec::new());
+                        };
+                        // A stored answer is the card's first valid one: it closes the card.
+                        let card = store.mark_answered(&message)?;
+                        Ok(std::iter::once(Event::MessageSent(message))
+                            .chain(card.map(Event::MessageEdited))
+                            .collect())
+                    }),
                 (OutboxKind::Edit, Some(target)) => store
                     .edit(
                         row.conversation_id,
@@ -379,21 +398,24 @@ impl Engine {
                         ack.seq,
                     )
                     .map(|applied| match applied {
-                        Applied::Edited(message) => Some(Event::MessageEdited(message)),
-                        _ => None,
+                        Applied::Edited(message) => vec![Event::MessageEdited(message)],
+                        _ => Vec::new(),
                     }),
                 (OutboxKind::Delete, Some(target)) => store
                     .erase(row.conversation_id, target, ack.seq)
                     .map(|applied| match applied {
-                        Applied::Deleted(message) => Some(Event::MessageDeleted(message)),
-                        _ => None,
+                        Applied::Deleted(message) => vec![Event::MessageDeleted(message)],
+                        _ => Vec::new(),
                     }),
-                (_, None) => Ok(None),
+                (_, None) => Ok(Vec::new()),
             }
         };
-        match event {
-            Ok(Some(event)) => self.shared.emit(event),
-            Ok(None) => {}
+        match events {
+            Ok(events) => {
+                for event in events {
+                    self.shared.emit(event);
+                }
+            }
             Err(error) => tracing::warn!(code = error.code(), "could not apply a SendAck"),
         }
         self.pump(now_ms, out);
@@ -564,8 +586,8 @@ mod tests {
     use push_proto::v1::{EntryKind, ErrorCode};
 
     use super::*;
-    use crate::model::{ConversationKind, MessageStatus};
-    use crate::store::tests::entry;
+    use crate::model::{ConversationKind, MessageKind, MessageStatus};
+    use crate::store::tests::{answer_entry, card_entry, entry};
 
     struct Fixture {
         engine: Engine,
@@ -810,6 +832,55 @@ mod tests {
         let events = f.events();
         assert!(matches!(&events[..], [Event::MessageEdited(message)]
             if message.body.as_deref() == Some("hello") && message.edited_at == Some(102)));
+    }
+
+    #[test]
+    fn an_answer_closes_its_card_and_the_card_is_reported_changed() {
+        let mut f = fixture();
+        let card = card_entry(f.conversation, f.me, 1);
+        f.frame(Body::Deliver(card.clone()));
+        f.events();
+        f.frame(Body::Deliver(answer_entry(
+            f.conversation,
+            f.peer,
+            2,
+            &card,
+        )));
+        let events = f.events();
+        assert!(matches!(&events[..], [
+            Event::MessageAdded(answer),
+            Event::MessageEdited(closed),
+            Event::ConversationChanged(_),
+        ] if answer.kind == MessageKind::Answer && answer.card_seq == Some(1)
+            && closed.seq == Some(1) && closed.answer_seq == Some(2)));
+    }
+
+    #[test]
+    fn the_ack_of_an_answer_closes_its_card() {
+        let mut f = fixture();
+        let card = card_entry(f.conversation, f.peer, 1);
+        f.frame(Body::Deliver(card));
+        let answer = ClientMsgId::new();
+        f.shared
+            .store()
+            .queue_content(
+                f.conversation,
+                answer,
+                MessageKind::Answer,
+                "{}",
+                Some(1),
+                1,
+            )
+            .unwrap();
+        let mut out = Vec::new();
+        f.engine.start(0, &mut out);
+        f.events();
+        f.frame(send_ack(answer, 2));
+        let events = f.events();
+        assert!(
+            matches!(&events[..], [Event::MessageSent(sent), Event::MessageEdited(closed)]
+            if sent.client_msg_id == answer && closed.answer_seq == Some(2))
+        );
     }
 
     #[test]

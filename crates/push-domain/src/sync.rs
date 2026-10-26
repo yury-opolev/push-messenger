@@ -28,8 +28,9 @@ where
     /// visible range, up to `limit` entries.
     ///
     /// Edits and deletes of messages below the member's visible range are never delivered
-    /// (spec §4.6). If such entries end a conversation, the device's position stays before
-    /// them until it acks a later entry; nothing is lost, as they are never delivered.
+    /// (spec §4.6); answers to cards below it are new messages and are delivered. If such
+    /// edits and deletes end a conversation, the device's position stays before them until
+    /// it acks a later entry; nothing is lost, as they are never delivered.
     ///
     /// Sync does not advance anything: the position moves only when the device acks.
     /// Calling sync again without acking returns the same entries.

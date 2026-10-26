@@ -1,5 +1,6 @@
 // The internal API of message-svc, called by the gateway (Messaging), the worker
-// (Accounts) and auth-svc (Directory) (spec §2). Never exposed outside the cluster.
+// (Accounts) and auth-svc (Directory, Templates) (spec §2). Never exposed outside the
+// cluster.
 // Callers pass the user and device the gateway verified, or auth-svc announced;
 // message-svc trusts them.
 //
@@ -88,6 +89,26 @@ service Directory {
   // sight of its profile by asking again. At most 100 ids; malformed ids are
   // INVALID_ARGUMENT.
   rpc VisibleUsers(VisibleUsersRequest) returns (VisibleUsersResponse);
+}
+
+// The template registry (REQUEST PUSH feature 8, docs/rich-messages.md), for auth-svc,
+// which presents the same internal token as for Directory; without it the call is
+// UNAUTHENTICATED. auth-svc serves Submit and Catalog to signed-in clients, and List, Get
+// and Review only on its admin listener. Malformed refs and definitions are
+// INVALID_ARGUMENT; an unknown ref is NOT_FOUND; submitting a ref that exists is
+// ALREADY_EXISTS; a status that does not allow the review, a publisher of another account
+// and too many pending submissions are FAILED_PRECONDITION.
+service Templates {
+  // Stores a new version as pending, claiming its publisher for the user if unclaimed.
+  rpc Submit(SubmitTemplateRequest) returns (TemplateSummary);
+  // Approved and revoked versions changed after `since`, oldest change first.
+  rpc Catalog(CatalogRequest) returns (CatalogResponse);
+  // Versions by status, newest submission first.
+  rpc List(ListTemplatesRequest) returns (TemplateList);
+  // One version with its definition, a plain-text outline and its audit trail.
+  rpc Get(GetTemplateRequest) returns (TemplateDetail);
+  // Approves or rejects a pending version, or revokes an approved one.
+  rpc Review(ReviewTemplateRequest) returns (TemplateSummary);
 }
 
 message IdentifyRequest {
@@ -245,4 +266,116 @@ message VisibleUsersRequest {
 message VisibleUsersResponse {
   // Sorted, without duplicates.
   repeated bytes user_ids = 1;
+}
+
+// Times in the Templates messages are microseconds since the Unix epoch; user ids are 16
+// bytes.
+
+enum TemplateStatus {
+  TEMPLATE_STATUS_UNSPECIFIED = 0;
+  TEMPLATE_STATUS_PENDING = 1;
+  TEMPLATE_STATUS_APPROVED = 2;
+  // Final.
+  TEMPLATE_STATUS_REJECTED = 3;
+  // Final.
+  TEMPLATE_STATUS_REVOKED = 4;
+}
+
+enum ReviewAction {
+  REVIEW_ACTION_UNSPECIFIED = 0;
+  // A pending version becomes approved.
+  REVIEW_ACTION_APPROVE = 1;
+  // A pending version becomes rejected.
+  REVIEW_ACTION_REJECT = 2;
+  // An approved version becomes revoked.
+  REVIEW_ACTION_REVOKE = 3;
+}
+
+message SubmitTemplateRequest {
+  // The submitting account.
+  bytes user_id = 1;
+  // The tpl/1 definition, as the client sent it (JSON, at most 16 KiB).
+  bytes definition = 2;
+}
+
+message TemplateSummary {
+  // `<publisher>.<name>@<version>`.
+  string template_ref = 1;
+  TemplateStatus status = 2;
+  // Absent for a built-in.
+  optional bytes submitted_by = 3;
+  int64 submitted_at = 4;
+  optional int64 reviewed_at = 5;
+  // Set once approved, revoked or seeded.
+  optional int64 change_seq = 6;
+  string title = 7;
+}
+
+message CatalogRequest {
+  // The change number the client has seen; 0 for everything.
+  int64 since = 1;
+  // At most this many entries; 0 means the server's maximum.
+  uint32 limit = 2;
+}
+
+message CatalogEntry {
+  string template_ref = 1;
+  // Approved or revoked.
+  TemplateStatus status = 2;
+  int64 change_seq = 3;
+  // Approved versions only: the canonical JSON definition.
+  optional string definition = 4;
+}
+
+message CatalogResponse {
+  // The change number to ask from next.
+  int64 seq = 1;
+  // More entries are waiting beyond this page.
+  bool more = 2;
+  repeated CatalogEntry entries = 3;
+}
+
+message ListTemplatesRequest {
+  // UNSPECIFIED: every status.
+  TemplateStatus status = 1;
+  // At most this many versions; 0 means the server's maximum.
+  uint32 limit = 2;
+}
+
+message TemplateList {
+  repeated TemplateSummary templates = 1;
+}
+
+message GetTemplateRequest {
+  string template_ref = 1;
+}
+
+// One row of a version's audit trail.
+message TemplateEvent {
+  // submit, approve, reject, revoke or seed.
+  string action = 1;
+  // The submitting account.
+  optional bytes actor = 2;
+  // The reviewer's label, for reviews.
+  optional string reviewer = 3;
+  optional string note = 4;
+  int64 at = 5;
+}
+
+message TemplateDetail {
+  TemplateSummary summary = 1;
+  // The canonical JSON definition.
+  string definition = 2;
+  // A plain-text rendering of the layout, for review.
+  string outline = 3;
+  // Oldest first.
+  repeated TemplateEvent events = 4;
+}
+
+message ReviewTemplateRequest {
+  string template_ref = 1;
+  ReviewAction action = 2;
+  // Who reviews: 1 to 64 printable characters, kept in the audit trail.
+  string reviewer = 3;
+  optional string note = 4;
 }

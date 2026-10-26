@@ -14,13 +14,41 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 use crate::error::{DomainError, DomainResult};
 use crate::ids::{ClientMsgId, ConversationId, DeviceId, MessageId, UserId};
 use crate::model::{
-    ContactState, Conversation, ConversationKind, ConversationOverview, DeviceState, Entry,
-    EntryKind, GroupPositions, InviteRecord, Member, Role,
+    ContactState, ContentType, Conversation, ConversationKind, ConversationOverview, DeviceState,
+    Entry, EntryKind, GroupPositions, InviteRecord, Member, PublisherOwner, Role, StoredTemplate,
+    TemplateEvent, TemplateStatus,
 };
 use crate::store::{InsertOutcome, Store, Tx};
+use crate::templates::TemplateRef;
 
 fn missing(what: &str) -> DomainError {
     DomainError::Store(format!("foreign key violation: {what} does not exist"))
+}
+
+/// The CHECK constraints of `template_version`: a version is reviewed unless pending, and
+/// has a change number exactly when approved or revoked.
+fn check_template_status(template: &StoredTemplate) -> DomainResult<()> {
+    let status = template.status;
+    if (status == TemplateStatus::Pending) != template.reviewed_at.is_none() {
+        return Err(DomainError::Store(format!(
+            "check violation: a {} template {} a review time",
+            status.as_str(),
+            if template.reviewed_at.is_some() {
+                "has"
+            } else {
+                "lacks"
+            }
+        )));
+    }
+    let listed = matches!(status, TemplateStatus::Approved | TemplateStatus::Revoked);
+    if listed != template.change_seq.is_some() {
+        return Err(DomainError::Store(format!(
+            "check violation: a {} template {} a change number",
+            status.as_str(),
+            if listed { "lacks" } else { "has" }
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Default)]
@@ -41,9 +69,42 @@ struct State {
     client_ids: HashMap<(ConversationId, ClientMsgId), i64>,
     cursors: HashMap<(DeviceId, ConversationId), i64>,
     message_ids: HashMap<MessageId, (ConversationId, i64)>,
+    publishers: HashMap<String, PublisherOwner>,
+    templates: BTreeMap<TemplateRef, StoredTemplate>,
+    /// The last change number of the template catalog handed out.
+    template_change: i64,
+    /// Every template event, oldest first.
+    template_events: Vec<TemplateEvent>,
 }
 
 impl State {
+    /// `template_version.change_seq` is UNIQUE: no other version may hold the number.
+    /// The guard trigger of `template_version`: a version enters the catalog only with the
+    /// counter's last number, taken by the same transaction.
+    fn check_change_seq_last(&self, template: &StoredTemplate) -> DomainResult<()> {
+        match template.change_seq {
+            Some(change_seq) if change_seq != self.template_change => Err(DomainError::Store(
+                format!("check violation: change number {change_seq} is not the last one taken"),
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    fn check_change_seq_unused(&self, template: &StoredTemplate) -> DomainResult<()> {
+        let Some(change_seq) = template.change_seq else {
+            return Ok(());
+        };
+        let taken = self.templates.values().any(|other| {
+            other.template != template.template && other.change_seq == Some(change_seq)
+        });
+        if taken {
+            return Err(DomainError::Store(format!(
+                "unique violation: change number {change_seq} is taken"
+            )));
+        }
+        Ok(())
+    }
+
     fn first_live_message(
         &self,
         conversation: ConversationId,
@@ -636,10 +697,22 @@ impl Tx for InMemoryTx {
             .entries
             .get_mut(&(entry.conversation_id, entry.seq))
             .ok_or_else(|| DomainError::Store("update of an entry that does not exist".into()))?;
+        // As the schema's message_card_answer check and message_answer_guard trigger.
+        if stored.answer_seq.is_some() && entry.answer_seq != stored.answer_seq {
+            return Err(DomainError::Store("a card's answer never changes".into()));
+        }
+        if let Some(answer_seq) = entry.answer_seq {
+            if stored.content_type != ContentType::Rich || answer_seq <= stored.seq {
+                return Err(DomainError::Store(
+                    "only a card is answered, by a later entry".into(),
+                ));
+            }
+        }
         stored.body = entry.body;
         stored.edited_at = entry.edited_at;
         stored.edit_seq = entry.edit_seq;
         stored.deleted_at = entry.deleted_at;
+        stored.answer_seq = entry.answer_seq;
         Ok(())
     }
 
@@ -676,7 +749,10 @@ impl Tx for InMemoryTx {
             .entries
             .range((conversation, after + 1)..=(conversation, up_to))
             .map(|(_, entry)| entry)
-            .filter(|entry| entry.target_seq.is_none_or(|target| target >= targets_from))
+            .filter(|entry| {
+                !matches!(entry.kind, EntryKind::Edit | EntryKind::Delete)
+                    || entry.target_seq.is_none_or(|target| target >= targets_from)
+            })
             .take(limit as usize)
             .cloned()
             .collect())
@@ -856,6 +932,191 @@ impl Tx for InMemoryTx {
                 }
                 Some(state.overview(conversation, member, unread_cap))
             })
+            .collect())
+    }
+
+    async fn is_agent(&mut self, user: UserId) -> DomainResult<bool> {
+        Ok(self.work.agent_owners.contains_key(&user))
+    }
+
+    async fn template(&mut self, template: &TemplateRef) -> DomainResult<Option<StoredTemplate>> {
+        Ok(self.work.templates.get(template).cloned())
+    }
+
+    async fn template_for_send(
+        &mut self,
+        template: &TemplateRef,
+    ) -> DomainResult<Option<StoredTemplate>> {
+        // Every in-memory transaction already holds the store-wide lock.
+        Ok(self.work.templates.get(template).cloned())
+    }
+
+    async fn lock_template(
+        &mut self,
+        template: &TemplateRef,
+    ) -> DomainResult<Option<StoredTemplate>> {
+        // Every in-memory transaction already holds the store-wide lock.
+        Ok(self.work.templates.get(template).cloned())
+    }
+
+    async fn insert_template(&mut self, template: StoredTemplate) -> DomainResult<InsertOutcome> {
+        // Postgres checks the row's CHECK constraints before it looks for a conflict.
+        check_template_status(&template)?;
+        // So does the guard trigger, which runs before the insert.
+        self.work.check_change_seq_last(&template)?;
+        if self.work.templates.contains_key(&template.template) {
+            return Ok(InsertOutcome::Duplicate);
+        }
+        self.work.check_change_seq_unused(&template)?;
+        if !self
+            .work
+            .publishers
+            .contains_key(&template.template.publisher)
+        {
+            return Err(missing("publisher"));
+        }
+        if template
+            .submitted_by
+            .is_some_and(|user| !self.work.users.contains(&user))
+        {
+            return Err(missing("user"));
+        }
+        self.work
+            .templates
+            .insert(template.template.clone(), template);
+        Ok(InsertOutcome::Inserted)
+    }
+
+    async fn set_template_status(
+        &mut self,
+        template: &TemplateRef,
+        status: TemplateStatus,
+        at: DateTime<Utc>,
+        change_seq: Option<i64>,
+    ) -> DomainResult<()> {
+        let stored = self
+            .work
+            .templates
+            .get(template)
+            .filter(|stored| stored.status.can_become(status))
+            .ok_or_else(|| {
+                DomainError::Store(format!(
+                    "no template {template} whose status may become {}",
+                    status.as_str()
+                ))
+            })?;
+        let changed = StoredTemplate {
+            status,
+            reviewed_at: Some(at),
+            change_seq,
+            ..stored.clone()
+        };
+        check_template_status(&changed)?;
+        self.work.check_change_seq_last(&changed)?;
+        self.work.check_change_seq_unused(&changed)?;
+        self.work
+            .templates
+            .insert(changed.template.clone(), changed);
+        Ok(())
+    }
+
+    async fn next_template_change(&mut self) -> DomainResult<i64> {
+        // Every in-memory transaction already holds the store-wide lock.
+        self.work.template_change += 1;
+        Ok(self.work.template_change)
+    }
+
+    async fn last_template_change(&mut self) -> DomainResult<i64> {
+        Ok(self.work.template_change)
+    }
+
+    async fn templates_changed_since(
+        &mut self,
+        since: i64,
+        limit: u32,
+    ) -> DomainResult<Vec<StoredTemplate>> {
+        let mut changed: Vec<StoredTemplate> = self
+            .work
+            .templates
+            .values()
+            .filter(|stored| {
+                matches!(
+                    stored.status,
+                    TemplateStatus::Approved | TemplateStatus::Revoked
+                ) && stored.change_seq.is_some_and(|seq| seq > since)
+            })
+            .cloned()
+            .collect();
+        changed.sort_by_key(|stored| stored.change_seq);
+        changed.truncate(limit as usize);
+        Ok(changed)
+    }
+
+    async fn templates_with_status(
+        &mut self,
+        status: Option<TemplateStatus>,
+        limit: u32,
+    ) -> DomainResult<Vec<StoredTemplate>> {
+        let mut found: Vec<StoredTemplate> = self
+            .work
+            .templates
+            .values()
+            .filter(|stored| status.is_none_or(|status| stored.status == status))
+            .cloned()
+            .collect();
+        // `templates` iterates in ref order, and the sort is stable: ties stay by ref.
+        found.sort_by_key(|stored| std::cmp::Reverse(stored.submitted_at));
+        found.truncate(limit as usize);
+        Ok(found)
+    }
+
+    async fn pending_templates_of(&mut self, user: UserId) -> DomainResult<u32> {
+        Ok(self
+            .work
+            .templates
+            .values()
+            .filter(|stored| {
+                stored.status == TemplateStatus::Pending && stored.submitted_by == Some(user)
+            })
+            .count() as u32)
+    }
+
+    async fn claim_publisher(
+        &mut self,
+        publisher: &str,
+        owner: PublisherOwner,
+    ) -> DomainResult<PublisherOwner> {
+        // Every in-memory transaction already holds the store-wide lock.
+        if let Some(recorded) = self.work.publishers.get(publisher) {
+            return Ok(*recorded);
+        }
+        if let PublisherOwner::User(user) = owner {
+            if !self.work.users.contains(&user) {
+                return Err(missing("user"));
+            }
+        }
+        self.work.publishers.insert(publisher.to_owned(), owner);
+        Ok(owner)
+    }
+
+    async fn insert_template_event(&mut self, event: TemplateEvent) -> DomainResult<()> {
+        if !self.work.templates.contains_key(&event.template) {
+            return Err(missing("template"));
+        }
+        self.work.template_events.push(event);
+        Ok(())
+    }
+
+    async fn template_events(
+        &mut self,
+        template: &TemplateRef,
+    ) -> DomainResult<Vec<TemplateEvent>> {
+        Ok(self
+            .work
+            .template_events
+            .iter()
+            .filter(|event| event.template == *template)
+            .cloned()
             .collect())
     }
 }

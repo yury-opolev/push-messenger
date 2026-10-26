@@ -1,21 +1,24 @@
 //! The public HTTP API (spec §2, §5; Entra ID sign-in: spec 2026-10-19 §4): `/v1/auth/*`,
-//! `/v1/devices/*` and `/v1/users*`, JSON in and out, plus the two small pages that email
-//! links open.
+//! `/v1/devices/*`, `/v1/agents*`, `/v1/users*` and `/v1/templates` (spec 2026-10-26 rich
+//! message templates), JSON in and out, plus the two small pages that email links open.
 //!
 //! Errors are `{"error": {"code", "message", "retryable"}}` with the status of
 //! [`AuthError::status`]; 429 answers carry `Retry-After`, 401 answers
 //! `WWW-Authenticate: Bearer`. No answer may be cached (`Cache-Control: no-store`) except
-//! the JWKS. Pages send `Referrer-Policy: no-referrer`, so the token in their URL never
-//! leaks to another site (spec §5.6), and change nothing on `GET`: the change is the
-//! `POST` their button sends, so a mail scanner that opens links does nothing.
+//! the JWKS and the template catalog (`private, no-cache`, with an ETag). Pages send
+//! `Referrer-Policy: no-referrer`, so the token in their URL never leaks to another site
+//! (spec §5.6), and change nothing on `GET`: the change is the `POST` their button sends,
+//! so a mail scanner that opens links does nothing.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
+use axum::body::{Body, to_bytes};
+use axum::extract::rejection::QueryRejection;
 use axum::extract::{ConnectInfo, FromRequest, FromRequestParts, Path, Query, Request, State};
 use axum::http::header::{
-    CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue,
-    REFERRER_POLICY, RETRY_AFTER, WWW_AUTHENTICATE, X_CONTENT_TYPE_OPTIONS,
+    CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE, ETAG, HeaderMap, HeaderName, HeaderValue,
+    IF_NONE_MATCH, REFERRER_POLICY, RETRY_AFTER, WWW_AUTHENTICATE, X_CONTENT_TYPE_OPTIONS,
 };
 use axum::http::request::Parts;
 use axum::http::{Extensions, StatusCode};
@@ -36,6 +39,7 @@ use crate::identity::{IdentityState, Principal, identify};
 use crate::limits::{Action, Limits};
 use crate::rules::{self, Invalid};
 use crate::service::{Auth, Signup};
+use crate::templates::{TemplateRegistry, rfc3339};
 
 /// Largest request body accepted.
 pub(crate) const MAX_BODY_BYTES: usize = 16 * 1024;
@@ -51,6 +55,8 @@ pub struct Api {
     pub client_ip_header: Option<HeaderName>,
     /// Who may see whose profile: message-svc's `Directory` API.
     pub directory: Arc<dyn Directory>,
+    /// The template registry: message-svc's `Templates` API.
+    pub templates: Arc<dyn TemplateRegistry>,
 }
 
 /// The router of the public API. Without email and password sign-in its routes do not
@@ -91,6 +97,7 @@ pub fn router(api: Api) -> Router {
         .route("/v1/users", get(profiles))
         .route("/v1/users/me", get(own_profile).patch(update_profile))
         .route("/v1/users/lookup", get(lookup))
+        .route("/v1/templates", post(submit_template).get(template_catalog))
         .route_layer(axum::middleware::from_fn_with_state(
             api.clone(),
             audit::audit,
@@ -796,6 +803,158 @@ async fn profiles(
         })
         .collect();
     Ok(Json(json!({ "users": users })).into_response())
+}
+
+/// Whether the body is declared as JSON (`application/json`, any parameters).
+fn is_json(headers: &HeaderMap) -> bool {
+    headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|essence| essence.trim().eq_ignore_ascii_case("application/json"))
+}
+
+/// `POST /v1/templates` with a tpl/1 definition (JSON, at most 16 KiB): stored as pending
+/// for review (spec 2026-10-26 rich message templates, D6), 201
+/// `{template, status, title, submitted_at}`. The body goes to message-svc byte for byte:
+/// it parses the definition strictly itself. Rate limited per IP and per user.
+async fn submit_template(
+    State(api): State<Api>,
+    headers: HeaderMap,
+    ClientIp(ip): ClientIp,
+    body: Body,
+) -> Result<Response, AuthError> {
+    let caller = caller(&api, &headers).await?;
+    let submitted = async {
+        if !is_json(&headers) {
+            return Err(template_body());
+        }
+        let definition = to_bytes(body, MAX_BODY_BYTES)
+            .await
+            .map_err(|_| template_body())?;
+        api.limits
+            .check(
+                Action::TemplateSubmit,
+                ip,
+                Some(&caller.user_id.to_string()),
+            )
+            .await?;
+        let summary = api
+            .templates
+            .submit(caller.user_id, definition.to_vec())
+            .await?;
+        Ok((
+            StatusCode::CREATED,
+            Json(json!({
+                "template": summary.template,
+                "status": summary.status.as_str(),
+                "title": summary.title,
+                "submitted_at": rfc3339(summary.submitted_at),
+            })),
+        )
+            .into_response())
+    }
+    .await;
+    // On refusals too, so the security log names who was refused.
+    let mut response = submitted.unwrap_or_else(IntoResponse::into_response);
+    response.extensions_mut().insert(Subject {
+        user: Some(caller.user_id),
+        device: Some(caller.device_id),
+    });
+    Ok(response)
+}
+
+fn template_body() -> AuthError {
+    AuthError::Invalid(Invalid {
+        field: "body",
+        reason: "expected a JSON template definition (application/json) of at most 16 KiB",
+    })
+}
+
+#[derive(Deserialize)]
+struct CatalogQuery {
+    #[serde(default)]
+    since: Option<String>,
+}
+
+/// `GET /v1/templates?since=N` (N ≥ 0, default 0): the approved and revoked versions
+/// changed after N (spec 2026-10-26 rich message templates, D8),
+/// `{seq, more, templates: [{template, status, seq, definition?}]}`, with the ETag
+/// `"tpl-<since>-<seq>"`; 304 when `If-None-Match` names it (or is `*`). Rate limited per
+/// IP and per user.
+async fn template_catalog(
+    State(api): State<Api>,
+    headers: HeaderMap,
+    ClientIp(ip): ClientIp,
+    query: Result<Query<CatalogQuery>, QueryRejection>,
+) -> Result<Response, AuthError> {
+    let caller = caller(&api, &headers).await?;
+    api.limits
+        .check(
+            Action::TemplateCatalog,
+            ip,
+            Some(&caller.user_id.to_string()),
+        )
+        .await?;
+    let since = match query.map(|Query(query)| query.since) {
+        Ok(None) => 0,
+        Ok(Some(since)) => since
+            .parse::<i64>()
+            .ok()
+            .filter(|since| *since >= 0)
+            .ok_or_else(bad_since)?,
+        Err(_) => return Err(bad_since()),
+    };
+    let catalog = api.templates.catalog(since, 0).await?;
+    let etag = format!("\"tpl-{since}-{}\"", catalog.seq);
+    let cache = [
+        (
+            ETAG,
+            HeaderValue::from_str(&etag).expect("digits and ASCII"),
+        ),
+        (CACHE_CONTROL, HeaderValue::from_static("private, no-cache")),
+    ];
+    if none_match(&headers, &etag) {
+        return Ok((StatusCode::NOT_MODIFIED, cache).into_response());
+    }
+    let templates: Vec<Value> = catalog
+        .entries
+        .into_iter()
+        .map(|entry| {
+            let mut answer = json!({
+                "template": entry.template,
+                "status": entry.status.as_str(),
+                "seq": entry.seq,
+            });
+            if let (Some(definition), Value::Object(fields)) = (entry.definition, &mut answer) {
+                fields.insert("definition".to_owned(), definition);
+            }
+            answer
+        })
+        .collect();
+    Ok((
+        cache,
+        Json(json!({"seq": catalog.seq, "more": catalog.more, "templates": templates})),
+    )
+        .into_response())
+}
+
+fn bad_since() -> AuthError {
+    AuthError::Invalid(Invalid {
+        field: "since",
+        reason: "expected a whole number of at least 0",
+    })
+}
+
+/// Whether `If-None-Match` names `etag` (weakly compared, as RFC 9110 asks) or is `*`.
+fn none_match(headers: &HeaderMap, etag: &str) -> bool {
+    headers
+        .get_all(IF_NONE_MATCH)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .any(|tag| tag == "*" || tag.strip_prefix("W/").unwrap_or(tag) == etag)
 }
 
 /// A small HTML page with the headers every link page needs.

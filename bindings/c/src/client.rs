@@ -353,7 +353,52 @@ pub unsafe extern "C" fn push_client_send(
     })
 }
 
-/// Changes the text of one of the user's messages; `*change_id` gets the id of the change.
+/// Queues a card: `rich_json` is a RICH body `{"tpl", "params", "fallback"}`, checked as
+/// an envelope (`invalid` otherwise). `*message_json` gets the local echo, as with
+/// `push_client_send`; the server checks the template and may refuse it later.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn push_client_send_rich(
+    client: *const PushClient,
+    conversation_id_text: *const c_char,
+    rich_json: *const c_char,
+    message_json: *mut *mut c_char,
+    error: *mut *mut PushError,
+) -> i32 {
+    guard(error, || {
+        let out = place(message_json, "message_json")?;
+        let this = unsafe { handle(client) }?;
+        let id = unsafe { conversation_id(conversation_id_text) }?;
+        let body = unsafe { text(rich_json, "rich_json") }?;
+        let message = this.client.send_rich(id, body)?;
+        put_json(out, &json::message(&message));
+        Ok(())
+    })
+}
+
+/// Queues an answer to a card: `answer_json` is an ANSWER body `{"card", "values",
+/// "fallback"}` naming a card held in the conversation, from someone else and not
+/// answered yet (`invalid` otherwise). `*message_json` gets the local echo.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn push_client_send_answer(
+    client: *const PushClient,
+    conversation_id_text: *const c_char,
+    answer_json: *const c_char,
+    message_json: *mut *mut c_char,
+    error: *mut *mut PushError,
+) -> i32 {
+    guard(error, || {
+        let out = place(message_json, "message_json")?;
+        let this = unsafe { handle(client) }?;
+        let id = unsafe { conversation_id(conversation_id_text) }?;
+        let body = unsafe { text(answer_json, "answer_json") }?;
+        let message = this.client.send_answer(id, body)?;
+        put_json(out, &json::message(&message));
+        Ok(())
+    })
+}
+
+/// Changes the text of one of the user's messages, or a card's RICH body (not an answer,
+/// nor an answered card); `*change_id` gets the id of the change.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn push_client_edit(
     client: *const PushClient,

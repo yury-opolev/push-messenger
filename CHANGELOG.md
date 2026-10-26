@@ -6,6 +6,75 @@ Notable changes for consumers of push-messenger. Newest first.
 
 ### Added
 
+- **Rich message templates and a template marketplace** (REQUEST PUSH feature 8). Two new
+  content types: `CONTENT_TYPE_RICH` (3), a card filled from an approved tpl/1 template
+  (`{tpl, params, fallback}`, up to 32 KiB), and `CONTENT_TYPE_ANSWER` (4), an answer to a
+  card (`{card, values, fallback}`, up to 4 KiB). message-svc enforces everything, since
+  bodies are not end-to-end encrypted: the template's approval, the full params schema,
+  the sender's kind (`agent` for owned agents, `human` otherwise) and every answer. The
+  first valid answer closes the card: the new `Deliver.answer_seq` carries it, the
+  answer's `Deliver.target_seq` is the card's seq, and later answers get
+  `ERROR_CODE_REJECTED`; answered cards and answers cannot be edited. Refused bodies are
+  `ERROR_CODE_INVALID`; no new frame or error code. Guide:
+  [docs/rich-messages.md](docs/rich-messages.md) (tpl/1 reference, review checklist,
+  catalog protocol).
+- auth-svc: `POST /v1/templates` submits a definition for review (access token, JSON up
+  to 16 KiB; publishers are claimed by the first submitter, `agent`, `push`, `system`,
+  `admin`, `builtin`, `official`, `verified` and every publisher starting with one of
+  them are reserved, at most 20 pending per account);
+  `GET /v1/templates?since=N` serves the client catalog of approved and revoked versions
+  (pages of 200, `seq`/`more`, ETag `"tpl-<since>-<seq>"` with 304 on `If-None-Match`,
+  `Cache-Control: private, no-cache`). The admin listener gains `GET /v1/admin/templates`,
+  `GET /v1/admin/templates/{ref}` (definition, outline, audit trail) and
+  `POST /v1/admin/templates/{ref}/approve|reject|revoke` (`{reviewer, note?}`): holders of
+  `PUSH_AUTH_ADMIN_TOKEN` are the reviewers. New error codes `not_found` (404) and
+  `conflict` (409); new rate limits: submissions 10 per hour per user and 60 per IP, the
+  catalog 120 per minute per user and 600 per IP. New security events
+  `auth.template.submitted`, `auth.template.refused` and `auth.admin.template_reviewed`
+  (with the reviewer's IP); message-svc logs `templates.submitted`, `templates.approved`,
+  `templates.rejected`, `templates.revoked`, `templates.seeded` and
+  `templates.builtin_mismatch`.
+- Built-in templates `agent.reply@1`, `agent.approval@1`, `agent.question@1` and
+  `agent.plan@1` (agents only), seeded as approved when message-svc starts, before it is
+  ready; an admin's revocation survives restarts. Designed upstream without the
+  consumer's spec: reconcile and propose changes as new versions.
+- messaging migrations `0005_templates.sql` and `0006_validate_message_checks.sql`:
+  content types 3 and 4, `answer_seq` on messages, the registry (`template_publisher`,
+  `template_version`, the `template_change` counter) and the append-only audit trail
+  `messaging.template_event`, guarded by triggers (immutable versions, one-way
+  statuses). They change no existing data and run with the usual messaging migrations.
+  **Upgrade notes:**
+  - 0005 is metadata-only: the new `answer_seq` column is nullable without a default and
+    the new message CHECKs are added `NOT VALID`, so it holds the message table's
+    exclusive lock only for a moment, without a scan (with `lock_timeout` 5 s: behind a
+    long transaction it fails and start-up retries it instead of stalling all traffic).
+    0006 then validates the CHECKs online: `VALIDATE CONSTRAINT` scans under SHARE UPDATE
+    EXCLUSIVE, so reads and writes continue. The scan grows with the message table and
+    runs before the pod reports ready: on a large installation run the migrations as a
+    job first (`push-message-svc migrate`, the chart's migrate job) or allow a longer
+    start-up probe.
+  - During a rolling upgrade old message-svc pods cannot decode content types 3 and 4: a
+    request that reads a card or an answer fails there. Finish rolling out message-svc
+    before approving or sending templates (the built-ins are approved as soon as the
+    first new pod starts, so also before agents send cards).
+  - Rolling back message-svc after 0005 is not supported: sqlx refuses a database with
+    applied migrations the binary does not know (`VersionMissing`), so an older
+    message-svc that migrates at start-up (`PUSH_RUN_MIGRATIONS=true`, the default) keeps
+    retrying and never becomes ready, and an older `push-message-svc migrate` job fails.
+    With `PUSH_RUN_MIGRATIONS=false` an older binary starts but fails every request that
+    reads a card or answer.
+  - Older SDKs do not know content types 3 and 4: they show RICH and ANSWER messages as
+    text, their raw JSON body, and keep them as text after an SDK upgrade (entries
+    already received are not reclassified). Ship the updated SDK to your apps before
+    agents send cards.
+- message-svc serves a new internal gRPC service, `push.internal.v1.Templates`, on the
+  Directory port with auth-svc's existing token: **no new configuration** (auth-svc uses
+  `PUSH_MESSAGE_SVC_URL` and `PUSH_DIRECTORY_TOKEN`; without them the template routes
+  answer 503). The chart's auth Ingress routes `/v1/templates`.
+- SDK and bindings: `MessageKind::Rich`/`Answer` (`rich`/`answer`), `answerSeq` on cards
+  and `cardSeq` on answers, and `send_rich`/`send_answer` (Node `sendRich`/`sendAnswer`,
+  C `push_client_send_rich`/`push_client_send_answer`) with local envelope checks. The
+  SDK does not fetch the catalog yet.
 - **Agent-key sign-in for owned agents** (REQUEST PUSH feature 6). A new opt-in provider,
   `agent-key` in `PUSH_AUTH_PROVIDERS` (off by default), lets an owned agent sign in with
   a P-256 key pair of its own instead of an Entra app token: no secret, certificate or

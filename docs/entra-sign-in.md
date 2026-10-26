@@ -326,6 +326,20 @@ separate limit (20 per 15 minutes per IP), so they never lock the token's holder
 Never expose the admin port through an Ingress;
 the chart allows it only from the peers you list (`networkPolicy.adminPeers`).
 
+### Template routes
+
+auth-svc fronts message-svc's template registry (rich message templates; see the full
+guide in [`docs/rich-messages.md`](rich-messages.md)). Both need `PUSH_MESSAGE_SVC_URL` and
+`PUSH_DIRECTORY_TOKEN`; without them they answer 503 `unavailable`.
+
+| Method/path | Auth | Body | Response |
+|---|---|---|---|
+| `POST /v1/templates` | access token | a tpl/1 definition, `application/json`, at most 16 KiB, forwarded byte for byte | 201 `{template,status:"pending",title,submitted_at}`; 400 `invalid` (the rule that failed), 409 `conflict` (exists, publisher of another account, too many pending); 10 per hour per user, 60 per IP |
+| `GET /v1/templates?since=N` | access token | none | `{seq,more,templates:[{template,status:"approved"\|"revoked",seq,definition?}]}`, `ETag: "tpl-<since>-<seq>"`, `Cache-Control: private, no-cache`; `If-None-Match` with that tag (or `*`) answers 304; 120 per minute per user, 600 per IP |
+| `GET /v1/admin/templates?status=pending\|approved\|rejected\|revoked` | admin token | none | `{templates:[{template,status,title,submitted_by,submitted_at,reviewed_at,seq}]}` |
+| `GET /v1/admin/templates/{ref}` | admin token | none | the summary's fields plus `definition`, `outline` and `events:[{action,actor,reviewer,note,at}]`; 404 `not_found` |
+| `POST /v1/admin/templates/{ref}/approve\|reject\|revoke` | admin token | `{reviewer,note?}` | the summary; 409 `conflict` when the status does not allow it; logged as `auth.admin.template_reviewed` |
+
 ## 4. Sign in from a browser (MSAL.js)
 
 ```js

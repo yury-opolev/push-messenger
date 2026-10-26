@@ -1,0 +1,22 @@
+{
+  "format": "tpl/1",
+  "publisher": "agent",
+  "name": "approval",
+  "version": 1,
+  "title": "Approval request",
+  "senders": ["agent"],
+  "params": {
+    "title": {"type": "string", "max_len": 120},
+    "details": {"type": "string", "max_len": 4000, "multiline": true},
+    "preview": {"type": "string", "max_len": 4000, "multiline": true, "optional": true}
+  },
+  "layout": [
+    {"type": "heading", "param": "title"},
+    {"type": "text", "param": "details"},
+    {"type": "preview", "param": "preview", "label": "Preview"},
+    {"type": "buttons", "options": [
+      {"id": "approve", "label": "Approve", "style": "primary"},
+      {"id": "reject", "label": "Reject", "style": "danger"}
+    ]}
+  ]
+}

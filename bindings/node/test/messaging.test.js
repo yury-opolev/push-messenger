@@ -96,6 +96,33 @@ test('requests: invites and contacts, and their errors', async (t) => {
   await client.close();
 });
 
+test('cards and answers: sendRich, the peer\'s card, sendAnswer, and invalid bodies', async (t) => {
+  const { client, events } = await connected(t);
+  const conversation = await client.openDirect(PEER);
+  const body = JSON.stringify({ tpl: 'agent.approval@1', params: { title: 'Deploy?' }, fallback: 'Deploy?' });
+  await assert.rejects(client.sendRich(conversation.id, 'Deploy?'), code('invalid'));
+  await assert.rejects(client.sendRich(conversation.id, JSON.stringify({ tpl: 'agent.approval@1' })), code('invalid'));
+  const card = await client.sendRich(conversation.id, body);
+  assert.equal(card.kind, 'rich');
+  assert.equal(card.answerSeq, null);
+  assert.equal(card.status, 'pending');
+  const own = await events.next((event) => event.type === 'messageSent' && event.message.clientMsgId === card.clientMsgId);
+  // The fake gateway's peer sends the same card back: one to answer.
+  const theirs = await events.next((event) => event.type === 'messageAdded' && event.message.senderId === PEER);
+  assert.equal(theirs.message.kind, 'rich');
+  const answer = (cardId) => JSON.stringify({ card: cardId, values: ['approve'], fallback: 'Approved' });
+  await assert.rejects(client.sendAnswer(conversation.id, answer(own.message.messageId)), code('invalid'));
+  await assert.rejects(client.sendAnswer(conversation.id, '{"values":["approve"]}'), code('invalid'));
+  const sent = await client.sendAnswer(conversation.id, answer(theirs.message.messageId));
+  assert.equal(sent.kind, 'answer');
+  assert.equal(sent.cardSeq, theirs.message.seq);
+  const closed = await events.next((event) => event.type === 'messageEdited' && event.message.clientMsgId === theirs.message.clientMsgId);
+  assert.ok(closed.message.answerSeq > theirs.message.seq);
+  await assert.rejects(client.sendAnswer(conversation.id, answer(theirs.message.messageId)), code('invalid'));
+  await assert.rejects(client.edit(conversation.id, sent.clientMsgId, answer(theirs.message.messageId)), code('invalid'));
+  await client.close();
+});
+
 test('the typings declare every call of the client, and only those', () => {
   const declared = fs.readFileSync(path.join(__dirname, '..', 'index.d.ts'), 'utf8');
   const body = declared.slice(declared.indexOf('export class Client {'));

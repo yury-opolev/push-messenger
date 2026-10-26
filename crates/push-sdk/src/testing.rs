@@ -332,7 +332,8 @@ pub const UNKNOWN_INVITE: &str = "NOSUCHCODE";
 /// A gateway that answers by itself, for tests that drive the SDK from outside Rust (the
 /// bindings'): `Identify` gets `Ready` for the identity [`FakeAuth`] issues, `Ping` gets
 /// `Pong`, every send, edit and delete is stored with the next `seq` of its conversation,
-/// and every text message sent is answered by the peer with the same text, delivered next.
+/// and every text message or card sent is answered by the peer with the same content,
+/// delivered next (answers are not echoed).
 /// `OpenDirect`, `CreateInvite`, `RedeemInvite` and the listings are answered; any other
 /// request is refused with `rejected`.
 pub struct AutoGateway {
@@ -420,24 +421,30 @@ async fn serve(mut socket: Server, identity: &Mutex<(UserId, DeviceId)>, log: &M
             Body::Send(send) => {
                 let conversation = conversation_of(&send.conversation_id);
                 let (seq, _) = append(log, conversation);
-                let (reply_seq, peer) = append(log, conversation);
-                let reply = Deliver {
-                    conversation_id: send.conversation_id,
-                    seq: reply_seq,
-                    message_id: id_bytes(Uuid::now_v7()),
-                    client_msg_id: id_bytes(Uuid::now_v7()),
-                    kind: EntryKind::Message.into(),
-                    target_seq: None,
-                    sender_id: id_bytes(peer.0),
-                    content_type: ContentType::Text.into(),
-                    body: Some(send.body),
-                    client_ts: None,
-                    server_ts: now_us(),
-                    edited_at: None,
-                    edit_seq: None,
-                    deleted: false,
-                };
-                vec![ack(send.client_msg_id, seq), Body::Deliver(reply)]
+                let echoed = send.content_type() != ContentType::Answer;
+                let mut answers = vec![ack(send.client_msg_id, seq)];
+                // Text and cards are echoed by the peer; an answer is not.
+                if echoed {
+                    let (reply_seq, peer) = append(log, conversation);
+                    answers.push(Body::Deliver(Deliver {
+                        conversation_id: send.conversation_id,
+                        seq: reply_seq,
+                        message_id: id_bytes(Uuid::now_v7()),
+                        client_msg_id: id_bytes(Uuid::now_v7()),
+                        kind: EntryKind::Message.into(),
+                        target_seq: None,
+                        sender_id: id_bytes(peer.0),
+                        content_type: send.content_type,
+                        body: Some(send.body),
+                        client_ts: None,
+                        server_ts: now_us(),
+                        edited_at: None,
+                        edit_seq: None,
+                        deleted: false,
+                        answer_seq: None,
+                    }));
+                }
+                answers
             }
             Body::Edit(edit) => {
                 let (seq, _) = append(log, conversation_of(&edit.conversation_id));

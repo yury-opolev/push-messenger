@@ -17,11 +17,14 @@ pub mod memory;
 pub mod model;
 pub mod notify;
 mod read;
+mod registry;
+mod rich;
 mod send;
 mod service;
 pub mod store;
 mod sync;
 pub mod system;
+pub mod templates;
 pub mod validation;
 
 pub use clock::{Clock, ManualClock, SystemClock};
@@ -33,11 +36,12 @@ pub use memory::InMemoryStore;
 pub use model::{
     ContactState, ContactSummary, ContentType, Conversation, ConversationKind,
     ConversationOverview, ConversationState, ConversationSummary, DeviceState, Entry, EntryKind,
-    GroupPositions, Invite, InviteRecord, Member, MemberState, Positions, Receipts, Role,
-    SendReceipt, direct_key,
+    GroupPositions, Invite, InviteRecord, Member, MemberState, Positions, PublisherOwner, Receipts,
+    Role, SendReceipt, StoredTemplate, TemplateAction, TemplateEvent, TemplateStatus, direct_key,
 };
 pub use notify::{Event, KickReason, NoopNotifier, Notifier, ReceiptUpdate, RecordingNotifier};
-pub use send::SendText;
+pub use registry::{Catalog, MAX_CATALOG_PAGE, MAX_PENDING_PER_USER, ReviewAction, ReviewCommand};
+pub use send::{SendMessage, SendText};
 pub use service::{Messaging, Policy};
 pub use store::{InsertOutcome, Store, Tx};
 pub use sync::SyncBatch;

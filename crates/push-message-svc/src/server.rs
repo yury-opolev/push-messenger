@@ -10,10 +10,11 @@ use axum::http::StatusCode;
 use axum::routing::get;
 use push_credentials::startup::{redis_permanent, retry};
 use push_credentials::{AuthMode, AzureConfig, RedisConnector};
-use push_domain::{Messaging, SystemClock};
+use push_domain::{DomainError, Messaging, SystemClock};
 use push_proto::internal::v1::accounts_server::AccountsServer;
 use push_proto::internal::v1::directory_server::DirectoryServer;
 use push_proto::internal::v1::messaging_server::MessagingServer;
+use push_proto::internal::v1::templates_server::TemplatesServer;
 use push_store::{Connector, PgStore, grant_runtime_access, is_permanent_startup, tokens_for};
 use tokio::task::JoinSet;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -23,6 +24,7 @@ use crate::Listeners;
 use crate::config::{Config, MigrateConfig};
 use crate::grpc::{AccountsApi, DirectoryApi, InternalToken, MessagingApi};
 use crate::notify::RedisNotifier;
+use crate::templates::{TemplatesApi, seed_builtins, seeding_is_permanent};
 
 /// How long to wait before trying an unreachable dependency again.
 const RETRY_DELAY: Duration = Duration::from_secs(2);
@@ -31,9 +33,9 @@ const RETRY_DELAY: Duration = Duration::from_secs(2);
 /// and closes the database pool. All `listeners` must be bound already.
 ///
 /// The health endpoints answer at once: `/healthz` always, `/readyz` only once the
-/// database is migrated and answers a ping and Redis has connected, and never after
-/// shutdown began. Postgres and Redis are retried until they answer, so the service may
-/// start before them.
+/// database is migrated and answers a ping, Redis has connected and the built-in templates
+/// are seeded, and never after shutdown began. Postgres, Redis and seeding are retried
+/// until they succeed, so the service may start before its datastores.
 pub async fn serve(
     config: Config,
     listeners: Listeners,
@@ -119,12 +121,33 @@ pub async fn serve(
         store.close().await;
         return finish(health_server).await;
     };
+    let messaging = Arc::new(Messaging::new(store.clone(), SystemClock, notifier));
+    // Before readiness and serving, so clients find the built-ins in the first catalog.
+    let seeding_fatal = |error: &anyhow::Error| {
+        error
+            .downcast_ref::<DomainError>()
+            .is_some_and(seeding_is_permanent)
+    };
+    let seeded = retry("templates", RETRY_DELAY, &shutdown, &seeding_fatal, || {
+        let messaging = Arc::clone(&messaging);
+        async move { anyhow::Ok(seed_builtins(&messaging).await?) }
+    })
+    .await;
+    match seeded {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            store.close().await;
+            return finish(health_server).await;
+        }
+        Err(error) => {
+            store.close().await;
+            return Err(error);
+        }
+    }
     let _ = ready.store.set(store.clone());
 
     // Every socket is already listening, so connections wait in the backlog until
     // the corresponding tonic server starts accepting.
-    let messaging = Arc::new(Messaging::new(store.clone(), SystemClock, notifier));
-
     let mut servers = JoinSet::new();
     tracing::info!(addr = %config.grpc_addr, "serving Messaging gRPC");
     servers.spawn(
@@ -150,12 +173,17 @@ pub async fn serve(
                 shutdown.clone().cancelled_owned(),
             ),
     );
-    tracing::info!(addr = %config.directory_grpc_addr, "serving Directory gRPC");
+    tracing::info!(addr = %config.directory_grpc_addr, "serving Directory and Templates gRPC");
+    let directory_token = InternalToken::directory(config.directory_token);
     servers.spawn(
         tonic::transport::Server::builder()
             .add_service(DirectoryServer::with_interceptor(
-                DirectoryApi::new(messaging),
-                InternalToken::directory(config.directory_token),
+                DirectoryApi::new(Arc::clone(&messaging)),
+                directory_token.clone(),
+            ))
+            .add_service(TemplatesServer::with_interceptor(
+                TemplatesApi::new(messaging),
+                directory_token,
             ))
             .serve_with_incoming_shutdown(
                 TcpListenerStream::new(directory),

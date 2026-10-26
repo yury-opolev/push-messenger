@@ -1,0 +1,20 @@
+{
+  "format": "tpl/1",
+  "publisher": "agent",
+  "name": "reply",
+  "version": 1,
+  "title": "Agent reply",
+  "senders": ["agent"],
+  "params": {
+    "title": {"type": "string", "max_len": 120, "optional": true},
+    "text": {"type": "string", "max_len": 4000, "multiline": true},
+    "thinking": {"type": "string", "max_len": 4000, "multiline": true, "optional": true},
+    "steps": {"type": "list", "item": {"type": "step"}, "max_items": 50, "optional": true}
+  },
+  "layout": [
+    {"type": "heading", "param": "title"},
+    {"type": "thinking", "param": "thinking", "label": "Thinking"},
+    {"type": "steps", "param": "steps", "label": "Steps"},
+    {"type": "text", "param": "text"}
+  ]
+}

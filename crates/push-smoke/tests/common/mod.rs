@@ -128,6 +128,10 @@ pub struct Stack {
     /// auth-svc and the gateway behind one origin, routed by path.
     pub public_url: String,
     pub signing_key: &'static str,
+    /// auth-svc's admin listener (only from [`Stack::start_with_admin`]), never behind
+    /// `public_url`, and its bearer token.
+    pub admin_url: Option<String>,
+    pub admin_token: &'static str,
     shutdown: CancellationToken,
     servers: Vec<(&'static str, Server)>,
 }
@@ -139,10 +143,21 @@ const DIRECTORY_TOKEN: &str = "directory-token-for-the-local-smoke-test";
 const MESSAGING_TOKEN: &str = "messaging-token-for-the-local-smoke-test";
 // The worker's token for message-svc's Accounts API.
 const ACCOUNTS_TOKEN: &str = "accounts-token-for-the-local-smoke-test";
+// The bearer token of auth-svc's admin API.
+const ADMIN_TOKEN: &str = "admin-token-for-the-local-smoke-test";
 
 impl Stack {
     /// Starts the four services on `datastores` and waits until each is ready.
     pub async fn start(datastores: Datastores) -> Self {
+        Self::launch(datastores, false).await
+    }
+
+    /// As [`Stack::start`], with auth-svc's admin listener too, accepting connections.
+    pub async fn start_with_admin(datastores: Datastores) -> Self {
+        Self::launch(datastores, true).await
+    }
+
+    async fn launch(datastores: Datastores, with_admin: bool) -> Self {
         let shutdown = CancellationToken::new();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let gateway_addr = listener.local_addr().unwrap();
@@ -152,6 +167,13 @@ impl Stack {
         let auth_health_addr = auth_health.local_addr().unwrap();
         let auth_http_addr = auth_http.local_addr().unwrap();
         let auth_url = format!("http://{auth_http_addr}");
+        // auth-svc binds its admin listener itself: find a free port for it.
+        let admin_addr = with_admin.then(|| {
+            std::net::TcpListener::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+        });
         let grpc = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let accounts = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let directory = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -176,6 +198,12 @@ impl Stack {
             ("PUSH_HTTP_ADDR", &auth_http_addr.to_string()),
             ("PUSH_HEALTH_ADDR", &auth_health_addr.to_string()),
         ]);
+        if let Some(admin_addr) = admin_addr {
+            auth_variables.extend(owned(&[
+                ("PUSH_AUTH_ADMIN_TOKEN", ADMIN_TOKEN),
+                ("PUSH_AUTH_ADMIN_ADDR", &admin_addr.to_string()),
+            ]));
+        }
         auth_variables.extend(datastores.auth);
         let auth_config = push_auth_core::Config::from_lookup(lookup(auth_variables)).unwrap();
         let auth = spawn(push_auth_core::serve(
@@ -258,6 +286,9 @@ impl Stack {
         wait_until_ready("the worker", worker_health_addr, &worker).await;
         wait_until_ready("message-svc", message_svc_health_addr, &message_svc).await;
         wait_until_ready("the gateway", gateway_health_addr, &gateway).await;
+        if let Some(admin_addr) = admin_addr {
+            wait_until_listening("auth-svc's admin listener", admin_addr, &auth).await;
+        }
 
         let router = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let public_url = format!("http://{}", router.local_addr().unwrap());
@@ -268,6 +299,8 @@ impl Stack {
             worker_url,
             public_url,
             signing_key,
+            admin_url: admin_addr.map(|addr| format!("http://{addr}")),
+            admin_token: ADMIN_TOKEN,
             shutdown,
             servers: vec![
                 ("auth-svc", auth),
@@ -395,6 +428,23 @@ async fn wait_until_ready<T: std::fmt::Debug>(
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
     panic!("{name} did not become ready within 60 s");
+}
+
+/// Waits until `addr` accepts connections: auth-svc binds its admin listener after it is
+/// ready. Fails if the server task stops first or after 10 s.
+async fn wait_until_listening<T: std::fmt::Debug>(
+    name: &str,
+    addr: SocketAddr,
+    server: &JoinHandle<T>,
+) {
+    for _ in 0..100 {
+        assert!(!server.is_finished(), "{name}: the server stopped");
+        if TcpStream::connect(addr).await.is_ok() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("{name} did not accept connections within 10 s");
 }
 
 async fn readyz_status(addr: SocketAddr) -> u16 {

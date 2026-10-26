@@ -6,10 +6,19 @@ use crate::ids::{ClientMsgId, ConversationId, DeviceId, MessageId, UserId};
 use crate::model::{ContentType, Entry, EntryKind, Member, SendReceipt};
 use crate::notify::{Event, Notifier};
 use crate::read::group_receipt;
+use crate::rich::check_rich;
 use crate::send::{Append, Prepared};
 use crate::service::{Messaging, current_member_ids};
 use crate::store::{InsertOutcome, Store, Tx};
-use crate::validation::validate_text;
+use crate::templates::{MAX_RICH_BYTES, RichBody, TemplateError};
+use crate::validation::{MAX_TEXT_BYTES, ValidationError, validate_text};
+
+/// The largest edit body of any content type, checked before the target is known.
+const MAX_EDIT_BYTES: usize = if MAX_TEXT_BYTES > MAX_RICH_BYTES {
+    MAX_TEXT_BYTES
+} else {
+    MAX_RICH_BYTES
+};
 
 /// The message an edit or delete changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,7 +29,7 @@ pub enum MessageRef {
     ClientId(ClientMsgId),
 }
 
-/// Replaces the text of a message. `sender` and `device` come from the verified token.
+/// Replaces the body of a message. `sender` and `device` come from the verified token.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EditText {
     pub sender: UserId,
@@ -68,14 +77,29 @@ where
     C: Clock,
     N: Notifier,
 {
-    /// Replaces the text of one of the sender's own messages (spec §4.6).
+    /// Replaces the body of one of the sender's own messages (spec §4.6).
     ///
-    /// The edit is a log entry of its own. In the same transaction the message row takes
-    /// the new text, and the text of any earlier edit entry is erased, so only the current
-    /// version is stored. A retry with the same `client_msg_id` returns the original
-    /// receipt, before any permission or window check.
+    /// The edit is a log entry of its own, of the message's content type. In the same
+    /// transaction the message row takes the new body, and the body of any earlier edit
+    /// entry is erased, so only the current version is stored. A retry with the same
+    /// `client_msg_id` returns the original receipt, before any permission or window check.
+    ///
+    /// The body is checked as the message's content type (spec 2026-10-26,
+    /// "Enforcement"): a text as text; a card as a full RICH body the sender may send now
+    /// (any approved template), unless the card is answered (`CardAnswered`). An answer
+    /// cannot be edited.
     pub async fn edit_text(&self, command: EditText) -> DomainResult<SendReceipt> {
-        validate_text(&command.body)?;
+        // The content type is known only with the target: here only what no type allows.
+        if command.body.is_empty() {
+            return Err(ValidationError::EmptyBody.into());
+        }
+        if command.body.len() > MAX_EDIT_BYTES {
+            return Err(ValidationError::BodyTooLarge {
+                actual: command.body.len(),
+                limit: MAX_EDIT_BYTES,
+            }
+            .into());
+        }
         self.change_message(Change {
             sender: command.sender,
             device: command.device,
@@ -97,6 +121,9 @@ where
     /// erased. A retry with the same `client_msg_id` returns the original receipt; a new
     /// delete of a deleted message fails with `AlreadyDeleted`. If the deleted message held
     /// a group's group-wide positions back, its members get the new ones.
+    ///
+    /// Deleting an answer does not reopen its card: the card keeps its `answer_seq`, so it
+    /// cannot be answered again.
     pub async fn delete_message(&self, command: DeleteMessage) -> DomainResult<SendReceipt> {
         self.change_message(Change {
             sender: command.sender,
@@ -126,6 +153,7 @@ where
                 change.conversation,
                 change.client_msg_id,
                 kind,
+                None,
             )
             .await?;
         let Append {
@@ -142,6 +170,9 @@ where
         };
         let mut target = resolve_target(&mut tx, &member, change.target).await?;
         check_change(&target, change.sender, now, window)?;
+        if let Some(body) = &body {
+            check_edit_body(&mut tx, &target, change.sender, body).await?;
+        }
 
         // Erase older edits first, so the only edit text left is the one inserted below.
         tx.erase_edit_bodies(conversation.id, target.seq).await?;
@@ -154,19 +185,26 @@ where
             target_seq: Some(target.seq),
             sender_id: change.sender,
             sender_device_id: Some(change.device),
-            content_type: ContentType::Text,
+            content_type: target.content_type,
             body: body.clone(),
             client_ts,
             server_ts: now,
             edited_at: None,
             edit_seq: None,
             deleted_at: None,
+            answer_seq: None,
         };
         let receipt = SendReceipt::from(&entry);
         if tx.insert_entry(entry).await? == InsertOutcome::Duplicate {
             tx.rollback().await?;
             return self
-                .replay_append(conversation.id, change.client_msg_id, change.sender, kind)
+                .replay_append(
+                    conversation.id,
+                    change.client_msg_id,
+                    change.sender,
+                    kind,
+                    None,
+                )
                 .await;
         }
 
@@ -205,6 +243,34 @@ async fn resolve_target<T: Tx>(
     found
         .filter(|entry| entry.kind == EntryKind::Message && entry.seq >= caller.visible_from_seq)
         .ok_or(DomainError::TargetNotFound)
+}
+
+/// Checks an edit's new body as the content type of `target`, the sender's own message.
+async fn check_edit_body<T: Tx>(
+    tx: &mut T,
+    target: &Entry,
+    sender: UserId,
+    body: &[u8],
+) -> DomainResult<()> {
+    match target.content_type {
+        ContentType::Text => Ok(validate_text(body)?),
+        ContentType::Rich => {
+            if target.answer_seq.is_some() {
+                return Err(DomainError::CardAnswered);
+            }
+            if body.len() > MAX_RICH_BYTES {
+                return Err(ValidationError::BodyTooLarge {
+                    actual: body.len(),
+                    limit: MAX_RICH_BYTES,
+                }
+                .into());
+            }
+            check_rich(tx, sender, &RichBody::parse(body)?).await
+        }
+        ContentType::Answer => Err(TemplateError("an answer cannot be edited".into()).into()),
+        // Never a message the sender wrote; `resolve_target` does not find one.
+        ContentType::SystemEvent => Err(DomainError::TargetNotFound),
+    }
 }
 
 /// Whether `sender` may still change `target` at `now`.

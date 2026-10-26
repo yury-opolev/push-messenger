@@ -317,6 +317,26 @@ int main(int argc, char **argv) {
     push_string_free(text);
     step("sent a message: messageSent (seq 1), the peer's answer (seq 2), both stored");
 
+    if (push_client_send_rich(client, conversation,
+                              "{\"tpl\":\"agent.approval@1\",\"params\":{},\"fallback\":\"Deploy?\"}",
+                              &text, &error) != PUSH_OK)
+        fail("send a card", error);
+    if (!strstr(text, "\"kind\":\"rich\"")) fail("the card's local echo", NULL);
+    push_string_free(text);
+    expect_code("a card that is not a RICH body",
+                push_client_send_rich(client, conversation, "hello", &text, &error), &error,
+                "invalid");
+    error = NULL;
+    expect_code("an answer to a message that is not a card held",
+                push_client_send_answer(
+                    client, conversation,
+                    "{\"card\":\"0199e1c2-0000-7000-8000-0000000000aa\",\"values\":[\"approve\"],"
+                    "\"fallback\":\"Approved\"}",
+                    &text, &error),
+                &error, "invalid");
+    error = NULL;
+    step("sent a card; an invalid card and an answer to no card were refused");
+
     expect_code("a send to an unknown conversation",
                 push_client_send(client, "0199e1c2-0000-7000-8000-0000000000ff", "x", &text, &error),
                 &error, "invalid");

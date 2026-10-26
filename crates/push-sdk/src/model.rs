@@ -110,6 +110,43 @@ pub enum MessageKind {
     Text,
     /// A system entry: its body is a small JSON document (spec §6).
     System,
+    /// A card from an approved template: its body is JSON
+    /// `{"tpl", "params", "fallback"}` (docs/rich-messages.md).
+    Rich,
+    /// An answer to a card in the same conversation: its body is JSON
+    /// `{"card", "values", "fallback"}`.
+    Answer,
+}
+
+impl MessageKind {
+    /// The wire's content type number, as the store keeps it.
+    pub(crate) fn code(self) -> i64 {
+        match self {
+            Self::Text => 1,
+            Self::System => 2,
+            Self::Rich => 3,
+            Self::Answer => 4,
+        }
+    }
+
+    /// Any other number is text, as older SDKs stored unknown content types.
+    pub(crate) fn from_code(code: i64) -> Self {
+        match code {
+            2 => Self::System,
+            3 => Self::Rich,
+            4 => Self::Answer,
+            _ => Self::Text,
+        }
+    }
+
+    pub(crate) fn content_type(self) -> v1::ContentType {
+        match self {
+            Self::Text => v1::ContentType::Text,
+            Self::System => v1::ContentType::SystemEvent,
+            Self::Rich => v1::ContentType::Rich,
+            Self::Answer => v1::ContentType::Answer,
+        }
+    }
 }
 
 /// Where one of the user's own messages stands (spec §4.4). Others' messages are
@@ -147,6 +184,11 @@ pub struct Message {
     pub edited_at: Option<i64>,
     pub deleted: bool,
     pub status: MessageStatus,
+    /// Cards ([`MessageKind::Rich`]): the `seq` of the answer that closed the card, once
+    /// answered. An answered card cannot be edited or answered again.
+    pub answer_seq: Option<i64>,
+    /// Answers ([`MessageKind::Answer`]): the `seq` of the card they answer, once known.
+    pub card_seq: Option<i64>,
 }
 
 impl std::fmt::Debug for Message {
@@ -165,6 +207,8 @@ impl std::fmt::Debug for Message {
             .field("edited_at", &self.edited_at)
             .field("deleted", &self.deleted)
             .field("status", &self.status)
+            .field("answer_seq", &self.answer_seq)
+            .field("card_seq", &self.card_seq)
             .finish()
     }
 }

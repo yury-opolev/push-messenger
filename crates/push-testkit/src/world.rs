@@ -5,9 +5,9 @@ use std::sync::Arc;
 
 use chrono::{TimeZone, Utc};
 use push_domain::{
-    ClientMsgId, Clock, Conversation, ConversationId, DeleteMessage, DeviceId, DomainResult,
-    EditText, Entry, Event, ManualClock, Member, MessageRef, Messaging, Policy, RecordingNotifier,
-    SendReceipt, SendText, Store, SystemEvent, Tx, UserId,
+    ClientMsgId, Clock, ContentType, Conversation, ConversationId, DeleteMessage, DeviceId,
+    DomainResult, EditText, Entry, Event, ManualClock, Member, MessageId, MessageRef, Messaging,
+    Policy, RecordingNotifier, SendMessage, SendReceipt, SendText, Store, SystemEvent, Tx, UserId,
 };
 
 use crate::Backend;
@@ -114,6 +114,26 @@ impl<S: Store + Clone> World<S> {
         person
     }
 
+    /// Registers a verified user with one device, enrolled as `owner`'s agent: an
+    /// accepted contact of the owner, and an agent to the templates' sender rules.
+    pub async fn agent(&self, owner: &Person) -> Person {
+        let agent = self.person().await;
+        self.svc.enroll_agent(owner.user, agent.user).await.unwrap();
+        agent
+    }
+
+    /// The entry with this message id, read straight from the store.
+    pub async fn entry(&self, conversation: ConversationId, message: MessageId) -> Entry {
+        let mut tx = self.store.begin().await.unwrap();
+        let entry = tx
+            .entry_by_message_id(conversation, message)
+            .await
+            .unwrap()
+            .unwrap();
+        tx.rollback().await.unwrap();
+        entry
+    }
+
     /// Registers another device for an existing person.
     pub async fn add_device(&self, person: &Person) -> DeviceId {
         let device = DeviceId::new();
@@ -202,6 +222,24 @@ pub fn edit(
         conversation,
         client_msg_id: ClientMsgId::new(),
         target,
+        body: body.as_bytes().to_vec(),
+        client_ts: None,
+    }
+}
+
+/// A send command of any content type with a fresh client message id.
+pub fn message(
+    from: &Person,
+    conversation: ConversationId,
+    content_type: ContentType,
+    body: &str,
+) -> SendMessage {
+    SendMessage {
+        sender: from.user,
+        device: from.device,
+        conversation,
+        client_msg_id: ClientMsgId::new(),
+        content_type,
         body: body.as_bytes().to_vec(),
         client_ts: None,
     }

@@ -1,7 +1,7 @@
 //! The whole service on real Postgres and Redis (Docker must be running): readiness, the
 //! worker's account events (a revocation kicks the device on Redis), a send that rings the
-//! recipient's Redis channel, sync, ack, the client's requests, auth-svc's Directory, and
-//! graceful shutdown.
+//! recipient's Redis channel, sync, ack, the client's requests, auth-svc's Directory and
+//! Templates (with the built-ins seeded at startup), and graceful shutdown.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -11,9 +11,10 @@ use push_message_svc::{Config, Listeners, serve};
 use push_proto::internal::v1::accounts_client::AccountsClient;
 use push_proto::internal::v1::directory_client::DirectoryClient;
 use push_proto::internal::v1::messaging_client::MessagingClient;
+use push_proto::internal::v1::templates_client::TemplatesClient;
 use push_proto::internal::v1::{
-    AccountDevice, AckRequest, EditRequest, IdentifyRequest, Kick, KickReason, Notification,
-    ReadUpToRequest, RequestCall, SendRequest, SyncRequest, VisibleUsersRequest,
+    AccountDevice, AckRequest, CatalogRequest, EditRequest, IdentifyRequest, Kick, KickReason,
+    Notification, ReadUpToRequest, RequestCall, SendRequest, SyncRequest, VisibleUsersRequest,
     notification::Kind,
 };
 use push_proto::v1::{
@@ -174,6 +175,20 @@ async fn each_listener_serves_only_its_own_api() {
                 .await
                 .unwrap_err();
             statuses.push((own_api, "Messaging", status.code()));
+        }
+        if own_api != "Directory" {
+            let mut request = Request::new(CatalogRequest::default());
+            request.metadata_mut().insert(
+                "authorization",
+                format!("Bearer {DIRECTORY_TOKEN}").parse().unwrap(),
+            );
+            let status = TemplatesClient::connect(url.clone())
+                .await
+                .unwrap()
+                .catalog(request)
+                .await
+                .unwrap_err();
+            statuses.push((own_api, "Templates", status.code()));
         }
         if own_api != "Directory" {
             let mut request = Request::new(VisibleUsersRequest::default());
@@ -664,6 +679,72 @@ async fn the_client_requests_and_the_directory_run_on_postgres() {
     let mut expected = vec![id_bytes(alice), id_bytes(bob)];
     expected.sort();
     assert_eq!(visible.user_ids, expected);
+
+    running.shutdown.cancel();
+    running.server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn templates_are_seeded_at_startup_and_served_only_with_auth_svcs_token() {
+    let running = start().await;
+    let channel = Channel::from_shared(format!("http://{}", running.directory))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let status = TemplatesClient::new(channel.clone())
+        .catalog(CatalogRequest::default())
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::Unauthenticated);
+    let bearer: MetadataValue<_> = format!("Bearer {MESSAGING_TOKEN}").parse().unwrap();
+    let status =
+        TemplatesClient::with_interceptor(channel.clone(), move |mut request: Request<()>| {
+            request
+                .metadata_mut()
+                .insert("authorization", bearer.clone());
+            Ok(request)
+        })
+        .catalog(CatalogRequest::default())
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::Unauthenticated);
+
+    let bearer: MetadataValue<_> = format!("Bearer {DIRECTORY_TOKEN}").parse().unwrap();
+    let mut templates =
+        TemplatesClient::with_interceptor(channel, move |mut request: Request<()>| {
+            request
+                .metadata_mut()
+                .insert("authorization", bearer.clone());
+            Ok(request)
+        });
+    let catalog = templates
+        .catalog(CatalogRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    let mut refs: Vec<&str> = catalog
+        .entries
+        .iter()
+        .map(|entry| entry.template_ref.as_str())
+        .collect();
+    refs.sort();
+    assert_eq!(
+        refs,
+        [
+            "agent.approval@1",
+            "agent.plan@1",
+            "agent.question@1",
+            "agent.reply@1"
+        ]
+    );
+    assert_eq!(catalog.seq, 4);
+    assert!(
+        catalog
+            .entries
+            .iter()
+            .all(|entry| entry.definition.is_some())
+    );
 
     running.shutdown.cancel();
     running.server.await.unwrap().unwrap();

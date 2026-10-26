@@ -108,6 +108,10 @@ enum ContentType {
   CONTENT_TYPE_UNSPECIFIED = 0;
   CONTENT_TYPE_TEXT = 1;
   CONTENT_TYPE_SYSTEM_EVENT = 2;
+  // A card from an approved template (docs/rich-messages.md): JSON {tpl, params, fallback}.
+  CONTENT_TYPE_RICH = 3;
+  // An answer to a card in the same conversation: JSON {card, values, fallback}.
+  CONTENT_TYPE_ANSWER = 4;
 }
 
 enum EntryKind {
@@ -146,6 +150,7 @@ message Deliver {
   bytes client_msg_id = 4;
   EntryKind kind = 5;
   // Edit and delete entries: the seq of the message they change (as the log stores it).
+  // Answer messages: the seq of the card they answer.
   optional int64 target_seq = 6;
   bytes sender_id = 7;
   ContentType content_type = 8;
@@ -156,6 +161,9 @@ message Deliver {
   optional int64 edited_at = 12;
   optional int64 edit_seq = 13;
   bool deleted = 14;
+  // Cards (RICH messages with a button or choice block): the seq of the first valid
+  // answer, once answered. Later answers are refused.
+  optional int64 answer_seq = 19;
   // 16 ephemeral, 17 urgent, 18 attachments (media).
   reserved 16, 17, 18;
   reserved "ephemeral", "urgent", "attachments";

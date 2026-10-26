@@ -451,5 +451,6 @@ fn system_entry(
         edited_at: None,
         edit_seq: None,
         deleted_at: None,
+        answer_seq: None,
     }
 }

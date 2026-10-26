@@ -2,7 +2,8 @@
 //! the outbox with their `client_msg_id` and sent once connected, in order; read positions
 //! move at once and are sent too.
 
-use push_domain::{ClientMsgId, ConversationId, UserId, validate_text};
+use push_domain::templates::{AnswerBody, RichBody};
+use push_domain::{ClientMsgId, ConversationId, MessageId, UserId, validate_text};
 
 use super::{Client, EDIT_WINDOW};
 use crate::SdkError;
@@ -27,13 +28,84 @@ impl Client {
     /// local echo is returned and reported as [`Event::MessageAdded`].
     pub fn send(&self, conversation: ConversationId, text: &str) -> Result<Message, SdkError> {
         validate_text(text.as_bytes()).map_err(|error| SdkError::Invalid(error.to_string()))?;
+        self.queue(conversation, MessageKind::Text, text, None)
+    }
+
+    /// Queues a card (spec "Clients and the SDK"): a RICH body
+    /// `{"tpl", "params", "fallback"}`. Only its envelope is checked here; the server
+    /// checks the params against the approved template and may still refuse it
+    /// ([`Event::SendFailed`]). Queued and reported as [`Client::send`] does.
+    pub fn send_rich(&self, conversation: ConversationId, body: &str) -> Result<Message, SdkError> {
+        RichBody::parse(body.as_bytes()).map_err(|error| SdkError::Invalid(error.to_string()))?;
+        self.queue(conversation, MessageKind::Rich, body, None)
+    }
+
+    /// Queues an answer to a card: an ANSWER body `{"card", "values", "fallback"}` naming
+    /// the card's server id. The card must be held in `conversation`: a live card from
+    /// someone else, not answered yet. The server checks the values against the card.
+    pub fn send_answer(
+        &self,
+        conversation: ConversationId,
+        body: &str,
+    ) -> Result<Message, SdkError> {
+        let answer = AnswerBody::parse(body.as_bytes())
+            .map_err(|error| SdkError::Invalid(error.to_string()))?;
+        let me = self.me()?;
+        let card = self
+            .inner
+            .shared
+            .store()
+            .message_by_id(conversation, MessageId(answer.card))?
+            .ok_or_else(|| SdkError::Invalid("no such card".to_owned()))?;
+        if card.kind != MessageKind::Rich || card.deleted {
+            return Err(SdkError::Invalid("the target is not a card".to_owned()));
+        }
+        if card.sender_id == me {
+            return Err(SdkError::Invalid(
+                "the user cannot answer their own card".to_owned(),
+            ));
+        }
+        if card.answer_seq.is_some() {
+            return Err(SdkError::Invalid("the card is already answered".to_owned()));
+        }
+        let waiting = card
+            .seq
+            .map(|seq| {
+                self.inner
+                    .shared
+                    .store()
+                    .has_unsent_answer(conversation, seq)
+            })
+            .transpose()?;
+        if waiting == Some(true) {
+            return Err(SdkError::Invalid(
+                "the card already has an answer waiting to be sent".to_owned(),
+            ));
+        }
+        self.queue(conversation, MessageKind::Answer, body, card.seq)
+    }
+
+    fn queue(
+        &self,
+        conversation: ConversationId,
+        kind: MessageKind,
+        body: &str,
+        card_seq: Option<i64>,
+    ) -> Result<Message, SdkError> {
         self.me()?;
         let message = {
             let mut store = self.inner.shared.store();
             if store.conversation(conversation)?.is_none() {
                 return Err(SdkError::Invalid("no such conversation".to_owned()));
             }
-            store.queue_send(conversation, ClientMsgId::new(), text, unix_ms() * 1000)?
+            store.queue_content(
+                conversation,
+                ClientMsgId::new(),
+                kind,
+                body,
+                card_seq,
+                unix_ms() * 1000,
+            )?
         };
         self.inner.shared.emit(Event::MessageAdded(message.clone()));
         self.wake();
@@ -59,8 +131,10 @@ impl Client {
         if message.deleted {
             return Err(SdkError::Invalid("the message is deleted".to_owned()));
         }
-        if message.kind != MessageKind::Text {
-            return Err(SdkError::Invalid("not a text message".to_owned()));
+        if message.kind == MessageKind::System {
+            return Err(SdkError::Invalid(
+                "a system entry cannot be changed".to_owned(),
+            ));
         }
         let window = i64::try_from(EDIT_WINDOW.as_micros()).unwrap_or(i64::MAX);
         if message
@@ -74,18 +148,31 @@ impl Client {
         Ok(message)
     }
 
-    /// Changes the text of one of the user's messages. A message still waiting in the
-    /// outbox is changed in place; otherwise the edit is queued (after the message, if it
-    /// is being sent) and applied locally when the server acknowledges it. The id of the
-    /// outbox entry that carries the change.
+    /// Changes the text of one of the user's messages, or replaces a card with a new RICH
+    /// body (an answered card cannot change; an answer never can). A message still
+    /// waiting in the outbox is changed in place; otherwise the edit is queued (after the
+    /// message, if it is being sent) and applied locally when the server acknowledges it.
+    /// The id of the outbox entry that carries the change.
     pub fn edit(
         &self,
         conversation: ConversationId,
         target: ClientMsgId,
         text: &str,
     ) -> Result<ClientMsgId, SdkError> {
-        validate_text(text.as_bytes()).map_err(|error| SdkError::Invalid(error.to_string()))?;
         let message = self.own_target(conversation, target)?;
+        let checked = match message.kind {
+            MessageKind::Text | MessageKind::System => {
+                validate_text(text.as_bytes()).map_err(|error| error.to_string())
+            }
+            MessageKind::Rich if message.answer_seq.is_some() => {
+                Err("an answered card cannot be edited".to_owned())
+            }
+            MessageKind::Rich => RichBody::parse(text.as_bytes())
+                .map(drop)
+                .map_err(|error| error.to_string()),
+            MessageKind::Answer => Err("an answer cannot be edited".to_owned()),
+        };
+        checked.map_err(SdkError::Invalid)?;
         let mut parent = None;
         if message.seq.is_none() {
             let edited = self.inner.shared.store().edit_unsent(target, text)?;
@@ -192,14 +279,14 @@ impl Client {
 mod tests {
     use std::time::Duration;
 
-    use push_proto::v1::{self, EntryKind, frame::Body};
+    use push_proto::v1::{self, Deliver, EntryKind, frame::Body};
     use uuid::Uuid;
 
     use super::*;
     use crate::client::tests::{Fixture, open};
     use crate::model::MessageStatus;
     use crate::store::bytes;
-    use crate::store::tests::entry;
+    use crate::store::tests::{CARD, answer_entry, card_entry, entry};
     use crate::testing::{recv_until, send};
 
     fn invalid<T>(result: Result<T, SdkError>) -> bool {
@@ -245,6 +332,130 @@ mod tests {
             old.client_msg_id,
             "too late"
         )));
+    }
+
+    #[tokio::test]
+    async fn cards_and_answers_are_checked_and_queued_with_their_content_type() {
+        let f = Fixture::new().await;
+        let (conversation, peer) = f.conversation();
+        let me = f.client.me().unwrap();
+        let store = || f.client.inner.shared.store();
+        let content_type = |id: ClientMsgId| {
+            let Body::Send(sent) = store().outbox_row(id).unwrap().unwrap().frame() else {
+                unreachable!("a send");
+            };
+            sent.content_type()
+        };
+        let answer_to = |card: &Deliver| {
+            let card = Uuid::from_slice(&card.message_id).unwrap();
+            format!(r#"{{"card":"{card}","values":["approve"],"fallback":"Approved"}}"#)
+        };
+
+        assert!(invalid(f.client.send_rich(conversation, "not json")));
+        assert!(invalid(f.client.send_rich(
+            conversation,
+            r#"{"tpl":"agent.approval@1","params":{},"fallback":"x","extra":1}"#
+        )));
+        assert!(invalid(f.client.send_answer(conversation, "{}")));
+        assert!(store().outbox().unwrap().is_empty());
+        let card = f.client.send_rich(conversation, CARD).unwrap();
+        assert_eq!(card.kind, MessageKind::Rich);
+        assert_eq!(content_type(card.client_msg_id), v1::ContentType::Rich);
+
+        // Answers go only to a held, live card from someone else that is still open.
+        let text = entry(conversation, peer, 1, EntryKind::Message);
+        store().apply_deliver(&text).unwrap();
+        assert!(invalid(
+            f.client.send_answer(conversation, &answer_to(&text))
+        ));
+        let own = card_entry(conversation, me, 2);
+        store().apply_deliver(&own).unwrap();
+        assert!(invalid(
+            f.client.send_answer(conversation, &answer_to(&own))
+        ));
+        let theirs = card_entry(conversation, peer, 3);
+        assert!(invalid(
+            f.client.send_answer(conversation, &answer_to(&theirs))
+        ));
+        store().apply_deliver(&theirs).unwrap();
+        assert!(invalid(
+            f.client
+                .send_answer(ConversationId::new(), &answer_to(&theirs))
+        ));
+        let answer = f
+            .client
+            .send_answer(conversation, &answer_to(&theirs))
+            .unwrap();
+        assert_eq!(
+            (answer.kind, answer.card_seq),
+            (MessageKind::Answer, Some(3))
+        );
+        assert_eq!(content_type(answer.client_msg_id), v1::ContentType::Answer);
+        let closing = answer_entry(conversation, me, 4, &theirs);
+        store().apply_deliver(&closing).unwrap();
+        let closing = store().message_at(conversation, 4).unwrap().unwrap();
+        store().mark_answered(&closing).unwrap().unwrap();
+        assert!(invalid(
+            f.client.send_answer(conversation, &answer_to(&theirs))
+        ));
+
+        // An answer never changes; a card takes only a RICH body, until it is answered.
+        assert!(invalid(f.client.edit(
+            conversation,
+            answer.client_msg_id,
+            &answer_to(&theirs)
+        )));
+        assert!(invalid(f.client.edit(
+            conversation,
+            card.client_msg_id,
+            "plain"
+        )));
+        let changed = CARD.replace("Deploy?", "Deploy now?");
+        assert_eq!(
+            f.client
+                .edit(conversation, card.client_msg_id, &changed)
+                .unwrap(),
+            card.client_msg_id
+        );
+        let mut answered = card_entry(conversation, me, 5);
+        answered.server_ts = unix_ms() * 1000;
+        answered.answer_seq = Some(6);
+        store().apply_deliver(&answered).unwrap();
+        let answered = store().message_at(conversation, 5).unwrap().unwrap();
+        assert!(invalid(f.client.edit(
+            conversation,
+            answered.client_msg_id,
+            &changed
+        )));
+        assert!(
+            f.client
+                .delete(conversation, answered.client_msg_id)
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_card_takes_one_answer_waiting_to_be_sent() {
+        let f = Fixture::new().await;
+        let (conversation, peer) = f.conversation();
+        let store = || f.client.inner.shared.store();
+        let card = card_entry(conversation, peer, 1);
+        store().apply_deliver(&card).unwrap();
+        let card = Uuid::from_slice(&card.message_id).unwrap();
+        let body = format!(r#"{{"card":"{card}","values":["approve"],"fallback":"Approved"}}"#);
+
+        let first = f.client.send_answer(conversation, &body).unwrap();
+        match f.client.send_answer(conversation, &body) {
+            Err(SdkError::Invalid(reason)) => {
+                assert_eq!(reason, "the card already has an answer waiting to be sent")
+            }
+            other => panic!("a second answer was not refused: {other:?}"),
+        }
+        assert_eq!(store().outbox().unwrap().len(), 1);
+
+        // Once the waiting answer is taken back, the card can be answered again.
+        assert!(f.client.cancel(conversation, first.client_msg_id).unwrap());
+        assert!(f.client.send_answer(conversation, &body).is_ok());
     }
 
     #[tokio::test]

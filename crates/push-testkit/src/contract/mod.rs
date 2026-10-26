@@ -16,6 +16,7 @@ mod conversations;
 mod entries;
 mod overviews;
 mod positions;
+mod templates;
 mod transactions;
 mod users;
 
@@ -28,6 +29,7 @@ pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
         ("contract::entries", entries::cases()),
         ("contract::positions", positions::cases()),
         ("contract::overviews", overviews::cases()),
+        ("contract::templates", templates::cases()),
     ];
     modules
         .into_iter()
@@ -71,6 +73,7 @@ fn entry(conversation: ConversationId, seq: i64, client_msg_id: ClientMsgId) -> 
         edited_at: None,
         edit_seq: None,
         deleted_at: None,
+        answer_seq: None,
     }
 }
 
