@@ -191,6 +191,27 @@ impl Ran {
     }
 }
 
+/// How a bounded lease script ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Outcome {
+    /// Redis answered.
+    Answered(Ran),
+    /// It failed or timed out, possibly after the script ran on Redis (cancelling a sent
+    /// command does not undo it), so a transition may have been lost.
+    Unknown,
+}
+
+impl Outcome {
+    /// Whether an UP or SETTLE outcome is to be announced: a transition, or a doubt, as
+    /// announcing is idempotent and a lost transition would never be announced again.
+    fn announces(self) -> bool {
+        match self {
+            Self::Answered(ran) => ran.transition(),
+            Self::Unknown => true,
+        }
+    }
+}
+
 /// The three lease scripts on the gateway's Redis connection.
 struct Leases {
     redis: ConnectionManager,
@@ -273,8 +294,9 @@ pub(crate) struct PresenceGuard {
 
 /// Starts tracking a connection's presence: `up` now and every 30 s, and, once the
 /// returned guard is dropped, `down`, then after the grace `settle` (skipped on shutdown).
-/// Transitions call `Messaging.AnnouncePresence`. Redis or message-svc failures are
-/// logged and ignored (fail open; the connection is never affected).
+/// Transitions call `Messaging.AnnouncePresence`, as does an `up` or `settle` whose
+/// outcome is unknown. Redis or message-svc failures are logged and otherwise ignored
+/// (fail open; the connection is never affected).
 pub(crate) fn track(context: PresenceContext, user: Uuid, connection: Uuid) -> PresenceGuard {
     let closed = CancellationToken::new();
     let tasks = context.tasks.clone();
@@ -288,10 +310,11 @@ pub(crate) fn track(context: PresenceContext, user: Uuid, connection: Uuid) -> P
 async fn run(context: PresenceContext, user: Uuid, connection: Uuid, closed: CancellationToken) {
     loop {
         let up = context.leases.up(user, connection, LEASE);
-        if let Some(ran) = bounded(up, user, "renew a presence lease").await {
-            if ran.transition() {
-                announce(&context, user).await;
-            }
+        if bounded(up, user, "renew a presence lease")
+            .await
+            .announces()
+        {
+            announce(&context, user).await;
         }
         tokio::select! {
             () = closed.cancelled() => break,
@@ -307,28 +330,26 @@ async fn run(context: PresenceContext, user: Uuid, connection: Uuid, closed: Can
         () = tokio::time::sleep(context.grace + SETTLE_MARGIN) => {}
     }
     let settle = context.leases.settle(user);
-    if let Some(ran) = bounded(settle, user, "settle presence").await {
-        if ran.transition() {
-            announce(&context, user).await;
-        }
+    if bounded(settle, user, "settle presence").await.announces() {
+        announce(&context, user).await;
     }
 }
 
-/// A lease script's answer, or `None` when it failed or took too long (logged).
+/// How a lease script ended; a failure or timeout is logged and its outcome unknown.
 async fn bounded(
     script: impl Future<Output = RedisResult<Ran>>,
     user: Uuid,
     what: &str,
-) -> Option<Ran> {
+) -> Outcome {
     match tokio::time::timeout(REDIS_TIMEOUT, script).await {
-        Ok(Ok(ran)) => Some(ran),
+        Ok(Ok(ran)) => Outcome::Answered(ran),
         Ok(Err(error)) => {
             tracing::warn!(%error, %user, "could not {what}");
-            None
+            Outcome::Unknown
         }
         Err(_) => {
             tracing::warn!(%user, "could not {what}: timed out");
-            None
+            Outcome::Unknown
         }
     }
 }
@@ -462,5 +483,29 @@ mod tests {
         assert!(ran(1, false));
         assert!(!ran(0, false));
         assert!(ran(0, true));
+    }
+
+    #[test]
+    fn an_unknown_outcome_announces() {
+        let answered = |value, retried| Outcome::Answered(Ran { value, retried }).announces();
+        assert!(answered(1, false));
+        assert!(!answered(0, false));
+        assert!(answered(0, true));
+        assert!(Outcome::Unknown.announces());
+    }
+
+    /// A script that never answers in time is unknown, even though it may have run.
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_out_script_is_unknown() {
+        let never = std::future::pending::<RedisResult<Ran>>();
+        assert_eq!(
+            bounded(never, Uuid::now_v7(), "test").await,
+            Outcome::Unknown
+        );
+        let failed = async { Err(redis::RedisError::from((ErrorKind::Io, "closed"))) };
+        assert_eq!(
+            bounded(failed, Uuid::now_v7(), "test").await,
+            Outcome::Unknown
+        );
     }
 }
