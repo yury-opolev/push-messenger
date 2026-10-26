@@ -11,8 +11,8 @@
 //!
 //! On `notify:{user_id}`, `EntriesAvailable` rings every connection of the user (rings
 //! coalesce: a busy connection syncs once more afterwards, not once per ring), and receipts,
-//! read positions and contact changes are forwarded to each as server frames. On
-//! `kick:{device_id}`, the connections of the device are told to close, with two
+//! read positions, contact changes, activity and presence are forwarded to each as server
+//! frames. On `kick:{device_id}`, the connections of the device are told to close, with two
 //! exceptions:
 //!
 //! - a takeover closes only connections older than the newcomer it names. Connection ids
@@ -42,7 +42,9 @@ use push_proto::internal::v1::{
     notification::Kind, receipt_changed,
 };
 use push_proto::v1::frame::Body;
-use push_proto::v1::{self, ContactEvent, GroupReceipts, ReadPosition, Receipt, receipt};
+use push_proto::v1::{
+    self, ContactEvent, GroupReceipts, PresenceEvent, ReadPosition, Receipt, receipt,
+};
 use push_proto::{id, kick_channel, notify_channel};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -359,6 +361,10 @@ fn server_frame(kind: Kind) -> Option<Body> {
         }) => Body::ReadPosition(ReadPosition {
             conversation_id,
             read_seq,
+        }),
+        Kind::ActivityChanged(event) => Body::ActivityEvent(event),
+        Kind::PresenceChanged(presence) => Body::PresenceEvent(PresenceEvent {
+            presence: Some(presence),
         }),
     })
 }
@@ -892,6 +898,42 @@ mod tests {
             Body::ContactEvent(ContactEvent {
                 user_id: id_bytes(peer),
                 state: v1::ContactState::Accepted.into(),
+            }),
+        ];
+        for frame in frames {
+            assert_eq!(pending(&mut session), Some(Signal::Frame(Box::new(frame))));
+        }
+        assert_eq!(pending(&mut session), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn activity_and_presence_changes_become_their_server_frames() {
+        let (hub, _commands) = hub();
+        let (user, peer) = (Uuid::now_v7(), Uuid::now_v7());
+        let (mut session, _, _) = connection(&hub, user).await;
+        let activity = v1::ActivityEvent {
+            conversation_id: id_bytes(Uuid::now_v7()),
+            user_id: id_bytes(peer),
+            state: v1::ActivityState::Working.into(),
+            label: Some("running tests".into()),
+            ttl_ms: 30_000,
+        };
+        let presence = v1::Presence {
+            user_id: id_bytes(peer),
+            state: v1::PresenceState::Offline.into(),
+            last_seen: Some(1_793_000_040_000_000),
+        };
+        for kind in [
+            Kind::ActivityChanged(activity.clone()),
+            Kind::PresenceChanged(presence.clone()),
+        ] {
+            let payload = Notification { kind: Some(kind) }.encode_to_vec();
+            hub.dispatch(&notify_channel(user), &payload);
+        }
+        let frames = [
+            Body::ActivityEvent(activity),
+            Body::PresenceEvent(PresenceEvent {
+                presence: Some(presence),
             }),
         ];
         for frame in frames {

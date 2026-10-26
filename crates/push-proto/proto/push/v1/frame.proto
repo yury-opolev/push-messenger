@@ -8,7 +8,9 @@
 //
 // Field numbers set aside for features the spec reserves (§7) are `reserved` below:
 // ephemeral and urgent messages, media attachments, and private reads. A later plan
-// removes the `reserved` line when it adds the field, keeping the number.
+// removes the `reserved` line when it adds the field, keeping the number. Activity and
+// presence are frames of their own, not the reserved `ephemeral` field, which stays
+// reserved for ephemeral (disappearing) messages.
 
 syntax = "proto3";
 
@@ -26,6 +28,7 @@ message Frame {
     Delete delete = 7;
     ReadUpTo read_up_to = 8;
     Request request = 9;
+    Activity activity = 10;
 
     // Server to client (spec §7.2).
     Ready ready = 32;
@@ -38,8 +41,10 @@ message Frame {
     ReadPosition read_position = 39;
     ContactEvent contact_event = 40;
     AuthExpiring auth_expiring = 41;
+    ActivityEvent activity_event = 42;
+    PresenceEvent presence_event = 43;
   }
-  // 10-31 are free for later client frames, 42-63 for later server frames.
+  // 11-31 are free for later client frames, 44-63 for later server frames.
 }
 
 // Must be the first frame, within 5 seconds of connecting. The gateway learns the user
@@ -104,6 +109,79 @@ message ContactEvent {
   ContactState state = 2;
 }
 
+// What the sender is doing in a conversation (docs/activity-presence.md). Not stored.
+// The other current members' connected devices hear it as ActivityEvent; it lasts 30 s
+// unless sent again, and idle ends it at once. At most one per second per device is fanned
+// out: extra frames are not refused, the latest one per conversation waits for its turn.
+// Nothing answers a good one; a refused one is answered with an Error without ids that is
+// never retryable.
+message Activity {
+  bytes conversation_id = 1;
+  ActivityState state = 2;
+  // Plain text, 1 to 60 characters, no control, invisible or bidi characters; shown
+  // inert (never linkified). Ignored for idle. Empty means none.
+  optional string label = 3;
+}
+
+enum ActivityState {
+  ACTIVITY_STATE_UNSPECIFIED = 0;
+  ACTIVITY_STATE_TYPING = 1;
+  ACTIVITY_STATE_WORKING = 2;
+  ACTIVITY_STATE_WAITING = 3;
+  ACTIVITY_STATE_IDLE = 4;
+}
+
+// Another member's activity in a conversation. Expire it ttl_ms after receiving it
+// (measured on the client's own clock); a newer event from the same user and conversation
+// replaces it. Idle has ttl_ms 0: clear at once.
+message ActivityEvent {
+  bytes conversation_id = 1;
+  bytes user_id = 2;
+  ActivityState state = 3;
+  optional string label = 4;
+  uint32 ttl_ms = 5;
+}
+
+enum PresenceState {
+  // Not visible: not an accepted contact, blocked, either side switched presence off, or
+  // no such user. These cases are indistinguishable on purpose.
+  PRESENCE_STATE_UNKNOWN = 0;
+  // At least one device of the user is connected.
+  PRESENCE_STATE_ONLINE = 1;
+  PRESENCE_STATE_OFFLINE = 2;
+}
+
+message Presence {
+  bytes user_id = 1;
+  PresenceState state = 2;
+  // OFFLINE only, when known: the minute the user was last online (microseconds since
+  // the Unix epoch, a whole minute).
+  optional int64 last_seen = 3;
+}
+
+// A contact's presence changed (or became visible or invisible).
+message PresenceEvent {
+  Presence presence = 1;
+}
+
+// The presence of up to 100 users; one Presence per distinct id, in request order.
+message GetPresence {
+  repeated bytes user_ids = 1;
+}
+
+message PresenceList {
+  repeated Presence presences = 1;
+}
+
+// Switches the caller's presence sharing. Off: contacts see UNKNOWN, and the caller sees
+// UNKNOWN for everyone else too. Without share it only reads the setting.
+message SetPresenceSharing {
+  optional bool share = 1;
+}
+
+message PresenceSharing {
+  bool share = 1;
+}
 enum ContentType {
   CONTENT_TYPE_UNSPECIFIED = 0;
   CONTENT_TYPE_TEXT = 1;
@@ -231,6 +309,8 @@ message Request {
     LeaveGroup leave_group = 17;
     RenameGroup rename_group = 18;
     SetRole set_role = 19;
+    GetPresence get_presence = 20;
+    SetPresenceSharing set_presence_sharing = 21;
   }
 }
 
@@ -249,6 +329,8 @@ message Response {
     // A request that answers nothing but success.
     Done done = 9;
     GroupCreated group_created = 10;
+    PresenceList presences = 11;
+    PresenceSharing presence_sharing = 12;
   }
 }
 

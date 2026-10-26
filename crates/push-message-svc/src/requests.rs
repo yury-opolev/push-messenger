@@ -289,6 +289,10 @@ async fn answer<S: Store, C: Clock, N: Notifier>(
                     .await,
             )?
         }
+        // Presence lands with the presence domain; until then these are refused.
+        request::Body::GetPresence(_) | request::Body::SetPresenceSharing(_) => {
+            return Err(invalid("not supported yet"));
+        }
     })
 }
 

@@ -15,7 +15,8 @@ use push_message_svc::{InternalToken, MessagingApi, RedisNotifier};
 use push_proto::internal::v1::messaging_client::MessagingClient;
 use push_proto::internal::v1::messaging_server::{self, MessagingServer};
 use push_proto::internal::v1::{
-    AckRequest, AckResponse, DeleteRequest, EditRequest, IdentifyRequest, IdentifyResponse,
+    AckRequest, AckResponse, ActivityRequest, ActivityResponse, AnnouncePresenceRequest,
+    AnnouncePresenceResponse, DeleteRequest, EditRequest, IdentifyRequest, IdentifyResponse,
     ReadUpToRequest, ReadUpToResponse, RequestCall, SendRequest, SyncRequest, SyncResponse,
 };
 use push_proto::v1;
@@ -99,6 +100,20 @@ impl messaging_server::Messaging for FlakySync {
         request: Request<RequestCall>,
     ) -> Result<Response<push_proto::v1::Response>, Status> {
         self.api.request(request).await
+    }
+
+    async fn activity(
+        &self,
+        request: Request<ActivityRequest>,
+    ) -> Result<Response<ActivityResponse>, Status> {
+        self.api.activity(request).await
+    }
+
+    async fn announce_presence(
+        &self,
+        request: Request<AnnouncePresenceRequest>,
+    ) -> Result<Response<AnnouncePresenceResponse>, Status> {
+        self.api.announce_presence(request).await
     }
 }
 

@@ -10,6 +10,7 @@ use push_domain::{
 use push_proto::id_bytes;
 use push_proto::internal::v1::{
     AccountAgent, AccountDevice, AccountUser, AccountsResponse, AckRequest, AckResponse,
+    ActivityRequest, ActivityResponse, AnnouncePresenceRequest, AnnouncePresenceResponse,
     DeleteRequest, EditRequest, IdentifyRequest, IdentifyResponse, ReadUpToRequest,
     ReadUpToResponse, RequestCall, SendRequest, SyncRequest, SyncResponse, VisibleUsersRequest,
     VisibleUsersResponse, accounts_server, directory_server, messaging_server,
@@ -145,6 +146,20 @@ where
         requests::request(&self.messaging, request.into_inner())
             .await
             .map(Response::new)
+    }
+
+    async fn activity(
+        &self,
+        _request: Request<ActivityRequest>,
+    ) -> Result<Response<ActivityResponse>, Status> {
+        Err(Status::unimplemented("activity is not supported yet"))
+    }
+
+    async fn announce_presence(
+        &self,
+        _request: Request<AnnouncePresenceRequest>,
+    ) -> Result<Response<AnnouncePresenceResponse>, Status> {
+        Err(Status::unimplemented("presence is not supported yet"))
     }
 }
 

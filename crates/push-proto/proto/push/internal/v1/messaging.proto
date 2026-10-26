@@ -43,6 +43,14 @@ service Messaging {
   // Any request frame (spec §7.1), on behalf of the user. The Response carries the
   // request's request_id, and so does the Error of a failed call.
   rpc Request(RequestCall) returns (push.v1.Response);
+  // An Activity frame of the user's device: checks the conversation and the membership,
+  // and publishes it to the other current members (no block either way). Answers once
+  // published. Errors: INVALID, CONVERSATION_NOT_FOUND, NOT_MEMBER.
+  rpc Activity(ActivityRequest) returns (ActivityResponse);
+  // The user's presence may have changed (the gateway saw a first connection or the end
+  // of the last one): reads the shared state and publishes it to the contacts allowed to
+  // see it. Idempotent.
+  rpc AnnouncePresence(AnnouncePresenceRequest) returns (AnnouncePresenceResponse);
 }
 
 // auth-svc's user and device events, relayed by the worker from auth-svc's outbox
@@ -175,6 +183,30 @@ message RequestCall {
   push.v1.Request request = 2;
 }
 
+message ActivityRequest {
+  bytes user_id = 1;
+  bytes device_id = 2;
+  push.v1.Activity activity = 3;
+}
+
+message ActivityResponse {}
+
+message AnnouncePresenceRequest {
+  bytes user_id = 1;
+}
+
+message AnnouncePresenceResponse {}
+
+// Presence state in Redis (docs/activity-presence.md), written by the gateways and read
+// by message-svc. The braces are a hash tag, so both keys of a user share a cluster slot.
+// Every script uses Redis `TIME`, never a replica's clock.
+// - `presence:{<user uuid>}:conns`: a sorted set, member = connection id, score = the end
+//   of its lease in milliseconds (Redis `TIME`). It expires with its longest lease, so the
+//   set of a gateway that died disappears.
+// - `presence:{<user uuid>}:state`: a hash, `on` (1 while the user is announced online)
+//   and `seen` (the last minute the user was online, in seconds since the Unix epoch).
+//   30-day TTL, refreshed on every write.
+
 // Published on the Redis channel `notify:{user_id}` after a commit (spec §4.3). Never
 // carries message bodies: a lost notification only delays the client.
 message Notification {
@@ -184,6 +216,10 @@ message Notification {
     ReceiptChanged receipt_changed = 2;
     ContactChanged contact_changed = 3;
     ReadPositionChanged read_position_changed = 4;
+    // Like everything on `notify:`, never a message body; a lost one only delays the
+    // client (activity is refreshed, presence is read again).
+    push.v1.ActivityEvent activity_changed = 5;
+    push.v1.Presence presence_changed = 6;
   }
 }
 
