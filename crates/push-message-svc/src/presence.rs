@@ -164,12 +164,14 @@ impl PresenceStates for RedisPresence {
 }
 
 /// For tests: fixed states; everyone else offline without `last_seen`. Can be made
-/// unavailable, as Redis is when it fails.
+/// unavailable, as Redis is when it fails, at once or after some reads.
 #[derive(Default)]
 pub struct FixedPresence {
     views: Mutex<HashMap<UserId, PresenceView>>,
     flips: Mutex<HashSet<UserId>>,
     unavailable: AtomicBool,
+    /// Reads left before every read fails; unlimited when `None`.
+    reads_left: Mutex<Option<usize>>,
 }
 
 impl FixedPresence {
@@ -189,6 +191,11 @@ impl FixedPresence {
     pub fn set_unavailable(&self, unavailable: bool) {
         self.unavailable.store(unavailable, Ordering::SeqCst);
     }
+
+    /// Lets the next `reads` reads succeed, then makes every read fail.
+    pub fn fail_after(&self, reads: usize) {
+        *self.reads_left.lock().expect("presence lock") = Some(reads);
+    }
 }
 
 #[async_trait]
@@ -199,6 +206,9 @@ impl PresenceStates for FixedPresence {
     ) -> Result<(Vec<PresenceView>, Vec<UserId>), PresenceUnavailable> {
         if self.unavailable.load(Ordering::SeqCst) {
             return Err(PresenceUnavailable);
+        }
+        if let Some(left) = self.reads_left.lock().expect("presence lock").as_mut() {
+            *left = left.checked_sub(1).ok_or(PresenceUnavailable)?;
         }
         let views = self.views.lock().expect("presence lock");
         let mut flips = self.flips.lock().expect("presence lock");
@@ -242,8 +252,22 @@ pub(crate) fn offline(count: usize) -> Vec<PresenceView> {
 /// nothing is published (logged). A flip this read finds is `user` itself, which the
 /// announcement publishes anyway.
 async fn current(presence: &dyn PresenceStates, user: UserId) -> Option<PresenceView> {
+    current_or(presence, user, None).await
+}
+
+/// `user`'s current state, read for an announcement; `fallback` when it cannot be read
+/// (logged), so `None` publishes nothing.
+async fn current_or(
+    presence: &dyn PresenceStates,
+    user: UserId,
+    fallback: Option<PresenceView>,
+) -> Option<PresenceView> {
     match presence.states(&[user]).await {
         Ok((views, _)) => views.first().copied(),
+        Err(PresenceUnavailable) if fallback.is_some() => {
+            tracing::warn!(user = %user.0, "presence unavailable; publishing the earlier read");
+            fallback
+        }
         Err(PresenceUnavailable) => {
             tracing::warn!(user = %user.0, "presence unavailable; publishing nothing");
             None
@@ -252,7 +276,7 @@ async fn current(presence: &dyn PresenceStates, user: UserId) -> Option<Presence
 }
 
 /// Announces `user`'s current state to their presence audience; nothing when the state
-/// cannot be read (the next transition or read corrects it).
+/// cannot be read (`user`'s next connect or disconnect announces it again).
 pub(crate) async fn announce<S: Store, C: Clock, N: Notifier>(
     messaging: &Messaging<S, C, N>,
     presence: &dyn PresenceStates,
@@ -276,16 +300,23 @@ pub(crate) async fn set_sharing<S: Store, C: Clock, N: Notifier>(
         .await
 }
 
-/// Announces each of `users`, whom a read found newly offline. Best effort: a failure is
-/// logged, and the next transition or read corrects it. Flips found by these
-/// announcements' own reads are the announced users themselves, so nothing recurses.
+/// Announces each of `users`, whom a read found newly offline, with the view that read
+/// returned. That read cleared their online mark, so no other reader will announce them:
+/// each is re-read inside the announcement's lock (a fresher state, such as a reconnect's
+/// `Online`, wins), but when the re-read fails the first read's view is published rather
+/// than nothing. Best effort: a store failure is logged and leaves contacts with the old
+/// state until `user` next connects. Flips found by these announcements' own reads are
+/// the announced users themselves, so nothing recurses.
 pub(crate) async fn announce_flipped<S: Store, C: Clock, N: Notifier>(
     messaging: &Messaging<S, C, N>,
     presence: &dyn PresenceStates,
-    users: &[UserId],
+    users: &[(UserId, PresenceView)],
 ) {
-    for &user in users {
-        if let Err(error) = announce(messaging, presence, user).await {
+    for &(user, read) in users {
+        let announced = messaging
+            .announce_presence(user, || current_or(presence, user, Some(read)))
+            .await;
+        if let Err(error) = announced {
             tracing::warn!(%error, user = %user.0, "could not announce a user found offline");
         }
     }

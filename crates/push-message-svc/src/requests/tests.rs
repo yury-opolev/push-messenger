@@ -883,6 +883,43 @@ async fn get_presence_announces_users_the_read_found_newly_offline() {
 }
 
 #[tokio::test]
+async fn a_user_found_newly_offline_is_announced_even_when_the_re_read_fails() {
+    let world = world();
+    let (alice, bob) = (world.person().await, world.person().await);
+    world.befriend(&alice, &bob).await;
+    let last_seen = Utc.with_ymd_and_hms(2026, 10, 13, 11, 58, 0).unwrap();
+    world.presence.flip(bob.user);
+    world.presence.set(
+        bob.user,
+        PresenceView::Offline {
+            last_seen: Some(last_seen),
+        },
+    );
+    world.presence.fail_after(1);
+    world.notifier.take();
+
+    let ids = vec![id_bytes(bob.user.0)];
+    assert_eq!(
+        get_presence(&world, &alice, ids).await.unwrap(),
+        [presence(
+            &bob,
+            PresenceState::Offline,
+            Some(last_seen.timestamp_micros())
+        )]
+    );
+    assert_eq!(
+        world.notifier.take(),
+        vec![Event::Presence {
+            to: vec![alice.user],
+            user: bob.user,
+            view: PresenceView::Offline {
+                last_seen: Some(last_seen),
+            },
+        }]
+    );
+}
+
+#[tokio::test]
 async fn opting_out_answers_unknown_to_contacts_and_hides_them_from_the_hider() {
     let world = world();
     let (alice, bob) = (world.person().await, world.person().await);
