@@ -4,6 +4,7 @@
 //! the crate's `testing` feature, which the crate's own integration tests cannot enable.
 
 mod admin;
+mod agent_key;
 mod agents;
 mod entra_accounts;
 mod entra_api;

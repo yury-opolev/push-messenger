@@ -90,6 +90,7 @@ async fn the_owner_migrates_and_a_second_run_changes_nothing() {
         tables,
         [
             "agent_enrollment",
+            "agent_key_assertion",
             "device",
             "external_identity",
             "outbox",

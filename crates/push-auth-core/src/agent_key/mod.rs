@@ -1,9 +1,104 @@
-// Until the authenticator uses it (Task 2 of the agent-key plan), only tests call the verifier.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the authenticator of Task 2 uses the verifier")
-)]
+//! The opt-in `agent-key` provider (spec 2026-10-26 agent-key provider): an owned agent
+//! proves possession of the P-256 key it bound at enrollment with a single-use ES256
+//! assertion. Push-messenger keeps only the key's thumbprint.
+
+use std::time::Duration;
+
+use sqlx::PgPool;
+
+use crate::identity::{AGENT_KEY_PROVIDER, AuthenticationError, Authenticator, Principal};
+
 mod jws;
+
+/// Policy of the explicitly enabled `agent-key` provider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentKeySettings {
+    /// The `aud` every assertion must carry, e.g. the public API URL.
+    pub audience: String,
+    /// How long a device signed in with a key stays signed in: 1 to 720 hours.
+    pub max_session: Duration,
+}
+
+/// The `agent-key` authenticator; its replay cache is the `auth` database.
+#[derive(Debug, Clone)]
+pub struct AgentKeySignIn {
+    settings: AgentKeySettings,
+    pool: PgPool,
+}
+
+impl AgentKeySignIn {
+    /// Refuses an audience that is not 1 to 256 visible ASCII characters and a session
+    /// outside 1 to 720 hours.
+    pub fn new(settings: AgentKeySettings, pool: PgPool) -> Result<Self, String> {
+        if !is_audience(&settings.audience) {
+            return Err(
+                "the agent-key audience must be 1 to 256 visible ASCII characters".to_owned(),
+            );
+        }
+        if settings.max_session < Duration::from_secs(3600)
+            || settings.max_session > Duration::from_secs(720 * 3600)
+        {
+            return Err("the agent-key maximum session must be 1 to 720 hours".to_owned());
+        }
+        Ok(Self { settings, pool })
+    }
+
+    /// Records the assertion's first use; `false` for a replay.
+    async fn first_use(&self, assertion: &jws::Assertion) -> Result<bool, sqlx::Error> {
+        sqlx::query("DELETE FROM auth.agent_key_assertion WHERE expires_at < now()")
+            .execute(&self.pool)
+            .await?;
+        let inserted = sqlx::query(
+            "INSERT INTO auth.agent_key_assertion (thumbprint, jti, expires_at) \
+             VALUES ($1, $2, to_timestamp($3::bigint)) ON CONFLICT DO NOTHING RETURNING 1",
+        )
+        .bind(&assertion.thumbprint)
+        .bind(&assertion.jti)
+        .bind(assertion.exp + jws::CLOCK_SKEW_SECONDS)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(inserted.is_some())
+    }
+}
+
+/// Whether `value` is an acceptable audience: 1 to 256 visible ASCII characters.
+pub(crate) fn is_audience(value: &str) -> bool {
+    (1..=256).contains(&value.len()) && value.bytes().all(|b| b.is_ascii_graphic())
+}
+
+#[async_trait::async_trait]
+impl Authenticator for AgentKeySignIn {
+    fn provider(&self) -> &str {
+        AGENT_KEY_PROVIDER
+    }
+
+    fn max_session(&self) -> Duration {
+        self.settings.max_session
+    }
+
+    async fn authenticate(&self, token: &str) -> Result<Principal, AuthenticationError> {
+        let assertion = jws::verify(token, &self.settings.audience, crate::service::unix_now())
+            .map_err(AuthenticationError::Rejected)?;
+        match self.first_use(&assertion).await {
+            Ok(true) => {}
+            Ok(false) => return Err(AuthenticationError::Rejected("replay")),
+            Err(error) => {
+                tracing::warn!(%error, "an agent-key sign-in failed: the replay cache is unreachable");
+                return Err(AuthenticationError::Unavailable(
+                    "the agent-key replay cache is unreachable".to_owned(),
+                ));
+            }
+        }
+        Ok(Principal {
+            provider: AGENT_KEY_PROVIDER.to_owned(),
+            issuer: AGENT_KEY_PROVIDER.to_owned(),
+            subject: assertion.thumbprint,
+            name: None,
+            email: None,
+            claims: assertion.claims,
+        })
+    }
+}
 
 #[cfg(test)]
 pub(crate) mod testing {
@@ -44,7 +139,6 @@ pub(crate) mod testing {
         }
 
         /// A valid assertion for `audience`, issued now, valid for two minutes.
-        #[expect(dead_code, reason = "the integration tests of Task 2 use it")]
         pub(crate) fn assertion(&self, audience: &str) -> String {
             let now = crate::service::unix_now();
             self.sign(
