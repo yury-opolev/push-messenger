@@ -1,12 +1,12 @@
-//! `RedisNotifier` against a real Redis (Docker must be running).
+//! `RedisNotifier` and `RedisPresence` against a real Redis (Docker must be running).
 
 use std::time::Duration;
 
 use prost::Message;
-use push_domain::{Event, Notifier, UserId};
-use push_message_svc::RedisNotifier;
+use push_domain::{Event, Notifier, PresenceView, UserId};
+use push_message_svc::{PresenceStates, RedisNotifier};
 use push_proto::internal::v1::{EntriesAvailable, Notification, notification::Kind};
-use push_proto::notify_channel;
+use push_proto::{notify_channel, presence_conns_key, presence_state_key};
 use testcontainers_modules::redis::Redis;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::{ContainerAsync, ImageExt};
@@ -110,4 +110,92 @@ async fn the_publish_after_redis_closed_the_connection_still_rings() {
             .expect("the subscription is open");
         assert_eq!(message.get_channel_name(), notify_channel(user.0));
     }
+}
+
+#[tokio::test]
+async fn the_read_script_reports_online_offline_and_flips_once() {
+    let (_container, url) = redis().await;
+    let mut admin = redis::Client::open(url.as_str())
+        .unwrap()
+        .get_multiplexed_async_connection()
+        .await
+        .unwrap();
+    let (online, gone, never) = (UserId::new(), UserId::new(), UserId::new());
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let minute = 1_760_000_040_i64;
+    let _: () = redis::cmd("ZADD")
+        .arg(presence_conns_key(online.0))
+        .arg(now_ms + 60_000)
+        .arg("connection-1")
+        .query_async(&mut admin)
+        .await
+        .unwrap();
+    let _: () = redis::cmd("ZADD")
+        .arg(presence_conns_key(gone.0))
+        .arg(now_ms - 60_000)
+        .arg("connection-2")
+        .query_async(&mut admin)
+        .await
+        .unwrap();
+    let _: () = redis::cmd("HSET")
+        .arg(presence_state_key(gone.0))
+        .arg("on")
+        .arg("1")
+        .arg("seen")
+        .arg(minute)
+        .query_async(&mut admin)
+        .await
+        .unwrap();
+
+    let presence = RedisNotifier::connect(&url)
+        .await
+        .expect("connect")
+        .presence();
+    let users = [online, gone, never];
+    let last_seen = chrono::DateTime::from_timestamp(minute, 0);
+    let (views, flipped) = presence.states(&users).await;
+    assert_eq!(
+        views,
+        [
+            PresenceView::Online,
+            PresenceView::Offline { last_seen },
+            PresenceView::Offline { last_seen: None },
+        ]
+    );
+    assert_eq!(flipped, [gone]);
+
+    let (views, flipped) = presence.states(&users).await;
+    assert_eq!(views[1], PresenceView::Offline { last_seen });
+    assert!(flipped.is_empty(), "a user flips only once");
+    let expired: i64 = redis::cmd("ZCARD")
+        .arg(presence_conns_key(gone.0))
+        .query_async(&mut admin)
+        .await
+        .unwrap();
+    assert_eq!(expired, 0, "the expired lease is pruned");
+
+    // A Redis that lost its scripts (a restart or SCRIPT FLUSH) is loaded again.
+    let _: () = redis::cmd("SCRIPT")
+        .arg("FLUSH")
+        .query_async(&mut admin)
+        .await
+        .unwrap();
+    let (views, _) = presence.states(&[online]).await;
+    assert_eq!(views, [PresenceView::Online]);
+}
+
+#[tokio::test]
+async fn presence_reads_without_redis_answer_offline() {
+    let (container, url) = redis().await;
+    let presence = RedisNotifier::connect(&url)
+        .await
+        .expect("connect")
+        .presence();
+    container.stop().await.expect("stop Redis");
+    let users = [UserId::new(), UserId::new()];
+    let (views, flipped) = tokio::time::timeout(Duration::from_secs(30), presence.states(&users))
+        .await
+        .expect("a failed read gives up instead of hanging");
+    assert_eq!(views, [PresenceView::Offline { last_seen: None }; 2]);
+    assert!(flipped.is_empty());
 }

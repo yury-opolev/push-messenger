@@ -19,18 +19,35 @@ use push_proto::v1::{ContentType, SendAck};
 use tonic::service::Interceptor;
 use tonic::{Request, Response, Status};
 
-use crate::convert::{deliver, domain_error, from_micros, invalid, parse_id, send_ack};
+use crate::convert::{
+    activity_state_from_wire, deliver, domain_error, from_micros, invalid, parse_id, send_ack,
+};
+use crate::presence::{self, OfflinePresence, PresenceStates};
 use crate::requests;
 
 /// The `Messaging` service: what the gateway calls for a connected device. The gateway
 /// passes the user and device it verified.
 pub struct MessagingApi<S, C, N> {
     messaging: Arc<Messaging<S, C, N>>,
+    presence: Arc<dyn PresenceStates>,
 }
 
 impl<S, C, N> MessagingApi<S, C, N> {
+    /// Without live presence: everyone reads offline. For tools and tests that do not
+    /// track presence; the service uses [`Self::with_presence`].
     pub fn new(messaging: Arc<Messaging<S, C, N>>) -> Self {
-        Self { messaging }
+        Self::with_presence(messaging, Arc::new(OfflinePresence))
+    }
+
+    /// With `presence` as the source of users' live state.
+    pub fn with_presence(
+        messaging: Arc<Messaging<S, C, N>>,
+        presence: Arc<dyn PresenceStates>,
+    ) -> Self {
+        Self {
+            messaging,
+            presence,
+        }
     }
 }
 
@@ -143,23 +160,44 @@ where
         &self,
         request: Request<RequestCall>,
     ) -> Result<Response<push_proto::v1::Response>, Status> {
-        requests::request(&self.messaging, request.into_inner())
-            .await
-            .map(Response::new)
+        requests::request(
+            &self.messaging,
+            self.presence.as_ref(),
+            request.into_inner(),
+        )
+        .await
+        .map(Response::new)
     }
 
     async fn activity(
         &self,
-        _request: Request<ActivityRequest>,
+        request: Request<ActivityRequest>,
     ) -> Result<Response<ActivityResponse>, Status> {
-        Err(Status::unimplemented("activity is not supported yet"))
+        let request = request.into_inner();
+        let sender = parse_id(&request.user_id, "user_id", UserId)?;
+        // Checked like every device frame, though the activity is the user's.
+        parse_id(&request.device_id, "device_id", DeviceId)?;
+        let activity = request
+            .activity
+            .ok_or_else(|| invalid("activity is required"))?;
+        let conversation = parse_id(&activity.conversation_id, "conversation_id", ConversationId)?;
+        let state = activity_state_from_wire(activity.state())?;
+        self.messaging
+            .activity(sender, conversation, state, activity.label.as_deref())
+            .await
+            .map_err(domain_error)?;
+        Ok(Response::new(ActivityResponse {}))
     }
 
     async fn announce_presence(
         &self,
-        _request: Request<AnnouncePresenceRequest>,
+        request: Request<AnnouncePresenceRequest>,
     ) -> Result<Response<AnnouncePresenceResponse>, Status> {
-        Err(Status::unimplemented("presence is not supported yet"))
+        let user = parse_id(&request.into_inner().user_id, "user_id", UserId)?;
+        presence::announce(&self.messaging, self.presence.as_ref(), user)
+            .await
+            .map_err(domain_error)?;
+        Ok(Response::new(AnnouncePresenceResponse {}))
     }
 }
 

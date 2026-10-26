@@ -6,7 +6,7 @@ use std::sync::Arc;
 use chrono::{TimeDelta, TimeZone, Utc};
 use push_domain::{
     ClientMsgId, ConversationId, DeviceId, Event, InMemoryStore, ManualClock, Messaging,
-    ReceiptUpdate, RecordingNotifier, UserId,
+    PresenceView, ReceiptUpdate, RecordingNotifier, UserId,
 };
 use push_proto::internal::v1::messaging_server::Messaging as MessagingRpc;
 use push_proto::internal::v1::{
@@ -15,14 +15,16 @@ use push_proto::internal::v1::{
 use push_proto::v1::{
     self, AddMembers, Contact, ContactAccept, ContactBlock, ContactRequest, ContactState,
     ContactUnblock, ContentType, ConversationKind, CreateGroup, CreateInvite, Delete, Deliver,
-    DirectReceipts, Done, Edit, EntryKind, ErrorCode, FetchHistory, InviteRedeemed, LeaveGroup,
-    ListContacts, ListConversations, OpenDirect, ReadUpTo, RedeemInvite, RemoveMember, RenameGroup,
-    RevokeInvite, Role, SendAck, SetRole, conversation_summary, delete, edit, request, response,
+    DirectReceipts, Done, Edit, EntryKind, ErrorCode, FetchHistory, GetPresence, InviteRedeemed,
+    LeaveGroup, ListContacts, ListConversations, OpenDirect, Presence, PresenceSharing,
+    PresenceState, ReadUpTo, RedeemInvite, RemoveMember, RenameGroup, RevokeInvite, Role, SendAck,
+    SetPresenceSharing, SetRole, conversation_summary, delete, edit, request, response,
 };
 use push_proto::{error_from_status, id_bytes};
 use tonic::{Code, Request, Status};
 
 use crate::grpc::MessagingApi;
+use crate::presence::FixedPresence;
 
 type Svc = Messaging<InMemoryStore, Arc<ManualClock>, Arc<RecordingNotifier>>;
 
@@ -31,6 +33,7 @@ struct World {
     svc: Arc<Svc>,
     clock: Arc<ManualClock>,
     notifier: Arc<RecordingNotifier>,
+    presence: Arc<FixedPresence>,
 }
 
 fn world() -> World {
@@ -43,11 +46,13 @@ fn world() -> World {
         Arc::clone(&clock),
         Arc::clone(&notifier),
     ));
+    let presence = Arc::new(FixedPresence::default());
     World {
-        api: MessagingApi::new(Arc::clone(&svc)),
+        api: MessagingApi::with_presence(Arc::clone(&svc), presence.clone()),
         svc,
         clock,
         notifier,
+        presence,
     }
 }
 
@@ -725,4 +730,217 @@ async fn group_requests_refuse_what_the_rules_forbid() {
         let status = world.request(&alice, bad_title).await.unwrap_err();
         assert_eq!(failure(&status).0, ErrorCode::Invalid, "{title:?}");
     }
+}
+
+async fn get_presence(
+    world: &World,
+    viewer: &Person,
+    ids: Vec<Vec<u8>>,
+) -> Result<Vec<Presence>, Status> {
+    let get = request::Body::GetPresence(GetPresence { user_ids: ids });
+    let response::Body::Presences(list) = world.request(viewer, get).await? else {
+        panic!("not a presence list");
+    };
+    Ok(list.presences)
+}
+
+fn presence(person: &Person, state: PresenceState, last_seen: Option<i64>) -> Presence {
+    Presence {
+        user_id: id_bytes(person.user.0),
+        state: state.into(),
+        last_seen,
+    }
+}
+
+async fn sharing(world: &World, of: &Person, share: Option<bool>) -> bool {
+    let set = request::Body::SetPresenceSharing(SetPresenceSharing { share });
+    let response::Body::PresenceSharing(PresenceSharing { share }) =
+        world.request(of, set).await.unwrap()
+    else {
+        panic!("not a presence sharing answer");
+    };
+    share
+}
+
+#[tokio::test]
+async fn get_presence_answers_unknown_for_strangers_and_the_state_for_contacts() {
+    let world = world();
+    let (alice, bob, carol) = (
+        world.person().await,
+        world.person().await,
+        world.person().await,
+    );
+    let dave = world.person().await;
+    world.befriend(&alice, &bob).await;
+    world.befriend(&alice, &dave).await;
+    let minute = Utc.with_ymd_and_hms(2026, 10, 13, 11, 58, 0).unwrap();
+    world.presence.set(bob.user, PresenceView::Online);
+    world.presence.set(
+        dave.user,
+        PresenceView::Offline {
+            last_seen: Some(minute),
+        },
+    );
+    world.presence.set(carol.user, PresenceView::Online);
+    world.presence.set(alice.user, PresenceView::Online);
+
+    let ids = [&bob, &carol, &dave, &alice]
+        .iter()
+        .map(|person| id_bytes(person.user.0))
+        .chain([id_bytes(UserId::new().0)])
+        .collect();
+    let answered = get_presence(&world, &alice, ids).await.unwrap();
+    assert_eq!(answered.len(), 5);
+    assert_eq!(
+        answered[..4],
+        [
+            presence(&bob, PresenceState::Online, None),
+            presence(&carol, PresenceState::Unknown, None),
+            presence(
+                &dave,
+                PresenceState::Offline,
+                Some(minute.timestamp_micros())
+            ),
+            presence(&alice, PresenceState::Online, None),
+        ]
+    );
+    assert_eq!(answered[4].state(), PresenceState::Unknown);
+    assert_eq!(answered[4].last_seen, None);
+    assert!(
+        world
+            .notifier
+            .take()
+            .iter()
+            .all(|event| !matches!(event, Event::Presence { .. }))
+    );
+}
+
+#[tokio::test]
+async fn get_presence_refuses_more_than_100_ids() {
+    let world = world();
+    let alice = world.person().await;
+    let crowd = (0..101).map(|_| id_bytes(UserId::new().0)).collect();
+    let status = get_presence(&world, &alice, crowd).await.unwrap_err();
+    assert_eq!(failure(&status), (ErrorCode::Invalid, true));
+    let status = get_presence(&world, &alice, vec![]).await.unwrap_err();
+    assert_eq!(failure(&status), (ErrorCode::Invalid, true));
+    let status = get_presence(&world, &alice, vec![vec![1, 2, 3]])
+        .await
+        .unwrap_err();
+    assert_eq!(failure(&status), (ErrorCode::Invalid, true));
+
+    let full = (0..100).map(|_| id_bytes(UserId::new().0)).collect();
+    assert_eq!(get_presence(&world, &alice, full).await.unwrap().len(), 100);
+}
+
+#[tokio::test]
+async fn get_presence_answers_once_per_distinct_id_in_order() {
+    let world = world();
+    let (alice, bob, carol) = (
+        world.person().await,
+        world.person().await,
+        world.person().await,
+    );
+    world.befriend(&alice, &bob).await;
+    world.presence.set(bob.user, PresenceView::Online);
+    let ids = vec![
+        id_bytes(carol.user.0),
+        id_bytes(bob.user.0),
+        id_bytes(carol.user.0),
+        id_bytes(bob.user.0),
+    ];
+    assert_eq!(
+        get_presence(&world, &alice, ids).await.unwrap(),
+        [
+            presence(&carol, PresenceState::Unknown, None),
+            presence(&bob, PresenceState::Online, None),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn get_presence_announces_users_the_read_found_newly_offline() {
+    let world = world();
+    let (alice, bob) = (world.person().await, world.person().await);
+    world.befriend(&alice, &bob).await;
+    world.presence.flip(bob.user);
+    world.notifier.take();
+    let offline = PresenceView::Offline { last_seen: None };
+
+    let ids = vec![id_bytes(bob.user.0)];
+    assert_eq!(
+        get_presence(&world, &alice, ids).await.unwrap(),
+        [presence(&bob, PresenceState::Offline, None)]
+    );
+    assert_eq!(
+        world.notifier.take(),
+        vec![Event::Presence {
+            to: vec![alice.user],
+            user: bob.user,
+            view: offline,
+        }]
+    );
+}
+
+#[tokio::test]
+async fn opting_out_answers_unknown_to_contacts_and_hides_them_from_the_hider() {
+    let world = world();
+    let (alice, bob) = (world.person().await, world.person().await);
+    world.befriend(&alice, &bob).await;
+    world.presence.set(alice.user, PresenceView::Online);
+    world.presence.set(bob.user, PresenceView::Online);
+    world.notifier.take();
+
+    assert!(!sharing(&world, &alice, Some(false)).await);
+    assert_eq!(
+        world.notifier.take(),
+        vec![Event::Presence {
+            to: vec![bob.user],
+            user: alice.user,
+            view: PresenceView::Unknown,
+        }]
+    );
+    let of_alice = vec![id_bytes(alice.user.0)];
+    assert_eq!(
+        get_presence(&world, &bob, of_alice.clone()).await.unwrap(),
+        [presence(&alice, PresenceState::Unknown, None)]
+    );
+    let of_bob = vec![id_bytes(bob.user.0)];
+    assert_eq!(
+        get_presence(&world, &alice, of_bob.clone()).await.unwrap(),
+        [presence(&bob, PresenceState::Unknown, None)]
+    );
+    // The hider still sees itself.
+    assert_eq!(
+        get_presence(&world, &alice, of_alice.clone())
+            .await
+            .unwrap(),
+        [presence(&alice, PresenceState::Online, None)]
+    );
+
+    assert!(sharing(&world, &alice, Some(true)).await);
+    assert_eq!(
+        world.notifier.take(),
+        vec![Event::Presence {
+            to: vec![bob.user],
+            user: alice.user,
+            view: PresenceView::Online,
+        }]
+    );
+    assert_eq!(
+        get_presence(&world, &bob, of_alice).await.unwrap(),
+        [presence(&alice, PresenceState::Online, None)]
+    );
+}
+
+#[tokio::test]
+async fn set_presence_sharing_without_a_value_reads_it() {
+    let world = world();
+    let alice = world.person().await;
+    assert!(sharing(&world, &alice, None).await);
+    assert!(!sharing(&world, &alice, Some(false)).await);
+    assert!(!sharing(&world, &alice, None).await);
+    assert!(!sharing(&world, &alice, Some(false)).await);
+    assert!(sharing(&world, &alice, Some(true)).await);
+    assert!(sharing(&world, &alice, None).await);
 }

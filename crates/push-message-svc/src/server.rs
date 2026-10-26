@@ -121,6 +121,7 @@ pub async fn serve(
         store.close().await;
         return finish(health_server).await;
     };
+    let presence = Arc::new(notifier.presence());
     let messaging = Arc::new(Messaging::new(store.clone(), SystemClock, notifier));
     // Before readiness and serving, so clients find the built-ins in the first catalog.
     let seeding_fatal = |error: &anyhow::Error| {
@@ -153,7 +154,7 @@ pub async fn serve(
     servers.spawn(
         tonic::transport::Server::builder()
             .add_service(MessagingServer::with_interceptor(
-                MessagingApi::new(Arc::clone(&messaging)),
+                MessagingApi::with_presence(Arc::clone(&messaging), presence),
                 InternalToken::messaging(config.messaging_token),
             ))
             .serve_with_incoming_shutdown(

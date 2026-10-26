@@ -2,26 +2,29 @@
 //! request frames, from protobuf to the domain and back. The gateway calls them on behalf
 //! of the user and device it verified.
 
+use std::collections::{HashMap, HashSet};
+
 use chrono::TimeDelta;
 use push_domain::{
     ClientMsgId, Clock, ConversationId, ConversationKind, ConversationSummary, DeleteMessage,
-    DeviceId, DomainResult, EditText, MAX_HISTORY_PAGE, MessageId, MessageRef, Messaging, Notifier,
-    Receipts, Role, Store, UserId,
+    DeviceId, DomainResult, EditText, MAX_HISTORY_PAGE, MAX_PRESENCE_BATCH, MessageId, MessageRef,
+    Messaging, Notifier, PresenceView, Receipts, Role, Store, UserId, ValidationError,
 };
 use push_proto::internal::v1::{
     DeleteRequest, EditRequest, ReadUpToRequest, ReadUpToResponse, RequestCall,
 };
 use push_proto::v1::{
     self, Contact, ContactList, ConversationList, DirectOpened, DirectReceipts, Done, GroupCreated,
-    GroupReceipts, HistoryPage, Invite, InviteRedeemed, ListContacts, SendAck,
-    conversation_summary, delete, edit, request, response,
+    GroupReceipts, HistoryPage, Invite, InviteRedeemed, ListContacts, PresenceList,
+    PresenceSharing, SendAck, conversation_summary, delete, edit, request, response,
 };
 use push_proto::{error_from_status, error_status, id_bytes};
 use tonic::Status;
 
 use crate::convert::{
-    contact_state, deliver, domain_error, from_micros, invalid, micros, parse_id, send_ack,
+    self, contact_state, deliver, domain_error, from_micros, invalid, micros, parse_id, send_ack,
 };
+use crate::presence::{self, PresenceStates};
 
 /// `Edit`: the edit entry's receipt, after commit.
 pub(crate) async fn edit<S: Store, C: Clock, N: Notifier>(
@@ -108,8 +111,10 @@ pub(crate) async fn read_up_to<S: Store, C: Clock, N: Notifier>(
 }
 
 /// A request frame: its `Response`, or a status whose error carries its `request_id`.
+/// `presence` is the users' live state, for the presence requests.
 pub(crate) async fn request<S: Store, C: Clock, N: Notifier>(
     messaging: &Messaging<S, C, N>,
+    presence: &dyn PresenceStates,
     call: RequestCall,
 ) -> Result<v1::Response, Status> {
     let request = call.request.ok_or_else(|| invalid("request is required"))?;
@@ -119,7 +124,7 @@ pub(crate) async fn request<S: Store, C: Clock, N: Notifier>(
         let body = request
             .body
             .ok_or_else(|| invalid("the request has no body"))?;
-        answer(messaging, user, body).await
+        answer(messaging, presence, user, body).await
     }
     .await;
     match answered {
@@ -138,6 +143,7 @@ pub(crate) async fn request<S: Store, C: Clock, N: Notifier>(
 /// What the domain answers to one request.
 async fn answer<S: Store, C: Clock, N: Notifier>(
     messaging: &Messaging<S, C, N>,
+    presence: &dyn PresenceStates,
     user: UserId,
     body: request::Body,
 ) -> Result<response::Body, Status> {
@@ -289,10 +295,55 @@ async fn answer<S: Store, C: Clock, N: Notifier>(
                     .await,
             )?
         }
-        // Presence lands with the presence domain; until then these are refused.
-        request::Body::GetPresence(_) | request::Body::SetPresenceSharing(_) => {
-            return Err(invalid("not supported yet"));
+        request::Body::GetPresence(get) => get_presence(messaging, presence, user, &get.user_ids)
+            .await
+            .map(response::Body::Presences)?,
+        request::Body::SetPresenceSharing(set) => {
+            let share = match set.share {
+                Some(share) => presence::set_sharing(messaging, presence, user, share).await,
+                None => messaging.presence_sharing(user).await,
+            };
+            response::Body::PresenceSharing(PresenceSharing {
+                share: share.map_err(domain_error)?,
+            })
         }
+    })
+}
+
+/// `GetPresence`: one presence per distinct id, in request order. Users the viewer may not
+/// see are `UNKNOWN`; the others are read from the live state, and anyone the read finds
+/// newly offline is announced before answering.
+async fn get_presence<S: Store, C: Clock, N: Notifier>(
+    messaging: &Messaging<S, C, N>,
+    presence: &dyn PresenceStates,
+    viewer: UserId,
+    ids: &[Vec<u8>],
+) -> Result<PresenceList, Status> {
+    if ids.is_empty() || ids.len() > MAX_PRESENCE_BATCH {
+        return Err(domain_error(ValidationError::PresenceBatch.into()));
+    }
+    let mut seen = HashSet::new();
+    let mut distinct = Vec::new();
+    for user in user_ids(ids, "user_ids")? {
+        if seen.insert(user) {
+            distinct.push(user);
+        }
+    }
+    let viewable = messaging
+        .presence_viewable(viewer, &distinct)
+        .await
+        .map_err(domain_error)?;
+    let (views, flipped) = presence.states(&viewable).await;
+    presence::announce_flipped(messaging, presence, &flipped).await;
+    let views: HashMap<UserId, PresenceView> = viewable.into_iter().zip(views).collect();
+    Ok(PresenceList {
+        presences: distinct
+            .into_iter()
+            .map(|user| {
+                let view = views.get(&user).copied().unwrap_or(PresenceView::Unknown);
+                convert::presence(user, view)
+            })
+            .collect(),
     })
 }
 

@@ -154,6 +154,7 @@ async fn stack_with(sync_failures: u32, heartbeat: Duration) -> Stack {
     );
 
     let notifier = RedisNotifier::connect(&redis_url).await.unwrap();
+    let presence = Arc::new(notifier.presence());
     let messaging = Arc::new(Messaging::new(
         InMemoryStore::default(),
         SystemClock,
@@ -165,7 +166,7 @@ async fn stack_with(sync_failures: u32, heartbeat: Duration) -> Stack {
         tonic::transport::Server::builder()
             .add_service(MessagingServer::with_interceptor(
                 FlakySync {
-                    api: MessagingApi::new(Arc::clone(&messaging)),
+                    api: MessagingApi::with_presence(Arc::clone(&messaging), presence),
                     sync_failures: Mutex::new(sync_failures),
                 },
                 InternalToken::messaging(Some(MESSAGING_TOKEN.to_owned())),
