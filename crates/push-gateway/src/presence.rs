@@ -191,7 +191,7 @@ impl Ran {
     }
 }
 
-/// How a bounded lease script ended.
+/// How a bounded lease script ended; [`Announcer`] decides whether it is announced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Outcome {
     /// Redis answered.
@@ -201,13 +201,47 @@ enum Outcome {
     Unknown,
 }
 
-impl Outcome {
-    /// Whether an UP or SETTLE outcome is to be announced: a transition, or a doubt, as
-    /// announcing is idempotent and a lost transition would never be announced again.
-    fn announces(self) -> bool {
-        match self {
-            Self::Answered(ran) => ran.transition(),
-            Self::Unknown => true,
+/// Which script of a connection's presence ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step {
+    /// The UP of a new connection.
+    Connect,
+    /// The UP renewing a live connection's lease.
+    Refresh,
+    /// The SETTLE after a closed connection's grace.
+    Settle,
+}
+
+/// Decides which of a connection's script outcomes are announced. Announcing is
+/// idempotent, so a doubt announces, but not on every refresh: while Redis is down every
+/// connection's refresh is unknown, and message-svc cannot read Redis either.
+#[derive(Debug, Default)]
+struct Announcer {
+    /// An outcome was unknown and has not been resolved by an announcement since.
+    in_doubt: bool,
+}
+
+impl Announcer {
+    /// Whether `step`'s `outcome` is to be announced.
+    ///
+    /// - Answered: announced on a transition, or once when an earlier outcome was unknown,
+    ///   which resolves a transition possibly lost while Redis was down.
+    /// - Unknown connect or settle: announced, once per connection. A connect stays in
+    ///   doubt, as message-svc may not have read the state either.
+    /// - Unknown refresh: not announced, only in doubt until an answer. A connection
+    ///   closing in doubt is covered by its settle.
+    fn announces(&mut self, step: Step, outcome: Outcome) -> bool {
+        match (outcome, step) {
+            (Outcome::Answered(ran), _) => ran.transition() | std::mem::take(&mut self.in_doubt),
+            (Outcome::Unknown, Step::Connect) => {
+                self.in_doubt = true;
+                true
+            }
+            (Outcome::Unknown, Step::Refresh) => {
+                self.in_doubt = true;
+                false
+            }
+            (Outcome::Unknown, Step::Settle) => true,
         }
     }
 }
@@ -294,9 +328,10 @@ pub(crate) struct PresenceGuard {
 
 /// Starts tracking a connection's presence: `up` now and every 30 s, and, once the
 /// returned guard is dropped, `down`, then after the grace `settle` (skipped on shutdown).
-/// Transitions call `Messaging.AnnouncePresence`, as does an `up` or `settle` whose
-/// outcome is unknown. Redis or message-svc failures are logged and otherwise ignored
-/// (fail open; the connection is never affected).
+/// Transitions call `Messaging.AnnouncePresence`, as does the first `up` or the `settle`
+/// when its outcome is unknown; an unknown refresh is announced only once Redis answers
+/// again (see [`Announcer`]). Redis or message-svc failures are logged and otherwise
+/// ignored (fail open; the connection is never affected).
 pub(crate) fn track(context: PresenceContext, user: Uuid, connection: Uuid) -> PresenceGuard {
     let closed = CancellationToken::new();
     let tasks = context.tasks.clone();
@@ -308,14 +343,15 @@ pub(crate) fn track(context: PresenceContext, user: Uuid, connection: Uuid) -> P
 
 /// One connection's presence, step by step, so its steps never overtake each other.
 async fn run(context: PresenceContext, user: Uuid, connection: Uuid, closed: CancellationToken) {
+    let mut announcer = Announcer::default();
+    let mut step = Step::Connect;
     loop {
         let up = context.leases.up(user, connection, LEASE);
-        if bounded(up, user, "renew a presence lease")
-            .await
-            .announces()
-        {
+        let outcome = bounded(up, user, "renew a presence lease").await;
+        if announcer.announces(step, outcome) {
             announce(&context, user).await;
         }
+        step = Step::Refresh;
         tokio::select! {
             () = closed.cancelled() => break,
             () = tokio::time::sleep(REFRESH) => {}
@@ -330,7 +366,8 @@ async fn run(context: PresenceContext, user: Uuid, connection: Uuid, closed: Can
         () = tokio::time::sleep(context.grace + SETTLE_MARGIN) => {}
     }
     let settle = context.leases.settle(user);
-    if bounded(settle, user, "settle presence").await.announces() {
+    let outcome = bounded(settle, user, "settle presence").await;
+    if announcer.announces(Step::Settle, outcome) {
         announce(&context, user).await;
     }
 }
@@ -485,13 +522,58 @@ mod tests {
         assert!(ran(0, true));
     }
 
+    fn answered(value: i64) -> Outcome {
+        Outcome::Answered(Ran {
+            value,
+            retried: false,
+        })
+    }
+
     #[test]
-    fn an_unknown_outcome_announces() {
-        let answered = |value, retried| Outcome::Answered(Ran { value, retried }).announces();
-        assert!(answered(1, false));
-        assert!(!answered(0, false));
-        assert!(answered(0, true));
-        assert!(Outcome::Unknown.announces());
+    fn answers_announce_their_transitions() {
+        let mut announcer = Announcer::default();
+        assert!(announcer.announces(Step::Connect, answered(1)));
+        assert!(!announcer.announces(Step::Refresh, answered(0)));
+        assert!(announcer.announces(Step::Refresh, answered(1)));
+        let doubtful = Outcome::Answered(Ran {
+            value: 0,
+            retried: true,
+        });
+        assert!(announcer.announces(Step::Refresh, doubtful));
+        assert!(!announcer.announces(Step::Settle, answered(0)));
+        assert!(announcer.announces(Step::Settle, answered(1)));
+    }
+
+    /// While Redis is down refreshes announce nothing; its first answer announces once.
+    #[test]
+    fn unknown_refreshes_announce_once_redis_answers() {
+        let mut announcer = Announcer::default();
+        assert!(announcer.announces(Step::Connect, answered(1)));
+        assert!(!announcer.announces(Step::Refresh, Outcome::Unknown));
+        assert!(!announcer.announces(Step::Refresh, Outcome::Unknown));
+        assert!(announcer.announces(Step::Refresh, answered(0)));
+        assert!(!announcer.announces(Step::Refresh, answered(0)), "once");
+
+        let mut announcer = Announcer::default();
+        announcer.announces(Step::Connect, answered(0));
+        assert!(!announcer.announces(Step::Refresh, Outcome::Unknown));
+        assert!(
+            announcer.announces(Step::Settle, answered(0)),
+            "closed in doubt"
+        );
+    }
+
+    #[test]
+    fn an_unknown_connect_or_settle_announces() {
+        let mut announcer = Announcer::default();
+        assert!(announcer.announces(Step::Connect, Outcome::Unknown));
+        assert!(
+            announcer.announces(Step::Refresh, answered(0)),
+            "resolved once Redis answers"
+        );
+        assert!(!announcer.announces(Step::Refresh, answered(0)));
+        assert!(announcer.announces(Step::Settle, Outcome::Unknown));
+        assert!(Announcer::default().announces(Step::Settle, Outcome::Unknown));
     }
 
     /// A script that never answers in time is unknown, even though it may have run.
