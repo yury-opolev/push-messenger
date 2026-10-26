@@ -8,7 +8,8 @@ use std::time::Duration;
 
 use chrono::TimeDelta;
 use push_domain::{
-    ContactState, DeviceId, DomainError, Event, ReceiptUpdate, SendReceipt, Store, Tx, UserId,
+    ContactState, DeviceId, DomainError, Event, MAX_PENDING_PER_USER, ReceiptUpdate, SendReceipt,
+    Store, TemplateStatus, Tx, UserId,
 };
 use tokio::task::JoinSet;
 
@@ -347,6 +348,75 @@ async fn a_deadlock_is_reported_as_a_retryable_conflict<B: Backend>(backend: &B)
     }
 }
 
+/// A valid tpl/1 definition of `<publisher>.deploy@1`.
+fn definition(publisher: &str) -> Vec<u8> {
+    format!(
+        r#"{{"format":"tpl/1","publisher":"{publisher}","name":"deploy","version":1,
+        "title":"Deploy check","senders":["human"],
+        "params":{{"text":{{"type":"string","max_len":200}}}},
+        "layout":[{{"type":"text","param":"text"}}]}}"#
+    )
+    .into_bytes()
+}
+
+async fn concurrent_submissions_never_exceed_the_pending_cap<B: Backend>(backend: &B) {
+    let world = Arc::new(World::new(backend).await);
+    let alice = world.person().await;
+    for index in 1..MAX_PENDING_PER_USER {
+        world
+            .svc
+            .submit_template(alice.user, &definition(&format!("p{index}")))
+            .await
+            .unwrap();
+    }
+
+    let submissions = (0..8)
+        .map(|index| {
+            let world = Arc::clone(&world);
+            async move {
+                world
+                    .svc
+                    .submit_template(alice.user, &definition(&format!("q{index}")))
+                    .await
+            }
+        })
+        .collect();
+    let results = all(submissions).await;
+
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    for result in results.iter().filter(|result| result.is_err()) {
+        assert_eq!(
+            *result,
+            Err(DomainError::TemplateConflict(
+                "too many submissions are waiting for review"
+            ))
+        );
+    }
+    let pending = world
+        .svc
+        .list_templates(Some(TemplateStatus::Pending), 0)
+        .await
+        .unwrap();
+    assert_eq!(pending.len(), MAX_PENDING_PER_USER as usize);
+}
+
+async fn concurrent_seeders_store_each_builtin_once<B: Backend>(backend: &B) {
+    let world = Arc::new(World::new(backend).await);
+
+    let seeders = (0..4)
+        .map(|_| {
+            let world = Arc::clone(&world);
+            async move { world.svc.seed_builtin_templates().await }
+        })
+        .collect();
+    let inserted: usize = all(seeders).await.into_iter().map(Result::unwrap).sum();
+
+    assert_eq!(inserted, 4);
+    let catalog = world.svc.template_catalog(0, 0).await.unwrap();
+    assert_eq!(catalog.entries.len(), 4);
+    assert_eq!(catalog.seq, 4);
+}
+
 /// The scenarios that need a store with concurrent transactions.
 pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
     case_list![
@@ -359,6 +429,8 @@ pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
         concurrent_registrations_of_one_device_give_it_one_owner,
         a_device_registered_during_a_join_misses_nothing,
         a_deadlock_is_reported_as_a_retryable_conflict,
+        concurrent_submissions_never_exceed_the_pending_cap,
+        concurrent_seeders_store_each_builtin_once,
     ]
     .into_iter()
     .map(|case| case.within("concurrency"))

@@ -18,6 +18,7 @@ mod read_state;
 mod receipts;
 mod send;
 mod sync;
+mod templates;
 mod visibility;
 
 pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
@@ -38,6 +39,7 @@ pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
         ("receipts", receipts::cases()),
         ("send", send::cases()),
         ("sync", sync::cases()),
+        ("templates", templates::cases()),
         ("visibility", visibility::cases()),
     ];
     modules

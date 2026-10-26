@@ -40,7 +40,11 @@
 //!
 //! Template operations lock in the order publisher ([`Tx::claim_publisher`]) → version
 //! ([`Tx::lock_template`]) → change counter ([`Tx::next_template_change`]), and take no
-//! messaging locks.
+//! messaging locks. A submission first takes its submitter's lock ([`Tx::lock_users`]),
+//! before the publisher, so one account's submissions are serialised and cannot both
+//! pass the pending cap. That puts a user lock first, unlike the messaging paths, which
+//! take user locks last; no cycle can form, because no messaging path takes a template
+//! lock and no template path takes a messaging lock other than that one user lock.
 //!
 //! # Delivery positions
 //!
@@ -461,9 +465,9 @@ pub trait Tx: Send {
     async fn pending_templates_of(&mut self, user: UserId) -> DomainResult<u32>;
     /// Records `owner` as the owner of `publisher` if the publisher is new, and returns the
     /// owner recorded, which is the first claimant's. Locks the publisher until the
-    /// transaction ends, so submissions under one publisher are serialised. Take it first,
-    /// before the version and counter locks. Fails with `DomainError::Store` if a user
-    /// owner is not a known user.
+    /// transaction ends, so submissions under one publisher are serialised. Take it before
+    /// the version and counter locks (a submission takes its user's lock before it).
+    /// Fails with `DomainError::Store` if a user owner is not a known user.
     async fn claim_publisher(
         &mut self,
         publisher: &str,
