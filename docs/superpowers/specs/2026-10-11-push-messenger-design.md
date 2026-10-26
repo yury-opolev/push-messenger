@@ -841,6 +841,7 @@ attachments are reserved.
 | Ack | `conversation_id, seq` |
 | ReadUpTo | `conversation_id, seq` |
 | Ping | — |
+| Activity | `conversation_id, state, label` ([activity-presence.md](../../activity-presence.md)) |
 
 Request frames carry a client-chosen `request_id`, echoed in the response:
 
@@ -856,6 +857,7 @@ Request frames carry a client-chosen `request_id`, echoed in the response:
 | CreateGroup | `title, member_ids[]` |
 | AddMembers / RemoveMember / LeaveGroup / RenameGroup | `conversation_id`, plus `user_ids[]` / `user_id` / — / `title` |
 | SetRole | `conversation_id, user_id, role` |
+| GetPresence / SetPresenceSharing | `user_ids[]` / `share` (optional) ([activity-presence.md](../../activity-presence.md)) |
 
 ### 7.2 Server → client
 
@@ -867,6 +869,7 @@ Request frames carry a client-chosen `request_id`, echoed in the response:
 | Receipt | direct: `conversation_id, user_id, delivered_seq, read_seq`; group: `conversation_id, all_delivered_seq, all_read_seq` |
 | ReadPosition | `conversation_id, read_seq` — the user's own read position moved |
 | ContactEvent | `user_id, state` |
+| ActivityEvent / PresenceEvent | another member's activity / a contact's presence ([activity-presence.md](../../activity-presence.md)) |
 | Response | `request_id` and the request-specific result |
 | AuthExpiring | `expires_in_s` |
 | Error | `code, message, retryable`, plus `client_msg_id` or `request_id`, and `retry_after_s` when rate limited |

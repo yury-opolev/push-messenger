@@ -262,9 +262,10 @@ export class Client {
 
   /**
    * Tells the other members what the user is doing in a conversation, with an optional short
-   * label (1 to 60 characters, plain text, no line breaks; ignored with `idle`). Fire and
-   * forget: resolves once queued; rejects with `invalid` for a bad label, `offline` unless
-   * connected. Others show it for 30 s: send it again every 10 to 20 s, and `idle` when done.
+   * label (empty means none; otherwise 1 to 60 characters, plain text, no line breaks; ignored
+   * with `idle`; rules in docs/activity-presence.md). Fire and forget: resolves once queued;
+   * rejects with `invalid` for a bad label, `offline` unless connected. Others show it for
+   * 30 s: send it again every 10 to 20 s, and `idle` when done.
    */
   sendActivity(conversationId: string, state: ActivityState, label?: string | null): Promise<void>;
   /** The presence of 1 to 100 users, one per distinct user in the order asked. */

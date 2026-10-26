@@ -333,6 +333,14 @@ peers). For example `x-forwarded-for` with Traefik and no trusted upstream IPs. 
 external load balancer's source-IP preservation is a deployment-specific acceptance
 check.
 
+### Presence grace
+
+`gateway.presenceGraceMs` (default `10000`) renders the gateway's `PUSH_PRESENCE_GRACE_MS`:
+how long a closed connection still counts as online, so a reconnect within it (a network
+blip, a gateway rollout) is never shown offline; 0 to 120000 milliseconds, anything else
+stops the gateway at start-up. Presence state lives in the Redis the gateways and
+message-svc already share; see [activity-presence.md](activity-presence.md).
+
 ## In-cluster transport
 
 Public traffic is TLS at the controller. Traffic between the services inside the

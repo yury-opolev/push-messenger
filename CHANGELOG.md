@@ -6,6 +6,51 @@ Notable changes for consumers of push-messenger. Newest first.
 
 ### Added
 
+- **Live activity and presence** (REQUEST PUSH feature 12). Guide:
+  [docs/activity-presence.md](docs/activity-presence.md) (frames, rules, multi-replica
+  design, agent recipe).
+  - Activity: a new client frame `Activity` (10) says what the user is doing in a
+    conversation (`typing`, `working`, `waiting`, `idle`, with an optional plain-text label
+    of 1 to 60 characters; empty means none). The other current members' connected devices
+    hear it as `ActivityEvent` (42) with `ttl_ms` 30000 (0 for idle), to expire locally at
+    receive time + ttl; the sender's own devices and members with a block either way do
+    not. Never stored. Paced per device (burst 2, then 1 per second; extra frames are not
+    refused, the latest per conversation is sent when a token frees up); a closed
+    connection (not a takeover) sends idle for its live activities. Refusals are `Error`
+    frames without ids that are never retryable.
+  - Presence: `PresenceEvent` (43) pushes a contact's `ONLINE`/`OFFLINE` (with a whole
+    `last_seen` minute) on change, and the request `GetPresence` (20, answered by
+    `PresenceList` 11) reads 1 to 100 users, rate limited to 120 per minute per user.
+    Visible only between accepted contacts; everything else (strangers, blocks, opt-outs,
+    unknown ids) reads `UNKNOWN`, indistinguishably. Online while any connection on any
+    gateway replica holds a lease in Redis (90 s, renewed every 30 s); a closed
+    connection keeps it for a grace (`PUSH_PRESENCE_GRACE_MS`). Blocking an accepted
+    contact pushes `UNKNOWN` both ways.
+  - Opt-out: `SetPresenceSharing` (21, answered by `PresenceSharing` 12; without a value it
+    reads the setting) switches sharing off or on; reciprocal (a user who hides sees
+    everyone as `UNKNOWN`).
+  - Internal: `Messaging.Activity` and `Messaging.AnnouncePresence` gRPC calls and
+    `Notification.activity_changed`/`presence_changed`; Redis keys
+    `presence:{<user>}:conns` and `presence:{<user>}:state`.
+  - SDK and bindings: `send_activity`, `get_presence`, `set_presence_sharing`,
+    `presence_sharing` (Node `sendActivity`, `getPresence`, `setPresenceSharing`,
+    `presenceSharing`; C `push_client_send_activity`, `push_client_get_presence`,
+    `push_client_set_presence_sharing`, `push_client_presence_sharing`) and the events
+    `ActivityChanged`/`PresenceChanged` (`activityChanged`/`presenceChanged`, with
+    millisecond fields `expiresAtMs` and `lastSeenMs`).
+  - Helm: `gateway.presenceGraceMs` renders `PUSH_PRESENCE_GRACE_MS`.
+
+  **Upgrade notes:**
+  - messaging migration `0007_presence_hidden.sql` adds the table
+    `messaging.presence_hidden` (the opt-out); it changes no existing data and runs with
+    the usual messaging migrations. Rolling message-svc back after it is not supported,
+    as for 0005.
+  - Deploy message-svc before the gateways. A new gateway in front of an old message-svc
+    answers `Activity` with `UNAVAILABLE`, gets `INVALID` for the presence requests and
+    cannot announce presence; old gateways ignore the new notifications.
+  - New gateway variable `PUSH_PRESENCE_GRACE_MS`: 0 to 120000 milliseconds, default
+    10000. No new secret: presence uses the Redis the gateways and message-svc share.
+  - Additive protocol: older SDKs log the new server frames as unreadable and ignore them.
 - **Rich message templates and a template marketplace** (REQUEST PUSH feature 8). Two new
   content types: `CONTENT_TYPE_RICH` (3), a card filled from an approved tpl/1 template
   (`{tpl, params, fallback}`, up to 32 KiB), and `CONTENT_TYPE_ANSWER` (4), an answer to a

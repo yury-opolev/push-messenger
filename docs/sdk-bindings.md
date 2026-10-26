@@ -142,10 +142,13 @@ owner's answer) before acting on it.
 
 ### Activity and presence
 
+The protocol, the rules and an agent recipe: [activity-presence.md](activity-presence.md).
+
 - `send_activity(conversation, state, label)` (`sendActivity`, `push_client_send_activity`)
   tells the other members what the user is doing: `state` is `typing`, `working`, `waiting`
-  or `idle`; `label` is optional (1–60 characters of plain text, no line breaks; ignored
-  with `idle`; `invalid` otherwise). Fire and forget: it returns once queued and fails with
+  or `idle`; `label` is optional: absent or empty means none, otherwise 1–60 characters of
+  plain text without line breaks, control or invisible characters (`invalid` otherwise),
+  and it is ignored with `idle`. Fire and forget: it returns once queued and fails with
   `offline` unless connected. Others show it for 30 s, so send it again every 10–20 s while
   it lasts and `idle` when it ends. Others' activity arrives as `activityChanged`.
 - `get_presence(user_ids)` (`getPresence`, `push_client_get_presence`) gives 1 to 100

@@ -230,6 +230,8 @@ Microsoft Entra ID sign-in (opt-in, also Entra-only without email):
 an Entra credential sign in with a key pair: [docs/agent-key-sign-in.md](docs/agent-key-sign-in.md).
 Rich messages (cards from reviewed templates, answers, publishing, admin review and the
 client catalog): [docs/rich-messages.md](docs/rich-messages.md).
+Live activity (typing, working, waiting) and presence (online, last seen):
+[docs/activity-presence.md](docs/activity-presence.md).
 auth-svc is a
 library, `push-auth-core`, and a thin binary, `push-auth`: a binary of your own can replace
 or restrict the sign-in check
