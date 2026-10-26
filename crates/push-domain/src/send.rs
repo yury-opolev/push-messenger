@@ -11,9 +11,23 @@ use crate::model::{
 };
 use crate::notify::{Event, Notifier};
 use crate::read::{direct_receipt, group_positions_before, group_receipt};
+use crate::rich::{Content, check_answer, check_rich};
 use crate::service::{Messaging, current_member_ids, require_device};
 use crate::store::{InsertOutcome, Store, Tx};
-use crate::validation::validate_text;
+
+/// A message to append. `sender` and `device` come from the verified token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SendMessage {
+    pub sender: UserId,
+    pub device: DeviceId,
+    pub conversation: ConversationId,
+    /// Chosen by the client before the first attempt and reused on every retry.
+    pub client_msg_id: ClientMsgId,
+    /// `Text`, `Rich` or `Answer`; a system event cannot be sent.
+    pub content_type: ContentType,
+    pub body: Vec<u8>,
+    pub client_ts: Option<DateTime<Utc>>,
+}
 
 /// A text message to append. `sender` and `device` come from the verified token.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,7 +78,32 @@ where
     /// member of a direct conversation, they get a read receipt. A group's members get its
     /// group-wide positions if they moved.
     pub async fn send_text(&self, command: SendText) -> DomainResult<SendReceipt> {
-        validate_text(&command.body)?;
+        self.send_message(SendMessage {
+            sender: command.sender,
+            device: command.device,
+            conversation: command.conversation,
+            client_msg_id: command.client_msg_id,
+            content_type: ContentType::Text,
+            body: command.body,
+            client_ts: command.client_ts,
+        })
+        .await
+    }
+
+    /// Appends a message of any content type a client may send, as [`Self::send_text`]
+    /// does a text (spec 2026-10-26, "Enforcement").
+    ///
+    /// A `Rich` body must fill an approved template that the sender's kind may use, with
+    /// valid params. An `Answer` body must answer a card of the conversation that the
+    /// sender may see, sent by someone else, not deleted and not answered yet, whose
+    /// template is still approved, with values the card offers; the answer's entry
+    /// targets the card (`target_seq`), and the card records the answer's seq as its
+    /// `answer_seq`, so a second answer is `CardAnswered`. The body is checked before the
+    /// transaction; the registry and the card are checked after a retry has been
+    /// answered, so a retry gets its original receipt even if the template was revoked
+    /// since.
+    pub async fn send_message(&self, command: SendMessage) -> DomainResult<SendReceipt> {
+        let content = Content::parse(command.content_type, &command.body)?;
         let prepared = self
             .prepare_append(
                 command.sender,
@@ -86,6 +125,14 @@ where
             Prepared::Retry(receipt) => return Ok(receipt),
             Prepared::Ready(append) => *append,
         };
+        let card = match &content {
+            Content::Text => None,
+            Content::Rich(body) => {
+                check_rich(&mut tx, command.sender, body).await?;
+                None
+            }
+            Content::Answer(body) => Some(check_answer(&mut tx, &member, body).await?),
+        };
 
         let entry = Entry {
             conversation_id: conversation.id,
@@ -93,10 +140,10 @@ where
             message_id: MessageId::new(),
             client_msg_id: command.client_msg_id,
             kind: EntryKind::Message,
-            target_seq: None,
+            target_seq: card.as_ref().map(|card| card.seq),
             sender_id: command.sender,
             sender_device_id: Some(command.device),
-            content_type: ContentType::Text,
+            content_type: command.content_type,
             body: Some(command.body),
             client_ts: command.client_ts,
             server_ts: now,
@@ -119,6 +166,10 @@ where
                     EntryKind::Message,
                 )
                 .await;
+        }
+        if let Some(mut card) = card {
+            card.answer_seq = Some(seq);
+            tx.update_entry(card).await?;
         }
         let device_position = tx
             .get_cursor(command.device, conversation.id)

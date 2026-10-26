@@ -49,6 +49,8 @@ pub enum ValidationError {
         "a review note is at most 500 characters, without control characters other than line breaks"
     )]
     ReviewNote,
+    #[error("this content type cannot be sent")]
+    ContentType,
 }
 
 /// Checks a text message body.

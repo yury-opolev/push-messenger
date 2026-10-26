@@ -22,7 +22,9 @@ mod contract;
 mod scenarios;
 mod world;
 
-pub use world::{Person, Svc, World, bodies, delete, edit, entries_for, seqs, system_events, text};
+pub use world::{
+    Person, Svc, World, bodies, delete, edit, entries_for, message, seqs, system_events, text,
+};
 
 /// Makes stores for the scenarios.
 pub trait Backend: Clone + Send + Sync + 'static {

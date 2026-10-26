@@ -18,6 +18,7 @@ pub mod model;
 pub mod notify;
 mod read;
 mod registry;
+mod rich;
 mod send;
 mod service;
 pub mod store;
@@ -40,7 +41,7 @@ pub use model::{
 };
 pub use notify::{Event, KickReason, NoopNotifier, Notifier, ReceiptUpdate, RecordingNotifier};
 pub use registry::{Catalog, MAX_CATALOG_PAGE, MAX_PENDING_PER_USER, ReviewAction, ReviewCommand};
-pub use send::SendText;
+pub use send::{SendMessage, SendText};
 pub use service::{Messaging, Policy};
 pub use store::{InsertOutcome, Store, Tx};
 pub use sync::SyncBatch;
