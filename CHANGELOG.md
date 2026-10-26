@@ -6,6 +6,18 @@ Notable changes for consumers of push-messenger. Newest first.
 
 ### Changed
 
+- **Deleting an agent releases its app identity** (REQUEST PUSH feature 7). `DELETE
+  /v1/agents/{agent_id}` of an active agent still disables it for good and revokes its
+  devices and tokens, and now also releases its app registration or managed identity in
+  the same transaction: a fresh `POST /v1/auth/entra-app {token, enrollment_code}` with
+  that app enrolls a new agent (of any owner) instead of failing with `identity_in_use`.
+  Until then the released app gets the normal unenrolled 403 `sign_in_not_permitted`.
+  Two live agents still cannot share an app. The released binding is kept in the new
+  `auth.released_identity` table (tenant and client app id stay on
+  `auth.agent_enrollment`) and logged as `auth.agent.identity_released`. Admin
+  revoke-sessions is unchanged and does not release.
+- auth migration `0008_released_identity.sql` adds the `auth.released_identity` audit
+  table. It changes no existing data and runs with the usual auth migrations.
 - **Handles may contain hyphens** (REQUEST PUSH 42). A handle is now 3 to 30 characters
   of `a-z`, `0-9`, `_` and `-`, starting with a letter, not ending with `-` and without
   `--` (so `yury-opolev` and `build-bot` are accepted; `bob-`, `a--b` and `-bob` are not).

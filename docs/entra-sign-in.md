@@ -127,8 +127,9 @@ Older manually linked app accounts cannot act as human owners either.
 6. Later call `POST /v1/auth/entra-app {"token":"..."}` without a code, or include
    `device_id` to reauthenticate the same active device. Reauthentication invalidates its
    old refresh tokens and renews its app session. Refresh past the maximum session age
-   returns `session_expired`. A second enrollment of the same `(entra-app,tid,oid)` returns
-   **409 `identity_in_use`**, without consuming an unrelated reservation.
+   returns `session_expired`. A second enrollment of an `(entra-app,tid,oid)` that is bound
+   to a live agent returns **409 `identity_in_use`**, without consuming an unrelated
+   reservation; once that agent is deleted, the app may enroll again.
 
 ### Agent management API contract
 
@@ -141,17 +142,24 @@ Management is rate limited per IP (300/15 minutes) and user (120/15 minutes), fa
 | `POST /v1/agents` | `{handle,display_name}` | 201 reservation above; 409 `too_many_agents` / `handle_taken` |
 | `GET /v1/agents` | none | `{agents:[{user_id,handle,display_name,kind:"agent",owner_user_id,state:"pending"\|"active",expires_at,client_app_id,devices:[{device_id,name,platform,created_at,last_seen_at}]}]}`; expiry null for active agents, client app id null until enrollment; no credentials or hashes |
 | `PATCH /v1/agents/{user_id}` | `{handle?,display_name?}`, at least one | 204; same profile validation/handle uniqueness as human profiles |
-| `DELETE /v1/agents/{user_id}` | none | 204; removes a pending reservation, or permanently disables the active agent |
+| `DELETE /v1/agents/{user_id}` | none | 204; removes a pending reservation, or permanently disables the active agent and releases its app identity |
 
 Bad/expired/spent codes return 400 `enrollment_invalid`; ambiguous/cross-tenant enrollment
-or agent ownership returns 403 `enrollment_not_permitted`. Disabled bindings are
-tombstones: sign-in cannot revive them, even with a fresh code; old registration,
-access and refresh tokens are refused. Deletion atomically revokes every device and
-refresh token and frees the owner's slot. Live sockets close **4003** after the durable
-revocation relay; no messages or account history are deleted. The disabled handle remains
-reserved, but disabled/pending accounts are absent from public lookups and batch profiles.
+or agent ownership returns 403 `enrollment_not_permitted`. Deleted agents stay disabled
+forever: nothing revives the account, and old registration, access and refresh tokens are
+refused. Deletion atomically revokes every device and refresh token and frees the owner's
+slot. In the same transaction it **releases** the agent's app identity: the
+`(entra-app,tid,oid)` row moves to the audit table `auth.released_identity` (with
+`released_at`; tenant and `client_app_id` stay on `auth.agent_enrollment`), and a
+`security` log line `auth.agent.identity_released` names the agent, owner, tenant, subject
+and client app. The released app is then unenrolled: without a code it gets 403
+`sign_in_not_permitted`; with a fresh code (of any owner) it enrolls a new agent. Only
+owner deletion disables an account; admin revoke-sessions is a sign-out and keeps the
+identity. Live sockets close **4003** after the durable revocation relay; no messages or
+account history are deleted. The disabled handle remains reserved, but disabled/pending
+accounts are absent from public lookups and batch profiles.
 Profile edits serialize with deletion: a `PATCH /v1/users/me` that loses to deletion
-returns 401 without changing the tombstone's display name or reserved handle.
+returns 401 without changing the deleted agent's display name or reserved handle.
 
 The first `agent.enrolled` projection accepts the owner/agent contact pair only if neither
 side has already blocked the other, including when device registration was projected first.

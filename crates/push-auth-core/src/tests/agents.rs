@@ -424,7 +424,7 @@ async fn a_legacy_linked_app_is_not_a_human_owner_even_with_the_old_default_kind
 }
 
 #[tokio::test]
-async fn same_app_competing_across_distinct_owners_has_one_permanent_binding() {
+async fn same_app_competing_across_distinct_owners_has_one_live_binding() {
     let (world, auth, _, owner) = setup().await;
     let other_owner = password_user(&auth, &world.pool, "another_owner", 1)
         .await
@@ -532,7 +532,7 @@ async fn owner_reserves_two_agents_with_ten_minute_single_use_codes() {
 }
 
 #[tokio::test]
-async fn consent_binds_a_separate_account_and_deletion_is_a_permanent_tombstone() {
+async fn consent_binds_a_separate_account_and_deletion_disables_it() {
     let (world, auth, router, owner) = setup().await;
     let (status, reservation) = call(
         &router,
@@ -1090,12 +1090,18 @@ async fn deletion_serializes_with_registration_refresh_and_reauthentication() {
                 auth.enroll_agent(&app, &reservation.enrollment_code)
                     .await
                     .err(),
-                Some(AuthError::IdentityInUse)
+                Some(AuthError::EnrollmentInvalid),
+                "the deleted agent's code stays spent"
             );
+            let replacement = auth
+                .reserve_agent(caller(&owner), "replacement_agent", "Replacement")
+                .await
+                .unwrap();
             assert!(
-                auth.reserve_agent(caller(&owner), "replacement_agent", "Replacement")
+                auth.enroll_agent(&app, &replacement.enrollment_code)
                     .await
-                    .is_ok()
+                    .is_ok(),
+                "deletion released the app"
             );
         }
     }
@@ -1134,4 +1140,130 @@ async fn agents_may_reserve_and_take_hyphenated_handles() {
             Err(AuthError::Invalid(_))
         ));
     }
+}
+
+#[tokio::test]
+async fn deleting_an_agent_releases_its_app_for_a_new_enrollment() {
+    let (world, auth, router, owner) = setup().await;
+    let object = Uuid::new_v4();
+    let token = app_token(&world, TENANT, object);
+    let first = auth
+        .reserve_agent(caller(&owner), "first_bot", "First")
+        .await
+        .unwrap();
+    let (status, registered) = call(
+        &router,
+        "POST",
+        "/v1/auth/entra-app",
+        "",
+        json!({"token":token,"enrollment_code":first.enrollment_code}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{registered}");
+    let registration = registered["registration_token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let device = auth
+        .register_device(&registration, Uuid::now_v7(), "Bot", "other")
+        .await
+        .unwrap();
+    let path = format!("/v1/agents/{}", first.user_id);
+    let (status, _) = call(&router, "DELETE", &path, &owner.access_token, json!({})).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // The released app is simply unenrolled: never the disabled account, never a new one.
+    let accounts = world.accounts().await;
+    let (status, refused) = call(
+        &router,
+        "POST",
+        "/v1/auth/entra-app",
+        "",
+        json!({"token":token}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{refused}");
+    assert_eq!(refused["error"]["code"], "sign_in_not_permitted");
+    assert_eq!(world.accounts().await, accounts);
+    assert!(auth.authenticate(&device.access_token).await.is_err());
+    assert!(auth.refresh(&device.refresh_token).await.is_err());
+    assert_eq!(
+        auth.register_device(&registration, Uuid::now_v7(), "Old", "other")
+            .await
+            .err(),
+        Some(AuthError::Unauthorized)
+    );
+    let released: (String, String, String, bool) = sqlx::query_as(
+        "SELECT provider, issuer, subject, released_at >= created_at \
+         FROM auth.released_identity WHERE user_id = $1",
+    )
+    .bind(first.user_id)
+    .fetch_one(&world.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        released,
+        ("entra-app".into(), TENANT.into(), object.to_string(), true)
+    );
+    let live: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM auth.external_identity WHERE user_id = $1")
+            .bind(first.user_id)
+            .fetch_one(&world.pool)
+            .await
+            .unwrap();
+    assert_eq!(live, 0);
+
+    let second = auth
+        .reserve_agent(caller(&owner), "second_bot", "Second")
+        .await
+        .unwrap();
+    let (status, rebound) = call(
+        &router,
+        "POST",
+        "/v1/auth/entra-app",
+        "",
+        json!({"token":token,"enrollment_code":second.enrollment_code}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rebound}");
+    assert_eq!(rebound["user_id"], second.user_id.to_string());
+    let (_, list) = call(&router, "GET", "/v1/agents", &owner.access_token, json!({})).await;
+    let agents = list["agents"].as_array().unwrap();
+    assert_eq!(agents.len(), 1);
+    assert_eq!(agents[0]["user_id"], second.user_id.to_string());
+    assert_eq!(agents[0]["state"], "active");
+    let disabled: bool = sqlx::query_scalar(
+        "SELECT disabled_at IS NOT NULL FROM auth.user_account WHERE user_id = $1",
+    )
+    .bind(first.user_id)
+    .fetch_one(&world.pool)
+    .await
+    .unwrap();
+    assert!(disabled, "the deleted agent stays disabled");
+    // Without a code the app now signs in to the new agent only.
+    let (status, again) = call(
+        &router,
+        "POST",
+        "/v1/auth/entra-app",
+        "",
+        json!({"token":token}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{again}");
+    assert_eq!(again["user_id"], second.user_id.to_string());
+    // And it still cannot be bound to a second live agent.
+    let third = auth
+        .reserve_agent(caller(&owner), "third_bot", "Third")
+        .await
+        .unwrap();
+    let (status, in_use) = call(
+        &router,
+        "POST",
+        "/v1/auth/entra-app",
+        "",
+        json!({"token":token,"enrollment_code":third.enrollment_code}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{in_use}");
+    assert_eq!(in_use["error"]["code"], "identity_in_use");
 }

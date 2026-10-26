@@ -94,6 +94,7 @@ async fn the_owner_migrates_and_a_second_run_changes_nothing() {
             "external_identity",
             "outbox",
             "refresh_token",
+            "released_identity",
             "user_account"
         ]
     );
