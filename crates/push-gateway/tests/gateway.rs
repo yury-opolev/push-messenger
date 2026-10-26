@@ -1073,3 +1073,180 @@ async fn a_failed_sync_is_retried() {
     };
     assert_eq!(entry.seq, 1);
 }
+
+/// An `Activity` frame.
+fn activity(conversation: &[u8], state: v1::ActivityState, label: Option<&str>) -> Body {
+    Body::Activity(v1::Activity {
+        conversation_id: conversation.to_vec(),
+        state: state.into(),
+        label: label.map(str::to_owned),
+    })
+}
+
+/// The next `ActivityEvent`, skipping other frames, within 5 s each.
+async fn next_activity(socket: &mut Socket) -> v1::ActivityEvent {
+    let Body::ActivityEvent(event) =
+        wait_for(socket, |body| matches!(body, Body::ActivityEvent(_))).await
+    else {
+        unreachable!("wait_for returns what it waited for");
+    };
+    event
+}
+
+/// Every `ActivityEvent` that arrives within `window`, skipping other frames.
+async fn activities_within(socket: &mut Socket, window: Duration) -> Vec<v1::ActivityEvent> {
+    let deadline = tokio::time::Instant::now() + window;
+    let mut events = Vec::new();
+    while let Ok(message) = tokio::time::timeout_at(deadline, socket.next()).await {
+        let message = message
+            .expect("the connection is open")
+            .expect("a WebSocket message");
+        if let Message::Binary(bytes) = message {
+            if let Body::ActivityEvent(event) = decode_frame(&bytes).expect("a valid frame") {
+                events.push(event);
+            }
+        }
+    }
+    events
+}
+
+/// Alice (two devices), Bob and Carol, with direct conversations Alice–Bob and
+/// Alice–Carol.
+#[tokio::test]
+async fn an_activity_reaches_the_other_members_and_not_other_conversations() {
+    let stack = stack().await;
+    let (alice, alice_phone) = person(&stack).await;
+    let (bob, bob_device) = person(&stack).await;
+    let (carol, carol_device) = person(&stack).await;
+    let alice_laptop = Uuid::now_v7();
+    stack
+        .messaging
+        .device_registered(DeviceId(alice_laptop), UserId(alice))
+        .await
+        .unwrap();
+    let with_bob = direct_chat(&stack, alice, bob).await;
+    direct_chat(&stack, alice, carol).await;
+    let mut bob_socket = ready(&stack, bob, bob_device).await;
+    let mut carol_socket = ready(&stack, carol, carol_device).await;
+    let mut laptop_socket = ready(&stack, alice, alice_laptop).await;
+    let mut phone_socket = ready(&stack, alice, alice_phone).await;
+
+    send(
+        &mut phone_socket,
+        activity(&with_bob, v1::ActivityState::Working, Some("running tests")),
+    )
+    .await;
+    assert_eq!(
+        next_activity(&mut bob_socket).await,
+        v1::ActivityEvent {
+            conversation_id: with_bob,
+            user_id: id_bytes(alice),
+            state: v1::ActivityState::Working.into(),
+            label: Some("running tests".to_owned()),
+            ttl_ms: 30_000,
+        }
+    );
+    // Not a member of that conversation, and the sender's own other device.
+    let window = Duration::from_millis(500);
+    assert_eq!(activities_within(&mut carol_socket, window).await, []);
+    assert_eq!(activities_within(&mut laptop_socket, window).await, []);
+    // Nothing answers a good activity.
+    assert_eq!(activities_within(&mut phone_socket, window).await, []);
+    send(&mut phone_socket, Body::Ping(Ping {})).await;
+    assert_eq!(next(&mut phone_socket).await, Body::Pong(Pong {}));
+}
+
+/// A connection that ends while its activity lasts tells the others it went idle.
+#[tokio::test]
+async fn an_activity_ends_with_idle_on_disconnect() {
+    let stack = stack().await;
+    let (alice, alice_device) = person(&stack).await;
+    let (bob, bob_device) = person(&stack).await;
+    let conversation = direct_chat(&stack, alice, bob).await;
+    let mut bob_socket = ready(&stack, bob, bob_device).await;
+    let mut alice_socket = ready(&stack, alice, alice_device).await;
+    send(
+        &mut alice_socket,
+        activity(&conversation, v1::ActivityState::Working, Some("compiling")),
+    )
+    .await;
+    assert_eq!(
+        next_activity(&mut bob_socket).await.state(),
+        v1::ActivityState::Working
+    );
+
+    alice_socket.close(None).await.unwrap();
+    assert_eq!(
+        next_activity(&mut bob_socket).await,
+        v1::ActivityEvent {
+            conversation_id: conversation,
+            user_id: id_bytes(alice),
+            state: v1::ActivityState::Idle.into(),
+            label: None,
+            ttl_ms: 0,
+        }
+    );
+}
+
+/// Ten activities at once: two go out, the latest of the rest a second later, and nothing
+/// else.
+#[tokio::test]
+async fn the_activity_rate_limit_holds() {
+    let stack = stack().await;
+    let (alice, alice_device) = person(&stack).await;
+    let (bob, bob_device) = person(&stack).await;
+    let conversation = direct_chat(&stack, alice, bob).await;
+    let mut bob_socket = ready(&stack, bob, bob_device).await;
+    let mut alice_socket = ready(&stack, alice, alice_device).await;
+    let mut last = None;
+    for step in 0..10 {
+        let state = if step % 2 == 0 {
+            v1::ActivityState::Typing
+        } else {
+            v1::ActivityState::Working
+        };
+        let label = format!("step {step}");
+        send(
+            &mut alice_socket,
+            activity(&conversation, state, Some(&label)),
+        )
+        .await;
+        last = Some((state, label));
+    }
+    let events = activities_within(&mut bob_socket, Duration::from_millis(2500)).await;
+    assert!(
+        (1..=3).contains(&events.len()),
+        "at most 2 at once and 1 trailing: {events:?}"
+    );
+    let (state, label) = last.unwrap();
+    let final_event = events.last().unwrap();
+    assert_eq!(final_event.state(), state);
+    assert_eq!(final_event.label.as_deref(), Some(label.as_str()));
+}
+
+/// An activity in a conversation the sender is not in is refused, never retryable, with
+/// no ids; the connection stays open.
+#[tokio::test]
+async fn an_activity_in_a_foreign_conversation_is_refused() {
+    let stack = stack().await;
+    let (alice, alice_device) = person(&stack).await;
+    let (bob, _) = person(&stack).await;
+    let (carol, _) = person(&stack).await;
+    let theirs = direct_chat(&stack, bob, carol).await;
+    let mut socket = ready(&stack, alice, alice_device).await;
+    send(
+        &mut socket,
+        activity(&theirs, v1::ActivityState::Typing, None),
+    )
+    .await;
+    let Body::Error(error) = wait_for(&mut socket, |body| matches!(body, Body::Error(_))).await
+    else {
+        unreachable!("wait_for returns what it waited for");
+    };
+    assert_eq!(error.code(), ErrorCode::NotMember);
+    assert!(!error.retryable);
+    assert_eq!(error.client_msg_id, None);
+    assert_eq!(error.request_id, None);
+    send(&mut socket, Body::Ping(Ping {})).await;
+    assert_eq!(next(&mut socket).await, Body::Pong(Pong {}));
+}

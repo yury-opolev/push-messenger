@@ -8,7 +8,8 @@ use std::time::Duration;
 use push_proto::close;
 use push_proto::v1::frame::Body;
 use push_proto::v1::{
-    Ack, Delete, Deliver, Edit, Error, ErrorCode, Pong, ReadUpTo, Ready, Request, Send, request,
+    Ack, Activity, Delete, Deliver, Edit, Error, ErrorCode, Pong, ReadUpTo, Ready, Request, Send,
+    request,
 };
 use push_proto::{FrameError, decode_frame, id_bytes};
 use uuid::Uuid;
@@ -41,6 +42,9 @@ pub enum Step {
     /// Forward a request to message-svc; answer with its `Response` or an error, both
     /// carrying the request's `request_id`.
     Request(Request),
+    /// Pace an activity through the connection's [`crate::ActivityLimiter`], then forward
+    /// it to message-svc; answer only if it fails, with an error that is never retryable.
+    Activity(Activity),
     /// Close the connection with this code and reason.
     Close(u16, &'static str),
 }
@@ -133,6 +137,7 @@ impl Session {
                 }
                 Step::Request(request)
             }
+            (Body::Activity(activity), State::Ready { .. }) => Step::Activity(activity),
             (Body::Ping(_), State::Ready { .. }) => Step::Reply(Body::Pong(Pong {})),
             (_, State::Ready { .. }) => reply_error(ErrorCode::BadFrame, "not a client frame"),
         }
@@ -260,8 +265,8 @@ fn reply_error(code: ErrorCode, message: &str) -> Step {
 #[cfg(test)]
 mod tests {
     use push_proto::v1::{
-        AddMembers, CreateGroup, Identify, LeaveGroup, ListContacts, Ping, ReAuth, RemoveMember,
-        RenameGroup, SetRole,
+        ActivityState, AddMembers, CreateGroup, Identify, LeaveGroup, ListContacts, Ping, ReAuth,
+        RemoveMember, RenameGroup, SetRole,
     };
     use push_proto::{MAX_FRAME_BYTES, encode_frame};
 
@@ -476,6 +481,22 @@ mod tests {
             session.on_binary(&encode_frame(Body::Request(list.clone()))),
             Step::Request(list)
         );
+    }
+
+    #[test]
+    fn activity_becomes_a_step_once_ready() {
+        let activity = Activity {
+            conversation_id: id_bytes(Uuid::now_v7()),
+            state: ActivityState::Working.into(),
+            label: Some("running tests".to_owned()),
+        };
+        let frame = encode_frame(Body::Activity(activity.clone()));
+        assert_eq!(
+            Session::new(false).on_binary(&frame),
+            Step::Close(1002, "the first frame must be Identify")
+        );
+        let (mut session, _) = ready_session();
+        assert_eq!(session.on_binary(&frame), Step::Activity(activity));
     }
 
     fn group_requests() -> Vec<request::Body> {
