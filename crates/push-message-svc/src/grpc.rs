@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use push_domain::{
-    ClientMsgId, Clock, ConversationId, DeviceId, MAX_SYNC_BATCH, Messaging, Notifier, SendText,
+    ClientMsgId, Clock, ConversationId, DeviceId, MAX_SYNC_BATCH, Messaging, Notifier, SendMessage,
     Store, UserId,
 };
 use push_proto::id_bytes;
@@ -61,20 +61,26 @@ where
         let sender = parse_id(&request.user_id, "user_id", UserId)?;
         let device = parse_id(&request.device_id, "device_id", DeviceId)?;
         let send = request.send.ok_or_else(|| invalid("send is required"))?;
-        if send.content_type() != ContentType::Text {
-            return Err(invalid("only text messages can be sent"));
-        }
-        let command = SendText {
+        let content_type = match send.content_type() {
+            ContentType::Text => push_domain::ContentType::Text,
+            ContentType::Rich => push_domain::ContentType::Rich,
+            ContentType::Answer => push_domain::ContentType::Answer,
+            ContentType::Unspecified | ContentType::SystemEvent => {
+                return Err(invalid("this content type cannot be sent"));
+            }
+        };
+        let command = SendMessage {
             sender,
             device,
             conversation: parse_id(&send.conversation_id, "conversation_id", ConversationId)?,
             client_msg_id: parse_id(&send.client_msg_id, "client_msg_id", ClientMsgId)?,
+            content_type,
             client_ts: send.client_ts.map(from_micros).transpose()?,
             body: send.body,
         };
         let receipt = self
             .messaging
-            .send_text(command)
+            .send_message(command)
             .await
             .map_err(domain_error)?;
         Ok(Response::new(send_ack(&receipt)))
@@ -291,10 +297,10 @@ where
 /// Guards an internal service: a call passes only with its shared internal token in its
 /// metadata, `authorization: Bearer <token>`, compared in constant time. Each service
 /// has a token of its own, given only to its caller: the worker's for `Accounts`,
-/// auth-svc's for `Directory`, the gateway's for `Messaging`. So the gateway cannot
-/// register devices or read relationships, and nobody but the gateway can act as a user,
-/// even though they can all reach message-svc. Without a configured token every call is
-/// refused.
+/// auth-svc's for `Directory` and `Templates`, the gateway's for `Messaging`. So the
+/// gateway cannot register devices, read relationships or review templates, and nobody
+/// but the gateway can act as a user, even though they can all reach message-svc. Without
+/// a configured token every call is refused.
 #[derive(Clone)]
 pub struct InternalToken {
     expected: Option<Arc<str>>,
@@ -317,7 +323,7 @@ impl InternalToken {
         }
     }
 
-    /// auth-svc's token for `Directory` (`PUSH_DIRECTORY_TOKEN`).
+    /// auth-svc's token for `Directory` and `Templates` (`PUSH_DIRECTORY_TOKEN`).
     pub fn directory(expected: Option<String>) -> Self {
         Self {
             expected: expected.map(Arc::from),
@@ -413,6 +419,7 @@ mod tests {
         api: Api,
         accounts: Accounts,
         directory: Directory,
+        messaging: Arc<Messaging<InMemoryStore, SystemClock, Arc<RecordingNotifier>>>,
         notifier: Arc<RecordingNotifier>,
     }
 
@@ -426,7 +433,8 @@ mod tests {
         World {
             api: MessagingApi::new(Arc::clone(&messaging)),
             accounts: AccountsApi::new(Arc::clone(&messaging)),
-            directory: DirectoryApi::new(messaging),
+            directory: DirectoryApi::new(Arc::clone(&messaging)),
+            messaging,
             notifier,
         }
     }
@@ -620,22 +628,24 @@ mod tests {
 
         let mut short_id = send_request(&alice, conversation, "hello");
         short_id.send.as_mut().unwrap().conversation_id = vec![1, 2, 3];
-        let not_text = SendRequest {
-            send: Some(Send {
-                content_type: ContentType::SystemEvent.into(),
-                ..send_request(&alice, conversation, "hello").send.unwrap()
-            }),
-            ..send_request(&alice, conversation, "hello")
-        };
         let empty = send_request(&alice, conversation, "");
         let missing = SendRequest {
             send: None,
             ..send_request(&alice, conversation, "hello")
         };
-        for request in [short_id, not_text, empty, missing] {
+        for request in [short_id, empty, missing] {
             let status = world.api.send(Request::new(request)).await.unwrap_err();
             assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
             assert_eq!(error_from_status(&status).code(), ErrorCode::Invalid);
+        }
+        for content_type in [ContentType::SystemEvent, ContentType::Unspecified] {
+            let mut request = send_request(&alice, conversation, "hello");
+            request.send.as_mut().unwrap().content_type = content_type.into();
+            let status = world.api.send(Request::new(request)).await.unwrap_err();
+            assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+            let error = error_from_status(&status);
+            assert_eq!(error.code(), ErrorCode::Invalid);
+            assert_eq!(error.message, "this content type cannot be sent");
         }
     }
 
@@ -714,6 +724,106 @@ mod tests {
             .await
             .unwrap_err();
         assert_invalid(status, "ack");
+    }
+
+    const APPROVAL: &str = r#"{"tpl":"agent.approval@1","params":{"title":"Deploy v2","details":"Ship it?"},"fallback":"Deploy v2?"}"#;
+
+    /// A person and their agent, enrolled as the worker relays it, in a direct
+    /// conversation, with the built-in templates seeded.
+    async fn agent_chat(world: &World) -> (Person, Person, ConversationId) {
+        world.messaging.seed_builtin_templates().await.unwrap();
+        let (owner, agent) = (person(world).await, person(world).await);
+        world
+            .accounts
+            .agent_enrolled(Request::new(AccountAgent {
+                user_id: id_bytes(agent.user.0),
+                owner_user_id: id_bytes(owner.user.0),
+            }))
+            .await
+            .unwrap();
+        let open = Request::new(RequestCall {
+            user_id: id_bytes(owner.user.0),
+            request: Some(push_proto::v1::Request {
+                request_id: 1,
+                body: Some(request::Body::OpenDirect(OpenDirect {
+                    peer_user_id: id_bytes(agent.user.0),
+                })),
+            }),
+        });
+        let Some(response::Body::DirectOpened(opened)) =
+            world.api.request(open).await.unwrap().into_inner().body
+        else {
+            panic!("not an opened conversation");
+        };
+        let conversation = ConversationId(id(&opened.conversation_id).unwrap());
+        (owner, agent, conversation)
+    }
+
+    fn send_of(
+        from: &Person,
+        conversation: ConversationId,
+        content_type: ContentType,
+        body: &str,
+    ) -> Request<SendRequest> {
+        let mut request = send_request(from, conversation, body);
+        request.send.as_mut().unwrap().content_type = content_type.into();
+        Request::new(request)
+    }
+
+    #[tokio::test]
+    async fn cards_and_answers_are_sent_and_synced() {
+        let world = world();
+        let (owner, agent, conversation) = agent_chat(&world).await;
+
+        let card = world
+            .api
+            .send(send_of(&agent, conversation, ContentType::Rich, APPROVAL))
+            .await
+            .unwrap()
+            .into_inner();
+        let card_id = id(&card.message_id).unwrap();
+        let answer =
+            format!(r#"{{"card":"{card_id}","values":["approve"],"fallback":"Approved"}}"#);
+        let reply = world
+            .api
+            .send(send_of(&owner, conversation, ContentType::Answer, &answer))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let entries = sync(&world, owner.device, 0).await.entries;
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].content_type(), ContentType::Rich);
+        assert_eq!(entries[0].answer_seq, Some(reply.seq));
+        assert_eq!(entries[0].body.as_deref(), Some(APPROVAL.as_bytes()));
+        assert_eq!(entries[1].content_type(), ContentType::Answer);
+        assert_eq!(entries[1].target_seq, Some(card.seq));
+
+        let status = world
+            .api
+            .send(send_of(&owner, conversation, ContentType::Answer, &answer))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), Code::FailedPrecondition);
+        assert_eq!(error_from_status(&status).code(), ErrorCode::Rejected);
+    }
+
+    #[tokio::test]
+    async fn cards_that_break_the_template_rules_are_invalid() {
+        let world = world();
+        let (owner, agent, conversation) = agent_chat(&world).await;
+        let unapproved = r#"{"tpl":"acme.unknown@1","params":{},"fallback":"A card"}"#;
+
+        for (from, body) in [(&owner, APPROVAL), (&agent, unapproved)] {
+            let status = world
+                .api
+                .send(send_of(from, conversation, ContentType::Rich, body))
+                .await
+                .unwrap_err();
+            assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+            assert_eq!(error_from_status(&status).code(), ErrorCode::Invalid);
+        }
+        assert!(sync(&world, owner.device, 0).await.entries.is_empty());
     }
 
     #[tokio::test]
