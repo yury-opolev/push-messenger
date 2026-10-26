@@ -187,8 +187,9 @@ card, so it is held to stricter rules than the values a sender fills in:
 - Nothing URL-like. The text is first normalised: NFKC (so fullwidth letters and similar
   compatibility forms count as the characters they stand for), the dot lookalikes U+3002,
   U+FF61, U+FE52 and U+2024 read as `.`, common Cyrillic and Greek letters that look like
-  Latin ones read as those (Cyrillic а е о р с у х і ј ѕ ԁ һ ӏ ԛ ԝ, Greek ο α ε ι κ ν ρ τ υ
-  χ, and their capitals, so `example.соm` with a Cyrillic `с` and `о` is `example.com`),
+  Latin ones read as those (Cyrillic а е о р с у х і ј ѕ ԁ һ ӏ ԛ ԝ к, Greek ο α ε ι κ ν ρ τ υ
+  χ, and their capitals, plus the capital-only lookalikes Cyrillic В Н К М Т and Greek
+  Β Η Μ Ζ, so `example.соm` with a Cyrillic `с` and `о` is `example.com`),
   then lower-cased. It is URL-like if it contains:
   - `//` or `www.`;
   - a known scheme at the start of a word: `javascript:`, `data:`, `vbscript:`, `file:`,
@@ -560,7 +561,8 @@ message-svc byte for byte, which parses it strictly and stores its canonical for
 - **Reserved publishers:** `agent`, `push`, `system`, `admin`, `builtin`, `official` and
   `verified`, and every publisher that starts with one of them (`agents`,
   `agent-official`, `push-team`, `admin1`, …: 409 `conflict`, "the publisher is
-  reserved"). The server owns `agent`.
+  reserved"). The server owns `agent`. The prefix rule is deliberately broad: it also
+  refuses ordinary names such as `agenda` or `pushover`; choose another publisher id.
 - **Pending cap:** at most 20 versions per account waiting for review (409 `conflict`).
 - **Rate limits:** 10 submissions per hour per account and 60 per hour per IP (429
   `rate_limited` with `Retry-After`).

@@ -70,7 +70,16 @@ fn latin_lookalike(c: char) -> Option<char> {
         'ӏ' => 'l',
         'ԛ' | 'Ԛ' => 'q',
         'ԝ' | 'Ԝ' => 'w',
+        'В' => 'b',
+        'Н' => 'h',
+        'К' | 'к' => 'k',
+        'М' => 'm',
+        'Т' => 't',
         // Greek
+        'Β' => 'b',
+        'Η' => 'h',
+        'Μ' => 'm',
+        'Ζ' => 'z',
         'ο' | 'Ο' => 'o',
         'α' | 'Α' => 'a',
         'ε' | 'Ε' => 'e',
@@ -340,6 +349,9 @@ mod tests {
             "example.c\u{03BF}m",
             "example.\u{039F}RG",
             "\u{0445}\u{0443}z.n\u{03B5}t",
+            "EXAMPLE.N\u{0415}\u{0422}",
+            "example.\u{041C}\u{0415}",
+            "EXAMPLE.\u{039C}\u{0395}",
         ] {
             assert!(looks_like_url(text), "{text}");
             assert!(check_literal(text, 80, false).is_err(), "{text}");

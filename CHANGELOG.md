@@ -49,7 +49,10 @@ Notable changes for consumers of push-messenger. Newest first.
     exclusive lock only for a moment, without a scan (with `lock_timeout` 5 s: behind a
     long transaction it fails and start-up retries it instead of stalling all traffic).
     0006 then validates the CHECKs online: `VALIDATE CONSTRAINT` scans under SHARE UPDATE
-    EXCLUSIVE, so reads and writes continue.
+    EXCLUSIVE, so reads and writes continue. The scan grows with the message table and
+    runs before the pod reports ready: on a large installation run the migrations as a
+    job first (`push-message-svc migrate`, the chart's migrate job) or allow a longer
+    start-up probe.
   - During a rolling upgrade old message-svc pods cannot decode content types 3 and 4: a
     request that reads a card or an answer fails there. Finish rolling out message-svc
     before approving or sending templates (the built-ins are approved as soon as the

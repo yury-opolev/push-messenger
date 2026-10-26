@@ -380,6 +380,10 @@ pending→approved, pending→rejected, approved→revoked with `DomainError::St
 `crates/push-store/src/{store,rows,codes}.rs`; `crates/push-store/tests/` (schema tests in
 an existing test file if one checks constraints, else `tests/templates.rs`).
 
+> Superseded during review: the shipped 0005 alters `messaging.message` in one statement
+> with `NOT VALID` CHECKs under `lock_timeout`, and `0006_validate_message_checks.sql`
+> validates them online. See the migration files for the final form.
+
 ```sql
 -- Rich message templates (REQUEST PUSH feature 8, spec 2026-10-26 rich message templates).
 --   message.content_type  3 rich, 4 answer
