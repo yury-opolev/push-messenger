@@ -4,6 +4,7 @@
 //! and read positions — independent of storage and transport. Storage is reached through
 //! the `Store` and `Tx` traits.
 
+mod activity;
 pub mod clock;
 mod contacts;
 mod conversations;
@@ -16,6 +17,7 @@ mod invites;
 pub mod memory;
 pub mod model;
 pub mod notify;
+mod presence;
 mod read;
 mod registry;
 mod rich;
@@ -25,8 +27,11 @@ pub mod store;
 mod sync;
 pub mod system;
 pub mod templates;
+#[cfg(test)]
+mod testing;
 pub mod validation;
 
+pub use activity::{ACTIVITY_TTL, ActivityState, MAX_ACTIVITY_LABEL_CHARS, validate_label};
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use edit::{DeleteMessage, EditText, MessageRef};
 pub use error::{DomainError, DomainResult};
@@ -40,6 +45,7 @@ pub use model::{
     Role, SendReceipt, StoredTemplate, TemplateAction, TemplateEvent, TemplateStatus, direct_key,
 };
 pub use notify::{Event, KickReason, NoopNotifier, Notifier, ReceiptUpdate, RecordingNotifier};
+pub use presence::{MAX_PRESENCE_BATCH, PresenceView};
 pub use registry::{Catalog, MAX_CATALOG_PAGE, MAX_PENDING_PER_USER, ReviewAction, ReviewCommand};
 pub use send::{SendMessage, SendText};
 pub use service::{Messaging, Policy};

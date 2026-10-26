@@ -416,6 +416,19 @@ impl Tx for PgTx {
         Ok(related.into_iter().map(UserId).collect())
     }
 
+    // Task 3 adds migration 0007 (`messaging.presence_hidden`) and the real queries.
+    async fn presence_hidden(&mut self, _users: &[UserId]) -> DomainResult<Vec<UserId>> {
+        Err(DomainError::Store(
+            "presence settings need migration 0007".into(),
+        ))
+    }
+
+    async fn set_presence_hidden(&mut self, _user: UserId, _hidden: bool) -> DomainResult<()> {
+        Err(DomainError::Store(
+            "presence settings need migration 0007".into(),
+        ))
+    }
+
     async fn insert_invite(&mut self, invite: InviteRecord) -> DomainResult<InsertOutcome> {
         let inserted = sqlx::query(
             "INSERT INTO messaging.invite \

@@ -179,6 +179,15 @@ pub trait Tx: Send {
         candidates: &[UserId],
     ) -> DomainResult<Vec<UserId>>;
 
+    // --- Presence ----------------------------------------------------------------------
+
+    /// The users among `users` who hide their presence. Duplicates in `users` are ignored;
+    /// unknown users hide nothing. The order of the result is unspecified.
+    async fn presence_hidden(&mut self, users: &[UserId]) -> DomainResult<Vec<UserId>>;
+    /// Hides (`true`) or shows `user`'s presence. Idempotent. Fails with
+    /// `DomainError::Store` when hiding the presence of a user who is not known.
+    async fn set_presence_hidden(&mut self, user: UserId, hidden: bool) -> DomainResult<()>;
+
     // --- Invites -----------------------------------------------------------------------
 
     /// Stores a new invite. Returns `Duplicate`, writing nothing, if an invite with the same

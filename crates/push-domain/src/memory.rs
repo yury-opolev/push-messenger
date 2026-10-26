@@ -61,6 +61,8 @@ struct State {
     contacts: HashMap<(UserId, UserId), ContactState>,
     /// Blocked rows whose owner could see the peer when blocking.
     sighted_blocks: HashSet<(UserId, UserId)>,
+    /// Users who hide their presence.
+    presence_hidden: HashSet<UserId>,
     invites: HashMap<String, InviteRecord>,
     conversations: HashMap<ConversationId, Conversation>,
     direct_index: HashMap<[u8; 32], ConversationId>,
@@ -477,6 +479,29 @@ impl Tx for InMemoryTx {
         related.sort();
         related.dedup();
         Ok(related)
+    }
+
+    async fn presence_hidden(&mut self, users: &[UserId]) -> DomainResult<Vec<UserId>> {
+        let mut hidden: Vec<UserId> = users
+            .iter()
+            .copied()
+            .filter(|user| self.work.presence_hidden.contains(user))
+            .collect();
+        hidden.sort();
+        hidden.dedup();
+        Ok(hidden)
+    }
+
+    async fn set_presence_hidden(&mut self, user: UserId, hidden: bool) -> DomainResult<()> {
+        if hidden {
+            if !self.work.users.contains(&user) {
+                return Err(missing("user"));
+            }
+            self.work.presence_hidden.insert(user);
+        } else {
+            self.work.presence_hidden.remove(&user);
+        }
+        Ok(())
     }
 
     async fn insert_invite(&mut self, invite: InviteRecord) -> DomainResult<InsertOutcome> {
