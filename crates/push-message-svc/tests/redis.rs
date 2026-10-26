@@ -1,16 +1,25 @@
 //! `RedisNotifier` and `RedisPresence` against a real Redis (Docker must be running).
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use prost::Message;
-use push_domain::{Event, Notifier, PresenceView, UserId};
-use push_message_svc::{PresenceStates, RedisNotifier};
-use push_proto::internal::v1::{EntriesAvailable, Notification, notification::Kind};
-use push_proto::{notify_channel, presence_conns_key, presence_state_key};
+use push_domain::{
+    DeviceId, Event, InMemoryStore, Messaging, Notifier, PresenceView, RecordingNotifier,
+    SystemClock, UserId,
+};
+use push_message_svc::{MessagingApi, PresenceStates, PresenceUnavailable, RedisNotifier};
+use push_proto::internal::v1::messaging_server::Messaging as MessagingRpc;
+use push_proto::internal::v1::{
+    AnnouncePresenceRequest, EntriesAvailable, Notification, RequestCall, notification::Kind,
+};
+use push_proto::v1::{self, GetPresence, PresenceState, request, response};
+use push_proto::{id_bytes, notify_channel, presence_conns_key, presence_state_key};
 use testcontainers_modules::redis::Redis;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::{ContainerAsync, ImageExt};
 use tokio_stream::StreamExt;
+use tonic::Request;
 
 async fn redis() -> (ContainerAsync<Redis>, String) {
     let container = Redis::default()
@@ -153,7 +162,7 @@ async fn the_read_script_reports_online_offline_and_flips_once() {
         .presence();
     let users = [online, gone, never];
     let last_seen = chrono::DateTime::from_timestamp(minute, 0);
-    let (views, flipped) = presence.states(&users).await;
+    let (views, flipped) = presence.states(&users).await.unwrap();
     assert_eq!(
         views,
         [
@@ -164,7 +173,7 @@ async fn the_read_script_reports_online_offline_and_flips_once() {
     );
     assert_eq!(flipped, [gone]);
 
-    let (views, flipped) = presence.states(&users).await;
+    let (views, flipped) = presence.states(&users).await.unwrap();
     assert_eq!(views[1], PresenceView::Offline { last_seen });
     assert!(flipped.is_empty(), "a user flips only once");
     let expired: i64 = redis::cmd("ZCARD")
@@ -180,22 +189,77 @@ async fn the_read_script_reports_online_offline_and_flips_once() {
         .query_async(&mut admin)
         .await
         .unwrap();
-    let (views, _) = presence.states(&[online]).await;
+    let (views, _) = presence.states(&[online]).await.unwrap();
     assert_eq!(views, [PresenceView::Online]);
 }
 
 #[tokio::test]
-async fn presence_reads_without_redis_answer_offline() {
+async fn presence_reads_without_redis_answer_offline_and_push_nothing() {
     let (container, url) = redis().await;
     let presence = RedisNotifier::connect(&url)
         .await
         .expect("connect")
         .presence();
+    let notifier = Arc::new(RecordingNotifier::default());
+    let messaging = Arc::new(Messaging::new(
+        InMemoryStore::default(),
+        SystemClock,
+        Arc::clone(&notifier),
+    ));
+    let (alice, bob) = (UserId::new(), UserId::new());
+    for user in [alice, bob] {
+        messaging
+            .device_registered(DeviceId::new(), user)
+            .await
+            .unwrap();
+    }
+    messaging.contact_request(alice, bob).await.unwrap();
+    messaging.contact_accept(bob, alice).await.unwrap();
+    let api = MessagingApi::with_presence(Arc::clone(&messaging), Arc::new(presence.clone()));
     container.stop().await.expect("stop Redis");
+    notifier.take();
+
     let users = [UserId::new(), UserId::new()];
-    let (views, flipped) = tokio::time::timeout(Duration::from_secs(30), presence.states(&users))
+    let failed = tokio::time::timeout(Duration::from_secs(30), presence.states(&users))
         .await
         .expect("a failed read gives up instead of hanging");
-    assert_eq!(views, [PresenceView::Offline { last_seen: None }; 2]);
-    assert!(flipped.is_empty());
+    assert_eq!(failed, Err(PresenceUnavailable));
+
+    let get = request::Body::GetPresence(GetPresence {
+        user_ids: vec![id_bytes(bob.0), id_bytes(alice.0)],
+    });
+    let call = RequestCall {
+        user_id: id_bytes(alice.0),
+        request: Some(v1::Request {
+            request_id: 7,
+            body: Some(get),
+        }),
+    };
+    let answered = tokio::time::timeout(Duration::from_secs(30), api.request(Request::new(call)))
+        .await
+        .expect("GetPresence gives up instead of hanging")
+        .expect("GetPresence answers")
+        .into_inner();
+    let Some(response::Body::Presences(list)) = answered.body else {
+        panic!("not a presence list");
+    };
+    assert_eq!(
+        list.presences
+            .iter()
+            .map(|presence| (presence.state(), presence.last_seen))
+            .collect::<Vec<_>>(),
+        [(PresenceState::Offline, None); 2]
+    );
+
+    let announce = AnnouncePresenceRequest {
+        user_id: id_bytes(alice.0),
+    };
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        api.announce_presence(Request::new(announce)),
+    )
+    .await
+    .expect("an announcement gives up instead of hanging")
+    .expect("an announcement that read nothing still succeeds");
+    assert_eq!(notifier.take(), vec![], "nothing is pushed");
 }

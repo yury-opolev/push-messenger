@@ -10,7 +10,7 @@ use push_domain::{
 };
 use push_proto::internal::v1::messaging_server::Messaging as MessagingRpc;
 use push_proto::internal::v1::{
-    DeleteRequest, EditRequest, ReadUpToRequest, RequestCall, SendRequest,
+    AnnouncePresenceRequest, DeleteRequest, EditRequest, ReadUpToRequest, RequestCall, SendRequest,
 };
 use push_proto::v1::{
     self, AddMembers, Contact, ContactAccept, ContactBlock, ContactRequest, ContactState,
@@ -929,6 +929,55 @@ async fn opting_out_answers_unknown_to_contacts_and_hides_them_from_the_hider() 
     );
     assert_eq!(
         get_presence(&world, &bob, of_alice).await.unwrap(),
+        [presence(&alice, PresenceState::Online, None)]
+    );
+}
+
+#[tokio::test]
+async fn presence_that_cannot_be_read_answers_offline_and_is_never_pushed() {
+    let world = world();
+    let (alice, bob, carol) = (
+        world.person().await,
+        world.person().await,
+        world.person().await,
+    );
+    world.befriend(&alice, &bob).await;
+    world.presence.set(alice.user, PresenceView::Online);
+    world.presence.set(bob.user, PresenceView::Online);
+    assert!(!sharing(&world, &alice, Some(false)).await);
+    world.notifier.take();
+    world.presence.set_unavailable(true);
+
+    let ids = [&bob, &carol]
+        .iter()
+        .map(|person| id_bytes(person.user.0))
+        .collect();
+    assert_eq!(
+        get_presence(&world, &bob, ids).await.unwrap(),
+        [
+            presence(&bob, PresenceState::Offline, None),
+            presence(&carol, PresenceState::Unknown, None),
+        ]
+    );
+    assert!(
+        sharing(&world, &alice, Some(true)).await,
+        "the setting changes"
+    );
+    assert!(sharing(&world, &alice, None).await);
+    world
+        .api
+        .announce_presence(Request::new(AnnouncePresenceRequest {
+            user_id: id_bytes(alice.user.0),
+        }))
+        .await
+        .unwrap();
+    assert_eq!(world.notifier.take(), vec![], "nothing is pushed");
+
+    world.presence.set_unavailable(false);
+    assert_eq!(
+        get_presence(&world, &bob, vec![id_bytes(alice.user.0)])
+            .await
+            .unwrap(),
         [presence(&alice, PresenceState::Online, None)]
     );
 }

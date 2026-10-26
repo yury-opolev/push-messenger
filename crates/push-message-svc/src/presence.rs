@@ -2,6 +2,7 @@
 //! and presence, "Redis presence state").
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -12,14 +13,23 @@ use push_proto::{presence_conns_key, presence_state_key};
 use redis::aio::ConnectionManager;
 use redis::{ErrorKind, RedisResult, ServerErrorKind};
 
+/// The live presence could not be read (Redis failed or timed out). Nothing read this way
+/// may be pushed: a guess would tell contacts a wrong state until the next transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("presence is unavailable")]
+pub struct PresenceUnavailable;
+
 /// The live presence of users, as the gateways recorded it in Redis.
 #[async_trait]
 pub trait PresenceStates: Send + Sync {
     /// The state of each of `users` (same order): `Online` or `Offline { last_seen }`;
-    /// never `Unknown`. On a Redis failure, `Offline { last_seen: None }` for all (logged).
-    /// `flipped` lists users this read found newly offline (their gateway died without
-    /// settling): the caller announces them.
-    async fn states(&self, users: &[UserId]) -> (Vec<PresenceView>, Vec<UserId>);
+    /// never `Unknown`. `flipped` lists users this read found newly offline (their
+    /// gateway died without settling): the caller announces them. When the state cannot
+    /// be read, `PresenceUnavailable` (logged here).
+    async fn states(
+        &self,
+        users: &[UserId],
+    ) -> Result<(Vec<PresenceView>, Vec<UserId>), PresenceUnavailable>;
 }
 
 /// Prunes the expired leases of one user and reports `{online, seen, flipped}`: online
@@ -110,9 +120,12 @@ impl RedisPresence {
 
 #[async_trait]
 impl PresenceStates for RedisPresence {
-    async fn states(&self, users: &[UserId]) -> (Vec<PresenceView>, Vec<UserId>) {
+    async fn states(
+        &self,
+        users: &[UserId],
+    ) -> Result<(Vec<PresenceView>, Vec<UserId>), PresenceUnavailable> {
         if users.is_empty() {
-            return (Vec::new(), Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         }
         let read = match tokio::time::timeout(READ_TIMEOUT, self.read(users)).await {
             Ok(Ok(read)) if read.len() == users.len() => Ok(read),
@@ -123,12 +136,8 @@ impl PresenceStates for RedisPresence {
         let read = match read {
             Ok(read) => read,
             Err(error) => {
-                tracing::warn!(
-                    %error,
-                    count = users.len(),
-                    "could not read presence; answering offline"
-                );
-                return (offline(users.len()), Vec::new());
+                tracing::warn!(%error, count = users.len(), "could not read presence");
+                return Err(PresenceUnavailable);
             }
         };
         let mut flipped = Vec::new();
@@ -150,15 +159,17 @@ impl PresenceStates for RedisPresence {
                 }
             })
             .collect();
-        (views, flipped)
+        Ok((views, flipped))
     }
 }
 
-/// For tests: fixed states; everyone else offline without `last_seen`.
+/// For tests: fixed states; everyone else offline without `last_seen`. Can be made
+/// unavailable, as Redis is when it fails.
 #[derive(Default)]
 pub struct FixedPresence {
     views: Mutex<HashMap<UserId, PresenceView>>,
     flips: Mutex<HashSet<UserId>>,
+    unavailable: AtomicBool,
 }
 
 impl FixedPresence {
@@ -173,11 +184,22 @@ impl FixedPresence {
         self.set(user, PresenceView::Offline { last_seen: None });
         self.flips.lock().expect("presence lock").insert(user);
     }
+
+    /// Makes every read fail with `PresenceUnavailable` (or succeed again).
+    pub fn set_unavailable(&self, unavailable: bool) {
+        self.unavailable.store(unavailable, Ordering::SeqCst);
+    }
 }
 
 #[async_trait]
 impl PresenceStates for FixedPresence {
-    async fn states(&self, users: &[UserId]) -> (Vec<PresenceView>, Vec<UserId>) {
+    async fn states(
+        &self,
+        users: &[UserId],
+    ) -> Result<(Vec<PresenceView>, Vec<UserId>), PresenceUnavailable> {
+        if self.unavailable.load(Ordering::SeqCst) {
+            return Err(PresenceUnavailable);
+        }
         let views = self.views.lock().expect("presence lock");
         let mut flips = self.flips.lock().expect("presence lock");
         let states = users
@@ -194,7 +216,7 @@ impl PresenceStates for FixedPresence {
             .filter(|user| flips.remove(user))
             .copied()
             .collect();
-        (states, flipped)
+        Ok((states, flipped))
     }
 }
 
@@ -203,28 +225,34 @@ pub struct OfflinePresence;
 
 #[async_trait]
 impl PresenceStates for OfflinePresence {
-    async fn states(&self, users: &[UserId]) -> (Vec<PresenceView>, Vec<UserId>) {
-        (offline(users.len()), Vec::new())
+    async fn states(
+        &self,
+        users: &[UserId],
+    ) -> Result<(Vec<PresenceView>, Vec<UserId>), PresenceUnavailable> {
+        Ok((offline(users.len()), Vec::new()))
     }
 }
 
-fn offline(count: usize) -> Vec<PresenceView> {
+/// `count` users offline without `last_seen`.
+pub(crate) fn offline(count: usize) -> Vec<PresenceView> {
     vec![PresenceView::Offline { last_seen: None }; count]
 }
 
-/// `user`'s current state, read for an announcement. A flip this read finds is `user`
-/// itself, which the announcement publishes anyway.
-async fn current(presence: &dyn PresenceStates, user: UserId) -> PresenceView {
-    presence
-        .states(&[user])
-        .await
-        .0
-        .first()
-        .copied()
-        .unwrap_or(PresenceView::Offline { last_seen: None })
+/// `user`'s current state, read for an announcement; `None` when it cannot be read, so
+/// nothing is published (logged). A flip this read finds is `user` itself, which the
+/// announcement publishes anyway.
+async fn current(presence: &dyn PresenceStates, user: UserId) -> Option<PresenceView> {
+    match presence.states(&[user]).await {
+        Ok((views, _)) => views.first().copied(),
+        Err(PresenceUnavailable) => {
+            tracing::warn!(user = %user.0, "presence unavailable; publishing nothing");
+            None
+        }
+    }
 }
 
-/// Announces `user`'s current state to their presence audience.
+/// Announces `user`'s current state to their presence audience; nothing when the state
+/// cannot be read (the next transition or read corrects it).
 pub(crate) async fn announce<S: Store, C: Clock, N: Notifier>(
     messaging: &Messaging<S, C, N>,
     presence: &dyn PresenceStates,
@@ -235,7 +263,8 @@ pub(crate) async fn announce<S: Store, C: Clock, N: Notifier>(
         .await
 }
 
-/// Switches `user`'s presence sharing; showing publishes their current state.
+/// Switches `user`'s presence sharing; showing publishes their current state, unless it
+/// cannot be read (the setting still changes).
 pub(crate) async fn set_sharing<S: Store, C: Clock, N: Notifier>(
     messaging: &Messaging<S, C, N>,
     presence: &dyn PresenceStates,

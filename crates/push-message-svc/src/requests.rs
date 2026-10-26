@@ -312,7 +312,8 @@ async fn answer<S: Store, C: Clock, N: Notifier>(
 
 /// `GetPresence`: one presence per distinct id, in request order. Users the viewer may not
 /// see are `UNKNOWN`; the others are read from the live state, and anyone the read finds
-/// newly offline is announced before answering.
+/// newly offline is announced before answering. When the state cannot be read, the others
+/// are `OFFLINE` without `last_seen` and nothing is announced.
 async fn get_presence<S: Store, C: Clock, N: Notifier>(
     messaging: &Messaging<S, C, N>,
     presence: &dyn PresenceStates,
@@ -333,7 +334,12 @@ async fn get_presence<S: Store, C: Clock, N: Notifier>(
         .presence_viewable(viewer, &distinct)
         .await
         .map_err(domain_error)?;
-    let (views, flipped) = presence.states(&viewable).await;
+    // Unreadable presence answers offline (never pushed): the viewer asked, so it must
+    // get an answer, and nothing announces it.
+    let (views, flipped) = presence
+        .states(&viewable)
+        .await
+        .unwrap_or_else(|_| (presence::offline(viewable.len()), Vec::new()));
     presence::announce_flipped(messaging, presence, &flipped).await;
     let views: HashMap<UserId, PresenceView> = viewable.into_iter().zip(views).collect();
     Ok(PresenceList {

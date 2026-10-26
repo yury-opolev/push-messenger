@@ -89,8 +89,10 @@ where
     /// Switches sharing and returns the new setting. When it changes, hiding publishes
     /// `Unknown` to the former audience (computed before the change), and showing
     /// publishes `current()` (the transport's view of the user, read only when showing) to
-    /// the new audience. An unchanged setting publishes nothing. An unknown user is
-    /// `UnknownUser`.
+    /// the new audience. When `current()` is `None` (the state cannot be read right now),
+    /// showing still changes the setting but publishes nothing: a guess could push a wrong
+    /// state, and the next announcement corrects the audience. An unchanged setting
+    /// publishes nothing. An unknown user is `UnknownUser`.
     ///
     /// Publications of a user's presence are serialized by the user's lock so a hide or
     /// block is never followed by a stale `Online`: this takes the lock before it reads
@@ -105,7 +107,7 @@ where
     ) -> DomainResult<bool>
     where
         F: FnOnce() -> Fut + Send,
-        Fut: Future<Output = PresenceView> + Send,
+        Fut: Future<Output = Option<PresenceView>> + Send,
     {
         let mut tx = self.store.begin().await?;
         tx.lock_users(&[user]).await?;
@@ -128,16 +130,19 @@ where
             let view = if share {
                 current().await
             } else {
-                PresenceView::Unknown
+                Some(PresenceView::Unknown)
             };
-            self.publish(vec![Event::Presence { to, user, view }]).await;
+            if let Some(view) = view {
+                self.publish(vec![Event::Presence { to, user, view }]).await;
+            }
         }
         tx.commit().await?;
         Ok(share)
     }
 
     /// Publishes `current()` (the transport's view of `user`) to
-    /// [`Self::presence_audience`]; nothing when it is empty.
+    /// [`Self::presence_audience`]; nothing when it is empty, or when `current()` is `None`
+    /// (the state cannot be read right now: a guess could push a wrong state).
     ///
     /// Publications of a user's presence are serialized by the user's lock so a hide or
     /// block is never followed by a stale `Online`: this takes the lock, computes the
@@ -148,13 +153,14 @@ where
     pub async fn announce_presence<F, Fut>(&self, user: UserId, current: F) -> DomainResult<()>
     where
         F: FnOnce() -> Fut + Send,
-        Fut: Future<Output = PresenceView> + Send,
+        Fut: Future<Output = Option<PresenceView>> + Send,
     {
         let mut tx = self.store.begin().await?;
         tx.lock_users(&[user]).await?;
         let to = audience(&mut tx, user).await?;
-        if !to.is_empty() {
-            let view = current().await;
+        if !to.is_empty()
+            && let Some(view) = current().await
+        {
             self.publish(vec![Event::Presence { to, user, view }]).await;
         }
         tx.rollback().await?;
@@ -214,8 +220,13 @@ mod tests {
     }
 
     /// A state source for tests: the user is online.
-    async fn online() -> PresenceView {
-        PresenceView::Online
+    async fn online() -> Option<PresenceView> {
+        Some(PresenceView::Online)
+    }
+
+    /// A state source for tests that cannot read the state.
+    async fn unreadable() -> Option<PresenceView> {
+        None
     }
 
     #[tokio::test]
@@ -234,7 +245,7 @@ mod tests {
         let reads = std::sync::atomic::AtomicUsize::new(0);
         let source = || async {
             reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            seen
+            Some(seen)
         };
 
         service.announce_presence(alice, source).await.unwrap();
@@ -412,7 +423,7 @@ mod tests {
         };
         assert_eq!(
             service
-                .set_presence_sharing(alice, true, move || async move { current })
+                .set_presence_sharing(alice, true, move || async move { Some(current) })
                 .await,
             Ok(true)
         );
@@ -424,6 +435,29 @@ mod tests {
                 view: current,
             }]
         );
+    }
+
+    #[tokio::test]
+    async fn a_state_that_cannot_be_read_is_never_published() {
+        let (service, notifier) = service();
+        let (alice, bob) = (user(&service).await, user(&service).await);
+        befriend(&service, alice, bob).await;
+        service
+            .set_presence_sharing(alice, false, online)
+            .await
+            .unwrap();
+        notifier.take();
+
+        assert_eq!(
+            service.set_presence_sharing(alice, true, unreadable).await,
+            Ok(true)
+        );
+        assert_eq!(notifier.take(), vec![], "showing publishes no guess");
+        assert_eq!(service.presence_sharing(alice).await, Ok(true));
+        assert_eq!(service.presence_audience(alice).await, Ok(vec![bob]));
+
+        assert_eq!(service.announce_presence(alice, unreadable).await, Ok(()));
+        assert_eq!(notifier.take(), vec![], "announcing publishes no guess");
     }
 
     #[tokio::test]
