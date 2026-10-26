@@ -35,7 +35,7 @@ others" mode, durable activity history, push notifications (APNs/FCM) for presen
 | Membership | The sender must be a current member; otherwise the usual `CONVERSATION_NOT_FOUND`/`NOT_MEMBER` error frame comes back. Blocks never produce an error (no block is revealed). |
 | Label | Optional, trimmed by the client; 1–60 characters (Unicode scalar values) when present; same value rules as template param values (`check_value`, `docs/rich-messages.md` §5): no control characters (no `\n` either), no U+2028/U+2029, no invisible/formatting/bidi characters. URLs and markup are *allowed*, rendered as inert plain text — consistent with the templates' policy for sender-filled values. An empty string means no label; whitespace-only is `INVALID`. `idle` never carries a label (dropped). |
 | Rate limit | Per device (= per connection: a device has at most one live connection, takeover closes older ones) token bucket: burst 2, refill 1 per second. Excess frames are **not** errors: the latest excess activity per conversation is kept (newest wins) and sent when a token frees up (trailing edge), so the final state always arrives and fan-out never exceeds the rate. At most 16 conversations wait; beyond that the frame is dropped silently. The general frame budget (close 4004) still applies on top. |
-| Activity errors | `Error` frame without ids: `INVALID` (bad label, unspecified state, bad id), `CONVERSATION_NOT_FOUND`, `NOT_MEMBER`, `UNAVAILABLE`. |
+| Activity errors | `Error` frame without ids, **never retryable** (an anonymous retryable error means "send ReAuth again" to SDKs; activity is refreshed anyway): `INVALID` (bad label, unspecified state, bad id), `CONVERSATION_NOT_FOUND`, `NOT_MEMBER`, `UNAVAILABLE`. |
 | Presence states | `PRESENCE_STATE_UNKNOWN` (0) / `ONLINE` (1) / `OFFLINE` (2, optional `last_seen`). "Not visible" — stranger, pending, blocked either way, opted out, the viewer opted out, unknown id — is always `UNKNOWN` with no `last_seen`, so none of these is distinguishable from the others. |
 | Aggregation | Online while at least one connection (any device, any gateway replica) holds a lease. |
 | Debounce | A closed connection keeps its lease for a 10 s grace period (`PUSH_PRESENCE_GRACE_MS`, default 10000). A reconnect within the grace (network blip, gateway rollout) never shows offline. Offline is announced once the last lease ends. |
@@ -127,7 +127,7 @@ unaffected. If Redis is flushed, `last_seen` is lost.
 
 ## Error handling
 
-- Activity RPC failure (message-svc down): `UNAVAILABLE` error frame, retryable.
+- Activity RPC failure (message-svc down): `UNAVAILABLE` error frame, not retryable.
 - Presence Redis failures in the gateway are logged and ignored (fail open: the
   connection continues; presence may be stale until the next refresh).
 - `AnnouncePresence` failures are logged; the next transition or read corrects state.
