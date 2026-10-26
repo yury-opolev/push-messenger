@@ -420,10 +420,10 @@ async fn a_block_is_announced_only_to_the_blocker<B: Backend>(backend: &B) {
 
     world.svc.contact_block(alice.user, bob.user).await.unwrap();
     // Bob's presence events are the same `Unknown` an opt-out gives: no sign of a block.
+    // They go out under the users' locks, before the commit and so before the change.
     assert_eq!(
         world.notifier.take(),
         [
-            changed(&alice, &bob, Some(ContactState::Blocked)),
             Event::Presence {
                 to: vec![bob.user],
                 user: alice.user,
@@ -434,6 +434,7 @@ async fn a_block_is_announced_only_to_the_blocker<B: Backend>(backend: &B) {
                 user: bob.user,
                 view: PresenceView::Unknown,
             },
+            changed(&alice, &bob, Some(ContactState::Blocked)),
         ]
     );
 }

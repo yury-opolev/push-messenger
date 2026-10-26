@@ -119,11 +119,15 @@ where
 
     /// Blocks `peer`. Ends any contact; `peer`'s side is removed unless they also block.
     /// `peer` is never told. Blocking an id that is not a verified user stores nothing.
-    /// Blocking an accepted contact also publishes `Unknown` presence both ways.
+    /// Blocking an accepted contact also publishes `Unknown` presence both ways, under both
+    /// users' locks and before the commit, so no announcement already under way can follow
+    /// it with a stale `Online` (see [`Self::announce_presence`]). Should the commit fail,
+    /// the contacts only saw `Unknown` early.
     pub async fn contact_block(&self, me: UserId, peer: UserId) -> DomainResult<()> {
         let Some(mut tx) = self.begin_pair(me, peer).await? else {
             return Ok(());
         };
+        tx.lock_users(&[me, peer]).await?;
         let blocked = Some(ContactState::Blocked);
         let mut events = Vec::new();
         // The block records whether `me` could see `peer` until now, so that blocking a
@@ -145,16 +149,18 @@ where
         if theirs != blocked {
             set_contact(&mut tx, peer, me, None).await?;
         }
-        tx.commit().await?;
         if presence_ended {
-            for (to, user) in [(peer, me), (me, peer)] {
-                events.push(Event::Presence {
+            let presence = [(peer, me), (me, peer)]
+                .into_iter()
+                .map(|(to, user)| Event::Presence {
                     to: vec![to],
                     user,
                     view: PresenceView::Unknown,
-                });
-            }
+                })
+                .collect();
+            self.publish(presence).await;
         }
+        tx.commit().await?;
         self.publish(events).await;
         Ok(())
     }

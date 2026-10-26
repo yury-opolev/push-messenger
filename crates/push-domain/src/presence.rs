@@ -88,15 +88,27 @@ where
 
     /// Switches sharing and returns the new setting. When it changes, hiding publishes
     /// `Unknown` to the former audience (computed before the change), and showing
-    /// publishes `current` (the transport's view of the user) to the new audience. An
-    /// unchanged setting publishes nothing. An unknown user is `UnknownUser`.
-    pub async fn set_presence_sharing(
+    /// publishes `current()` (the transport's view of the user, read only when showing) to
+    /// the new audience. An unchanged setting publishes nothing. An unknown user is
+    /// `UnknownUser`.
+    ///
+    /// Publications of a user's presence are serialized by the user's lock so a hide or
+    /// block is never followed by a stale `Online`: this takes the lock before it reads
+    /// the setting, and publishes before it commits. Should the commit then fail, the
+    /// audience saw the change early: `Unknown` for a hide (harmless), or the current
+    /// state for a show until the next announcement.
+    pub async fn set_presence_sharing<F, Fut>(
         &self,
         user: UserId,
         share: bool,
-        current: PresenceView,
-    ) -> DomainResult<bool> {
+        current: F,
+    ) -> DomainResult<bool>
+    where
+        F: FnOnce() -> Fut + Send,
+        Fut: Future<Output = PresenceView> + Send,
+    {
         let mut tx = self.store.begin().await?;
+        tx.lock_users(&[user]).await?;
         if !tx.user_exists(user).await? {
             return Err(DomainError::UnknownUser);
         }
@@ -104,27 +116,48 @@ where
             tx.rollback().await?;
             return Ok(share);
         }
-        let (to, view) = if share {
+        let to = if share {
             tx.set_presence_hidden(user, false).await?;
-            (audience(&mut tx, user).await?, current)
+            audience(&mut tx, user).await?
         } else {
             let former = audience(&mut tx, user).await?;
             tx.set_presence_hidden(user, true).await?;
-            (former, PresenceView::Unknown)
+            former
         };
-        tx.commit().await?;
         if !to.is_empty() {
+            let view = if share {
+                current().await
+            } else {
+                PresenceView::Unknown
+            };
             self.publish(vec![Event::Presence { to, user, view }]).await;
         }
+        tx.commit().await?;
         Ok(share)
     }
 
-    /// Publishes `view` of `user` to [`Self::presence_audience`]; nothing when it is empty.
-    pub async fn announce_presence(&self, user: UserId, view: PresenceView) -> DomainResult<()> {
-        let to = self.presence_audience(user).await?;
+    /// Publishes `current()` (the transport's view of `user`) to
+    /// [`Self::presence_audience`]; nothing when it is empty.
+    ///
+    /// Publications of a user's presence are serialized by the user's lock so a hide or
+    /// block is never followed by a stale `Online`: this takes the lock, computes the
+    /// audience, reads `current()` and publishes, all before it releases the lock. Reading
+    /// the state inside the lock also keeps two announcements in order: the later one
+    /// publishes the later state. An unknown user takes a lock nobody else needs and has
+    /// an empty audience.
+    pub async fn announce_presence<F, Fut>(&self, user: UserId, current: F) -> DomainResult<()>
+    where
+        F: FnOnce() -> Fut + Send,
+        Fut: Future<Output = PresenceView> + Send,
+    {
+        let mut tx = self.store.begin().await?;
+        tx.lock_users(&[user]).await?;
+        let to = audience(&mut tx, user).await?;
         if !to.is_empty() {
+            let view = current().await;
             self.publish(vec![Event::Presence { to, user, view }]).await;
         }
+        tx.rollback().await?;
         Ok(())
     }
 }
@@ -180,6 +213,54 @@ mod tests {
         users
     }
 
+    /// A state source for tests: the user is online.
+    async fn online() -> PresenceView {
+        PresenceView::Online
+    }
+
+    #[tokio::test]
+    async fn an_announcement_publishes_what_the_state_source_reads_only_when_someone_hears() {
+        let (service, notifier) = service();
+        let (alice, bob, loner) = (
+            user(&service).await,
+            user(&service).await,
+            user(&service).await,
+        );
+        befriend(&service, alice, bob).await;
+        notifier.take();
+        let seen = PresenceView::Offline {
+            last_seen: Some(Utc.with_ymd_and_hms(2026, 10, 26, 19, 0, 0).unwrap()),
+        };
+        let reads = std::sync::atomic::AtomicUsize::new(0);
+        let source = || async {
+            reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            seen
+        };
+
+        service.announce_presence(alice, source).await.unwrap();
+        assert_eq!(
+            notifier.take(),
+            vec![Event::Presence {
+                to: vec![bob],
+                user: alice,
+                view: seen,
+            }]
+        );
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        service.announce_presence(loner, source).await.unwrap();
+        service
+            .announce_presence(UserId::new(), source)
+            .await
+            .unwrap();
+        assert_eq!(notifier.take(), vec![]);
+        assert_eq!(
+            reads.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "nobody hears it, so the state is not read"
+        );
+    }
+
     #[tokio::test]
     async fn presence_is_viewable_by_accepted_contacts_only() {
         let (service, _) = service();
@@ -226,9 +307,7 @@ mod tests {
         befriend(&service, alice, carol).await;
         befriend(&service, bob, carol).await;
 
-        let sharing = service
-            .set_presence_sharing(alice, false, PresenceView::Online)
-            .await;
+        let sharing = service.set_presence_sharing(alice, false, online).await;
 
         assert_eq!(sharing, Ok(false));
         assert_eq!(service.presence_sharing(alice).await, Ok(false));
@@ -243,7 +322,7 @@ mod tests {
         );
 
         service
-            .set_presence_sharing(alice, true, PresenceView::Online)
+            .set_presence_sharing(alice, true, online)
             .await
             .unwrap();
         assert_eq!(
@@ -282,14 +361,14 @@ mod tests {
         service.contact_request(me, asked).await.unwrap();
         service.contact_block(blocked, me).await.unwrap();
         service
-            .set_presence_sharing(hider, false, PresenceView::Online)
+            .set_presence_sharing(hider, false, online)
             .await
             .unwrap();
 
         assert_eq!(service.presence_audience(me).await, Ok(vec![friend]));
 
         service
-            .set_presence_sharing(me, false, PresenceView::Online)
+            .set_presence_sharing(me, false, online)
             .await
             .unwrap();
         assert_eq!(service.presence_audience(me).await, Ok(vec![]));
@@ -310,7 +389,7 @@ mod tests {
         let audience = sorted(vec![bob, carol]);
 
         service
-            .set_presence_sharing(alice, false, PresenceView::Online)
+            .set_presence_sharing(alice, false, online)
             .await
             .unwrap();
         assert_eq!(
@@ -323,9 +402,7 @@ mod tests {
         );
 
         assert_eq!(
-            service
-                .set_presence_sharing(alice, false, PresenceView::Online)
-                .await,
+            service.set_presence_sharing(alice, false, online).await,
             Ok(false)
         );
         assert_eq!(notifier.take(), vec![], "an unchanged setting says nothing");
@@ -334,7 +411,9 @@ mod tests {
             last_seen: Some(Utc.with_ymd_and_hms(2026, 10, 26, 18, 0, 0).unwrap()),
         };
         assert_eq!(
-            service.set_presence_sharing(alice, true, current).await,
+            service
+                .set_presence_sharing(alice, true, move || async move { current })
+                .await,
             Ok(true)
         );
         assert_eq!(
@@ -352,7 +431,7 @@ mod tests {
         let (service, _) = service();
 
         let refused = service
-            .set_presence_sharing(UserId::new(), false, PresenceView::Online)
+            .set_presence_sharing(UserId::new(), false, online)
             .await;
 
         assert_eq!(refused, Err(DomainError::UnknownUser));
@@ -370,10 +449,7 @@ mod tests {
         service.contact_request(alice, carol).await.unwrap();
         notifier.take();
 
-        service
-            .announce_presence(alice, PresenceView::Online)
-            .await
-            .unwrap();
+        service.announce_presence(alice, online).await.unwrap();
         assert_eq!(
             notifier.take(),
             vec![Event::Presence {
@@ -384,14 +460,11 @@ mod tests {
         );
 
         service
-            .set_presence_sharing(bob, false, PresenceView::Online)
+            .set_presence_sharing(bob, false, online)
             .await
             .unwrap();
         notifier.take();
-        service
-            .announce_presence(alice, PresenceView::Online)
-            .await
-            .unwrap();
+        service.announce_presence(alice, online).await.unwrap();
         assert_eq!(notifier.take(), vec![], "nobody may hear it");
     }
 

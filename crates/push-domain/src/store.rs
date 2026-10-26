@@ -34,7 +34,9 @@
 //! conversation row ([`Tx::next_seq`]) → positions → users. `add_members`
 //! takes the positions lock while it reads the group's positions, before it locks the
 //! users it adds, so never take user locks before the positions lock in a path that also
-//! takes positions. A device registration takes only its user's lock. A transaction takes
+//! takes positions. A device registration takes only its user's lock. Presence
+//! publications take the lock of the user whose presence they publish (`contact_block`
+//! after the pair lock), so they are serialised per user. A transaction takes
 //! its user locks in one call, so no two transactions wait for each other's user locks in
 //! a cycle.
 //!

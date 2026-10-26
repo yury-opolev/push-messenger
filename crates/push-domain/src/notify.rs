@@ -120,7 +120,9 @@ pub enum ReceiptUpdate {
 
 #[async_trait]
 pub trait Notifier: Send + Sync {
-    /// Called only after the triggering transaction committed. Best effort: it must not
+    /// Called only after the triggering transaction committed, except for
+    /// `Event::Presence`, which is published while the publishing transaction still holds
+    /// the user's lock (see `Messaging::announce_presence`). Best effort: it must not
     /// fail the operation that triggered it.
     async fn publish(&self, events: &[Event]);
 
