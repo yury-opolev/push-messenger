@@ -45,9 +45,17 @@ impl AgentKeySignIn {
 
     /// Records the assertion's first use; `false` for a replay.
     async fn first_use(&self, assertion: &jws::Assertion) -> Result<bool, sqlx::Error> {
-        sqlx::query("DELETE FROM auth.agent_key_assertion WHERE expires_at < now()")
-            .execute(&self.pool)
-            .await?;
+        // Rows are kept five minutes past their expiry, so a database clock ahead of a
+        // replica's cannot purge an entry that replica would still accept. A bounded
+        // batch that skips rows other sign-ins hold never waits on them nor deadlocks.
+        sqlx::query(
+            "DELETE FROM auth.agent_key_assertion WHERE ctid IN ( \
+             SELECT ctid FROM auth.agent_key_assertion \
+             WHERE expires_at < now() - interval '5 minutes' \
+             LIMIT 100 FOR UPDATE SKIP LOCKED)",
+        )
+        .execute(&self.pool)
+        .await?;
         let inserted = sqlx::query(
             "INSERT INTO auth.agent_key_assertion (thumbprint, jti, expires_at) \
              VALUES ($1, $2, to_timestamp($3::bigint)) ON CONFLICT DO NOTHING RETURNING 1",

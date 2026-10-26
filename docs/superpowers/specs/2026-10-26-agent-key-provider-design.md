@@ -74,8 +74,11 @@ Each `(thumbprint, jti)` can be used once. The verifier records it after the sig
 and claims are checked, in a new table `auth.agent_key_assertion (thumbprint, jti,
 expires_at)` with primary key `(thumbprint, jti)` and an index on `expires_at`:
 `INSERT … ON CONFLICT DO NOTHING RETURNING 1`. No row returned means a replay.
-`expires_at` is `exp + 60 s`. Before the insert, rows past `expires_at` are deleted, so
-the table holds at most the assertions of the last few minutes.
+`expires_at` is `exp + 60 s`. Before the insert, a bounded batch (100 rows,
+`FOR UPDATE SKIP LOCKED`) of rows more than five minutes past `expires_at` is deleted.
+The margin keeps a database clock that runs ahead of a replica's from purging an entry
+the replica would still accept. The table holds only the assertions of the last few
+minutes.
 
 Why PostgreSQL and not Redis: Redis holds only rate-limit counters, which may be lost
 or evicted without harm. A lost or evicted replay entry would reopen a replay. PostgreSQL

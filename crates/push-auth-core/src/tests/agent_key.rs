@@ -10,7 +10,7 @@ use serde_json::json;
 use super::{Offer, World, world};
 use crate::agent_key::testing::TestKey;
 use crate::api::{Api, router};
-use crate::identity::AuthenticationError;
+use crate::identity::{AuthenticationError, Authenticator};
 use crate::limits::{Limits, MemoryCounter};
 use crate::service::unix_now;
 use crate::{AgentKeySettings, AgentKeySignIn, Auth, NoDirectory};
@@ -101,13 +101,16 @@ async fn a_jti_is_single_use_per_key() {
     let expected = unix_now() + 120 + 60;
     assert!((expected - 5..=expected).contains(&expires_at));
 
+    // Purged five minutes after expiry, so a clock drift cannot reopen a replay.
     let expired = "fedcba9876543210-expired";
+    let recent = "fedcba9876543210-recently";
     sqlx::query(
         "INSERT INTO auth.agent_key_assertion (thumbprint, jti, expires_at) \
-         VALUES ($1, $2, now() - interval '1 second')",
+         VALUES ($1, $2, now() - interval '301 seconds'), ($1, $3, now() - interval '1 second')",
     )
     .bind(key.thumbprint())
     .bind(expired)
+    .bind(recent)
     .execute(&world.pool)
     .await
     .unwrap();
@@ -126,7 +129,35 @@ async fn a_jti_is_single_use_per_key() {
         .fetch_one(&world.pool)
         .await
         .unwrap();
-    assert_eq!(kept, 4, "unexpired uses stay");
+    assert_eq!(kept, 5, "unexpired and recently expired uses stay");
+}
+
+#[tokio::test]
+async fn concurrent_uses_of_one_assertion_admit_one() {
+    let (_world, auth, _router) = key_world().await;
+    let authenticator = auth.authenticator("agent-key").unwrap();
+    let token = TestKey::generate().assertion(KEY_AUDIENCE);
+    let (first, second) = tokio::join!(
+        authenticator.authenticate(&token),
+        authenticator.authenticate(&token)
+    );
+    assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
+}
+
+#[tokio::test]
+async fn an_unreachable_replay_cache_fails_closed() {
+    let world = world(Offer::Password).await;
+    let authenticator = AgentKeySignIn::new(
+        settings(KEY_AUDIENCE, Duration::from_secs(3600)),
+        world.pool.clone(),
+    )
+    .unwrap();
+    world.pool.close().await;
+    let token = TestKey::generate().assertion(KEY_AUDIENCE);
+    assert!(matches!(
+        authenticator.authenticate(&token).await,
+        Err(AuthenticationError::Unavailable(_))
+    ));
 }
 
 #[tokio::test]
