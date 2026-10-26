@@ -67,12 +67,12 @@ async fn owner(connection: &mut PgConnection, caller: Caller) -> Result<(), Auth
 
 /// Moves every external identity of `agent` into `auth.released_identity` (spec R1-R3),
 /// whatever its provider, so the identity can be enrolled again; the account keeps its
-/// history. Call inside the transaction that disables the account.
+/// history. Call inside the transaction that disables the account; it returns the
+/// released rows and the caller logs them after commit.
 async fn release_identities(
     connection: &mut PgConnection,
     agent: Uuid,
-    owner_user_id: Uuid,
-) -> Result<(), AuthError> {
+) -> Result<Vec<Released>, AuthError> {
     let released: Vec<(String, String, String, Option<Uuid>)> = sqlx::query_as(
         "WITH gone AS (DELETE FROM auth.external_identity WHERE user_id = $1 \
          RETURNING identity_id, provider, issuer, subject, user_id, created_at), \
@@ -86,14 +86,23 @@ async fn release_identities(
     .bind(agent)
     .fetch_all(connection)
     .await?;
-    for (provider, issuer, subject, client_app_id) in released {
-        tracing::info!(
-            target: "security", event = "auth.agent.identity_released", user_id = %agent,
-            %owner_user_id, %provider, %issuer, %subject, ?client_app_id,
-            "a deleted agent's identity was released"
-        );
-    }
-    Ok(())
+    Ok(released
+        .into_iter()
+        .map(|(provider, issuer, subject, client_app_id)| Released {
+            provider,
+            issuer,
+            subject,
+            client_app_id,
+        })
+        .collect())
+}
+
+/// An external identity moved into `auth.released_identity` by [`release_identities`].
+struct Released {
+    provider: String,
+    issuer: String,
+    subject: String,
+    client_app_id: Option<Uuid>,
 }
 
 impl Auth {
@@ -347,6 +356,7 @@ impl Auth {
         .fetch_optional(&mut *tx)
         .await?;
         let active = found.ok_or(AuthError::AgentNotFound)?;
+        let mut released = Vec::new();
         if delete {
             if active {
                 sqlx::query("UPDATE auth.user_account SET disabled_at = now() WHERE user_id = $1")
@@ -361,7 +371,7 @@ impl Auth {
                 .fetch_all(&mut *tx)
                 .await?;
                 revoke_devices(&mut tx, &devices).await?;
-                release_identities(&mut tx, agent, caller.user_id).await?;
+                released = release_identities(&mut tx, agent).await?;
             } else {
                 sqlx::query("DELETE FROM auth.user_account WHERE user_id = $1")
                     .bind(agent)
@@ -387,6 +397,14 @@ impl Auth {
             }
         }
         tx.commit().await?;
+        for row in released {
+            tracing::info!(
+                target: "security", event = "auth.agent.identity_released", user_id = %agent,
+                owner_user_id = %caller.user_id, provider = %row.provider, issuer = %row.issuer,
+                subject = %row.subject, client_app_id = ?row.client_app_id,
+                "a deleted agent's identity was released"
+            );
+        }
         Ok(())
     }
 }
