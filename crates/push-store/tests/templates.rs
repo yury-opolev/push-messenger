@@ -1,5 +1,5 @@
-//! The schema's own guards for templates and card messages: what migration 0005 refuses
-//! even to SQL that bypasses the store.
+//! The schema's own guards for templates and card messages: what migrations 0005 and 0006
+//! refuse even to SQL that bypasses the store.
 //!
 //! Each test starts a Postgres container of its own (Docker must be running); the tests
 //! run in parallel, so the file takes about as long as one container start.
@@ -326,6 +326,15 @@ async fn the_template_tables_are_never_truncated() {
 #[tokio::test]
 async fn messages_take_rich_and_answer_content_but_no_other() {
     let (_container, pool) = seeded().await;
+    // 0005 adds the checks NOT VALID; 0006 validates them.
+    let unvalidated: Vec<String> = sqlx::query_scalar(
+        "SELECT conname::text FROM pg_constraint \
+         WHERE conrelid = 'messaging.message'::regclass AND NOT convalidated",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(unvalidated, Vec::<String>::new());
     let insert = |seq: i64, content_type: i16, answer_seq: Option<i64>| {
         sqlx::query(
             "INSERT INTO messaging.message \

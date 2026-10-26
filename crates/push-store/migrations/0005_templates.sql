@@ -5,13 +5,20 @@
 --   message.content_type       3 rich, 4 answer (1 text, 2 system event as before)
 --   template_version.status    1 pending, 2 approved, 3 rejected, 4 revoked
 
-ALTER TABLE messaging.message DROP CONSTRAINT message_content_type_check;
-ALTER TABLE messaging.message ADD CONSTRAINT message_content_type_check
-    CHECK (content_type BETWEEN 1 AND 4);
--- Cards: the seq of the first valid answer. Only a card is answered, by a later entry.
-ALTER TABLE messaging.message ADD COLUMN answer_seq bigint;
-ALTER TABLE messaging.message ADD CONSTRAINT message_card_answer
-    CHECK (answer_seq IS NULL OR (content_type = 3 AND answer_seq > seq));
+-- Metadata only: one brief ACCESS EXCLUSIVE lock, no table scan or rewrite. The new
+-- constraints are NOT VALID (enforced for new and updated rows at once; existing rows
+-- are checked by 0006 without blocking reads and writes) and the new column is nullable
+-- without a default. Give up rather than queue behind long transactions and stall every
+-- statement waiting behind this one.
+SET LOCAL lock_timeout = '5s';
+-- Cards: answer_seq is the seq of the first valid answer. Only a card is answered, by a
+-- later entry.
+ALTER TABLE messaging.message
+    DROP CONSTRAINT message_content_type_check,
+    ADD CONSTRAINT message_content_type_check CHECK (content_type BETWEEN 1 AND 4) NOT VALID,
+    ADD COLUMN answer_seq bigint,
+    ADD CONSTRAINT message_card_answer
+        CHECK (answer_seq IS NULL OR (content_type = 3 AND answer_seq > seq)) NOT VALID;
 
 -- A card is answered once: its answer is never replaced or cleared.
 CREATE FUNCTION messaging.message_answer_guard()
