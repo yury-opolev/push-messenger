@@ -1,5 +1,6 @@
 // Types of push-sdk for Node.js (index.js). docs/sdk-bindings.md describes every call.
-// Ids are UUID strings; times are microseconds since the Unix epoch.
+// Ids are UUID strings; times are microseconds since the Unix epoch, except fields ending in
+// `Ms` (activity and presence), which are milliseconds.
 
 /** The servers and the database of one app profile. */
 export interface Config {
@@ -125,6 +126,29 @@ export interface ErrorDetail {
   retryAfterS: number | null;
 }
 
+export type ActivityState = 'typing' | 'working' | 'waiting' | 'idle';
+
+/** Another member's live activity in a conversation; a newer one from the same user and conversation replaces it. */
+export interface Activity {
+  conversationId: string;
+  userId: string;
+  state: ActivityState;
+  /** Plain text to show inert (never as links or markup). */
+  label: string | null;
+  /** When to stop showing it: milliseconds since the Unix epoch on this device's clock (`idle`: at once). */
+  expiresAtMs: number;
+}
+
+/** `unknown`: not visible (not an accepted contact, blocked, sharing off on either side, or no such user). */
+export type PresenceState = 'unknown' | 'online' | 'offline';
+
+export interface Presence {
+  userId: string;
+  state: PresenceState;
+  /** Offline only: milliseconds since the Unix epoch, a whole minute. */
+  lastSeenMs: number | null;
+}
+
 export type PushEvent =
   | ({ type: 'connectionStateChanged' } & ConnectionState)
   | { type: 'messageAdded' | 'messageSent' | 'messageEdited' | 'messageDeleted'; message: Message }
@@ -138,6 +162,8 @@ export type PushEvent =
   | { type: 'receiptChanged'; conversationId: string; peerDeliveredSeq: number; peerReadSeq: number }
   | { type: 'conversationChanged'; conversation: Conversation }
   | { type: 'contactChanged'; contact: Contact }
+  | { type: 'activityChanged'; activity: Activity }
+  | { type: 'presenceChanged'; presence: Presence }
   | { type: 'signedOut' | 'deviceRemoved' | 'openedElsewhere' | 'eventsLost' };
 
 /** A failed call; `code` is the SDK's stable error code, as in Rust and C. */
@@ -233,6 +259,19 @@ export class Client {
   updateProfile(displayName: string | null, handle: string | null): Promise<Profile>;
   devices(): Promise<Device[]>;
   revokeDevice(deviceId: string): Promise<void>;
+
+  /**
+   * Tells the other members what the user is doing in a conversation, with an optional short
+   * label (1 to 60 characters, plain text, no line breaks; ignored with `idle`). Fire and
+   * forget: resolves once queued; rejects with `invalid` for a bad label, `offline` unless
+   * connected. Others show it for 30 s: send it again every 10 to 20 s, and `idle` when done.
+   */
+  sendActivity(conversationId: string, state: ActivityState, label?: string | null): Promise<void>;
+  /** The presence of 1 to 100 users, one per distinct user in the order asked. */
+  getPresence(userIds: string[]): Promise<Presence[]>;
+  /** Switches sharing the user's presence on or off (reciprocal); resolves to the setting now. */
+  setPresenceSharing(share: boolean): Promise<boolean>;
+  presenceSharing(): Promise<boolean>;
 }
 
 export function deriveDatabaseKey(secret: Uint8Array | string, salt: Uint8Array | string): Promise<Uint8Array>;

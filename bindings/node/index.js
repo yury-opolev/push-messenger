@@ -371,6 +371,33 @@ class Client {
   revokeDevice(deviceId) {
     return settled(() => this.#native.revokeDevice(deviceId));
   }
+
+  // ----- activity and presence -----
+
+  /**
+   * Tells the other members what the user is doing in a conversation: `typing`, `working`,
+   * `waiting` or `idle`, with an optional short label (ignored with `idle`). Fire and forget:
+   * resolves once queued; rejects with `offline` unless connected. Send it again every 10 to
+   * 20 s while it lasts, and `idle` when it ends.
+   */
+  sendActivity(conversationId, state, label) {
+    return settled(() => this.#native.sendActivity(conversationId, state, label ?? null));
+  }
+
+  /** The presence of 1 to 100 users, one per distinct user in the order asked. */
+  getPresence(userIds) {
+    return settled(() => this.#native.getPresence(userIds));
+  }
+
+  /** Switches sharing the user's presence on or off; resolves to the setting now. */
+  setPresenceSharing(share) {
+    return settled(() => this.#native.setPresenceSharing(share));
+  }
+
+  /** Whether the user shares their presence (on unless switched off). */
+  presenceSharing() {
+    return settled(() => this.#native.presenceSharing());
+  }
 }
 
 /** Derives a 32-byte database key from what the user knows and a salt the app keeps. */

@@ -337,6 +337,42 @@ int main(int argc, char **argv) {
     error = NULL;
     step("sent a card; an invalid card and an answer to no card were refused");
 
+    {
+        const char *peers[] = {"0199e1c2-0000-7000-8000-000000000001"};
+        bool sharing = false;
+        if (push_client_send_activity(client, conversation, "working", "Running tests", &error) !=
+            PUSH_OK)
+            fail("send activity", error);
+        if (push_client_send_activity(client, conversation, "idle", NULL, &error) != PUSH_OK)
+            fail("send idle", error);
+        expect_code("an unknown activity state",
+                    push_client_send_activity(client, conversation, "dancing", NULL, &error),
+                    &error, "invalid");
+        expect_code("a label with a line break",
+                    push_client_send_activity(client, conversation, "typing", "a\nb", &error),
+                    &error, "invalid");
+        if (push_client_get_presence(client, peers, 1, &text, &error) != PUSH_OK)
+            fail("get presence", error);
+        if (!strstr(text, peers[0]) || !strstr(text, "\"state\":\"offline\"") ||
+            !strstr(text, "\"lastSeenMs\":") || strstr(text, "\"lastSeenMs\":null"))
+            fail("the peer is offline, last seen", NULL);
+        push_string_free(text);
+        expect_code("presence of nobody", push_client_get_presence(client, NULL, 0, &text, &error),
+                    &error, "invalid");
+        if (push_client_presence_sharing(client, &sharing, &error) != PUSH_OK || !sharing)
+            fail("presence is shared by default", error);
+        if (push_client_set_presence_sharing(client, false, &sharing, &error) != PUSH_OK || sharing)
+            fail("switch presence sharing off", error);
+        if (push_client_get_presence(client, peers, 1, &text, &error) != PUSH_OK)
+            fail("get presence while not sharing", error);
+        if (!strstr(text, "\"state\":\"unknown\"") || !strstr(text, "\"lastSeenMs\":null"))
+            fail("presence is unknown while not sharing", NULL);
+        push_string_free(text);
+        if (push_client_set_presence_sharing(client, true, &sharing, &error) != PUSH_OK || !sharing)
+            fail("switch presence sharing on", error);
+    }
+    step("sent activity; read presence; switched sharing off and on");
+
     expect_code("a send to an unknown conversation",
                 push_client_send(client, "0199e1c2-0000-7000-8000-0000000000ff", "x", &text, &error),
                 &error, "invalid");
