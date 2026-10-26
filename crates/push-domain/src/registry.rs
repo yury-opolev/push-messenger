@@ -10,7 +10,10 @@ use crate::model::{PublisherOwner, StoredTemplate, TemplateAction, TemplateEvent
 use crate::notify::Notifier;
 use crate::service::Messaging;
 use crate::store::{InsertOutcome, Store, Tx};
-use crate::templates::{BUILTIN_PUBLISHER, Definition, RESERVED_PUBLISHERS, TemplateRef, builtins};
+use crate::templates::{
+    BUILTIN_PUBLISHER, Definition, MAX_DEFINITION_BYTES, RESERVED_PUBLISHERS, TemplateError,
+    TemplateRef, builtins,
+};
 use crate::validation::ValidationError;
 
 /// Most submissions one account may have waiting for review.
@@ -67,13 +70,15 @@ where
     /// The first submission under a publisher claims it for `user`; later ones must come
     /// from the same account. Reserved publishers are refused, an account may have at most
     /// [`MAX_PENDING_PER_USER`] versions waiting, and a ref that is already stored, in any
-    /// status, is `TemplateExists`.
+    /// status, is `TemplateExists`. The canonical form is what is stored, so it too must
+    /// fit in [`MAX_DEFINITION_BYTES`].
     pub async fn submit_template(
         &self,
         user: UserId,
         definition: &[u8],
     ) -> DomainResult<StoredTemplate> {
         let definition = Definition::parse(definition)?;
+        let canonical = within_definition_limit(definition.canonical_json())?;
         let template = definition.template_ref();
         if RESERVED_PUBLISHERS.contains(&template.publisher.as_str()) {
             return Err(DomainError::TemplateConflict("the publisher is reserved"));
@@ -100,7 +105,7 @@ where
         let stored = StoredTemplate {
             template: template.clone(),
             title: definition.title().to_owned(),
-            definition: definition.canonical_json(),
+            definition: canonical,
             status: TemplateStatus::Pending,
             submitted_by: Some(user),
             submitted_at: now,
@@ -125,9 +130,14 @@ where
 
     /// Approves, rejects or revokes a version (spec D5, D7, D8) and returns it as stored
     /// now. Approve and Reject need a pending version, Revoke an approved one; approving
-    /// and revoking take the catalog's next change number.
-    pub async fn review_template(&self, command: ReviewCommand) -> DomainResult<StoredTemplate> {
+    /// and revoking take the catalog's next change number. A note's `"\r\n"` line breaks
+    /// are read, checked and stored as `"\n"`.
+    pub async fn review_template(
+        &self,
+        mut command: ReviewCommand,
+    ) -> DomainResult<StoredTemplate> {
         validate_reviewer(&command.reviewer)?;
+        command.note = command.note.map(|note| note.replace("\r\n", "\n"));
         if let Some(note) = &command.note {
             validate_note(note)?;
         }
@@ -185,7 +195,9 @@ where
 
     /// The approved and revoked versions changed after `since`, at most `limit` (0, or
     /// more than [`MAX_CATALOG_PAGE`], asks for [`MAX_CATALOG_PAGE`]). Asking again from
-    /// the returned `seq` continues without gaps or repeats.
+    /// the returned `seq` continues without gaps or repeats. A `since` beyond the last
+    /// change (a client ahead of a restored database) returns the last change as `seq`, so
+    /// the client starts over from there.
     pub async fn template_catalog(&self, since: i64, limit: u32) -> DomainResult<Catalog> {
         if since < 0 {
             return Err(ValidationError::CatalogPosition { actual: since }.into());
@@ -205,6 +217,8 @@ where
         let more = entries.len() == limit as usize;
         let seq = if more {
             newest
+        } else if entries.is_empty() && since > last {
+            last
         } else {
             since.max(last).max(newest)
         };
@@ -314,6 +328,18 @@ fn page_limit(limit: u32) -> u32 {
     }
 }
 
+/// `canonical` unless it is longer than [`MAX_DEFINITION_BYTES`]: the stored form must fit
+/// the same limit as the submitted one.
+fn within_definition_limit(canonical: String) -> Result<String, TemplateError> {
+    if canonical.len() > MAX_DEFINITION_BYTES {
+        return Err(TemplateError(format!(
+            "the canonical definition is {} bytes; the limit is {MAX_DEFINITION_BYTES}",
+            canonical.len()
+        )));
+    }
+    Ok(canonical)
+}
+
 /// 1 to 64 characters, no control characters, not only whitespace.
 fn validate_reviewer(reviewer: &str) -> Result<(), ValidationError> {
     let printable = !reviewer.chars().any(char::is_control);
@@ -332,5 +358,24 @@ fn validate_note(note: &str) -> Result<(), ValidationError> {
         Ok(())
     } else {
         Err(ValidationError::ReviewNote)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_canonical_definition_must_fit_the_definition_limit() {
+        let fits = "x".repeat(MAX_DEFINITION_BYTES);
+        assert_eq!(within_definition_limit(fits.clone()), Ok(fits));
+        let error = within_definition_limit("x".repeat(MAX_DEFINITION_BYTES + 1)).unwrap_err();
+        assert_eq!(
+            error.0,
+            format!(
+                "the canonical definition is {} bytes; the limit is {MAX_DEFINITION_BYTES}",
+                MAX_DEFINITION_BYTES + 1
+            )
+        );
     }
 }

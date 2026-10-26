@@ -79,6 +79,17 @@ struct State {
 
 impl State {
     /// `template_version.change_seq` is UNIQUE: no other version may hold the number.
+    /// The guard trigger of `template_version`: a version enters the catalog only with the
+    /// counter's last number, taken by the same transaction.
+    fn check_change_seq_last(&self, template: &StoredTemplate) -> DomainResult<()> {
+        match template.change_seq {
+            Some(change_seq) if change_seq != self.template_change => Err(DomainError::Store(
+                format!("check violation: change number {change_seq} is not the last one taken"),
+            )),
+            _ => Ok(()),
+        }
+    }
+
     fn check_change_seq_unused(&self, template: &StoredTemplate) -> DomainResult<()> {
         let Some(change_seq) = template.change_seq else {
             return Ok(());
@@ -929,6 +940,8 @@ impl Tx for InMemoryTx {
     async fn insert_template(&mut self, template: StoredTemplate) -> DomainResult<InsertOutcome> {
         // Postgres checks the row's CHECK constraints before it looks for a conflict.
         check_template_status(&template)?;
+        // So does the guard trigger, which runs before the insert.
+        self.work.check_change_seq_last(&template)?;
         if self.work.templates.contains_key(&template.template) {
             return Ok(InsertOutcome::Duplicate);
         }
@@ -977,6 +990,7 @@ impl Tx for InMemoryTx {
             ..stored.clone()
         };
         check_template_status(&changed)?;
+        self.work.check_change_seq_last(&changed)?;
         self.work.check_change_seq_unused(&changed)?;
         self.work
             .templates

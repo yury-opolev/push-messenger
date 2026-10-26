@@ -422,15 +422,17 @@ pub trait Tx: Send {
     /// stored definition never changes (Postgres: `ON CONFLICT DO NOTHING`). The row must
     /// satisfy the status invariants even when it is a duplicate (Postgres checks them
     /// before it looks for a conflict): `reviewed_at` is set unless pending, `change_seq`
-    /// is set exactly when approved or revoked, and no other version holds that
-    /// `change_seq`; otherwise it fails with `DomainError::Store`. Also fails with
+    /// is set exactly when approved or revoked, it is the last number taken
+    /// ([`Tx::next_template_change`], in this transaction), and no other version holds
+    /// that `change_seq`; otherwise it fails with `DomainError::Store`. Also fails with
     /// `DomainError::Store` if the publisher has not been claimed
     /// ([`Tx::claim_publisher`]) or the submitter is not a known user.
     async fn insert_template(&mut self, template: StoredTemplate) -> DomainResult<InsertOutcome>;
     /// Moves the version to `status`, setting `reviewed_at` to `at` and `change_seq`. Only
     /// `pending → approved`, `pending → rejected` and `approved → revoked` are allowed
     /// (see [`TemplateStatus::can_become`]); any other move, an unknown ref, a `change_seq`
-    /// that is not set exactly for approved and revoked, or one another version holds,
+    /// that is not set exactly for approved and revoked, that is not the last number taken
+    /// ([`Tx::next_template_change`], in this transaction), or that another version holds,
     /// fails with `DomainError::Store`.
     async fn set_template_status(
         &mut self,

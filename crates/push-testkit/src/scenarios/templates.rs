@@ -205,9 +205,16 @@ async fn the_catalog_refuses_a_negative_position_and_caps_its_page<B: Backend>(b
         .await
         .unwrap();
     assert_eq!((page.seq, page.more), (0, false));
-    // A client ahead of the server (a restored database) keeps its position.
+    // A client ahead of the server (a restored database) is sent back to the server's
+    // position, so it does not miss the changes made from there on.
     let ahead = world.svc.template_catalog(7, 10).await.unwrap();
-    assert_eq!((ahead.seq, ahead.more), (7, false));
+    assert_eq!((ahead.seq, ahead.more), (0, false));
+    let alice = world.person().await;
+    submit(&world, alice.user, "acme", "deploy", 1).await;
+    reviewed(&world, "acme.deploy@1", ReviewAction::Approve).await;
+    let ahead = world.svc.template_catalog(7, 10).await.unwrap();
+    assert!(ahead.entries.is_empty());
+    assert_eq!((ahead.seq, ahead.more), (1, false));
 }
 
 async fn a_publisher_belongs_to_the_account_that_claimed_it<B: Backend>(backend: &B) {
@@ -399,6 +406,48 @@ async fn a_review_needs_a_printable_reviewer_and_a_short_note<B: Backend>(backen
     };
     let approved = world.svc.review_template(command).await.unwrap();
     assert_eq!(approved.status, TemplateStatus::Approved);
+}
+
+async fn a_note_keeps_windows_line_breaks_as_newlines<B: Backend>(backend: &B) {
+    let world = World::new(backend).await;
+    let alice = world.person().await;
+    submit(&world, alice.user, "acme", "deploy", 1).await;
+
+    let command = ReviewCommand {
+        note: Some("a lone\rreturn".to_owned()),
+        ..review("acme.deploy@1", ReviewAction::Approve)
+    };
+    assert_eq!(
+        world.svc.review_template(command).await,
+        Err(DomainError::Invalid(ValidationError::ReviewNote))
+    );
+    // 501 characters as sent, 500 once "\r\n" is read as "\n".
+    let note = format!("{}\r\n", "a".repeat(499));
+    let command = ReviewCommand {
+        note: Some(note),
+        ..review("acme.deploy@1", ReviewAction::Approve)
+    };
+    world.svc.review_template(command).await.unwrap();
+    let command = ReviewCommand {
+        note: Some("looks good\r\nship it".to_owned()),
+        ..review("acme.deploy@1", ReviewAction::Revoke)
+    };
+    world.svc.review_template(command).await.unwrap();
+
+    let (_, events) = world
+        .svc
+        .template_detail(&template_ref("acme.deploy@1"))
+        .await
+        .unwrap();
+    let notes: Vec<Option<String>> = events.into_iter().map(|event| event.note).collect();
+    assert_eq!(
+        notes,
+        [
+            None,
+            Some(format!("{}\n", "a".repeat(499))),
+            Some("looks good\nship it".to_owned()),
+        ]
+    );
 }
 
 async fn seeding_stores_the_builtins_once<B: Backend>(backend: &B) {
@@ -621,6 +670,7 @@ pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
         a_stored_version_cannot_be_submitted_again,
         reviews_follow_the_one_way_status,
         a_review_needs_a_printable_reviewer_and_a_short_note,
+        a_note_keeps_windows_line_breaks_as_newlines,
         seeding_stores_the_builtins_once,
         a_revoked_builtin_stays_revoked_after_seeding_again,
         the_audit_trail_records_every_step,

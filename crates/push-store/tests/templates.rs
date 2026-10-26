@@ -16,8 +16,8 @@ const USER: &str = "00000000-0000-0000-0000-000000000001";
 const CONVERSATION: &str = "00000000-0000-0000-0000-000000000002";
 
 /// A migrated database holding one user, the `acme` publisher, an approved
-/// `acme.approved@1` (change 1), a pending `acme.pending@1`, a rejected `acme.rejected@1`,
-/// one audit event and a conversation.
+/// `acme.approved@1` (change 1, the counter's last), a pending `acme.pending@1`, a
+/// rejected `acme.rejected@1`, one audit event and a conversation.
 async fn seeded() -> (ContainerAsync<Postgres>, PgPool) {
     let container = Postgres::default()
         .with_tag("17-alpine")
@@ -40,6 +40,7 @@ async fn seeded() -> (ContainerAsync<Postgres>, PgPool) {
         "INSERT INTO messaging.known_user (user_id) VALUES ('{USER}');
          INSERT INTO messaging.template_publisher (publisher, owner_user_id)
              VALUES ('acme', '{USER}');
+         UPDATE messaging.template_change SET last_seq = 1;
          INSERT INTO messaging.template_version
              (publisher, name, version, title, definition, status, submitted_by,
               submitted_at, reviewed_at, change_seq)
@@ -149,8 +150,10 @@ async fn the_status_only_moves_one_way() {
     // The allowed moves, and an update that changes nothing.
     sqlx::raw_sql(
         "UPDATE messaging.template_version SET status = status;
+         UPDATE messaging.template_change SET last_seq = 2;
          UPDATE messaging.template_version \
          SET status = 2, reviewed_at = now(), change_seq = 2 WHERE name = 'pending';
+         UPDATE messaging.template_change SET last_seq = 3;
          UPDATE messaging.template_version \
          SET status = 4, reviewed_at = now(), change_seq = 3 WHERE name = 'approved';",
     )
@@ -176,6 +179,148 @@ async fn the_audit_trail_is_append_only() {
         .await
         .unwrap();
     assert_eq!(count, 1);
+}
+
+#[tokio::test]
+async fn a_version_enters_the_catalog_only_with_the_last_change_number() {
+    let (_container, pool) = seeded().await;
+    let not_last = "is not the last one taken";
+    let insert = |name: &str, change_seq: i64| {
+        format!(
+            "INSERT INTO messaging.template_version \
+             (publisher, name, version, title, definition, status, submitted_at, \
+              reviewed_at, change_seq) \
+             VALUES ('acme', '{name}', 1, 'New', '{{}}', 2, now(), now(), {change_seq})"
+        )
+    };
+    // The counter's last number is 1; 2 has not been taken.
+    refused(&pool, &insert("new", 2), not_last).await;
+    refused(
+        &pool,
+        "UPDATE messaging.template_version \
+         SET status = 2, reviewed_at = now(), change_seq = 2 WHERE name = 'pending'",
+        not_last,
+    )
+    .await;
+    refused(
+        &pool,
+        "UPDATE messaging.template_version \
+         SET status = 4, reviewed_at = now(), change_seq = 2 WHERE name = 'approved'",
+        not_last,
+    )
+    .await;
+    // Taken in the same transaction, as the store does, the number is accepted.
+    sqlx::raw_sql(&format!(
+        "UPDATE messaging.template_change SET last_seq = last_seq + 1;
+         UPDATE messaging.template_version \
+         SET status = 2, reviewed_at = now(), change_seq = 2 WHERE name = 'pending';
+         UPDATE messaging.template_change SET last_seq = last_seq + 1;
+         {};",
+        insert("new", 3)
+    ))
+    .execute(&pool)
+    .await
+    .expect("changes with the last number");
+    // A number taken earlier is stale.
+    sqlx::raw_sql("UPDATE messaging.template_change SET last_seq = last_seq + 1")
+        .execute(&pool)
+        .await
+        .unwrap();
+    refused(
+        &pool,
+        "UPDATE messaging.template_version \
+         SET status = 4, reviewed_at = now(), change_seq = 3 WHERE name = 'pending'",
+        not_last,
+    )
+    .await;
+    assert_eq!(status(&pool, "pending").await, 2);
+    assert_eq!(status(&pool, "new").await, 2);
+}
+
+#[tokio::test]
+async fn the_change_counter_only_counts_up_by_one() {
+    let (_container, pool) = seeded().await;
+    let one_by_one = "only counts up by one";
+    for sql in [
+        "UPDATE messaging.template_change SET last_seq = last_seq + 2",
+        "UPDATE messaging.template_change SET last_seq = last_seq - 1",
+        "UPDATE messaging.template_change SET last_seq = last_seq",
+        "UPDATE messaging.template_change SET last_seq = 0",
+    ] {
+        refused(&pool, sql, one_by_one).await;
+    }
+    refused(
+        &pool,
+        "DELETE FROM messaging.template_change",
+        "never deleted",
+    )
+    .await;
+    sqlx::raw_sql("UPDATE messaging.template_change SET last_seq = last_seq + 1")
+        .execute(&pool)
+        .await
+        .expect("counting up");
+    let last: i64 = sqlx::query_scalar("SELECT last_seq FROM messaging.template_change")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(last, 2);
+}
+
+#[tokio::test]
+async fn a_publisher_keeps_its_owner_for_good() {
+    let (_container, pool) = seeded().await;
+    let owner = "owner never changes";
+    refused(
+        &pool,
+        "UPDATE messaging.template_publisher SET owner_user_id = NULL",
+        owner,
+    )
+    .await;
+    refused(
+        &pool,
+        "UPDATE messaging.template_publisher SET publisher = 'other'",
+        owner,
+    )
+    .await;
+    refused(
+        &pool,
+        "DELETE FROM messaging.template_publisher",
+        "never deleted",
+    )
+    .await;
+    let owners: Vec<(String, Option<Uuid>)> =
+        sqlx::query_as("SELECT publisher, owner_user_id FROM messaging.template_publisher")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        owners,
+        [("acme".to_owned(), Some(Uuid::parse_str(USER).unwrap()))]
+    );
+}
+
+#[tokio::test]
+async fn the_template_tables_are_never_truncated() {
+    let (_container, pool) = seeded().await;
+    // CASCADE, so that the foreign keys do not refuse it first.
+    for table in [
+        "template_publisher",
+        "template_version",
+        "template_change",
+        "template_event",
+    ] {
+        refused(
+            &pool,
+            &format!("TRUNCATE messaging.{table} CASCADE"),
+            "never truncated",
+        )
+        .await;
+    }
+    let versions: i64 = sqlx::query_scalar("SELECT count(*) FROM messaging.template_version")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(versions, 3);
 }
 
 #[tokio::test]

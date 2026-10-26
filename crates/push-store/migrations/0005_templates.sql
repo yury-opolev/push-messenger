@@ -44,8 +44,40 @@ CREATE INDEX template_version_status ON messaging.template_version (status, subm
 CREATE INDEX template_version_pending_by ON messaging.template_version (submitted_by)
     WHERE status = 1;
 
+-- One row: the last change number handed out (approve, revoke, seed). Updating it locks
+-- the row, so change numbers commit in order. It only counts up, one at a time, and the
+-- row is never deleted.
+CREATE TABLE messaging.template_change (
+    id       boolean PRIMARY KEY DEFAULT true CHECK (id),
+    last_seq bigint NOT NULL DEFAULT 0 CHECK (last_seq >= 0)
+);
+INSERT INTO messaging.template_change DEFAULT VALUES;
+
+CREATE FUNCTION messaging.template_change_guard()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'the template change counter is never deleted'
+            USING ERRCODE = '23514';
+    END IF;
+    IF NEW.id IS DISTINCT FROM OLD.id OR NEW.last_seq IS DISTINCT FROM OLD.last_seq + 1 THEN
+        RAISE EXCEPTION 'the template change counter only counts up by one'
+            USING ERRCODE = '23514';
+    END IF;
+    RETURN NEW;
+END
+$$;
+CREATE TRIGGER template_change_guard
+    BEFORE UPDATE OR DELETE ON messaging.template_change
+    FOR EACH ROW EXECUTE FUNCTION messaging.template_change_guard();
+
 -- A version's identity and definition never change, it is never deleted, and its status
--- only moves one way: pending to approved or rejected, approved to revoked.
+-- only moves one way: pending to approved or rejected, approved to revoked. A version
+-- enters the catalog (is inserted or moves with a change number) only with the counter's
+-- last number, which the writer took in the same transaction.
 CREATE FUNCTION messaging.template_version_guard()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -54,6 +86,15 @@ AS $$
 BEGIN
     IF TG_OP = 'DELETE' THEN
         RAISE EXCEPTION 'template versions are never deleted' USING ERRCODE = '23514';
+    END IF;
+    IF TG_OP = 'INSERT' THEN
+        IF NEW.change_seq IS NOT NULL
+            AND NEW.change_seq IS DISTINCT FROM
+                (SELECT last_seq FROM messaging.template_change) THEN
+            RAISE EXCEPTION 'change number % is not the last one taken', NEW.change_seq
+                USING ERRCODE = '23514';
+        END IF;
+        RETURN NEW;
     END IF;
     IF (OLD.publisher, OLD.name, OLD.version, OLD.title, OLD.definition, OLD.submitted_by,
             OLD.submitted_at)
@@ -74,20 +115,40 @@ BEGIN
         RAISE EXCEPTION 'template status % cannot become %', OLD.status, NEW.status
             USING ERRCODE = '23514';
     END IF;
+    IF OLD.status <> NEW.status
+        AND NEW.change_seq IS NOT NULL
+        AND NEW.change_seq IS DISTINCT FROM
+            (SELECT last_seq FROM messaging.template_change) THEN
+        RAISE EXCEPTION 'change number % is not the last one taken', NEW.change_seq
+            USING ERRCODE = '23514';
+    END IF;
     RETURN NEW;
 END
 $$;
 CREATE TRIGGER template_version_guard
-    BEFORE UPDATE OR DELETE ON messaging.template_version
+    BEFORE INSERT OR UPDATE OR DELETE ON messaging.template_version
     FOR EACH ROW EXECUTE FUNCTION messaging.template_version_guard();
 
--- One row: the last change number handed out (approve, revoke, seed). Updating it locks
--- the row, so change numbers commit in order.
-CREATE TABLE messaging.template_change (
-    id       boolean PRIMARY KEY DEFAULT true CHECK (id),
-    last_seq bigint NOT NULL DEFAULT 0 CHECK (last_seq >= 0)
-);
-INSERT INTO messaging.template_change DEFAULT VALUES;
+-- Who may publish under a name never changes, and a claim is never given up.
+CREATE FUNCTION messaging.template_publisher_guard()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'template publishers are never deleted' USING ERRCODE = '23514';
+    END IF;
+    IF (OLD.publisher, OLD.owner_user_id) IS DISTINCT FROM (NEW.publisher, NEW.owner_user_id)
+    THEN
+        RAISE EXCEPTION 'a template publisher''s owner never changes' USING ERRCODE = '23514';
+    END IF;
+    RETURN NEW;
+END
+$$;
+CREATE TRIGGER template_publisher_guard
+    BEFORE UPDATE OR DELETE ON messaging.template_publisher
+    FOR EACH ROW EXECUTE FUNCTION messaging.template_publisher_guard();
 
 -- The audit trail of every version, append-only.
 CREATE TABLE messaging.template_event (
@@ -120,3 +181,26 @@ $$;
 CREATE TRIGGER template_event_append_only
     BEFORE UPDATE OR DELETE ON messaging.template_event
     FOR EACH ROW EXECUTE FUNCTION messaging.template_event_append_only();
+
+-- The guards above are row triggers, which TRUNCATE skips: refuse it outright.
+CREATE FUNCTION messaging.template_no_truncate()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $$
+BEGIN
+    RAISE EXCEPTION '% is never truncated', TG_TABLE_NAME USING ERRCODE = '23514';
+END
+$$;
+CREATE TRIGGER template_publisher_no_truncate
+    BEFORE TRUNCATE ON messaging.template_publisher
+    FOR EACH STATEMENT EXECUTE FUNCTION messaging.template_no_truncate();
+CREATE TRIGGER template_version_no_truncate
+    BEFORE TRUNCATE ON messaging.template_version
+    FOR EACH STATEMENT EXECUTE FUNCTION messaging.template_no_truncate();
+CREATE TRIGGER template_change_no_truncate
+    BEFORE TRUNCATE ON messaging.template_change
+    FOR EACH STATEMENT EXECUTE FUNCTION messaging.template_no_truncate();
+CREATE TRIGGER template_event_no_truncate
+    BEFORE TRUNCATE ON messaging.template_event
+    FOR EACH STATEMENT EXECUTE FUNCTION messaging.template_no_truncate();

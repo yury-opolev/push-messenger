@@ -70,6 +70,7 @@ async fn a_stored_template_is_read_back_whole<B: Backend>(backend: &B) {
     };
     let submitted = template("acme.deploy@3", Some(user), start());
     let mut tx = store.begin().await.unwrap();
+    assert_eq!(tx.next_template_change().await, Ok(1));
     submit(&mut tx, builtin.clone()).await;
     submit(&mut tx, submitted.clone()).await;
     tx.commit().await.unwrap();
@@ -135,6 +136,7 @@ async fn reviews_set_the_status_the_time_and_the_change<B: Backend>(backend: &B)
     let mut tx = store.begin().await.unwrap();
     submit(&mut tx, approved.clone()).await;
     submit(&mut tx, rejected.clone()).await;
+    assert_eq!(tx.next_template_change().await, Ok(1));
     tx.set_template_status(&approved.template, TemplateStatus::Approved, first, Some(1))
         .await
         .unwrap();
@@ -161,6 +163,7 @@ async fn reviews_set_the_status_the_time_and_the_change<B: Backend>(backend: &B)
             ..rejected
         })
     );
+    assert_eq!(tx.next_template_change().await, Ok(2));
     tx.set_template_status(&approved.template, TemplateStatus::Revoked, second, Some(2))
         .await
         .unwrap();
@@ -190,15 +193,18 @@ async fn only_the_one_way_status_changes_are_allowed<B: Backend>(backend: &B) {
     for stored in [&pending, &approved, &rejected, &revoked] {
         submit(&mut tx, stored.clone()).await;
     }
+    tx.next_template_change().await.unwrap();
     tx.set_template_status(&approved.template, TemplateStatus::Approved, at, Some(1))
         .await
         .unwrap();
     tx.set_template_status(&rejected.template, TemplateStatus::Rejected, at, None)
         .await
         .unwrap();
+    tx.next_template_change().await.unwrap();
     tx.set_template_status(&revoked.template, TemplateStatus::Approved, at, Some(2))
         .await
         .unwrap();
+    tx.next_template_change().await.unwrap();
     tx.set_template_status(&revoked.template, TemplateStatus::Revoked, at, Some(3))
         .await
         .unwrap();
@@ -262,9 +268,11 @@ async fn status_invariants_hold_in_every_write<B: Backend>(backend: &B) {
     for stored in [&first, &second, &pending] {
         submit(&mut tx, stored.clone()).await;
     }
+    tx.next_template_change().await.unwrap();
     tx.set_template_status(&first.template, TemplateStatus::Approved, at, Some(1))
         .await
         .unwrap();
+    tx.next_template_change().await.unwrap();
     tx.set_template_status(&second.template, TemplateStatus::Approved, at, Some(2))
         .await
         .unwrap();
@@ -379,22 +387,22 @@ async fn the_catalog_lists_approved_and_revoked_changes_in_order<B: Backend>(bac
     add_users(&store, &[user]).await;
     let at = start() + TimeDelta::hours(1);
     let mut tx = store.begin().await.unwrap();
-    // Approved as change 3, 1 and 4; one of them revoked later as change 5.
-    for (reference, change) in [("acme.c@1", 3), ("acme.a@1", 1), ("acme.d@1", 4)] {
-        let stored = template(reference, Some(user), start());
-        submit(&mut tx, stored.clone()).await;
-        tx.set_template_status(&stored.template, TemplateStatus::Approved, at, Some(change))
+    // Submitted as c, a, d; approved as a (change 1), c (2) and d (3); c revoked later as
+    // change 4.
+    for reference in ["acme.c@1", "acme.a@1", "acme.d@1"] {
+        submit(&mut tx, template(reference, Some(user), start())).await;
+    }
+    for (reference, status) in [
+        ("acme.a@1", TemplateStatus::Approved),
+        ("acme.c@1", TemplateStatus::Approved),
+        ("acme.d@1", TemplateStatus::Approved),
+        ("acme.c@1", TemplateStatus::Revoked),
+    ] {
+        let change = tx.next_template_change().await.unwrap();
+        tx.set_template_status(&reference.parse().unwrap(), status, at, Some(change))
             .await
             .unwrap();
     }
-    tx.set_template_status(
-        &"acme.c@1".parse().unwrap(),
-        TemplateStatus::Revoked,
-        at,
-        Some(5),
-    )
-    .await
-    .unwrap();
     // Pending and rejected versions are never in the catalog.
     submit(&mut tx, template("acme.pending@1", Some(user), start())).await;
     let rejected = template("acme.rejected@1", Some(user), start());
@@ -414,7 +422,7 @@ async fn the_catalog_lists_approved_and_revoked_changes_in_order<B: Backend>(bac
         refs(&tx.templates_changed_since(0, 2).await.unwrap()),
         ["acme.a@1", "acme.d@1"]
     );
-    assert!(tx.templates_changed_since(5, 10).await.unwrap().is_empty());
+    assert!(tx.templates_changed_since(4, 10).await.unwrap().is_empty());
 }
 
 async fn versions_are_listed_by_status_newest_first<B: Backend>(backend: &B) {
@@ -426,6 +434,7 @@ async fn versions_are_listed_by_status_newest_first<B: Backend>(backend: &B) {
         let at = start() + TimeDelta::minutes(minutes);
         submit(&mut tx, template(reference, Some(user), at)).await;
     }
+    tx.next_template_change().await.unwrap();
     tx.set_template_status(
         &"acme.mid@1".parse().unwrap(),
         TemplateStatus::Approved,
@@ -672,10 +681,10 @@ async fn template_writes_are_kept_only_on_commit<B: Backend>(backend: &B) {
     tx.insert_template_event(submit_event.clone())
         .await
         .unwrap();
+    assert_eq!(tx.next_template_change().await, Ok(1));
     tx.set_template_status(&stored.template, TemplateStatus::Approved, start(), Some(1))
         .await
         .unwrap();
-    assert_eq!(tx.next_template_change().await, Ok(1));
     tx.commit().await.unwrap();
 
     let mut tx = store.begin().await.unwrap();
@@ -691,6 +700,74 @@ async fn template_writes_are_kept_only_on_commit<B: Backend>(backend: &B) {
         [submit_event]
     );
     assert_eq!(tx.last_template_change().await, Ok(1));
+}
+
+async fn a_change_number_is_the_last_one_taken<B: Backend>(backend: &B) {
+    let store = backend.store().await;
+    let user = UserId::new();
+    add_users(&store, &[user]).await;
+    let (first, second) = (
+        template("acme.first@1", Some(user), start()),
+        template("acme.second@1", Some(user), start()),
+    );
+    let at = start() + TimeDelta::hours(1);
+    let mut tx = store.begin().await.unwrap();
+    submit(&mut tx, first.clone()).await;
+    submit(&mut tx, second.clone()).await;
+    tx.commit().await.unwrap();
+
+    // Not taken yet, or taken before the last one: refused, on insert and on review.
+    let builtin = |change_seq| StoredTemplate {
+        status: TemplateStatus::Approved,
+        reviewed_at: Some(at),
+        change_seq: Some(change_seq),
+        ..template("agent.note@1", None, start())
+    };
+    let mut tx = store.begin().await.unwrap();
+    tx.claim_publisher("agent", PublisherOwner::Server)
+        .await
+        .unwrap();
+    assert!(matches!(
+        tx.insert_template(builtin(1)).await,
+        Err(DomainError::Store(_))
+    ));
+    tx.rollback().await.unwrap();
+    let mut tx = store.begin().await.unwrap();
+    assert!(matches!(
+        tx.set_template_status(&first.template, TemplateStatus::Approved, at, Some(1))
+            .await,
+        Err(DomainError::Store(_))
+    ));
+    tx.rollback().await.unwrap();
+    let mut tx = store.begin().await.unwrap();
+    assert_eq!(tx.next_template_change().await, Ok(1));
+    assert_eq!(tx.next_template_change().await, Ok(2));
+    assert!(matches!(
+        tx.set_template_status(&first.template, TemplateStatus::Approved, at, Some(1))
+            .await,
+        Err(DomainError::Store(_))
+    ));
+    tx.rollback().await.unwrap();
+
+    // The last one taken is accepted.
+    let mut tx = store.begin().await.unwrap();
+    assert_eq!(tx.next_template_change().await, Ok(1));
+    tx.set_template_status(&first.template, TemplateStatus::Approved, at, Some(1))
+        .await
+        .unwrap();
+    assert_eq!(tx.next_template_change().await, Ok(2));
+    tx.claim_publisher("agent", PublisherOwner::Server)
+        .await
+        .unwrap();
+    assert_eq!(
+        tx.insert_template(builtin(2)).await,
+        Ok(InsertOutcome::Inserted)
+    );
+    // Rejecting takes no number.
+    tx.set_template_status(&second.template, TemplateStatus::Rejected, at, None)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
 }
 
 pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
@@ -711,5 +788,6 @@ pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
         an_event_of_an_unknown_template_is_refused,
         only_owned_agents_are_agents,
         template_writes_are_kept_only_on_commit,
+        a_change_number_is_the_last_one_taken,
     ]
 }
