@@ -11,7 +11,7 @@ use super::strict::{self, Object, StrictValue, at, join};
 use super::wording::check_value;
 use super::{
     Block, Choices, Definition, ItemType, MAX_ANSWER_BYTES, MAX_RICH_BYTES, ParamType,
-    TemplateError, TemplateRef, matches_pattern,
+    TemplateError, TemplateRef, is_key,
 };
 
 const MAX_RICH_FALLBACK_CHARS: usize = 2000;
@@ -211,8 +211,8 @@ impl RichBody {
 
 impl AnswerBody {
     /// Reads the body: at most `MAX_ANSWER_BYTES` of strict JSON holding exactly `card` (a
-    /// hyphenated UUID), `values` (1 to 10 distinct strings) and `fallback` (1 to 500
-    /// characters on one line, not only whitespace).
+    /// hyphenated UUID), `values` (1 to 10 distinct option ids, `^[a-z][a-z0-9_]{0,31}$`) and
+    /// `fallback` (1 to 500 characters on one line, not only whitespace).
     pub fn parse(body: &[u8]) -> Result<AnswerBody, TemplateError> {
         let value = parse_document(body, "ANSWER", MAX_ANSWER_BYTES)?;
         let root = value.object("")?;
@@ -233,6 +233,7 @@ impl AnswerBody {
         for (i, item) in items.iter().enumerate() {
             let path = format!("values[{i}]");
             let value = item.string(&path)?;
+            check_option_id(value, &path)?;
             if values.iter().any(|v| v == value) {
                 return Err(at(&path, format!("{value:?} is listed twice")));
             }
@@ -391,7 +392,7 @@ fn parse_item(value: &StrictValue, path: &str) -> Result<ListItem, TemplateError
 fn check_param(value: &ParamValue, ty: &ParamType, path: &str) -> Result<(), TemplateError> {
     match (ty, value) {
         (ParamType::String { max_len, multiline }, ParamValue::String(s)) => {
-            check_value(s, *max_len as usize, *multiline).map_err(|e| at(path, e))
+            check_label(s, *max_len as usize, *multiline, path)
         }
         (ParamType::Enum { values }, ParamValue::String(s)) => {
             if values.contains(s) {
@@ -448,10 +449,16 @@ fn describe(ty: &ParamType) -> &'static str {
     }
 }
 
-/// Option ids in a body: `^[a-z0-9][a-z0-9_-]{0,31}$`.
-fn is_option_id(id: &str) -> bool {
-    let rest = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-';
-    matches_pattern(id, |b| b.is_ascii_lowercase() || b.is_ascii_digit(), rest)
+/// Option ids in a body: `^[a-z][a-z0-9_]{0,31}$`, as everywhere else.
+fn check_option_id(id: &str, path: &str) -> Result<(), TemplateError> {
+    if is_key(id) {
+        Ok(())
+    } else {
+        Err(at(
+            path,
+            format!("{id:?} does not match ^[a-z][a-z0-9_]{{0,31}}$"),
+        ))
+    }
 }
 
 fn check_text(
@@ -463,29 +470,30 @@ fn check_text(
     check_value(text, max_chars, multiline).map_err(|e| at(path, e))
 }
 
-fn check_label(text: &str, max_chars: usize, path: &str) -> Result<(), TemplateError> {
+/// A present string: like `check_text`, and not empty or only whitespace.
+fn check_label(
+    text: &str,
+    max_chars: usize,
+    multiline: bool,
+    path: &str,
+) -> Result<(), TemplateError> {
     if text.trim().is_empty() {
         return Err(at(path, "is empty"));
     }
-    check_text(text, max_chars, false, path)
+    check_text(text, max_chars, multiline, path)
 }
 
 fn check_item(value: &ListItem, ty: &ItemType, path: &str) -> Result<(), TemplateError> {
     match (ty, value) {
         (ItemType::String { max_len }, ListItem::String(s)) => {
-            check_text(s, *max_len as usize, false, path)
+            check_label(s, *max_len as usize, false, path)
         }
         (ItemType::Option, ListItem::Option { id, label }) => {
-            if !is_option_id(id) {
-                return Err(at(
-                    &join(path, "id"),
-                    format!("{id:?} does not match ^[a-z0-9][a-z0-9_-]{{0,31}}$"),
-                ));
-            }
-            check_label(label, MAX_OPTION_LABEL_CHARS, &join(path, "label"))
+            check_option_id(id, &join(path, "id"))?;
+            check_label(label, MAX_OPTION_LABEL_CHARS, false, &join(path, "label"))
         }
         (ItemType::Step, ListItem::Step { label, detail, .. }) => {
-            check_label(label, MAX_STEP_LABEL_CHARS, &join(path, "label"))?;
+            check_label(label, MAX_STEP_LABEL_CHARS, false, &join(path, "label"))?;
             match detail {
                 Some(detail) => {
                     check_text(detail, MAX_STEP_DETAIL_CHARS, true, &join(path, "detail"))
@@ -540,7 +548,7 @@ mod tests {
             "tpl": "agent.question@1",
             "params": {
                 "question": "Which region?",
-                "options": [{"id": "eu-west", "label": "EU"}, {"id": "us_1", "label": "US"}]
+                "options": [{"id": "eu_west", "label": "EU"}, {"id": "us_1", "label": "US"}]
             },
             "fallback": "Which region: EU or US?"
         })
@@ -676,6 +684,35 @@ mod tests {
     }
 
     #[test]
+    fn refuses_empty_strings_when_present() {
+        let definition = builtin("approval");
+        for text in ["", " ", "\n\t "] {
+            let mut body = approval();
+            body["params"]["title"] = json!(text);
+            refused(checked(&body, &definition), "params.title: is empty");
+            let mut body = approval();
+            body["params"]["details"] = json!(text);
+            refused(checked(&body, &definition), "params.details: is empty");
+            let mut body = approval();
+            body["params"]["preview"] = json!(text);
+            refused(checked(&body, &definition), "params.preview: is empty");
+        }
+        let definition = custom(
+            json!({"tags": {"type": "list", "item": {"type": "string", "max_len": 10}, "max_items": 3}}),
+            json!([{"type": "text", "param": "tags"}]),
+        );
+        assert!(checked(&custom_body(json!({"tags": ["a"]})), &definition).is_ok());
+        refused(
+            checked(&custom_body(json!({"tags": ["a", " "]})), &definition),
+            "params.tags[1]: is empty",
+        );
+        refused(
+            checked(&custom_body(json!({"tags": [""]})), &definition),
+            "params.tags[0]: is empty",
+        );
+    }
+
+    #[test]
     fn checks_enum_int_and_list_values() {
         let plan = builtin("plan");
         let body = json!({"tpl": "agent.plan@1", "params": {"title": "P", "steps": [], "state": "paused"}, "fallback": "P"});
@@ -730,13 +767,17 @@ mod tests {
     fn checks_options() {
         let definition = builtin("question");
         let mut body = question();
-        body["params"]["options"][1]["id"] = json!("eu-west");
+        body["params"]["options"][1]["id"] = json!("eu_west");
         refused(
             checked(&body, &definition),
-            "params.options[1].id: duplicate option id \"eu-west\"",
+            "params.options[1].id: duplicate option id \"eu_west\"",
         );
-        body["params"]["options"][1]["id"] = json!("-us");
-        refused(checked(&body, &definition), "params.options[1].id");
+        for id in ["-us", "eu-west", "1us", "Us", "_us", ""] {
+            body["params"]["options"][1]["id"] = json!(id);
+            refused(checked(&body, &definition), "params.options[1].id: ");
+        }
+        body["params"]["options"][1]["id"] = json!("u");
+        assert!(checked(&body, &definition).is_ok());
         body["params"]["options"][1] = json!({"id": "us", "label": " "});
         refused(
             checked(&body, &definition),
@@ -816,7 +857,7 @@ mod tests {
     fn answers_to_a_question_come_from_the_card() {
         let definition = builtin("question");
         let card = checked(&question(), &definition).unwrap();
-        assert_eq!(card.offered(&definition), ["eu-west", "us_1"]);
+        assert_eq!(card.offered(&definition), ["eu_west", "us_1"]);
         assert!(
             answer(CARD, &["us_1"])
                 .unwrap()
@@ -873,6 +914,10 @@ mod tests {
         let eleven: Vec<String> = (0..11).map(|i| format!("v{i}")).collect();
         let eleven: Vec<&str> = eleven.iter().map(String::as_str).collect();
         refused(answer(CARD, &eleven), "not 11");
+        for value in ["x\u{0}", "A", "", "eu-west", "1a", "a".repeat(33).as_str()] {
+            refused(answer(CARD, &["a", value]), "values[1]: ");
+        }
+        assert!(answer(CARD, &["a_1", &"a".repeat(32)]).is_ok());
         let body = |fallback: &str| {
             AnswerBody::parse(
                 &serde_json::to_vec(&json!({"card": CARD, "values": ["a"], "fallback": fallback}))

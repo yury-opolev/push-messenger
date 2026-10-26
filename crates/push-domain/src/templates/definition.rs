@@ -395,6 +395,17 @@ impl Definition {
                     format!("an interactive block cannot use the optional param {name:?}"),
                 ));
             }
+            if let (Block::Heading(_), ParamType::String { max_len, .. }) = (block, &spec.ty) {
+                if *max_len as usize > MAX_HEADING_CHARS {
+                    return Err(at(
+                        &param_path,
+                        format!(
+                            "a heading block needs a param with max_len at most \
+                             {MAX_HEADING_CHARS}; {name:?} has {max_len}"
+                        ),
+                    ));
+                }
+            }
             if let (Block::Multi { min, max, .. }, ParamType::List { max_items, .. }) =
                 (block, &spec.ty)
             {
@@ -1333,6 +1344,18 @@ mod tests {
         assert!(parse(&value).is_ok());
         value["params"]["body"]["multiline"] = json!(true);
         refused(&value, "a heading block needs a single-line string param");
+    }
+
+    #[test]
+    fn refuses_a_heading_bound_to_a_long_string() {
+        let mut value = with_block(json!({"type": "heading", "param": "body"}));
+        value["params"]["body"]["max_len"] = json!(200);
+        assert!(parse(&value).is_ok());
+        value["params"]["body"]["max_len"] = json!(201);
+        refused(
+            &value,
+            "layout[1].param: a heading block needs a param with max_len at most 200; \"body\" has 201",
+        );
     }
 
     #[test]

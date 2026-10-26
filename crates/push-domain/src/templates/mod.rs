@@ -116,7 +116,8 @@ pub(crate) fn is_id(s: &str) -> bool {
     )
 }
 
-/// `^[a-z][a-z0-9_]{0,31}$`: param names, enum values and literal option ids.
+/// `^[a-z][a-z0-9_]{0,31}$`: param names, enum values and option ids (literal, in bodies
+/// and in answers).
 pub(crate) fn is_key(s: &str) -> bool {
     matches_pattern(
         s,
