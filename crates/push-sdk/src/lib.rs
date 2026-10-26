@@ -31,8 +31,9 @@ pub use client::{Account, Client, Config, EDIT_WINDOW, Events};
 pub use error::SdkError;
 pub use key::DatabaseKey;
 pub use model::{
-    ConnectionState, Contact, ContactState, Conversation, ConversationKind, Event, Invite, Message,
-    MessageKind, MessageStatus, OutboxKind,
+    Activity, ActivityState, ConnectionState, Contact, ContactState, Conversation,
+    ConversationKind, Event, Invite, Message, MessageKind, MessageStatus, OutboxKind, Presence,
+    PresenceState,
 };
 pub use push_domain::{ClientMsgId, ConversationId, DeviceId, MessageId, UserId};
 pub use secrets::{MemorySecretStore, SECRET_KEYS, SecretError, SecretStore};

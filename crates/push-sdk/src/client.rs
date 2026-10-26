@@ -6,6 +6,7 @@
 //! and can be awaited from any executor; its plain methods read or change the local store
 //! at once. It is cheap to clone, and every clone is the same client.
 
+mod presence;
 mod requests;
 mod sending;
 

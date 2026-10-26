@@ -17,7 +17,7 @@ use tokio::time::Instant;
 use uuid::Uuid;
 
 use crate::SdkError;
-use crate::model::{Contact, ContactState, Event, OutboxKind};
+use crate::model::{Activity, ActivityState, Contact, ContactState, Event, OutboxKind, Presence};
 use crate::policy::{Acks, Backoff};
 use crate::store::{Applied, Store, bytes};
 
@@ -299,6 +299,8 @@ impl Engine {
             Body::Receipt(receipt) => self.on_receipt(&receipt),
             Body::ReadPosition(position) => self.on_read_position(&position),
             Body::ContactEvent(event) => self.on_contact_event(&event, out),
+            Body::ActivityEvent(event) => self.on_activity_event(&event, now_ms),
+            Body::PresenceEvent(event) => self.on_presence_event(&event),
             other => return Some(other),
         }
         None
@@ -578,6 +580,33 @@ impl Engine {
         }
         self.relist(out);
     }
+
+    /// Activity is reported, not stored: it expires `ttl_ms` after it arrived, on this
+    /// device's clock.
+    fn on_activity_event(&mut self, event: &v1::ActivityEvent, now_ms: i64) {
+        let (Ok(conversation), Ok(user)) = (
+            Uuid::from_slice(&event.conversation_id),
+            Uuid::from_slice(&event.user_id),
+        ) else {
+            return;
+        };
+        let Some(state) = ActivityState::from_wire(event.state()) else {
+            return;
+        };
+        self.shared.emit(Event::ActivityChanged(Activity {
+            conversation_id: ConversationId(conversation),
+            user_id: user.into(),
+            state,
+            label: event.label.clone(),
+            expires_at_ms: now_ms.saturating_add(i64::from(event.ttl_ms)),
+        }));
+    }
+
+    fn on_presence_event(&mut self, event: &v1::PresenceEvent) {
+        if let Some(presence) = event.presence.as_ref().and_then(Presence::from_wire) {
+            self.shared.emit(Event::PresenceChanged(presence));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -586,7 +615,7 @@ mod tests {
     use push_proto::v1::{EntryKind, ErrorCode};
 
     use super::*;
-    use crate::model::{ConversationKind, MessageKind, MessageStatus};
+    use crate::model::{ConversationKind, MessageKind, MessageStatus, PresenceState};
     use crate::store::tests::{answer_entry, card_entry, entry};
 
     struct Fixture {
@@ -925,6 +954,86 @@ mod tests {
                 user_id: f.peer,
                 state: ContactState::Blocked,
             })]
+        );
+    }
+
+    #[test]
+    fn an_activity_event_becomes_activity_changed_with_a_local_expiry() {
+        let mut f = fixture();
+        let (conversation, peer) = (f.conversation, f.peer);
+        let activity = move |conversation_id: Vec<u8>, state: v1::ActivityState, ttl_ms| {
+            Body::ActivityEvent(v1::ActivityEvent {
+                conversation_id,
+                user_id: bytes(peer.0),
+                state: state.into(),
+                label: Some("running tests".to_owned()),
+                ttl_ms,
+            })
+        };
+        let working = activity(bytes(conversation.0), v1::ActivityState::Working, 30_000);
+        let idle = activity(bytes(conversation.0), v1::ActivityState::Idle, 0);
+        let unspecified = activity(bytes(conversation.0), v1::ActivityState::Unspecified, 1);
+        let nameless = activity(vec![1, 2], v1::ActivityState::Typing, 30_000);
+        for body in [working, idle, unspecified, nameless] {
+            let mut out = Vec::new();
+            let back = f.engine.on_frame(body, Instant::now(), 5_000, &mut out);
+            assert_eq!((back, out), (None, Vec::new()));
+        }
+        let changed = move |state, expires_at_ms| {
+            Event::ActivityChanged(Activity {
+                conversation_id: conversation,
+                user_id: peer,
+                state,
+                label: Some("running tests".to_owned()),
+                expires_at_ms,
+            })
+        };
+        assert_eq!(
+            f.events(),
+            [
+                changed(ActivityState::Working, 35_000),
+                changed(ActivityState::Idle, 5_000),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_presence_event_becomes_presence_changed() {
+        let mut f = fixture();
+        let peer = f.peer;
+        let presence = |user_id: Vec<u8>, state: v1::PresenceState, last_seen| {
+            Body::PresenceEvent(v1::PresenceEvent {
+                presence: Some(v1::Presence {
+                    user_id,
+                    state: state.into(),
+                    last_seen,
+                }),
+            })
+        };
+        f.frame(presence(bytes(peer.0), v1::PresenceState::Online, None));
+        f.frame(presence(
+            bytes(peer.0),
+            v1::PresenceState::Offline,
+            Some(1_700_000_040_000_000),
+        ));
+        f.frame(presence(bytes(peer.0), v1::PresenceState::Unknown, None));
+        f.frame(presence(vec![7], v1::PresenceState::Online, None));
+        let (back, out) = f.frame(Body::PresenceEvent(v1::PresenceEvent { presence: None }));
+        assert_eq!((back, out), (None, Vec::new()));
+        let changed = move |state, last_seen_ms| {
+            Event::PresenceChanged(Presence {
+                user_id: peer,
+                state,
+                last_seen_ms,
+            })
+        };
+        assert_eq!(
+            f.events(),
+            [
+                changed(PresenceState::Online, None),
+                changed(PresenceState::Offline, Some(1_700_000_040_000)),
+                changed(PresenceState::Unknown, None),
+            ]
         );
     }
 

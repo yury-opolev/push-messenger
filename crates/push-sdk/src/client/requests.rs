@@ -24,7 +24,7 @@ impl Client {
     /// Sends a request once connected, waiting for the connection and then for the
     /// answer up to the request timeout each. Fails at once while signed out, removed,
     /// opened elsewhere or not asked to connect.
-    async fn request(&self, body: request::Body) -> Result<response::Body, SdkError> {
+    pub(super) async fn request(&self, body: request::Body) -> Result<response::Body, SdkError> {
         let inner = self.inner.clone();
         self.run(async move {
             let mut state = inner.state.clone();
@@ -336,7 +336,7 @@ impl Client {
     }
 }
 
-fn unexpected() -> SdkError {
+pub(super) fn unexpected() -> SdkError {
     SdkError::UnexpectedAnswer("the server answered with something unexpected".to_owned())
 }
 

@@ -222,6 +222,9 @@ pub fn event(event: &Event) -> Value {
         Event::DeviceRemoved => json!({"type": "deviceRemoved"}),
         Event::OpenedElsewhere => json!({"type": "openedElsewhere"}),
         Event::EventsLost => json!({"type": "eventsLost"}),
+        // Placeholders until the bindings carry activity and presence with their fields.
+        Event::ActivityChanged(_) => json!({"type": "activityChanged"}),
+        Event::PresenceChanged(_) => json!({"type": "presenceChanged"}),
     }
 }
 

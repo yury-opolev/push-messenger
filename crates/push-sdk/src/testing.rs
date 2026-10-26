@@ -13,11 +13,12 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{delete, patch, post};
 use futures_util::{SinkExt, StreamExt};
-use push_domain::{ConversationId, DeviceId, UserId};
+use push_domain::{ConversationId, DeviceId, MAX_PRESENCE_BATCH, UserId};
 use push_proto::v1::frame::Body;
 use push_proto::v1::{
     ContactList, ContentType, ConversationList, Deliver, DirectOpened, EntryKind, ErrorCode,
-    InviteRedeemed, Pong, Ready, Request, Response, SendAck, request, response,
+    InviteRedeemed, Pong, Presence, PresenceList, PresenceSharing, PresenceState, Ready, Request,
+    Response, SendAck, request, response,
 };
 use push_proto::{decode_frame, encode_frame};
 use serde_json::{Value, json};
@@ -334,8 +335,10 @@ pub const UNKNOWN_INVITE: &str = "NOSUCHCODE";
 /// `Pong`, every send, edit and delete is stored with the next `seq` of its conversation,
 /// and every text message or card sent is answered by the peer with the same content,
 /// delivered next (answers are not echoed).
-/// `OpenDirect`, `CreateInvite`, `RedeemInvite` and the listings are answered; any other
-/// request is refused with `rejected`.
+/// `OpenDirect`, `CreateInvite`, `RedeemInvite` and the listings are answered; so are
+/// `GetPresence` (every user offline, last seen this minute; unknown while sharing is
+/// off) and `SetPresenceSharing` (on until switched off, per gateway). Activity frames are
+/// taken silently. Any other request is refused with `rejected`.
 pub struct AutoGateway {
     pub url: String,
 }
@@ -344,6 +347,7 @@ pub struct AutoGateway {
 struct Log {
     /// Each conversation's peer and last `seq`.
     conversations: HashMap<ConversationId, (UserId, i64)>,
+    presence_hidden: bool,
 }
 
 impl AutoGateway {
@@ -516,6 +520,44 @@ fn answer(request: Request, log: &Mutex<Log>) -> Body {
         Some(request::Body::RedeemInvite(_)) => response::Body::InviteRedeemed(InviteRedeemed {
             user_id: id_bytes(Uuid::now_v7()),
         }),
+        Some(request::Body::GetPresence(get))
+            if get.user_ids.is_empty() || get.user_ids.len() > MAX_PRESENCE_BATCH =>
+        {
+            return refuse(ErrorCode::Invalid, "ask for 1 to 100 users");
+        }
+        Some(request::Body::GetPresence(get)) => {
+            let hidden = log.lock().unwrap().presence_hidden;
+            let minute = now_us() / 60_000_000 * 60_000_000;
+            let mut asked: Vec<Vec<u8>> = Vec::new();
+            for id in get.user_ids {
+                if !asked.contains(&id) {
+                    asked.push(id);
+                }
+            }
+            let presences = asked
+                .into_iter()
+                .map(|user_id| Presence {
+                    user_id,
+                    state: if hidden {
+                        PresenceState::Unknown
+                    } else {
+                        PresenceState::Offline
+                    }
+                    .into(),
+                    last_seen: (!hidden).then_some(minute),
+                })
+                .collect();
+            response::Body::Presences(PresenceList { presences })
+        }
+        Some(request::Body::SetPresenceSharing(set)) => {
+            let mut log = log.lock().unwrap();
+            if let Some(share) = set.share {
+                log.presence_hidden = !share;
+            }
+            response::Body::PresenceSharing(PresenceSharing {
+                share: !log.presence_hidden,
+            })
+        }
         _ => return refuse(ErrorCode::Rejected, "the fake gateway does not answer this"),
     };
     Body::Response(Response {
