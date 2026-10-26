@@ -633,10 +633,10 @@ impl Engine {
     }
 
     fn on_presence_event(&mut self, event: &v1::PresenceEvent) {
-        if let Some(presence) = event.presence.as_ref().and_then(Presence::from_wire)
-            && !self.shared.drops_presence_of(presence.user_id)
-        {
-            self.shared.emit(Event::PresenceChanged(presence));
+        if let Some(presence) = event.presence.as_ref().and_then(Presence::from_wire) {
+            if !self.shared.drops_presence_of(presence.user_id) {
+                self.shared.emit(Event::PresenceChanged(presence));
+            }
         }
     }
 }

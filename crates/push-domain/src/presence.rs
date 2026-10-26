@@ -126,10 +126,10 @@ where
         if share {
             tx.set_presence_hidden(user, false).await?;
             let to = audience(&mut tx, user).await?;
-            if !to.is_empty()
-                && let Some(view) = current().await
-            {
-                self.publish(vec![Event::Presence { to, user, view }]).await;
+            if !to.is_empty() {
+                if let Some(view) = current().await {
+                    self.publish(vec![Event::Presence { to, user, view }]).await;
+                }
             }
             tx.commit().await?;
         } else {
@@ -167,10 +167,10 @@ where
         let mut tx = self.store.begin().await?;
         tx.lock_users(&[user]).await?;
         let to = audience(&mut tx, user).await?;
-        if !to.is_empty()
-            && let Some(view) = current().await
-        {
-            self.publish(vec![Event::Presence { to, user, view }]).await;
+        if !to.is_empty() {
+            if let Some(view) = current().await {
+                self.publish(vec![Event::Presence { to, user, view }]).await;
+            }
         }
         tx.rollback().await?;
         Ok(())
