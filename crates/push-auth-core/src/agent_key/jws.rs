@@ -6,6 +6,7 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ring::signature::{ECDSA_P256_SHA256_FIXED, UnparsedPublicKey};
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
@@ -66,8 +67,9 @@ pub(crate) fn verify(token: &str, audience: &str, now: i64) -> Result<Assertion,
     else {
         return Err("format");
     };
-    let header: Header =
-        serde_json::from_slice(&decode(header_part).ok_or("format")?).map_err(|_| "header")?;
+    let header_bytes = decode(header_part).ok_or("format")?;
+    let payload = decode(payload_part).ok_or("format")?;
+    let header: Header = parse_object(&header_bytes, Some("jwk")).ok_or("header")?;
     if header.alg != "ES256" {
         return Err("algorithm");
     }
@@ -92,9 +94,9 @@ pub(crate) fn verify(token: &str, audience: &str, now: i64) -> Result<Assertion,
     UnparsedPublicKey::new(&ECDSA_P256_SHA256_FIXED, &point)
         .verify(signed.as_bytes(), &signature)
         .map_err(|_| "signature")?;
-    let payload = decode(payload_part).ok_or("format")?;
-    // The struct refuses duplicate and unknown members; the map keeps them for admission.
-    let claims: Claims = serde_json::from_slice(&payload).map_err(|_| "claims")?;
+    // The object checks refuse the array form; the struct refuses duplicate and unknown
+    // members; the map keeps the claims for admission.
+    let claims: Claims = parse_object(&payload, None).ok_or("claims")?;
     let map: Map<String, Value> = serde_json::from_slice(&payload).map_err(|_| "claims")?;
     if !is_jti(&claims.jti) {
         return Err("claims");
@@ -132,6 +134,21 @@ pub(crate) fn thumbprint(x: &[u8], y: &[u8]) -> String {
         URL_SAFE_NO_PAD.encode(y)
     );
     URL_SAFE_NO_PAD.encode(Sha256::digest(canonical.as_bytes()))
+}
+
+/// Parses `bytes` as `T` only if they are a JSON object whose `nested` member, when
+/// present, is an object too: serde's derived structs also accept arrays.
+fn parse_object<T: DeserializeOwned>(bytes: &[u8], nested: Option<&str>) -> Option<T> {
+    let Value::Object(object) = serde_json::from_slice(bytes).ok()? else {
+        return None;
+    };
+    if nested
+        .and_then(|member| object.get(member))
+        .is_some_and(|value| !value.is_object())
+    {
+        return None;
+    }
+    serde_json::from_slice(bytes).ok()
 }
 
 /// Strict base64url: no padding, no other alphabet, canonical trailing bits.
@@ -223,6 +240,41 @@ mod tests {
         }
     }
 
+    /// `a - b` for big-endian 32-byte integers, `a >= b`.
+    fn subtract(a: &[u8], b: &[u8]) -> Vec<u8> {
+        let mut difference = vec![0u8; 32];
+        let mut borrow = 0i16;
+        for at in (0..32).rev() {
+            let mut digit = i16::from(a[at]) - i16::from(b[at]) - borrow;
+            borrow = i16::from(digit < 0);
+            if digit < 0 {
+                digit += 256;
+            }
+            difference[at] = u8::try_from(digit).unwrap();
+        }
+        assert_eq!(borrow, 0);
+        difference
+    }
+
+    #[test]
+    fn a_high_s_signature_verifies() {
+        // D1 accepts both s and n - s.
+        let order = hex("FFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551");
+        let key = TestKey::generate();
+        let token = key.sign(&key.header(), &claims());
+        let signature = URL_SAFE_NO_PAD
+            .decode(token.split('.').nth(2).unwrap())
+            .unwrap();
+        let mut flipped = signature[..32].to_vec();
+        flipped.extend(subtract(&order, &signature[32..]));
+        assert_ne!(flipped, signature);
+        let flipped = replace_part(&token, 2, &encode(flipped));
+        assert_eq!(
+            verify(&flipped, AUD, NOW).unwrap().thumbprint,
+            key.thumbprint()
+        );
+    }
+
     #[test]
     fn refusals_have_their_reasons() {
         let key = TestKey::generate();
@@ -243,6 +295,25 @@ mod tests {
         let claims_text =
             |aud: &str| format!(r#"{aud}"iat":{NOW},"exp":{},"jti":"{JTI}"}}"#, NOW + 120);
         let jwk_text = jwk.to_string();
+        // The last of x's 43 characters carries 2 unused bits, zero when canonical.
+        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        let x = jwk["x"].as_str().unwrap();
+        let last = ALPHABET
+            .iter()
+            .position(|&c| c == x.as_bytes()[42])
+            .unwrap();
+        assert_eq!(last & 3, 0);
+        let loose_x = format!("{}{}", &x[..42], char::from(ALPHABET[last | 1]));
+        let array_header = format!(
+            r#"["ES256","{TOKEN_TYPE}",["EC","P-256",{},{}]]"#,
+            jwk["x"], jwk["y"]
+        );
+        let array_jwk = with(
+            header.clone(),
+            "jwk",
+            json!(["EC", "P-256", jwk["x"], jwk["y"]]),
+        );
+        let array_claims = json!([AUD, NOW, NOW + 120, JTI]);
 
         let cases: Vec<(&str, String, &str)> =
             vec![
@@ -275,12 +346,27 @@ mod tests {
                 sign_header(&with(header.clone(), "x5u", json!("https://evil.example/x5u"))),
                 "header",
             ),
+            ("x5c", sign_header(&with(header.clone(), "x5c", json!(["AAAA"]))), "header"),
+            ("x5t", sign_header(&with(header.clone(), "x5t", json!("AAAA"))), "header"),
+            ("b64", sign_header(&with(header.clone(), "b64", json!(false))), "header"),
+            ("zip", sign_header(&with(header.clone(), "zip", json!("DEF"))), "header"),
+            ("alg RS256", sign_header(&with(header.clone(), "alg", json!("RS256"))), "algorithm"),
+            ("alg EdDSA", sign_header(&with(header.clone(), "alg", json!("EdDSA"))), "algorithm"),
+            ("array header", key.sign_raw(&array_header, &claims().to_string()), "header"),
+            ("array jwk", sign_header(&array_jwk), "header"),
+            ("array claims", sign(&array_claims), "claims"),
             ("private jwk", sign_jwk(with(jwk.clone(), "d", json!("d".repeat(43)))), "header"),
             ("jwk kid", sign_jwk(with(jwk.clone(), "kid", json!("one"))), "header"),
+            ("jwk use", sign_jwk(with(jwk.clone(), "use", json!("sig"))), "header"),
+            ("jwk key_ops", sign_jwk(with(jwk.clone(), "key_ops", json!(["verify"]))), "header"),
+            ("jwk alg", sign_jwk(with(jwk.clone(), "alg", json!("ES256"))), "header"),
             ("P-384", sign_jwk(with(jwk.clone(), "crv", json!("P-384"))), "key"),
             ("OKP", sign_jwk(with(jwk.clone(), "kty", json!("OKP"))), "key"),
             ("short x", sign_jwk(with(jwk.clone(), "x", json!(encode([0u8; 31])))), "key"),
+            ("short y", sign_jwk(with(jwk.clone(), "y", json!(encode([0u8; 31])))), "key"),
+            ("non-canonical x", sign_jwk(with(jwk.clone(), "x", json!(loose_x))), "key"),
             (
+                // ring reports a point off the curve as a generic signature error.
                 "off-curve point",
                 sign_jwk(with(
                     with(jwk.clone(), "x", json!(encode([1u8; 32]))),
@@ -326,6 +412,13 @@ mod tests {
                 "claims",
             ),
             ("fractional iat", sign(&with(claims(), "iat", json!(1.5))), "claims"),
+            ("string iat", sign(&with(claims(), "iat", json!(NOW.to_string()))), "claims"),
+            ("no jti", sign(&without(claims(), "jti")), "claims"),
+            (
+                "malformed payload, wrong signature",
+                replace_part(&other.sign(&header, &claims()), 1, "a*b"),
+                "format",
+            ),
             ("oversized", "a".repeat(MAX_TOKEN_BYTES + 1), "size"),
             ("two parts", "a.b".to_owned(), "format"),
             ("four parts", format!("{valid}.x"), "format"),

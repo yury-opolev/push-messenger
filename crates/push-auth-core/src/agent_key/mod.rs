@@ -1,5 +1,8 @@
 // Until the authenticator uses it (Task 2 of the agent-key plan), only tests call the verifier.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the authenticator of Task 2 uses the verifier")
+)]
 mod jws;
 
 #[cfg(test)]
@@ -41,8 +44,7 @@ pub(crate) mod testing {
         }
 
         /// A valid assertion for `audience`, issued now, valid for two minutes.
-        // The integration tests of Task 2 of the agent-key plan use it.
-        #[allow(dead_code)]
+        #[expect(dead_code, reason = "the integration tests of Task 2 use it")]
         pub(crate) fn assertion(&self, audience: &str) -> String {
             let now = crate::service::unix_now();
             self.sign(
