@@ -276,9 +276,9 @@ where
             .claim_publisher(BUILTIN_PUBLISHER, PublisherOwner::Server)
             .await?;
         if owner != PublisherOwner::Server {
-            return Err(DomainError::Store(format!(
-                "the built-in publisher {BUILTIN_PUBLISHER:?} belongs to an account"
-            )));
+            return Err(DomainError::TemplateConflict(
+                "the built-in publisher belongs to an account",
+            ));
         }
         if tx.template(&template).await?.is_some() {
             tx.rollback().await?;

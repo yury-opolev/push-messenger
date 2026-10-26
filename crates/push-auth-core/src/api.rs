@@ -879,13 +879,22 @@ struct CatalogQuery {
 /// `GET /v1/templates?since=N` (N ≥ 0, default 0): the approved and revoked versions
 /// changed after N (spec 2026-10-26 rich message templates, D8),
 /// `{seq, more, templates: [{template, status, seq, definition?}]}`, with the ETag
-/// `"tpl-<since>-<seq>"`; 304 when `If-None-Match` names it (or is `*`).
+/// `"tpl-<since>-<seq>"`; 304 when `If-None-Match` names it (or is `*`). Rate limited per
+/// IP and per user.
 async fn template_catalog(
     State(api): State<Api>,
     headers: HeaderMap,
+    ClientIp(ip): ClientIp,
     query: Result<Query<CatalogQuery>, QueryRejection>,
 ) -> Result<Response, AuthError> {
-    caller(&api, &headers).await?;
+    let caller = caller(&api, &headers).await?;
+    api.limits
+        .check(
+            Action::TemplateCatalog,
+            ip,
+            Some(&caller.user_id.to_string()),
+        )
+        .await?;
     let since = match query.map(|Query(query)| query.since) {
         Ok(None) => 0,
         Ok(Some(since)) => since

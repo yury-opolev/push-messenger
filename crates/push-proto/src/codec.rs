@@ -87,17 +87,9 @@ pub fn error_status(code: tonic::Code, error: Error) -> tonic::Status {
 /// The client error a gRPC status carries. A status without one — message-svc is
 /// unreachable, or failed before answering — becomes a retryable `UNAVAILABLE`.
 pub fn error_from_status(status: &tonic::Status) -> Error {
-    let carried = RpcStatus::decode(status.details())
-        .ok()
-        .and_then(|rich| {
-            rich.details
-                .into_iter()
-                .find(|detail| detail.type_url == ERROR_TYPE_URL)
-        })
-        .and_then(|detail| Error::decode(detail.value.as_slice()).ok());
-    match carried {
-        Some(error) if error.code() != ErrorCode::Unspecified => error,
-        _ => Error {
+    match carried_error(status) {
+        Some(error) => error,
+        None => Error {
             code: ErrorCode::Unavailable.into(),
             message: "the message service is unavailable".to_owned(),
             retryable: true,
@@ -106,6 +98,20 @@ pub fn error_from_status(status: &tonic::Status) -> Error {
             retry_after_s: None,
         },
     }
+}
+
+/// The client error a gRPC status carries in its details, if it carries one with a code:
+/// unlike [`error_from_status`], a status without one is `None`.
+pub fn carried_error(status: &tonic::Status) -> Option<Error> {
+    RpcStatus::decode(status.details())
+        .ok()
+        .and_then(|rich| {
+            rich.details
+                .into_iter()
+                .find(|detail| detail.type_url == ERROR_TYPE_URL)
+        })
+        .and_then(|detail| Error::decode(detail.value.as_slice()).ok())
+        .filter(|error| error.code() != ErrorCode::Unspecified)
 }
 
 /// The type URL of a `push.v1.Error` packed in a `google.protobuf.Any`.

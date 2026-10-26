@@ -22,8 +22,8 @@ pub mod internal {
 mod codec;
 
 pub use codec::{
-    ERROR_TYPE_URL, FrameError, InvalidId, MAX_FRAME_BYTES, decode_frame, encode_frame,
-    error_from_status, error_status, id, id_bytes, kick_channel, notify_channel,
+    ERROR_TYPE_URL, FrameError, InvalidId, MAX_FRAME_BYTES, carried_error, decode_frame,
+    encode_frame, error_from_status, error_status, id, id_bytes, kick_channel, notify_channel,
 };
 
 /// WebSocket close codes (spec §7.4). Codes from 4000 are the protocol's own; the others

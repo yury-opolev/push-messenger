@@ -1,6 +1,6 @@
 //! Rate limits (spec §5.6): per account and per IP, on signup, login, verification resend,
-//! password reset, opening email links, handle lookup and template submission, and on
-//! sign-in by token (Entra ID
+//! password reset, opening email links, handle lookup, template submission and the
+//! template catalog, and on sign-in by token (Entra ID
 //! or an external provider). Accounts are never locked; a
 //! request over a limit is refused with `rate_limited` and a retry delay.
 //!
@@ -54,6 +54,8 @@ pub enum Action {
     AgentManagement,
     /// `POST /v1/templates`: per IP and per user.
     TemplateSubmit,
+    /// `GET /v1/templates`: per IP and per user.
+    TemplateCatalog,
 }
 
 /// Whom a limit counts.
@@ -79,6 +81,7 @@ impl Scope {
 
 const HOUR: u64 = 3600;
 const QUARTER: u64 = 900;
+const MINUTE: u64 = 60;
 const DAY: u64 = 24 * HOUR;
 
 /// At most `max` requests per `seconds`.
@@ -105,6 +108,7 @@ impl Action {
             Self::AdminAuthFailure => "admin_auth_failure",
             Self::AgentManagement => "agents",
             Self::TemplateSubmit => "template_submit",
+            Self::TemplateCatalog => "template_catalog",
         }
     }
 
@@ -140,6 +144,11 @@ impl Action {
         // Each submission waits for a review (spec 2026-10-26 rich message templates, D6).
         const TEMPLATE_SUBMIT: &[(Scope, Limit)] =
             &[(Scope::Ip, per(60, HOUR)), (Scope::Account, per(10, HOUR))];
+        // Clients poll the catalog (spec D8), mostly answered 304; this only bounds a loop.
+        const TEMPLATE_CATALOG: &[(Scope, Limit)] = &[
+            (Scope::Ip, per(600, MINUTE)),
+            (Scope::Account, per(120, MINUTE)),
+        ];
         match self {
             Self::Signup => SIGNUP,
             Self::Login => LOGIN,
@@ -153,6 +162,7 @@ impl Action {
             Self::AdminAuthFailure => ADMIN_AUTH_FAILURE,
             Self::AgentManagement => AGENTS,
             Self::TemplateSubmit => TEMPLATE_SUBMIT,
+            Self::TemplateCatalog => TEMPLATE_CATALOG,
         }
     }
 }

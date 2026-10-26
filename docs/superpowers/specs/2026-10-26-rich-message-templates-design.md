@@ -41,8 +41,9 @@ caller is the same), so the chart needs no new secret.
 **D5 — Admins are the operator admin role.** Review is served only on auth-svc's admin
 listener (`PUSH_AUTH_ADMIN_ADDR`, `PUSH_AUTH_ADMIN_TOKEN`, never routed by the Ingress,
 spec D15). Holders of the admin token are the template reviewers. Each review call names
-its `reviewer` (1 to 64 printable characters), which goes into the audit trail with the
-caller's IP. A per-user reviewer group on the public API was rejected: it would put an
+its `reviewer` (1 to 64 printable characters), which is stored in the audit trail
+(`messaging.template_event`); the caller's IP is recorded in auth-svc's security log event
+`auth.admin.template_reviewed`. A per-user reviewer group on the public API was rejected: it would put an
 approval endpoint on the internet-facing listener for little gain over the isolated one.
 
 **D6 — Publishers claim a namespace.** Any signed-in account may submit
@@ -61,7 +62,9 @@ change is a new version. A refused ref cannot be resubmitted.
 row lock, so change numbers commit in order and a client that has seen `N` never misses a
 change below `N`. `GET /v1/templates?since=N` returns approved and revoked versions
 changed after `N` (oldest first, at most 200 per page) and `seq`, the position to ask from
-next. Its ETag is `"tpl-<since>-<seq>"`; `If-None-Match` answers 304.
+next. Its ETag is `"tpl-<since>-<seq>"`; `If-None-Match` answers 304. Each approved
+entry carries its definition as a JSON object: key order is not significant, and clients
+must not hash the bytes. The catalog is rate limited per user and per IP.
 
 **D9 — Sender kind is derived, never claimed.** `agent` when the sender has a row in
 `messaging.agent_owner` (an owned agent, enrolled through auth, PR #46/#47), otherwise
@@ -173,13 +176,15 @@ unchanged (deleting an answer does not reopen its card).
 ## HTTP (auth-svc)
 
 Public, with an access token: `POST /v1/templates` (submit; 201 with the summary),
-`GET /v1/templates?since=N` (catalog, ETag). Admin listener, with the admin token:
+`GET /v1/templates?since=N` (catalog, ETag; definitions as JSON objects, whose key order
+is not significant, so clients must not hash the bytes). Admin listener, with the admin token:
 `GET /v1/admin/templates?status=pending|approved|rejected|revoked` (list),
 `GET /v1/admin/templates/{ref}` (definition, a plain-text outline as the preview, the
 audit trail), `POST /v1/admin/templates/{ref}/approve|reject|revoke` with
 `{"reviewer": "...", "note": "..."}`. Errors: 400 `invalid` (with the meta-rule that
 failed), 404 `not_found`, 409 `conflict` (exists, wrong status, publisher of another
-account, too many pending), 503 when message-svc does not answer.
+account, too many pending), 429 `rate_limited`, 503 when message-svc does not answer or
+does not know the submitting account yet (retryable: accounts reach it asynchronously).
 
 ## Clients and the SDK
 

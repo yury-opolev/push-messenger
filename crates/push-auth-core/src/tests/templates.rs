@@ -467,6 +467,26 @@ async fn the_catalog_answers_with_an_etag_and_304_when_unchanged() {
 }
 
 #[tokio::test]
+async fn the_catalog_is_limited_to_120_requests_a_minute_per_user() {
+    let world = world(Offer::Password).await;
+    let user = password_user(&world.auth, &world.pool, "rita", 1)
+        .await
+        .remove(0);
+    let registry = Arc::new(FakeRegistry::default());
+    let routes = public(&world, registry.clone());
+    let token = Some(user.access_token.as_str());
+
+    for _ in 0..120 {
+        let answer = send(&routes, Method::GET, "/v1/templates", token, &[], None).await;
+        assert_eq!(answer.status, StatusCode::OK);
+    }
+    let answer = send(&routes, Method::GET, "/v1/templates", token, &[], None).await;
+    assert_eq!(answer.status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(answer.json()["error"]["code"], "rate_limited");
+    assert_eq!(registry.catalogs.lock().unwrap().len(), 120);
+}
+
+#[tokio::test]
 async fn without_message_svc_the_template_routes_are_unavailable() {
     let world = world(Offer::Password).await;
     let user = password_user(&world.auth, &world.pool, "nora", 1)

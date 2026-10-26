@@ -8,13 +8,14 @@ use push_domain::{
     Clock, DomainError, DomainResult, Messaging, Notifier, ReviewAction, ReviewCommand, Store,
     StoredTemplate, TemplateEvent, TemplateStatus, UserId,
 };
-use push_proto::id_bytes;
 use push_proto::internal::v1::{
     self as internal, CatalogEntry, CatalogRequest, CatalogResponse, GetTemplateRequest,
     ListTemplatesRequest, ReviewTemplateRequest, SubmitTemplateRequest, TemplateDetail,
     TemplateList, TemplateSummary, templates_server,
 };
-use tonic::{Request, Response, Status};
+use push_proto::v1::{self, ErrorCode};
+use push_proto::{error_status, id_bytes};
+use tonic::{Code, Request, Response, Status};
 
 use crate::convert::{domain_error, invalid, micros, parse_id};
 
@@ -47,7 +48,7 @@ where
             .messaging
             .submit_template(user, &request.definition)
             .await
-            .map_err(domain_error)?;
+            .map_err(submit_error)?;
         tracing::info!(
             target: "security",
             event = "templates.submitted",
@@ -200,6 +201,25 @@ pub(crate) fn seeding_is_permanent(error: &DomainError) -> bool {
     !error.is_retryable() && !matches!(error, DomainError::Store(_))
 }
 
+/// A submission's failure. The worker relays new accounts to message-svc asynchronously,
+/// so an account it does not know yet is about to exist: retryable, not not-found.
+fn submit_error(error: DomainError) -> Status {
+    match error {
+        DomainError::UnknownUser => error_status(
+            Code::Unavailable,
+            v1::Error {
+                code: ErrorCode::Unavailable.into(),
+                message: "the account is not ready yet; retry shortly".to_owned(),
+                retryable: true,
+                client_msg_id: None,
+                request_id: None,
+                retry_after_s: None,
+            },
+        ),
+        other => domain_error(other),
+    }
+}
+
 fn parse_ref(template_ref: &str) -> Result<TemplateRef, Status> {
     template_ref
         .parse()
@@ -267,7 +287,7 @@ fn from_status(status: internal::TemplateStatus) -> Option<TemplateStatus> {
 
 #[cfg(test)]
 mod tests {
-    use push_domain::{InMemoryStore, NoopNotifier, SystemClock};
+    use push_domain::{InMemoryStore, NoopNotifier, PublisherOwner, SystemClock, Tx};
     use push_proto::error_from_status;
     use push_proto::internal::v1::templates_server::Templates as TemplatesRpc;
     use push_proto::v1::ErrorCode;
@@ -475,6 +495,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_submission_by_an_account_not_relayed_yet_is_retryable() {
+        let (api, _messaging) = api();
+        let status = api
+            .submit(Request::new(SubmitTemplateRequest {
+                user_id: id_bytes(UserId::new().0),
+                definition: definition("deploy"),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), Code::Unavailable);
+        let error = error_from_status(&status);
+        assert_eq!(error.code(), ErrorCode::Unavailable);
+        assert!(error.retryable);
+        assert_eq!(error.message, "the account is not ready yet; retry shortly");
+    }
+
+    #[tokio::test]
     async fn listings_filter_by_status_and_unspecified_lists_all() {
         let (api, messaging) = api();
         let user = UserId::new();
@@ -550,6 +587,26 @@ mod tests {
             ]
         );
         assert!(page.entries.iter().all(|entry| entry.definition.is_some()));
+    }
+
+    #[tokio::test]
+    async fn seeding_fails_for_good_when_an_account_holds_the_builtin_publisher() {
+        let store = InMemoryStore::default();
+        let messaging = Messaging::new(store.clone(), SystemClock, NoopNotifier);
+        let user = UserId::new();
+        messaging.register_user(user).await.unwrap();
+        let mut tx = store.begin().await.unwrap();
+        tx.claim_publisher("agent", PublisherOwner::User(user))
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        let error = seed_builtins(&messaging).await.unwrap_err();
+        assert_eq!(
+            error,
+            DomainError::TemplateConflict("the built-in publisher belongs to an account")
+        );
+        assert!(seeding_is_permanent(&error));
     }
 
     #[test]

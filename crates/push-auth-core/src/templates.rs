@@ -2,17 +2,19 @@
 //! keeps it, and auth-svc fronts it over HTTP. auth-svc calls message-svc's internal
 //! `Templates` API with the same internal token and channel as `Directory`.
 //!
-//! message-svc's refusals keep their human message: a definition that breaks a rule is
+//! message-svc's refusals keep their human message when they carry it as a `push.v1.Error`
+//! (a bare status gets a generic one): a definition that breaks a rule is
 //! `TemplateInvalid` (400 `invalid`), an unknown ref `TemplateNotFound` (404 `not_found`),
 //! an existing ref, a status that does not allow the review, another account's publisher
-//! or too many pending submissions `TemplateConflict` (409 `conflict`). Anything else is
-//! `Unavailable`.
+//! or too many pending submissions `TemplateConflict` (409 `conflict`). Anything else,
+//! including a submitter message-svc does not know yet, is `Unavailable`.
 
 use async_trait::async_trait;
 use chrono::{DateTime, SecondsFormat, Utc};
 use push_proto::internal::v1 as internal;
 use push_proto::internal::v1::templates_client::TemplatesClient;
-use push_proto::{error_from_status, id, id_bytes};
+use push_proto::v1::ErrorCode;
+use push_proto::{carried_error, id, id_bytes};
 use serde_json::{Value, json};
 use tonic::{Code, Status};
 use uuid::Uuid;
@@ -369,30 +371,41 @@ impl TemplateRegistry for NoTemplates {
     }
 }
 
-/// The error a refusal of message-svc's stands for; its message, carried as a
-/// `push.v1.Error` in the details, is kept for the client.
+/// The error a refusal of message-svc's stands for. Its message is kept for the client
+/// only when it comes as a `push.v1.Error` in the details, which message-svc's own
+/// refusals carry; a bare status (a proxy, tonic itself) gets a generic one. Not found is
+/// an unknown ref only when message-svc says so (`REJECTED`); any other not found, such as
+/// a user it does not know yet, is `Unavailable`.
 pub(crate) fn status_error(rpc: &'static str, status: &Status) -> AuthError {
+    let carried = carried_error(status);
     let message = || {
-        let message = if status.details().is_empty() {
-            status.message().to_owned()
-        } else {
-            error_from_status(status).message
-        };
-        let message = message.trim();
+        let message = carried
+            .as_ref()
+            .map_or("", |error| error.message.trim())
+            .chars()
+            .take(MAX_MESSAGE_CHARS)
+            .collect::<String>();
         if message.is_empty() {
-            "the template registry refused the request".to_owned()
+            "the template service refused the request".to_owned()
         } else {
-            message.chars().take(MAX_MESSAGE_CHARS).collect()
+            message
         }
+    };
+    let unavailable = |code: Code| {
+        tracing::warn!(?code, rpc, "message-svc's Templates API did not answer");
+        AuthError::Unavailable
     };
     match status.code() {
         Code::InvalidArgument => AuthError::TemplateInvalid(message()),
-        Code::NotFound => AuthError::TemplateNotFound,
-        Code::AlreadyExists | Code::FailedPrecondition => AuthError::TemplateConflict(message()),
-        code => {
-            tracing::warn!(?code, rpc, "message-svc's Templates API did not answer");
-            AuthError::Unavailable
+        Code::NotFound
+            if carried
+                .as_ref()
+                .is_some_and(|error| error.code() == ErrorCode::Rejected) =>
+        {
+            AuthError::TemplateNotFound
         }
+        Code::AlreadyExists | Code::FailedPrecondition => AuthError::TemplateConflict(message()),
+        code => unavailable(code),
     }
 }
 
@@ -509,6 +522,21 @@ mod tests {
         Ok(())
     }
 
+    /// A refusal as message-svc answers it: a `push.v1.Error` in the details.
+    fn rich(code: Code, error_code: ErrorCode, message: &str) -> Status {
+        push_proto::error_status(
+            code,
+            Error {
+                code: error_code.into(),
+                message: message.to_owned(),
+                retryable: false,
+                client_msg_id: None,
+                request_id: None,
+                retry_after_s: None,
+            },
+        )
+    }
+
     fn proto_summary() -> internal::TemplateSummary {
         internal::TemplateSummary {
             template_ref: "acme.shipped@1".to_owned(),
@@ -530,16 +558,17 @@ mod tests {
             checked(&request)?;
             let request = request.into_inner();
             if request.definition == b"bad" {
-                return Err(push_proto::error_status(
+                return Err(rich(
                     Code::InvalidArgument,
-                    Error {
-                        code: ErrorCode::Rejected.into(),
-                        message: "title: 1 to 80 characters".to_owned(),
-                        retryable: false,
-                        client_msg_id: None,
-                        request_id: None,
-                        retry_after_s: None,
-                    },
+                    ErrorCode::Rejected,
+                    "title: 1 to 80 characters",
+                ));
+            }
+            if request.definition == b"unknown user" {
+                return Err(rich(
+                    Code::NotFound,
+                    ErrorCode::UserNotFound,
+                    "unknown user",
                 ));
             }
             self.submitted.lock().unwrap().push(request.definition);
@@ -568,7 +597,11 @@ mod tests {
             request: Request<internal::ListTemplatesRequest>,
         ) -> Result<Response<internal::TemplateList>, Status> {
             checked(&request)?;
-            Err(Status::failed_precondition("too many pending"))
+            Err(rich(
+                Code::FailedPrecondition,
+                ErrorCode::Rejected,
+                "too many pending",
+            ))
         }
 
         async fn get(
@@ -576,7 +609,11 @@ mod tests {
             request: Request<internal::GetTemplateRequest>,
         ) -> Result<Response<internal::TemplateDetail>, Status> {
             checked(&request)?;
-            Err(Status::not_found("template not found"))
+            Err(rich(
+                Code::NotFound,
+                ErrorCode::Rejected,
+                "template not found",
+            ))
         }
 
         async fn review(
@@ -632,6 +669,12 @@ mod tests {
                 "title: 1 to 80 characters".to_owned()
             ))
         );
+        assert_eq!(
+            templates
+                .submit(Uuid::from_u128(1), b"unknown user".to_vec())
+                .await,
+            Err(AuthError::Unavailable)
+        );
         let catalog = templates.catalog(0, 0).await.unwrap();
         assert_eq!((catalog.seq, catalog.more), (4, true));
         assert_eq!(
@@ -651,7 +694,7 @@ mod tests {
                 .review("acme.shipped@1", ReviewAction::Approve, "ops", None)
                 .await,
             Err(AuthError::TemplateConflict(
-                "acme.shipped@1 exists".to_owned()
+                "the template service refused the request".to_owned()
             ))
         );
 
@@ -659,5 +702,52 @@ mod tests {
         assert_eq!(wrong.catalog(0, 0).await, Err(AuthError::Unavailable));
         let unreachable = GrpcTemplates::new("http://127.0.0.1:1", TOKEN).unwrap();
         assert_eq!(unreachable.catalog(0, 0).await, Err(AuthError::Unavailable));
+    }
+
+    #[test]
+    fn a_not_found_is_an_unknown_ref_only_when_message_svc_rejects_it() {
+        let unknown_user = rich(Code::NotFound, ErrorCode::UserNotFound, "unknown user");
+        let error = status_error("Submit", &unknown_user);
+        assert_eq!(error, AuthError::Unavailable);
+        assert_eq!(error.status(), 503);
+        assert_eq!(
+            status_error("Submit", &Status::not_found("not found")),
+            AuthError::Unavailable
+        );
+        assert_eq!(
+            status_error(
+                "Get",
+                &rich(Code::NotFound, ErrorCode::Rejected, "template not found")
+            ),
+            AuthError::TemplateNotFound
+        );
+    }
+
+    #[test]
+    fn only_a_carried_error_message_reaches_the_client() {
+        for code in [
+            Code::InvalidArgument,
+            Code::AlreadyExists,
+            Code::FailedPrecondition,
+        ] {
+            let bare = status_error("Submit", &Status::new(code, "internal detail"));
+            let carried =
+                status_error("Submit", &rich(code, ErrorCode::Rejected, "  the reason  "));
+            let generic = "the template service refused the request".to_owned();
+            let reason = "the reason".to_owned();
+            let (bare_expected, carried_expected) = if code == Code::InvalidArgument {
+                (
+                    AuthError::TemplateInvalid(generic),
+                    AuthError::TemplateInvalid(reason),
+                )
+            } else {
+                (
+                    AuthError::TemplateConflict(generic),
+                    AuthError::TemplateConflict(reason),
+                )
+            };
+            assert_eq!(bare, bare_expected);
+            assert_eq!(carried, carried_expected);
+        }
     }
 }
