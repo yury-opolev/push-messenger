@@ -240,7 +240,18 @@ async fn reserved_publishers_are_refused<B: Backend>(backend: &B) {
     let world = World::new(backend).await;
     let alice = world.person().await;
 
-    for publisher in ["agent", "push", "system", "admin", "builtin"] {
+    for publisher in [
+        "agent",
+        "push",
+        "system",
+        "admin",
+        "builtin",
+        "official",
+        "verified",
+        "agents",
+        "agent-official",
+        "push-team",
+    ] {
         assert_eq!(
             world
                 .svc

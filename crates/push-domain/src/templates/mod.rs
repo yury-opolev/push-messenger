@@ -33,10 +33,22 @@ pub const MAX_DEFINITION_BYTES: usize = 16 * 1024;
 pub const MAX_RICH_BYTES: usize = 32 * 1024;
 /// Largest ANSWER body, in bytes.
 pub const MAX_ANSWER_BYTES: usize = 4 * 1024;
-/// Publisher ids no account may claim.
-pub const RESERVED_PUBLISHERS: &[&str] = &["agent", "push", "system", "admin", "builtin"];
+/// Publisher ids no account may claim, nor any id that starts with one of them
+/// ([`is_reserved_publisher`]).
+pub const RESERVED_PUBLISHERS: &[&str] = &[
+    "agent", "push", "system", "admin", "builtin", "official", "verified",
+];
 /// The publisher of the built-in templates, owned by the server.
 pub const BUILTIN_PUBLISHER: &str = "agent";
+
+/// Whether no account may claim `publisher`: it is a reserved name or starts with one, so
+/// lookalikes such as `agents`, `agent-official` or `push-team` are refused too. The server
+/// itself still publishes the built-ins under [`BUILTIN_PUBLISHER`].
+pub fn is_reserved_publisher(publisher: &str) -> bool {
+    RESERVED_PUBLISHERS
+        .iter()
+        .any(|reserved| publisher.starts_with(reserved))
+}
 
 /// Who sent a message, as the server derives it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -182,5 +194,25 @@ mod tests {
     fn sender_kinds_display_in_lowercase() {
         assert_eq!(SenderKind::Human.to_string(), "human");
         assert_eq!(SenderKind::Agent.to_string(), "agent");
+    }
+
+    #[test]
+    fn reserved_publishers_and_their_extensions_are_reserved() {
+        for publisher in [
+            "agent",
+            "agents",
+            "agent-official",
+            "push-team",
+            "system-x",
+            "admin1",
+            "builtins",
+            "official",
+            "verified-co",
+        ] {
+            assert!(is_reserved_publisher(publisher), "{publisher}");
+        }
+        for publisher in ["acme", "my-agent", "a", "sys", "unofficial"] {
+            assert!(!is_reserved_publisher(publisher), "{publisher}");
+        }
     }
 }

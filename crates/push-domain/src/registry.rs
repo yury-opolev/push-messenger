@@ -11,8 +11,8 @@ use crate::notify::Notifier;
 use crate::service::Messaging;
 use crate::store::{InsertOutcome, Store, Tx};
 use crate::templates::{
-    BUILTIN_PUBLISHER, Definition, MAX_DEFINITION_BYTES, RESERVED_PUBLISHERS, TemplateError,
-    TemplateRef, builtins,
+    BUILTIN_PUBLISHER, Definition, MAX_DEFINITION_BYTES, TemplateError, TemplateRef, builtins,
+    is_reserved_publisher,
 };
 use crate::validation::ValidationError;
 
@@ -80,7 +80,7 @@ where
         let definition = Definition::parse(definition)?;
         let canonical = within_definition_limit(definition.canonical_json())?;
         let template = definition.template_ref();
-        if RESERVED_PUBLISHERS.contains(&template.publisher.as_str()) {
+        if is_reserved_publisher(&template.publisher) {
             return Err(DomainError::TemplateConflict("the publisher is reserved"));
         }
         let now = self.template_now();

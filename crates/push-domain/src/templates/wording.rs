@@ -32,20 +32,59 @@ const MARKUP: &[char] = &['<', '>', '`', '{', '}'];
 /// the start of a word (a known one, or two or more letters, `:` and then neither a space nor
 /// a digit), a dotted-quad IPv4 address, or a dotted host ending in a common top-level
 /// domain. Case-insensitive, and compatibility forms (fullwidth letters, ideographic full
-/// stops, ...) count as the characters they stand for.
+/// stops, ...) and Cyrillic or Greek Latin lookalikes count as the characters they stand
+/// for.
 pub fn looks_like_url(text: &str) -> bool {
     url_like(&normalise(text))
 }
 
-/// NFKC, then the dot lookalikes NFKC leaves alone mapped to `.`, then lowercase.
+/// NFKC, then the dot lookalikes NFKC leaves alone mapped to `.` and Cyrillic and Greek
+/// letters that look like Latin ones mapped to those, then lowercase: `example.соm`
+/// (Cyrillic `с` and `о`) is `example.com`.
 fn normalise(text: &str) -> String {
     text.nfkc()
         .map(|c| match c {
             '\u{3002}' | '\u{FF61}' | '\u{FE52}' | '\u{2024}' => '.',
-            c => c,
+            c => latin_lookalike(c).unwrap_or(c),
         })
         .collect::<String>()
         .to_lowercase()
+}
+
+/// The ASCII letter a common Cyrillic or Greek homoglyph stands for.
+fn latin_lookalike(c: char) -> Option<char> {
+    Some(match c {
+        // Cyrillic
+        'а' | 'А' => 'a',
+        'е' | 'Е' => 'e',
+        'о' | 'О' => 'o',
+        'р' | 'Р' => 'p',
+        'с' | 'С' => 'c',
+        'у' | 'У' => 'y',
+        'х' | 'Х' => 'x',
+        'і' | 'І' | 'Ӏ' => 'i',
+        'ј' | 'Ј' => 'j',
+        'ѕ' | 'Ѕ' => 's',
+        'ԁ' | 'Ԁ' => 'd',
+        'һ' | 'Һ' => 'h',
+        'ӏ' => 'l',
+        'ԛ' | 'Ԛ' => 'q',
+        'ԝ' | 'Ԝ' => 'w',
+        // Greek
+        'ο' | 'Ο' => 'o',
+        'α' | 'Α' => 'a',
+        'ε' | 'Ε' => 'e',
+        'ι' | 'Ι' => 'i',
+        'κ' | 'Κ' => 'k',
+        'ν' => 'v',
+        'Ν' => 'n',
+        'ρ' | 'Ρ' => 'p',
+        'τ' | 'Τ' => 't',
+        'υ' => 'u',
+        'Υ' => 'y',
+        'χ' | 'Χ' => 'x',
+        _ => return None,
+    })
 }
 
 /// `looks_like_url` on text already normalised.
@@ -289,6 +328,26 @@ mod tests {
         ] {
             assert!(looks_like_url(text), "{text}");
             assert!(check_literal(text, 80, false).is_err(), "{text}");
+        }
+    }
+
+    #[test]
+    fn cyrillic_and_greek_lookalikes_do_not_hide_urls() {
+        for text in [
+            "example.\u{0441}\u{043E}m",
+            "EXAMPLE.\u{0421}\u{041E}M",
+            "\u{0430}pp.\u{0456}\u{043E}",
+            "example.c\u{03BF}m",
+            "example.\u{039F}RG",
+            "\u{0445}\u{0443}z.n\u{03B5}t",
+        ] {
+            assert!(looks_like_url(text), "{text}");
+            assert!(check_literal(text, 80, false).is_err(), "{text}");
+        }
+        for text in ["Привет, мир", "Καλημέρα", "Одобрить развёртывание?"]
+        {
+            assert!(!looks_like_url(text), "{text}");
+            assert_eq!(check_literal(text, 80, false), Ok(()), "{text}");
         }
     }
 
