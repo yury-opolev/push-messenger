@@ -693,7 +693,8 @@ Implementation notes (push-auth, Plan 5A):
   `POST|GET /v1/agents`, `PATCH|DELETE /v1/agents/{id}` and opt-in
   `POST /v1/auth/entra-app` with single-use owner-consent enrollment codes. Agents are
   separate authors with ordinary limits, never automatically provisioned by sign-in;
-  deletion disables their bindings and relays socket close 4003 without deleting history.
+  deletion disables the agent, releases its app identity for a new enrollment and relays
+  socket close 4003 without deleting history.
   Pending and disabled agents are not returned by public/batch profile lookup. Errors are
   `{"error": {"code", "message", "retryable"}}`; 429 carries `Retry-After`; 503
   `unavailable` is retryable and carries `Retry-After: 1`. No answer may be cached except
