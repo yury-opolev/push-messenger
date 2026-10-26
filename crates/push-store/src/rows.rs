@@ -32,7 +32,7 @@ macro_rules! entry_columns {
     () => {
         "e.conversation_id, e.seq, e.message_id, e.client_msg_id, e.kind, e.target_seq, \
          e.sender_id, e.sender_device_id, e.content_type, e.body, e.client_ts, e.server_ts, \
-         e.edited_at, e.edit_seq, e.deleted_at"
+         e.edited_at, e.edit_seq, e.deleted_at, e.answer_seq"
     };
 }
 pub(crate) use entry_columns;
@@ -99,8 +99,7 @@ pub(crate) fn entry(row: &PgRow) -> Result<Entry, sqlx::Error> {
         edited_at: row.try_get("edited_at")?,
         edit_seq: row.try_get("edit_seq")?,
         deleted_at: row.try_get("deleted_at")?,
-        // Not stored on Postgres until migration 0005 adds `message.answer_seq`.
-        answer_seq: None,
+        answer_seq: row.try_get("answer_seq")?,
     })
 }
 

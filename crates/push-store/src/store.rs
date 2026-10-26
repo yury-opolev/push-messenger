@@ -662,8 +662,8 @@ impl Tx for PgTx {
             "INSERT INTO messaging.message \
              (conversation_id, seq, message_id, client_msg_id, kind, target_seq, sender_id, \
               sender_device_id, content_type, body, client_ts, server_ts, edited_at, edit_seq, \
-              deleted_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) \
+              deleted_at, answer_seq) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) \
              ON CONFLICT (conversation_id, client_msg_id) DO NOTHING",
         )
         .bind(entry.conversation_id.0)
@@ -681,6 +681,7 @@ impl Tx for PgTx {
         .bind(entry.edited_at)
         .bind(entry.edit_seq)
         .bind(entry.deleted_at)
+        .bind(entry.answer_seq)
         .execute(self.conn())
         .await
         .map_err(store_error)?
@@ -733,7 +734,7 @@ impl Tx for PgTx {
     async fn update_entry(&mut self, entry: Entry) -> DomainResult<()> {
         let updated = sqlx::query(
             "UPDATE messaging.message \
-             SET body = $3, edited_at = $4, edit_seq = $5, deleted_at = $6 \
+             SET body = $3, edited_at = $4, edit_seq = $5, deleted_at = $6, answer_seq = $7 \
              WHERE conversation_id = $1 AND seq = $2",
         )
         .bind(entry.conversation_id.0)
@@ -742,6 +743,7 @@ impl Tx for PgTx {
         .bind(entry.edited_at)
         .bind(entry.edit_seq)
         .bind(entry.deleted_at)
+        .bind(entry.answer_seq)
         .execute(self.conn())
         .await
         .map_err(store_error)?
