@@ -186,7 +186,10 @@ card, so it is held to stricter rules than the values a sender fills in:
 - No markup: `<`, `>`, `` ` ``, `{`, `}` or `](`.
 - Nothing URL-like. The text is first normalised: NFKC (so fullwidth letters and similar
   compatibility forms count as the characters they stand for), the dot lookalikes U+3002,
-  U+FF61, U+FE52 and U+2024 read as `.`, then lower-cased. It is URL-like if it contains:
+  U+FF61, U+FE52 and U+2024 read as `.`, common Cyrillic and Greek letters that look like
+  Latin ones read as those (Cyrillic а е о р с у х і ј ѕ ԁ һ ӏ ԛ ԝ, Greek ο α ε ι κ ν ρ τ υ
+  χ, and their capitals, so `example.соm` with a Cyrillic `с` and `о` is `example.com`),
+  then lower-cased. It is URL-like if it contains:
   - `//` or `www.`;
   - a known scheme at the start of a word: `javascript:`, `data:`, `vbscript:`, `file:`,
     `mailto:`, `tel:`, `sms:`, `blob:`, `about:`, `intent:`, `ftp:`, `http:`, `https:`;
@@ -355,6 +358,11 @@ Card state is kept by the server, so a sender never edits a card to close it:
   before their `visible_from_seq`), not deleted, whose template is still approved and has
   an interactive block. Any sender kind may answer.
 - Answering one's own card is refused.
+- **In a group, any member other than the card's sender may answer**, and the first valid
+  answer closes the card for everyone. The server does not check that the answerer is the
+  person the card was meant for: before acting on an answer, an agent must check the
+  answer's `sender_id` (for example, act only on its owner's answer, and treat any other
+  as closing the card without effect, or send a new card).
 - The **first valid answer closes the card**: in the same transaction the card records the
   answer's seq, delivered as `Deliver.answer_seq` on the card (in history and sync). The
   answer itself fans out like any message; its `Deliver.target_seq` is the card's seq.
@@ -401,6 +409,8 @@ keeps `answer_seq` on cards and applies incoming answers to their card, and offe
 `push_client_send_answer`) with the same envelope checks before queueing. See
 [docs/sdk-bindings.md](sdk-bindings.md#cards-and-answers). The SDK does not fetch the
 catalog yet; apps call `GET /v1/templates` themselves ([section 9](#9-client-catalog-protocol)).
+Clients built before this feature (older SDKs) do not know content types 3 and 4 and show
+RICH and ANSWER messages as text, their raw JSON body.
 
 ## 6. Built-in templates
 
@@ -547,8 +557,10 @@ message-svc byte for byte, which parses it strictly and stores its canonical for
   the submitting account, for good. Later versions and other names under that publisher
   must come from the same account (otherwise 409 `conflict`, "the publisher belongs to
   another account").
-- **Reserved publishers:** `agent`, `push`, `system`, `admin` and `builtin` (409
-  `conflict`, "the publisher is reserved"). The server owns `agent`.
+- **Reserved publishers:** `agent`, `push`, `system`, `admin`, `builtin`, `official` and
+  `verified`, and every publisher that starts with one of them (`agents`,
+  `agent-official`, `push-team`, `admin1`, …: 409 `conflict`, "the publisher is
+  reserved"). The server owns `agent`.
 - **Pending cap:** at most 20 versions per account waiting for review (409 `conflict`).
 - **Rate limits:** 10 submissions per hour per account and 60 per hour per IP (429
   `rate_limited` with `Retry-After`).
@@ -713,8 +725,8 @@ curl -sS -H "Authorization: Bearer $ACCESS_TOKEN" "$PUSH_AUTH_URL/v1/templates?s
 - If an answer's `seq` is lower than the `since` you sent, the server's registry was
   restored to an earlier state: drop the stored catalog and read again from 0.
 - Rate limits: 120 per minute per account, 600 per minute per IP (429 `rate_limited`
-  with `Retry-After`). 400 `invalid` for a bad `since`, 503 `unavailable` when message-svc
-  does not answer.
+  with `Retry-After`); 304 answers count toward them too. 400 `invalid` for a bad `since`,
+  503 `unavailable` when message-svc does not answer.
 
 Storing the catalog: keep a table of ref → status and definition, and the `seq`. On an
 `approved` entry store or replace the definition; on a `revoked` entry mark the ref
@@ -790,8 +802,9 @@ recorded only in auth-svc's log, not in the database.
 No new configuration: the public and admin template routes use auth-svc's existing
 `PUSH_MESSAGE_SVC_URL` and `PUSH_DIRECTORY_TOKEN` to reach message-svc's internal
 `push.internal.v1.Templates` service (on the Directory port), and the admin routes the
-existing `PUSH_AUTH_ADMIN_TOKEN`. The schema is messaging migration
-`0005_templates.sql`.
+existing `PUSH_AUTH_ADMIN_TOKEN`. The schema is messaging migrations
+`0005_templates.sql` and `0006_validate_message_checks.sql`; see the CHANGELOG's upgrade
+notes before rolling them out.
 
 Follow-ups, not in this release:
 

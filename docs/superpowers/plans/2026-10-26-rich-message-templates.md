@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development
 > (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps
-> use checkbox (`- [ ]`) syntax for tracking.
+> use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Reviewed, server-enforced rich message templates (tpl/1), a template registry with
 admin review and a client catalog, `CONTENT_TYPE_RICH` / `CONTENT_TYPE_ANSWER`, server card
@@ -159,7 +159,7 @@ Meta-rules (each a distinct `TemplateError` message naming the path):
 control characters (except `\n` when multiline) and invisible/format characters refused;
 URLs and markup are allowed in values (clients render them inert).
 
-- [ ] **Step 1: Write failing unit tests** in each file's `#[cfg(test)] mod tests`:
+- [x] **Step 1: Write failing unit tests** in each file's `#[cfg(test)] mod tests`:
   `TemplateRef` parse/display round-trip and refusals (`A.b@1`, `a.b@0`, `a.b@65536`,
   `a.b@01`, `a@1`, `a.b.c@1`); `looks_like_url` true for `https://x`, `HTTP://X`, `www.x`,
   `javascript:alert`, `data:text/html`, `example.com`, `a.b.io`, `//host`; false for
@@ -170,10 +170,10 @@ URLs and markup are allowed in values (clients render them inert).
   unknown block type; duplicate key; URL in title, in a heading literal, in a button label;
   `<b>` in text; bidi override U+202E in a label; unused param; two interactive blocks;
   heading bound to a multiline string; canonical JSON re-parses to an equal definition.
-- [ ] **Step 2:** `cargo test -p push-domain --locked -j 4 templates` → fails (missing).
-- [ ] **Step 3: Implement** to pass.
-- [ ] **Step 4:** tests pass; fmt; clippy.
-- [ ] **Step 5: Commit** `feat(domain): parse and check tpl/1 template definitions`.
+- [x] **Step 2:** `cargo test -p push-domain --locked -j 4 templates` → fails (missing).
+- [x] **Step 3: Implement** to pass.
+- [x] **Step 4:** tests pass; fmt; clippy.
+- [x] **Step 5: Commit** `feat(domain): parse and check tpl/1 template definitions`.
 
 ### Task 2: RICH and ANSWER bodies, outline, built-ins (push-domain, pure)
 
@@ -234,15 +234,15 @@ Built-in definitions (all `senders: ["agent"]`, version 1, publisher `agent`):
   [draft, running, done, failed] optional; heading(title), status(state, label "State"),
   steps(steps, label "Steps").
 
-- [ ] **Step 1: Failing tests:** each built-in parses and round-trips; a valid approval
+- [x] **Step 1: Failing tests:** each built-in parses and round-trips; a valid approval
   body passes; refusals: missing required param, unknown param, wrong type, string over
   max_len, `\n` in single-line string, U+202E in a value, enum value not listed, int out
   of range, list over max_items, option id duplicate, fallback empty / 2001 chars, body
   over 32 KiB, duplicate key in params; answer: valid `approve`, `maybe` refused, two values
   for buttons refused, question answer from the card's own options, multi min/max, card
   not a UUID; `outline` of approval lists four lines.
-- [ ] **Step 2–4:** red, implement, green; fmt; clippy.
-- [ ] **Step 5: Commit** `feat(domain): check rich and answer bodies; ship the agent templates`.
+- [x] **Step 2–4:** red, implement, green; fmt; clippy.
+- [x] **Step 5: Commit** `feat(domain): check rich and answer bodies; ship the agent templates`.
 
 ### Task 3: Wire (push-proto) and exhaustive matches
 
@@ -300,7 +300,7 @@ message ReviewTemplateRequest { string template_ref = 1; ReviewAction action = 2
   string reviewer = 3; optional string note = 4; }
 ```
 
-- [ ] Steps: edit protos; `cargo build --workspace --locked -j 4`; fix non-exhaustive
+- [x] Steps: edit protos; `cargo build --workspace --locked -j 4`; fix non-exhaustive
   matches minimally (message-svc still refuses non-TEXT sends; SDK maps 3/4 to its existing
   default until Task 11); fmt; clippy; `cargo test -p push-proto --locked`; commit
   `feat(proto): rich and answer content types, card state and the Templates API`.
@@ -365,14 +365,14 @@ including: a template's definition and identity never change (`insert_template` 
 existing ref is `Duplicate`), and `set_template_status` refuses any transition other than
 pending→approved, pending→rejected, approved→revoked with `DomainError::Store`.
 
-- [ ] **Step 1:** failing contract cases in `contract/templates.rs` (registered in
+- [x] **Step 1:** failing contract cases in `contract/templates.rs` (registered in
   `contract/mod.rs`): insert/get round-trip; duplicate insert; illegal transitions refused;
   change numbers increase; `templates_changed_since` filters and orders and limits;
   `claim_publisher` first owner wins; events list in order; `is_agent` after
   `record_agent_owner`; entry `answer_seq` round-trips through `update_entry`.
-- [ ] **Step 2–4:** `cargo test -p push-testkit --locked -j 4` red → implement memory →
+- [x] **Step 2–4:** `cargo test -p push-testkit --locked -j 4` red → implement memory →
   green (Postgres runs in Task 5). Workspace builds; fmt; clippy.
-- [ ] **Step 5: Commit** `feat(domain): template registry storage contract`.
+- [x] **Step 5: Commit** `feat(domain): template registry storage contract`.
 
 ### Task 5: Postgres (push-store)
 
@@ -476,7 +476,7 @@ CREATE TRIGGER template_event_append_only BEFORE UPDATE OR DELETE ON messaging.t
 guard with explicit parentheses.) `codes.rs`: ContentType 3/4, TemplateStatus 1..4.
 Trigger violations map to `DomainError::Store` as other check violations do.
 
-- [ ] Steps: add migration; `cargo clean -p push-store`; implement; run
+- [x] Steps: add migration; `cargo clean -p push-store`; implement; run
   `cargo test -p push-store --locked -j 4` (the behaviour suite incl. Task 4 contract
   cases, plus schema tests: direct SQL UPDATE of an approved definition refused, DELETE
   refused, approved→pending refused, event UPDATE refused); fmt; clippy; commit
@@ -523,7 +523,7 @@ invalid definition refused with `Template`; 21st pending refused; approving twic
 revoking pending refused; seeding twice inserts once and keeps a revoked built-in revoked;
 events record submit/approve/reject/revoke with actor/reviewer/note.
 
-- [ ] Steps: red (in-memory: `cargo test -p push-testkit --locked -j 4`), implement, green;
+- [x] Steps: red (in-memory: `cargo test -p push-testkit --locked -j 4`), implement, green;
   then `cargo test -p push-store --locked -j 4`; fmt; clippy; commit
   `feat(domain): submit, review and list templates`.
 
@@ -574,7 +574,7 @@ answer after the template is revoked → refused; edit card valid → ok; edit c
 params → refused; edit answered card → `CardAnswered`; edit answer → refused; retry of a
 RICH send after revocation returns the original receipt.
 
-- [ ] Steps: red, implement, green (testkit then push-store); fmt; clippy; commit
+- [x] Steps: red, implement, green (testkit then push-store); fmt; clippy; commit
   `feat(domain): enforce templates on send and edit; answer cards once`.
 
 ### Task 8: message-svc
@@ -596,9 +596,9 @@ RICH send after revocation returns the original receipt.
   count) when > 0.
 - Security log lines (target `security`) for submit/approve/reject/revoke: event names
   `templates.submitted|approved|rejected|revoked` with ref, actor/reviewer; never bodies.
-- [ ] Tests: gRPC Send RICH ok / refused INVALID; Templates without the token refused;
+- [x] Tests: gRPC Send RICH ok / refused INVALID; Templates without the token refused;
   Submit → Review(approve) → Catalog contains it; seeding at startup visible in Catalog.
-- [ ] fmt; clippy; `cargo test -p push-message-svc --locked -j 4`; commit
+- [x] fmt; clippy; `cargo test -p push-message-svc --locked -j 4`; commit
   `feat(message-svc): accept rich and answer messages and serve the Templates API`.
 
 ### Task 9: auth-svc HTTP
@@ -624,9 +624,9 @@ for the new routes), tests in `src/tests/templates.rs` with a fake registry.
 - gRPC status → AuthError: InvalidArgument→Invalid(400), NotFound→404 `not_found`,
   AlreadyExists/FailedPrecondition→409 `conflict`, else Unavailable(503). Check the existing
   `AuthError` variants; add `NotFound`/`Conflict` only if missing, with codes.
-- [ ] Tests (fake registry): submit happy path and 400 pass-through; catalog ETag + 304;
+- [x] Tests (fake registry): submit happy path and 400 pass-through; catalog ETag + 304;
   admin routes need the token (401 without); approve path; bad ref 400.
-- [ ] fmt; clippy; `cargo test -p push-auth-core --locked -j 4`; commit
+- [x] fmt; clippy; `cargo test -p push-auth-core --locked -j 4`; commit
   `feat(auth): serve template submission, the catalog and admin review`.
 
 ### Task 10: Whole-stack acceptance (push-smoke)
@@ -640,7 +640,7 @@ sending it → INVALID (pending); admin approves via the admin listener → 200;
 /v1/templates?since=0` lists it (and the four built-ins), ETag replay → 304; sending it →
 SendAck; submit with a URL / unknown block / 17 params → 400; re-submitting the approved ref
 → 409 (immutable); revoke → catalog shows revoked; sending → INVALID.
-- [ ] Run `cargo test -p push-smoke --test templates --locked -j 4`; fmt; clippy; commit
+- [x] Run `cargo test -p push-smoke --test templates --locked -j 4`; fmt; clippy; commit
   `test(smoke): rich templates through the whole stack`.
 
 ### Task 11: SDK and bindings
@@ -660,7 +660,7 @@ SendAck; submit with a URL / unknown block / 17 params → 400; re-submitting th
 - Bindings: JSON kind strings `"rich"`, `"answer"`, field `answerSeq`; C
   `push_client_send_rich`/`push_client_send_answer` (header regenerated/updated so
   `tests/header.rs` passes); node `sendRich`, `sendAnswer` + `index.d.ts` + a test.
-- [ ] `cargo test -p push-sdk --locked -j 4`; `cargo test --locked -p push-sdk-c -p
+- [x] `cargo test -p push-sdk --locked -j 4`; `cargo test --locked -p push-sdk-c -p
   push-sdk-ffi`; in `bindings/node`: `npm test` and `npm run typecheck`; fmt; clippy;
   commit `feat(sdk): rich cards and answers in the SDK and bindings`.
 
@@ -674,7 +674,7 @@ RICH and ANSWER bodies, card state, the four built-ins verbatim with a note that
 designed upstream and the consumer should reconcile with its spec, the review checklist,
 the admin API with curl examples, the client fetch protocol (since/seq/more/ETag/304,
 revoked handling), publishing, audit events, limits, follow-ups.
-- [ ] Commit `docs: rich message templates, review checklist and catalog protocol`.
+- [x] Commit `docs: rich message templates, review checklist and catalog protocol`.
 
 ---
 

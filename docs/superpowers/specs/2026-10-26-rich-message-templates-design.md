@@ -49,7 +49,8 @@ approval endpoint on the internet-facing listener for little gain over the isola
 **D6 — Publishers claim a namespace.** Any signed-in account may submit
 (`POST /v1/templates`). The first accepted submission under a publisher id claims it for
 the submitting account; later versions and names under it must come from the same
-account. `agent`, `push`, `system`, `admin` and `builtin` are reserved (the server owns
+account. `agent`, `push`, `system`, `admin`, `builtin`, `official` and `verified` are
+reserved, and so is every publisher that starts with one of them (the server owns
 `agent`). At most 20 pending submissions per account; submissions are rate limited.
 
 **D7 — Immutable versions, a one-way status.** A ref is `<publisher>.<name>@<version>`.
@@ -144,12 +145,14 @@ duplicate keys refused):
   options), `single` and `multi` (1-10 literal options or a `list` of `option` param;
   `multi` has `min`/`max`), `status` (an `enum` param). At most one interactive block
   (`buttons`, `single`, `multi`). A block whose optional param is absent is skipped.
-- Literal wording (`title`, `text`, `label`): at most 500 (`text`) or 80 characters;
+- Literal wording (`title`, `heading`, `text`, `label`): at most 500 (`text`), 200
+  (`heading`) or 80 characters;
   no control characters (a `text` block may hold line breaks), no invisible or bidi
   formatting characters, no markup (`<`, `>`, `` ` ``, `](`, `{`, `}`), and nothing
   URL-like: a scheme (`x://`, `javascript:`, `data:`, `vbscript:`, `file:`, `mailto:`,
   `tel:`, `sms:`, `blob:`), `www.`, `//`, or a dotted host with a common top-level
-  domain.
+  domain (after NFKC, dot lookalikes and Cyrillic/Greek Latin lookalikes are mapped).
+- Step items in a body: `label` at most 200 characters, `detail` at most 1000.
 
 RICH body (at most 32 KiB): `{"tpl": "agent.approval@1", "params": {...}, "fallback":
 "..."}`; `fallback` is 1-2000 characters of plain text for clients that cannot render
@@ -173,6 +176,13 @@ On Edit, the body is checked as the target's content type: a TEXT edit is text, 
 edit is a full RICH body checked as above (any approved template the sender may use), an
 ANSWER cannot be edited, and an answered card cannot be edited (`REJECTED`). Delete is
 unchanged (deleting an answer does not reopen its card).
+
+Sends, edits and answers read the template with `template_for_send`, which takes a share
+lock on the version's row (`SELECT … FOR SHARE`) until the message commits. The trade-off:
+a revocation (`FOR UPDATE` on the same row) waits for the in-flight sends of that version
+to commit (short transactions, bounded by the store's timeouts), and in exchange no
+message that commits after the revocation can use the revoked version. Sends never wait
+for each other.
 
 ## HTTP (auth-svc)
 

@@ -128,6 +128,10 @@ set and the card is reported with `messageEdited`. Cards and answers from others
 unread. Render only approved templates from the catalog (`GET /v1/templates`), as inert
 text, and show `fallback` for anything else.
 
+In a group any member other than the card's sender may answer, and the first answer
+closes the card: an agent must check the answer's `senderId` (for example, act only on its
+owner's answer) before acting on it.
+
 ### The secret store and the database key
 
 The credentials live only in a store the app provides, under the keys `push.session`,
