@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use push_domain::{ClientMsgId, ConversationId};
+use push_domain::{ClientMsgId, ConversationId, UserId};
 use push_proto::v1::frame::Body;
 use push_proto::v1::{self, ListContacts, ListConversations, ReadUpTo, request, response};
 use tokio::sync::mpsc;
@@ -25,10 +25,14 @@ use crate::store::{Applied, Store, bytes};
 /// ones and is told so with [`Event::EventsLost`]; the store holds everything anyway.
 pub(crate) const EVENT_QUEUE: usize = 10_000;
 
-/// What the connection and the app's calls share: the store and the event stream.
+/// What the connection and the app's calls share: the store, the event stream, and the
+/// presence sharing setting this client last learned.
 pub(crate) struct Shared {
     store: Mutex<Store>,
     events: Mutex<Queue>,
+    /// The user and whether they share presence, as last answered to this client; `None`
+    /// (unknown) counts as sharing.
+    presence_sharing: Mutex<Option<(UserId, bool)>>,
 }
 
 /// The sending end of the event queue.
@@ -47,6 +51,32 @@ impl Shared {
                 sender: events,
                 lost: false,
             }),
+            presence_sharing: Mutex::new(None),
+        }
+    }
+
+    /// Records the presence sharing setting of `user` that the server answered.
+    pub fn learned_presence_sharing(&self, user: UserId, share: bool) {
+        *self
+            .presence_sharing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((user, share));
+    }
+
+    /// Whether a presence change of `about` is dropped: the signed-in user is known to
+    /// hide their presence, and `about` is someone else. The opt-out is reciprocal, but an
+    /// announcement the server computed just before the hide committed can still arrive.
+    fn drops_presence_of(&self, about: UserId) -> bool {
+        let learned = *self
+            .presence_sharing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match learned {
+            Some((hider, false)) if hider != about => {
+                // A setting learned for another user (signed out since) does not count.
+                self.store().owner().ok().flatten() == Some(hider)
+            }
+            _ => false,
         }
     }
 
@@ -603,7 +633,9 @@ impl Engine {
     }
 
     fn on_presence_event(&mut self, event: &v1::PresenceEvent) {
-        if let Some(presence) = event.presence.as_ref().and_then(Presence::from_wire) {
+        if let Some(presence) = event.presence.as_ref().and_then(Presence::from_wire)
+            && !self.shared.drops_presence_of(presence.user_id)
+        {
             self.shared.emit(Event::PresenceChanged(presence));
         }
     }
@@ -995,6 +1027,40 @@ mod tests {
                 changed(ActivityState::Idle, 5_000),
             ]
         );
+    }
+
+    #[test]
+    fn while_hiding_presence_only_the_users_own_presence_is_reported() {
+        let mut f = fixture();
+        let (me, peer) = (f.me, f.peer);
+        let online = |user: UserId| {
+            Body::PresenceEvent(v1::PresenceEvent {
+                presence: Some(v1::Presence {
+                    user_id: bytes(user.0),
+                    state: v1::PresenceState::Online.into(),
+                    last_seen: None,
+                }),
+            })
+        };
+        let changed = |user_id| {
+            Event::PresenceChanged(Presence {
+                user_id,
+                state: PresenceState::Online,
+                last_seen_ms: None,
+            })
+        };
+
+        f.shared.learned_presence_sharing(me, false);
+        f.frame(online(peer));
+        f.frame(online(me));
+        assert_eq!(f.events(), [changed(me)]);
+
+        // Another user's setting (signed out since) does not hide anything.
+        f.shared.learned_presence_sharing(UserId::new(), false);
+        f.frame(online(peer));
+        f.shared.learned_presence_sharing(me, true);
+        f.frame(online(peer));
+        assert_eq!(f.events(), [changed(peer), changed(peer)]);
     }
 
     #[test]

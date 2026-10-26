@@ -134,7 +134,10 @@ unaffected. If Redis is flushed, `last_seen` is lost.
 - `Client::send_activity(conversation, ActivityState, Option<&str>)` — fire and forget
   while connected (returns `Offline` otherwise); validates the label locally.
 - `Client::get_presence(&[UserId]) -> Vec<Presence>`,
-  `Client::set_presence_sharing(bool)`, `Client::presence_sharing() -> bool`.
+  `Client::set_presence_sharing(bool)`, `Client::presence_sharing() -> bool`. While the
+  client knows sharing is off (learned from either call; unknown counts as on), it drops
+  `PresenceChanged` about other users: an announcement computed just before the hide
+  committed can still arrive once.
 - Events `Event::ActivityChanged(Activity)` (with `expires_at_ms`, local clock) and
   `Event::PresenceChanged(Presence)`.
 - C and Node bindings: the same calls and the events in their JSON form.

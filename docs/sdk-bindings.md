@@ -158,7 +158,10 @@ The protocol, the rules and an agent recipe: [activity-presence.md](activity-pre
   and `presence_sharing()` (`presenceSharing`, `push_client_presence_sharing`) switch and
   read whether the user shares their presence (on by default). The opt-out is reciprocal:
   while it is off, everyone reads as `unknown`. Nothing is reported when it changes; clear
-  the presence the app holds when switching it off.
+  the presence the app holds when switching it off. While the client knows sharing is off
+  (from either call; before either it counts as on), it drops `presenceChanged` about other
+  users, so a change the server sent just before the switch is not shown; the user's own
+  presence still arrives.
 
 ### The secret store and the database key
 

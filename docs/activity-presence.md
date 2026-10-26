@@ -197,7 +197,9 @@ These cases are **indistinguishable** on purpose.
   it is switched back on. Nothing is pushed to the user who switches: an app clears the
   presence it holds when switching off, and reads it again (`GetPresence`) when switching
   on. Sharing is on by default. Activity is not affected by the opt-out (it is explicit
-  and per conversation).
+  and per conversation). A contact's change that message-svc sent just before the hide
+  committed can still reach the hider once; the SDK drops presence changes about other
+  users while it knows sharing is off (see §6).
 - **Block.** Blocking an accepted contact ends the contact, so presence becomes invisible
   both ways: each side is pushed `UNKNOWN` for the other, the same event an opt-out gives,
   so the blocked user learns nothing new.
@@ -326,6 +328,9 @@ for presence in client.get_presence(&contacts).await? {
 
 let sharing: bool = client.presence_sharing().await?;
 client.set_presence_sharing(false).await?; // reciprocal: everyone reads Unknown now
+// While this client knows sharing is off (from either call; unknown counts as on), it
+// drops PresenceChanged about other users, so a change sent just before the switch is not
+// shown. The user's own presence still arrives. The C and Node bindings do the same.
 
 while let Some(event) = events.next().await {
     match event {

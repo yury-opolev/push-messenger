@@ -79,6 +79,13 @@ impl Client {
     /// reads as `Unknown` too (the opt-out is reciprocal). Nothing else is reported: an
     /// app that keeps presence should clear what it holds when it switches sharing off.
     ///
+    /// While this client knows sharing is off (from this call or
+    /// [`Self::presence_sharing`]), it drops [`Event::PresenceChanged`] about other users,
+    /// so a change the server sent just before the switch is not shown. Before either is
+    /// called, sharing counts as on.
+    ///
+    /// [`Event::PresenceChanged`]: crate::Event::PresenceChanged
+    ///
     /// [`PresenceState::Unknown`]: crate::PresenceState::Unknown
     pub async fn set_presence_sharing(&self, share: bool) -> Result<bool, SdkError> {
         self.presence_sharing_request(Some(share)).await
@@ -94,6 +101,12 @@ impl Client {
         let response::Body::PresenceSharing(sharing) = self.request(body).await? else {
             return Err(unexpected());
         };
+        let owner = self.inner.shared.store().owner()?;
+        if let Some(user) = owner {
+            self.inner
+                .shared
+                .learned_presence_sharing(user, sharing.share);
+        }
         Ok(sharing.share)
     }
 }
@@ -262,6 +275,65 @@ mod tests {
         // Within the limit it gets as far as the connection.
         let within = f.client.get_presence(&many[..MAX_PRESENCE_BATCH]).await;
         assert_eq!(within, Err(SdkError::Offline));
+    }
+
+    #[tokio::test]
+    async fn presence_of_others_is_dropped_once_sharing_is_known_off() {
+        let mut f = Fixture::new().await;
+        f.client.connect().unwrap();
+        let mut socket = f.ready().await;
+        let me = f.client.inner.shared.store().owner().unwrap().unwrap();
+        let peer = UserId::new();
+        let online = |user: UserId| {
+            Body::PresenceEvent(v1::PresenceEvent {
+                presence: Some(v1::Presence {
+                    user_id: bytes(user.0),
+                    state: v1::PresenceState::Online.into(),
+                    last_seen: None,
+                }),
+            })
+        };
+        let changed = |user_id| Presence {
+            user_id,
+            state: PresenceState::Online,
+            last_seen_ms: None,
+        };
+        let next_presence = async |f: &mut Fixture| loop {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(10), f.events.next())
+                .await
+                .expect("an event within 10 s")
+                .expect("the event stream is open");
+            if let crate::Event::PresenceChanged(presence) = event {
+                return presence;
+            }
+        };
+
+        // Unknown sharing counts as on.
+        send(&mut socket, online(peer)).await;
+        assert_eq!(next_presence(&mut f).await, changed(peer));
+
+        let client = f.client.clone();
+        let switching = tokio::spawn(async move { client.set_presence_sharing(false).await });
+        let request = next_request(&mut socket).await;
+        let off = response::Body::PresenceSharing(v1::PresenceSharing { share: false });
+        answer(&mut socket, request.request_id, off).await;
+        assert_eq!(switching.await.unwrap(), Ok(false));
+        send(&mut socket, online(peer)).await;
+        send(&mut socket, online(me)).await;
+        assert_eq!(
+            next_presence(&mut f).await,
+            changed(me),
+            "the peer's is dropped"
+        );
+
+        let client = f.client.clone();
+        let reading = tokio::spawn(async move { client.presence_sharing().await });
+        let request = next_request(&mut socket).await;
+        let on = response::Body::PresenceSharing(v1::PresenceSharing { share: true });
+        answer(&mut socket, request.request_id, on).await;
+        assert_eq!(reading.await.unwrap(), Ok(true));
+        send(&mut socket, online(peer)).await;
+        assert_eq!(next_presence(&mut f).await, changed(peer));
     }
 
     #[tokio::test]
