@@ -11,6 +11,7 @@ use base64::engine::general_purpose::STANDARD;
 use push_credentials::{AuthMode, AzureConfig, ConfigProblem, RedisTarget, azure_for};
 use push_store::{DatabaseTarget, DatabaseVars, StoreOptions, postgres_auth};
 
+use crate::agent_key::AgentKeySettings;
 use crate::db::is_role_name;
 use crate::entra::{EntraAppSettings, EntraSettings, Providers};
 
@@ -39,7 +40,7 @@ use crate::entra::{EntraAppSettings, EntraSettings, Providers};
 /// | `PUSH_AUTH_WORKER_ROLE` | role the worker connects as: granted the outbox and the cleanups at start-up (or by `migrate`); a plain role name, or an Entra principal name in Entra mode | none |
 /// | `PUSH_MESSAGE_SVC_URL` | Directory gRPC URL of message-svc, `http://host:50053` (plain `http://` only), asked whose profiles a caller may see; without it `GET /v1/users` answers 503 | none |
 /// | `PUSH_DIRECTORY_TOKEN` | the token message-svc requires for its `Directory` API, 32 to 256 visible ASCII characters; required with `PUSH_MESSAGE_SVC_URL` | none |
-/// | `PUSH_AUTH_PROVIDERS` | `password`, `entra`, `entra-app`, `external`, comma-separated; `external` is the authenticator a binary of one's own passes to `serve_with`, and reads no `PUSH_ENTRA_*` | `password` |
+/// | `PUSH_AUTH_PROVIDERS` | `password`, `entra`, `entra-app`, `agent-key`, `external`, comma-separated; `external` is the authenticator a binary of one's own passes to `serve_with`, and reads no `PUSH_ENTRA_*` | `password` |
 /// | `PUSH_ENTRA_CLIENT_ID` | accepted audiences: the API registration's application id, optionally with its `api://` URI | required with `entra` or `entra-app` |
 /// | `PUSH_ENTRA_ALLOWED_TENANTS` | exactly one of `common`, `organizations`, `consumers`, or tenant ids (GUIDs), comma-separated; `entra-app` requires explicit tenant GUIDs | required with either Entra provider |
 /// | `PUSH_ENTRA_AUTHORITY_HOST` | the Entra ID host; `http://` only for loopback (tests) | `https://login.microsoftonline.com/` |
@@ -50,6 +51,8 @@ use crate::entra::{EntraAppSettings, EntraSettings, Providers};
 /// | `PUSH_ENTRA_APP_REQUIRED_ROLE` | app-only role, independent of delegated-user policy | none |
 /// | `PUSH_ENTRA_APP_ALLOWED_CLIENT_APPS` | app-only client ids (`azp`), comma-separated | any valid client id |
 /// | `PUSH_ENTRA_APP_MAX_SESSION_HOURS` | app-only maximum session age, 1 to 720 | `24` |
+/// | `PUSH_AUTH_AGENT_KEY_AUDIENCE` | with `agent-key`: the `aud` every key assertion must carry, 1 to 256 visible ASCII characters | `PUSH_AUTH_PUBLIC_URL` without a trailing `/` |
+/// | `PUSH_AUTH_AGENT_KEY_MAX_SESSION_HOURS` | with `agent-key`: maximum session age of a key-backed device, 1 to 720 | `24` |
 /// | `PUSH_AGENTS_PER_USER` | active + unexpired pending agents per human owner, 0 to 100; 0 disables reservation/redemption | `2` |
 /// | `PUSH_AUTH_ADMIN_TOKEN` | the admin API's bearer token, 32 to 256 visible ASCII characters; unset: no admin listener (spec 2026-10-19 D15) | none |
 /// | `PUSH_AUTH_ADMIN_ADDR` | address of the admin listener; never expose it publicly | `0.0.0.0:8082` |
@@ -82,6 +85,8 @@ pub struct Config {
     pub entra: Option<EntraSettings>,
     /// App-only sign-in policy, read only with explicit `entra-app` opt-in.
     pub entra_app: Option<EntraAppSettings>,
+    /// Key sign-in policy, read only with explicit `agent-key` opt-in.
+    pub agent_key: Option<AgentKeySettings>,
     /// Maximum active + unexpired pending agents per human owner (0 disables enrollment).
     pub agents_per_user: u32,
     /// The admin API's bearer token; without it there is no admin listener.
@@ -117,6 +122,7 @@ impl std::fmt::Debug for Config {
             .field("providers", &self.providers)
             .field("entra", &self.entra)
             .field("entra_app", &self.entra_app)
+            .field("agent_key", &self.agent_key)
             .field("agents_per_user", &self.agents_per_user)
             .field(
                 "admin_token",
@@ -290,6 +296,11 @@ impl Config {
         } else {
             None
         };
+        let agent_key = if providers.agent_key {
+            Some(AgentKeySettings::from_lookup(lookup_dyn, &public_url)?)
+        } else {
+            None
+        };
         let agents_value = lookup("PUSH_AGENTS_PER_USER").unwrap_or_else(|| "2".to_owned());
         let agents_per_user = agents_value
             .trim()
@@ -332,6 +343,7 @@ impl Config {
             providers,
             entra,
             entra_app,
+            agent_key,
             agents_per_user,
             admin_token,
             admin_addr: parsed(&lookup, "PUSH_AUTH_ADMIN_ADDR", ([0, 0, 0, 0], 8082).into())?,
@@ -878,6 +890,60 @@ mod tests {
     }
 
     #[test]
+    fn agent_key_sign_in_is_explicit_and_bounded() {
+        let mut variables = with("PUSH_AUTH_PROVIDERS", "password,agent-key");
+        variables.push(("PUSH_AUTH_PUBLIC_URL", "https://api.example.com/"));
+        let configured = config(&variables).unwrap();
+        assert!(configured.providers.agent_key);
+        assert_eq!(
+            configured.agent_key,
+            Some(AgentKeySettings {
+                audience: "https://api.example.com".to_owned(),
+                max_session: std::time::Duration::from_secs(24 * 3600),
+            })
+        );
+        assert!(format!("{configured:?}").contains("agent_key"));
+        let mut chosen = variables.clone();
+        chosen.extend([
+            (
+                "PUSH_AUTH_AGENT_KEY_AUDIENCE",
+                " https://api.example.com/agents ",
+            ),
+            ("PUSH_AUTH_AGENT_KEY_MAX_SESSION_HOURS", "720"),
+        ]);
+        assert_eq!(
+            config(&chosen).unwrap().agent_key,
+            Some(AgentKeySettings {
+                audience: "https://api.example.com/agents".to_owned(),
+                max_session: std::time::Duration::from_secs(720 * 3600),
+            })
+        );
+        let long: &'static str = Box::leak("a".repeat(257).into_boxed_str());
+        for (name, bad) in [
+            ("PUSH_AUTH_AGENT_KEY_MAX_SESSION_HOURS", "0"),
+            ("PUSH_AUTH_AGENT_KEY_MAX_SESSION_HOURS", "721"),
+            ("PUSH_AUTH_AGENT_KEY_MAX_SESSION_HOURS", "1.5"),
+            ("PUSH_AUTH_AGENT_KEY_AUDIENCE", "an audience"),
+            ("PUSH_AUTH_AGENT_KEY_AUDIENCE", long),
+        ] {
+            let mut invalid = variables.clone();
+            invalid.push((name, bad));
+            assert!(
+                matches!(config(&invalid), Err(ConfigError::Invalid { name: refused, .. }) if refused == name),
+                "{name}={bad}"
+            );
+        }
+        let mut disabled = REQUIRED.to_vec();
+        disabled.extend([
+            ("PUSH_AUTH_AGENT_KEY_AUDIENCE", "an audience"),
+            ("PUSH_AUTH_AGENT_KEY_MAX_SESSION_HOURS", "0"),
+        ]);
+        let configured = config(&disabled).unwrap();
+        assert!(!configured.providers.agent_key);
+        assert_eq!(configured.agent_key, None);
+    }
+
+    #[test]
     fn sign_in_is_email_and_password_unless_entra_is_chosen() {
         let default = config(&REQUIRED).unwrap();
         assert_eq!(
@@ -886,6 +952,7 @@ mod tests {
                 password: true,
                 entra: false,
                 entra_app: false,
+                agent_key: false,
                 external: false
             }
         );
@@ -911,6 +978,7 @@ mod tests {
                 password: false,
                 entra: true,
                 entra_app: false,
+                agent_key: false,
                 external: false
             }
         );
@@ -946,6 +1014,7 @@ mod tests {
                 password: false,
                 entra: false,
                 entra_app: false,
+                agent_key: false,
                 external: true
             }
         );

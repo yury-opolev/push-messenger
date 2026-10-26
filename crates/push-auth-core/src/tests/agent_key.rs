@@ -307,6 +307,61 @@ async fn a_key_enrolls_signs_in_and_another_key_is_refused() {
 }
 
 #[tokio::test]
+async fn agent_key_sign_ins_are_audited() {
+    super::capture_logs();
+    let (world, auth, router) = key_world().await;
+    let owner = password_user(&auth, &world.pool, "owner", 1)
+        .await
+        .remove(0);
+    let reservation = auth
+        .reserve_agent(caller(&owner), "audited_agent", "Audited agent")
+        .await
+        .unwrap();
+    let key = TestKey::generate();
+    let (status, body) = enroll(&router, &key, &reservation.enrollment_code).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_token_invalid(
+        post_key(
+            &router,
+            json!({"token": TestKey::generate().assertion(KEY_AUDIENCE)}),
+        )
+        .await,
+        "an unknown key",
+    );
+
+    let events = super::security_events();
+    let user = reservation.user_id.to_string();
+    let success = events
+        .iter()
+        .find(|event| event["event"] == "auth.agent-key.success" && event["user_id"] == user)
+        .expect("the enrollment is audited");
+    assert_eq!(success["route"], "/v1/auth/agent-key");
+    assert!(
+        events
+            .iter()
+            .any(|event| event["event"] == "auth.agent-key.failure"
+                && event["route"] == "/v1/auth/agent-key"
+                && event["code"] == "token_invalid")
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event["event"] == "auth.external.rejected"
+                && event["provider"] == "agent-key"
+                && event["reason"].is_string())
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event["route"] == "/v1/auth/agent-key"
+                && event["event"]
+                    .as_str()
+                    .is_some_and(|name| name.starts_with("auth.external."))),
+        "the agent-key route is not audited as an external one"
+    );
+}
+
+#[tokio::test]
 async fn assertion_refusals_answer_401() {
     let (world, auth, router) = key_world().await;
     let key = TestKey::generate();

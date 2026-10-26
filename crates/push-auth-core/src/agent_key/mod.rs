@@ -6,9 +6,12 @@ use std::time::Duration;
 
 use sqlx::PgPool;
 
+use crate::config::ConfigError;
 use crate::identity::{AGENT_KEY_PROVIDER, AuthenticationError, Authenticator, Principal};
 
 mod jws;
+
+const MAX_SESSION_HOURS: u64 = 720;
 
 /// Policy of the explicitly enabled `agent-key` provider.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17,6 +20,60 @@ pub struct AgentKeySettings {
     pub audience: String,
     /// How long a device signed in with a key stays signed in: 1 to 720 hours.
     pub max_session: Duration,
+}
+
+impl AgentKeySettings {
+    /// `PUSH_AUTH_AGENT_KEY_AUDIENCE` (trimmed; default `public_url` without a trailing
+    /// `/`) and `PUSH_AUTH_AGENT_KEY_MAX_SESSION_HOURS` (a whole number from 1 to 720;
+    /// default 24), read through `lookup`.
+    pub fn from_lookup(
+        lookup: &dyn Fn(&str) -> Option<String>,
+        public_url: &str,
+    ) -> Result<Self, ConfigError> {
+        const AUDIENCE: &str = "PUSH_AUTH_AGENT_KEY_AUDIENCE";
+        const HOURS: &str = "PUSH_AUTH_AGENT_KEY_MAX_SESSION_HOURS";
+        let audience = lookup(AUDIENCE)
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| public_url.trim_end_matches('/').to_owned());
+        if !is_audience(&audience) {
+            return Err(ConfigError::Invalid {
+                name: AUDIENCE,
+                value: audience,
+                reason: "use 1 to 256 visible ASCII characters".to_owned(),
+            });
+        }
+        let hours_value = lookup(HOURS).unwrap_or_else(|| "24".to_owned());
+        let hours: u64 = hours_value
+            .trim()
+            .parse()
+            .ok()
+            .filter(|hours| (1..=MAX_SESSION_HOURS).contains(hours))
+            .ok_or_else(|| ConfigError::Invalid {
+                name: HOURS,
+                value: hours_value.clone(),
+                reason: "use a whole number of hours from 1 to 720".to_owned(),
+            })?;
+        Ok(Self {
+            audience,
+            max_session: Duration::from_secs(hours * 3600),
+        })
+    }
+}
+
+/// Refuses an audience that is not 1 to 256 visible ASCII characters and a session
+/// outside 1 to 720 hours: what [`AgentKeySignIn::new`] checks, for a start-up that
+/// validates before it has a pool.
+pub fn check(settings: &AgentKeySettings) -> Result<(), String> {
+    if !is_audience(&settings.audience) {
+        return Err("the agent-key audience must be 1 to 256 visible ASCII characters".to_owned());
+    }
+    if settings.max_session < Duration::from_secs(3600)
+        || settings.max_session > Duration::from_secs(MAX_SESSION_HOURS * 3600)
+    {
+        return Err("the agent-key maximum session must be 1 to 720 hours".to_owned());
+    }
+    Ok(())
 }
 
 /// The `agent-key` authenticator; its replay cache is the `auth` database.
@@ -30,16 +87,7 @@ impl AgentKeySignIn {
     /// Refuses an audience that is not 1 to 256 visible ASCII characters and a session
     /// outside 1 to 720 hours.
     pub fn new(settings: AgentKeySettings, pool: PgPool) -> Result<Self, String> {
-        if !is_audience(&settings.audience) {
-            return Err(
-                "the agent-key audience must be 1 to 256 visible ASCII characters".to_owned(),
-            );
-        }
-        if settings.max_session < Duration::from_secs(3600)
-            || settings.max_session > Duration::from_secs(720 * 3600)
-        {
-            return Err("the agent-key maximum session must be 1 to 720 hours".to_owned());
-        }
+        check(&settings)?;
         Ok(Self { settings, pool })
     }
 
