@@ -359,7 +359,8 @@ pub(crate) fn check_overrides(providers: &Providers, overrides: &Overrides) -> R
     {
         return Err(
             "an admission was supplied in Overrides, but PUSH_AUTH_PROVIDERS names \
-                    neither entra nor external: no sign-in would ask it"
+                    no sign-in by token (entra, entra-app, agent-key or external): no sign-in \
+                    would ask it"
                 .to_owned(),
         );
     }
@@ -621,12 +622,18 @@ mod tests {
                     authenticator: None,
                     admission: Some(RequireGroup::new("staff")),
                 },
-                "neither entra nor external",
+                "no sign-in by token",
             ),
         ];
         for (names, overrides, expected) in refused {
             let message = check_overrides(&providers(names), &overrides).unwrap_err();
             assert!(message.contains(expected), "{names}: {message}");
+            if expected == "no sign-in by token" {
+                assert!(
+                    message.contains("agent-key") && message.contains("entra-app"),
+                    "{message}"
+                );
+            }
             assert!(
                 message.contains("PUSH_AUTH_PROVIDERS") || message.contains("Overrides"),
                 "{message}"

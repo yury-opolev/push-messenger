@@ -17,6 +17,7 @@ use axum::response::Response;
 use uuid::Uuid;
 
 use crate::api::{Api, client_ip};
+use crate::identity::AGENT_KEY_ROUTE;
 
 /// The error code of a refused request ([`crate::AuthError::code`]), attached to its
 /// answer.
@@ -43,7 +44,7 @@ pub(crate) async fn audit(State(api): State<Api>, request: Request, next: Next) 
     let response = next.run(request).await;
     let status = response.status();
     let code = response.extensions().get::<ErrorCode>().map(|code| code.0);
-    let event = if route == "/v1/auth/agent-key" && api.auth.agent_key_offered() {
+    let event = if route == AGENT_KEY_ROUTE && api.auth.agent_key_offered() {
         sign_in_event(
             status,
             code,

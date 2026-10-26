@@ -22,6 +22,8 @@ pub const ENTRA_PROVIDER: &str = "entra";
 pub const ENTRA_APP_PROVIDER: &str = "entra-app";
 /// The opt-in, non-provisioning agent key-pair provider (spec 2026-10-26).
 pub const AGENT_KEY_PROVIDER: &str = "agent-key";
+/// The sign-in route of [`AGENT_KEY_PROVIDER`].
+pub(crate) const AGENT_KEY_ROUTE: &str = "/v1/auth/agent-key";
 /// The providers whose identities only an owner's enrollment binds: never a human, and
 /// never created on a first sign-in.
 pub const AGENT_PROVIDERS: &[&str] = &[ENTRA_APP_PROVIDER, AGENT_KEY_PROVIDER];
@@ -196,6 +198,11 @@ pub(crate) fn informational(value: Option<&str>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_agent_key_route_is_named_after_its_provider() {
+        assert_eq!(AGENT_KEY_ROUTE, format!("/v1/auth/{AGENT_KEY_PROVIDER}"));
+    }
 
     #[test]
     fn provider_ids_are_short_lower_case_names() {

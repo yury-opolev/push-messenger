@@ -463,7 +463,22 @@ pub(super) async fn call(
     token: &str,
     body: Value,
 ) -> (StatusCode, Value) {
+    call_from(router, method, path, token, body, None).await
+}
+
+/// [`call`], from the client IP `ip` in `x-real-ip` when given.
+pub(super) async fn call_from(
+    router: &Router,
+    method: &str,
+    path: &str,
+    token: &str,
+    body: Value,
+    ip: Option<&str>,
+) -> (StatusCode, Value) {
     let mut request = Request::builder().method(method).uri(path);
+    if let Some(ip) = ip {
+        request = request.header("x-real-ip", ip);
+    }
     if !token.is_empty() {
         request = request.header("authorization", format!("Bearer {token}"));
     }

@@ -5,11 +5,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
-use axum::http::StatusCode;
+use axum::http::{HeaderName, StatusCode};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use super::agents::{call, caller, principal, setup};
+use super::agents::{call, call_from, caller, principal, setup};
 use super::{Offer, World, password_user, world};
 use crate::agent_key::testing::TestKey;
 use crate::api::{Api, router};
@@ -309,7 +309,18 @@ async fn a_key_enrolls_signs_in_and_another_key_is_refused() {
 #[tokio::test]
 async fn agent_key_sign_ins_are_audited() {
     super::capture_logs();
-    let (world, auth, router) = key_world().await;
+    let (world, auth, _) = key_world().await;
+    // The log buffer is shared by every test of the process: this test's events are
+    // told apart by client IPs of its own.
+    let router = router(Api {
+        auth: auth.clone(),
+        limits: Limits::new(Arc::new(MemoryCounter::default())),
+        client_ip_header: Some(HeaderName::from_static("x-real-ip")),
+        directory: Arc::new(NoDirectory),
+    });
+    let [a, b, c, _] = rand::random::<u32>().to_be_bytes();
+    let success_ip = format!("10.{a}.{b}.{}", c & 0xfe);
+    let failure_ip = format!("10.{a}.{b}.{}", c | 1);
     let owner = password_user(&auth, &world.pool, "owner", 1)
         .await
         .remove(0);
@@ -318,12 +329,24 @@ async fn agent_key_sign_ins_are_audited() {
         .await
         .unwrap();
     let key = TestKey::generate();
-    let (status, body) = enroll(&router, &key, &reservation.enrollment_code).await;
+    let (status, body) = call_from(
+        &router,
+        "POST",
+        "/v1/auth/agent-key",
+        "",
+        json!({"token": key.assertion(KEY_AUDIENCE), "enrollment_code": reservation.enrollment_code}),
+        Some(&success_ip),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_token_invalid(
-        post_key(
+        call_from(
             &router,
+            "POST",
+            "/v1/auth/agent-key",
+            "",
             json!({"token": TestKey::generate().assertion(KEY_AUDIENCE)}),
+            Some(&failure_ip),
         )
         .await,
         "an unknown key",
@@ -333,16 +356,20 @@ async fn agent_key_sign_ins_are_audited() {
     let user = reservation.user_id.to_string();
     let success = events
         .iter()
-        .find(|event| event["event"] == "auth.agent-key.success" && event["user_id"] == user)
+        .find(|event| event["ip"] == success_ip.as_str())
         .expect("the enrollment is audited");
+    assert_eq!(success["event"], "auth.agent-key.success");
+    assert_eq!(success["user_id"], user);
     assert_eq!(success["route"], "/v1/auth/agent-key");
-    assert!(
-        events
-            .iter()
-            .any(|event| event["event"] == "auth.agent-key.failure"
-                && event["route"] == "/v1/auth/agent-key"
-                && event["code"] == "token_invalid")
-    );
+    let failure = events
+        .iter()
+        .find(|event| event["ip"] == failure_ip.as_str())
+        .expect("the refusal is audited");
+    assert_eq!(failure["event"], "auth.agent-key.failure");
+    assert_eq!(failure["route"], "/v1/auth/agent-key");
+    assert_eq!(failure["code"], "token_invalid");
+    // The authenticator logs its refusal without the client IP, so this line cannot be
+    // tied to this test's request: any agent-key refusal of the process satisfies it.
     assert!(
         events
             .iter()

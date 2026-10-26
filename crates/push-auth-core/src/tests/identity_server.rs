@@ -75,7 +75,7 @@ async fn mismatched_overrides_stop_start_up_before_any_datastore() {
                 authenticator: None,
                 admission: Some(RequireGroup::new("staff")),
             },
-            "neither entra nor external",
+            "no sign-in by token",
         ),
     ];
     for (providers, overrides, expected) in cases {

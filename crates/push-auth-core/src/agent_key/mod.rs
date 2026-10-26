@@ -64,14 +64,14 @@ impl AgentKeySettings {
 /// Refuses an audience that is not 1 to 256 visible ASCII characters and a session
 /// outside 1 to 720 hours: what [`AgentKeySignIn::new`] checks, for a start-up that
 /// validates before it has a pool.
-pub fn check(settings: &AgentKeySettings) -> Result<(), String> {
+pub(crate) fn check(settings: &AgentKeySettings) -> Result<(), String> {
     if !is_audience(&settings.audience) {
-        return Err("the agent-key audience must be 1 to 256 visible ASCII characters".to_owned());
+        return Err("the agent-key audience (PUSH_AUTH_AGENT_KEY_AUDIENCE) must be 1 to 256 visible ASCII characters".to_owned());
     }
     if settings.max_session < Duration::from_secs(3600)
         || settings.max_session > Duration::from_secs(MAX_SESSION_HOURS * 3600)
     {
-        return Err("the agent-key maximum session must be 1 to 720 hours".to_owned());
+        return Err("the agent-key maximum session (PUSH_AUTH_AGENT_KEY_MAX_SESSION_HOURS) must be 1 to 720 hours".to_owned());
     }
     Ok(())
 }
