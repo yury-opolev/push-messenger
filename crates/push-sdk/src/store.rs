@@ -29,7 +29,7 @@ pub(crate) mod outbox;
 
 /// The schema steps: `SCHEMA_STEPS[n]` brings a database from version `n` to `n + 1`.
 /// Each runs in one transaction with the version bump, so a crash leaves the old version.
-const SCHEMA_STEPS: &[&str] = &[SCHEMA_V1];
+const SCHEMA_STEPS: &[&str] = &[SCHEMA_V1, SCHEMA_V2];
 
 const SCHEMA_V1: &str = "
 CREATE TABLE meta (
@@ -91,6 +91,13 @@ CREATE TABLE outbox (
     parent_id            BLOB
 );
 CREATE INDEX outbox_order ON outbox (conversation_id);
+";
+
+/// Cards and answers: a card's `answer_seq` (the answer that closed it) and an answer's
+/// `card_seq` (the card it answers).
+const SCHEMA_V2: &str = "
+ALTER TABLE message ADD COLUMN answer_seq INTEGER;
+ALTER TABLE message ADD COLUMN card_seq INTEGER;
 ";
 
 /// Refuses to go on with a key unless the linked SQLite is SQLite3 Multiple Ciphers: on a
@@ -465,7 +472,7 @@ impl Store {
             "UPDATE conversation SET unread = (
                  SELECT MIN(COUNT(*), ?3) FROM message m
                  WHERE m.conversation_id = conversation.id AND m.seq > conversation.read_seq
-                   AND m.sender_id <> ?2 AND m.deleted = 0 AND m.content_type = 1)
+                   AND m.sender_id <> ?2 AND m.deleted = 0 AND m.content_type IN (1, 3, 4))
              WHERE id = ?1",
             params![bytes(id.0), bytes(me.0), i64::from(MAX_UNREAD)],
         )?;
@@ -522,7 +529,7 @@ impl Store {
             params![bytes(id.0), entry.seq, entry.server_ts],
         )?;
         let counts = matches!(&applied, Applied::Added(message)
-            if message.sender_id != me && message.kind == MessageKind::Text && !message.deleted);
+            if message.sender_id != me && message.kind != MessageKind::System && !message.deleted);
         if counts || matches!(applied, Applied::Deleted(_)) {
             self.recount_unread(id)?;
         }
@@ -544,7 +551,8 @@ impl Store {
                 // message is not deleted and the entry is not older than what is held:
                 // a stale page never brings a body back or replaces a newer edit.
                 self.conn.execute(
-                    "UPDATE message SET seq = ?3, message_id = ?4, server_ts = ?5
+                    "UPDATE message SET seq = ?3, message_id = ?4, server_ts = ?5,
+                         answer_seq = COALESCE(answer_seq, ?6), card_seq = COALESCE(card_seq, ?7)
                      WHERE conversation_id = ?1 AND client_msg_id = ?2",
                     params![
                         bytes(id.0),
@@ -552,6 +560,8 @@ impl Store {
                         entry.seq,
                         entry.message_id,
                         entry.server_ts,
+                        entry.answer_seq,
+                        card_seq(entry),
                     ],
                 )?;
                 self.conn.execute(
@@ -578,8 +588,9 @@ impl Store {
             None => {
                 let inserted = self.conn.execute(
                     "INSERT OR IGNORE INTO message (conversation_id, client_msg_id, seq, message_id,
-                         sender_id, content_type, body, client_ts, server_ts, edited_at, edit_seq, deleted)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                         sender_id, content_type, body, client_ts, server_ts, edited_at, edit_seq, deleted,
+                         answer_seq, card_seq)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                     params![
                         bytes(id.0),
                         bytes(client_msg_id.0),
@@ -593,6 +604,8 @@ impl Store {
                         entry.edited_at,
                         entry.edit_seq.unwrap_or(0),
                         entry.deleted,
+                        entry.answer_seq,
+                        card_seq(entry),
                     ],
                 )?;
                 if inserted == 0 {
@@ -714,10 +727,68 @@ impl Store {
             self.store_entry(entry)?;
             let client_msg_id = ClientMsgId(id_of(&entry.client_msg_id)?);
             if let Some(message) = self.message(id, client_msg_id)? {
+                self.mark_answered(&message)?;
                 stored.push(message);
             }
         }
+        // An answer later in the page may have closed a card earlier in it.
+        for message in &mut stored {
+            if message.kind == MessageKind::Rich && message.answer_seq.is_none() {
+                if let Some(now) = self.message(message.conversation_id, message.client_msg_id)? {
+                    *message = now;
+                }
+            }
+        }
         Ok(stored)
+    }
+
+    /// An answer stored by the server closes its card: the card's `answer_seq` is set
+    /// unless it was answered already. The card if it changed.
+    pub fn mark_answered(&mut self, answer: &Message) -> Result<Option<Message>, SdkError> {
+        let (MessageKind::Answer, Some(seq), Some(card_seq)) =
+            (answer.kind, answer.seq, answer.card_seq)
+        else {
+            return Ok(None);
+        };
+        let changed = self.conn.execute(
+            "UPDATE message SET answer_seq = ?3
+             WHERE conversation_id = ?1 AND seq = ?2 AND content_type = 3 AND answer_seq IS NULL",
+            params![bytes(answer.conversation_id.0), card_seq, seq],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        self.message_at(answer.conversation_id, card_seq)
+    }
+
+    /// The message at `seq`, if held.
+    pub fn message_at(&self, id: ConversationId, seq: i64) -> Result<Option<Message>, SdkError> {
+        let me = self.me()?;
+        Ok(self
+            .conn
+            .query_row(
+                &format!("{MESSAGE_COLUMNS} WHERE m.conversation_id = ?1 AND m.seq = ?2"),
+                params![bytes(id.0), seq],
+                |row| message_row(row, me),
+            )
+            .optional()?)
+    }
+
+    /// The message the server stored as `message_id`, if held.
+    pub fn message_by_id(
+        &self,
+        id: ConversationId,
+        message_id: MessageId,
+    ) -> Result<Option<Message>, SdkError> {
+        let me = self.me()?;
+        Ok(self
+            .conn
+            .query_row(
+                &format!("{MESSAGE_COLUMNS} WHERE m.conversation_id = ?1 AND m.message_id = ?2"),
+                params![bytes(id.0), bytes(message_id.0)],
+                |row| message_row(row, me),
+            )
+            .optional()?)
     }
 
     pub fn message(
@@ -835,7 +906,7 @@ fn conversation_row(row: &Row<'_>) -> rusqlite::Result<Conversation> {
 
 const MESSAGE_COLUMNS: &str = "SELECT m.conversation_id, m.client_msg_id, m.message_id, m.seq,
     m.sender_id, m.content_type, m.body, m.client_ts, m.server_ts, m.edited_at, m.deleted,
-    c.peer_delivered_seq, c.peer_read_seq
+    c.peer_delivered_seq, c.peer_read_seq, m.answer_seq, m.card_seq
     FROM message m JOIN conversation c ON c.id = m.conversation_id";
 
 fn message_row(row: &Row<'_>, me: UserId) -> rusqlite::Result<Message> {
@@ -858,17 +929,15 @@ fn message_row(row: &Row<'_>, me: UserId) -> rusqlite::Result<Message> {
         message_id: message_id.and_then(|id| Uuid::from_slice(&id).ok().map(MessageId)),
         seq,
         sender_id,
-        kind: if content_type == 2 {
-            MessageKind::System
-        } else {
-            MessageKind::Text
-        },
+        kind: MessageKind::from_code(content_type),
         body: body.map(|body| String::from_utf8_lossy(&body).into_owned()),
         client_ts: row.get(7)?,
         server_ts: row.get(8)?,
         edited_at: row.get(9)?,
         deleted: row.get(10)?,
         status,
+        answer_seq: row.get(13)?,
+        card_seq: row.get(14)?,
     })
 }
 
@@ -885,9 +954,19 @@ fn uuid_at(row: &Row<'_>, index: usize) -> rusqlite::Result<Uuid> {
 
 fn content_type_code(entry: &Deliver) -> i64 {
     match entry.content_type() {
-        ContentType::SystemEvent => 2,
-        _ => 1,
+        ContentType::SystemEvent => MessageKind::System,
+        ContentType::Rich => MessageKind::Rich,
+        ContentType::Answer => MessageKind::Answer,
+        ContentType::Text | ContentType::Unspecified => MessageKind::Text,
     }
+    .code()
+}
+
+/// An answer's card: the entry's `target_seq`. Nothing for any other entry.
+fn card_seq(entry: &Deliver) -> Option<i64> {
+    (entry.content_type() == ContentType::Answer)
+        .then_some(entry.target_seq)
+        .flatten()
 }
 
 fn id_of(value: &[u8]) -> Result<Uuid, SdkError> {
@@ -1307,6 +1386,131 @@ pub(crate) mod tests {
         let shown = format!("{:?}", crate::model::Event::MessageAdded(message));
         assert!(!shown.contains("a private text"), "{shown}");
         assert!(shown.contains("<14 bytes>"), "{shown}");
+    }
+
+    pub(crate) const CARD: &str =
+        r#"{"tpl":"agent.approval@1","params":{"title":"Deploy?"},"fallback":"Deploy?"}"#;
+
+    pub(crate) fn card_entry(conversation: ConversationId, sender: UserId, seq: i64) -> Deliver {
+        let mut card = entry(conversation, sender, seq, EntryKind::Message);
+        card.content_type = ContentType::Rich.into();
+        card.body = Some(CARD.as_bytes().to_vec());
+        card
+    }
+
+    pub(crate) fn answer_entry(
+        conversation: ConversationId,
+        sender: UserId,
+        seq: i64,
+        card: &Deliver,
+    ) -> Deliver {
+        let mut answer = entry(conversation, sender, seq, EntryKind::Message);
+        answer.content_type = ContentType::Answer.into();
+        answer.target_seq = Some(card.seq);
+        let card_id = Uuid::from_slice(&card.message_id).unwrap();
+        answer.body = Some(
+            format!(r#"{{"card":"{card_id}","values":["approve"],"fallback":"Approved"}}"#)
+                .into_bytes(),
+        );
+        answer
+    }
+
+    #[test]
+    fn cards_and_answers_keep_their_kind_and_an_answer_closes_its_card() {
+        let mut f = fixture();
+        let card = card_entry(f.conversation, f.peer, 1);
+        let (applied, conversation, _) = f.store.apply_deliver(&card).unwrap();
+        assert!(matches!(applied, Applied::Added(ref message)
+            if message.kind == MessageKind::Rich && message.answer_seq.is_none()));
+        assert_eq!(
+            conversation.unwrap().unread,
+            1,
+            "a card from the peer is unread"
+        );
+
+        // The user answered on another device: the answer comes back as a delivery.
+        let answer = answer_entry(f.conversation, f.me, 2, &card);
+        let (applied, _, _) = f.store.apply_deliver(&answer).unwrap();
+        let Applied::Added(answer) = applied else {
+            panic!("a new message");
+        };
+        assert_eq!(
+            (answer.kind, answer.card_seq, answer.answer_seq),
+            (MessageKind::Answer, Some(1), None)
+        );
+        let card = f.store.mark_answered(&answer).unwrap().expect("closed");
+        assert_eq!((card.seq, card.answer_seq), (Some(1), Some(2)));
+        assert_eq!(f.store.mark_answered(&answer).unwrap(), None, "once");
+        assert_eq!(message_at(&f, 1).answer_seq, Some(2));
+        assert_eq!(message_at(&f, 2).kind, MessageKind::Answer);
+
+        // A text message is never closed, whatever names it.
+        f.store
+            .apply_deliver(&entry(f.conversation, f.peer, 3, EntryKind::Message))
+            .unwrap();
+        let mut stray = answer;
+        stray.card_seq = Some(3);
+        assert_eq!(f.store.mark_answered(&stray).unwrap(), None);
+    }
+
+    #[test]
+    fn answers_from_others_count_as_unread_and_history_carries_answer_seq() {
+        let mut f = fixture();
+        let mut card = card_entry(f.conversation, f.me, 1);
+        card.answer_seq = Some(2);
+        let answer = answer_entry(f.conversation, f.peer, 2, &card);
+        let stored = f.store.store_history(&[card.clone(), answer]).unwrap();
+        assert_eq!(stored[0].answer_seq, Some(2));
+        assert_eq!(stored[1].card_seq, Some(1));
+        let later = answer_entry(f.conversation, f.peer, 3, &card);
+        let (_, conversation, _) = f.store.apply_deliver(&later).unwrap();
+        assert_eq!(
+            conversation.unwrap().unread,
+            2,
+            "both answers from the peer"
+        );
+    }
+
+    #[test]
+    fn a_database_from_the_first_schema_upgrades_and_keeps_its_messages() {
+        let scratch = Scratch::new();
+        let (me, peer, conversation) = (UserId::new(), UserId::new(), ConversationId::new());
+        let mut conn = Connection::open(scratch.database()).unwrap();
+        migrate(&mut conn, &SCHEMA_STEPS[..1]).unwrap();
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('owner', ?1)",
+            params![bytes(me.0)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO conversation (id, kind, peer_id) VALUES (?1, 1, ?2)",
+            params![bytes(conversation.0), bytes(peer.0)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message (conversation_id, client_msg_id, seq, sender_id, content_type, body)
+             VALUES (?1, ?2, 1, ?3, 1, CAST('kept' AS BLOB))",
+            params![bytes(conversation.0), bytes(Uuid::now_v7()), bytes(peer.0)],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut store = Store::open(&scratch.database(), None).unwrap();
+        let held = store.messages(conversation, None, 10).unwrap();
+        assert_eq!(held.len(), 1);
+        assert_eq!(
+            (
+                held[0].body.as_deref(),
+                held[0].answer_seq,
+                held[0].card_seq
+            ),
+            (Some("kept"), None, None)
+        );
+        store
+            .apply_deliver(&card_entry(conversation, peer, 2))
+            .unwrap();
+        let held = store.messages(conversation, None, 10).unwrap();
+        assert_eq!(held[1].kind, MessageKind::Rich);
     }
 
     #[test]

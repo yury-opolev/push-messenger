@@ -271,6 +271,16 @@ class Client {
     return settled(() => this.#native.send(conversationId, text));
   }
 
+  /** Queues a card, a RICH body as a JSON string; resolves to the local echo. */
+  sendRich(conversationId, body) {
+    return settled(() => this.#native.sendRich(conversationId, body));
+  }
+
+  /** Queues an answer to a held card, an ANSWER body as a JSON string; resolves to the local echo. */
+  sendAnswer(conversationId, body) {
+    return settled(() => this.#native.sendAnswer(conversationId, body));
+  }
+
   /** Resolves to the change's own id. */
   edit(conversationId, clientMsgId, text) {
     return settled(() => this.#native.edit(conversationId, clientMsgId, text));

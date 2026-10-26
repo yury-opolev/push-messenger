@@ -73,9 +73,13 @@ values are `null`.
 - **Connection state:** `{state}` — `offline`, `connecting`, `connected`, `signedOut`,
   `deviceRemoved`, `openedElsewhere`, or `reconnecting` with `attempt` and `retryInMs`.
 - **Message:** `{conversationId, clientMsgId, messageId, seq, senderId, kind, body,
-  clientTs, serverTs, editedAt, deleted, status}`; `kind` is `text` or `system`; `status`
+  clientTs, serverTs, editedAt, deleted, status, answerSeq, cardSeq}`; `kind` is `text`,
+  `system`, `rich` (a card from a template; `body` is JSON `{tpl, params, fallback}`) or
+  `answer` (an answer to a card; `body` is JSON `{card, values, fallback}`); `status`
   is `pending`, `sent`, `delivered`, `read` (the user's own) or `received` (others');
   `body` is `null` once deleted. `clientMsgId` is the handle for edit, delete and cancel.
+  `answerSeq` (cards) is the `seq` of the answer that closed the card, once answered;
+  `cardSeq` (answers) is the `seq` of the card answered. Both are `null` otherwise.
 - **Conversation:** `{id, kind, peer, title, lastSeq, readSeq, unread, peerDeliveredSeq,
   peerReadSeq, updatedAt}`; `kind` is `direct`, `group` or `unknown`.
 - **Contact:** `{userId, state}`; `state` is `none`, `requestedOut`, `requestedIn`,
@@ -93,7 +97,7 @@ One ordered stream per client, each event an object with a `type`:
 | `connectionStateChanged` | the connection state's fields |
 | `messageAdded` | `message`: the local echo of a send, or a message received |
 | `messageSent` | `message`: stored by the server, with its `seq` |
-| `messageEdited` | `message` |
+| `messageEdited` | `message`; also a card closed by an answer (its `answerSeq` set) |
 | `messageDeleted` | `message`, its `body` gone |
 | `sendFailed` | `conversationId`, `clientMsgId`, `kind` (`send`, `edit`, `delete`), `error` |
 | `receiptChanged` | `conversationId`, `peerDeliveredSeq`, `peerReadSeq` |
@@ -103,6 +107,26 @@ One ordered stream per client, each event an object with a `type`:
 | `deviceRemoved` | the device was revoked |
 | `openedElsewhere` | another copy took over |
 | `eventsLost` | the app stopped reading and 10,000 events waited: reload what the UI shows from the local data |
+
+### Cards and answers
+
+Rich messages ([the design](superpowers/specs/2026-10-26-rich-message-templates-design.md))
+are sent as JSON strings:
+
+- `send_rich(conversation, body)` (`sendRich`, `push_client_send_rich`) queues a card, a
+  RICH body `{"tpl": "agent.approval@1", "params": {...}, "fallback": "..."}`.
+- `send_answer(conversation, body)` (`sendAnswer`, `push_client_send_answer`) queues an
+  answer, an ANSWER body `{"card": "<the card's messageId>", "values": ["approve"],
+  "fallback": "Approved"}`. The card must be held in the conversation, live, from someone
+  else and not answered yet.
+
+Both check the envelope locally and fail with `invalid` otherwise; the server checks the
+template and the values and may still refuse (`sendFailed`). Both return the local echo,
+as `send` does. `edit` replaces a card's whole RICH body; an answer, or a card already
+answered, cannot be edited (`invalid`). When an answer is stored the card's `answerSeq` is
+set and the card is reported with `messageEdited`. Cards and answers from others count as
+unread. Render only approved templates from the catalog (`GET /v1/templates`), as inert
+text, and show `fallback` for anything else.
 
 ### The secret store and the database key
 

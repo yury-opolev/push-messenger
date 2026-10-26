@@ -279,7 +279,26 @@ int32_t push_client_send(const PushClient *client,
                          char **message_json,
                          PushError **error);
 
-// Changes the text of one of the user's messages; `*change_id` gets the id of the change.
+// Queues a card: `rich_json` is a RICH body `{"tpl", "params", "fallback"}`, checked as
+// an envelope (`invalid` otherwise). `*message_json` gets the local echo, as with
+// `push_client_send`; the server checks the template and may refuse it later.
+int32_t push_client_send_rich(const PushClient *client,
+                              const char *conversation_id_text,
+                              const char *rich_json,
+                              char **message_json,
+                              PushError **error);
+
+// Queues an answer to a card: `answer_json` is an ANSWER body `{"card", "values",
+// "fallback"}` naming a card held in the conversation, from someone else and not
+// answered yet (`invalid` otherwise). `*message_json` gets the local echo.
+int32_t push_client_send_answer(const PushClient *client,
+                                const char *conversation_id_text,
+                                const char *answer_json,
+                                char **message_json,
+                                PushError **error);
+
+// Changes the text of one of the user's messages, or a card's RICH body (not an answer,
+// nor an answered card); `*change_id` gets the id of the change.
 int32_t push_client_edit(const PushClient *client,
                          const char *conversation_id_text,
                          const char *target_client_msg_id,

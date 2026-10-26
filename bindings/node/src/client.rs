@@ -364,6 +364,34 @@ impl NativeClient {
         })
     }
 
+    /// Queues a card (a RICH body); resolves to the local echo.
+    #[napi(catch_unwind)]
+    pub fn send_rich<'env>(
+        &self,
+        env: &'env Env,
+        conversation: String,
+        body: String,
+    ) -> napi::Result<Object<'env>> {
+        self.promise(env, |client| async move {
+            let message = client.send_rich(conversation_id(&conversation)?, &body)?;
+            Ok(json::message(&message))
+        })
+    }
+
+    /// Queues an answer to a card (an ANSWER body); resolves to the local echo.
+    #[napi(catch_unwind)]
+    pub fn send_answer<'env>(
+        &self,
+        env: &'env Env,
+        conversation: String,
+        body: String,
+    ) -> napi::Result<Object<'env>> {
+        self.promise(env, |client| async move {
+            let message = client.send_answer(conversation_id(&conversation)?, &body)?;
+            Ok(json::message(&message))
+        })
+    }
+
     /// Resolves to the change's id.
     #[napi(catch_unwind)]
     pub fn edit<'env>(

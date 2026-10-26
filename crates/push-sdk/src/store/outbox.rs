@@ -2,13 +2,13 @@
 //! order per conversation, one at a time, with the same `client_msg_id` on every attempt.
 
 use push_domain::{ClientMsgId, ConversationId, MessageId};
-use push_proto::v1::{self, ContentType};
+use push_proto::v1;
 use rusqlite::{OptionalExtension, Row, params};
 use uuid::Uuid;
 
 use super::{Store, bytes, id_of, uuid_at};
 use crate::SdkError;
-use crate::model::{Message, OutboxKind, redacted};
+use crate::model::{Message, MessageKind, OutboxKind, redacted};
 
 /// A row of the outbox.
 #[derive(Clone, PartialEq, Eq)]
@@ -18,6 +18,8 @@ pub(crate) struct OutboxRow {
     pub kind: OutboxKind,
     pub target_message_id: Option<MessageId>,
     pub target_client_msg_id: Option<ClientMsgId>,
+    /// What a send carries; an edit or delete carries its target's kind.
+    pub content: MessageKind,
     pub body: Option<String>,
     pub in_flight: bool,
     pub enqueued_at: i64,
@@ -34,6 +36,7 @@ impl std::fmt::Debug for OutboxRow {
             .field("kind", &self.kind)
             .field("target_message_id", &self.target_message_id)
             .field("target_client_msg_id", &self.target_client_msg_id)
+            .field("content", &self.content)
             .field("body", &redacted(&self.body))
             .field("in_flight", &self.in_flight)
             .field("enqueued_at", &self.enqueued_at)
@@ -52,7 +55,7 @@ impl OutboxRow {
             OutboxKind::Send => v1::frame::Body::Send(v1::Send {
                 client_msg_id,
                 conversation_id,
-                content_type: ContentType::Text.into(),
+                content_type: self.content.content_type().into(),
                 body: self.body.clone().unwrap_or_default().into_bytes(),
                 client_ts: Some(self.enqueued_at),
             }),
@@ -82,6 +85,7 @@ impl OutboxRow {
 
 impl Store {
     /// Queues a text message and stores its local echo, in one transaction.
+    #[cfg(test)]
     pub fn queue_send(
         &mut self,
         id: ConversationId,
@@ -89,17 +93,46 @@ impl Store {
         body: &str,
         now_us: i64,
     ) -> Result<Message, SdkError> {
+        self.queue_content(id, client_msg_id, MessageKind::Text, body, None, now_us)
+    }
+
+    /// Queues a message of `kind` (an answer names its card's `seq`) and stores its local
+    /// echo, in one transaction.
+    pub fn queue_content(
+        &mut self,
+        id: ConversationId,
+        client_msg_id: ClientMsgId,
+        kind: MessageKind,
+        body: &str,
+        card_seq: Option<i64>,
+        now_us: i64,
+    ) -> Result<Message, SdkError> {
         let me = self.me()?;
         let tx = self.conn.transaction()?;
         tx.execute(
             "INSERT INTO outbox (client_msg_id, conversation_id, kind, content_type, body, enqueued_at)
-             VALUES (?1, ?2, 1, 1, ?3, ?4)",
-            params![bytes(client_msg_id.0), bytes(id.0), body.as_bytes(), now_us],
+             VALUES (?1, ?2, 1, ?3, ?4, ?5)",
+            params![
+                bytes(client_msg_id.0),
+                bytes(id.0),
+                kind.code(),
+                body.as_bytes(),
+                now_us
+            ],
         )?;
         tx.execute(
-            "INSERT INTO message (conversation_id, client_msg_id, sender_id, content_type, body, client_ts)
-             VALUES (?1, ?2, ?3, 1, ?4, ?5)",
-            params![bytes(id.0), bytes(client_msg_id.0), bytes(me.0), body.as_bytes(), now_us],
+            "INSERT INTO message (conversation_id, client_msg_id, sender_id, content_type, body,
+                 client_ts, card_seq)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                bytes(id.0),
+                bytes(client_msg_id.0),
+                bytes(me.0),
+                kind.code(),
+                body.as_bytes(),
+                now_us,
+                card_seq
+            ],
         )?;
         tx.commit()?;
         Ok(self.message(id, client_msg_id)?.expect("just queued"))
@@ -121,7 +154,7 @@ impl Store {
         self.conn.execute(
             "INSERT INTO outbox (client_msg_id, conversation_id, kind, target_message_id,
                  target_client_msg_id, content_type, body, enqueued_at, parent_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7, ?8)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?9, ?6, ?7, ?8)",
             params![
                 bytes(client_msg_id.0),
                 bytes(id.0),
@@ -131,6 +164,7 @@ impl Store {
                 body.map(str::as_bytes),
                 now_us,
                 parent.map(|id| bytes(id.0)),
+                target.kind.code(),
             ],
         )?;
         Ok(())
@@ -306,7 +340,7 @@ impl Store {
 }
 
 const OUTBOX_COLUMNS: &str = "SELECT client_msg_id, conversation_id, kind, target_message_id,
-    target_client_msg_id, body, state, enqueued_at, attempts, parent_id FROM outbox";
+    target_client_msg_id, body, state, enqueued_at, attempts, parent_id, content_type FROM outbox";
 
 fn outbox_row(row: &Row<'_>) -> rusqlite::Result<OutboxRow> {
     let optional_id = |index: usize| -> rusqlite::Result<Option<Uuid>> {
@@ -322,6 +356,7 @@ fn outbox_row(row: &Row<'_>) -> rusqlite::Result<OutboxRow> {
         kind: OutboxKind::from_code(row.get(2)?),
         target_message_id: optional_id(3)?.map(MessageId),
         target_client_msg_id: optional_id(4)?.map(ClientMsgId),
+        content: MessageKind::from_code(row.get::<_, Option<i64>>(10)?.unwrap_or(1)),
         body: body.map(|body| String::from_utf8_lossy(&body).into_owned()),
         in_flight: state == 1,
         enqueued_at: row.get(7)?,

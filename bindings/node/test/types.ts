@@ -41,6 +41,18 @@ async function app(): Promise<void> {
   client.connect();
   const conversation = await client.openDirect('0199e1c2-0000-7000-8000-000000000001');
   const echo = await client.send(conversation.id, 'hi');
+  const card = await client.sendRich(
+    conversation.id,
+    JSON.stringify({ tpl: 'agent.approval@1', params: {}, fallback: 'Deploy?' }),
+  );
+  if (card.kind === 'rich' && card.answerSeq === null && card.messageId) {
+    const answer = await client.sendAnswer(
+      conversation.id,
+      JSON.stringify({ card: card.messageId, values: ['approve'], fallback: 'Approved' }),
+    );
+    const cardSeq: number | null = answer.cardSeq;
+    console.log(cardSeq);
+  }
   const history = await client.messages(conversation.id, null, 50);
   console.log(echo.seq, history.length);
   try {

@@ -73,6 +73,8 @@ pub fn message(message: &Message) -> Value {
     let kind = match message.kind {
         MessageKind::Text => "text",
         MessageKind::System => "system",
+        MessageKind::Rich => "rich",
+        MessageKind::Answer => "answer",
     };
     let status = match message.status {
         MessageStatus::Pending => "pending",
@@ -94,6 +96,8 @@ pub fn message(message: &Message) -> Value {
         "editedAt": message.edited_at,
         "deleted": message.deleted,
         "status": status,
+        "answerSeq": message.answer_seq,
+        "cardSeq": message.card_seq,
     })
 }
 
@@ -340,7 +344,7 @@ mod tests {
         assert_eq!(failed["error"]["code"], "not_contact");
         assert_eq!(event(&Event::EventsLost), json!({"type": "eventsLost"}));
         let sender = UserId::new();
-        let added = event(&Event::MessageAdded(Message {
+        let text = Message {
             conversation_id,
             client_msg_id,
             message_id: None,
@@ -353,11 +357,33 @@ mod tests {
             edited_at: None,
             deleted: false,
             status: MessageStatus::Received,
-        }));
+            answer_seq: None,
+            card_seq: None,
+        };
+        let added = event(&Event::MessageAdded(text.clone()));
         assert_eq!(added["message"]["senderId"], sender.to_string());
         assert_eq!(added["message"]["serverTs"], 1_760_000_000_000_000_i64);
         assert_eq!(added["message"]["messageId"], Value::Null);
         assert_eq!(added["message"]["status"], "received");
+        assert_eq!(added["message"]["answerSeq"], Value::Null);
+        let answer = |kind, answer_seq, card_seq| {
+            message(&Message {
+                kind,
+                answer_seq,
+                card_seq,
+                ..text.clone()
+            })
+        };
+        let card = answer(MessageKind::Rich, Some(5), None);
+        assert_eq!(
+            (&card["kind"], &card["answerSeq"]),
+            (&json!("rich"), &json!(5))
+        );
+        let reply = answer(MessageKind::Answer, None, Some(4));
+        assert_eq!(
+            (&reply["kind"], &reply["cardSeq"]),
+            (&json!("answer"), &json!(4))
+        );
         let account = account(&Account {
             user_id: sender,
             device_id: DeviceId::new(),
@@ -438,6 +464,8 @@ mod tests {
             edited_at: None,
             deleted: false,
             status: MessageStatus::Pending,
+            answer_seq: None,
+            card_seq: None,
         };
         let events = [
             Event::ConnectionStateChanged(ConnectionState::Offline),
