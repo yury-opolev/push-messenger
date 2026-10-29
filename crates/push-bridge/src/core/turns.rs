@@ -309,6 +309,14 @@ impl<M: Messenger> Core<M> {
             None => self.reply(&note),
         }
         self.close_backend_requests(&format!("Declined: {} stopped.", self.name));
+        if std::mem::take(&mut self.new_after_turn) {
+            // The `/new` that waited for the turn: the restart starts the new session.
+            let key = folder_key(&self.folder);
+            self.save(|state| {
+                state.sessions.remove(&key);
+            });
+            self.mode = self.options.default_mode;
+        }
         let now = Instant::now();
         if self
             .running_since

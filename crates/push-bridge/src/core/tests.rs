@@ -685,6 +685,23 @@ async fn idle_only_commands_wait_and_new_waits_for_the_turn() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_new_session_waiting_for_the_turn_survives_an_exit() {
+    let h = Harness::started().await;
+    h.backend.turn_started(TurnSource::Prompt);
+    h.messenger.owner_says("/new");
+    h.backend.wait_for("interrupt", 1).await;
+    h.backend.emit(exited());
+    h.backend.wait_for("start", 2).await;
+    let starts: Vec<_> = h
+        .backend
+        .calls()
+        .into_iter()
+        .filter(|call| call.starts_with("start"))
+        .collect();
+    assert_eq!(starts[1], h.start_call(&h.work, "None"));
+}
+
+#[tokio::test(start_paused = true)]
 async fn resume_and_fork_store_their_sessions() {
     let h = Harness::started().await;
     h.backend.fail_next_start(ErrorKind::SessionNotFound);
