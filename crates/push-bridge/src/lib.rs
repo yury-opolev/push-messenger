@@ -10,8 +10,10 @@ pub mod commands;
 pub mod config;
 pub mod folders;
 pub mod mask;
+pub mod messenger;
 pub mod render;
 pub mod state;
+pub mod test_backend;
 
 #[cfg(test)]
 pub(crate) mod test_dir;
