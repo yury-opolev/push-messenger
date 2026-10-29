@@ -1,0 +1,33 @@
+[package]
+name = "push-agent-key"
+description = "Agent-key signers for push-sdk: a non-exportable Windows CNG key (TPM when there is one) and a software key for tests."
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+push-sdk.workspace = true
+# P-256 signing for SoftwareKey and SHA-256 for CngKey's signing input.
+ring.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
+
+[dev-dependencies]
+base64.workspace = true
+push-auth-core = { workspace = true, features = ["testing"] }
+serde_json.workspace = true
+uuid.workspace = true
+
+# Not `workspace = true`: the workspace forbids unsafe code, and NCrypt needs it.
+[lints.rust]
+# Only src/cng.rs uses unsafe (NCrypt FFI), each block with a SAFETY note.
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "warn"
