@@ -10,6 +10,7 @@ pub mod commands;
 pub mod config;
 pub mod core;
 pub mod folders;
+pub mod logging;
 pub mod mask;
 pub mod messenger;
 pub mod render;

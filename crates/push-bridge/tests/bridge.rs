@@ -2,7 +2,7 @@
 //! `coda serve`, and a test messenger.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use push_bridge::backend::{
@@ -556,4 +556,119 @@ async fn folder_and_approval_commands() {
             .all(|call| !matches!(call, Call::SendText { .. }))
     );
     assert_eq!(h.stop().await, Ok(()));
+}
+
+/// 8. A whole run with secrets in every input writes none of them to the log.
+#[tokio::test(start_paused = true)]
+async fn the_log_holds_no_input_text() {
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&buffer);
+    let subscriber = push_bridge::logging::subscriber(
+        move || LogSink(Arc::clone(&sink)),
+        tracing_subscriber::EnvFilter::new("trace"),
+    );
+    // Global: a thread-local default misses events whose callsites other tests' threads
+    // registered first. The other tests' events land here too, and must be clean as well.
+    tracing::subscriber::set_global_default(subscriber).unwrap();
+    const JWT: &str = "eyJhbGciOiJFUzI1NiJ9.eyJzdWIiOiJTRUNSRVQifQ.c2lnbmF0dXJlU0VDUkVU";
+
+    let (mut h, backend) = Harness::with_test_backend().await;
+    h.messenger.says(UserId::new(), "SECRET-STRANGER");
+    h.messenger
+        .owner_says(&format!("SECRET-PROMPT password=hunter2 {JWT}"));
+    backend.wait_for("prompt SECRET-PROMPT", 1).await;
+    backend.turn_started(TurnSource::Prompt);
+    backend.emit(BackendEvent::ThinkingDelta("SECRET-THINKING".into()));
+    backend.text("SECRET-TEXT");
+    backend.emit(BackendEvent::ToolStarted {
+        id: "SECRET-ID".into(),
+        tool: "SECRET-TOOL".into(),
+        target: "SECRET-TARGET".into(),
+        task: Some("SECRET-SUBTASK".into()),
+    });
+    backend.emit(BackendEvent::TaskStarted {
+        id: "SECRET-TASK-ID".into(),
+        description: "SECRET-TASK".into(),
+        background: true,
+    });
+    h.messenger.owner_says("SECRET-STEER");
+    backend.wait_for("steer SECRET-STEER", 1).await;
+
+    let approval = backend.request(RequestKind::Permission {
+        tool: "SECRET-TOOL".into(),
+        preview: "SECRET-PREVIEW".into(),
+    });
+    let (card, _) = h.card(1).await;
+    h.messenger.answer(card, &["approve"]);
+    assert_eq!(approval.await, Ok(Answer::Permission(true)));
+    let question = backend.request(RequestKind::Question {
+        question: "SECRET-QUESTION".into(),
+        options: vec!["SECRET-OPTION".into()],
+        multi_select: false,
+        allow_free_text: true,
+    });
+    h.card(2).await;
+    h.messenger.owner_says("SECRET-ANSWER");
+    assert_eq!(question.await, Ok(Answer::Question("SECRET-ANSWER".into())));
+    let plan = backend.request(RequestKind::Plan {
+        plan: "SECRET-PLAN".into(),
+    });
+    let (card, _) = h.card(3).await;
+    h.messenger.answer(card, &["reject"]);
+    assert_eq!(plan.await, Ok(Answer::Plan(false)));
+
+    backend.emit(BackendEvent::TaskCompleted {
+        id: "SECRET-TASK-ID".into(),
+        description: "SECRET-TASK".into(),
+        status: push_bridge::backend::TaskStatus::Completed,
+        background: true,
+        report: Some("SECRET-REPORT".into()),
+    });
+    backend.emit(BackendEvent::Error("SECRET-ERROR".into()));
+    backend.emit(BackendEvent::ToolFinished {
+        id: "SECRET-ID".into(),
+        failed: true,
+    });
+    backend.turn_ended(true);
+    h.activity(ActivityState::Idle).await;
+    backend.emit(BackendEvent::AgentMessage {
+        cursor: 1,
+        label: "SECRET-LABEL".into(),
+        text: "SECRET-AGENT-MESSAGE".into(),
+    });
+    h.reply_containing("SECRET-AGENT-MESSAGE").await;
+
+    backend.next_command(Err(error("session/setGoal", ErrorKind::Other)));
+    h.messenger.owner_says("/goal SECRET-GOAL");
+    h.reply_containing("session/setGoal").await;
+    h.messenger.owner_says("/btw SECRET-ASIDE");
+    backend.wait_for("command AskAside", 1).await;
+    h.messenger.owner_says("/cd SECRET-FOLDER");
+    h.reply_containing("Cannot switch to").await;
+    backend.emit(BackendEvent::Exited {
+        reason: "SECRET-EXIT".into(),
+    });
+    h.reply_containing("restarted").await;
+    assert_eq!(h.stop().await, Ok(()));
+
+    let log = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+    for event in ["turn_started", "turn_ended", "card_answered", "command"] {
+        assert!(log.contains(event), "{event} is logged: {log}");
+    }
+    for secret in ["SECRET", "hunter2", "eyJ"] {
+        assert!(!log.contains(secret), "{secret} is in the log: {log}");
+    }
+}
+
+struct LogSink(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogSink {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }

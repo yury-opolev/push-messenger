@@ -101,6 +101,8 @@ pub fn wire_permission_mode(mode: PermissionMode) -> &'static str {
 
 /// `<exe> serve <args…> --cwd <folder> --permission-mode <mode>`: arguments as a list,
 /// never through a shell; stdin and stdout piped, stderr discarded, killed when dropped.
+/// On Windows it gets no console window of its own (the logon task runs the bridge in
+/// the background).
 pub fn serve_command(config: &CodaConfig, folder: &Path, mode: PermissionMode) -> Command {
     let mut command = Command::new(&config.exe);
     command
@@ -116,6 +118,12 @@ pub fn serve_command(config: &CodaConfig, folder: &Path, mode: PermissionMode) -
         .kill_on_drop(true);
     for name in REMOVED_ENV {
         command.env_remove(name);
+    }
+    #[cfg(windows)]
+    {
+        /// `CREATE_NO_WINDOW`: the child gets no console window.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
     }
     command
 }
