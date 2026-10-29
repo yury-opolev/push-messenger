@@ -5,6 +5,7 @@
 pub mod backend;
 pub mod backoff;
 pub mod cards;
+pub mod coda;
 pub mod commands;
 pub mod config;
 pub mod folders;
