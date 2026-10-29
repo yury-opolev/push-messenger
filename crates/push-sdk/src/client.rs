@@ -19,6 +19,7 @@ use tokio::runtime::Runtime;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::SdkError;
+use crate::agent_key::{AgentClaims, AgentSigner};
 use crate::auth::{AuthApi, Platform, Tokens};
 use crate::connection::{Command, Connection, Endpoint, set_state};
 use crate::credentials::{Credentials, MIN_ACCESS_LIFETIME_S, is_refused, unix_now};
@@ -246,9 +247,27 @@ enum Proof {
         access_token: String,
         handle: Option<String>,
     },
+    /// An agent's key, through the app's signer: a new assertion for every request.
+    /// `enrollment_code` enrolls the agent (a new account) instead of signing it in.
+    AgentKey {
+        signer: Arc<dyn AgentSigner>,
+        audience: String,
+        enrollment_code: Option<String>,
+    },
 }
 
 impl Proof {
+    /// Whether this sign-in creates the account, so no earlier device can be its own.
+    fn enrolls(&self) -> bool {
+        matches!(
+            self,
+            Self::AgentKey {
+                enrollment_code: Some(_),
+                ..
+            }
+        )
+    }
+
     /// New tokens for `device`, a device this client registered before.
     async fn device(&self, auth: &AuthApi, device: DeviceId) -> Result<Tokens, SdkError> {
         match self {
@@ -259,6 +278,12 @@ impl Proof {
             } => {
                 auth.entra_device(access_token, handle.as_deref(), device)
                     .await
+            }
+            Self::AgentKey {
+                signer, audience, ..
+            } => {
+                let assertion = agent_assertion(signer, audience).await?;
+                auth.agent_key_device(&assertion, device).await
             }
         }
     }
@@ -271,8 +296,29 @@ impl Proof {
                 access_token,
                 handle,
             } => auth.entra(access_token, handle.as_deref()).await,
+            Self::AgentKey {
+                signer,
+                audience,
+                enrollment_code,
+            } => {
+                let assertion = agent_assertion(signer, audience).await?;
+                auth.agent_key(&assertion, enrollment_code.as_deref()).await
+            }
         }
     }
+}
+
+/// A new assertion for `audience`, signed by the app's signer on a blocking thread.
+async fn agent_assertion(
+    signer: &Arc<dyn AgentSigner>,
+    audience: &str,
+) -> Result<String, SdkError> {
+    let claims = AgentClaims::new(audience, unix_now());
+    let signer = Arc::clone(signer);
+    tokio::task::spawn_blocking(move || signer.sign(&claims))
+        .await
+        .map_err(|_| SdkError::Signer("the signer did not finish".to_owned()))?
+        .map_err(|error| SdkError::Signer(error.to_string()))
 }
 
 /// A push-messenger client.
@@ -286,6 +332,8 @@ struct Inner {
     shared: Arc<Shared>,
     credentials: Arc<Credentials>,
     auth: AuthApi,
+    /// `Config::auth_url` without a trailing `/`: the default agent-key audience.
+    auth_url: String,
     commands: mpsc::UnboundedSender<Command>,
     state: watch::Receiver<ConnectionState>,
     state_sender: Arc<watch::Sender<ConnectionState>>,
@@ -334,6 +382,7 @@ impl Client {
         let (state_sender, state) = watch::channel(ConnectionState::Offline);
         let state_sender = Arc::new(state_sender);
         let (commands, command_receiver) = mpsc::unbounded_channel();
+        let auth_url = config.auth_url.trim_end_matches('/').to_owned();
         let endpoint = Endpoint {
             socket_url: config.socket_url,
             host: config.host,
@@ -351,6 +400,7 @@ impl Client {
             shared,
             credentials,
             auth,
+            auth_url,
             commands,
             state,
             state_sender,
@@ -479,6 +529,51 @@ impl Client {
         self.sign_in_with(proof, device_name, platform).await
     }
 
+    /// Enrolls this agent with its owner's one-time enrollment code and registers this
+    /// device (docs/agent-key-sign-in.md). `signer` holds the agent's key; it signs a new
+    /// single-use assertion for every request, and the SDK never sees the private key.
+    /// `audience` is auth-svc's `PUSH_AUTH_AGENT_KEY_AUDIENCE`; `None` uses
+    /// `Config::auth_url` without a trailing `/`. The enrollment creates the agent's
+    /// account, so the device is always a new one. Then call [`Client::connect`].
+    pub async fn enroll_with_agent_key(
+        &self,
+        signer: Arc<dyn AgentSigner>,
+        audience: Option<&str>,
+        enrollment_code: &str,
+        device_name: &str,
+        platform: Platform,
+    ) -> Result<Account, SdkError> {
+        let proof = Proof::AgentKey {
+            signer,
+            audience: self.agent_audience(audience),
+            enrollment_code: Some(enrollment_code.to_owned()),
+        };
+        self.sign_in_with(proof, device_name, platform).await
+    }
+
+    /// Signs the enrolled agent in on this device: the device it registered before if
+    /// it is still active, or a new one, kept exactly as by [`Client::sign_in`]. After
+    /// the session's maximum age the SDK reports `SignedOut`: call this again (same
+    /// device). `signer` and `audience` as for [`Client::enroll_with_agent_key`].
+    pub async fn sign_in_with_agent_key(
+        &self,
+        signer: Arc<dyn AgentSigner>,
+        audience: Option<&str>,
+        device_name: &str,
+        platform: Platform,
+    ) -> Result<Account, SdkError> {
+        let proof = Proof::AgentKey {
+            signer,
+            audience: self.agent_audience(audience),
+            enrollment_code: None,
+        };
+        self.sign_in_with(proof, device_name, platform).await
+    }
+
+    fn agent_audience(&self, audience: Option<&str>) -> String {
+        audience.unwrap_or(&self.inner.auth_url).to_owned()
+    }
+
     async fn sign_in_with(
         &self,
         proof: Proof,
@@ -490,7 +585,12 @@ impl Client {
         self.run(async move {
             let credentials = &inner.credentials;
             let mut tokens = None;
-            if let Some(device) = credentials.last_device()? {
+            let last_device = if proof.enrolls() {
+                None
+            } else {
+                credentials.last_device()?
+            };
+            if let Some(device) = last_device {
                 match proof.device(&inner.auth, device).await {
                     Ok(found) => tokens = Some(found),
                     // Revoked meanwhile: register anew.
@@ -504,6 +604,10 @@ impl Client {
                 Some(tokens) => tokens,
                 None => {
                     let registration = proof.registration(&inner.auth).await?;
+                    if proof.enrolls() {
+                        // A new account: the device of an earlier one is not its own.
+                        credentials.forget_device()?;
+                    }
                     let register = |registration_id| {
                         inner.auth.register_device(
                             &registration,
@@ -1356,6 +1460,213 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(refused.code(), "entra_token_invalid");
+    }
+
+    /// Signs with no key: `h.<claims>.s`, which is all [`FakeAuth`] reads. Counts its calls.
+    struct TestSigner {
+        calls: std::sync::atomic::AtomicUsize,
+        refusal: Option<crate::SignerError>,
+    }
+
+    impl TestSigner {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                refusal: None,
+            })
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl crate::AgentSigner for TestSigner {
+        fn sign(&self, claims: &crate::AgentClaims) -> Result<String, crate::SignerError> {
+            use base64::Engine;
+
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(refusal) = &self.refusal {
+                return Err(refusal.clone());
+            }
+            let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims.to_json());
+            Ok(format!("h.{payload}.s"))
+        }
+    }
+
+    /// The claims of every assertion the fake auth-svc was sent.
+    fn agent_claims(auth: &FakeAuth) -> Vec<serde_json::Value> {
+        use base64::Engine;
+
+        auth.agent_key_bodies
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|body| {
+                let payload = body["token"].as_str().unwrap().split('.').nth(1).unwrap();
+                let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(payload)
+                    .unwrap();
+                serde_json::from_slice(&bytes).unwrap()
+            })
+            .collect()
+    }
+
+    fn distinct_jtis(claims: &[serde_json::Value]) -> usize {
+        let jtis: std::collections::HashSet<&str> = claims
+            .iter()
+            .map(|claims| claims["jti"].as_str().unwrap())
+            .collect();
+        jtis.len()
+    }
+
+    #[tokio::test]
+    async fn an_agent_key_enrollment_registers_and_a_later_sign_in_reuses_the_device() {
+        use serde_json::json;
+
+        let (auth, gateway) = (FakeAuth::start().await, FakeGateway::start().await);
+        let secrets = Arc::new(MemorySecretStore::new());
+        let database = format!("file:client-{}?mode=memory&cache=shared", Uuid::now_v7());
+        let (client, _events) = open(&auth, &gateway, &database, &secrets);
+        let signer = TestSigner::new();
+        let account = client
+            .enroll_with_agent_key(
+                signer.clone(),
+                None,
+                "CODE1234",
+                "build box",
+                Platform::Desktop,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            (account.user_id, account.device_id),
+            (auth.user, auth.device)
+        );
+        assert_eq!(auth.registrations.load(Ordering::SeqCst), 1);
+
+        // Signed out by the server (the session's maximum age): the same device again.
+        client.inner.credentials.sign_out().await.unwrap();
+        let again = client
+            .sign_in_with_agent_key(signer.clone(), None, "build box", Platform::Desktop)
+            .await
+            .unwrap();
+        assert_eq!(again, account);
+        assert_eq!(auth.registrations.load(Ordering::SeqCst), 1);
+
+        let bodies = auth.agent_key_bodies.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(
+            bodies[0],
+            json!({"token": bodies[0]["token"], "enrollment_code": "CODE1234"})
+        );
+        assert_eq!(
+            bodies[1],
+            json!({"token": bodies[1]["token"], "device_id": auth.device})
+        );
+        let claims = agent_claims(&auth);
+        assert_eq!(distinct_jtis(&claims), 2);
+        for claims in &claims {
+            assert_eq!(claims["aud"], auth.url.as_str());
+            let lifetime = claims["exp"].as_i64().unwrap() - claims["iat"].as_i64().unwrap();
+            assert_eq!(lifetime, crate::AGENT_ASSERTION_LIFETIME_S);
+        }
+        assert_eq!(signer.calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn every_agent_key_request_signs_a_new_assertion() {
+        use serde_json::json;
+
+        let (auth, gateway) = (FakeAuth::start().await, FakeGateway::start().await);
+        let secrets = Arc::new(MemorySecretStore::new());
+        let database = format!("file:client-{}?mode=memory&cache=shared", Uuid::now_v7());
+        let (client, _events) = open(&auth, &gateway, &database, &secrets);
+        let signer = TestSigner::new();
+        let audience = auth.url.clone();
+        client
+            .enroll_with_agent_key(
+                signer.clone(),
+                Some(&audience),
+                "CODE1234",
+                "build box",
+                Platform::Desktop,
+            )
+            .await
+            .unwrap();
+
+        // The device was revoked meanwhile: its sign-in fails, and a new one registers.
+        let replacement = DeviceId::new();
+        *auth.identity.lock().unwrap() = (auth.user, replacement);
+        client.inner.credentials.sign_out().await.unwrap();
+        let account = client
+            .sign_in_with_agent_key(
+                signer.clone(),
+                Some(&audience),
+                "build box",
+                Platform::Desktop,
+            )
+            .await
+            .unwrap();
+        assert_eq!(account.device_id, replacement);
+        assert_eq!(signer.calls(), 3);
+        let bodies = auth.agent_key_bodies.lock().unwrap().clone();
+        assert_eq!(
+            bodies[1],
+            json!({"token": bodies[1]["token"], "device_id": auth.device})
+        );
+        assert_eq!(bodies[2], json!({"token": bodies[2]["token"]}));
+        assert_eq!(distinct_jtis(&agent_claims(&auth)), 3);
+        assert_eq!(auth.registrations.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_failing_signer_stops_the_sign_in_with_its_code() {
+        let (auth, gateway) = (FakeAuth::start().await, FakeGateway::start().await);
+        let secrets = Arc::new(MemorySecretStore::new());
+        let database = format!("file:client-{}?mode=memory&cache=shared", Uuid::now_v7());
+        let (client, _events) = open(&auth, &gateway, &database, &secrets);
+        let signer = Arc::new(TestSigner {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            refusal: Some(crate::SignerError {
+                code: "NTE_BAD_KEYSET".to_owned(),
+                message: "the key does not exist".to_owned(),
+            }),
+        });
+        let refused = client
+            .sign_in_with_agent_key(signer.clone(), None, "build box", Platform::Desktop)
+            .await
+            .unwrap_err();
+        assert!(matches!(refused, SdkError::Signer(_)), "{refused:?}");
+        assert_eq!(refused.code(), "signer");
+        assert!(!refused.is_retryable());
+        assert!(refused.to_string().contains("NTE_BAD_KEYSET"));
+        assert_eq!(signer.calls(), 1);
+        assert!(auth.agent_key_bodies.lock().unwrap().is_empty());
+        assert_eq!(client.account().unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_spent_code_is_enrollment_invalid() {
+        use crate::testing::BAD_ENROLLMENT_CODE;
+
+        let (auth, gateway) = (FakeAuth::start().await, FakeGateway::start().await);
+        let secrets = Arc::new(MemorySecretStore::new());
+        let database = format!("file:client-{}?mode=memory&cache=shared", Uuid::now_v7());
+        let (client, _events) = open(&auth, &gateway, &database, &secrets);
+        let refused = client
+            .enroll_with_agent_key(
+                TestSigner::new(),
+                None,
+                BAD_ENROLLMENT_CODE,
+                "build box",
+                Platform::Desktop,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code(), "enrollment_invalid");
+        assert_eq!(auth.registrations.load(Ordering::SeqCst), 0);
+        assert_eq!(client.account().unwrap(), None);
     }
 
     #[tokio::test]

@@ -1,8 +1,9 @@
 //! push-sdk: the client core of push-messenger, which third-party apps embed (spec §8).
 //!
 //! It owns everything below the user interface: signing up and in through auth-svc
-//! (email and password, or a Microsoft Entra ID access token the app obtained), the
-//! device's credentials (in a [`SecretStore`] the app provides), the WebSocket
+//! (email and password, a Microsoft Entra ID access token the app obtained, or an
+//! agent's key through the app's [`AgentSigner`]), the device's credentials (in a
+//! [`SecretStore`] the app provides), the WebSocket
 //! connection to the gateway with its reconnects, a local SQLite store of conversations,
 //! messages and contacts (encrypted as a whole when the app gives a key), the outbox that
 //! sends messages, edits and deletes exactly once, and one stream of events for the UI.
@@ -11,6 +12,7 @@
 //! are therefore plain data: identifiers, strings, numbers and enums, with no lifetimes
 //! or generics.
 
+mod agent_key;
 mod auth;
 mod client;
 mod connection;
@@ -26,6 +28,10 @@ mod store;
 #[doc(hidden)]
 pub mod testing;
 
+pub use agent_key::{
+    AGENT_ASSERTION_LIFETIME_S, AgentClaims, AgentPublicKey, AgentSigner, SignerError,
+    assemble_assertion,
+};
 pub use auth::{Device, Platform, Profile};
 pub use client::{Account, Client, Config, EDIT_WINDOW, Events};
 pub use error::SdkError;

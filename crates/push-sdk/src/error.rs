@@ -77,6 +77,10 @@ pub enum SdkError {
     /// The app's secret store failed.
     #[error("secret store: {0}")]
     Secrets(String),
+    /// The app's agent-key signer failed: its code and message ([`crate::SignerError`]).
+    /// Nothing was sent.
+    #[error("signer: {0}")]
+    Signer(String),
     /// The client was closed.
     #[error("the client is closed")]
     Closed,
@@ -102,6 +106,7 @@ impl SdkError {
             Self::WrongKey => "wrong_key",
             Self::EncryptionUnavailable => "encryption_unavailable",
             Self::Secrets(_) => "secrets",
+            Self::Signer(_) => "signer",
             Self::Closed => "closed",
         }
     }
@@ -177,6 +182,13 @@ mod tests {
         assert_eq!(SdkError::WrongKey.code(), "wrong_key");
         assert!(!SdkError::WrongKey.is_retryable());
         assert!(!SdkError::NotSignedIn.is_retryable());
+        let signer = SdkError::Signer("NTE_BAD_KEYSET: the key does not exist".to_owned());
+        assert_eq!(signer.code(), "signer");
+        assert!(!signer.is_retryable());
+        assert_eq!(
+            signer.to_string(),
+            "signer: NTE_BAD_KEYSET: the key does not exist"
+        );
     }
 
     #[test]

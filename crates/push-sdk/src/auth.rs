@@ -312,6 +312,37 @@ impl AuthApi {
         tokens(answer)
     }
 
+    /// `POST /v1/auth/agent-key`: a registration token for the agent whose key signed
+    /// `assertion`; with `enrollment_code`, the owner's one-time code, it enrolls the
+    /// agent first. Never repeated: each assertion is single-use.
+    pub async fn agent_key(
+        &self,
+        assertion: &str,
+        enrollment_code: Option<&str>,
+    ) -> Result<String, SdkError> {
+        let body = match enrollment_code {
+            Some(code) => json!({ "token": assertion, "enrollment_code": code }),
+            None => json!({ "token": assertion }),
+        };
+        let answer = once(self.request(Method::POST, "/v1/auth/agent-key").json(&body)).await?;
+        answer["registration_token"]
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| unreadable("the sign-in answer"))
+    }
+
+    /// `POST /v1/auth/agent-key` with an active device: its new tokens and a new session.
+    /// Never repeated: each assertion is single-use.
+    pub async fn agent_key_device(
+        &self,
+        assertion: &str,
+        device: DeviceId,
+    ) -> Result<Tokens, SdkError> {
+        let body = json!({ "token": assertion, "device_id": device });
+        let answer = once(self.request(Method::POST, "/v1/auth/agent-key").json(&body)).await?;
+        tokens(answer)
+    }
+
     /// `POST /v1/devices`: registers a device, or finds the one an earlier attempt with
     /// the same `registration_id` registered.
     pub async fn register_device(

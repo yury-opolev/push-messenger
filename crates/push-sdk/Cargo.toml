@@ -20,6 +20,8 @@ required-features = ["testing"]
 # Argon2id for `DatabaseKey::derive`, as auth-svc hashes passwords.
 argon2 = { workspace = true, features = ["zeroize"] }
 axum = { workspace = true, optional = true }
+# base64url and SHA-256 for agent-key assertions and key thumbprints.
+base64.workspace = true
 futures-util.workspace = true
 push-domain.workspace = true
 push-proto.workspace = true
@@ -29,6 +31,7 @@ reqwest = { workspace = true, features = ["rustls-tls"] }
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
 # wss:// with rustls; ring is its provider through reqwest's rustls-tls.

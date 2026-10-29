@@ -122,6 +122,13 @@ pub(crate) fn is_audience(value: &str) -> bool {
     (1..=256).contains(&value.len()) && value.bytes().all(|b| b.is_ascii_graphic())
 }
 
+/// The server's assertion check, for other crates' tests: the key's thumbprint, or the
+/// refusal reason. It does not record the `jti` (no replay check).
+#[cfg(feature = "testing")]
+pub fn verify_assertion(token: &str, audience: &str, now: i64) -> Result<String, &'static str> {
+    jws::verify(token, audience, now).map(|assertion| assertion.thumbprint)
+}
+
 #[async_trait::async_trait]
 impl Authenticator for AgentKeySignIn {
     fn provider(&self) -> &str {
@@ -227,5 +234,26 @@ pub(crate) mod testing {
                 .unwrap();
             format!("{signed}.{}", URL_SAFE_NO_PAD.encode(signature.as_ref()))
         }
+    }
+}
+
+#[cfg(all(test, feature = "testing"))]
+mod tests {
+    use super::testing::TestKey;
+    use super::*;
+
+    #[test]
+    fn the_exported_check_names_the_key_or_the_reason() {
+        let key = TestKey::generate();
+        let token = key.assertion("https://push.test");
+        let now = crate::service::unix_now();
+        assert_eq!(
+            verify_assertion(&token, "https://push.test", now),
+            Ok(key.thumbprint())
+        );
+        assert_eq!(
+            verify_assertion(&token, "https://other.test", now),
+            Err("audience")
+        );
     }
 }
