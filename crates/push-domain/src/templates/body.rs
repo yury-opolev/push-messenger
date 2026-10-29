@@ -7,6 +7,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use super::markdown::check_markdown;
 use super::strict::{self, Object, StrictValue, at, join};
 use super::wording::check_value;
 use super::{
@@ -137,8 +138,9 @@ impl RichBody {
     }
 
     /// Checks the params against the definition's schema: every required param present,
-    /// none unknown, each value of its declared type and within its caps. A list bound to
-    /// `single` or `multi` must offer enough options to answer.
+    /// none unknown, each value of its declared type and within its caps. A string bound to
+    /// `markdown` must be allowed Markdown. A list bound to `single` or `multi` must offer
+    /// enough options to answer.
     pub fn check(&self, definition: &Definition) -> Result<(), TemplateError> {
         same_template(&self.template, definition)?;
         if let Some((name, _)) = self
@@ -157,6 +159,13 @@ impl RichBody {
                 Some(value) => check_param(value, &spec.ty, &path)?,
                 None if spec.optional => {}
                 None => return Err(at(&path, "is required")),
+            }
+        }
+        for block in definition.layout() {
+            if let Block::Markdown { param } = block {
+                if let Some(ParamValue::String(text)) = self.params.get(param) {
+                    check_markdown(text).map_err(|e| at(&join("params", param), e))?;
+                }
             }
         }
         let needed = match definition.interactive() {
@@ -662,6 +671,38 @@ mod tests {
         });
         let card = checked(&card, &approval).unwrap();
         assert_eq!(card.offered(&approval), ["approve", "reject"]);
+    }
+
+    #[test]
+    fn markdown_params_are_checked_as_markdown() {
+        let definition = custom(
+            json!({
+                "notes": {"type": "string", "max_len": 4000, "multiline": true, "optional": true},
+                "plain": {"type": "string", "max_len": 4000, "multiline": true}
+            }),
+            json!([{"type": "markdown", "param": "notes"}, {"type": "text", "param": "plain"}]),
+        );
+        let body = |notes: &str| custom_body(json!({"notes": notes, "plain": "<b>x</b>"}));
+        assert!(
+            checked(
+                &body("**Done**: see [docs](https://example.com)\n\n```\n<script>\n```"),
+                &definition
+            )
+            .is_ok()
+        );
+        assert!(checked(&custom_body(json!({"plain": "<b>x</b>"})), &definition).is_ok());
+        refused(
+            checked(&body("Hi <script>alert(1)</script>"), &definition),
+            "params.notes: contains raw HTML",
+        );
+        refused(
+            checked(&body("[x](javascript:alert(1))"), &definition),
+            "params.notes: links to \"javascript:...\"",
+        );
+        refused(
+            checked(&body(&"a".repeat(4001)), &definition),
+            "params.notes: is 4001 characters",
+        );
     }
 
     #[test]

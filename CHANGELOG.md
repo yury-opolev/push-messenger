@@ -6,6 +6,26 @@ Notable changes for consumers of push-messenger. Newest first.
 
 ### Added
 
+- **Safe Markdown in templates**: a tpl/1 `markdown` block (`{"type": "markdown", "param":
+  "<multiline string>"}`, no literal, no label) whose value the server checks against a
+  CommonMark subset: paragraphs, emphasis, strikethrough, code spans, fenced and indented
+  code, headings 1–6, lists nested up to 4 and quotes up to 3 levels, GFM tables up to 20
+  columns and 200 rows, thematic breaks, and links and autolinks to absolute http(s) URLs
+  only. Raw HTML, images, footnotes and any other link scheme (`javascript:`, `data:`,
+  `file:`, `mailto:`, …, also in link reference definitions) are refused with
+  `ERROR_CODE_INVALID` and the reason. The subset and how clients must render it (from a
+  Markdown AST into native elements, links with their URL shown and confirmed, no images
+  or remote content, code never run) are in
+  [docs/rich-messages.md](docs/rich-messages.md#markdown).
+- **`agent.reply@2`** built-in: `agent.reply@1` with `text` rendered as Markdown. It is
+  seeded at start like the other built-ins; `@1` stays. Clients that do not know it show
+  the fallback.
+- **Agent bridge**: `/yolo`, the same as `/mode bypass` (the same confirmation card,
+  reset and `/status` line). The `Backend` trait declares its `TextFormat` (plain by
+  default); Coda writes Markdown, so its turns and background messages are sent as
+  `agent.reply@2` with the Markdown kept and masked, a marker-free fallback, and pages
+  that never end inside a code block. The bridge's own messages stay `agent.reply@1`.
+
 - **Agent bridge with a Coda backend**: `push-agent-bridge` (new crate `push-bridge`)
   reaches a local AI coding agent from push-messenger as a private agent contact. Guide:
   [docs/agent-bridge.md](docs/agent-bridge.md) (setup on Windows, commands, security
@@ -192,6 +212,12 @@ Notable changes for consumers of push-messenger. Newest first.
 
 ### Changed
 
+- **Agent bridge**: a card ends the reply before it. When a request opens a card, the
+  turn's reply gets its final state (a step still running shows as `pending`) and is not
+  edited again; what the agent does after the owner's answer goes into a new reply below
+  the answer, where the waiting step finishes. Requests in a row post their cards one
+  after the other, and a turn that ends right after a card posts no empty reply. See
+  [docs/agent-bridge.md](docs/agent-bridge.md#6-behaviour).
 - `serve_with` refuses an `Overrides` authenticator with the built-in id `agent-key`, as
   for `entra-app`. An `Overrides` admission is also accepted with `agent-key` alone, and
   the start-up error without any sign-in by token now names all of them (`entra`,

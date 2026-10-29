@@ -51,6 +51,7 @@ fn block_line(definition: &Definition, block: &Block) -> String {
         | Block::Thinking { param, label }
         | Block::Steps { param, label }
         | Block::Status { param, label } => format!("{}: {}", labelled(label), source(param)),
+        Block::Markdown { param } => format!("markdown: {}", source(param)),
         Block::Buttons { options } => {
             let options: Vec<String> = options
                 .iter()
@@ -123,6 +124,27 @@ mod tests {
                 "  details: string, max_len 4000, multiline\n",
                 "  preview: string, max_len 4000, multiline, optional",
             )
+        );
+    }
+
+    #[test]
+    fn outlines_a_markdown_block() {
+        let reply = builtins()
+            .into_iter()
+            .find(|d| d.template_ref().to_string() == "agent.reply@2")
+            .unwrap();
+        let reply = outline(&reply);
+        assert!(
+            reply.ends_with(concat!(
+                "steps \"Steps\": {steps} (optional)\n",
+                "markdown: {text}\n",
+                "params:\n",
+                "  title: string, max_len 120, optional\n",
+                "  text: string, max_len 4000, multiline\n",
+                "  thinking: string, max_len 4000, multiline, optional\n",
+                "  steps: list of step, max_items 50, optional",
+            )),
+            "{reply}"
         );
     }
 

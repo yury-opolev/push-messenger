@@ -327,11 +327,11 @@ impl TestMessenger {
         shown
     }
 
-    /// The `text` of every `agent.reply@1` sent (not edits), in order.
+    /// The `text` of every `agent.reply@1` or `@2` sent (not edits), in order.
     pub fn reply_texts(&self) -> Vec<String> {
         self.sent_rich()
             .iter()
-            .filter(|(_, body)| template(body) == "agent.reply@1")
+            .filter(|(_, body)| template(body).starts_with("agent.reply@"))
             .filter_map(|(_, body)| param(body, "text"))
             .collect()
     }

@@ -121,7 +121,7 @@ impl Harness {
             .sent_rich()
             .into_iter()
             .map(|(id, body)| (id, template(&body)))
-            .filter(|(_, tpl)| tpl != "agent.reply@1")
+            .filter(|(_, tpl)| !tpl.starts_with("agent.reply@"))
             .collect()
     }
 
@@ -241,10 +241,19 @@ async fn a_turn_with_an_approval_end_to_end() {
         id: "c1".into(),
         failed: false,
     });
-    backend.text(" — fixed.");
+    backend.text("Fixed.");
     backend.turn_ended(false);
     h.activity(ActivityState::Idle).await;
-    assert_eq!(h.last_edit(), "Looking — fixed.");
+    assert_eq!(
+        h.last_edit(),
+        "Looking",
+        "the reply before the card ends there"
+    );
+    assert_eq!(
+        h.replies().last().map(String::as_str),
+        Some("Fixed."),
+        "what follows the answer is a new reply"
+    );
     assert_eq!(
         h.activity_states(),
         [
@@ -264,7 +273,7 @@ async fn a_turn_with_an_approval_end_to_end() {
     backend.text("The background build passed.");
     backend.turn_ended(false);
     h.messenger
-        .wait_until("the engine's reply", |_| h.messenger.sent_rich().len() == 3)
+        .wait_until("the engine's reply", |_| h.messenger.sent_rich().len() == 4)
         .await;
     h.activity(ActivityState::Idle).await;
     assert_eq!(h.last_edit(), "The background build passed.");
@@ -458,7 +467,8 @@ async fn an_exited_backend_restarts_with_backoff() {
         reason: "exit code 1".into(),
     });
     h.reply_containing("Declined: Test stopped.").await;
-    assert_eq!(h.last_edit(), "Working on it\n(Test stopped; restarting)");
+    assert_eq!(h.last_edit(), "Working on it");
+    h.reply_containing("(Test stopped; restarting)").await;
     drop(answer);
 
     h.reply_containing(

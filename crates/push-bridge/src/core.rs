@@ -24,7 +24,7 @@ use tokio::time::{Instant, MissedTickBehavior};
 
 use crate::backend::{
     Backend, BackendCommand, BackendError, BackendEvent, Capability, CommandReply, PermissionMode,
-    Responder,
+    Responder, TextFormat,
 };
 use crate::backoff::Backoff;
 use crate::cards::CardKind;
@@ -238,6 +238,8 @@ struct Core<M: Messenger> {
     messenger: Arc<M>,
     backend: Arc<dyn Backend>,
     name: String,
+    /// How the backend writes its turns and background messages.
+    format: TextFormat,
     state: Arc<StateFile>,
     options: BridgeOptions,
     internal: mpsc::UnboundedSender<Internal>,
@@ -291,10 +293,12 @@ impl<M: Messenger> Core<M> {
         conversation: ConversationId,
     ) -> Self {
         let name = backend.name().to_owned();
+        let format = backend.text_format();
         Self {
             messenger,
             backend,
             name,
+            format,
             state,
             folder: options.default_folder.clone(),
             mode: options.default_mode,
@@ -330,7 +334,7 @@ impl<M: Messenger> Core<M> {
         self.backend.capabilities().contains(&capability)
     }
 
-    /// Sends `text` as `agent.reply@1` replies (masked, paged).
+    /// Sends `text`, the bridge's own words, as `agent.reply@1` replies (masked, paged).
     fn reply(&self, text: &str) {
         for body in reply_bodies(None, text) {
             self.send_rich(&body);

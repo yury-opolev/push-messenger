@@ -1,13 +1,15 @@
-//! A turn's output as `agent.reply@1` RICH bodies: the text in pages of 4,000 characters,
+//! A turn's output as `agent.reply@1` RICH bodies (`agent.reply@2` when the text is
+//! Markdown): the text in pages of 4,000 characters,
 //! the latest thinking, and the tool calls as steps. Pure: the caller sends what `poll` and
 //! `finish` return and passes the time in.
 
 use std::time::Duration;
 
-use push_domain::templates::{MAX_RICH_BYTES, check_value};
+use push_domain::templates::{MAX_RICH_BYTES, check_markdown, check_value};
 use serde_json::{Map, Value, json};
 use tokio::time::Instant;
 
+use crate::backend::TextFormat;
 use crate::mask::{cap, mask, masked, masked_line};
 
 /// Edits of a reply are at least this far apart.
@@ -41,7 +43,7 @@ const EMPTY: &str = "…";
 pub struct ReplyUpdate {
     /// The reply's 0-based index in this turn.
     pub page: usize,
-    /// The `agent.reply@1` RICH body.
+    /// The `agent.reply@1` or `agent.reply@2` RICH body.
     pub body: String,
     /// Send a new reply; else edit the reply of this page.
     pub new: bool,
@@ -60,6 +62,8 @@ impl std::fmt::Debug for ReplyUpdate {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Status {
+    /// Running when its reply was sealed: it goes on in the next reply.
+    Pending,
     Running,
     Done,
     Failed,
@@ -68,6 +72,7 @@ enum Status {
 impl Status {
     fn as_str(self) -> &'static str {
         match self {
+            Self::Pending => "pending",
             Self::Running => "running",
             Self::Done => "done",
             Self::Failed => "failed",
@@ -75,6 +80,7 @@ impl Status {
     }
 }
 
+#[derive(Clone)]
 struct Step {
     /// The tool call's id; `None` for a task's step.
     id: Option<String>,
@@ -95,9 +101,11 @@ struct Page {
     sent: Option<String>,
 }
 
-/// Renders one turn into `agent.reply@1` replies.
+/// Renders one turn into `agent.reply@1` replies, or `agent.reply@2` for Markdown.
 pub struct TurnRenderer {
     title: Option<String>,
+    /// The text is Markdown: pages keep their code fences balanced.
+    markdown: bool,
     text: String,
     /// The next text starts on a new line (after a note).
     break_before_text: bool,
@@ -105,6 +113,16 @@ pub struct TurnRenderer {
     pages: Vec<Page>,
     /// Characters of the raw (cleaned, unmasked) text in final pages.
     final_raw: usize,
+    /// The code fence open where the final pages end (Markdown only).
+    final_fence: Option<Fence>,
+    /// The final pages end at the start of a line.
+    final_at_line_start: bool,
+    /// Bytes of `text` before the current segment (the replies since the last card).
+    segment_start: usize,
+    /// The page that shows the thinking: the first of the current segment.
+    thinking_page: usize,
+    /// Sealed for a card, and no output since: the open page is not sent.
+    held: bool,
     last_update: Instant,
     finished: bool,
 }
@@ -116,17 +134,33 @@ impl TurnRenderer {
             .filter(|title| !title.trim().is_empty());
         Self {
             title,
+            markdown: false,
             text: String::new(),
             break_before_text: false,
             thinking: String::new(),
             pages: vec![Page::default()],
             final_raw: 0,
+            final_fence: None,
+            final_at_line_start: true,
+            segment_start: 0,
+            thinking_page: 0,
+            held: false,
             last_update: now,
             finished: false,
         }
     }
 
+    /// Renders the text as `format`: Markdown goes out as `agent.reply@2`.
+    pub fn with_format(mut self, format: TextFormat) -> Self {
+        self.markdown = format == TextFormat::Markdown;
+        self
+    }
+
     pub fn thinking(&mut self, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+        self.held = false;
         self.thinking.push_str(delta);
         // Keeps twice the tail, so masking sees whole secrets around the cut.
         let keep = 2 * THINKING_TAIL;
@@ -145,6 +179,7 @@ impl TurnRenderer {
         if delta.is_empty() {
             return;
         }
+        self.held = false;
         if self.break_before_text {
             self.break_before_text = false;
             self.new_line();
@@ -186,6 +221,7 @@ impl TurnRenderer {
         if let Some(step) = step {
             step.status = if failed { Status::Failed } else { Status::Done };
             step.detail = Some(duration(now.saturating_duration_since(step.started)));
+            self.held = false;
         }
     }
 
@@ -204,6 +240,7 @@ impl TurnRenderer {
 
     /// Appends `text` to the reply's text on its own line, e.g. "(Coda stopped; restarting)".
     pub fn note(&mut self, text: &str) {
+        self.held = false;
         self.new_line();
         self.text.push_str(text);
         self.break_before_text = true;
@@ -219,6 +256,9 @@ impl TurnRenderer {
         }
         let mut updates = Vec::new();
         let open = self.split(&mut updates);
+        if self.held {
+            return updates;
+        }
         let page = self.pages.len() - 1;
         let body = self.render(page, &open);
         let sent = &mut self.pages[page].sent;
@@ -239,6 +279,11 @@ impl TurnRenderer {
             return Vec::new();
         }
         self.finished = true;
+        if self.held {
+            // Nothing came after the card: its reply stays as sealed, and no empty one
+            // follows.
+            return Vec::new();
+        }
         if interrupted {
             self.new_line();
             self.text.push_str("(stopped)");
@@ -263,6 +308,58 @@ impl TurnRenderer {
         updates
     }
 
+    /// A card is about to be posted: the open reply gets its final state now (a step still
+    /// running shows as pending) and is not edited again. The next output (thinking, a
+    /// step, text, a note) starts a new reply below the card, where the running steps go on;
+    /// with none, nothing more is sent. Sealing again before any output does nothing.
+    pub fn seal(&mut self) -> Vec<ReplyUpdate> {
+        if self.finished || self.held {
+            return Vec::new();
+        }
+        let mut updates = Vec::new();
+        self.split(&mut updates);
+        let mut rest = self.open_raw();
+        // The fence it may have to close can take the page past its size.
+        while self.framed(&rest).chars().count() > TEXT_PAGE {
+            self.cut(&rest, &mut updates);
+            rest = self.open_raw();
+        }
+        let text = self.framed(&rest);
+        let page = self.pages.len() - 1;
+        let running: Vec<Step> = self.pages[page]
+            .steps
+            .iter()
+            .filter(|step| step.status == Status::Running)
+            .cloned()
+            .collect();
+        for step in &mut self.pages[page].steps {
+            if step.status == Status::Running {
+                step.status = Status::Pending;
+            }
+        }
+        self.pages[page].text = Some(text.clone());
+        let body = self.render(page, &text);
+        let sent = &mut self.pages[page].sent;
+        if sent.as_deref() != Some(body.as_str()) {
+            let new = sent.is_none();
+            *sent = Some(body.clone());
+            updates.push(ReplyUpdate { page, body, new });
+        }
+        self.advance(&rest);
+        // The next segment starts a new reply, on a line of its own.
+        self.final_at_line_start = true;
+        self.segment_start = self.text.len();
+        self.break_before_text = false;
+        self.thinking.clear();
+        self.pages.push(Page {
+            steps: running,
+            ..Page::default()
+        });
+        self.thinking_page = self.pages.len() - 1;
+        self.held = true;
+        updates
+    }
+
     /// The activity label: the latest running tool as `<tool> <target>`, else "thinking".
     pub fn current_label(&self) -> String {
         self.pages
@@ -276,12 +373,13 @@ impl TurnRenderer {
     }
 
     fn new_line(&mut self) {
-        if !self.text.is_empty() && !self.text.ends_with('\n') {
+        if self.text.len() > self.segment_start && !self.text.ends_with('\n') {
             self.text.push('\n');
         }
     }
 
     fn push_step(&mut self, step: Step) {
+        self.held = false;
         let steps = &mut self.pages.last_mut().expect("a renderer has a page").steps;
         steps.push(step);
         if steps.len() > MAX_STEPS {
@@ -298,40 +396,96 @@ impl TurnRenderer {
     /// text and each is masked on its own: a final page is `mask(its raw text)`, the open
     /// page `mask(the raw text after the final pages)`, so text that arrives later never
     /// changes, loses or repeats a final page's text (see [`raw_page_break`]).
+    ///
+    /// In Markdown, a page that ends inside a code fence closes it, and the next page opens
+    /// it again (the closing and opening lines count towards the page's characters).
     fn split(&mut self, updates: &mut Vec<ReplyUpdate>) -> String {
-        let all: Vec<char> = clean(&self.text, true).chars().collect();
         loop {
-            let rest = all.get(self.final_raw..).unwrap_or_default();
-            let open = mask(&string(rest));
+            let rest = self.open_raw();
+            let open = self.prefix() + &mask(&string(&rest));
             if open.chars().count() <= TEXT_PAGE {
                 return open;
             }
-            let at = raw_page_break(rest);
-            let page = self.pages.len() - 1;
-            let text = mask(&string(&rest[..at]));
-            let (running, done) = std::mem::take(&mut self.pages[page].steps)
-                .into_iter()
-                .partition(|step| step.status == Status::Running);
-            self.pages[page].steps = done;
-            self.pages[page].text = Some(text.clone());
-            let body = self.render(page, &text);
-            let sent = &mut self.pages[page].sent;
-            if sent.as_deref() != Some(body.as_str()) {
-                let new = sent.is_none();
-                *sent = Some(body.clone());
-                updates.push(ReplyUpdate { page, body, new });
-            }
-            self.pages.push(Page {
-                steps: running,
-                ..Page::default()
-            });
-            self.final_raw += at;
+            self.cut(&rest, updates);
         }
+    }
+
+    /// Makes a full page of `rest` (the raw text after the final pages) final; its running
+    /// steps move on to the next page.
+    fn cut(&mut self, rest: &[char], updates: &mut Vec<ReplyUpdate>) {
+        let at = raw_page_break(rest, &|at| self.framed(&rest[..at]).chars().count());
+        let page = self.pages.len() - 1;
+        let text = self.framed(&rest[..at]);
+        let (running, done) = std::mem::take(&mut self.pages[page].steps)
+            .into_iter()
+            .partition(|step| step.status == Status::Running);
+        self.pages[page].steps = done;
+        self.pages[page].text = Some(text.clone());
+        let body = self.render(page, &text);
+        let sent = &mut self.pages[page].sent;
+        if sent.as_deref() != Some(body.as_str()) {
+            let new = sent.is_none();
+            *sent = Some(body.clone());
+            updates.push(ReplyUpdate { page, body, new });
+        }
+        self.pages.push(Page {
+            steps: running,
+            ..Page::default()
+        });
+        self.advance(&rest[..at]);
+    }
+
+    /// The raw (cleaned, unmasked) text after the final pages.
+    fn open_raw(&self) -> Vec<char> {
+        clean(&self.text, true)
+            .chars()
+            .skip(self.final_raw)
+            .collect()
+    }
+
+    /// `page`, the raw text that follows the final pages, becomes final.
+    fn advance(&mut self, page: &[char]) {
+        if self.markdown {
+            self.final_fence = fence_after(
+                self.final_fence.take(),
+                &string(page),
+                self.final_at_line_start,
+            );
+        }
+        if let Some(last) = page.last() {
+            self.final_at_line_start = *last == '\n';
+        }
+        self.final_raw += page.len();
+    }
+
+    /// The line that opens the fence the open page starts in, if any.
+    fn prefix(&self) -> String {
+        match &self.final_fence {
+            Some(fence) => format!("{}\n", fence.opening()),
+            None => String::new(),
+        }
+    }
+
+    /// `page` (raw text that follows the final pages) masked as a final page: in Markdown,
+    /// inside the fences it starts or ends in.
+    fn framed(&self, page: &[char]) -> String {
+        let mut text = self.prefix() + &mask(&string(page));
+        if self.markdown {
+            let raw = string(page);
+            let fence = fence_after(self.final_fence.clone(), &raw, self.final_at_line_start);
+            if let Some(fence) = fence {
+                if !text.ends_with('\n') {
+                    text.push('\n');
+                }
+                text.push_str(&fence.closing());
+            }
+        }
+        text
     }
 
     fn render(&self, page: usize, open: &str) -> String {
         let text = self.pages[page].text.as_deref().unwrap_or(open);
-        let thinking = if page == 0 {
+        let thinking = if page == self.thinking_page {
             let all: Vec<char> = mask(&clean(&self.thinking, true)).chars().collect();
             let tail: String = all[all.len().saturating_sub(THINKING_TAIL)..]
                 .iter()
@@ -351,8 +505,96 @@ impl TurnRenderer {
                 item
             })
             .collect();
-        reply_body(self.title.as_deref(), text, thinking.as_deref(), &steps)
+        reply_body_in(
+            self.title.as_deref(),
+            text,
+            thinking.as_deref(),
+            &steps,
+            self.markdown,
+        )
     }
+}
+
+/// A fenced code block's opening, enough to close it at a page break and open it again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Fence {
+    indent: usize,
+    marker: char,
+    len: usize,
+    /// The info string's first word, a hint only.
+    info: String,
+}
+
+/// Fences longer or more indented than this are left alone at page breaks.
+const MAX_FENCE: usize = 12;
+/// Characters of an info string kept when a fence opens again.
+const FENCE_INFO: usize = 20;
+
+impl Fence {
+    fn opening(&self) -> String {
+        format!("{}{}", self.closing(), self.info)
+    }
+
+    fn closing(&self) -> String {
+        format!(
+            "{}{}",
+            " ".repeat(self.indent),
+            self.marker.to_string().repeat(self.len)
+        )
+    }
+}
+
+/// The code fence still open after `text`, which follows text ending inside `open` (or in
+/// none). Best effort, after CommonMark: a line of three or more backticks or tildes opens
+/// a fence (a backtick fence's info has no backtick), and a line of at least as many of
+/// the same character and nothing else closes it. Fences inside block quotes are not
+/// seen. With `at_line_start` false, `text` begins in the middle of a line, which is
+/// skipped.
+fn fence_after(mut open: Option<Fence>, text: &str, at_line_start: bool) -> Option<Fence> {
+    let mut lines = text.split('\n');
+    if !at_line_start {
+        lines.next();
+    }
+    for line in lines {
+        let trimmed = line.trim_start_matches(' ');
+        let indent = line.len() - trimmed.len();
+        let marker = match trimmed.chars().next() {
+            Some(c @ ('`' | '~')) => c,
+            _ => continue,
+        };
+        let len = trimmed.chars().take_while(|&c| c == marker).count();
+        if len < 3 {
+            continue;
+        }
+        let rest = &trimmed[len..];
+        match &open {
+            Some(fence) => {
+                if marker == fence.marker && len >= fence.len && rest.trim().is_empty() {
+                    open = None;
+                }
+            }
+            None => {
+                let backtick_info = marker == '`' && rest.contains('`');
+                if backtick_info || len > MAX_FENCE || indent > MAX_FENCE {
+                    continue;
+                }
+                let info = rest
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or_default()
+                    .chars()
+                    .take(FENCE_INFO)
+                    .collect();
+                open = Some(Fence {
+                    indent,
+                    marker,
+                    len,
+                    info,
+                });
+            }
+        }
+    }
+    open
 }
 
 /// Where a final page of the raw (cleaned, unmasked) open text `rest` ends; `rest`
@@ -375,7 +617,10 @@ impl TurnRenderer {
 /// earlier until the masked page fits: each part is masked on its own, so a hex or base64
 /// secret that long is still masked in both, unless the second part is shorter than the
 /// 40 characters that mark one.
-fn raw_page_break(rest: &[char]) -> usize {
+///
+/// `len(at)` is how many characters the page cut at `at` shows: masked, and in Markdown
+/// with the fence lines around it.
+fn raw_page_break(rest: &[char], len: &dyn Fn(usize) -> usize) -> usize {
     let size = TEXT_PAGE.min(rest.len());
     let window = size - BREAK_WINDOW.min(size);
     let newlines = (window + 1..=size).rev().filter(|&at| rest[at - 1] == '\n');
@@ -387,7 +632,7 @@ fn raw_page_break(rest: &[char]) -> usize {
         .filter(|&at| rest[at - 1].is_whitespace());
     let mut fallback = None;
     for at in newlines.chain(spaces).chain(earlier).take(MAX_BREAK_TRIES) {
-        if mask(&string(&rest[..at])).chars().count() > TEXT_PAGE {
+        if len(at) > TEXT_PAGE {
             continue;
         }
         if clean_cut(rest, at) {
@@ -400,7 +645,7 @@ fn raw_page_break(rest: &[char]) -> usize {
     }
     let mut at = size;
     loop {
-        let len = mask(&string(&rest[..at])).chars().count();
+        let len = len(at);
         if len <= TEXT_PAGE || at == 1 {
             return at;
         }
@@ -430,6 +675,22 @@ fn string(chars: &[char]) -> String {
 /// `agent.reply@1` bodies for `text` (masked, then split into pages of [`TEXT_PAGE`]
 /// characters), each titled `title`. Always at least one.
 pub fn reply_bodies(title: Option<&str>, text: &str) -> Vec<String> {
+    formatted_bodies(title, text, TextFormat::Plain)
+}
+
+/// [`reply_bodies`] for text in `format`: Markdown pages as a turn's do (`agent.reply@2`,
+/// fences closed and opened again across pages).
+pub fn formatted_bodies(title: Option<&str>, text: &str, format: TextFormat) -> Vec<String> {
+    if format == TextFormat::Markdown {
+        let mut renderer =
+            TurnRenderer::new(Instant::now(), title.map(str::to_owned)).with_format(format);
+        renderer.text(text);
+        return renderer
+            .finish(false)
+            .into_iter()
+            .map(|update| update.body)
+            .collect();
+    }
     let title = title
         .map(|title| shown_line(title, TITLE))
         .filter(|title| !title.trim().is_empty());
@@ -475,9 +736,28 @@ pub(crate) fn reply_body(
     thinking: Option<&str>,
     steps: &[Value],
 ) -> String {
+    reply_body_in(title, text, thinking, steps, false)
+}
+
+/// [`reply_body`], or with `markdown` an `agent.reply@2` body whose fallback is the text
+/// without its Markdown markers. Markdown the server would refuse (raw HTML, an image, a
+/// link that is not http(s), …) goes out as `agent.reply@1`, shown as typed.
+fn reply_body_in(
+    title: Option<&str>,
+    text: &str,
+    thinking: Option<&str>,
+    steps: &[Value],
+    markdown: bool,
+) -> String {
     let text = if text.trim().is_empty() { EMPTY } else { text };
+    let markdown = markdown && check_markdown(text).is_ok();
+    let (tpl, plain) = if markdown {
+        ("agent.reply@2", without_markers(text))
+    } else {
+        ("agent.reply@1", text.to_owned())
+    };
     let mut thinking = thinking;
-    let mut fallback = cap(text, FALLBACK);
+    let mut fallback = cap(&plain, FALLBACK);
     let mut steps = steps;
     loop {
         let mut params = Map::new();
@@ -491,20 +771,39 @@ pub(crate) fn reply_body(
         if !steps.is_empty() {
             params.insert("steps".into(), json!(steps));
         }
-        let body = rich_body("agent.reply@1", params, &fallback);
+        let body = rich_body(tpl, params, &fallback);
         if body.len() <= MAX_RICH_BYTES {
             return body;
         }
         if thinking.is_some() {
             thinking = None;
         } else if fallback.chars().count() > 200 {
-            fallback = cap(text, 200);
+            fallback = cap(&plain, 200);
         } else if !steps.is_empty() {
             steps = &steps[steps.len().div_ceil(2)..];
         } else {
             return body;
         }
     }
+}
+
+/// Markdown as plain text, best effort: without fence lines and without `**`, `__`, `~~`
+/// and backticks.
+fn without_markers(text: &str) -> String {
+    let mut lines = Vec::new();
+    for line in text.split('\n') {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            continue;
+        }
+        lines.push(
+            line.replace("**", "")
+                .replace("__", "")
+                .replace("~~", "")
+                .replace('`', ""),
+        );
+    }
+    lines.join("\n")
 }
 
 /// `{"tpl": …, "params": …, "fallback": …}`.
@@ -1027,5 +1326,203 @@ pub(crate) mod tests {
         assert_eq!(duration(secs(59.99)), "59.9 s");
         assert_eq!(duration(secs(120.0)), "2 min");
         assert_eq!(duration(secs(3_725.0)), "1 h 2 min");
+    }
+
+    #[test]
+    fn a_seal_ends_the_reply_and_the_next_output_starts_another() {
+        let t0 = Instant::now();
+        let mut renderer = TurnRenderer::new(t0, None);
+        renderer.poll(t0);
+        renderer.thinking("Plan A");
+        renderer.text("Checking.");
+        renderer.tool_started("1", "Bash", "date", None, t0);
+        let sealed = renderer.seal();
+        assert_eq!(sealed.len(), 1);
+        assert_eq!((sealed[0].page, sealed[0].new), (0, false));
+        let first = reply(&sealed[0]);
+        assert_eq!(param(&first, "text").as_deref(), Some("Checking."));
+        assert_eq!(param(&first, "thinking").as_deref(), Some("Plan A"));
+        assert_eq!(steps(&first)[0].1, "pending");
+        assert!(renderer.seal().is_empty(), "a second card adds nothing");
+        assert!(renderer.poll(t0 + secs(5.0)).is_empty());
+
+        renderer.thinking("Plan B");
+        renderer.tool_finished("1", false, t0 + secs(3.0));
+        renderer.text("Done.");
+        let updates = renderer.poll(t0 + secs(5.0));
+        assert_eq!(updates.len(), 1);
+        assert_eq!((updates[0].page, updates[0].new), (1, true));
+        let second = reply(&updates[0]);
+        assert_eq!(param(&second, "text").as_deref(), Some("Done."));
+        assert_eq!(param(&second, "thinking").as_deref(), Some("Plan B"));
+        assert_eq!(
+            steps(&second),
+            [(
+                "Bash date".to_owned(),
+                "done".to_owned(),
+                Some("3.0 s".to_owned())
+            )]
+        );
+        assert!(renderer.finish(false).is_empty());
+    }
+
+    #[test]
+    fn a_turn_that_ends_sealed_sends_nothing_more() {
+        let t0 = Instant::now();
+        let mut renderer = TurnRenderer::new(t0, None);
+        renderer.poll(t0);
+        renderer.text("Asking.");
+        renderer.seal();
+        assert!(renderer.finish(true).is_empty());
+    }
+
+    fn markdown_reply(text: &str) -> RichBody {
+        let t0 = Instant::now();
+        let mut renderer = TurnRenderer::new(t0, None).with_format(TextFormat::Markdown);
+        renderer.text(text);
+        let updates = renderer.finish(false);
+        assert_eq!(updates.len(), 1);
+        let body = &updates[0].body;
+        valid(body, &crate::messenger::template(body))
+    }
+
+    #[test]
+    fn markdown_goes_out_as_reply_v2_with_its_markers_kept() {
+        let text = "Right now it's **1:32 PM**.\n\n```sh\ndate\n```\nSee `man date`.";
+        let body = markdown_reply(text);
+        assert_eq!(body.template.to_string(), "agent.reply@2");
+        assert_eq!(param(&body, "text").as_deref(), Some(text));
+        assert_eq!(
+            body.fallback,
+            "Right now it's 1:32 PM.\n\ndate\nSee man date."
+        );
+    }
+
+    #[test]
+    fn plain_text_stays_reply_v1_as_typed() {
+        let t0 = Instant::now();
+        let mut renderer = TurnRenderer::new(t0, None);
+        renderer.text("2 * 3 * 4 is **24**");
+        let body = reply(&renderer.finish(false)[0]);
+        assert_eq!(param(&body, "text").as_deref(), Some("2 * 3 * 4 is **24**"));
+        assert_eq!(body.fallback, "2 * 3 * 4 is **24**");
+    }
+
+    #[test]
+    fn markdown_the_server_would_refuse_goes_out_as_reply_v1() {
+        for text in [
+            "Hi <b>there</b>",
+            "![logo](https://example.com/x.png)",
+            "[x](javascript:alert(1))",
+        ] {
+            let body = markdown_reply(text);
+            assert_eq!(body.template.to_string(), "agent.reply@1", "{text}");
+            assert_eq!(param(&body, "text").as_deref(), Some(text));
+        }
+    }
+
+    #[test]
+    fn masking_reaches_inside_code_spans_and_fences() {
+        let body = markdown_reply(
+            "Run `authorization: bearer s3cr3t1` or:\n\n```sh\ncurl -H 'authorization: bearer t0k3n'\n```",
+        );
+        assert_eq!(body.template.to_string(), "agent.reply@2");
+        let text = param(&body, "text").unwrap();
+        assert!(
+            !text.contains("s3cr3t1") && !text.contains("t0k3n"),
+            "{text}"
+        );
+        assert_eq!(text.matches("«masked»").count(), 2, "{text}");
+        assert!(!body.fallback.contains("t0k3n"));
+    }
+
+    #[test]
+    fn a_long_fenced_block_pages_with_its_fences_balanced() {
+        let code = "let answer = compute(41) + 1;\n".repeat(400);
+        let text = format!("Here:\n\n```rust\n{code}```\nThat is all.");
+        let bodies = formatted_bodies(None, &text, TextFormat::Markdown);
+        assert!(bodies.len() >= 3, "{} pages", bodies.len());
+        let mut joined = String::new();
+        for (i, body) in bodies.iter().enumerate() {
+            let parsed = valid(body, "agent.reply@2");
+            let page = param(&parsed, "text").unwrap();
+            assert!(page.chars().count() <= TEXT_PAGE);
+            assert_eq!(fence_after(None, &page, true), None, "page {i} is balanced");
+            let mut inner = page.as_str();
+            if i > 0 {
+                inner = inner
+                    .strip_prefix("```rust\n")
+                    .expect("opens the fence again");
+            }
+            if i + 1 < bodies.len() {
+                inner = inner.strip_suffix("```").expect("closes the fence");
+            }
+            joined.push_str(inner);
+        }
+        assert_eq!(joined, text, "nothing is lost or repeated");
+    }
+
+    #[test]
+    fn a_seal_inside_a_fence_closes_it_and_the_next_reply_opens_it_again() {
+        let t0 = Instant::now();
+        let mut renderer = TurnRenderer::new(t0, None).with_format(TextFormat::Markdown);
+        renderer.text("```py\nprint(1)\n");
+        let sealed = renderer.seal();
+        let first = valid(&sealed[0].body, "agent.reply@2");
+        assert_eq!(
+            param(&first, "text").as_deref(),
+            Some("```py\nprint(1)\n```")
+        );
+        renderer.text("print(2)\n```\nDone.");
+        let next = renderer.finish(false);
+        let second = valid(&next[0].body, "agent.reply@2");
+        assert_eq!(
+            param(&second, "text").as_deref(),
+            Some("```py\nprint(2)\n```\nDone.")
+        );
+    }
+
+    #[test]
+    fn a_seal_of_a_full_page_inside_a_fence_still_fits() {
+        let t0 = Instant::now();
+        let mut renderer = TurnRenderer::new(t0, None).with_format(TextFormat::Markdown);
+        renderer.poll(t0);
+        renderer.text(&format!("```sh\n{}ab", "echo 12345678\n".repeat(285)));
+        let open = renderer.poll(t0 + secs(3.0));
+        assert_eq!(open.len(), 1, "the open page fits");
+        assert_eq!(open[0].page, 0);
+        let updates = renderer.seal();
+        assert!(!updates.is_empty());
+        for update in &updates {
+            let page = param(&valid(&update.body, "agent.reply@2"), "text").unwrap();
+            assert!(
+                page.chars().count() <= TEXT_PAGE,
+                "{}",
+                page.chars().count()
+            );
+            assert_eq!(fence_after(None, &page, true), None);
+        }
+    }
+
+    #[test]
+    fn a_fence_that_opens_the_reply_after_a_card_is_seen() {
+        let t0 = Instant::now();
+        let mut renderer = TurnRenderer::new(t0, None).with_format(TextFormat::Markdown);
+        renderer.poll(t0);
+        renderer.text("Running it:");
+        renderer.seal();
+        renderer.text(&format!("```sh\n{}```\nok", "echo 12345678\n".repeat(400)));
+        let updates = renderer.finish(false);
+        assert!(updates.len() >= 2);
+        for (i, update) in updates.iter().enumerate() {
+            let page = param(&valid(&update.body, "agent.reply@2"), "text").unwrap();
+            assert_eq!(fence_after(None, &page, true), None, "page {i}");
+            if i > 0 {
+                assert!(
+                    page.starts_with("```sh\n"),
+                    "page {i} opens the fence again"
+                );
+            }
+        }
     }
 }

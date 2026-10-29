@@ -15,7 +15,7 @@ use crate::backoff::RESET_AFTER;
 use crate::folders;
 use crate::mask::masked_line;
 use crate::messenger::Messenger;
-use crate::render::{ReplyUpdate, TurnRenderer, reply_bodies};
+use crate::render::{ReplyUpdate, TurnRenderer, formatted_bodies};
 
 /// Characters of a background task's report shown in its reply.
 const REPORT_LINE: usize = 200;
@@ -70,8 +70,9 @@ impl<M: Messenger> Core<M> {
 
     /// The running turn; output outside a turn starts one.
     fn turn(&mut self) -> &mut Turn {
+        let format = self.format;
         self.turn.get_or_insert_with(|| Turn {
-            renderer: TurnRenderer::new(Instant::now(), None),
+            renderer: TurnRenderer::new(Instant::now(), None).with_format(format),
             pages: Vec::new(),
         })
     }
@@ -91,6 +92,15 @@ impl<M: Messenger> Core<M> {
     pub(super) fn poll_turn(&mut self) {
         if let Some(mut turn) = self.turn.take() {
             let updates = turn.renderer.poll(Instant::now());
+            self.apply(&mut turn.pages, updates);
+            self.turn = Some(turn);
+        }
+    }
+
+    /// Ends the running turn's open reply before a card (see [`TurnRenderer::seal`]).
+    pub(super) fn seal_turn(&mut self) {
+        if let Some(mut turn) = self.turn.take() {
+            let updates = turn.renderer.seal();
             self.apply(&mut turn.pages, updates);
             self.turn = Some(turn);
         }
@@ -148,7 +158,7 @@ impl<M: Messenger> Core<M> {
             return;
         }
         tracing::info!(event = "agent_message", cursor);
-        for body in reply_bodies(Some(label), text) {
+        for body in formatted_bodies(Some(label), text, self.format) {
             self.send_rich(&body);
         }
         self.save(|state| state.agent_message_cursor = Some(cursor));

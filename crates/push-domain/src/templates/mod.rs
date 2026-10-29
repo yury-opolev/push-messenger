@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 mod body;
 mod builtin;
 mod definition;
+mod markdown;
 mod outline;
 mod strict;
 mod wording;
@@ -22,6 +23,7 @@ pub use definition::{
     Block, ButtonOption, ButtonStyle, ChoiceOption, Choices, Definition, ItemType, ParamSpec,
     ParamType, Source,
 };
+pub use markdown::check_markdown;
 pub use outline::outline;
 pub use wording::{check_literal, check_value, looks_like_url};
 

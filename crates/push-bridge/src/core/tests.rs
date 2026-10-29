@@ -107,7 +107,7 @@ impl Harness {
             .sent_rich()
             .into_iter()
             .map(|(id, body)| (id, template(&body)))
-            .filter(|(_, tpl)| tpl != "agent.reply@1")
+            .filter(|(_, tpl)| !tpl.starts_with("agent.reply@"))
             .collect()
     }
 
@@ -690,7 +690,11 @@ async fn an_interrupted_turn_closes_its_cards() {
     h.reply_containing("Declined: the turn was stopped.").await;
     h.idle().await;
     let (_, body) = h.messenger.edits().pop().unwrap();
-    assert!(param(&body, "text").unwrap().ends_with("(stopped)"));
+    assert_eq!(
+        param(&body, "text").as_deref(),
+        Some("working"),
+        "the reply sealed for the card stays as it was; the decline says why"
+    );
     h.messenger.owner_says("next");
     h.backend.wait_for("prompt next", 1).await;
 }
@@ -959,5 +963,237 @@ async fn a_failing_first_start_is_said_once_and_retried() {
             "initialize failed (exited): not running; retrying.",
             "Test started."
         ]
+    );
+}
+
+/// The agent's posts in its owner's conversation, in order: `reply N: <text> [<step>
+/// <status>, …]`, `edit N: …` and `card <template>`, replies numbered from 1.
+fn posts(calls: &[Call]) -> Vec<String> {
+    let describe = |body: &str| {
+        let value: serde_json::Value = serde_json::from_str(body).unwrap();
+        let text = value["params"]["text"].as_str().unwrap_or_default();
+        let steps: Vec<String> = value["params"]["steps"]
+            .as_array()
+            .map(|steps| {
+                steps
+                    .iter()
+                    .map(|step| format!("{} {}", step["label"], step["status"]).replace('"', ""))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if steps.is_empty() {
+            text.to_owned()
+        } else {
+            format!("{text} [{}]", steps.join(", "))
+        }
+    };
+    let mut replies: Vec<ClientMsgId> = Vec::new();
+    let mut posts = Vec::new();
+    for call in calls {
+        match call {
+            Call::SendRich { id, body, .. } if template(body).starts_with("agent.reply@") => {
+                replies.push(*id);
+                posts.push(format!("reply {}: {}", replies.len(), describe(body)));
+            }
+            Call::SendRich { body, .. } => posts.push(format!("card {}", template(body))),
+            Call::EditRich { id, body, .. } => {
+                let n = replies.iter().position(|reply| reply == id).unwrap() + 1;
+                posts.push(format!("edit {n}: {}", describe(body)));
+            }
+            _ => {}
+        }
+    }
+    posts
+}
+
+fn bash(id: &str, target: &str) -> BackendEvent {
+    BackendEvent::ToolStarted {
+        id: id.into(),
+        tool: "Bash".into(),
+        target: target.into(),
+        task: None,
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_card_ends_the_reply_and_what_follows_goes_into_a_new_one_below_the_answer() {
+    let h = Harness::started().await;
+    h.backend.turn_started(TurnSource::Prompt);
+    h.backend.text("Checking the time.");
+    h.backend.emit(bash("a", "date"));
+    let answer = h.backend.request(permission());
+    let card = h.card(1).await;
+    settle().await;
+    assert_eq!(
+        posts(&h.messenger.calls()),
+        [
+            "reply 1: …",
+            "edit 1: Checking the time. [Bash date pending]",
+            "card agent.approval@1",
+        ]
+    );
+
+    h.messenger.answer(card, &["approve"]);
+    assert_eq!(answer.await, Ok(Answer::Permission(true)));
+    settle().await;
+    let answered = posts(&h.messenger.calls()).len();
+    assert_eq!(answered, 3, "approving edits nothing");
+
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    h.backend.emit(BackendEvent::ToolFinished {
+        id: "a".into(),
+        failed: false,
+    });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    h.backend.text("done");
+    h.backend.turn_ended(false);
+    h.idle().await;
+    let after = posts(&h.messenger.calls())[answered..].to_vec();
+    assert_eq!(after[0], "reply 2: … [Bash date done]");
+    assert_eq!(after.last().unwrap(), "edit 2: done [Bash date done]");
+    assert!(after.iter().all(|post| !post.starts_with("edit 1")));
+    let detail = h
+        .messenger
+        .edits()
+        .last()
+        .and_then(|(_, body)| {
+            let value: serde_json::Value = serde_json::from_str(body).ok()?;
+            value["params"]["steps"][0]["detail"]
+                .as_str()
+                .map(str::to_owned)
+        })
+        .unwrap();
+    assert!(detail.ends_with(" s"), "{detail}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn requests_in_a_row_post_their_cards_one_after_the_other() {
+    let h = Harness::started().await;
+    h.backend.turn_started(TurnSource::Prompt);
+    h.backend.text("Two questions.");
+    let first = h.backend.request(permission());
+    let second = h.backend.request(RequestKind::Plan {
+        plan: "1. edit".into(),
+    });
+    h.card(2).await;
+    settle().await;
+    assert_eq!(
+        posts(&h.messenger.calls()),
+        [
+            "reply 1: …",
+            "edit 1: Two questions.",
+            "card agent.approval@1",
+            "card agent.plan-approval@1",
+        ]
+    );
+    let cards = h.cards();
+    h.messenger.answer(cards[0].0, &["approve"]);
+    h.messenger.answer(cards[1].0, &["approve"]);
+    assert_eq!(first.await, Ok(Answer::Permission(true)));
+    assert_eq!(second.await, Ok(Answer::Plan(true)));
+    h.backend.text("Both answered.");
+    h.backend.turn_ended(false);
+    h.idle().await;
+    assert_eq!(
+        posts(&h.messenger.calls())[4..],
+        ["reply 2: Both answered."]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_turn_that_ends_after_a_declined_card_posts_no_empty_reply() {
+    let h = Harness::started().await;
+    h.backend.turn_started(TurnSource::Prompt);
+    h.backend.emit(bash("a", "rm -rf build"));
+    let answer = h.backend.request(permission());
+    let card = h.card(1).await;
+    h.messenger.answer(card, &["reject"]);
+    assert_eq!(answer.await, Ok(Answer::Permission(false)));
+    h.backend.turn_ended(false);
+    h.idle().await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(
+        posts(&h.messenger.calls()),
+        [
+            "reply 1: …",
+            "edit 1: … [Bash rm -rf build pending]",
+            "card agent.approval@1",
+        ]
+    );
+    assert_eq!(
+        h.messenger.activities().last(),
+        Some(&(ActivityState::Idle, None))
+    );
+}
+
+async fn started_as(format: crate::backend::TextFormat) -> Harness {
+    let mut h = Harness::new();
+    h.backend.set_text_format(format);
+    h.start();
+    h.backend.wait_for("start", 1).await;
+    settle().await;
+    h
+}
+
+/// `(template, text)` of every reply sent, in order.
+fn reply_templates(h: &Harness) -> Vec<(String, String)> {
+    h.messenger
+        .sent_rich()
+        .iter()
+        .map(|(_, body)| (template(body), param(body, "text").unwrap_or_default()))
+        .collect()
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_markdown_backend_s_turns_and_messages_go_out_as_reply_v2() {
+    let h = started_as(crate::backend::TextFormat::Markdown).await;
+    h.backend.turn_started(TurnSource::Prompt);
+    h.backend.text("It is **1:32 PM**.");
+    h.backend.turn_ended(false);
+    h.idle().await;
+    h.backend.emit(BackendEvent::AgentMessage {
+        cursor: 1,
+        label: "Build".into(),
+        text: "`cargo test` passed".into(),
+    });
+    h.reply_containing("passed").await;
+    h.messenger.owner_says("/help");
+    h.reply_containing("/yolo").await;
+    let sent = reply_templates(&h);
+    assert_eq!(sent[0].0, "agent.reply@2");
+    assert_eq!(
+        h.messenger
+            .edits()
+            .last()
+            .map(|(_, body)| param(body, "text")),
+        Some(Some("It is **1:32 PM**.".to_owned()))
+    );
+    assert_eq!(
+        sent[1],
+        ("agent.reply@2".to_owned(), "`cargo test` passed".to_owned())
+    );
+    assert_eq!(
+        sent[2].0, "agent.reply@1",
+        "the bridge's own words stay plain"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_plain_backend_s_text_goes_out_as_reply_v1() {
+    let h = Harness::started().await;
+    h.backend.turn_started(TurnSource::Prompt);
+    h.backend.text("2 * 3 * 4 = 24");
+    h.backend.turn_ended(false);
+    h.idle().await;
+    h.backend.emit(BackendEvent::AgentMessage {
+        cursor: 1,
+        label: "Note".into(),
+        text: "**hi**".into(),
+    });
+    h.reply_containing("**hi**").await;
+    assert!(
+        reply_templates(&h)
+            .iter()
+            .all(|(tpl, _)| tpl == "agent.reply@1")
     );
 }

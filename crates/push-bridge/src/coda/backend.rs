@@ -17,7 +17,7 @@ use super::rpc::{Incoming, RpcError, RpcPeer};
 use crate::backend::{
     Answer, Backend, BackendCommand, BackendError, BackendEvent, BackendRequest, BackendStatus,
     Capability, CommandReply, ErrorKind, PendingMessages, PermissionMode, RequestKind, Responder,
-    ScheduleWhen, StartOptions, Started, SteerOutcome, TaskStatus, TurnSource,
+    ScheduleWhen, StartOptions, Started, SteerOutcome, TaskStatus, TextFormat, TurnSource,
 };
 use crate::config::CodaConfig;
 use crate::mask;
@@ -887,6 +887,10 @@ impl CodaBackend {
 impl Backend for CodaBackend {
     fn name(&self) -> &str {
         "Coda"
+    }
+
+    fn text_format(&self) -> TextFormat {
+        TextFormat::Markdown
     }
 
     fn capabilities(&self) -> BTreeSet<Capability> {
