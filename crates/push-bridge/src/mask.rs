@@ -92,6 +92,9 @@ static FLAG: LazyLock<Regex> = LazyLock::new(|| {
 
 static HEX_RUN: LazyLock<Regex> = LazyLock::new(|| regex(r"\b[0-9a-fA-F]{40,}\b"));
 
+/// A hex run of 40 anywhere in a base64 run.
+static HEX_IN_RUN: LazyLock<Regex> = LazyLock::new(|| regex(r"[0-9a-fA-F]{40,}"));
+
 /// Base64 and base64url together, so a run mixing both alphabets is one run.
 static BASE64_RUN: LazyLock<Regex> = LazyLock::new(|| regex(r"[A-Za-z0-9+/_-]{40,}={0,2}"));
 
@@ -150,24 +153,35 @@ fn mask_value(caps: &Captures<'_>) -> String {
     format!("{}{}{open}{MASK}{close}", &caps["name"], &caps["delimiter"])
 }
 
-/// A base64 run is masked, unless it is a path: long Unix and relative paths
-/// (`/home/me/projects/push-messenger/crates/…`) are runs of the base64 alphabet too.
-/// A run counts as a path only when it has at least two `/`, no `+`, no `=` padding, and
-/// every segment is shorter than 40 characters and made of words ([`PATH_SEGMENT`]). A
-/// random base64 string almost never passes the word test: it has upper-case letters in
-/// a row or digits followed by capitals. (Windows paths need no exception: `\` and `:`
-/// end a run.)
+/// A base64 run is masked when it looks random, unless it is a path.
+///
+/// Random-looking: it has an upper-case letter, a lower-case letter and a digit, or `=`
+/// padding, or a `+`, or a hex run of 40 (`HEX_RUN` needs word boundaries, so it misses
+/// one after `_`). Long names (`push-bridge-test-3f2a9c1e-…`,
+/// `a_very_long_function_name_in_snake_case`) have no such mix and are kept; a random
+/// base64 secret of 40 characters almost always has all three.
+///
+/// Long Unix and relative paths (`/home/me/projects/push-messenger/crates/…`) are runs of
+/// the base64 alphabet too. A run counts as a path only when it has at least two `/`, no
+/// `+`, no `=` padding, and every segment is shorter than 40 characters and made of words
+/// ([`PATH_SEGMENT`]). A random base64 string almost never passes the word test: it has
+/// upper-case letters in a row or digits followed by capitals. (Windows paths need no
+/// exception: `\` and `:` end a run.)
 fn mask_run(run: &str) -> String {
+    let mixed = run.chars().any(|c| c.is_ascii_uppercase())
+        && run.chars().any(|c| c.is_ascii_lowercase())
+        && run.chars().any(|c| c.is_ascii_digit());
+    let random = mixed || run.ends_with('=') || run.contains('+') || HEX_IN_RUN.is_match(run);
     let path_like = !run.contains('+')
         && !run.ends_with('=')
         && run.matches('/').count() >= 2
         && run.split('/').all(|segment| {
             segment.is_empty() || (segment.len() < 40 && PATH_SEGMENT.is_match(segment))
         });
-    if path_like {
-        run.to_owned()
-    } else {
+    if random && !path_like {
         MASK.to_owned()
+    } else {
+        run.to_owned()
     }
 }
 
@@ -467,6 +481,39 @@ mod tests {
     }
 
     #[test]
+    fn random_base64_and_tokens_are_masked() {
+        masks(
+            "s 9xK2mQ7vLp4RtZ8wNc3BfH6jYd1GsA5eUo0iWq2T e",
+            "s «masked» e",
+        );
+        // Built at run time, so secret scanners do not flag the source.
+        let github = format!("{}_{}", "ghp", "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8");
+        assert_eq!(github.len(), 40);
+        masks(&format!("t {github} e"), "t «masked» e");
+        masks(
+            "p abcdefghijklmnopqrstuvwxyzabcdefghijklmn== e",
+            "p «masked» e",
+        );
+        masks(
+            "p abcdefghijklmnopqrst+vwxyzabcdefghijklmn e",
+            "p «masked» e",
+        );
+        masks(
+            "h x_0123456789abcdef0123456789abcdef01234567 e",
+            "h «masked» e",
+        );
+    }
+
+    #[test]
+    fn long_names_are_not_masked() {
+        keeps("push-bridge-test-3f2a9c1e-7b4d-4e8a-9c21-5d6f7a8b9c0d");
+        keeps("/tmp/push-bridge-test-3f2a9c1e-7b4d-4e8a-9c21-5d6f7a8b9c0d/root/work");
+        keeps("a_very_long_function_name_in_snake_case_x");
+        keeps("a-very-long-kebab-case-name-for-a-feature-flag");
+        keeps("SOME_VERY_LONG_CONSTANT_NAME_IN_SCREAMING_CASE");
+    }
+
+    #[test]
     fn cap_counts_characters() {
         assert_eq!(cap("short", 10), "short");
         assert_eq!(cap("exactly", 7), "exactly");
@@ -478,9 +525,10 @@ mod tests {
 
     #[test]
     fn masked_masks_before_it_cuts() {
-        let secret = "zq9".repeat(15);
+        // Mixed case and digits: a run of lower case and digits alone is kept now.
+        let secret = "zQ9".repeat(15);
         let shown = masked(&format!("a long line then the value {secret}"), 30);
-        assert!(!shown.contains("zq9"), "{shown}");
+        assert!(!shown.contains("zQ9"), "{shown}");
         assert_eq!(shown.chars().count(), 30);
     }
 
