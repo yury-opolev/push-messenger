@@ -1,0 +1,33 @@
+[package]
+name = "push-bridge"
+description = "The agent bridge: reach a local AI coding agent (Coda first) from push-messenger as a private agent contact."
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "push-agent-bridge"
+path = "src/main.rs"
+
+[dependencies]
+async-trait.workspace = true
+push-agent-key.workspace = true
+push-domain.workspace = true
+push-sdk.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "process", "rt", "rt-multi-thread", "signal", "sync", "time"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "test-util"] }

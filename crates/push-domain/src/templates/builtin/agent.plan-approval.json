@@ -1,0 +1,20 @@
+{
+  "format": "tpl/1",
+  "publisher": "agent",
+  "name": "plan-approval",
+  "version": 1,
+  "title": "Plan approval",
+  "senders": ["agent"],
+  "params": {
+    "title": {"type": "string", "max_len": 120},
+    "plan": {"type": "string", "max_len": 4000, "multiline": true}
+  },
+  "layout": [
+    {"type": "heading", "param": "title"},
+    {"type": "preview", "param": "plan", "label": "Plan"},
+    {"type": "buttons", "options": [
+      {"id": "approve", "label": "Approve plan", "style": "primary"},
+      {"id": "reject", "label": "Reject", "style": "danger"}
+    ]}
+  ]
+}

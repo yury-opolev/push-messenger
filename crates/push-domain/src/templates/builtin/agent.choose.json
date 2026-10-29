@@ -1,0 +1,16 @@
+{
+  "format": "tpl/1",
+  "publisher": "agent",
+  "name": "choose",
+  "version": 1,
+  "title": "Multiple choice",
+  "senders": ["agent"],
+  "params": {
+    "question": {"type": "string", "max_len": 1000, "multiline": true},
+    "options": {"type": "list", "item": {"type": "option"}, "max_items": 10}
+  },
+  "layout": [
+    {"type": "text", "param": "question"},
+    {"type": "multi", "label": "Choose any", "param": "options", "min": 1, "max": 10}
+  ]
+}

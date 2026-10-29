@@ -24,11 +24,13 @@ type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 const APPROVAL: &str = r#"{"tpl":"agent.approval@1","params":{"title":"Deploy v2","details":"Ship it to production?"},"fallback":"Deploy v2 to production?"}"#;
 const NOTICE: &str =
     r#"{"tpl":"acme.notice@1","params":{"text":"The office is closed today"},"fallback":"Closed"}"#;
-const BUILT_INS: [&str; 4] = [
+const BUILT_INS: [&str; 6] = [
     "agent.reply@1",
     "agent.approval@1",
     "agent.question@1",
     "agent.plan@1",
+    "agent.choose@1",
+    "agent.plan-approval@1",
 ];
 
 fn notice(version: u32) -> Value {

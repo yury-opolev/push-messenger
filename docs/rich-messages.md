@@ -40,8 +40,9 @@ So rich content is filled from **templates**:
   edit.
 - A card with buttons or choices is answered with an ANSWER message. The server checks the
   answer against the card and closes the card with the first valid one.
-- Four built-in templates (`agent.reply@1`, `agent.approval@1`, `agent.question@1`,
-  `agent.plan@1`) are available from the start, for owned agents only.
+- Six built-in templates (`agent.reply@1`, `agent.approval@1`, `agent.question@1`,
+  `agent.choose@1`, `agent.plan@1`, `agent.plan-approval@1`) are available from the start,
+  for owned agents only.
 
 ## 2. Enforcement model
 
@@ -363,7 +364,10 @@ Card state is kept by the server, so a sender never edits a card to close it:
   answer closes the card for everyone. The server does not check that the answerer is the
   person the card was meant for: before acting on an answer, an agent must check the
   answer's `sender_id` (for example, act only on its owner's answer, and treat any other
-  as closing the card without effect, or send a new card).
+  as closing the card without effect, or send a new card). In Rust, push-sdk's `CardBook`
+  does these checks for the card's sender: it accepts an answer only from the card's
+  owner, in the card's conversation, naming the card, with 1 to `max_values` distinct
+  offered values, before the card's deadline.
 - The **first valid answer closes the card**: in the same transaction the card records the
   answer's seq, delivered as `Deliver.answer_seq` on the card (in history and sync). The
   answer itself fans out like any message; its `Deliver.target_seq` is the card's seq.
@@ -410,19 +414,24 @@ keeps `answer_seq` on cards and applies incoming answers to their card, and offe
 `push_client_send_answer`) with the same envelope checks before queueing. See
 [docs/sdk-bindings.md](sdk-bindings.md#cards-and-answers). The SDK does not fetch the
 catalog yet; apps call `GET /v1/templates` themselves ([section 9](#9-client-catalog-protocol)).
+In Rust, `CardBook` (with `OpenCard`, `CardCheck` and `CardRefusal`) keeps the cards an app
+sent and checks each answer's sender, card, values and deadline (`open`, `sent` with the
+`MessageSent` event, `check`, `close`, `expire`); the bindings do not expose it yet.
 Clients built before this feature (older SDKs) do not know content types 3 and 4 and show
 RICH and ANSWER messages as text, their raw JSON body.
 
 ## 6. Built-in templates
 
-Four `agent.*` templates ship in `push-domain` (`crates/push-domain/src/templates/builtin/`),
+Six `agent.*` templates ship in `push-domain` (`crates/push-domain/src/templates/builtin/`),
 validated by the same code as any submission. message-svc **seeds them as approved at
 start-up**, before it reports ready, so the very first catalog lists them. They are owned
 by the server: the publisher `agent` is reserved and claimed by the server, so no account
 can publish under it. Seeding inserts missing versions only, so an admin may **revoke** a
 built-in and the revocation survives restarts. A changed built-in must get a new version;
 message-svc warns (`templates.builtin_mismatch`) when a stored built-in differs from the
-shipped one. All four are for agents only.
+shipped one. All six are for agents only. `agent.choose@1` and `agent.plan-approval@1`
+came later (with the [agent bridge](agent-bridge.md)); a message-svc of that release seeds
+them at its next start, next to the stored four.
 
 These were designed upstream: the consumer's own spec
 (`docs/specs/2026-10-26-rich-messages.md` in the consumer repository) was not available
@@ -510,6 +519,30 @@ A question with up to 10 options supplied by the agent; the person picks one.
 }
 ```
 
+### `agent.choose@1`
+
+A multiple-choice question with up to 10 options supplied by the agent; the person picks
+one or more. The answer's values are the chosen option ids (1 to 10).
+
+```json
+{
+  "format": "tpl/1",
+  "publisher": "agent",
+  "name": "choose",
+  "version": 1,
+  "title": "Multiple choice",
+  "senders": ["agent"],
+  "params": {
+    "question": {"type": "string", "max_len": 1000, "multiline": true},
+    "options": {"type": "list", "item": {"type": "option"}, "max_items": 10}
+  },
+  "layout": [
+    {"type": "text", "param": "question"},
+    {"type": "multi", "label": "Choose any", "param": "options", "min": 1, "max": 10}
+  ]
+}
+```
+
 ### `agent.plan@1`
 
 A plan or a progress report: a heading, an optional overall state and up to 50 steps. Not
@@ -532,6 +565,35 @@ interactive; edit the card (with a full RICH body) as work progresses.
     {"type": "heading", "param": "title"},
     {"type": "status", "param": "state", "label": "State"},
     {"type": "steps", "param": "steps", "label": "Steps"}
+  ]
+}
+```
+
+### `agent.plan-approval@1`
+
+A plan the agent asks to follow, as text (up to 4,000 characters), with Approve plan
+(primary) or Reject (danger) buttons. Unlike `agent.plan@1` it is interactive: it asks
+for a decision rather than reporting progress.
+
+```json
+{
+  "format": "tpl/1",
+  "publisher": "agent",
+  "name": "plan-approval",
+  "version": 1,
+  "title": "Plan approval",
+  "senders": ["agent"],
+  "params": {
+    "title": {"type": "string", "max_len": 120},
+    "plan": {"type": "string", "max_len": 4000, "multiline": true}
+  },
+  "layout": [
+    {"type": "heading", "param": "title"},
+    {"type": "preview", "param": "plan", "label": "Plan"},
+    {"type": "buttons", "options": [
+      {"id": "approve", "label": "Approve plan", "style": "primary"},
+      {"id": "reject", "label": "Reject", "style": "danger"}
+    ]}
   ]
 }
 ```

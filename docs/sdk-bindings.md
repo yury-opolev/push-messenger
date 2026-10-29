@@ -45,6 +45,7 @@ later (`retryable`). A refusal by a server keeps the server's own code (`not_con
 | `wrong_key` | no | The database key is wrong or missing; nothing was changed. |
 | `encryption_unavailable` | no | A key was given, but the linked SQLite cannot encrypt. Do not retry. |
 | `secrets` | no | The app's secret store failed (or, in Node, did not answer within 30 s). |
+| `signer` | no | The app's agent-key signer failed (Rust only); the message carries the key provider's code, such as `NTE_BAD_KEYSET`. Nothing was sent. |
 | `closed` | no | The client was closed. |
 | `panic` | no | A bug in the SDK, caught at the C boundary. Exists only in C: Node never reports it. Close the client. |
 
@@ -138,7 +139,8 @@ text, and show `fallback` for anything else.
 
 In a group any member other than the card's sender may answer, and the first answer
 closes the card: an agent must check the answer's `senderId` (for example, act only on its
-owner's answer) before acting on it.
+owner's answer) before acting on it. Rust apps can use push-sdk's `CardBook` for these
+checks ([card state](rich-messages.md#card-state)); the bindings do not expose it yet.
 
 ### Activity and presence
 
@@ -381,6 +383,9 @@ polling and by callback, sending, activity and presence, and an encrypted databa
 - No mobile bindings: the C library is enough for Swift and Kotlin apps for now.
 - The first platforms are Windows x64, Linux x64 and macOS arm64.
 - Publishing to npm (and prebuilt binaries) is deferred.
+- Rust only for now: agent-key enrollment and sign-in through an app-supplied signer
+  (`enroll_with_agent_key`, `sign_in_with_agent_key`;
+  [guide](agent-key-sign-in.md#from-push-sdk-rust)) and `CardBook`.
 
 ## Testing the bindings
 

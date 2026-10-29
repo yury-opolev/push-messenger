@@ -567,6 +567,7 @@ mod tests {
             SdkError::WrongKey,
             SdkError::EncryptionUnavailable,
             SdkError::Secrets(text()),
+            SdkError::Signer(text()),
             SdkError::Closed,
         ];
         for failure in &errors {

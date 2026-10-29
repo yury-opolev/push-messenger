@@ -138,6 +138,30 @@ pub struct FakeAuth {
     pub signups: Arc<AtomicUsize>,
     /// Every `POST /v1/auth/entra` body, in order.
     pub entra_bodies: Arc<Mutex<Vec<Value>>>,
+    /// Every `POST /v1/auth/agent-key` body, in order.
+    pub agent_key_bodies: Arc<Mutex<Vec<Value>>>,
+    /// The `jti` of every agent-key assertion accepted, in order; a second use is
+    /// refused with `token_invalid`.
+    pub agent_key_jtis: Arc<Mutex<Vec<String>>>,
+}
+
+/// The enrollment code [`FakeAuth`] refuses with `enrollment_invalid`; it accepts any other.
+pub const BAD_ENROLLMENT_CODE: &str = "BADCODE";
+
+/// The claims of an agent-key assertion, read without checking its signature.
+fn assertion_claims(token: &str) -> Option<Value> {
+    use base64::Engine;
+
+    let payload = token.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn refusal(status: StatusCode, code: &str, message: &str) -> axum::response::Response {
+    let error = json!({"error": {"code": code, "message": message, "retryable": false}});
+    (status, Json(error)).into_response()
 }
 
 /// The password [`FakeAuth`] refuses with `invalid_credentials`; it accepts any other.
@@ -151,6 +175,8 @@ pub const TAKEN_HANDLE: &str = "taken";
 
 impl FakeAuth {
     pub async fn start() -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
         let (user, device) = (UserId::new(), DeviceId::new());
         let registrations = Arc::new(AtomicUsize::new(0));
         let refreshes = Arc::new(AtomicUsize::new(0));
@@ -188,8 +214,21 @@ impl FakeAuth {
             spend_next_registration.clone(),
             registration_ids.clone(),
         );
-        let (login_tokens, device_tokens, entra_tokens, refresh_tokens) =
-            (tokens.clone(), tokens.clone(), tokens.clone(), tokens);
+        let (login_tokens, device_tokens, entra_tokens, agent_tokens, refresh_tokens) = (
+            tokens.clone(),
+            tokens.clone(),
+            tokens.clone(),
+            tokens.clone(),
+            tokens,
+        );
+        let agent_key_bodies = Arc::new(Mutex::new(Vec::new()));
+        let agent_key_jtis = Arc::new(Mutex::new(Vec::new()));
+        let (agent_bodies, agent_jtis, agent_identity, audience) = (
+            agent_key_bodies.clone(),
+            agent_key_jtis.clone(),
+            identity.clone(),
+            url.clone(),
+        );
         let router = Router::new()
             .route(
                 "/v1/auth/login",
@@ -226,6 +265,65 @@ impl FakeAuth {
                             Json(json!({"registration_token": "registration", "expires_in_s": 300}))
                                 .into_response()
                         }
+                    }
+                }),
+            )
+            .route(
+                "/v1/auth/agent-key",
+                post(move |Json(body): Json<Value>| {
+                    let (bodies, jtis) = (agent_bodies.clone(), agent_jtis.clone());
+                    let (identity, audience) = (agent_identity.clone(), audience.clone());
+                    let tokens = agent_tokens.clone();
+                    async move {
+                        bodies.lock().unwrap().push(body.clone());
+                        let refused = || {
+                            refusal(
+                                StatusCode::UNAUTHORIZED,
+                                "token_invalid",
+                                "the agent-key assertion is not accepted",
+                            )
+                        };
+                        let Some(claims) = body["token"].as_str().and_then(assertion_claims)
+                        else {
+                            return refused();
+                        };
+                        let lifetime = claims["exp"].as_i64().zip(claims["iat"].as_i64());
+                        let Some(jti) = claims["jti"].as_str() else {
+                            return refused();
+                        };
+                        if claims["aud"] != audience.as_str()
+                            || !lifetime.is_some_and(|(exp, iat)| iat < exp && exp - iat <= 300)
+                        {
+                            return refused();
+                        }
+                        {
+                            let mut jtis = jtis.lock().unwrap();
+                            if jtis.iter().any(|used| used == jti) {
+                                return refused();
+                            }
+                            jtis.push(jti.to_owned());
+                        }
+                        if body["enrollment_code"] == BAD_ENROLLMENT_CODE {
+                            return refusal(
+                                StatusCode::BAD_REQUEST,
+                                "enrollment_invalid",
+                                "the enrollment code is wrong, expired or spent",
+                            );
+                        }
+                        if let Some(device) = body.get("device_id") {
+                            let (_, active) = *identity.lock().unwrap();
+                            if *device != json!(active) {
+                                return refusal(
+                                    StatusCode::NOT_FOUND,
+                                    "device_not_found",
+                                    "no such device",
+                                );
+                            }
+                            return Json(tokens(300)).into_response();
+                        }
+                        let (user, _) = *identity.lock().unwrap();
+                        Json(json!({"user_id": user, "registration_token": "registration", "expires_in_s": 300}))
+                            .into_response()
                     }
                 }),
             )
@@ -305,8 +403,6 @@ impl FakeAuth {
                 }
             }),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         Self {
             url,
@@ -323,6 +419,8 @@ impl FakeAuth {
             registration_ids,
             signups,
             entra_bodies,
+            agent_key_bodies,
+            agent_key_jtis,
         }
     }
 }

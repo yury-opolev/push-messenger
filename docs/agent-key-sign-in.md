@@ -176,13 +176,43 @@ with `provider=agent-key` and a `reason` (never the token): `size`, `format`, `h
 are not; `enrollment_invalid` is). Enrollment logs `auth.agent.enrolled` with
 `provider=agent-key`, and deletion `auth.agent.identity_released`.
 
+## From push-sdk (Rust)
+
+`push-sdk` enrolls and signs in an agent through a signer the app supplies, so the private
+key can stay in OS key storage: the SDK builds the claims of every assertion, the signer
+returns the compact JWS, and the SDK never sees the key.
+
+- `AgentSigner` is the app's signer: `fn sign(&self, claims: &AgentClaims) ->
+  Result<String, SignerError>`, called on a blocking thread. `AgentClaims::new(audience,
+  now_s)` is what the SDK passes: `aud`, `iat`, `exp = iat + 120`
+  (`AGENT_ASSERTION_LIFETIME_S`) and a new `jti` (32 hex characters) for every call.
+- `assemble_assertion(&public_key, &claims, sign)` builds the JWS for a signer: the header
+  with the `jwk`, the claims, and the signature from `sign` over the signing input (the
+  64-byte `r || s`). `AgentPublicKey { x, y }.thumbprint()` is the RFC 7638 thumbprint to
+  show the owner.
+- `client.enroll_with_agent_key(signer, audience, enrollment_code, device_name,
+  platform)` redeems the owner's code and registers a new device;
+  `client.sign_in_with_agent_key(signer, audience, device_name, platform)` signs the
+  device it registered before in again (or a new one), as `sign_in` does. `audience`
+  `None` means `Config::auth_url` without a trailing `/`. Then call `connect`. After the
+  maximum session age the SDK reports `SignedOut`: sign in again.
+- A failing signer is `SdkError::Signer` (code `signer`, not retryable), carrying the key
+  provider's code and message, never key material; nothing was sent.
+
+The crate `push-agent-key` holds ready signers (`AgentKey` adds `public_key()` and
+`storage()`): `cng::CngKey` (Windows) opens or creates a persisted, non-exportable P-256
+key under a name, in the TPM (`Microsoft Platform Crypto Provider`) when it can, otherwise
+in the `Microsoft Software Key Storage Provider`; `software::SoftwareKey` keeps the key in
+memory or in a PKCS#8 file, for tests and development only. The C and Node bindings do not
+expose agent-key sign-in yet. The [agent bridge](agent-bridge.md) is a complete agent
+built on this API.
+
 ## Client example (PowerShell, Windows)
 
-An example for PowerShell 7.4 or later on Windows. It keeps a persisted, non-exportable
-P-256 key in the TPM (`Microsoft Platform Crypto Provider`), or in the
+An example for PowerShell 7.4 or later on Windows, without the SDK. It keeps a persisted,
+non-exportable P-256 key in the TPM (`Microsoft Platform Crypto Provider`), or in the
 `Microsoft Software Key Storage Provider` where there is no usable TPM, and opens the same
-key on later runs. Only the public key ever leaves the key store. The SDK and its bindings
-have no agent helpers.
+key on later runs. Only the public key ever leaves the key store.
 
 ```powershell
 $ErrorActionPreference = 'Stop'

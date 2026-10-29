@@ -2,14 +2,17 @@
 
 use super::Definition;
 
-const SOURCES: [&str; 4] = [
+const SOURCES: [&str; 6] = [
     include_str!("builtin/agent.reply.json"),
     include_str!("builtin/agent.approval.json"),
     include_str!("builtin/agent.question.json"),
     include_str!("builtin/agent.plan.json"),
+    include_str!("builtin/agent.choose.json"),
+    include_str!("builtin/agent.plan-approval.json"),
 ];
 
-/// `agent.reply@1`, `agent.approval@1`, `agent.question@1` and `agent.plan@1`.
+/// `agent.reply@1`, `agent.approval@1`, `agent.question@1`, `agent.plan@1`, `agent.choose@1`
+/// and `agent.plan-approval@1`.
 pub fn builtins() -> Vec<Definition> {
     SOURCES
         .iter()
@@ -34,7 +37,9 @@ mod tests {
                 "agent.reply@1",
                 "agent.approval@1",
                 "agent.question@1",
-                "agent.plan@1"
+                "agent.plan@1",
+                "agent.choose@1",
+                "agent.plan-approval@1"
             ]
         );
         for definition in builtins() {
@@ -58,6 +63,8 @@ mod tests {
                 ("Approval request".to_owned(), true),
                 ("Question".to_owned(), true),
                 ("Plan".to_owned(), false),
+                ("Multiple choice".to_owned(), true),
+                ("Plan approval".to_owned(), true),
             ]
         );
     }
