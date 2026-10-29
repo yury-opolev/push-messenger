@@ -10,7 +10,7 @@ use tokio::time::Instant;
 use crate::backend::{
     Answer, Backend, BackendCommand, BackendError, BackendEvent, BackendRequest, BackendStatus,
     Capability, CommandReply, ErrorKind, PendingMessages, RequestKind, Responder, StartOptions,
-    Started, SteerOutcome, TurnSource,
+    Started, SteerOutcome, TextFormat, TurnSource,
 };
 use crate::messenger::wait;
 
@@ -45,6 +45,7 @@ struct Script {
     pending: PendingMessages,
     engine_instance: Option<String>,
     sessions: u64,
+    text_format: TextFormat,
 }
 
 /// A [`Backend`] a test scripts.
@@ -73,6 +74,7 @@ impl TestBackend {
                 pending: PendingMessages::default(),
                 engine_instance: Some("engine-1".to_owned()),
                 sessions: 0,
+                text_format: TextFormat::Plain,
             }),
             changed: Notify::new(),
         }
@@ -86,6 +88,11 @@ impl TestBackend {
 
     pub fn set_capabilities(&self, capabilities: impl IntoIterator<Item = Capability>) {
         self.lock().capabilities = capabilities.into_iter().collect();
+    }
+
+    /// How the backend says it writes (plain unless set); the core reads it once.
+    pub fn set_text_format(&self, format: TextFormat) {
+        self.lock().text_format = format;
     }
 
     /// The engine instance the next starts report.
@@ -219,6 +226,10 @@ impl Backend for TestBackend {
 
     fn capabilities(&self) -> BTreeSet<Capability> {
         self.lock().capabilities.clone()
+    }
+
+    fn text_format(&self) -> TextFormat {
+        self.lock().text_format
     }
 
     async fn start(&self, options: StartOptions) -> Result<Started, BackendError> {

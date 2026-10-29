@@ -1125,3 +1125,75 @@ async fn a_turn_that_ends_after_a_declined_card_posts_no_empty_reply() {
         Some(&(ActivityState::Idle, None))
     );
 }
+
+async fn started_as(format: crate::backend::TextFormat) -> Harness {
+    let mut h = Harness::new();
+    h.backend.set_text_format(format);
+    h.start();
+    h.backend.wait_for("start", 1).await;
+    settle().await;
+    h
+}
+
+/// `(template, text)` of every reply sent, in order.
+fn reply_templates(h: &Harness) -> Vec<(String, String)> {
+    h.messenger
+        .sent_rich()
+        .iter()
+        .map(|(_, body)| (template(body), param(body, "text").unwrap_or_default()))
+        .collect()
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_markdown_backend_s_turns_and_messages_go_out_as_reply_v2() {
+    let h = started_as(crate::backend::TextFormat::Markdown).await;
+    h.backend.turn_started(TurnSource::Prompt);
+    h.backend.text("It is **1:32 PM**.");
+    h.backend.turn_ended(false);
+    h.idle().await;
+    h.backend.emit(BackendEvent::AgentMessage {
+        cursor: 1,
+        label: "Build".into(),
+        text: "`cargo test` passed".into(),
+    });
+    h.reply_containing("passed").await;
+    h.messenger.owner_says("/help");
+    h.reply_containing("/yolo").await;
+    let sent = reply_templates(&h);
+    assert_eq!(sent[0].0, "agent.reply@2");
+    assert_eq!(
+        h.messenger
+            .edits()
+            .last()
+            .map(|(_, body)| param(body, "text")),
+        Some(Some("It is **1:32 PM**.".to_owned()))
+    );
+    assert_eq!(
+        sent[1],
+        ("agent.reply@2".to_owned(), "`cargo test` passed".to_owned())
+    );
+    assert_eq!(
+        sent[2].0, "agent.reply@1",
+        "the bridge's own words stay plain"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_plain_backend_s_text_goes_out_as_reply_v1() {
+    let h = Harness::started().await;
+    h.backend.turn_started(TurnSource::Prompt);
+    h.backend.text("2 * 3 * 4 = 24");
+    h.backend.turn_ended(false);
+    h.idle().await;
+    h.backend.emit(BackendEvent::AgentMessage {
+        cursor: 1,
+        label: "Note".into(),
+        text: "**hi**".into(),
+    });
+    h.reply_containing("**hi**").await;
+    assert!(
+        reply_templates(&h)
+            .iter()
+            .all(|(tpl, _)| tpl == "agent.reply@1")
+    );
+}

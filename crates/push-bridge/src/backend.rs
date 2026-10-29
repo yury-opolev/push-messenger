@@ -14,6 +14,16 @@ use tokio::sync::oneshot;
 
 pub use crate::commands::ScheduleWhen;
 
+/// How a backend writes the text of its turns and background messages.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TextFormat {
+    /// Plain text, shown as it is (`agent.reply@1`): `2 * 3 * 4` stays as typed.
+    #[default]
+    Plain,
+    /// Markdown, shown formatted (`agent.reply@2`, the safe subset the server checks).
+    Markdown,
+}
+
 /// What a backend can do beyond prompts; the core offers only what the backend has.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Capability {
@@ -307,6 +317,10 @@ pub trait Backend: Send + Sync + 'static {
     /// "Coda": used in replies such as "(Coda stopped; restarting)".
     fn name(&self) -> &str;
     fn capabilities(&self) -> BTreeSet<Capability>;
+    /// How the agent writes its text; plain unless the backend says Markdown.
+    fn text_format(&self) -> TextFormat {
+        TextFormat::Plain
+    }
     /// Starts the agent in `options.folder` (restarting its process when the folder
     /// changed or it is not running) and opens `options.session`, or a new session when
     /// `None`. [`ErrorKind::SessionNotFound`] when the session is unknown in that folder.
