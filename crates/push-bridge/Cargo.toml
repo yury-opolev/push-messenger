@@ -14,12 +14,13 @@ path = "src/main.rs"
 
 [dependencies]
 async-trait.workspace = true
+push-domain.workspace = true
 push-sdk.workspace = true
 regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["sync", "time"] }
 uuid.workspace = true
 
 [lints]

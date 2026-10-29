@@ -4,10 +4,12 @@
 
 pub mod backend;
 pub mod backoff;
+pub mod cards;
 pub mod commands;
 pub mod config;
 pub mod folders;
 pub mod mask;
+pub mod render;
 pub mod state;
 
 #[cfg(test)]
