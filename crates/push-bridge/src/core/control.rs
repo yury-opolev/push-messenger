@@ -139,11 +139,25 @@ impl<M: Messenger> Core<M> {
         if holds_slot(&command) {
             self.slot_commands = self.slot_commands.saturating_sub(1);
         }
+        let outdated = folder != self.folder || session != self.session.as_deref();
         let reply = match result {
             Ok(reply) => reply,
             Err(error) => return self.backend_failed(&error),
         };
         match command {
+            BackendCommand::SetPermissionMode(mode) if outdated => {
+                tracing::info!(event = "permission_mode_outdated");
+                // The change may have reached the new session's process: set the
+                // current mode again.
+                if mode != self.mode {
+                    self.command_in_background(BackendCommand::SetPermissionMode(self.mode));
+                }
+                return self.reply(&format!(
+                    "The change to {mode} finished after the session changed, so it was \
+                     dropped; the permission mode stays {}.",
+                    self.mode
+                ));
+            }
             BackendCommand::SetPermissionMode(mode) => {
                 self.mode = mode;
                 if mode == PermissionMode::BypassPermissions {
@@ -152,7 +166,7 @@ impl<M: Messenger> Core<M> {
             }
             BackendCommand::Fork => {
                 if let Some(id) = reply.session.clone() {
-                    if folder != self.folder || session != self.session.as_deref() {
+                    if outdated {
                         tracing::info!(event = "fork_outdated");
                         return self.reply(&format!(
                             "The fork finished after the session changed, so it was not \
@@ -196,6 +210,7 @@ impl<M: Messenger> Core<M> {
                 let id = started.session_id.clone();
                 self.adopt(self.folder.clone(), started).await;
                 self.close_backend_requests("Declined: a new session started.");
+                self.cancel_bypass_request();
                 self.reply(&format!("New session {id} in {}.", self.folder.display()));
             }
             Err(error) => self.start_failed(&error),
@@ -235,6 +250,7 @@ impl<M: Messenger> Core<M> {
                 let id = started.session_id.clone();
                 self.adopt(folder, started).await;
                 self.close_backend_requests("Declined: the folder changed.");
+                self.cancel_bypass_request();
                 let how = if resumed { "resumed" } else { "new" };
                 self.reply(&format!(
                     "Folder {}; {how} session {id}.",
@@ -253,6 +269,7 @@ impl<M: Messenger> Core<M> {
             Ok(started) => {
                 self.adopt(self.folder.clone(), started).await;
                 self.close_backend_requests("Declined: another session was resumed.");
+                self.cancel_bypass_request();
                 self.reply(&format!("Resumed session {id}."));
             }
             Err(error) if error.kind == ErrorKind::SessionNotFound => {

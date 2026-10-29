@@ -135,4 +135,22 @@ impl<M: Messenger> Core<M> {
         }
         self.reply(why);
     }
+
+    /// Closes an open `/mode bypass` card without turning approvals off: it was for the
+    /// session that just ended.
+    pub(super) fn cancel_bypass_request(&mut self) {
+        let (closed, open): (Vec<_>, Vec<_>) = std::mem::take(&mut self.open)
+            .into_iter()
+            .partition(|request| request.kind == CardKind::Bypass);
+        self.open = open;
+        if closed.is_empty() {
+            return;
+        }
+        for request in closed {
+            if let Some(card) = request.card {
+                self.cards.close(card);
+            }
+        }
+        self.reply("Turning approvals off was cancelled: the session changed.");
+    }
 }

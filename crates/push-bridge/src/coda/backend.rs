@@ -240,7 +240,8 @@ fn reply_for(expect: Expect, answer: Answer) -> Option<Value> {
 struct Session {
     peer: RpcPeer,
     folder: PathBuf,
-    mode: Mutex<PermissionMode>,
+    /// The process's permission mode; `None` while a change is unconfirmed or failed.
+    mode: Mutex<Option<PermissionMode>>,
     version: Mutex<Option<String>>,
     /// Stopped on purpose: its end is not reported as [`BackendEvent::Exited`].
     retired: AtomicBool,
@@ -267,7 +268,7 @@ impl Session {
         let session = Arc::new(Self {
             peer: peer.clone(),
             folder,
-            mode: Mutex::new(mode),
+            mode: Mutex::new(Some(mode)),
             version: Mutex::new(None),
             retired: AtomicBool::new(false),
             kill: Mutex::new(Some(spawned.kill)),
@@ -531,6 +532,8 @@ impl Session {
     async fn set_permission_mode(&self, mode: PermissionMode) -> Result<String, BackendError> {
         const METHOD: &str = "session/setPermissionMode";
         let wanted = wire_permission_mode(mode);
+        // Unknown until Coda confirms: a lost answer may still have changed it.
+        *lock(&self.mode) = None;
         let result = self
             .call(METHOD, json!({ "mode": wanted }), Some(CALL_TIMEOUT))
             .await?;
@@ -541,7 +544,7 @@ impl Session {
                 format!("Coda kept the permission mode {applied}"),
             ));
         }
-        *lock(&self.mode) = mode;
+        *lock(&self.mode) = Some(mode);
         Ok(applied)
     }
 
@@ -966,7 +969,7 @@ impl Backend for CodaBackend {
         }
         let version = version_text(&result);
         *lock(&session.version) = version.clone();
-        if *lock(&session.mode) != options.permission_mode {
+        if *lock(&session.mode) != Some(options.permission_mode) {
             session.set_permission_mode(options.permission_mode).await?;
         }
         Ok(Started {
@@ -1030,6 +1033,11 @@ impl Backend for CodaBackend {
     }
 
     async fn command(&self, command: BackendCommand) -> Result<CommandReply, BackendError> {
+        // A mode change never overlaps a start, which sets the mode its session asks for.
+        let _lifecycle = match command {
+            BackendCommand::SetPermissionMode(_) => Some(self.lifecycle.lock().await),
+            _ => None,
+        };
         let session = self.session("command")?;
         let session = session.as_ref();
         let timeout = Some(CALL_TIMEOUT);

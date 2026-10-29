@@ -823,6 +823,65 @@ async fn cd_new_and_resume_close_the_old_session_s_requests() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn bypass_approved_before_new_does_not_reach_the_new_session() {
+    let h = Harness::started().await;
+    h.messenger.owner_says("/mode bypass");
+    h.card(1).await;
+    let release = h.backend.hold_next_command();
+    h.messenger.owner_says("y");
+    h.backend
+        .wait_for("command SetPermissionMode(bypassPermissions)", 1)
+        .await;
+    h.messenger.owner_says("/new");
+    h.reply_containing("New session session-2").await;
+    drop(release);
+    h.backend
+        .wait_for("command SetPermissionMode(default)", 1)
+        .await;
+    h.reply_containing("was dropped").await;
+    assert!(
+        !h.replies().iter().any(|r| r.contains("Approvals are off")),
+        "{:?}",
+        h.replies()
+    );
+    h.messenger.owner_says("/status");
+    h.reply_containing("Permission mode: default").await;
+    h.backend.emit(exited());
+    h.backend.wait_for("start", 3).await;
+    let starts: Vec<_> = h
+        .backend
+        .calls()
+        .into_iter()
+        .filter(|call| call.starts_with("start"))
+        .collect();
+    assert_eq!(starts[2], h.start_call(&h.work, "session-2"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn cd_new_and_resume_cancel_an_open_bypass_card() {
+    for (command, reply) in [
+        ("/cd ../other", "Folder "),
+        ("/new", "New session"),
+        ("/resume s-7", "Resumed session s-7."),
+    ] {
+        let h = Harness::started().await;
+        h.messenger.owner_says("/mode bypass");
+        let card = h.card(1).await;
+        h.messenger.owner_says(command);
+        h.reply_containing(reply).await;
+        h.reply_containing("Turning approvals off was cancelled")
+            .await;
+        h.messenger.answer(card, &["approve"]);
+        h.messenger.owner_says("y");
+        h.backend.wait_for("prompt y", 1).await;
+        settle().await;
+        assert_eq!(h.count("command"), 0, "{command}");
+        h.messenger.owner_says("/status");
+        h.reply_containing("Permission mode: default").await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_fork_that_finishes_after_a_cd_is_not_stored_in_the_new_folder() {
     let h = Harness::started().await;
     let release = h.backend.hold_next_command();

@@ -600,6 +600,57 @@ async fn a_different_mode_in_the_same_folder_is_set_on_the_running_process() {
 }
 
 #[tokio::test]
+async fn a_permission_mode_change_never_overlaps_a_start() {
+    let mut h = harness();
+    let mut fake = h.running().await;
+    let command = h.command(BackendCommand::SetPermissionMode(
+        PermissionMode::BypassPermissions,
+    ));
+    let (id, _) = within(fake.expect("session/setPermissionMode")).await;
+    let backend = Arc::clone(&h.backend);
+    let start = tokio::spawn(async move {
+        backend
+            .start(options("/work/a", None, PermissionMode::Default))
+            .await
+    });
+    let early = tokio::time::timeout(Duration::from_millis(100), fake.request()).await;
+    assert!(early.is_err(), "the start waits for the change: {early:?}");
+    fake.respond(&id, json!({"ok": true, "applied": "bypassPermissions"}))
+        .await;
+    within(command).await.unwrap().unwrap();
+    within(fake.handshake("s-2")).await;
+    let (id, params) = within(fake.expect("session/setPermissionMode")).await;
+    assert_eq!(params, json!({"mode": "default"}));
+    fake.respond(&id, json!({"ok": true, "applied": "default"}))
+        .await;
+    within(start).await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn after_a_failed_mode_change_the_next_start_sets_the_mode_again() {
+    let mut h = harness();
+    let mut fake = h.running().await;
+    let command = h.command(BackendCommand::SetPermissionMode(
+        PermissionMode::BypassPermissions,
+    ));
+    let (id, _) = within(fake.expect("session/setPermissionMode")).await;
+    fake.respond_error(&id, -32000, "lost").await;
+    within(command).await.unwrap().unwrap_err();
+    let backend = Arc::clone(&h.backend);
+    let start = tokio::spawn(async move {
+        backend
+            .start(options("/work/a", None, PermissionMode::Default))
+            .await
+    });
+    within(fake.handshake("s-2")).await;
+    let (id, params) = within(fake.expect("session/setPermissionMode")).await;
+    assert_eq!(params, json!({"mode": "default"}));
+    fake.respond(&id, json!({"ok": true, "applied": "default"}))
+        .await;
+    within(start).await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn stop_shuts_coda_down_without_an_exit_event() {
     let mut h = harness();
     let mut fake = h.running().await;
