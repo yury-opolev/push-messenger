@@ -30,7 +30,7 @@ and the plan differ, this guide describes what the code does.
 | Identity | an owned agent signed in with [agent-key](agent-key-sign-in.md): a non-exportable P-256 key in the TPM (or the software key storage provider) |
 | Who may use it | only the agent's owner (`owner_user_id` of the agent's own profile); anyone else gets "This agent is private." |
 | The agent | `coda serve` over stdio (JSON-RPC 2.0 with Content-Length framing), started and restarted by the bridge |
-| Replies | `agent.reply@1` cards: thinking, tool steps and text, edited as the turn runs |
+| Replies | `agent.reply@2` cards (Coda writes Markdown; `agent.reply@1` for a plain-text backend): thinking, tool steps and text, edited as the turn runs |
 | Questions to the owner | `agent.approval@1`, `agent.question@1`, `agent.choose@1`, `agent.plan-approval@1` ([built-ins](rich-messages.md#6-built-in-templates)) |
 | Status | live activity: working, waiting, idle ([activity](activity-presence.md#7-agents)) |
 | Stored on the machine | `config.json`, `state.json` (no secrets) and a JSON-lines log; tokens stay in memory |
@@ -300,15 +300,41 @@ does not know there (-32002) is replaced by a new one. Session ids never move be
 folders. A stored folder that is no longer inside `roots` falls back to `default_folder`.
 
 **Turns.** A turn starts when Coda reports activity and ends at `event/turnEnded`, whether
-the owner's prompt started it or the engine did (after a background task finished). Each
-turn is **one `agent.reply@1`** (untitled), sent at once and then edited at most every 2 s
-while something changed, plus once at the end:
+the owner's prompt started it or the engine did (after a background task finished). A turn
+is shown as **reply messages** (untitled): the first is sent at once, and the open one is
+edited at most every 2 s while something changed, plus once at the end. A turn has several
+replies when its text passes 4,000 characters or a [card](#7-cards) opens in it:
 
 | Part | Content |
 |---|---|
-| `thinking` | the latest 4,000 characters of the turn's thinking (first reply of the turn only) |
-| `steps` | at most 50 tool calls; when full, the oldest finished step makes room. Each is labelled `<tool> <target>` (the path, command, query, pattern, URL or description from the call's input), masked, one line, at most 80 characters; a subagent's tool is `<task>: <tool> <target>`. Status `running`, then `done` or `failed`, with the duration as the detail |
-| `text` | the assistant's text. Past 4,000 characters the reply is final and the text continues in a new `agent.reply@1` (running steps move on with it) |
+| `thinking` | the latest 4,000 characters of the thinking, in the first reply of a segment only (a segment is the turn up to the first card, or between two cards, or after the last) |
+| `steps` | at most 50 tool calls; when full, the oldest finished step makes room. Each is labelled `<tool> <target>` (the path, command, query, pattern, URL or description from the call's input), masked, one line, at most 80 characters; a subagent's tool is `<task>: <tool> <target>`. Status `running`, then `done` or `failed`, with the duration as the detail; `pending` in a reply a card ended while the step ran |
+| `text` | the assistant's text. Past 4,000 characters the reply is final and the text continues in a new reply (running steps move on with it) |
+
+**Cards end a reply.** When a request opens a card (a permission, a question, a plan
+approval, or the `/mode bypass` or `/yolo` confirmation), the reply in progress gets a
+final edit and is not edited again; a step still running then (usually the one waiting for
+approval) shows as `pending` in it. The card follows. The turn's next output after the
+answer (thinking, a step, text, an error) starts a new reply, posted after the owner's
+answer; the step that waited appears in it again and finishes there (`done` or `failed`,
+with its duration). Requests that open with no output between them post their cards one
+after the other. When the turn ends with no output after a card, no empty reply is posted;
+only the activity goes idle. So the chat reads in the order things happened: the request,
+the answer, then what the agent did next.
+
+**Markdown.** Coda writes Markdown, so its replies are `agent.reply@2`: the same as
+`agent.reply@1`, but clients render `text` as [safe Markdown](rich-messages.md#markdown)
+(thinking and step details stay plain). The Markdown is sent as Coda wrote it, masked
+first (also inside code spans and code blocks); the fallback is the text without its
+markers (`**`, `__`, `~~`, backticks and fence lines), at most 2,000 characters. A page
+never ends inside a code block: a page that would closes the fence, and the next page (or
+the next reply after a card) opens it again with the same fence and language. A page whose
+Markdown the server would refuse (raw HTML, an image, a link that is not http or https) is
+sent as `agent.reply@1`, shown as typed. A backend that writes plain text
+(`Backend::text_format()` is `TextFormat::Plain`, the default) keeps `agent.reply@1`, so
+its text is never formatted by mistake (`2 * 3 * 4` stays as typed). The bridge's own
+messages (command results, notes such as "No answer; skipped") are always
+`agent.reply@1`.
 
 An interrupted turn ends its text with "(stopped)" and marks running steps failed. If Coda
 exits mid-turn, the text ends with "(Coda stopped; restarting)". Coda's `event/error`
@@ -317,7 +343,7 @@ RICH limit drops the thinking first, then shortens the fallback, then drops the 
 steps.
 
 **Background work.** Each `notify_user` message (`event/agentMessage`) becomes its own
-`agent.reply@1` titled with its label. Its cursor and Coda's engine instance are stored;
+reply titled with its label (`agent.reply@2`, as Markdown, like a turn's text). Its cursor and Coda's engine instance are stored;
 after a messenger reconnect or a bridge restart against the same engine, the bridge fetches
 what it missed with `session/pendingMessages` (and says "Some background messages were
 lost." when Coda no longer has them). A background task's completion
@@ -330,7 +356,7 @@ at most 200 characters).
 | State | Label | When |
 |---|---|---|
 | `working` | the running tool as `<tool> <target>` (at most 60 characters), else `thinking` | a turn runs |
-| `waiting` | `approval needed` (permission, `/mode bypass`), `question`, `plan approval` | a card is open (the oldest one) |
+| `waiting` | `approval needed` (permission, `/mode bypass`, `/yolo`), `question`, `plan approval` | a card is open (the oldest one) |
 | `idle` | none | otherwise (sent once) |
 
 Working and waiting are sent when they change and again every 15 s.
@@ -367,8 +393,11 @@ Coda, and their answers to the owner's cards are ignored.
 
 ## 7. Cards
 
-Every request from Coda becomes a card in the owner's conversation, posted after the reply
-so far. A card waits **10 minutes**.
+Every request from Coda becomes a card in the owner's conversation. The reply so far gets
+its final state first (a running step shows as `pending`) and is not edited again; what
+the turn does after the answer goes into a new reply below the answer
+([turns](#6-behaviour)). Several requests in a row post their cards one after the other. A
+card waits **10 minutes**.
 
 | Coda request | Card | Answer back to Coda |
 |---|---|---|
@@ -378,7 +407,7 @@ so far. A card waits **10 minutes**.
 | `request/question` with no options or more than 10 | no card: a reply titled "Question" with the numbered options | typed text only |
 | `request/planApproval` | `agent.plan-approval@1`, title "Approve the plan?", the masked plan. A plan over 4,000 characters is cut with "(The plan is cut here; the full text follows.)" and follows in full as replies titled "Plan (1/N)" | Approve → `{approve: true}`; Reject, any typed text, or no answer → `{approve: false}` |
 
-**Typed answers** (the oldest open request): a permission or `/mode bypass` takes `yes` or
+**Typed answers** (the oldest open request): a permission or `/mode bypass` (`/yolo`) takes `yes` or
 `y` (any case) as approve and anything else as reject; a plan takes any text as reject. A
 question takes an option's label (any case) or its number; a multi-select also takes
 several, separated by commas. Other text is the answer when Coda allows free text (or there
@@ -405,7 +434,7 @@ was declined."
 
 Only the owner's commands run. Arguments are checked; a bad one is answered with the usage
 line (`Usage: /effort <low|medium|high|xhigh|max|auto>`). Command names are case-sensitive:
-`/NEW` goes to Coda as a prompt. Results come back as masked `agent.reply@1` text.
+`/NEW` goes to Coda as a prompt. Results come back as masked `agent.reply@1` text (plain, never Markdown).
 
 | Command | Effect |
 |---|---|
@@ -417,7 +446,8 @@ line (`Usage: /effort <low|medium|high|xhigh|max|auto>`). Command names are case
 | `/model [id]` | without an id `session/models`: the models and the current one; with an id `session/setModel` |
 | `/effort <low\|medium\|high\|xhigh\|max\|auto>` | `session/setEffort` |
 | `/mode <default\|acceptEdits\|plan>` | `session/setPermissionMode` |
-| `/mode bypass` | posts the approval card "Turn off approvals?" first; Approve → `bypassPermissions` ("Approvals are off until /new."). Reject or a timeout leave approvals on. `/new` resets it (and a bridge restart or `/cd` does too); `/status` shows it |
+| `/mode bypass` | posts the approval card "Turn off approvals?" first; Approve → `bypassPermissions` ("Approvals are off until /new."). Reject or a timeout leave approvals on. `/new` resets it (and a bridge restart, `/cd` or `/resume` does too); `/status` shows it |
+| `/yolo` | the same as `/mode bypass` (the name Coda's terminal uses): the same card first, the same reset and the same `/status` line. It takes no arguments; `/yolo <anything>` is answered with the usage line `Usage: /yolo` |
 | `/goal [text]` | `session/setGoal`; without text, clears the goal |
 | `/sessions` | `session/listSessions` for the current folder (up to 20) |
 | `/resume <id>` | resumes that session of the current folder (`initialize {sessionId}`); "No session <id> in this folder." otherwise. Not during a turn |
@@ -442,7 +472,7 @@ restarts."
 | Someone else controls the agent | Only text from `owner_user_id` (from the agent's own profile) in the owner's direct conversation reaches Coda. Only the owner's card answers count, checked by the bridge with `CardBook` (sender, card, offered values, deadline), since the server does not check who answers |
 | Key theft | A non-exportable P-256 key in the TPM (or the software provider, encrypted with the user's DPAPI keys); signing happens inside the provider and only the public key leaves it. Each assertion lives 120 s, has a new `jti` and is accepted once by auth-svc. `software-file` keys are plain files: development only |
 | Secrets leaving the machine | Everything sent is masked first (below) and capped. **Message history is stored on the server unencrypted**: bodies, cards and answers are plaintext to the server and its operators, and stay in the history |
-| Approval bypass from a stolen messenger session | `/mode bypass` needs a confirmation card; `default_permission_mode` cannot be `bypassPermissions`; `/new`, `/cd` and a bridge restart reset it; `/status` shows it |
+| Approval bypass from a stolen messenger session | `/mode bypass` (and `/yolo`) needs a confirmation card; `default_permission_mode` cannot be `bypassPermissions`; `/new`, `/cd` and a bridge restart reset it; `/status` shows it |
 | Folder escape | `/cd` and `default_folder` accept only real paths (after symlinks, junctions and `..`) inside a root, compared by path component (`C:\src2` is not inside `C:\src`) |
 | Command injection | Coda gets text over JSON-RPC, never through a shell; `coda serve` is started with its arguments as a list |
 | Credentials in Coda's hands | The bridge never sets `CODA_SERVE_API_KEY` (an LLM credential in Coda's engine) and removes it from Coda's environment; stdio needs no key |
