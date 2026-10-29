@@ -7,6 +7,7 @@ members = [
     "crates/push-agent-key",
     "crates/push-auth",
     "crates/push-auth-core",
+    "crates/push-bridge",
     "crates/push-credentials",
     "crates/push-domain",
     "crates/push-email",
@@ -67,6 +68,7 @@ redis = { version = "1", default-features = false, features = [
     "tokio-rustls-comp",
     "token-based-authentication",
 ] }
+regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
 ring = "0.17"
 # 0.32 links libsqlite3-sys 0.30, the version sqlx 0.8 names: two crates linking
