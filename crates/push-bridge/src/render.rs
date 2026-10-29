@@ -60,6 +60,8 @@ impl std::fmt::Debug for ReplyUpdate {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Status {
+    /// Running when its reply was sealed: it goes on in the next reply.
+    Pending,
     Running,
     Done,
     Failed,
@@ -68,6 +70,7 @@ enum Status {
 impl Status {
     fn as_str(self) -> &'static str {
         match self {
+            Self::Pending => "pending",
             Self::Running => "running",
             Self::Done => "done",
             Self::Failed => "failed",
@@ -75,6 +78,7 @@ impl Status {
     }
 }
 
+#[derive(Clone)]
 struct Step {
     /// The tool call's id; `None` for a task's step.
     id: Option<String>,
@@ -105,6 +109,12 @@ pub struct TurnRenderer {
     pages: Vec<Page>,
     /// Characters of the raw (cleaned, unmasked) text in final pages.
     final_raw: usize,
+    /// Bytes of `text` before the current segment (the replies since the last card).
+    segment_start: usize,
+    /// The page that shows the thinking: the first of the current segment.
+    thinking_page: usize,
+    /// Sealed for a card, and no output since: the open page is not sent.
+    held: bool,
     last_update: Instant,
     finished: bool,
 }
@@ -121,12 +131,19 @@ impl TurnRenderer {
             thinking: String::new(),
             pages: vec![Page::default()],
             final_raw: 0,
+            segment_start: 0,
+            thinking_page: 0,
+            held: false,
             last_update: now,
             finished: false,
         }
     }
 
     pub fn thinking(&mut self, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+        self.held = false;
         self.thinking.push_str(delta);
         // Keeps twice the tail, so masking sees whole secrets around the cut.
         let keep = 2 * THINKING_TAIL;
@@ -145,6 +162,7 @@ impl TurnRenderer {
         if delta.is_empty() {
             return;
         }
+        self.held = false;
         if self.break_before_text {
             self.break_before_text = false;
             self.new_line();
@@ -186,6 +204,7 @@ impl TurnRenderer {
         if let Some(step) = step {
             step.status = if failed { Status::Failed } else { Status::Done };
             step.detail = Some(duration(now.saturating_duration_since(step.started)));
+            self.held = false;
         }
     }
 
@@ -204,6 +223,7 @@ impl TurnRenderer {
 
     /// Appends `text` to the reply's text on its own line, e.g. "(Coda stopped; restarting)".
     pub fn note(&mut self, text: &str) {
+        self.held = false;
         self.new_line();
         self.text.push_str(text);
         self.break_before_text = true;
@@ -219,6 +239,9 @@ impl TurnRenderer {
         }
         let mut updates = Vec::new();
         let open = self.split(&mut updates);
+        if self.held {
+            return updates;
+        }
         let page = self.pages.len() - 1;
         let body = self.render(page, &open);
         let sent = &mut self.pages[page].sent;
@@ -239,6 +262,11 @@ impl TurnRenderer {
             return Vec::new();
         }
         self.finished = true;
+        if self.held {
+            // Nothing came after the card: its reply stays as sealed, and no empty one
+            // follows.
+            return Vec::new();
+        }
         if interrupted {
             self.new_line();
             self.text.push_str("(stopped)");
@@ -263,6 +291,49 @@ impl TurnRenderer {
         updates
     }
 
+    /// A card is about to be posted: the open reply gets its final state now (a step still
+    /// running shows as pending) and is not edited again. The next output (thinking, a
+    /// step, text, a note) starts a new reply below the card, where the running steps go on;
+    /// with none, nothing more is sent. Sealing again before any output does nothing.
+    pub fn seal(&mut self) -> Vec<ReplyUpdate> {
+        if self.finished || self.held {
+            return Vec::new();
+        }
+        let mut updates = Vec::new();
+        let open = self.split(&mut updates);
+        let page = self.pages.len() - 1;
+        let running: Vec<Step> = self.pages[page]
+            .steps
+            .iter()
+            .filter(|step| step.status == Status::Running)
+            .cloned()
+            .collect();
+        for step in &mut self.pages[page].steps {
+            if step.status == Status::Running {
+                step.status = Status::Pending;
+            }
+        }
+        self.pages[page].text = Some(open.clone());
+        let body = self.render(page, &open);
+        let sent = &mut self.pages[page].sent;
+        if sent.as_deref() != Some(body.as_str()) {
+            let new = sent.is_none();
+            *sent = Some(body.clone());
+            updates.push(ReplyUpdate { page, body, new });
+        }
+        self.final_raw = clean(&self.text, true).chars().count();
+        self.segment_start = self.text.len();
+        self.break_before_text = false;
+        self.thinking.clear();
+        self.pages.push(Page {
+            steps: running,
+            ..Page::default()
+        });
+        self.thinking_page = self.pages.len() - 1;
+        self.held = true;
+        updates
+    }
+
     /// The activity label: the latest running tool as `<tool> <target>`, else "thinking".
     pub fn current_label(&self) -> String {
         self.pages
@@ -276,12 +347,13 @@ impl TurnRenderer {
     }
 
     fn new_line(&mut self) {
-        if !self.text.is_empty() && !self.text.ends_with('\n') {
+        if self.text.len() > self.segment_start && !self.text.ends_with('\n') {
             self.text.push('\n');
         }
     }
 
     fn push_step(&mut self, step: Step) {
+        self.held = false;
         let steps = &mut self.pages.last_mut().expect("a renderer has a page").steps;
         steps.push(step);
         if steps.len() > MAX_STEPS {
@@ -331,7 +403,7 @@ impl TurnRenderer {
 
     fn render(&self, page: usize, open: &str) -> String {
         let text = self.pages[page].text.as_deref().unwrap_or(open);
-        let thinking = if page == 0 {
+        let thinking = if page == self.thinking_page {
             let all: Vec<char> = mask(&clean(&self.thinking, true)).chars().collect();
             let tail: String = all[all.len().saturating_sub(THINKING_TAIL)..]
                 .iter()
@@ -1027,5 +1099,53 @@ pub(crate) mod tests {
         assert_eq!(duration(secs(59.99)), "59.9 s");
         assert_eq!(duration(secs(120.0)), "2 min");
         assert_eq!(duration(secs(3_725.0)), "1 h 2 min");
+    }
+
+    #[test]
+    fn a_seal_ends_the_reply_and_the_next_output_starts_another() {
+        let t0 = Instant::now();
+        let mut renderer = TurnRenderer::new(t0, None);
+        renderer.poll(t0);
+        renderer.thinking("Plan A");
+        renderer.text("Checking.");
+        renderer.tool_started("1", "Bash", "date", None, t0);
+        let sealed = renderer.seal();
+        assert_eq!(sealed.len(), 1);
+        assert_eq!((sealed[0].page, sealed[0].new), (0, false));
+        let first = reply(&sealed[0]);
+        assert_eq!(param(&first, "text").as_deref(), Some("Checking."));
+        assert_eq!(param(&first, "thinking").as_deref(), Some("Plan A"));
+        assert_eq!(steps(&first)[0].1, "pending");
+        assert!(renderer.seal().is_empty(), "a second card adds nothing");
+        assert!(renderer.poll(t0 + secs(5.0)).is_empty());
+
+        renderer.thinking("Plan B");
+        renderer.tool_finished("1", false, t0 + secs(3.0));
+        renderer.text("Done.");
+        let updates = renderer.poll(t0 + secs(5.0));
+        assert_eq!(updates.len(), 1);
+        assert_eq!((updates[0].page, updates[0].new), (1, true));
+        let second = reply(&updates[0]);
+        assert_eq!(param(&second, "text").as_deref(), Some("Done."));
+        assert_eq!(param(&second, "thinking").as_deref(), Some("Plan B"));
+        assert_eq!(
+            steps(&second),
+            [(
+                "Bash date".to_owned(),
+                "done".to_owned(),
+                Some("3.0 s".to_owned())
+            )]
+        );
+        assert!(renderer.finish(false).is_empty());
+    }
+
+    #[test]
+    fn a_turn_that_ends_sealed_sends_nothing_more() {
+        let t0 = Instant::now();
+        let mut renderer = TurnRenderer::new(t0, None);
+        renderer.poll(t0);
+        renderer.text("Asking.");
+        renderer.seal();
+        assert!(renderer.finish(true).is_empty());
     }
 }

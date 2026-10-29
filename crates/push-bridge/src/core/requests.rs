@@ -33,8 +33,9 @@ impl<M: Messenger> Core<M> {
     /// Posts the card and its follow-ups and waits for the owner; `responder` is `None`
     /// for `/mode bypass`.
     pub(super) async fn post_card(&mut self, plan: CardPlan, responder: Option<Responder>) {
-        // The reply so far comes first, so the card follows what led to it.
-        self.poll_turn();
+        // The reply so far gets its final state first, so the card follows what led to
+        // it and what comes after the owner's answer goes into a new reply below it.
+        self.seal_turn();
         let card = match &plan.card {
             Some(body) => match self.messenger.send_rich(self.conversation, body) {
                 Ok(id) => Some(id),

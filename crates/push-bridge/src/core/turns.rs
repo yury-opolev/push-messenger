@@ -96,6 +96,15 @@ impl<M: Messenger> Core<M> {
         }
     }
 
+    /// Ends the running turn's open reply before a card (see [`TurnRenderer::seal`]).
+    pub(super) fn seal_turn(&mut self) {
+        if let Some(mut turn) = self.turn.take() {
+            let updates = turn.renderer.seal();
+            self.apply(&mut turn.pages, updates);
+            self.turn = Some(turn);
+        }
+    }
+
     /// Sends new pages and edits old ones.
     pub(super) fn apply(&self, pages: &mut Vec<Option<ClientMsgId>>, updates: Vec<ReplyUpdate>) {
         for update in updates {
