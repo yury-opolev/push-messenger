@@ -6,9 +6,11 @@ Starts push-agent-bridge at logon: registers a Scheduled Task for the current us
 The task runs `<Exe> --dir "<Dir>" run` when the current user logs on, as that user,
 without elevation, restarts it every minute after a failure (up to 999 times) and has
 no time limit. Run `push-agent-bridge --dir <Dir> keygen` and `enroll --code <code>`
-first. The bridge is a console program: the task runs it in the user's session, so
-its console window shows while it runs (closing the window stops the bridge until the
-task restarts it).
+first. The bridge is a console program: the task runs it hidden, through
+`%SystemRoot%\System32\conhost.exe --headless "<Exe>" --dir "<Dir>" run`, so no console
+window shows; the bridge writes to its log. Where conhost.exe is missing the task runs
+<Exe> directly (the script says so), and its console window shows while it runs
+(closing the window stops the bridge until the task restarts it).
 
 Works with Windows PowerShell 5.1 and PowerShell 7.
 
@@ -67,7 +69,15 @@ if ($null -ne $existing -and -not $Force) {
     exit 1
 }
 
-$action = New-ScheduledTaskAction -Execute $Exe -Argument ('--dir "{0}" run' -f $Dir) -WorkingDirectory $Dir
+$arguments = '--dir "{0}" run' -f $Dir
+# conhost --headless gives the console program its console without a window.
+$conhost = Join-Path $env:SystemRoot 'System32\conhost.exe'
+if (Test-Path -LiteralPath $conhost -PathType Leaf) {
+    $action = New-ScheduledTaskAction -Execute $conhost -Argument ('--headless "{0}" {1}' -f $Exe, $arguments) -WorkingDirectory $Dir
+} else {
+    Write-Host "No $conhost; the task runs $Exe directly, so its console window shows."
+    $action = New-ScheduledTaskAction -Execute $Exe -Argument $arguments -WorkingDirectory $Dir
+}
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
 $settings = New-ScheduledTaskSettingsSet `
