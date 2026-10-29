@@ -31,6 +31,8 @@ const ACTIVITY_LABEL: usize = 60;
 const TASK_PREFIX: usize = 30;
 /// A page break looks this far back for a line break or a space.
 const BREAK_WINDOW: usize = 200;
+/// Page breaks a turn's text tries before it takes one that is not clean.
+const MAX_BREAK_TRIES: usize = 64;
 /// What an empty text shows.
 const EMPTY: &str = "…";
 
@@ -101,8 +103,8 @@ pub struct TurnRenderer {
     break_before_text: bool,
     thinking: String,
     pages: Vec<Page>,
-    /// Characters of the masked text in final pages.
-    final_chars: usize,
+    /// Characters of the raw (cleaned, unmasked) text in final pages.
+    final_raw: usize,
     last_update: Instant,
     finished: bool,
 }
@@ -118,7 +120,7 @@ impl TurnRenderer {
             break_before_text: false,
             thinking: String::new(),
             pages: vec![Page::default()],
-            final_chars: 0,
+            final_raw: 0,
             last_update: now,
             finished: false,
         }
@@ -291,16 +293,22 @@ impl TurnRenderer {
         }
     }
 
-    /// Masks the whole text, makes every full page final (its final body goes to
-    /// `updates`; its running steps move on to the next page) and returns the open page's
-    /// text.
+    /// Makes every full page final (its final body goes to `updates`; its running steps
+    /// move on to the next page) and returns the open page's text. Pages are cut in the raw
+    /// text and each is masked on its own: a final page is `mask(its raw text)`, the open
+    /// page `mask(the raw text after the final pages)`, so text that arrives later never
+    /// changes, loses or repeats a final page's text (see [`raw_page_break`]).
     fn split(&mut self, updates: &mut Vec<ReplyUpdate>) -> String {
-        let all: Vec<char> = mask(&clean(&self.text, true)).chars().collect();
-        let mut open = all.get(self.final_chars..).unwrap_or_default();
-        while open.len() > TEXT_PAGE {
-            let at = page_break(open, TEXT_PAGE);
+        let all: Vec<char> = clean(&self.text, true).chars().collect();
+        loop {
+            let rest = all.get(self.final_raw..).unwrap_or_default();
+            let open = mask(&string(rest));
+            if open.chars().count() <= TEXT_PAGE {
+                return open;
+            }
+            let at = raw_page_break(rest);
             let page = self.pages.len() - 1;
-            let text: String = open[..at].iter().collect();
+            let text = mask(&string(&rest[..at]));
             let (running, done) = std::mem::take(&mut self.pages[page].steps)
                 .into_iter()
                 .partition(|step| step.status == Status::Running);
@@ -317,10 +325,8 @@ impl TurnRenderer {
                 steps: running,
                 ..Page::default()
             });
-            self.final_chars += at;
-            open = &open[at..];
+            self.final_raw += at;
         }
-        open.iter().collect()
     }
 
     fn render(&self, page: usize, open: &str) -> String {
@@ -347,6 +353,78 @@ impl TurnRenderer {
             .collect();
         reply_body(self.title.as_deref(), text, thinking.as_deref(), &steps)
     }
+}
+
+/// Where a final page of the raw (cleaned, unmasked) open text `rest` ends; `rest`
+/// masked is longer than a page.
+///
+/// A page is final the moment it is cut and is masked on its own, so the cut must not fall
+/// inside a secret. A cut goes after a whitespace character, never inside a run of other
+/// characters: after a line break in the page's last [`BREAK_WINDOW`] characters, else
+/// after a space there, else after any whitespace earlier in the page (latest first). Of
+/// these (at most [`MAX_BREAK_TRIES`]), the first where
+/// - the page masked fits [`TEXT_PAGE`] characters (a mask can be longer than what it
+///   hides, as in `pwd=x`);
+/// - something other than whitespace follows (so a `password: ` or `Bearer ` ending the
+///   page already shows its value), and no secret pattern spans the cut: masking both
+///   sides apart gives what masking them together gives;
+/// - the page holds no `-----BEGIN` without its `-----END` (a key block still arriving).
+///
+/// When none passes, the latest cut whose masked page fits. When no cut fits (a page
+/// without whitespace: a run longer than a page), the page is cut at [`TEXT_PAGE`], or
+/// earlier until the masked page fits: each part is masked on its own, so a hex or base64
+/// secret that long is still masked in both, unless the second part is shorter than the
+/// 40 characters that mark one.
+fn raw_page_break(rest: &[char]) -> usize {
+    let size = TEXT_PAGE.min(rest.len());
+    let window = size - BREAK_WINDOW.min(size);
+    let newlines = (window + 1..=size).rev().filter(|&at| rest[at - 1] == '\n');
+    let spaces = (window + 1..=size)
+        .rev()
+        .filter(|&at| rest[at - 1] != '\n' && rest[at - 1].is_whitespace());
+    let earlier = (1..=window)
+        .rev()
+        .filter(|&at| rest[at - 1].is_whitespace());
+    let mut fallback = None;
+    for at in newlines.chain(spaces).chain(earlier).take(MAX_BREAK_TRIES) {
+        if mask(&string(&rest[..at])).chars().count() > TEXT_PAGE {
+            continue;
+        }
+        if clean_cut(rest, at) {
+            return at;
+        }
+        fallback.get_or_insert(at);
+    }
+    if let Some(at) = fallback {
+        return at;
+    }
+    let mut at = size;
+    loop {
+        let len = mask(&string(&rest[..at])).chars().count();
+        if len <= TEXT_PAGE || at == 1 {
+            return at;
+        }
+        at -= (len - TEXT_PAGE).min(at - 1);
+    }
+}
+
+/// No secret spans a cut of `rest` at `at`, as far as the text so far shows.
+fn clean_cut(rest: &[char], at: usize) -> bool {
+    let page = string(&rest[..at]);
+    let next = string(&rest[at..rest.len().min(at + TEXT_PAGE)]);
+    if next.trim().is_empty() {
+        return false;
+    }
+    if let Some(begin) = page.rfind("-----BEGIN") {
+        if !page[begin..].contains("-----END") {
+            return false;
+        }
+    }
+    mask(&format!("{page}{next}")) == mask(&page) + &mask(&next)
+}
+
+fn string(chars: &[char]) -> String {
+    chars.iter().collect()
 }
 
 /// `agent.reply@1` bodies for `text` (masked, then split into pages of [`TEXT_PAGE`]
@@ -723,6 +801,110 @@ pub(crate) mod tests {
         let finals = renderer.finish(false);
         assert!(finals.is_empty());
         assert!(renderer.poll(t0 + secs(10.0)).is_empty());
+    }
+
+    /// Streams `chunks`, polling after each, then finishes; returns every update's page
+    /// and text, and each page's last text.
+    fn stream(chunks: &[String]) -> (Vec<(usize, String)>, Vec<String>) {
+        let t0 = Instant::now();
+        let mut renderer = TurnRenderer::new(t0, None);
+        let mut updates = renderer.poll(t0);
+        for (i, chunk) in chunks.iter().enumerate() {
+            renderer.text(chunk);
+            updates.extend(renderer.poll(t0 + secs(3.0 * (i + 1) as f64)));
+        }
+        updates.extend(renderer.finish(false));
+        let texts: Vec<(usize, String)> = updates
+            .iter()
+            .map(|u| (u.page, param(&reply(u), "text").unwrap()))
+            .collect();
+        let pages = texts.iter().map(|(page, _)| page + 1).max().unwrap_or(0);
+        let last = (0..pages)
+            .map(|page| {
+                texts
+                    .iter()
+                    .rev()
+                    .find(|(p, _)| *p == page)
+                    .map(|(_, text)| text.clone())
+                    .unwrap()
+            })
+            .collect();
+        (texts, last)
+    }
+
+    fn hex_run(text: &str) -> bool {
+        text.chars()
+            .collect::<Vec<_>>()
+            .windows(4)
+            .any(|w| w.iter().all(|c| c.is_ascii_hexdigit()))
+    }
+
+    #[test]
+    fn a_hex_token_across_a_page_break_never_shows_in_a_final_page() {
+        let filler = "xyz ".repeat(925);
+        let hex = "0123456789abcdef".repeat(4);
+        let chunks = [
+            filler,
+            format!("{}{}", "=".repeat(262), &hex[..39]),
+            format!("{} done", &hex[39..]),
+        ];
+        let (_, pages) = stream(&chunks);
+        assert_eq!(pages.len(), 2);
+        for page in &pages {
+            assert!(!hex_run(page), "{page}");
+            assert!(page.chars().count() <= TEXT_PAGE);
+        }
+        assert!(pages[1].ends_with("«masked» done"), "{}", pages[1]);
+    }
+
+    #[test]
+    fn a_key_block_arriving_across_a_page_break_is_masked_and_nothing_is_lost() {
+        let chunks = [
+            "xyz ".repeat(995),
+            "-----BEGIN OPENSSH PRIV".to_owned(),
+            "ATE KEY-----\n".to_owned(),
+            "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\n".to_owned(),
+            "QyNTUxOQAAACD\n".to_owned(),
+            "-----END OPENSSH PRIVATE KEY-----\nafter\n".to_owned(),
+        ];
+        let (updates, pages) = stream(&chunks);
+        for (_, text) in &updates {
+            assert!(!text.contains("b3Bl") && !text.contains("QyNT"), "{text}");
+        }
+        assert_eq!(pages.concat(), mask(&chunks.concat()));
+        assert!(pages.concat().ends_with("«masked»\nafter\n"));
+    }
+
+    #[test]
+    fn streamed_pages_lose_and_repeat_nothing() {
+        let line = |i: usize| {
+            format!(
+                "line {i}: api_key=k{i} pwd=x sha {}{i:04} and some words\n",
+                "f".repeat(40)
+            )
+        };
+        let text: String = (0..400).map(line).collect();
+        let chunks: Vec<String> = text
+            .chars()
+            .collect::<Vec<_>>()
+            .chunks(37)
+            .map(|chunk| chunk.iter().collect())
+            .collect();
+        let (updates, pages) = stream(&chunks);
+        assert!(pages.len() > 2);
+        for (_, text) in &updates {
+            assert!(text.chars().count() <= TEXT_PAGE);
+        }
+        assert_eq!(pages.concat(), mask(&text));
+
+        let plain: String = (0..2_000).map(|i| format!("w{i} ")).collect();
+        let chunks: Vec<String> = plain
+            .chars()
+            .collect::<Vec<_>>()
+            .chunks(53)
+            .map(|chunk| chunk.iter().collect())
+            .collect();
+        assert_eq!(stream(&chunks).1.concat(), plain);
     }
 
     #[test]

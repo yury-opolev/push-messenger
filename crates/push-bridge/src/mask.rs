@@ -19,12 +19,25 @@ macro_rules! secret_word {
     };
 }
 
-/// A value after a name: a quoted string up to its closing quote (or the line's end), or
+/// A quoted value up to its closing quote (or the line's end); a backslash escapes the
+/// next character, so `"p\"ss w0rd"` is one value.
+macro_rules! quoted_value {
+    () => {
+        r#""(?:[^"\\\r\n]|\\.)*"?|'(?:[^'\\\r\n]|\\.)*'?"#
+    };
+}
+
+/// A value after a name: a quoted string ([`quoted_value!`]), a string quoted with escaped
+/// quotes inside a quoted string (`\"hunter2\"` in `"{\"password\":\"hunter2\"}"`), or
 /// an unquoted run up to whitespace, `;`, `,`, `&`, `}` or `)`. An unquoted value never
 /// starts with `=`, `:` or `>`, so `a == b`, `Type::path` and `key => value` are no pairs.
 macro_rules! value {
     () => {
-        r#"(?P<value>"[^"\r\n]*"?|'[^'\r\n]*'?|[^\s;,&})"'=:>][^\s;,&})]*)"#
+        concat!(
+            "(?P<value>",
+            quoted_value!(),
+            r#"|\\"(?:[^"\\]|\\[^"])*(?:\\")?|[^\s;,&})"'=:>][^\s;,&})]*)"#,
+        )
     };
 }
 
@@ -53,13 +66,14 @@ static CONNECTION_STRING: LazyLock<Regex> = LazyLock::new(|| {
 static SAS_SIGNATURE: LazyLock<Regex> =
     LazyLock::new(|| regex(r#"(?i)(?P<name>[?&]sig=)[^&\s"'#]+"#));
 
-/// `name=value`, `name: value`, `"name": "value"`, `'name'='value'` whose name is an
-/// identifier (no spaces: `token count: 12` is no pair) containing a secret word.
+/// `name=value`, `name: value`, `name := value`, `"name": "value"`, `'name'='value'`,
+/// `\"name\":\"value\"` whose name is an identifier (no spaces: `token count: 12` is no
+/// pair) containing a secret word.
 static PAIR: LazyLock<Regex> = LazyLock::new(|| {
     regex(concat!(
-        r#"(?i)(?P<name>["']?[A-Za-z0-9_.-]*"#,
+        r#"(?i)(?P<name>\\?["']?[A-Za-z0-9_.-]*"#,
         secret_word!(),
-        r#"[A-Za-z0-9_.-]*["']?)(?P<delimiter>[ \t]*[=:][ \t]*)"#,
+        r#"[A-Za-z0-9_.-]*\\?["']?)(?P<delimiter>[ \t]*(?::=|[=:])[ \t]*)"#,
         value!(),
     ))
 });
@@ -70,7 +84,9 @@ static FLAG: LazyLock<Regex> = LazyLock::new(|| {
     regex(concat!(
         r"(?i)(?P<name>--[A-Za-z0-9_-]*",
         secret_word!(),
-        r#"[A-Za-z0-9_-]*)(?P<delimiter>[ \t]+)(?P<value>"[^"\r\n]*"?|'[^'\r\n]*'?|[^\s"'-]\S*)"#,
+        r#"[A-Za-z0-9_-]*)(?P<delimiter>[ \t]+)(?P<value>"#,
+        quoted_value!(),
+        r#"|[^\s"'-]\S*)"#,
     ))
 });
 
@@ -117,21 +133,21 @@ fn replace<'t>(
     }
 }
 
-/// Keeps the name, the delimiter and a quoted value's quotes; masks the value.
+/// Keeps the name, the delimiter and a quoted value's quotes (escaped or not); masks the
+/// value.
 fn mask_value(caps: &Captures<'_>) -> String {
     let value = &caps["value"];
-    let (open, close) = match value.chars().next() {
-        Some(quote @ ('"' | '\'')) => {
-            let closed = value.len() > 1 && value.ends_with(quote);
-            (Some(quote), closed.then_some(quote))
+    let quote = ["\\\"", "\"", "'"]
+        .into_iter()
+        .find(|quote| value.starts_with(quote));
+    let (open, close) = match quote {
+        Some(quote) => {
+            let closed = value.len() > quote.len() && value.ends_with(quote);
+            (quote, if closed { quote } else { "" })
         }
-        _ => (None, None),
+        None => ("", ""),
     };
-    let mut masked = format!("{}{}", &caps["name"], &caps["delimiter"]);
-    masked.extend(open);
-    masked.push_str(MASK);
-    masked.extend(close);
-    masked
+    format!("{}{}{open}{MASK}{close}", &caps["name"], &caps["delimiter"])
 }
 
 /// A base64 run is masked, unless it is a path: long Unix and relative paths
@@ -299,6 +315,63 @@ mod tests {
     }
 
     #[test]
+    fn an_escaped_json_pair_is_masked() {
+        masks(
+            r#"curl -d "{\"password\":\"hunter2\"}" https://x"#,
+            r#"curl -d "{\"password\":\"«masked»\"}" https://x"#,
+        );
+        masks(
+            r#"echo "{\"api_key\": \"two words\", \"id\": 1}""#,
+            r#"echo "{\"api_key\": \"«masked»\", \"id\": 1}""#,
+        );
+    }
+
+    #[test]
+    fn a_go_short_variable_declaration_is_masked() {
+        masks(r#"apiKey := "sk-live-abc""#, r#"apiKey := "«masked»""#);
+        masks("token:=abc next", "token:=«masked» next");
+    }
+
+    #[test]
+    fn a_quoted_value_with_escaped_quotes_is_masked_whole() {
+        masks(
+            r#"{"password": "p\"ss w0rd"}"#,
+            r#"{"password": "«masked»"}"#,
+        );
+        masks(r"pwd='it\'s secret' x", r"pwd='«masked»' x");
+        masks(
+            r#"tool --password "p\"ss w0rd" x"#,
+            r#"tool --password "«masked»" x"#,
+        );
+    }
+
+    #[test]
+    fn common_secret_forms_are_masked() {
+        masks(
+            "password: hunter2\nuser: me",
+            "password: «masked»\nuser: me",
+        );
+        masks("set API_KEY=abc123", "set API_KEY=«masked»");
+        masks(
+            r#"$env:GITHUB_TOKEN = "ghp_x""#,
+            r#"$env:GITHUB_TOKEN = "«masked»""#,
+        );
+        masks(
+            "https://x/y?token=abc&z=1",
+            "https://x/y?token=«masked»&z=1",
+        );
+        masks(
+            "a\n-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjE\nQyNTUxOQ\n-----END OPENSSH PRIVATE KEY-----\nb",
+            "a\n«masked»\nb",
+        );
+        masks("x --password hunter2", "x --password «masked»");
+        masks(
+            "Authorization: Bearer abc.def",
+            "Authorization: Bearer «masked»",
+        );
+    }
+
+    #[test]
     fn a_long_flag_naming_a_secret_masks_its_value() {
         masks(
             "tool --password hunter2 --verbose",
@@ -373,6 +446,7 @@ mod tests {
             "SecretStore::load(&self, key)",
             "match key => value",
             "if key == other {",
+            "count := len(items)",
         ] {
             keeps(input);
         }
