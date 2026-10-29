@@ -318,7 +318,12 @@ impl TurnRenderer {
         }
         let mut updates = Vec::new();
         self.split(&mut updates);
-        let rest = self.open_raw();
+        let mut rest = self.open_raw();
+        // The fence it may have to close can take the page past its size.
+        while self.framed(&rest).chars().count() > TEXT_PAGE {
+            self.cut(&rest, &mut updates);
+            rest = self.open_raw();
+        }
         let text = self.framed(&rest);
         let page = self.pages.len() - 1;
         let running: Vec<Step> = self.pages[page]
@@ -341,6 +346,8 @@ impl TurnRenderer {
             updates.push(ReplyUpdate { page, body, new });
         }
         self.advance(&rest);
+        // The next segment starts a new reply, on a line of its own.
+        self.final_at_line_start = true;
         self.segment_start = self.text.len();
         self.break_before_text = false;
         self.thinking.clear();
@@ -399,27 +406,33 @@ impl TurnRenderer {
             if open.chars().count() <= TEXT_PAGE {
                 return open;
             }
-            let at = raw_page_break(&rest, &|at| self.framed(&rest[..at]).chars().count());
-            let page = self.pages.len() - 1;
-            let text = self.framed(&rest[..at]);
-            let (running, done) = std::mem::take(&mut self.pages[page].steps)
-                .into_iter()
-                .partition(|step| step.status == Status::Running);
-            self.pages[page].steps = done;
-            self.pages[page].text = Some(text.clone());
-            let body = self.render(page, &text);
-            let sent = &mut self.pages[page].sent;
-            if sent.as_deref() != Some(body.as_str()) {
-                let new = sent.is_none();
-                *sent = Some(body.clone());
-                updates.push(ReplyUpdate { page, body, new });
-            }
-            self.pages.push(Page {
-                steps: running,
-                ..Page::default()
-            });
-            self.advance(&rest[..at]);
+            self.cut(&rest, updates);
         }
+    }
+
+    /// Makes a full page of `rest` (the raw text after the final pages) final; its running
+    /// steps move on to the next page.
+    fn cut(&mut self, rest: &[char], updates: &mut Vec<ReplyUpdate>) {
+        let at = raw_page_break(rest, &|at| self.framed(&rest[..at]).chars().count());
+        let page = self.pages.len() - 1;
+        let text = self.framed(&rest[..at]);
+        let (running, done) = std::mem::take(&mut self.pages[page].steps)
+            .into_iter()
+            .partition(|step| step.status == Status::Running);
+        self.pages[page].steps = done;
+        self.pages[page].text = Some(text.clone());
+        let body = self.render(page, &text);
+        let sent = &mut self.pages[page].sent;
+        if sent.as_deref() != Some(body.as_str()) {
+            let new = sent.is_none();
+            *sent = Some(body.clone());
+            updates.push(ReplyUpdate { page, body, new });
+        }
+        self.pages.push(Page {
+            steps: running,
+            ..Page::default()
+        });
+        self.advance(&rest[..at]);
     }
 
     /// The raw (cleaned, unmasked) text after the final pages.
@@ -1467,5 +1480,49 @@ pub(crate) mod tests {
             param(&second, "text").as_deref(),
             Some("```py\nprint(2)\n```\nDone.")
         );
+    }
+
+    #[test]
+    fn a_seal_of_a_full_page_inside_a_fence_still_fits() {
+        let t0 = Instant::now();
+        let mut renderer = TurnRenderer::new(t0, None).with_format(TextFormat::Markdown);
+        renderer.poll(t0);
+        renderer.text(&format!("```sh\n{}ab", "echo 12345678\n".repeat(285)));
+        let open = renderer.poll(t0 + secs(3.0));
+        assert_eq!(open.len(), 1, "the open page fits");
+        assert_eq!(open[0].page, 0);
+        let updates = renderer.seal();
+        assert!(!updates.is_empty());
+        for update in &updates {
+            let page = param(&valid(&update.body, "agent.reply@2"), "text").unwrap();
+            assert!(
+                page.chars().count() <= TEXT_PAGE,
+                "{}",
+                page.chars().count()
+            );
+            assert_eq!(fence_after(None, &page, true), None);
+        }
+    }
+
+    #[test]
+    fn a_fence_that_opens_the_reply_after_a_card_is_seen() {
+        let t0 = Instant::now();
+        let mut renderer = TurnRenderer::new(t0, None).with_format(TextFormat::Markdown);
+        renderer.poll(t0);
+        renderer.text("Running it:");
+        renderer.seal();
+        renderer.text(&format!("```sh\n{}```\nok", "echo 12345678\n".repeat(400)));
+        let updates = renderer.finish(false);
+        assert!(updates.len() >= 2);
+        for (i, update) in updates.iter().enumerate() {
+            let page = param(&valid(&update.body, "agent.reply@2"), "text").unwrap();
+            assert_eq!(fence_after(None, &page, true), None, "page {i}");
+            if i > 0 {
+                assert!(
+                    page.starts_with("```sh\n"),
+                    "page {i} opens the fence again"
+                );
+            }
+        }
     }
 }
