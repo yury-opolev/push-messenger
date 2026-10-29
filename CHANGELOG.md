@@ -6,6 +6,48 @@ Notable changes for consumers of push-messenger. Newest first.
 
 ### Added
 
+- **Agent bridge with a Coda backend**: `push-agent-bridge` (new crate `push-bridge`)
+  reaches a local AI coding agent from push-messenger as a private agent contact. Guide:
+  [docs/agent-bridge.md](docs/agent-bridge.md) (setup on Windows, commands, security
+  model, troubleshooting, live smoke checklist).
+  - A backend-independent core: agent-key sign-in with the OS key, the owner gate ("This
+    agent is private." to anyone else, at most once per sender per hour), one
+    `agent.reply@1` per turn (thinking, up to 50 steps, text paged at 4,000 characters,
+    edits at most every 2 s, "(stopped)"), cards for the agent's requests with the
+    owner's answers checked by the bridge and a 10-minute deadline ("No answer;
+    skipped"), activity (working, waiting, idle), secret masking and caps on everything
+    sent, the owner's `/` commands (`/new`, `/cd` inside configured roots, `/stop`,
+    `/status`, `/mode bypass` behind a confirmation card, …), sessions per folder, and
+    restarts with backoff (1 s to 60 s). A small `Backend` trait with typed events and
+    capabilities; a `TestBackend` runs the core without Coda.
+  - The Coda backend drives `coda serve` (JSON-RPC 2.0 over stdio): prompts, steering,
+    permission, question and plan requests, background messages and task completions,
+    and Coda's session, model, effort, mode, goal, task, schedule and skill commands. It
+    never sets `CODA_SERVE_API_KEY`.
+  - `config.json`, `state.json` (no secrets) and a JSON-lines log without bodies or
+    tokens in `%LOCALAPPDATA%\push-messenger\coda-bridge` (or `--dir`); commands `keygen`,
+    `thumbprint`, `enroll --code`, `run`, `status`; `scripts\install.ps1` and
+    `uninstall.ps1` register and remove a logon Scheduled Task that restarts on failure.
+- **push-sdk: agent-key sign-in through a signer**
+  ([guide](docs/agent-key-sign-in.md#from-push-sdk-rust)).
+  `Client::enroll_with_agent_key` and `Client::sign_in_with_agent_key` take an
+  `AgentSigner` the app supplies, so the private key stays in OS key storage: the SDK
+  builds the claims (`aud`, `iat`, `exp = iat + 120`, a new `jti` for every request) and
+  the signer returns the compact JWS. Helpers: `AgentClaims`, `AgentPublicKey::thumbprint`
+  (RFC 7638), `assemble_assertion`. A failing signer is the new `SdkError::Signer`, code
+  `signer` (not retryable; the key provider's code, never key material). Rust only: the C
+  and Node bindings do not expose it yet.
+- **push-sdk: `CardBook`**, which checks answers to the cards an app sent: from the card's
+  owner, in its conversation, naming the card, with offered values only, before its
+  deadline (the server does not check who answers). Rust only.
+- **`push-agent-key`** (new crate): agent-key signers. `cng::CngKey` keeps a persisted,
+  non-exportable P-256 key in Windows key storage, in the TPM (Microsoft Platform Crypto
+  Provider) when it can and otherwise in the Microsoft Software Key Storage Provider;
+  `software::SoftwareKey` keeps the key in a PKCS#8 file, for tests and development only.
+- **Built-in templates `agent.choose@1`** (multiple choice, 1 to 10 of up to 10 options)
+  **and `agent.plan-approval@1`** (a plan of up to 4,000 characters with Approve plan and
+  Reject), for owned agents ([definitions](docs/rich-messages.md#6-built-in-templates)).
+  message-svc seeds them as approved at its next start; nothing else to do.
 - **Live activity and presence** (REQUEST PUSH feature 12). Guide:
   [docs/activity-presence.md](docs/activity-presence.md) (frames, rules, multi-replica
   design, agent recipe).

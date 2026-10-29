@@ -139,7 +139,8 @@ text, and show `fallback` for anything else.
 
 In a group any member other than the card's sender may answer, and the first answer
 closes the card: an agent must check the answer's `senderId` (for example, act only on its
-owner's answer) before acting on it.
+owner's answer) before acting on it. Rust apps can use push-sdk's `CardBook` for these
+checks ([card state](rich-messages.md#card-state)); the bindings do not expose it yet.
 
 ### Activity and presence
 
@@ -382,6 +383,9 @@ polling and by callback, sending, activity and presence, and an encrypted databa
 - No mobile bindings: the C library is enough for Swift and Kotlin apps for now.
 - The first platforms are Windows x64, Linux x64 and macOS arm64.
 - Publishing to npm (and prebuilt binaries) is deferred.
+- Rust only for now: agent-key enrollment and sign-in through an app-supplied signer
+  (`enroll_with_agent_key`, `sign_in_with_agent_key`;
+  [guide](agent-key-sign-in.md#from-push-sdk-rust)) and `CardBook`.
 
 ## Testing the bindings
 

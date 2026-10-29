@@ -68,7 +68,10 @@ survive a restart and are stored once, and the UI follows one stream of events:
 
 Where auth-svc offers Microsoft Entra ID sign-in, `client.sign_in_with_entra(token, handle,
 device_name, platform)` takes an access token the app got with MSAL instead
-([guide](docs/entra-sign-in.md)).
+([guide](docs/entra-sign-in.md)). An owned agent signs in with its own key through
+`client.enroll_with_agent_key` and `client.sign_in_with_agent_key`, given a signer that
+keeps the private key in OS key storage (`crates/push-agent-key`: a non-exportable TPM key
+on Windows) ([guide](docs/agent-key-sign-in.md#from-push-sdk-rust)).
 
 Given a `DatabaseKey` (`Config::database_key`), the client encrypts the whole database;
 an app derives the key from a PIN or password the user enters (`DatabaseKey::derive`), so
@@ -87,6 +90,15 @@ C, `bindings/c` builds a shared library with a generated header,
 `bindings/c/include/push_sdk.h`: opaque handles, error codes, UTF-8 JSON and blocking calls
 (`cargo test -p push-sdk-c` compiles and runs a C program against it). Both report the
 same error codes as Rust: [docs/sdk-bindings.md](docs/sdk-bindings.md) is the guide.
+
+## The agent bridge
+
+`push-agent-bridge` (`crates/push-bridge`) reaches an AI coding agent on the owner's own
+Windows machine from push-messenger as a private agent contact: replies with thinking and
+steps, cards for approvals, questions and plans, live activity and `/` commands. It signs
+in with a TPM key, runs one agent backend per instance (Coda, through `coda serve`, is the
+first) and starts at logon as a Scheduled Task. Setup, commands, the security model and
+troubleshooting: [docs/agent-bridge.md](docs/agent-bridge.md).
 
 ## Run it on minikube
 
