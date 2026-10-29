@@ -59,6 +59,7 @@ const CD_USAGE: &str = "/cd <path>";
 const MODEL_USAGE: &str = "/model [id]";
 const EFFORT_USAGE: &str = "/effort <low|medium|high|xhigh|max|auto>";
 const MODE_USAGE: &str = "/mode <default|acceptEdits|plan|bypass>";
+const YOLO_USAGE: &str = "/yolo";
 const RESUME_USAGE: &str = "/resume <id>";
 const TASK_USAGE: &str = "/task stop <id>";
 const BTW_USAGE: &str = "/btw <question>";
@@ -76,6 +77,7 @@ pub const HELP: &str = "\
 /effort <low|medium|high|xhigh|max|auto>: set the reasoning effort
 /mode <default|acceptEdits|plan>: set the permission mode
 /mode bypass: turn approvals off until /new (asks for confirmation first)
+/yolo: the same as /mode bypass
 /goal [text]: set the session's goal; without text, clear it
 /sessions: list this folder's sessions
 /resume <id>: resume one of this folder's sessions
@@ -127,6 +129,8 @@ pub fn parse(text: &str) -> Option<Command> {
         "effort" => Command::Usage(EFFORT_USAGE),
         "mode" if MODES.contains(&arguments) => Command::Mode(arguments.to_owned()),
         "mode" => Command::Usage(MODE_USAGE),
+        // Coda's terminal name for `/mode bypass`.
+        "yolo" => no_arguments(Command::Mode("bypass".to_owned()), YOLO_USAGE),
         "goal" => Command::Goal(arguments.to_owned()),
         "resume" => match one_word(arguments) {
             Some("") | None => Command::Usage(RESUME_USAGE),
@@ -354,6 +358,15 @@ mod tests {
     }
 
     #[test]
+    fn yolo_is_mode_bypass_without_arguments() {
+        assert_eq!(parsed("/yolo"), parsed("/mode bypass"));
+        assert_eq!(parsed(" /yolo \n"), Command::Mode("bypass".into()));
+        assert_eq!(parsed("/yolo now"), Command::Usage(YOLO_USAGE));
+        assert_eq!(parsed("/yolo bypass"), Command::Usage(YOLO_USAGE));
+        assert_eq!(parsed("/YOLO"), Command::Passthrough("/YOLO".into()));
+    }
+
+    #[test]
     fn goal_with_text_or_empty() {
         assert_eq!(
             parsed("/goal ship the bridge"),
@@ -472,6 +485,7 @@ mod tests {
             "/effort",
             "/mode",
             "/mode bypass",
+            "/yolo",
             "/goal",
             "/sessions",
             "/resume",
