@@ -14,6 +14,7 @@
 
 mod agent_key;
 mod auth;
+mod cards;
 mod client;
 mod connection;
 mod credentials;
@@ -33,6 +34,7 @@ pub use agent_key::{
     assemble_assertion,
 };
 pub use auth::{Device, Platform, Profile};
+pub use cards::{CardBook, CardCheck, CardRefusal, OpenCard};
 pub use client::{Account, Client, Config, EDIT_WINDOW, Events};
 pub use error::SdkError;
 pub use key::DatabaseKey;
