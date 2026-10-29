@@ -189,11 +189,7 @@ impl TestMessenger {
 
     /// The direct conversation with `peer` (created on first use).
     pub fn conversation_with(&self, peer: UserId) -> ConversationId {
-        *self
-            .lock()
-            .conversations
-            .entry(peer)
-            .or_default()
+        *self.lock().conversations.entry(peer).or_default()
     }
 
     /// The direct conversation with the owner.
@@ -342,7 +338,7 @@ impl TestMessenger {
 
     /// Waits until `done` holds for the calls so far; panics after 60 s.
     pub async fn wait_until(&self, what: &str, done: impl Fn(&[Call]) -> bool) {
-        wait(&self.changed, what, || done(&self.lock().calls)).await;
+        wait(&self.changed, what, || done(&self.calls())).await;
     }
 
     fn record(&self, call: Call) {

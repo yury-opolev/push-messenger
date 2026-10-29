@@ -7,6 +7,7 @@ pub mod backoff;
 pub mod cards;
 pub mod coda;
 pub mod commands;
+pub mod core;
 pub mod config;
 pub mod folders;
 pub mod mask;
