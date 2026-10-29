@@ -1,6 +1,8 @@
 //! The owner's commands: the core's own (`/new`, `/cd`, `/stop`, `/status`, `/help`,
 //! `/mode bypass`, `/resume`) and the ones the backend runs.
 
+use std::path::Path;
+
 use super::{Core, Internal};
 use crate::backend::{
     BackendCommand, BackendError, Capability, CommandReply, ErrorKind, PermissionMode,
@@ -11,6 +13,12 @@ use crate::folders;
 use crate::messenger::Messenger;
 
 const WAIT: &str = "Wait until the turn ends.";
+
+/// Commands that keep the agent busy without a turn: a prompt meanwhile meets a busy
+/// agent.
+fn holds_slot(command: &BackendCommand) -> bool {
+    matches!(command, BackendCommand::Compact | BackendCommand::Fork)
+}
 
 /// The capability a command needs, when it needs one.
 fn needs(command: &Command) -> Option<Capability> {
@@ -101,20 +109,36 @@ impl<M: Messenger> Core<M> {
 
     /// Runs a backend command without waiting for it; its reply comes as
     /// [`Internal::Commanded`].
-    pub(super) fn command_in_background(&self, command: BackendCommand) {
+    pub(super) fn command_in_background(&mut self, command: BackendCommand) {
+        if holds_slot(&command) {
+            self.slot_commands += 1;
+        }
         let backend = self.backend.clone();
         let internal = self.internal.clone();
+        let folder = self.folder.clone();
+        let session = self.session.clone();
         tokio::spawn(async move {
             let result = backend.command(command.clone()).await;
-            let _ = internal.send(Internal::Commanded { command, result });
+            let _ = internal.send(Internal::Commanded {
+                command,
+                folder,
+                session,
+                result,
+            });
         });
     }
 
+    /// A backend command's reply; `folder` and `session` are where it ran.
     pub(super) fn commanded(
         &mut self,
         command: BackendCommand,
+        folder: &Path,
+        session: Option<&str>,
         result: Result<CommandReply, BackendError>,
     ) {
+        if holds_slot(&command) {
+            self.slot_commands = self.slot_commands.saturating_sub(1);
+        }
         let reply = match result {
             Ok(reply) => reply,
             Err(error) => return self.backend_failed(&error),
@@ -128,6 +152,14 @@ impl<M: Messenger> Core<M> {
             }
             BackendCommand::Fork => {
                 if let Some(id) = reply.session.clone() {
+                    if folder != self.folder || session != self.session.as_deref() {
+                        tracing::info!(event = "fork_outdated");
+                        return self.reply(&format!(
+                            "The fork finished after the session changed, so it was not \
+                             opened: session {id} in {}.",
+                            folder.display()
+                        ));
+                    }
                     let key = super::folder_key(&self.folder);
                     let stored = id.clone();
                     self.save(|state| {
@@ -163,6 +195,7 @@ impl<M: Messenger> Core<M> {
                 self.mode = mode;
                 let id = started.session_id.clone();
                 self.adopt(self.folder.clone(), started).await;
+                self.close_backend_requests("Declined: a new session started.");
                 self.reply(&format!("New session {id} in {}.", self.folder.display()));
             }
             Err(error) => self.start_failed(&error),
@@ -201,6 +234,7 @@ impl<M: Messenger> Core<M> {
                 let resumed = stored.as_deref() == Some(started.session_id.as_str());
                 let id = started.session_id.clone();
                 self.adopt(folder, started).await;
+                self.close_backend_requests("Declined: the folder changed.");
                 let how = if resumed { "resumed" } else { "new" };
                 self.reply(&format!(
                     "Folder {}; {how} session {id}.",
@@ -218,6 +252,7 @@ impl<M: Messenger> Core<M> {
         {
             Ok(started) => {
                 self.adopt(self.folder.clone(), started).await;
+                self.close_backend_requests("Declined: another session was resumed.");
                 self.reply(&format!("Resumed session {id}."));
             }
             Err(error) if error.kind == ErrorKind::SessionNotFound => {

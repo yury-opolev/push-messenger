@@ -442,17 +442,91 @@ async fn other_prompt_errors_are_replied_with_method_and_code() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn busy_then_no_active_turn_prompts_again() {
+async fn busy_then_no_active_turn_prompts_again_after_a_pause() {
     let h = Harness::started().await;
     h.backend
         .next_prompt(Err(error("session/prompt", ErrorKind::Busy)));
     h.backend.next_steer(Ok(SteerOutcome::NoActiveTurn));
     h.messenger.owner_says("go");
     h.backend.wait_for("prompt go", 2).await;
-    assert_eq!(
-        h.backend.calls()[1..],
-        ["prompt go", "steer go", "prompt go"]
+    let calls = h.backend.timed_calls();
+    let calls = &calls[1..];
+    let names: Vec<_> = calls.iter().map(|(_, call)| call.as_str()).collect();
+    assert_eq!(names, ["prompt go", "steer go", "prompt go"]);
+    assert!(calls[2].0 - calls[1].0 >= Duration::from_millis(500));
+}
+
+/// Coda reports the turn's end before it frees its slot: a prompt right after it meets
+/// a busy agent whose turn is ending, with no turn running here to wait for.
+#[tokio::test(start_paused = true)]
+async fn a_turn_ending_without_a_turn_here_prompts_again_after_a_pause() {
+    let h = Harness::started().await;
+    h.backend
+        .next_prompt(Err(error("session/prompt", ErrorKind::Busy)));
+    h.backend.next_steer(Ok(SteerOutcome::TurnEnding));
+    h.messenger.owner_says("go");
+    h.backend.wait_for("prompt go", 2).await;
+    let calls = h.backend.timed_calls();
+    assert!(calls[3].0 - calls[2].0 >= Duration::from_millis(500));
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_text_queued_at_a_turn_s_end_is_not_lost_when_the_agent_is_still_busy() {
+    let h = Harness::started().await;
+    h.backend.set_capabilities([Capability::Sessions]);
+    h.backend.turn_started(TurnSource::Prompt);
+    h.messenger.owner_says("next");
+    settle().await;
+    h.backend
+        .next_prompt(Err(error("session/prompt", ErrorKind::Busy)));
+    h.backend.turn_ended(false);
+    h.backend.wait_for("prompt next", 2).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_agent_that_stays_busy_gets_bounded_retries_then_the_owner_hears_it() {
+    let h = Harness::started().await;
+    for _ in 0..20 {
+        h.backend
+            .next_prompt(Err(error("session/prompt", ErrorKind::Busy)));
+        h.backend.next_steer(Ok(SteerOutcome::TurnEnding));
+    }
+    let start = tokio::time::Instant::now();
+    h.messenger.owner_says("go");
+    h.reply_containing("not delivered").await;
+    let prompts: Vec<_> = h
+        .backend
+        .timed_calls()
+        .into_iter()
+        .filter(|(_, call)| call == "prompt go")
+        .map(|(at, _)| at)
+        .collect();
+    assert!((3..=10).contains(&prompts.len()), "{}", prompts.len());
+    for pair in prompts.windows(2) {
+        assert!(pair[1] - pair[0] >= Duration::from_millis(500));
+    }
+    let took = start.elapsed();
+    assert!(
+        took >= Duration::from_secs(15) && took <= Duration::from_secs(35),
+        "{took:?}"
     );
+    assert!(h.replies().last().unwrap().contains("go"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn texts_during_a_compact_or_fork_wait_for_it() {
+    for command in ["/compact", "/fork"] {
+        let h = Harness::started().await;
+        let release = h.backend.hold_next_command();
+        h.messenger.owner_says(command);
+        h.backend.wait_for("command", 1).await;
+        h.messenger.owner_says("one");
+        h.messenger.owner_says("two");
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert_eq!(h.count("prompt") + h.count("steer"), 0, "{command}");
+        drop(release);
+        h.backend.wait_for("prompt one\n\ntwo", 1).await;
+    }
 }
 
 #[tokio::test(start_paused = true)]
@@ -642,7 +716,10 @@ async fn status_help_usage_and_backend_commands() {
     ] {
         assert!(status.contains(&line), "{status}");
     }
-    assert!(status.contains(&format!("{}work\n", std::path::MAIN_SEPARATOR)));
+    assert!(
+        status.contains(&format!("Folder: {}\n", h.work.display())),
+        "{status}"
+    );
     h.messenger.owner_says("/help");
     h.reply_containing("/schedule list").await;
     h.messenger.owner_says("/effort huge");
@@ -719,6 +796,51 @@ async fn resume_and_fork_store_their_sessions() {
     assert_eq!(h.state.get().sessions[&folder_key(&h.work)], "s-8");
     h.messenger.owner_says("/status");
     h.reply_containing("Session: s-8").await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn cd_new_and_resume_close_the_old_session_s_requests() {
+    for (command, reply) in [
+        ("/cd ../other", "Folder "),
+        ("/new", "New session"),
+        ("/resume s-7", "Resumed session s-7."),
+    ] {
+        let h = Harness::started().await;
+        let answer = h.backend.request(permission());
+        h.card(1).await;
+        h.messenger.owner_says(command);
+        h.reply_containing(reply).await;
+        h.reply_containing("Declined: ").await;
+        assert!(answer.await.is_err(), "{command}: declined");
+        h.messenger.owner_says("hello");
+        h.backend.wait_for("prompt hello", 1).await;
+        tokio::time::sleep(Duration::from_secs(3_600)).await;
+        assert!(
+            !h.replies().iter().any(|r| r.contains("No answer; skipped")),
+            "{command}"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_fork_that_finishes_after_a_cd_is_not_stored_in_the_new_folder() {
+    let h = Harness::started().await;
+    let release = h.backend.hold_next_command();
+    h.backend.next_command(Ok(CommandReply {
+        text: "Forked.".into(),
+        session: Some("s-8".into()),
+    }));
+    h.messenger.owner_says("/fork");
+    h.backend.wait_for("command Fork", 1).await;
+    h.messenger.owner_says("/cd ../other");
+    h.reply_containing("new session session-2").await;
+    drop(release);
+    h.reply_containing("s-8").await;
+    let state = h.state.get();
+    assert_eq!(state.sessions[&folder_key(&h.other)], "session-2");
+    assert_eq!(state.sessions[&folder_key(&h.work)], "session-1");
+    h.messenger.owner_says("/status");
+    h.reply_containing("Session: session-2").await;
 }
 
 #[tokio::test(start_paused = true)]

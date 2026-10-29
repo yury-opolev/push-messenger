@@ -132,9 +132,10 @@ impl<M: Messenger> Core<M> {
         self.send_queued();
     }
 
-    /// The owner's texts that waited for the turn to end, as one prompt.
+    /// The owner's texts that waited for the turn (or a slot-holding command) to end, as
+    /// one prompt.
     pub(super) fn send_queued(&mut self) {
-        if self.turn.is_none() && !self.queued.is_empty() {
+        if self.turn.is_none() && self.slot_commands == 0 && !self.queued.is_empty() {
             let text = std::mem::take(&mut self.queued).join("\n\n");
             self.prompt(text, 0);
         }

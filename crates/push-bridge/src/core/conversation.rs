@@ -7,11 +7,15 @@ use push_sdk::{
 };
 use tokio::time::Instant;
 
-use super::{BridgeError, Core, Internal, PRIVATE, PROMPT_ATTEMPTS, SEEN, STRANGER_QUIET};
+use super::{BridgeError, Core, Internal, PRIVATE, SEEN, STRANGER_QUIET, retry_delay};
 use crate::backend::{Answer, BackendError, Capability, ErrorKind, SteerOutcome};
 use crate::cards::{self, TypedOutcome};
 use crate::commands;
+use crate::mask::cap;
 use crate::messenger::Messenger;
+
+/// Characters of an undelivered text quoted back to the owner.
+const UNDELIVERED_SHOWN: usize = 500;
 
 impl<M: Messenger> Core<M> {
     pub(super) async fn on_messenger(&mut self, event: Event) -> Result<(), BridgeError> {
@@ -149,17 +153,24 @@ impl<M: Messenger> Core<M> {
         self.send_to_agent(text).await;
     }
 
-    /// Steers the running turn (or waits for it to end without steering); prompts when
-    /// no turn runs.
+    /// Steers the running turn (or waits for it to end without steering); waits for a
+    /// slot-holding command; else prompts.
     pub(super) async fn send_to_agent(&mut self, text: String) {
+        self.deliver(text, 0).await;
+    }
+
+    /// [`Self::send_to_agent`] for the `attempt`th time (from 0).
+    pub(super) async fn deliver(&mut self, text: String, attempt: u32) {
         if self.turn.is_some() {
             if self.has(Capability::Steer) {
-                self.steer(text, 0).await;
+                self.steer(text, attempt).await;
             } else {
                 self.queued.push(text);
             }
+        } else if self.slot_commands > 0 {
+            self.queued.push(text);
         } else {
-            self.prompt(text, 0);
+            self.prompt(text, attempt);
         }
     }
 
@@ -189,32 +200,59 @@ impl<M: Messenger> Core<M> {
                 if self.has(Capability::Steer) {
                     self.steer(text, attempt).await;
                 } else {
-                    self.queued.push(text);
+                    self.wait_or_retry(text, attempt);
                 }
             }
             Err(error) => self.backend_failed(&error),
         }
     }
 
-    /// Steers; a turn that is ending (or that we still see running) gets the text as a
-    /// prompt once it ended.
+    /// Steers; a turn that is ending (or none) gets the text as a prompt later.
     async fn steer(&mut self, text: String, attempt: u32) {
         tracing::info!(event = "steer");
         match self.backend.steer(&text).await {
             Ok(SteerOutcome::Accepted) => {}
-            Ok(SteerOutcome::TurnEnding) => self.queued.push(text),
-            Ok(SteerOutcome::NoActiveTurn) if self.turn.is_some() => self.queued.push(text),
-            Ok(SteerOutcome::NoActiveTurn) if attempt + 1 < PROMPT_ATTEMPTS => {
-                self.prompt(text, attempt + 1);
-            }
-            Ok(SteerOutcome::NoActiveTurn) => {
-                self.reply(&format!("{} stayed busy; send it again.", self.name));
+            Ok(SteerOutcome::TurnEnding | SteerOutcome::NoActiveTurn) => {
+                self.wait_or_retry(text, attempt);
             }
             Ok(SteerOutcome::Rejected(reason)) => {
                 self.reply(&format!("{} did not take it: {reason}", self.name));
             }
             Err(error) => self.backend_failed(&error),
         }
+    }
+
+    /// The agent is busy: the text waits for the running turn (or slot-holding command)
+    /// here, which sends it when it ends. With nothing here to wait for (Coda reports a
+    /// turn's end before it is free again), it is prompted again after a pause, never
+    /// at once; when the pauses are spent, the owner hears it was not delivered.
+    fn wait_or_retry(&mut self, text: String, attempt: u32) {
+        if self.turn.is_some() || self.slot_commands > 0 {
+            self.queued.push(text);
+            return;
+        }
+        let retry = attempt + 1;
+        let Some(delay) = retry_delay(retry) else {
+            tracing::warn!(event = "prompt_undelivered", attempts = retry);
+            return self.reply(&format!(
+                "{} stayed busy; this was not delivered, send it again:\n{}",
+                self.name,
+                cap(&text, UNDELIVERED_SHOWN)
+            ));
+        };
+        tracing::info!(
+            event = "prompt_retry_scheduled",
+            retry,
+            delay_ms = delay.as_millis() as u64
+        );
+        let internal = self.internal.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let _ = internal.send(Internal::Retry {
+                text,
+                attempt: retry,
+            });
+        });
     }
 
     /// Replies "<method> failed (<code>): <message>".

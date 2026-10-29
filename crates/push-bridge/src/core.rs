@@ -42,8 +42,22 @@ const STRANGER_QUIET: Duration = Duration::from_secs(3_600);
 pub const PRIVATE: &str = "This agent is private.";
 /// Delivered messages remembered to handle a re-delivery once.
 const SEEN: usize = 10_000;
-/// A prompt that meets a busy agent is retried at most this often.
-const PROMPT_ATTEMPTS: u32 = 3;
+/// A prompt that meets a busy agent with no turn to wait for is sent again after a pause:
+/// the first, doubling up to the longest, while all the pauses add up to the budget.
+const RETRY_FIRST: Duration = Duration::from_millis(500);
+const RETRY_LONGEST: Duration = Duration::from_secs(8);
+const RETRY_BUDGET: Duration = Duration::from_secs(30);
+
+/// The pause before the `retry`th retry (from 1), or `None` once the budget is spent.
+fn retry_delay(retry: u32) -> Option<Duration> {
+    let mut total = Duration::ZERO;
+    let mut delay = RETRY_FIRST;
+    for _ in 1..retry {
+        total += delay;
+        delay = (delay * 2).min(RETRY_LONGEST);
+    }
+    (retry > 0 && total + delay <= RETRY_BUDGET).then_some(delay)
+}
 
 /// Where the agent may work and how it starts.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -168,8 +182,13 @@ enum Internal {
         attempt: u32,
         result: Result<(), BackendError>,
     },
+    /// The pause before prompting `text` again is over.
+    Retry { text: String, attempt: u32 },
     Commanded {
         command: BackendCommand,
+        /// The folder and session the command ran in.
+        folder: PathBuf,
+        session: Option<String>,
         result: Result<CommandReply, BackendError>,
     },
 }
@@ -233,8 +252,11 @@ struct Core<M: Messenger> {
     engine_instance: Option<String>,
 
     turn: Option<Turn>,
-    /// The owner's texts waiting for the turn to end.
+    /// The owner's texts waiting for the turn (or a slot-holding command) to end.
     queued: Vec<String>,
+    /// Backend commands running that keep the agent busy without a turn (`/compact`,
+    /// `/fork`): texts wait for them.
+    slot_commands: usize,
     /// `/new` came during a turn: start it when the turn ends.
     new_after_turn: bool,
 
@@ -286,6 +308,7 @@ impl<M: Messenger> Core<M> {
             engine_instance: None,
             turn: None,
             queued: Vec::new(),
+            slot_commands: 0,
             new_after_turn: false,
             open: Vec::new(),
             cards: CardBook::new(),
@@ -378,7 +401,16 @@ impl<M: Messenger> Core<M> {
                 attempt,
                 result,
             } => self.prompted(text, attempt, result).await,
-            Internal::Commanded { command, result } => self.commanded(command, result),
+            Internal::Retry { text, attempt } => self.deliver(text, attempt).await,
+            Internal::Commanded {
+                command,
+                folder,
+                session,
+                result,
+            } => {
+                self.commanded(command, &folder, session.as_deref(), result);
+                self.send_queued();
+            }
         }
     }
 

@@ -39,6 +39,8 @@ struct Script {
     prompts: VecDeque<Result<(), BackendError>>,
     steers: VecDeque<Result<SteerOutcome, BackendError>>,
     commands: VecDeque<Result<CommandReply, BackendError>>,
+    /// The next commands wait for these before they return.
+    command_holds: VecDeque<oneshot::Receiver<()>>,
     status: BackendStatus,
     pending: PendingMessages,
     engine_instance: Option<String>,
@@ -66,6 +68,7 @@ impl TestBackend {
                 prompts: VecDeque::new(),
                 steers: VecDeque::new(),
                 commands: VecDeque::new(),
+                command_holds: VecDeque::new(),
                 status: BackendStatus::default(),
                 pending: PendingMessages::default(),
                 engine_instance: Some("engine-1".to_owned()),
@@ -110,6 +113,14 @@ impl TestBackend {
 
     pub fn next_command(&self, result: Result<CommandReply, BackendError>) {
         self.lock().commands.push_back(result);
+    }
+
+    /// The next command (recorded at once) returns only once the sender is used or
+    /// dropped; its result is taken then.
+    pub fn hold_next_command(&self) -> oneshot::Sender<()> {
+        let (release, hold) = oneshot::channel();
+        self.lock().command_holds.push_back(hold);
+        release
     }
 
     pub fn set_status(&self, status: BackendStatus) {
@@ -259,6 +270,10 @@ impl Backend for TestBackend {
 
     async fn command(&self, command: BackendCommand) -> Result<CommandReply, BackendError> {
         self.record(format!("command {command:?}"));
+        let hold = self.lock().command_holds.pop_front();
+        if let Some(hold) = hold {
+            let _ = hold.await;
+        }
         self.lock().commands.pop_front().unwrap_or_else(|| {
             Ok(CommandReply {
                 text: "ok".to_owned(),
