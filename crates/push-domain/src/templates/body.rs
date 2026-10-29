@@ -631,6 +631,40 @@ mod tests {
     }
 
     #[test]
+    fn a_choose_card_takes_several_options_and_a_plan_approval_offers_two() {
+        let choose = builtin("choose");
+        let card = json!({
+            "tpl": "agent.choose@1",
+            "params": {
+                "question": "Which checks?\nPick any.",
+                "options": [
+                    {"id": "lint", "label": "Lint"},
+                    {"id": "unit", "label": "Unit tests"},
+                    {"id": "e2e", "label": "End to end"}
+                ]
+            },
+            "fallback": "Which checks: lint, unit tests or end to end?"
+        });
+        let card = checked(&card, &choose).unwrap();
+        assert_eq!(card.offered(&choose), ["lint", "unit", "e2e"]);
+        assert!(
+            answer(CARD, &["lint", "e2e"])
+                .unwrap()
+                .check(&card, &choose)
+                .is_ok()
+        );
+
+        let approval = builtin("plan-approval");
+        let card = json!({
+            "tpl": "agent.plan-approval@1",
+            "params": {"title": "Refactor", "plan": "1. Split the module\n2. Add tests"},
+            "fallback": "Approve the refactoring plan?"
+        });
+        let card = checked(&card, &approval).unwrap();
+        assert_eq!(card.offered(&approval), ["approve", "reject"]);
+    }
+
+    #[test]
     fn refuses_missing_unknown_and_mistyped_params() {
         let definition = builtin("approval");
         let mut body = approval();
