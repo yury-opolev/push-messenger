@@ -11,9 +11,9 @@ use std::ptr;
 
 use windows_sys::Win32::Foundation::{
     NTE_BAD_ALGID, NTE_BAD_DATA, NTE_BAD_FLAGS, NTE_BAD_KEY_STATE, NTE_BAD_KEYSET, NTE_BAD_TYPE,
-    NTE_BUFFER_TOO_SMALL, NTE_DEVICE_NOT_READY, NTE_EXISTS, NTE_INVALID_HANDLE,
-    NTE_INVALID_PARAMETER, NTE_NO_KEY, NTE_NO_MEMORY, NTE_NOT_FOUND, NTE_NOT_SUPPORTED, NTE_PERM,
-    NTE_PROVIDER_DLL_FAIL, NTE_SILENT_CONTEXT, NTE_USER_CANCELLED,
+    NTE_BUFFER_TOO_SMALL, NTE_DEVICE_NOT_FOUND, NTE_DEVICE_NOT_READY, NTE_EXISTS,
+    NTE_INVALID_HANDLE, NTE_INVALID_PARAMETER, NTE_NO_KEY, NTE_NO_MEMORY, NTE_NOT_FOUND,
+    NTE_NOT_SUPPORTED, NTE_PERM, NTE_PROVIDER_DLL_FAIL, NTE_SILENT_CONTEXT, NTE_USER_CANCELLED,
 };
 use windows_sys::Win32::Security::Cryptography::{
     BCRYPT_ECCPUBLIC_BLOB, BCRYPT_ECDSA_P256_ALGORITHM, BCRYPT_ECDSA_PUBLIC_P256_MAGIC,
@@ -56,6 +56,111 @@ impl Provider {
     }
 }
 
+/// Where an NCrypt operation failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step {
+    /// NCryptOpenStorageProvider: the provider itself is not there.
+    OpenProvider,
+    /// Anything after the provider was opened.
+    Key,
+}
+
+/// What a failed open says about the key in that provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenOutcome {
+    /// The provider works and does not have the key.
+    Missing,
+    /// The provider is not usable on this machine.
+    Unavailable,
+    /// Anything else: the key may well be there, so do not create a new one.
+    Failed,
+}
+
+/// What to do after a failed create in a provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CreateNext {
+    /// Someone else created the key meanwhile: open theirs.
+    Reopen,
+    /// The provider cannot hold the key: try the next one.
+    NextProvider,
+    /// Return the error; the caller may retry later.
+    Stop,
+}
+
+fn classify_open(provider: Provider, step: Step, status: Option<HRESULT>) -> OpenOutcome {
+    if step == Step::OpenProvider {
+        return OpenOutcome::Unavailable;
+    }
+    match status {
+        Some(NTE_BAD_KEYSET | NTE_NOT_FOUND | NTE_NO_KEY) => OpenOutcome::Missing,
+        Some(status) if platform_unavailable(provider, status) => OpenOutcome::Unavailable,
+        _ => OpenOutcome::Failed,
+    }
+}
+
+fn after_create_failure(provider: Provider, step: Step, status: Option<HRESULT>) -> CreateNext {
+    if status == Some(NTE_EXISTS) {
+        return CreateNext::Reopen;
+    }
+    // Software is the last resort; a busy, locked-out or refusing TPM is retried later
+    // rather than replaced by a software key.
+    if provider != Provider::Platform {
+        return CreateNext::Stop;
+    }
+    match (step, status) {
+        (Step::OpenProvider, _) => CreateNext::NextProvider,
+        (Step::Key, Some(NTE_BAD_ALGID)) => CreateNext::NextProvider,
+        (Step::Key, Some(status)) if platform_unavailable(provider, status) => {
+            CreateNext::NextProvider
+        }
+        _ => CreateNext::Stop,
+    }
+}
+
+/// No TPM, or a TPM the Platform Crypto Provider cannot use.
+fn platform_unavailable(provider: Provider, status: HRESULT) -> bool {
+    provider == Provider::Platform
+        && matches!(
+            status,
+            NTE_DEVICE_NOT_FOUND | NTE_PROVIDER_DLL_FAIL | NTE_NOT_SUPPORTED
+        )
+}
+
+/// A failed NCrypt step, keeping the raw HRESULT for [`classify_open`] and
+/// [`after_create_failure`].
+#[derive(Debug)]
+struct Failure {
+    step: Step,
+    /// None when the failure is not an NCrypt status (a bad name, a bad public key).
+    status: Option<HRESULT>,
+    error: SignerError,
+}
+
+impl From<SignerError> for Failure {
+    fn from(error: SignerError) -> Self {
+        Self {
+            step: Step::Key,
+            status: None,
+            error,
+        }
+    }
+}
+
+impl From<Failure> for SignerError {
+    fn from(failure: Failure) -> Self {
+        failure.error
+    }
+}
+
+/// What looking for a key in every provider found.
+enum Lookup {
+    Found(CngKey),
+    /// No provider has the key; the error is from the last provider asked.
+    Absent(SignerError),
+    /// A provider failed in a way that does not rule out the key being there.
+    Failed(SignerError),
+}
+
 /// An NCrypt provider or key handle, freed on drop.
 struct Handle(NCRYPT_HANDLE);
 
@@ -89,15 +194,26 @@ unsafe impl Sync for CngKey {}
 impl CngKey {
     /// The key named `name` in the first provider that has it, or a new one: in the TPM if
     /// the Platform Crypto Provider can create it, otherwise in the software provider.
+    ///
+    /// Creates only when every provider either lacks the key or is unavailable; any other
+    /// failure is returned so that an existing key is never replaced by a new identity.
     pub fn open_or_create(name: &str) -> Result<Self, SignerError> {
-        if let Ok(key) = Self::open(name) {
-            return Ok(key);
+        match Self::lookup(name) {
+            Lookup::Found(key) => return Ok(key),
+            Lookup::Failed(e) => return Err(e),
+            Lookup::Absent(_) => {}
         }
         let mut last = None;
         for provider in Provider::ALL {
-            match Self::create_in(provider, name) {
+            let failure = match Self::create_raw(provider, name) {
                 Ok(key) => return Ok(key),
-                Err(e) => last = Some(e),
+                Err(failure) => failure,
+            };
+            match after_create_failure(provider, failure.step, failure.status) {
+                // Another process won the race: use its key, not a second one.
+                CreateNext::Reopen => return Self::open_in(provider, name),
+                CreateNext::NextProvider => last = Some(failure.error),
+                CreateNext::Stop => return Err(failure.error),
             }
         }
         Err(last.expect("Provider::ALL is not empty"))
@@ -105,18 +221,40 @@ impl CngKey {
 
     /// The key named `name` in the first provider that has it.
     pub fn open(name: &str) -> Result<Self, SignerError> {
-        let mut last = None;
+        match Self::lookup(name) {
+            Lookup::Found(key) => Ok(key),
+            Lookup::Absent(e) | Lookup::Failed(e) => Err(e),
+        }
+    }
+
+    fn lookup(name: &str) -> Lookup {
+        let mut absent = None;
+        let mut failed = None;
         for provider in Provider::ALL {
-            match Self::open_in(provider, name) {
-                Ok(key) => return Ok(key),
-                Err(e) => last = Some(e),
+            let failure = match Self::open_raw(provider, name) {
+                Ok(key) => return Lookup::Found(key),
+                Err(failure) => failure,
+            };
+            match classify_open(provider, failure.step, failure.status) {
+                OpenOutcome::Missing | OpenOutcome::Unavailable => absent = Some(failure.error),
+                OpenOutcome::Failed => {
+                    failed.get_or_insert(failure.error);
+                }
             }
         }
-        Err(last.expect("Provider::ALL is not empty"))
+        match (failed, absent) {
+            (Some(e), _) => Lookup::Failed(e),
+            (None, Some(e)) => Lookup::Absent(e),
+            (None, None) => unreachable!("Provider::ALL is not empty"),
+        }
     }
 
     /// The key named `name` in `provider`.
     pub fn open_in(provider: Provider, name: &str) -> Result<Self, SignerError> {
+        Ok(Self::open_raw(provider, name)?)
+    }
+
+    fn open_raw(provider: Provider, name: &str) -> Result<Self, Failure> {
         let wide_name = wide(name)?;
         let prov = open_provider(provider)?;
         let mut key = Handle(0);
@@ -138,6 +276,10 @@ impl CngKey {
     /// A new non-exportable P-256 key named `name` in `provider`; fails if the name is
     /// taken there.
     pub fn create_in(provider: Provider, name: &str) -> Result<Self, SignerError> {
+        Ok(Self::create_raw(provider, name)?)
+    }
+
+    fn create_raw(provider: Provider, name: &str) -> Result<Self, Failure> {
         let wide_name = wide(name)?;
         let prov = open_provider(provider)?;
         let mut key = Handle(0);
@@ -231,7 +373,7 @@ impl CngKey {
         prov: Handle,
         provider: Provider,
         name: &str,
-    ) -> Result<Self, SignerError> {
+    ) -> Result<Self, Failure> {
         let blob = export(&key, BCRYPT_ECCPUBLIC_BLOB, provider)?;
         let public_key = parse_public_blob(&blob)?;
         Ok(Self {
@@ -245,7 +387,7 @@ impl CngKey {
 
     #[cfg(test)]
     fn export_blob(&self, blob_type: PCWSTR) -> Result<Vec<u8>, SignerError> {
-        export(&self.key, blob_type, self.provider)
+        Ok(export(&self.key, blob_type, self.provider)?)
     }
 
     fn sign_hash(&self, hash: &[u8]) -> Result<[u8; 64], SignerError> {
@@ -305,16 +447,19 @@ impl fmt::Debug for CngKey {
     }
 }
 
-fn open_provider(provider: Provider) -> Result<Handle, SignerError> {
+fn open_provider(provider: Provider) -> Result<Handle, Failure> {
     let mut prov = Handle(0);
     // SAFETY: `prov.0` is a valid out pointer; the provider name is a NUL-terminated
     // static string.
     let status = unsafe { NCryptOpenStorageProvider(&mut prov.0, provider.ncrypt_name(), 0) };
-    check(status, "NCryptOpenStorageProvider", provider)?;
+    check(status, "NCryptOpenStorageProvider", provider).map_err(|failure| Failure {
+        step: Step::OpenProvider,
+        ..failure
+    })?;
     Ok(prov)
 }
 
-fn export(key: &Handle, blob_type: PCWSTR, provider: Provider) -> Result<Vec<u8>, SignerError> {
+fn export(key: &Handle, blob_type: PCWSTR, provider: Provider) -> Result<Vec<u8>, Failure> {
     let mut size = 0u32;
     // SAFETY: `key.0` is an open key handle, `blob_type` a NUL-terminated static string;
     // a null output buffer asks for the size, written to `size`.
@@ -380,7 +525,7 @@ fn wide(name: &str) -> Result<Vec<u16>, SignerError> {
     Ok(name.encode_utf16().chain(std::iter::once(0)).collect())
 }
 
-fn check(status: HRESULT, operation: &str, provider: Provider) -> Result<(), SignerError> {
+fn check(status: HRESULT, operation: &str, provider: Provider) -> Result<(), Failure> {
     if status >= 0 {
         return Ok(());
     }
@@ -389,9 +534,13 @@ fn check(status: HRESULT, operation: &str, provider: Provider) -> Result<(), Sig
         Some(name) => format!("{name} ({hex})"),
         None => hex,
     };
-    Err(SignerError {
-        code,
-        message: format!("{operation} failed in the {}", provider.display_name()),
+    Err(Failure {
+        step: Step::Key,
+        status: Some(status),
+        error: SignerError {
+            code,
+            message: format!("{operation} failed in the {}", provider.display_name()),
+        },
     })
 }
 
@@ -404,6 +553,7 @@ fn status_name(status: HRESULT) -> Option<&'static str> {
         NTE_BAD_KEYSET => "NTE_BAD_KEYSET",
         NTE_BAD_TYPE => "NTE_BAD_TYPE",
         NTE_BUFFER_TOO_SMALL => "NTE_BUFFER_TOO_SMALL",
+        NTE_DEVICE_NOT_FOUND => "NTE_DEVICE_NOT_FOUND",
         NTE_DEVICE_NOT_READY => "NTE_DEVICE_NOT_READY",
         NTE_EXISTS => "NTE_EXISTS",
         NTE_INVALID_HANDLE => "NTE_INVALID_HANDLE",
@@ -482,7 +632,117 @@ mod tests {
     }
 
     #[test]
+    fn open_classifies_a_missing_key() {
+        for provider in Provider::ALL {
+            for status in [NTE_BAD_KEYSET, NTE_NOT_FOUND, NTE_NO_KEY] {
+                assert_eq!(
+                    classify_open(provider, Step::Key, Some(status)),
+                    OpenOutcome::Missing
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn open_classifies_an_unavailable_provider() {
+        for provider in Provider::ALL {
+            assert_eq!(
+                classify_open(provider, Step::OpenProvider, Some(NTE_PERM)),
+                OpenOutcome::Unavailable
+            );
+        }
+        for status in [
+            NTE_DEVICE_NOT_FOUND,
+            NTE_PROVIDER_DLL_FAIL,
+            NTE_NOT_SUPPORTED,
+        ] {
+            assert_eq!(
+                classify_open(Provider::Platform, Step::Key, Some(status)),
+                OpenOutcome::Unavailable
+            );
+            assert_eq!(
+                classify_open(Provider::Software, Step::Key, Some(status)),
+                OpenOutcome::Failed
+            );
+        }
+    }
+
+    #[test]
+    fn open_does_not_mistake_a_tpm_failure_for_a_missing_key() {
+        for status in [
+            NTE_DEVICE_NOT_READY,
+            NTE_PERM,
+            NTE_BAD_KEY_STATE,
+            NTE_EXISTS,
+        ] {
+            assert_eq!(
+                classify_open(Provider::Platform, Step::Key, Some(status)),
+                OpenOutcome::Failed
+            );
+        }
+        assert_eq!(
+            classify_open(Provider::Platform, Step::Key, None),
+            OpenOutcome::Failed
+        );
+    }
+
+    #[test]
+    fn create_reopens_a_key_someone_else_created() {
+        for provider in Provider::ALL {
+            assert_eq!(
+                after_create_failure(provider, Step::Key, Some(NTE_EXISTS)),
+                CreateNext::Reopen
+            );
+        }
+    }
+
+    #[test]
+    fn create_falls_back_to_software_only_when_the_tpm_cannot_hold_the_key() {
+        assert_eq!(
+            after_create_failure(Provider::Platform, Step::OpenProvider, Some(NTE_PERM)),
+            CreateNext::NextProvider
+        );
+        for status in [
+            NTE_DEVICE_NOT_FOUND,
+            NTE_PROVIDER_DLL_FAIL,
+            NTE_NOT_SUPPORTED,
+            NTE_BAD_ALGID,
+        ] {
+            assert_eq!(
+                after_create_failure(Provider::Platform, Step::Key, Some(status)),
+                CreateNext::NextProvider
+            );
+        }
+        for status in [NTE_DEVICE_NOT_READY, NTE_PERM, NTE_BAD_KEYSET] {
+            assert_eq!(
+                after_create_failure(Provider::Platform, Step::Key, Some(status)),
+                CreateNext::Stop
+            );
+        }
+        assert_eq!(
+            after_create_failure(Provider::Platform, Step::Key, None),
+            CreateNext::Stop
+        );
+    }
+
+    #[test]
+    fn create_in_software_has_nowhere_else_to_go() {
+        assert_eq!(
+            after_create_failure(Provider::Software, Step::OpenProvider, Some(NTE_PERM)),
+            CreateNext::Stop
+        );
+        assert_eq!(
+            after_create_failure(Provider::Software, Step::Key, Some(NTE_NOT_SUPPORTED)),
+            CreateNext::Stop
+        );
+    }
+
+    #[test]
     fn a_name_with_nul_is_refused() {
+        assert_eq!(
+            CngKey::open_or_create("bad\0name").unwrap_err().code,
+            "bad_key_name"
+        );
         assert_eq!(CngKey::open("bad\0name").unwrap_err().code, "bad_key_name");
     }
 }
