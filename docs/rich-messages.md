@@ -40,9 +40,9 @@ So rich content is filled from **templates**:
   edit.
 - A card with buttons or choices is answered with an ANSWER message. The server checks the
   answer against the card and closes the card with the first valid one.
-- Six built-in templates (`agent.reply@1`, `agent.approval@1`, `agent.question@1`,
-  `agent.choose@1`, `agent.plan@1`, `agent.plan-approval@1`) are available from the start,
-  for owned agents only.
+- Seven built-in templates (`agent.reply@1`, `agent.approval@1`, `agent.question@1`,
+  `agent.choose@1`, `agent.plan@1`, `agent.plan-approval@1`, `agent.reply@2`) are available
+  from the start, for owned agents only.
 
 ## 2. Enforcement model
 
@@ -56,8 +56,8 @@ own part, because only they render.
 | The server enforces (message-svc) | Clients must |
 |---|---|
 | The body parses as strict JSON of its content type, within its size cap | Render only refs that are in their catalog with status `approved` |
-| The ref names a stored version whose status is `approved` (missing, pending, rejected and revoked all get the same refusal) | Render blocks as inert text: never linkify, never interpret Markdown, HTML or any other markup in values |
-| Every param: no unknown, every required one present, each of its type and within its caps, strings without control or invisible characters | Show who sent the message (the sender's name, and that it is an agent when it is one) |
+| The ref names a stored version whose status is `approved` (missing, pending, rejected and revoked all get the same refusal) | Render blocks as inert text: never linkify, never interpret Markdown, HTML or any other markup in values, except the checked Markdown of a [`markdown`](#markdown) block |
+| Every param: no unknown, every required one present, each of its type and within its caps, strings without control or invisible characters; a param shown by a `markdown` block is only the [allowed Markdown](#markdown) | Show who sent the message (the sender's name, and that it is an agent when it is one) |
 | The sender's kind (`agent` or `human`) is one of the definition's `senders` | Show `fallback` for an unknown or revoked ref, or one they cannot render |
 | An answer names a live card of the same conversation, from someone else, not answered yet, whose template is still approved, with values the card offers | Never render a `TEXT` message as a card, even if its text is a RICH body |
 | The first valid answer closes the card (`answer_seq`); later ones are refused | Show a closed card as closed (`Deliver.answer_seq` set) and offer no buttons on it |
@@ -138,6 +138,7 @@ List item types (`item`):
 | `thinking` | `param`, `label`? | a `string` param (the agent's reasoning, usually collapsed) |
 | `steps` | `param`, `label`? | a `list` of `step` param |
 | `status` | `param`, `label`? | an `enum` param |
+| `markdown` | `param` only (no literal `text`, no `label`) | a `multiline` `string` param, whose value must be [allowed Markdown](#markdown) |
 | `buttons` | `options`: 1 to 4 `{"id", "label", "style"}`; `style` is `primary`, `secondary` or `danger` | literal options only |
 | `single` | `label`?, exactly one of `options` (1 to 10 literal `{"id", "label"}`) or `param` | a required `list` of `option` param |
 | `multi` | as `single`, plus `min` and `max` | as `single`; 1 ≤ `min` ≤ `max` ≤ the number of literal options, or the param's `max_items` |
@@ -148,6 +149,61 @@ wording, 1 to 80 characters.
 
 `buttons`, `single` and `multi` are **interactive**: they make the message a card that can
 be answered. A block whose optional param is absent from a body is skipped when rendering.
+
+### Markdown
+
+A `markdown` block shows its param as Markdown: a subset of
+[CommonMark](https://spec.commonmark.org/) with GitHub's tables and strikethrough. The
+server parses the value of every param a `markdown` block shows (with `pulldown-cmark`) on
+every send and edit, after the param's own checks (length, line breaks, control and
+invisible characters), and refuses anything outside this subset. A param also shown by
+other blocks is checked too; those blocks still show it as plain text.
+
+Allowed:
+
+| Construct | Limit |
+|---|---|
+| Paragraphs, soft and hard line breaks | |
+| Strong, emphasis, strikethrough (`~~x~~`), inline code | |
+| Fenced code blocks (the info string, such as `rust`, is only a hint) and indented code blocks | |
+| Headings, ATX (`#`) and setext (underlined), levels 1 to 6 | |
+| Ordered and unordered lists | nested at most 4 levels |
+| Block quotes | nested at most 3 levels |
+| Tables (GitHub style) | at most 20 columns and 200 body rows (the header row is not counted) |
+| Thematic breaks (`---`) | |
+| Links, autolinks (`<https://…>`) and link reference definitions | the destination is an absolute `https://` or `http://` URL (scheme in any case) with a non-empty host and no whitespace or control characters |
+
+Refused, with the reason in the error:
+
+| Construct | Reason |
+|---|---|
+| Raw HTML, inline (`a <b>x</b>`) or as a block (`<div>`, `<script>`, comments) | `contains raw HTML` |
+| Images (`![alt](url)`) | `contains an image` |
+| A link to any other scheme (`javascript:`, `data:`, `file:`, `mailto:`, …), also when written with entities (`javascript&#58;`) | `links to "javascript:..."; only absolute http(s) links are allowed` (only the scheme is shown) |
+| A relative link, an empty destination, or an http(s) URL without a host | `links to a relative URL`, `links to nothing`, `links to an http(s) URL without a host` |
+| An email autolink (`<a@example.com>`) | `contains an email link` |
+| A link reference definition to any other scheme, even when no link uses it | `has a link reference definition that links to "file:..."` |
+| Footnotes, references or definitions | `contains a footnote` |
+| Lists nested deeper than 4 levels, quotes deeper than 3 | `nests lists 5 levels; the limit is 4`, `nests quotes 4 levels; the limit is 3` |
+| Tables wider or longer than the limits | `has a table with 21 columns; the limit is 20`, `has a table with more than 200 rows; …` |
+| Anything else (task lists, math, …) | `contains unsupported Markdown` |
+
+HTML-like text inside inline code or a code block is code, not HTML, and is allowed:
+`` `<script>` `` passes. A refused send or edit gets `ERROR_CODE_INVALID`, its message
+naming the param and the reason, for example
+`invalid template: params.text: contains raw HTML`.
+
+Clients rendering a `markdown` block must:
+
+- **Render from a Markdown AST** (CommonMark with GitHub tables and strikethrough) into
+  native UI elements, never through an HTML string or a web view fed with generated HTML.
+- **Show every link's real URL** visibly (not only its text), and ask for a confirmation
+  before opening it.
+- **Never load images or any remote content**, whatever the text says.
+- Show code blocks in a monospace font, **horizontally scrollable**, never executed;
+  syntax highlighting, if any, must not run the code.
+- Show the message's `fallback` for a block type they do not know, as for an unknown
+  template.
 
 ### Meta-rules
 
@@ -162,7 +218,8 @@ A definition is refused unless all of these hold:
 5. Every cap is within its range (`max_len`, `max_items`, `min`/`max`, option counts).
 6. No unknown param type, item type or block type.
 7. Every block that names a `param` names an existing param of a type the block accepts
-   (table above); a `heading` param is single-line with `max_len` ≤ 200.
+   (table above); a `heading` param is single-line with `max_len` ≤ 200; a `markdown`
+   param is a `multiline` string.
 8. Every param is used by at least one block.
 9. At most one interactive block, and it does not use an optional param.
 10. `multi` bounds: 1 ≤ `min` ≤ `max` ≤ the options it can offer.
@@ -388,6 +445,7 @@ edit window, not deleted) apply first. Delete is unchanged.
 | Refusal | `ErrorCode` |
 |---|---|
 | Content type unspecified or `SYSTEM_EVENT` | `ERROR_CODE_INVALID` |
+| A `markdown` block's param holds Markdown outside the [allowed subset](#markdown) | `ERROR_CODE_INVALID` |
 | RICH or ANSWER body too large, not strict JSON, unknown or missing field, bad `fallback` | `ERROR_CODE_INVALID` |
 | The ref is missing, pending, rejected or revoked (one refusal: "template … is not approved") | `ERROR_CODE_INVALID` |
 | A param is unknown, missing, of the wrong type or beyond its caps; a choice list offers too few options | `ERROR_CODE_INVALID` |
@@ -422,16 +480,17 @@ RICH and ANSWER messages as text, their raw JSON body.
 
 ## 6. Built-in templates
 
-Six `agent.*` templates ship in `push-domain` (`crates/push-domain/src/templates/builtin/`),
+Seven `agent.*` templates ship in `push-domain` (`crates/push-domain/src/templates/builtin/`),
 validated by the same code as any submission. message-svc **seeds them as approved at
 start-up**, before it reports ready, so the very first catalog lists them. They are owned
 by the server: the publisher `agent` is reserved and claimed by the server, so no account
 can publish under it. Seeding inserts missing versions only, so an admin may **revoke** a
 built-in and the revocation survives restarts. A changed built-in must get a new version;
 message-svc warns (`templates.builtin_mismatch`) when a stored built-in differs from the
-shipped one. All six are for agents only. `agent.choose@1` and `agent.plan-approval@1`
+shipped one. All seven are for agents only. `agent.choose@1` and `agent.plan-approval@1`
 came later (with the [agent bridge](agent-bridge.md)); a message-svc of that release seeds
-them at its next start, next to the stored four.
+them at its next start, next to the stored four. `agent.reply@2` came after them, and is
+seeded the same way.
 
 These were designed upstream: the consumer's own spec
 (`docs/specs/2026-10-26-rich-messages.md` in the consumer repository) was not available
@@ -462,6 +521,36 @@ An agent's answer: an optional heading, its thinking and tool steps, then the re
     {"type": "thinking", "param": "thinking", "label": "Thinking"},
     {"type": "steps", "param": "steps", "label": "Steps"},
     {"type": "text", "param": "text"}
+  ]
+}
+```
+
+### `agent.reply@2`
+
+The same as `agent.reply@1`, except that the reply text is [Markdown](#markdown): the last
+block is `markdown`, so the server refuses text outside the allowed subset. `agent.reply@1`
+stays, and still shows its text as plain text. A client that does not know `agent.reply@2`
+(or the `markdown` block) shows the message's `fallback`.
+
+```json
+{
+  "format": "tpl/1",
+  "publisher": "agent",
+  "name": "reply",
+  "version": 2,
+  "title": "Agent reply",
+  "senders": ["agent"],
+  "params": {
+    "title": {"type": "string", "max_len": 120, "optional": true},
+    "text": {"type": "string", "max_len": 4000, "multiline": true},
+    "thinking": {"type": "string", "max_len": 4000, "multiline": true, "optional": true},
+    "steps": {"type": "list", "item": {"type": "step"}, "max_items": 50, "optional": true}
+  },
+  "layout": [
+    {"type": "heading", "param": "title"},
+    {"type": "thinking", "param": "thinking", "label": "Thinking"},
+    {"type": "steps", "param": "steps", "label": "Steps"},
+    {"type": "markdown", "param": "text"}
   ]
 }
 ```
@@ -853,6 +942,8 @@ recorded only in auth-svc's log, not in the database.
 | `buttons` options / `single` and `multi` literal options | 1 to 4 / 1 to 10 |
 | Title, labels / literal heading / literal text | 80 / 200 / 500 characters |
 | Heading-bound param `max_len` | ≤ 200 |
+| Markdown: list / quote nesting | 4 / 3 levels |
+| Markdown: table columns / body rows | 20 / 200 |
 | RICH `fallback` / ANSWER `fallback` | 2000 / 500 characters |
 | ANSWER values | 1 to 10 |
 | Strict JSON nesting depth | 16 |

@@ -2,17 +2,19 @@
 
 use super::Definition;
 
-const SOURCES: [&str; 6] = [
+const SOURCES: [&str; 7] = [
     include_str!("builtin/agent.reply.json"),
     include_str!("builtin/agent.approval.json"),
     include_str!("builtin/agent.question.json"),
     include_str!("builtin/agent.plan.json"),
     include_str!("builtin/agent.choose.json"),
     include_str!("builtin/agent.plan-approval.json"),
+    include_str!("builtin/agent.reply.v2.json"),
 ];
 
-/// `agent.reply@1`, `agent.approval@1`, `agent.question@1`, `agent.plan@1`, `agent.choose@1`
-/// and `agent.plan-approval@1`.
+/// `agent.reply@1`, `agent.approval@1`, `agent.question@1`, `agent.plan@1`, `agent.choose@1`,
+/// `agent.plan-approval@1` and `agent.reply@2` (its text is Markdown). New built-ins go last,
+/// so the order the server seeds them in stays the same.
 pub fn builtins() -> Vec<Definition> {
     SOURCES
         .iter()
@@ -39,7 +41,8 @@ mod tests {
                 "agent.question@1",
                 "agent.plan@1",
                 "agent.choose@1",
-                "agent.plan-approval@1"
+                "agent.plan-approval@1",
+                "agent.reply@2"
             ]
         );
         for definition in builtins() {
@@ -65,6 +68,7 @@ mod tests {
                 ("Plan".to_owned(), false),
                 ("Multiple choice".to_owned(), true),
                 ("Plan approval".to_owned(), true),
+                ("Agent reply".to_owned(), false),
             ]
         );
     }

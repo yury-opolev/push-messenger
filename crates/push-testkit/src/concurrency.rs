@@ -412,10 +412,10 @@ async fn concurrent_seeders_store_each_builtin_once<B: Backend>(backend: &B) {
         .collect();
     let inserted: usize = all(seeders).await.into_iter().map(Result::unwrap).sum();
 
-    assert_eq!(inserted, 6);
+    assert_eq!(inserted, 7);
     let catalog = world.svc.template_catalog(0, 0).await.unwrap();
-    assert_eq!(catalog.entries.len(), 6);
-    assert_eq!(catalog.seq, 6);
+    assert_eq!(catalog.entries.len(), 7);
+    assert_eq!(catalog.seq, 7);
 }
 
 const APPROVAL: &str = r#"{"tpl":"agent.approval@1","params":{"title":"Deploy v2","details":"Ship it to production?"},"fallback":"Deploy v2 to production?"}"#;

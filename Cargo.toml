@@ -45,6 +45,7 @@ jsonwebtoken = { version = "9", default-features = false }
 libtest-mimic = "0.8"
 prost = "0.14"
 protoc-bin-vendored = "3"
+pulldown-cmark = { version = "0.13.5", default-features = false }
 push-agent-key = { path = "crates/push-agent-key" }
 push-auth-core = { path = "crates/push-auth-core" }
 push-credentials = { path = "crates/push-credentials" }

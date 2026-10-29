@@ -737,10 +737,11 @@ async fn templates_are_seeded_at_startup_and_served_only_with_auth_svcs_token() 
             "agent.plan-approval@1",
             "agent.plan@1",
             "agent.question@1",
-            "agent.reply@1"
+            "agent.reply@1",
+            "agent.reply@2"
         ]
     );
-    assert_eq!(catalog.seq, 6);
+    assert_eq!(catalog.seq, 7);
     assert!(
         catalog
             .entries

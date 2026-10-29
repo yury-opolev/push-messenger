@@ -676,6 +676,51 @@ async fn deleting_an_answer_leaves_the_card_answered<B: Backend>(backend: &B) {
     );
 }
 
+async fn an_agent_reply_v2_carries_checked_markdown<B: Backend>(backend: &B) {
+    let (world, _person, agent, chat) = agent_chat(backend).await;
+    let markdown = r#""text":"**Done**: see [docs](https://example.com)\n\n```rust\nlet x = \"<script>\";\n```""#;
+
+    sent(
+        &world,
+        &agent,
+        chat,
+        ContentType::Rich,
+        &rich("agent.reply@2", markdown),
+    )
+    .await;
+    for (params, reason) in [
+        (r#""text":"Hi <script>alert(1)</script>""#, "raw HTML"),
+        (
+            r#""text":"[docs](javascript:alert(1))""#,
+            "links to \"javascript:...\"",
+        ),
+    ] {
+        let refused = world
+            .svc
+            .send_message(message(
+                &agent,
+                chat,
+                ContentType::Rich,
+                &rich("agent.reply@2", params),
+            ))
+            .await;
+        let Err(DomainError::Template(error)) = refused else {
+            panic!("{params} was not refused: {refused:?}");
+        };
+        assert!(error.0.contains(reason), "{error}");
+        assert!(error.0.starts_with("params.text: "), "{error}");
+    }
+    // agent.reply@1 shows its text as plain text, so markup in it is only characters.
+    sent(
+        &world,
+        &agent,
+        chat,
+        ContentType::Rich,
+        &rich("agent.reply@1", r#""text":"Hi <script>alert(1)</script>""#),
+    )
+    .await;
+}
+
 pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
     case_list![
         an_agent_sends_an_approval_card,
@@ -699,5 +744,6 @@ pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
         a_client_msg_id_reused_for_another_content_type_conflicts,
         a_member_who_joined_after_a_card_cannot_answer_it_but_receives_its_answer,
         deleting_an_answer_leaves_the_card_answered,
+        an_agent_reply_v2_carries_checked_markdown,
     ]
 }

@@ -464,7 +464,7 @@ async fn a_note_keeps_windows_line_breaks_as_newlines<B: Backend>(backend: &B) {
 async fn seeding_stores_the_builtins_once<B: Backend>(backend: &B) {
     let world = World::new(backend).await;
 
-    assert_eq!(world.svc.seed_builtin_templates().await, Ok(6));
+    assert_eq!(world.svc.seed_builtin_templates().await, Ok(7));
 
     let catalog = catalog(&world, 0).await;
     assert_eq!(
@@ -475,10 +475,11 @@ async fn seeding_stores_the_builtins_once<B: Backend>(backend: &B) {
             "agent.question@1",
             "agent.plan@1",
             "agent.choose@1",
-            "agent.plan-approval@1"
+            "agent.plan-approval@1",
+            "agent.reply@2"
         ]
     );
-    assert_eq!(catalog.seq, 6);
+    assert_eq!(catalog.seq, 7);
     for (stored, builtin) in catalog.entries.iter().zip(builtins()) {
         assert_eq!(stored.status, TemplateStatus::Approved);
         assert_eq!(stored.definition, builtin.canonical_json());
@@ -490,7 +491,7 @@ async fn seeding_stores_the_builtins_once<B: Backend>(backend: &B) {
     assert_eq!(world.svc.seed_builtin_templates().await, Ok(0));
     let again = world.svc.template_catalog(0, 0).await.unwrap();
     assert_eq!(again.entries, catalog.entries);
-    assert_eq!(again.seq, 6);
+    assert_eq!(again.seq, 7);
 }
 
 async fn a_revoked_builtin_stays_revoked_after_seeding_again<B: Backend>(backend: &B) {
@@ -506,7 +507,7 @@ async fn a_revoked_builtin_stays_revoked_after_seeding_again<B: Backend>(backend
         .await
         .unwrap();
     assert_eq!(stored, revoked);
-    assert_eq!(catalog(&world, 0).await.seq, 7);
+    assert_eq!(catalog(&world, 0).await.seq, 8);
     let alice = world.person().await;
     assert_eq!(
         world

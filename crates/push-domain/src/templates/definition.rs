@@ -88,6 +88,10 @@ pub enum Block {
         param: String,
         label: Option<String>,
     },
+    /// Markdown from a multiline string param, checked by `check_markdown`.
+    Markdown {
+        param: String,
+    },
 }
 
 /// Literal text, or the name of a param holding it.
@@ -147,6 +151,7 @@ impl Block {
             Self::Single { .. } => "single",
             Self::Multi { .. } => "multi",
             Self::Status { .. } => "status",
+            Self::Markdown { .. } => "markdown",
         }
     }
 
@@ -167,6 +172,7 @@ impl Block {
             | Self::Thinking { param: p, .. }
             | Self::Steps { param: p, .. }
             | Self::Status { param: p, .. }
+            | Self::Markdown { param: p }
             | Self::Single {
                 choices: Choices::Param(p),
                 ..
@@ -370,6 +376,7 @@ impl Definition {
                     },
                 ) => true,
                 (Block::Status { .. }, ParamType::Enum { .. }) => true,
+                (Block::Markdown { .. }, ParamType::String { multiline, .. }) => *multiline,
                 _ => false,
             };
             if !fits {
@@ -378,6 +385,7 @@ impl Definition {
                     Block::Steps { .. } => "a list of step",
                     Block::Single { .. } | Block::Multi { .. } => "a list of option",
                     Block::Status { .. } => "an enum",
+                    Block::Markdown { .. } => "a multiline string",
                     Block::Text(_) => "a string, int, bool, enum or list of string",
                     _ => "a string",
                 };
@@ -670,6 +678,12 @@ fn parse_block(value: &StrictValue, path: &str) -> Result<Block, TemplateError> 
                 _ => Block::Status { param, label },
             }
         }
+        "markdown" => {
+            obj.only(&["type", "param"])?;
+            Block::Markdown {
+                param: obj.string("param")?.to_owned(),
+            }
+        }
         "buttons" => {
             obj.only(&["type", "options"])?;
             let path = obj.path("options");
@@ -836,6 +850,7 @@ fn block_json(block: &Block) -> StrictValue {
             fields.push(("param", text(param)));
             push_label(&mut fields, label);
         }
+        Block::Markdown { param } => fields.push(("param", text(param))),
         Block::Buttons { options } => {
             let options = options
                 .iter()
@@ -1418,6 +1433,57 @@ mod tests {
         refused(
             &with_param("choices", spec, block(6)),
             "layout[1]: needs 1 <= min <= max <= 5",
+        );
+    }
+
+    fn markdown(spec: Value) -> Value {
+        with_param("notes", spec, json!({"type": "markdown", "param": "notes"}))
+    }
+
+    #[test]
+    fn a_markdown_block_parses_and_round_trips() {
+        let definition = parse(&markdown(
+            json!({"type": "string", "max_len": 4000, "multiline": true}),
+        ))
+        .unwrap();
+        let block = &definition.layout()[1];
+        assert_eq!(
+            block,
+            &Block::Markdown {
+                param: "notes".into()
+            }
+        );
+        assert_eq!(block.kind(), "markdown");
+        assert_eq!(block.param(), Some("notes"));
+        assert!(!block.is_interactive());
+        let canonical = definition.canonical_json();
+        assert!(
+            canonical.contains(r#"{"type":"markdown","param":"notes"}"#),
+            "{canonical}"
+        );
+        assert_eq!(Definition::parse(canonical.as_bytes()).unwrap(), definition);
+    }
+
+    #[test]
+    fn a_markdown_block_takes_only_a_multiline_string_param() {
+        let multiline = json!({"type": "string", "max_len": 100, "multiline": true});
+        let mut value = markdown(multiline.clone());
+        value["layout"][1]["label"] = json!("Notes");
+        refused(&value, "layout[1]: unknown field \"label\"");
+        let mut value = markdown(multiline);
+        value["layout"][1]["text"] = json!("**hi**");
+        refused(&value, "layout[1]: unknown field \"text\"");
+        refused(
+            &with_block(json!({"type": "markdown", "text": "**hi**"})),
+            "layout[1]: unknown field \"text\"",
+        );
+        refused(
+            &markdown(json!({"type": "string", "max_len": 100})),
+            "layout[1].param: a markdown block needs a multiline string param; \"notes\" is not one",
+        );
+        refused(
+            &markdown(json!({"type": "int", "min": 0, "max": 9})),
+            "a markdown block needs a multiline string param",
         );
     }
 
