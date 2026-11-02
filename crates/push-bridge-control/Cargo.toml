@@ -15,6 +15,9 @@ sha2.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util", "net", "rt", "sync", "time", "macros"] }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Pipes", "Win32_System_Threading", "Win32_Storage_FileSystem"] }
+
 # Not `workspace = true`: the workspace forbids unsafe code, and the Windows transport
 # needs it for the pipe's security descriptor and the peer SID check.
 [lints.rust]
