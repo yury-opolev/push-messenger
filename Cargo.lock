@@ -2562,6 +2562,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "push-tray-core"
+version = "0.1.0"
+dependencies = [
+ "push-bridge-control",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "push-worker"
 version = "0.1.0"
 dependencies = [

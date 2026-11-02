@@ -645,8 +645,8 @@ src/schedtask.rs, src/open.rs}`; root `Cargo.toml` member. Deps: `push-bridge-co
 - `state.rs`:
   ```rust
   pub enum AgentState { Idle, Working, Waiting(Option<String>), Starting, Reconnecting, Restarting, Paused, Stopping, Stopped, Failed { code: Option<i32>, retry_in: Option<Duration> }, GaveUp { code: Option<i32> }, NotSetUp, External /* run by a Scheduled Task, reachable */ }
-  pub enum IconState { Normal, Busy, Waiting, Paused, Disconnected, Error }  // derive Ord in this order of severity (Error worst)
-  pub fn icon_for(state: &AgentState) -> IconState;  // Idle→Normal, Working→Busy, Waiting→Waiting, Paused→Paused, Starting/Reconnecting/Restarting/Stopping→Disconnected, Stopped/Failed/GaveUp/NotSetUp→Error
+  pub enum IconState { Normal, Busy, Paused, Waiting, Disconnected, Error }  // derive Ord in this order of severity (Error worst; waiting for you is more urgent than paused)
+  pub fn icon_for(state: &AgentState) -> IconState;  // Idle/External→Normal, Working→Busy, Waiting→Waiting, Paused→Paused, Starting/Reconnecting/Restarting/Stopping→Disconnected, Stopped/Failed/GaveUp/NotSetUp→Error
   pub fn worst(states: impl IntoIterator<Item = IconState>) -> IconState; // max; empty → Normal
   pub fn label(state: &AgentState) -> String; // "connected, idle", "working", "waiting for you (approval)", "paused for an upgrade", "disconnected, reconnecting", "Coda restarting", "stopped", "failed (exit 1), retrying in 4 s", "stopped after 5 failures (exit 1)", "Not set up: run keygen and enroll", "starting", "stopping"
   pub fn from_bridge(state: BridgeState, detail: Option<String>) -> AgentState;

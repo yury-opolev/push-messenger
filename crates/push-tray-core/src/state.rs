@@ -1,0 +1,337 @@
+//! What the tray shows for an agent: its state, the icon state, a label and the tooltip.
+
+use std::time::Duration;
+
+use push_bridge_control::BridgeState;
+
+use crate::policy::MAX_EXITS;
+
+/// An agent (bridge instance) as the tray sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentState {
+    /// Connected, nothing to do.
+    Idle,
+    /// A turn or a slot command runs.
+    Working,
+    /// A card waits for the owner; the detail names its kind ("approval", …).
+    Waiting(Option<String>),
+    /// The process is up, signing in or opening the conversation.
+    Starting,
+    /// The messenger connection is down; the bridge reconnects.
+    Reconnecting,
+    /// Coda is down and restarts.
+    Restarting,
+    /// Upgrade mode.
+    Paused,
+    Stopping,
+    /// Not running: stopped by the owner, or never started.
+    Stopped,
+    /// The bridge exited; `retry_in` when the tray starts it again.
+    Failed {
+        code: Option<i32>,
+        retry_in: Option<Duration>,
+    },
+    /// The bridge failed too often; the tray no longer restarts it.
+    GaveUp {
+        code: Option<i32>,
+    },
+    /// The bridge exited with code 2: no key or not enrolled.
+    NotSetUp,
+    /// Run by a Scheduled Task (not by the tray) and reachable.
+    External,
+}
+
+/// The tray icon's state, from the least to the most urgent (`Ord` follows this order).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum IconState {
+    Normal,
+    Busy,
+    Paused,
+    Waiting,
+    Disconnected,
+    Error,
+}
+
+impl IconState {
+    /// Every icon state, from the least to the most urgent.
+    pub const ALL: [IconState; 6] = [
+        IconState::Normal,
+        IconState::Busy,
+        IconState::Paused,
+        IconState::Waiting,
+        IconState::Disconnected,
+        IconState::Error,
+    ];
+}
+
+/// The icon an agent's state asks for.
+pub fn icon_for(state: &AgentState) -> IconState {
+    match state {
+        AgentState::Idle | AgentState::External => IconState::Normal,
+        AgentState::Working => IconState::Busy,
+        AgentState::Waiting(_) => IconState::Waiting,
+        AgentState::Paused => IconState::Paused,
+        AgentState::Starting
+        | AgentState::Reconnecting
+        | AgentState::Restarting
+        | AgentState::Stopping => IconState::Disconnected,
+        AgentState::Stopped
+        | AgentState::Failed { .. }
+        | AgentState::GaveUp { .. }
+        | AgentState::NotSetUp => IconState::Error,
+    }
+}
+
+/// The most urgent of `states`; [`IconState::Normal`] when there are none.
+pub fn worst(states: impl IntoIterator<Item = IconState>) -> IconState {
+    states.into_iter().max().unwrap_or(IconState::Normal)
+}
+
+/// The state for people, e.g. "waiting for you (approval)".
+pub fn label(state: &AgentState) -> String {
+    match state {
+        AgentState::Idle => "connected, idle".to_owned(),
+        AgentState::Working => "working".to_owned(),
+        AgentState::Waiting(Some(detail)) if !detail.is_empty() => {
+            format!("waiting for you ({detail})")
+        }
+        AgentState::Waiting(_) => "waiting for you".to_owned(),
+        AgentState::Starting => "starting".to_owned(),
+        AgentState::Reconnecting => "disconnected, reconnecting".to_owned(),
+        AgentState::Restarting => "Coda restarting".to_owned(),
+        AgentState::Paused => "paused for an upgrade".to_owned(),
+        AgentState::Stopping => "stopping".to_owned(),
+        AgentState::Stopped => "stopped".to_owned(),
+        AgentState::Failed { code, retry_in } => {
+            let mut text = format!("failed{}", exit_suffix(*code));
+            if let Some(delay) = retry_in {
+                text.push_str(&format!(", retrying in {} s", whole_seconds(*delay)));
+            }
+            text
+        }
+        AgentState::GaveUp { code } => {
+            format!("stopped after {MAX_EXITS} failures{}", exit_suffix(*code))
+        }
+        AgentState::NotSetUp => "Not set up: run keygen and enroll".to_owned(),
+        AgentState::External => "running (Scheduled Task)".to_owned(),
+    }
+}
+
+fn exit_suffix(code: Option<i32>) -> String {
+    code.map(|code| format!(" (exit {code})"))
+        .unwrap_or_default()
+}
+
+/// Seconds, rounded up: "retrying in 1 s" rather than "in 0 s".
+fn whole_seconds(delay: Duration) -> u128 {
+    delay.as_millis().div_ceil(1000)
+}
+
+/// The agent state for a state the bridge reports.
+pub fn from_bridge(state: BridgeState, detail: Option<String>) -> AgentState {
+    match state {
+        BridgeState::Starting => AgentState::Starting,
+        BridgeState::Idle => AgentState::Idle,
+        BridgeState::Working => AgentState::Working,
+        BridgeState::Waiting => AgentState::Waiting(detail),
+        BridgeState::Reconnecting => AgentState::Reconnecting,
+        BridgeState::Restarting => AgentState::Restarting,
+        BridgeState::Paused => AgentState::Paused,
+        BridgeState::Stopping => AgentState::Stopping,
+    }
+}
+
+/// The longest tooltip, in UTF-16 units (Windows' `NOTIFYICONDATA.szTip` holds 128 with
+/// the terminating NUL).
+pub const TOOLTIP_MAX: usize = 127;
+
+/// The tray icon's tooltip: a line per agent, "Coda on Devbox: waiting for you
+/// (approval)"; "push-agent-tray" and "No agents" without agents. At most
+/// [`TOOLTIP_MAX`] UTF-16 units, cut with "…".
+pub fn tooltip(agents: &[(String, AgentState)]) -> String {
+    let text = if agents.is_empty() {
+        "push-agent-tray\nNo agents".to_owned()
+    } else {
+        agents
+            .iter()
+            .map(|(name, state)| format!("{name}: {}", label(state)))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    cap_utf16(text, TOOLTIP_MAX)
+}
+
+fn cap_utf16(text: String, max: usize) -> String {
+    if text.encode_utf16().count() <= max {
+        return text;
+    }
+    let budget = max.saturating_sub(1);
+    let mut used = 0;
+    let mut cut = String::new();
+    for ch in text.chars() {
+        used += ch.len_utf16();
+        if used > budget {
+            break;
+        }
+        cut.push(ch);
+    }
+    cut.push('…');
+    cut
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn failed(code: Option<i32>, retry_secs: Option<u64>) -> AgentState {
+        AgentState::Failed {
+            code,
+            retry_in: retry_secs.map(Duration::from_secs),
+        }
+    }
+
+    #[test]
+    fn every_state_has_its_icon() {
+        let cases = [
+            (AgentState::Idle, IconState::Normal),
+            (AgentState::External, IconState::Normal),
+            (AgentState::Working, IconState::Busy),
+            (AgentState::Waiting(None), IconState::Waiting),
+            (AgentState::Waiting(Some("plan".into())), IconState::Waiting),
+            (AgentState::Paused, IconState::Paused),
+            (AgentState::Starting, IconState::Disconnected),
+            (AgentState::Reconnecting, IconState::Disconnected),
+            (AgentState::Restarting, IconState::Disconnected),
+            (AgentState::Stopping, IconState::Disconnected),
+            (AgentState::Stopped, IconState::Error),
+            (failed(Some(1), Some(4)), IconState::Error),
+            (AgentState::GaveUp { code: Some(1) }, IconState::Error),
+            (AgentState::NotSetUp, IconState::Error),
+        ];
+        for (state, icon) in cases {
+            assert_eq!(icon_for(&state), icon, "{state:?}");
+        }
+    }
+
+    #[test]
+    fn severity_runs_from_normal_to_error() {
+        let mut sorted = IconState::ALL;
+        sorted.sort();
+        assert_eq!(sorted, IconState::ALL);
+        assert!(IconState::Paused < IconState::Waiting);
+        assert!(IconState::Waiting < IconState::Disconnected);
+    }
+
+    #[test]
+    fn the_worst_icon_wins() {
+        assert_eq!(worst([]), IconState::Normal);
+        assert_eq!(worst([IconState::Busy]), IconState::Busy);
+        assert_eq!(
+            worst([IconState::Normal, IconState::Waiting, IconState::Busy]),
+            IconState::Waiting
+        );
+        assert_eq!(
+            worst([IconState::Waiting, IconState::Paused]),
+            IconState::Waiting
+        );
+        assert_eq!(
+            worst([IconState::Error, IconState::Disconnected, IconState::Normal]),
+            IconState::Error
+        );
+        assert_eq!(
+            worst([IconState::Paused, IconState::Busy, IconState::Normal]),
+            IconState::Paused
+        );
+    }
+
+    #[test]
+    fn labels_read_as_documented() {
+        let cases = [
+            (AgentState::Idle, "connected, idle"),
+            (AgentState::Working, "working"),
+            (
+                AgentState::Waiting(Some("approval".into())),
+                "waiting for you (approval)",
+            ),
+            (AgentState::Waiting(None), "waiting for you"),
+            (AgentState::Paused, "paused for an upgrade"),
+            (AgentState::Reconnecting, "disconnected, reconnecting"),
+            (AgentState::Restarting, "Coda restarting"),
+            (AgentState::Stopped, "stopped"),
+            (failed(Some(1), Some(4)), "failed (exit 1), retrying in 4 s"),
+            (failed(Some(1), None), "failed (exit 1)"),
+            (failed(None, None), "failed"),
+            (
+                AgentState::GaveUp { code: Some(1) },
+                "stopped after 5 failures (exit 1)",
+            ),
+            (AgentState::NotSetUp, "Not set up: run keygen and enroll"),
+            (AgentState::Starting, "starting"),
+            (AgentState::Stopping, "stopping"),
+        ];
+        for (state, text) in cases {
+            assert_eq!(label(&state), text, "{state:?}");
+        }
+        let soon = AgentState::Failed {
+            code: Some(1),
+            retry_in: Some(Duration::from_millis(1500)),
+        };
+        assert_eq!(label(&soon), "failed (exit 1), retrying in 2 s");
+    }
+
+    #[test]
+    fn bridge_states_map_one_to_one() {
+        let cases = [
+            (BridgeState::Starting, AgentState::Starting),
+            (BridgeState::Idle, AgentState::Idle),
+            (BridgeState::Working, AgentState::Working),
+            (
+                BridgeState::Waiting,
+                AgentState::Waiting(Some("detail".into())),
+            ),
+            (BridgeState::Reconnecting, AgentState::Reconnecting),
+            (BridgeState::Restarting, AgentState::Restarting),
+            (BridgeState::Paused, AgentState::Paused),
+            (BridgeState::Stopping, AgentState::Stopping),
+        ];
+        for (bridge, agent) in cases {
+            assert_eq!(from_bridge(bridge, Some("detail".into())), agent);
+        }
+        assert_eq!(
+            from_bridge(BridgeState::Waiting, None),
+            AgentState::Waiting(None)
+        );
+    }
+
+    #[test]
+    fn the_tooltip_has_a_line_per_agent() {
+        assert_eq!(tooltip(&[]), "push-agent-tray\nNo agents");
+        let agents = [
+            (
+                "Coda on Devbox".to_owned(),
+                AgentState::Waiting(Some("approval".into())),
+            ),
+            ("Coda at home".to_owned(), AgentState::Idle),
+        ];
+        assert_eq!(
+            tooltip(&agents),
+            "Coda on Devbox: waiting for you (approval)\nCoda at home: connected, idle"
+        );
+    }
+
+    #[test]
+    fn a_long_tooltip_is_cut_at_127_utf16_units() {
+        let agents: Vec<_> = (0..10)
+            .map(|n| (format!("Agent {n} 🙂"), AgentState::Working))
+            .collect();
+        let text = tooltip(&agents);
+        let units = text.encode_utf16().count();
+        // A surrogate pair is never split, so the cut may be one unit short.
+        assert!((TOOLTIP_MAX - 1..=TOOLTIP_MAX).contains(&units), "{units}");
+        assert!(text.ends_with('…'));
+        assert!(text.starts_with("Agent 0 🙂: working\n"));
+        let exact = vec![("x".repeat(TOOLTIP_MAX - 9), AgentState::Working)];
+        assert_eq!(tooltip(&exact).encode_utf16().count(), TOOLTIP_MAX);
+        assert!(!tooltip(&exact).ends_with('…'));
+    }
+}

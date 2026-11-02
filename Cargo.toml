@@ -19,6 +19,7 @@ members = [
     "crates/push-sdk",
     "crates/push-smoke",
     "crates/push-store",
+    "crates/push-tray-core",
     "crates/push-testkit",
     "crates/push-worker",
 ]
