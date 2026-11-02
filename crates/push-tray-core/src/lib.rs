@@ -3,10 +3,12 @@
 //! ([`history`]), the tray's `tray.json` ([`tray_config`]) and folders ([`paths`]), the
 //! tray's own start at logon ([`autostart`]), the switch-over from Scheduled Tasks
 //! ([`schedtask`]), opening a file or folder ([`open`]), the bridges' control channel
-//! ([`client`]), the bridges' supervision ([`supervisor`]) and the tray menu ([`menu`]).
+//! ([`client`]), the bridges' supervision ([`supervisor`]), the tray menu ([`menu`]), and
+//! the details window and notifications ([`details`]).
 
 pub mod autostart;
 pub mod client;
+pub mod details;
 pub mod history;
 pub mod icon;
 pub mod menu;

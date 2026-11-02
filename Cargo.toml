@@ -23,6 +23,8 @@ members = [
     "crates/push-testkit",
     "crates/push-worker",
 ]
+# The tray app's Tauri shell is its own workspace (apps/push-agent-tray/Cargo.toml).
+exclude = ["apps/push-agent-tray"]
 
 [workspace.package]
 version = "0.1.0"

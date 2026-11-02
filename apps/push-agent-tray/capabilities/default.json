@@ -1,0 +1,6 @@
+{
+  "identifier": "default",
+  "description": "The details windows: Tauri's core defaults only. The app's own `details` command needs no permission (no app manifest restricts app commands).",
+  "windows": ["details-*"],
+  "permissions": ["core:default"]
+}
