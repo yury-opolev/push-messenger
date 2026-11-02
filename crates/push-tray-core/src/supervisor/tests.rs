@@ -21,6 +21,10 @@ struct Bridge {
     state: BridgeState,
     /// Answer `shutdown` but keep running.
     ignore_shutdown: bool,
+    /// Connecting fails with `ConnectionRefused` (while it keeps running).
+    refuse_connects: bool,
+    /// Connecting never completes.
+    hang_connects: bool,
     /// The process the tray started for it.
     process: Option<Arc<Mutex<Option<Exit>>>>,
     /// Open connections: `Some(line)` to send, `None` to close.
@@ -34,6 +38,8 @@ impl Default for Bridge {
             listening: false,
             state: BridgeState::Idle,
             ignore_shutdown: false,
+            refuse_connects: false,
+            hang_connects: false,
             process: None,
             connections: Vec::new(),
             connects: 0,
@@ -167,14 +173,22 @@ impl Connector for FakeConnector {
             let (sender, control) = mpsc::unbounded_channel();
             let state = world.bridge(&name, |bridge| {
                 if !bridge.listening {
-                    return None;
+                    return Err(io::ErrorKind::NotFound);
+                }
+                if bridge.hang_connects {
+                    return Err(io::ErrorKind::WouldBlock);
+                }
+                if bridge.refuse_connects {
+                    return Err(io::ErrorKind::ConnectionRefused);
                 }
                 bridge.connects += 1;
                 bridge.connections.push(sender);
-                Some(bridge.state)
+                Ok(bridge.state)
             });
-            let Some(state) = state else {
-                return Err(io::Error::new(io::ErrorKind::NotFound, "nobody listens"));
+            let state = match state {
+                Ok(state) => state,
+                Err(io::ErrorKind::WouldBlock) => std::future::pending().await,
+                Err(kind) => return Err(io::Error::new(kind, "nobody listens")),
             };
             tokio::spawn(serve(world, name, server, control, state));
             connect_stream(client).await
@@ -409,7 +423,9 @@ async fn a_reachable_bridge_is_external_and_never_spawned() {
     let world = Shared::default();
     world.listen("a");
     let mut harness = start(&world, vec![spec("a", true)]);
-    let a = harness.state("a", AgentState::External).await;
+    let a = harness
+        .state("a", AgentState::External { task: false })
+        .await;
     assert!(!a.started_by_tray);
     assert!(a.connected);
     harness.send(Command::Start(dir("a"))).await;
@@ -496,11 +512,125 @@ async fn a_bridge_that_does_not_exit_after_shutdown_is_killed() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn an_exit_0_the_tray_did_not_ask_for_is_a_stop_not_a_failure() {
+    let world = Shared::default();
+    let mut harness = start(&world, vec![spec("a", true)]);
+    harness.state("a", AgentState::Idle).await;
+    // Ctrl-C, or `shutdown` from another tool: the bridge exits 0 on its own.
+    world.bridge("a", |bridge| {
+        bridge.listening = false;
+        *bridge.process.as_ref().unwrap().lock().unwrap() = Some(Exit { code: Some(0) });
+    });
+    world.cut("a");
+    let a = harness.state("a", AgentState::Stopped).await;
+    assert_eq!(a.last_exit, Some(0));
+    assert_eq!(labels(&a).last().unwrap(), STOPPED_ELSEWHERE);
+    assert!(!labels(&a).iter().any(|label| label.starts_with("failed")));
+    tokio::time::sleep(Duration::from_secs(30 * 60)).await;
+    assert_eq!(world.count("spawn a"), 1);
+    assert_eq!(harness.views.borrow()[0].state, AgentState::Stopped);
+}
+
+/// Spawns `a`, then loses the control connection to it while it keeps running.
+async fn running_but_not_connected(world: &Shared) -> Harness {
+    let mut harness = start(world, vec![spec("a", true)]);
+    harness.state("a", AgentState::Idle).await;
+    world.bridge("a", |bridge| bridge.refuse_connects = true);
+    world.cut("a");
+    harness
+        .until("a disconnected", |views| !views[0].connected)
+        .await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(harness.views.borrow()[0].started_by_tray);
+    harness
+}
+
+#[tokio::test(start_paused = true)]
+async fn stop_without_a_connection_connects_and_asks_before_killing() {
+    let world = Shared::default();
+    let mut harness = running_but_not_connected(&world).await;
+    world.bridge("a", |bridge| bridge.refuse_connects = false);
+    harness.send(Command::Stop(dir("a"))).await;
+    let a = harness.state("a", AgentState::Stopped).await;
+    assert_eq!(a.last_exit, Some(0));
+    assert_eq!(world.count("shutdown a"), 1);
+    assert_eq!(world.count("kill a"), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn stop_kills_when_the_bridge_cannot_be_reached_in_time() {
+    let world = Shared::default();
+    let mut harness = running_but_not_connected(&world).await;
+    world.bridge("a", |bridge| {
+        bridge.refuse_connects = false;
+        bridge.hang_connects = true;
+    });
+    let asked = Instant::now();
+    harness.send(Command::Stop(dir("a"))).await;
+    harness.state("a", AgentState::Stopped).await;
+    let waited = asked.elapsed();
+    assert!(waited >= STOP_CONNECT_TIMEOUT, "{waited:?}");
+    assert!(waited < STOP_CONNECT_TIMEOUT + EXIT_GRACE, "{waited:?}");
+    assert_eq!(world.count("shutdown a"), 0);
+    assert_eq!(world.count("kill a"), 1);
+    tokio::time::sleep(Duration::from_secs(5 * 60)).await;
+    assert_eq!(world.count("spawn a"), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn retiring_a_task_bridge_that_is_gone_sends_nothing() {
+    let world = Shared::default();
+    retire_task_bridge(&FakeConnector(world.clone()), &dir("a"), SWITCH_PATIENCE)
+        .await
+        .unwrap();
+    assert!(world.log().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn retiring_a_surviving_task_bridge_shuts_it_down_and_waits() {
+    let world = Shared::default();
+    world.listen("a");
+    retire_task_bridge(&FakeConnector(world.clone()), &dir("a"), SWITCH_PATIENCE)
+        .await
+        .unwrap();
+    assert_eq!(world.count("shutdown a"), 1);
+    assert!(!world.bridge("a", |bridge| bridge.listening));
+}
+
+#[tokio::test(start_paused = true)]
+async fn retiring_a_task_bridge_that_never_goes_away_fails_after_the_patience() {
+    let world = Shared::default();
+    world.listen("a");
+    world.bridge("a", |bridge| bridge.ignore_shutdown = true);
+    let began = Instant::now();
+    let error = retire_task_bridge(&FakeConnector(world.clone()), &dir("a"), SWITCH_PATIENCE)
+        .await
+        .unwrap_err();
+    assert!(began.elapsed() >= SWITCH_PATIENCE);
+    assert!(began.elapsed() < SWITCH_PATIENCE + Duration::from_secs(10));
+    assert!(error.to_string().contains("still running"), "{error}");
+    assert!(world.count("shutdown a") >= 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn retiring_a_task_bridge_that_hangs_is_not_gone() {
+    let world = Shared::default();
+    world.listen("a");
+    world.bridge("a", |bridge| bridge.hang_connects = true);
+    let error = retire_task_bridge(&FakeConnector(world.clone()), &dir("a"), SWITCH_PATIENCE)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("still running"), "{error}");
+}
+
+#[tokio::test(start_paused = true)]
 async fn stopping_an_external_bridge_only_asks_it() {
     let world = Shared::default();
     world.listen("a");
     let mut harness = start(&world, vec![spec("a", false)]);
-    harness.state("a", AgentState::External).await;
+    harness
+        .state("a", AgentState::External { task: false })
+        .await;
     harness.send(Command::Stop(dir("a"))).await;
     harness.state("a", AgentState::Stopped).await;
     assert_eq!(world.count("shutdown a"), 1);
@@ -513,7 +643,9 @@ async fn quit_stops_only_the_bridges_the_tray_started() {
     let world = Shared::default();
     world.listen("ext");
     let mut harness = start(&world, vec![spec("ext", true), spec("own", true)]);
-    harness.state("ext", AgentState::External).await;
+    harness
+        .state("ext", AgentState::External { task: false })
+        .await;
     harness.state("own", AgentState::Idle).await;
     harness.send(Command::Quit).await;
     tokio::time::timeout(Duration::from_secs(60), harness.run)
@@ -601,11 +733,26 @@ async fn a_task_run_instance_is_started_through_its_task() {
     assert_eq!(harness.views.borrow()[0].state, AgentState::Stopped);
     assert_eq!(world.count("spawn a"), 0);
     harness.send(Command::Start(dir("a"))).await;
-    let a = harness.state("a", AgentState::External).await;
+    let a = harness
+        .state("a", AgentState::External { task: true })
+        .await;
     assert!(!a.started_by_tray);
     assert_eq!(a.task, Some(task));
     assert_eq!(world.count("run a"), 1);
     assert_eq!(world.count("spawn a"), 0);
+
+    // The task is removed (a switch-over) while its bridge still runs.
+    harness
+        .send(Command::SetInstances(vec![spec("a", true)]))
+        .await;
+    let a = harness
+        .state("a", AgentState::External { task: false })
+        .await;
+    assert_eq!(a.task, None);
+    assert_eq!(
+        labels(&a).last().unwrap(),
+        "running (started outside the tray)"
+    );
 }
 
 #[tokio::test(start_paused = true)]

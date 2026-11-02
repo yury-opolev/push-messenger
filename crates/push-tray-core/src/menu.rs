@@ -220,7 +220,7 @@ pub fn enabled(view: &InstanceView, action: MenuAction) -> bool {
             | AgentState::Reconnecting
             | AgentState::Restarting
             | AgentState::Paused
-            | AgentState::External
+            | AgentState::External { .. }
     );
     let live = view.connected && *state != AgentState::Stopping;
     match action {
@@ -449,7 +449,7 @@ mod tests {
                 ],
             ),
             (
-                AgentState::External,
+                AgentState::External { task: false },
                 true,
                 &[
                     "stop",

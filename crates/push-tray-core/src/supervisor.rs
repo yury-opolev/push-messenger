@@ -44,6 +44,14 @@ pub const CONNECT_PATIENCE: Duration = Duration::from_secs(30);
 pub const PROBE_EVERY: Duration = Duration::from_secs(10);
 /// How long `shutdown` may take to answer.
 pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long Stop tries to open a control channel to a bridge the tray started but is not
+/// connected to, to ask it to shut down before killing it.
+pub const STOP_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long a switch-over waits for a Scheduled Task's bridge to go away (after its task
+/// was stopped and `shutdown` sent) before giving up rather than starting a second one.
+pub const SWITCH_PATIENCE: Duration = Duration::from_secs(20);
+/// The history entry for a bridge that exited with code 0 without the tray asking.
+pub const STOPPED_ELSEWHERE: &str = "stopped outside the tray (exit 0)";
 /// How long a bridge has to exit after `shutdown` before it is killed.
 pub const EXIT_GRACE: Duration = Duration::from_secs(20);
 /// How long `restart_backend`, `reconnect` and `resume_backend` may take (the bridge's
@@ -309,6 +317,13 @@ impl Instance {
         }
     }
 
+    /// The state of a reachable bridge the tray did not start.
+    fn external(&self) -> AgentState {
+        AgentState::External {
+            task: self.task.is_some(),
+        }
+    }
+
     fn name(&self) -> String {
         if let Some(agent) = self
             .status
@@ -377,6 +392,8 @@ enum Internal {
     ShutdownDone {
         id: String,
         result: Result<Value, ErrorBody>,
+        /// Sent over a connection opened for it (Stop while not connected).
+        fresh: bool,
     },
     TaskRun {
         id: String,
@@ -477,6 +494,10 @@ impl Supervisor {
                 instance.autostart = spec.autostart;
                 instance.task = spec.task;
                 instance.removed = false;
+                if matches!(instance.state, AgentState::External { .. }) {
+                    let state = instance.external();
+                    instance.set_state(state);
+                }
                 continue;
             }
             let autostart = spec.autostart && spec.task.is_none();
@@ -634,8 +655,12 @@ impl Supervisor {
                     instance.kill_at = Some(now + SHUTDOWN_TIMEOUT + EXIT_GRACE);
                     self.shutdown(index, client);
                 }
-                // Not connected: there is no other way to ask it.
-                None => instance.kill_at = Some(now),
+                // Not connected: connect to ask it; killed only if that fails.
+                None => {
+                    instance.kill_at =
+                        Some(now + STOP_CONNECT_TIMEOUT + SHUTDOWN_TIMEOUT + EXIT_GRACE);
+                    self.connect_and_shutdown(index);
+                }
             }
         } else if let Some(client) = instance.client.clone() {
             instance.requested_stop = true;
@@ -658,7 +683,43 @@ impl Supervisor {
         tracing::info!(event = "bridge_shutdown_requested");
         tokio::spawn(async move {
             let result = client.call(Call::Shutdown, SHUTDOWN_TIMEOUT).await;
-            let _ = inbox.send(Internal::ShutdownDone { id, result });
+            let _ = inbox.send(Internal::ShutdownDone {
+                id,
+                result,
+                fresh: false,
+            });
+        });
+    }
+
+    /// Opens a control channel of its own (for at most [`STOP_CONNECT_TIMEOUT`]) and sends
+    /// `shutdown` on it, so the bridge declines its open cards before it goes.
+    fn connect_and_shutdown(&self, index: usize) {
+        let connector = Arc::clone(&self.connector);
+        let inbox = self.inbox.clone();
+        let instance = &self.instances[index];
+        let id = instance.id.clone();
+        let dir = instance.dir.clone();
+        tracing::info!(event = "bridge_shutdown_requested", connect = true);
+        tokio::spawn(async move {
+            let result = match shutdown_over_new_connection(connector.as_ref(), &dir).await {
+                Ok(Some(result)) => result,
+                Ok(None) => Err(ErrorBody {
+                    code: "not_connected".into(),
+                    message: format!(
+                        "the control channel did not answer within {} s",
+                        STOP_CONNECT_TIMEOUT.as_secs()
+                    ),
+                }),
+                Err(error) => Err(ErrorBody {
+                    code: "not_connected".into(),
+                    message: error.to_string(),
+                }),
+            };
+            let _ = inbox.send(Internal::ShutdownDone {
+                id,
+                result,
+                fresh: true,
+            });
         });
     }
 
@@ -753,9 +814,9 @@ impl Supervisor {
                     }
                 }
             }
-            Internal::ShutdownDone { id, result } => {
+            Internal::ShutdownDone { id, result, fresh } => {
                 if let Some(index) = self.index(&id) {
-                    self.shutdown_done(index, result, now);
+                    self.shutdown_done(index, result, fresh, now);
                 }
             }
             Internal::TaskRun { id, result } => {
@@ -811,7 +872,8 @@ impl Supervisor {
                 instance.purpose = Purpose::Retry { fast_until: now };
                 if instance.child.is_none() {
                     instance.requested_stop = false;
-                    instance.set_state(AgentState::External);
+                    let state = instance.external();
+                    instance.set_state(state);
                 }
                 let inbox = self.inbox.clone();
                 let id = instance.id.clone();
@@ -860,7 +922,7 @@ impl Supervisor {
             Event::StateChanged { state, detail } => {
                 let mut state = from_bridge(state, detail);
                 if instance.child.is_none() && state == AgentState::Idle {
-                    state = AgentState::External;
+                    state = instance.external();
                 }
                 instance.reported = Some(state.clone());
                 if !instance.requested_stop {
@@ -900,19 +962,34 @@ impl Supervisor {
         }
     }
 
-    fn shutdown_done(&mut self, index: usize, result: Result<Value, ErrorBody>, now: Instant) {
+    fn shutdown_done(
+        &mut self,
+        index: usize,
+        result: Result<Value, ErrorBody>,
+        fresh: bool,
+        now: Instant,
+    ) {
         let instance = &mut self.instances[index];
         if let Err(error) = &result {
             instance.last_error = Some(format!("shutdown: {} ({})", error.message, error.code));
         }
         if instance.child.is_some() {
             if instance.kill_at.is_some() {
-                instance.kill_at = Some(now + EXIT_GRACE);
+                // Could not even ask it: kill it now if it is still alive.
+                let grace = if fresh && result.is_err() {
+                    Duration::ZERO
+                } else {
+                    EXIT_GRACE
+                };
+                instance.kill_at = Some(now + grace);
             }
         } else if result.is_err() && instance.client.is_some() && instance.requested_stop {
             // The bridge did not take the request: show what it last reported.
             instance.requested_stop = false;
-            let state = instance.reported.clone().unwrap_or(AgentState::External);
+            let state = instance
+                .reported
+                .clone()
+                .unwrap_or_else(|| instance.external());
             instance.set_state(state);
         }
     }
@@ -1034,6 +1111,11 @@ impl Supervisor {
                 instance.set_state(AgentState::Stopped);
                 None
             }
+            Decision::StoppedElsewhere => {
+                instance.state = AgentState::Stopped;
+                instance.history.push(now_ms(), STOPPED_ELSEWHERE);
+                None
+            }
             Decision::Restart(delay) => {
                 instance.set_state(AgentState::Failed {
                     code,
@@ -1079,6 +1161,72 @@ impl Supervisor {
                 true
             }
         });
+    }
+}
+
+/// Nobody listens on the control channel.
+fn nobody_listens(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+    )
+}
+
+/// Connects to the bridge in `dir` (for at most [`STOP_CONNECT_TIMEOUT`]) and sends
+/// `shutdown`: `None` when the connection did not complete in time.
+async fn shutdown_over_new_connection(
+    connector: &dyn Connector,
+    dir: &Path,
+) -> io::Result<Option<Result<Value, ErrorBody>>> {
+    match tokio::time::timeout(STOP_CONNECT_TIMEOUT, connector.connect(dir)).await {
+        Ok(Ok((client, _events))) => Ok(Some(client.call(Call::Shutdown, SHUTDOWN_TIMEOUT).await)),
+        Ok(Err(error)) => Err(error),
+        Err(_) => Ok(None),
+    }
+}
+
+/// Makes sure the bridge in `dir` is gone before the tray starts its own: for the
+/// switch-over, after the instance's Scheduled Task was stopped and removed (the bridge it
+/// ran may survive that, under conhost). While the control channel is reachable it sends
+/// `shutdown` (once it is taken) and looks again every [`CONNECT_RETRY`], for at most
+/// `patience`. `Ok` once nobody listens; an error if a bridge (or anything that does not
+/// answer as "nobody listens") is still there: then the caller must not start one.
+pub async fn retire_task_bridge(
+    connector: &dyn Connector,
+    dir: &Path,
+    patience: Duration,
+) -> io::Result<()> {
+    let deadline = Instant::now() + patience;
+    let mut asked = false;
+    loop {
+        if asked {
+            match tokio::time::timeout(STOP_CONNECT_TIMEOUT, connector.connect(dir)).await {
+                Ok(Err(error)) if nobody_listens(&error) => return Ok(()),
+                _ => {}
+            }
+        } else {
+            match shutdown_over_new_connection(connector, dir).await {
+                Err(error) if nobody_listens(&error) => return Ok(()),
+                Ok(Some(Ok(_))) => {
+                    tracing::info!(event = "switch_over", step = "shutdown_bridge");
+                    asked = true;
+                }
+                _ => {}
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::other(format!(
+                "the bridge in {} is still running {} s after its Scheduled Task was stopped{}; the tray does not start a second one",
+                dir.display(),
+                patience.as_secs(),
+                if asked {
+                    " and it was asked to shut down"
+                } else {
+                    ""
+                },
+            )));
+        }
+        tokio::time::sleep(CONNECT_RETRY).await;
     }
 }
 

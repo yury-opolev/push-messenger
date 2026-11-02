@@ -37,8 +37,11 @@ pub enum AgentState {
     },
     /// The bridge exited with code 2: no key or not enrolled.
     NotSetUp,
-    /// Run by a Scheduled Task (not by the tray) and reachable.
-    External,
+    /// Reachable, but not started by the tray: by the instance's Scheduled Task (`task`),
+    /// or from outside the tray (a console, a script).
+    External {
+        task: bool,
+    },
 }
 
 /// The tray icon's state, from the least to the most urgent (`Ord` follows this order).
@@ -67,7 +70,7 @@ impl IconState {
 /// The icon an agent's state asks for.
 pub fn icon_for(state: &AgentState) -> IconState {
     match state {
-        AgentState::Idle | AgentState::External => IconState::Normal,
+        AgentState::Idle | AgentState::External { .. } => IconState::Normal,
         AgentState::Working => IconState::Busy,
         AgentState::Waiting(_) => IconState::Waiting,
         AgentState::Paused => IconState::Paused,
@@ -113,7 +116,8 @@ pub fn label(state: &AgentState) -> String {
             format!("stopped after {MAX_EXITS} failures{}", exit_suffix(*code))
         }
         AgentState::NotSetUp => "Not set up: run keygen and enroll".to_owned(),
-        AgentState::External => "running (Scheduled Task)".to_owned(),
+        AgentState::External { task: true } => "running (Scheduled Task)".to_owned(),
+        AgentState::External { task: false } => "running (started outside the tray)".to_owned(),
     }
 }
 
@@ -194,7 +198,8 @@ mod tests {
     fn every_state_has_its_icon() {
         let cases = [
             (AgentState::Idle, IconState::Normal),
-            (AgentState::External, IconState::Normal),
+            (AgentState::External { task: true }, IconState::Normal),
+            (AgentState::External { task: false }, IconState::Normal),
             (AgentState::Working, IconState::Busy),
             (AgentState::Waiting(None), IconState::Waiting),
             (AgentState::Waiting(Some("plan".into())), IconState::Waiting),
@@ -268,6 +273,14 @@ mod tests {
             (AgentState::NotSetUp, "Not set up: run keygen and enroll"),
             (AgentState::Starting, "starting"),
             (AgentState::Stopping, "stopping"),
+            (
+                AgentState::External { task: true },
+                "running (Scheduled Task)",
+            ),
+            (
+                AgentState::External { task: false },
+                "running (started outside the tray)",
+            ),
         ];
         for (state, text) in cases {
             assert_eq!(label(&state), text, "{state:?}");

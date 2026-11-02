@@ -615,7 +615,9 @@ The tray keeps `tray.json` outside the bridge folders
 | "The bridge in <dir> is not running (no control channel)." | No bridge serves that folder's control channel: it is not running, `--dir` names another folder, `"control": false`, or the bridge could not bind its pipe (the log says `control_unavailable`; `kind` `AddrInUse` means another bridge already serves that folder) |
 | The tray shows an agent red with "Not set up: run keygen and enroll" | The bridge exited with code 2: run `keygen` and `enroll` for that folder, then Start it from the tray |
 | The tray shows "stopped after 5 failures (exit N)" | The bridge exited 5 times within 10 minutes; Open log from its menu, fix the cause, then Start |
-| The tray shows "running (Scheduled Task)" | The tray did not start that process (a Scheduled Task, a console, or an earlier tray process did). Stop asks it to shut down through the control channel; Quit leaves it running; the tray never restarts it |
+| The tray shows "running (Scheduled Task)" | The folder's Scheduled Task runs that bridge, not the tray. Stop asks it to shut down through the control channel; Quit leaves it running; the tray never restarts it; "Switch from Scheduled Task to tray…" moves it under the tray |
+| The tray shows "running (started outside the tray)" | The bridge answers but the tray did not start it and no Scheduled Task runs it: it was started in a console, by a script, or by an earlier tray process. Stop, Quit and restarts as for a Scheduled Task's bridge |
+| The tray shows "stopped" and Details lists "stopped outside the tray (exit 0)" | A bridge the tray started was stopped on purpose elsewhere: Ctrl-C, or `shutdown` from another tool (`push-agent-bridge` CLI or another control-channel client). The tray does not restart it and does not count it as a failure; Start runs it again |
 | "Coda is paused for an upgrade; try again when it is back." | Upgrade mode: wait for the upgrade, or `push-agent-bridge resume` |
 
 ## 12. Live smoke test (opt-in)
@@ -668,7 +670,7 @@ first row below that applies to any agent); with no agents it is green.
 | waiting for you | amber `#e8a317` | "waiting for you (approval needed)", "… (question)", "… (plan approval)" | `waiting` with its detail |
 | paused | purple `#8a5cd1` | "paused for an upgrade" | `paused` |
 | busy | blue `#2f6fdf` | "working" | `working` |
-| normal | green `#2e9d4f` | "connected, idle"; "running (Scheduled Task)" | `idle` (the second label when the tray did not start the process) |
+| normal | green `#2e9d4f` | "connected, idle"; "running (Scheduled Task)"; "running (started outside the tray)" | `idle` (the second label when the tray did not start the process and the folder's Scheduled Task runs it, the third when no task runs it) |
 
 A stopped agent is red, so stopping one agent turns the icon red. The tooltip has a line
 per agent, "`<name>: <label>`" (for example "Coda on Devbox (coda-devbox): waiting for
@@ -772,14 +774,19 @@ While such a task exists, the menu offers "Switch from Scheduled Task to tray…
 confirmation ("Stop and remove the Scheduled Task(s) <names>, start push-agent-tray at
 logon, and run these agents under the tray instead?", Switch or Cancel) the tray:
 
-1. stops each task (`Stop-ScheduledTask`; this is not the graceful Stop, so cards open at
-   that moment are not declined) and removes it (`Unregister-ScheduledTask
+1. stops each task (`Stop-ScheduledTask`; this is not the graceful Stop, so a bridge that
+   ends with its task does not decline the cards open at that moment) and removes it (`Unregister-ScheduledTask
    -Confirm:$false`), each addressed by its Task Scheduler folder and name;
 2. turns its own "Start at logon" on;
 3. marks each switched folder `autostart` in `tray.json` (adding it if absent; folders added
    meanwhile are kept) and saves it;
-4. starts each switched bridge under the tray once the task's bridge is gone (it waits up
-   to 15 s).
+4. starts each switched bridge under the tray once the task's bridge is gone. Stopping a
+   task may leave the bridge it ran alive (under `conhost`): while the folder's control
+   channel still answers, the tray sends it `shutdown` (so it declines its open cards) and
+   looks again every 0.5 s for up to 20 s. A bridge still there after that is not joined
+   by a second one: the tray does not start that folder and says so ("Not started under the
+   tray: the bridge in <folder> is still running 20 s after its Scheduled Task was stopped
+   …"); stop it, then use Start.
 
 It stops at the first failure and says so: a task that could not be stopped or removed
 leaves "Start at logon" off and `tray.json` unchanged, so a folder never ends up started by
@@ -787,14 +794,15 @@ both. Tasks for folders not in `tray.json` are not touched.
 
 ### Restarts and failures
 
-When a bridge the tray started exits without a Stop (whatever its exit code, 0 included),
-the tray starts it again after a delay:
+When a bridge the tray started exits without a Stop, the tray starts it again after a
+delay, except after exit code 0 or 2:
 
 | Rule | Value |
 |---|---|
 | Delay | 1 s, then 2 s, 4 s, … up to 60 s; a run of 60 s or more starts the delay over; shown as "failed (exit N), retrying in S s" |
 | Giving up | at the 5th exit within 10 minutes: "stopped after 5 failures (exit N)" and the notification "<name> stopped after 5 failures (exit N). Open its log from the tray menu." |
 | Exit code 2 (no key, not enrolled, key not accepted) | never retried: "Not set up: run keygen and enroll" and the notification "<name> is not set up: run keygen and enroll." |
+| Exit code 0 the tray did not ask for | the bridge exits 0 only when stopped on purpose (Ctrl-C, or `shutdown` from another tool such as the CLI): "stopped", with "stopped outside the tray (exit 0)" in the details' history; never restarted and not counted |
 | A bridge that cannot be started (no `push-agent-bridge.exe` next to the tray) | counts as an exit |
 | Start | forgets the exits and starts the delay over |
 
@@ -808,14 +816,16 @@ restarted by it; when it goes away it shows "stopped".
 "(The bridge stopped.)", declines the open requests and tells the owner once "Declined: the
 bridge was stopped.", stops Coda and exits with 0; the device stays enrolled and the next
 Start signs in again. For a bridge the tray started, the tray waits up to 5 s for the
-answer and then 20 s for the exit before it kills the process; one it cannot reach over
-the control channel is killed at once (no graceful decline then). A stopped bridge is not
-restarted.
+answer and then 20 s for the exit before it kills the process. When the tray has no live
+control connection to it (it lost the connection, say), Stop first opens one (for up to
+3 s) and sends `shutdown` over it; only when that fails is the process killed, if it is
+still alive (no graceful decline then). A stopped bridge is not restarted.
 
 **Quit** stops (as above, all at once) only the bridges this tray process started, waits
 for them to exit, and leaves the others running (a Scheduled Task's, one started in a
 console, or one an earlier tray process started: the bridges are not tied to the tray's
-life, so after a tray crash they keep running and the next tray only shows them).
+life, so after a tray crash they keep running and the next tray only shows them, as
+"running (started outside the tray)").
 
 ### What it never does
 

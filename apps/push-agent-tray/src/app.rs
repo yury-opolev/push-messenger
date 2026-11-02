@@ -38,9 +38,9 @@ const TRAY_ID: &str = "push-agent-tray";
 const TITLE: &str = "push-agent-tray";
 const ICON_SIZE: u32 = 32;
 const COMMAND_BUFFER: usize = 64;
-/// How long the switch-over waits for a task's bridge to go away before starting it under
-/// the tray.
-const SWITCH_WAIT: Duration = Duration::from_secs(15);
+/// How long the switch-over waits for the supervisor to notice that a task's bridge (gone
+/// by then) closed its control channel before starting the instance under the tray.
+const SWITCH_WAIT: Duration = Duration::from_secs(5);
 const DETAILS_PAGE: &str = "details.html";
 const DETAILS_SIZE: (f64, f64) = (420.0, 520.0);
 
@@ -691,7 +691,17 @@ async fn switch_over(app: AppHandle) {
         Err(error) => (Err(io::Error::other(error.to_string())), Vec::new()),
     };
     shell.set_instances();
+    let mut stuck: Vec<String> = Vec::new();
     for dir in started {
+        // Never both: a task's bridge that survives its task is asked to shut down, and
+        // the tray starts its own only once it is gone.
+        if let Err(error) =
+            supervisor::retire_task_bridge(&EndpointConnector, &dir, supervisor::SWITCH_PATIENCE)
+                .await
+        {
+            stuck.push(error.to_string());
+            continue;
+        }
         let id = instance_id(&dir);
         let mut views = shell.views.clone();
         let gone =
@@ -703,6 +713,16 @@ async fn switch_over(app: AppHandle) {
         message(
             &app,
             format!("The switch-over stopped: {error}"),
+            MessageDialogKind::Error,
+        );
+    }
+    if !stuck.is_empty() {
+        message(
+            &app,
+            format!(
+                "Not started under the tray: {}. Stop it, then use Start.",
+                stuck.join("; ")
+            ),
             MessageDialogKind::Error,
         );
     }

@@ -28,6 +28,10 @@ pub enum Decision {
     NotSetUp,
     /// The tray asked it to stop.
     Stopped,
+    /// It exited with code 0 without the tray asking: it was stopped on purpose elsewhere
+    /// (Ctrl-C, or `shutdown` from another tool on the control channel). Never restarted,
+    /// never counted.
+    StoppedElsewhere,
 }
 
 /// One bridge's restart policy. Call [`RestartPolicy::reset`] when the owner starts it.
@@ -62,7 +66,8 @@ impl RestartPolicy {
     }
 
     /// Decides after an exit with `code` (`None`: killed by a signal) at `now`, after a run
-    /// of `ran_for`. A requested stop and code 2 are not counted as failures.
+    /// of `ran_for`. A requested stop, code 0 (the bridge was stopped on purpose elsewhere)
+    /// and code 2 are not counted as failures.
     pub fn on_exit(
         &mut self,
         code: Option<i32>,
@@ -72,6 +77,9 @@ impl RestartPolicy {
     ) -> Decision {
         if requested_stop {
             return Decision::Stopped;
+        }
+        if code == Some(0) {
+            return Decision::StoppedElsewhere;
         }
         if code == Some(EXIT_NOT_SET_UP) {
             return Decision::NotSetUp;
@@ -197,6 +205,22 @@ mod tests {
         let now = Instant::now();
         for code in [None, Some(0), Some(1), Some(2)] {
             assert_eq!(policy.on_exit(code, true, QUICK, now), Decision::Stopped);
+        }
+        assert_eq!(
+            policy.on_exit(Some(1), false, QUICK, now),
+            Decision::Restart(secs(1))
+        );
+    }
+
+    #[test]
+    fn an_unrequested_exit_0_is_a_deliberate_stop_and_never_counted() {
+        let mut policy = RestartPolicy::new();
+        let now = Instant::now();
+        for _ in 0..10 {
+            assert_eq!(
+                policy.on_exit(Some(0), false, QUICK, now),
+                Decision::StoppedElsewhere
+            );
         }
         assert_eq!(
             policy.on_exit(Some(1), false, QUICK, now),
