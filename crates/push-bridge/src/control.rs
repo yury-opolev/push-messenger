@@ -114,6 +114,16 @@ impl ControlHandle {
         });
     }
 
+    /// Changes the status snapshot, then sends `event` (if any). In this order: a
+    /// connection subscribes before it reads the snapshot, so it sees the change in
+    /// one or the other.
+    pub fn update_and_emit(&self, change: impl FnOnce(&mut Status), event: Option<Event>) {
+        self.update(change);
+        if let Some(event) = event {
+            self.emit(event);
+        }
+    }
+
     pub fn status(&self) -> Status {
         self.status.borrow().clone()
     }
@@ -503,6 +513,42 @@ mod tests {
             panic!("an event");
         };
         assert_eq!(event.event, Event::TurnEnded { interrupted: false });
+    }
+
+    #[test]
+    fn the_snapshot_changes_before_the_event_goes_out() {
+        let handle = ControlHandle::detached();
+        let mut events = handle.subscribe();
+        // Holding the snapshot blocks its change: the event must wait for it.
+        let held = handle.status.borrow();
+        let writer = {
+            let handle = handle.clone();
+            std::thread::spawn(move || {
+                handle.update_and_emit(
+                    |status| status.state = Some(BridgeState::Working),
+                    Some(Event::StateChanged {
+                        state: BridgeState::Working,
+                        detail: None,
+                    }),
+                );
+            })
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            events.try_recv().is_err(),
+            "the event went out before the snapshot changed"
+        );
+        drop(held);
+        writer.join().unwrap();
+        let line = events.try_recv().expect("the event");
+        assert!(matches!(
+            line.event,
+            Event::StateChanged {
+                state: BridgeState::Working,
+                ..
+            }
+        ));
+        assert_eq!(handle.status().state, Some(BridgeState::Working));
     }
 
     #[tokio::test]

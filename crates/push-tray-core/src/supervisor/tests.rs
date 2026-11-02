@@ -698,6 +698,19 @@ async fn events_map_to_states() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn the_status_poll_corrects_a_missed_state_change() {
+    let world = Shared::default();
+    let mut harness = start(&world, vec![spec("a", true)]);
+    harness.state("a", AgentState::Idle).await;
+    // The bridge changed state but its `state_changed` never arrived (a lagging
+    // subscriber skips events).
+    world.bridge("a", |bridge| bridge.state = BridgeState::Working);
+    let a = harness.state("a", AgentState::Working).await;
+    assert_eq!(labels(&a).last().unwrap(), "working");
+    assert_eq!(a.status.unwrap().state, Some(BridgeState::Working));
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_lost_connection_to_a_live_bridge_reconnects() {
     let world = Shared::default();
     let mut harness = start(&world, vec![spec("a", true)]);

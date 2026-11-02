@@ -63,18 +63,18 @@ impl<M: Messenger> Core<M> {
         (BridgeState::Idle, None)
     }
 
-    /// Emits `state_changed` when the state or its detail changed, and updates the
-    /// status snapshot.
+    /// Updates the status snapshot, then emits `state_changed` when the state or its
+    /// detail changed.
     pub(super) fn publish(&mut self) {
         let reported = self.bridge_state();
-        if self.reported.as_ref() != Some(&reported) {
+        let changed = (self.reported.as_ref() != Some(&reported)).then(|| {
             tracing::debug!(event = "bridge_state", state = ?reported.0);
-            self.control.emit(Event::StateChanged {
+            self.reported = Some(reported.clone());
+            Event::StateChanged {
                 state: reported.0,
                 detail: reported.1.clone(),
-            });
-            self.reported = Some(reported.clone());
-        }
+            }
+        });
         let (state, detail) = reported;
         let folder = self.folder.display().to_string();
         let session = self.session.clone();
@@ -93,19 +93,22 @@ impl<M: Messenger> Core<M> {
         } else {
             0
         };
-        self.control.update(|status| {
-            status.state = Some(state);
-            status.detail = detail;
-            status.folder = Some(folder);
-            status.session = session;
-            if let Some(connection) = connection {
-                status.connection = Some(connection.to_owned());
-            }
-            status.backend = Some(backend);
-            status.open_requests = open_requests;
-            status.held_texts = held_texts;
-            status.pause = pause;
-        });
+        self.control.update_and_emit(
+            |status| {
+                status.state = Some(state);
+                status.detail = detail;
+                status.folder = Some(folder);
+                status.session = session;
+                if let Some(connection) = connection {
+                    status.connection = Some(connection.to_owned());
+                }
+                status.backend = Some(backend);
+                status.open_requests = open_requests;
+                status.held_texts = held_texts;
+                status.pause = pause;
+            },
+            changed,
+        );
     }
 
     pub(super) fn report_turn_started(&self, source: TurnSource) {

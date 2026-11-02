@@ -475,17 +475,18 @@ fn set_state(control: Option<&ControlHandle>, state: BridgeState, connection: &s
     let Some(control) = control else {
         return;
     };
-    if control.status().state != Some(state) {
-        control.emit(ControlEvent::StateChanged {
-            state,
-            detail: None,
-        });
-    }
-    control.update(|status| {
-        status.state = Some(state);
-        status.detail = None;
-        status.connection = Some(connection.to_owned());
+    let changed = (control.status().state != Some(state)).then_some(ControlEvent::StateChanged {
+        state,
+        detail: None,
     });
+    control.update_and_emit(
+        |status| {
+            status.state = Some(state);
+            status.detail = None;
+            status.connection = Some(connection.to_owned());
+        },
+        changed,
+    );
 }
 
 /// Signs the client in again and connects it: the messenger's `reconnect`. A failed

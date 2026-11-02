@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use push_bridge_control::{
-    Call, ErrorBody, Event, EventLine, PauseParams, Status, instance_id, now_ms,
+    BridgeState, Call, ErrorBody, Event, EventLine, PauseParams, Status, instance_id, now_ms,
 };
 use serde_json::Value;
 use tokio::sync::{mpsc, watch};
@@ -321,6 +321,24 @@ impl Instance {
     fn external(&self) -> AgentState {
         AgentState::External {
             task: self.task.is_some(),
+        }
+    }
+
+    /// The state the bridge reports, as the tray shows it: an idle bridge the tray did
+    /// not start is external.
+    fn shown(&self, state: BridgeState, detail: Option<String>) -> AgentState {
+        let state = from_bridge(state, detail);
+        if self.child.is_none() && state == AgentState::Idle {
+            return self.external();
+        }
+        state
+    }
+
+    /// Takes the state the bridge reported; shown unless the tray asked it to stop.
+    fn report(&mut self, state: AgentState) {
+        self.reported = Some(state.clone());
+        if !self.requested_stop {
+            self.set_state(state);
         }
     }
 
@@ -795,7 +813,17 @@ impl Supervisor {
                 }
                 instance.status_pending = false;
                 match *result {
-                    Ok(status) => instance.status = Some(status),
+                    Ok(status) => {
+                        // Corrects a missed `state_changed` (a lagging connection skips
+                        // events).
+                        if let Some(state) = status.state {
+                            let state = instance.shown(state, status.detail.clone());
+                            if instance.reported.as_ref() != Some(&state) {
+                                instance.report(state);
+                            }
+                        }
+                        instance.status = Some(status);
+                    }
                     Err(error) => {
                         tracing::debug!(event = "bridge_status_failed", code = %error.code);
                     }
@@ -920,14 +948,8 @@ impl Supervisor {
         }
         match line.event {
             Event::StateChanged { state, detail } => {
-                let mut state = from_bridge(state, detail);
-                if instance.child.is_none() && state == AgentState::Idle {
-                    state = instance.external();
-                }
-                instance.reported = Some(state.clone());
-                if !instance.requested_stop {
-                    instance.set_state(state);
-                }
+                let state = instance.shown(state, detail);
+                instance.report(state);
             }
             Event::Error { code, method } => {
                 instance.last_error = Some(match method {
