@@ -461,6 +461,7 @@ impl<M: Messenger> Core<M> {
 
     /// Takes a started session as current and stores it; fetches missed background
     /// messages when the engine is the same as before, else starts their cursor over.
+    /// A pending restart and the carry of a failed resume are dropped.
     pub(super) async fn adopt(&mut self, folder: PathBuf, started: Started) {
         tracing::info!(event = "session_started");
         let previous = self.state.get().engine_instance;
@@ -483,6 +484,11 @@ impl<M: Messenger> Core<M> {
         self.running_since = Some(Instant::now());
         self.running_tasks.clear();
         self.restore_next = false;
+        // A session runs again: a pending retry (and the upgrade it would announce) is
+        // obsolete. The start meant to finish that upgrade took the carry already.
+        self.pending_resume = None;
+        self.restart_at = None;
+        self.start_failing = false;
         if same_engine {
             self.fetch_pending().await;
         }

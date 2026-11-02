@@ -1795,6 +1795,38 @@ async fn a_failed_resume_keeps_the_restore_and_the_bypass_confirmation() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_session_the_owner_picks_drops_a_failed_resume() {
+    for (command, reply) in [
+        ("/new", "New session"),
+        ("/cd ../other", "Folder "),
+        ("/resume s-7", "Resumed session s-7."),
+    ] {
+        let h = Harness::started().await;
+        let program = bypassed_and_paused(&h).await;
+        h.backend.fail_next_start(ErrorKind::Other);
+        std::fs::write(&program, "build number two").unwrap();
+        h.backend.wait_for("start", 2).await;
+        h.reply_containing("retrying").await;
+        h.messenger.owner_says(command);
+        h.reply_containing(reply).await;
+        h.backend.wait_for("start", 3).await;
+        tokio::time::sleep(Duration::from_secs(3_600)).await;
+        settle().await;
+        assert_eq!(h.count("start"), 3, "{command}: no start from the timer");
+        assert_eq!(h.cards().len(), 1, "{command}: no bypass card");
+        let replies = h.replies();
+        assert!(
+            replies
+                .iter()
+                .all(|reply| !reply.contains("upgraded") && !reply.contains("restarted")),
+            "{command}: {replies:?}"
+        );
+        h.messenger.owner_says("/status");
+        h.reply_containing("Permission mode: default").await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_resume_failing_on_a_missing_program_keeps_the_restore_and_the_bypass_confirmation() {
     let h = Harness::started().await;
     let program = bypassed_and_paused(&h).await;
