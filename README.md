@@ -100,6 +100,13 @@ in with a TPM key, runs one agent backend per instance (Coda, through `coda serv
 first) and starts at logon as a Scheduled Task. Setup, commands, the security model and
 troubleshooting: [docs/agent-bridge.md](docs/agent-bridge.md).
 
+- `apps/push-agent-tray` (with `crates/push-tray-core`): a tray app that starts the
+  bridges at logon, shows their state and restarts them
+  ([guide](docs/agent-bridge.md#13-the-tray-app-push-agent-tray)).
+- `crates/push-bridge-control`: each bridge's local control channel, for the tray, `pause`
+  / `resume` around a Coda upgrade, and other tools
+  ([guide](docs/agent-bridge.md#14-control-channel-for-other-tools)).
+
 ## Run it on minikube
 
 The whole system runs on a local [minikube](https://minikube.sigs.k8s.io/) cluster with

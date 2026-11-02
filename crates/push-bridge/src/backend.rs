@@ -8,6 +8,7 @@
 use std::collections::BTreeSet;
 use std::fmt;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
@@ -93,6 +94,8 @@ pub struct StartOptions {
     /// The session to resume; `None` starts a new one.
     pub session: Option<String>,
     pub permission_mode: PermissionMode,
+    /// Restore the state the backend saved before a planned restart.
+    pub restore: bool,
 }
 
 /// A started (or resumed) session.
@@ -103,6 +106,96 @@ pub struct Started {
     /// only from the same instance.
     pub engine_instance: Option<String>,
     pub version: Option<String>,
+    /// What the backend restored after a planned restart; `None` when it restored nothing
+    /// (or was not asked to).
+    pub restored: Option<Restored>,
+}
+
+/// What a backend restored after a planned restart: counts, versions and setting names
+/// only. The default is an applied restore of nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Restored {
+    /// The saved state was applied; when not, [`Restored::ignored_reason`] says why.
+    pub applied: bool,
+    /// Why the saved state was not applied, such as `expired` or `unsupportedFormat`.
+    pub ignored_reason: Option<String>,
+    /// The version that saved the state.
+    pub from_version: Option<String>,
+    /// The version that restored it.
+    pub to_version: Option<String>,
+    pub schedules: usize,
+    pub messages: usize,
+    /// The restored settings' names, such as `model` or `goal`.
+    pub settings: Vec<String>,
+    /// Settings that were saved but not restored, such as approvals that were off.
+    pub settings_not_restored: Vec<NotRestored>,
+    pub interrupted_tasks: usize,
+    pub interrupted_requests: usize,
+    pub steering: usize,
+    pub tasks_suspended: usize,
+}
+
+impl Default for Restored {
+    fn default() -> Self {
+        Self {
+            applied: true,
+            ignored_reason: None,
+            from_version: None,
+            to_version: None,
+            schedules: 0,
+            messages: 0,
+            settings: Vec::new(),
+            settings_not_restored: Vec::new(),
+            interrupted_tasks: 0,
+            interrupted_requests: 0,
+            steering: 0,
+            tasks_suspended: 0,
+        }
+    }
+}
+
+impl Restored {
+    /// Approvals were off when the state was saved; they are to be confirmed again.
+    pub fn bypass_not_restored(&self) -> bool {
+        self.settings_not_restored.iter().any(|setting| {
+            setting.name == "bypassPermissions"
+                || (setting.name == "permissionMode"
+                    && setting.value.as_deref() == Some(PermissionMode::BypassPermissions.as_str()))
+        })
+    }
+}
+
+/// A saved setting a restore did not bring back.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NotRestored {
+    pub name: String,
+    pub value: Option<String>,
+    pub reason: Option<String>,
+}
+
+/// What `prepare_restart` is asked to do.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PrepareOptions {
+    /// How long running work may finish first.
+    pub drain: Duration,
+    pub reason: Option<String>,
+    /// The last background message the bridge showed: the backend does not deliver it
+    /// (or older ones) again after the restore.
+    pub delivered_cursor: Option<u64>,
+}
+
+/// How a backend prepared for a planned restart.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Prepared {
+    /// Running work finished before the backend saved its state.
+    pub drained: bool,
+    /// Tasks still running when the drain time was up; the backend reports them after
+    /// the restart.
+    pub interrupted_tasks: usize,
+    /// Requests still open when the drain time was up.
+    pub interrupted_requests: usize,
+    /// Tasks saved to continue after the restart.
+    pub suspended_tasks: usize,
 }
 
 /// What kind of failure a [`BackendError`] is.
@@ -116,6 +209,10 @@ pub enum ErrorKind {
     NotRunning,
     /// The agent refused the call, for example while busy or for bad arguments.
     Refused,
+    /// The backend has no such method (an older version).
+    Unsupported,
+    /// The backend is draining for a restart.
+    RestartPending,
     Other,
 }
 
@@ -339,6 +436,26 @@ pub trait Backend: Send + Sync + 'static {
         after: Option<u64>,
         engine_instance: Option<&str>,
     ) -> Result<PendingMessages, BackendError>;
+    /// Saves the backend's state for a restart after letting running work finish (up to
+    /// `options.drain`). [`ErrorKind::Unsupported`] when the backend cannot (the
+    /// default).
+    async fn prepare_restart(&self, _options: PrepareOptions) -> Result<Prepared, BackendError> {
+        Err(unsupported("session/prepareRestart"))
+    }
+    /// The program file the backend runs, for upgrade detection; `None` when unknown.
+    fn executable(&self) -> Option<PathBuf> {
+        None
+    }
+}
+
+/// A [`ErrorKind::Unsupported`] error for `method`.
+pub fn unsupported(method: &str) -> BackendError {
+    BackendError {
+        method: method.to_owned(),
+        code: "unsupported".to_owned(),
+        message: "not supported by this backend".to_owned(),
+        kind: ErrorKind::Unsupported,
+    }
 }
 
 /// `<n chars>`: how much text there is, never the text.

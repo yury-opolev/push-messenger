@@ -159,9 +159,12 @@ impl<M: Messenger> Core<M> {
         self.deliver(text, 0).await;
     }
 
-    /// [`Self::send_to_agent`] for the `attempt`th time (from 0).
+    /// [`Self::send_to_agent`] for the `attempt`th time (from 0). While paused, the text
+    /// is held until the backend is back.
     pub(super) async fn deliver(&mut self, text: String, attempt: u32) {
-        if self.turn.is_some() {
+        if self.pause.is_some() {
+            self.hold(text);
+        } else if self.turn.is_some() {
             if self.has(Capability::Steer) {
                 self.steer(text, attempt).await;
             } else {
@@ -202,6 +205,9 @@ impl<M: Messenger> Core<M> {
                 } else {
                     self.wait_or_retry(text, attempt);
                 }
+            }
+            Err(error) if error.kind == ErrorKind::RestartPending && self.pause.is_some() => {
+                self.hold(text);
             }
             Err(error) => self.backend_failed(&error),
         }
@@ -262,6 +268,7 @@ impl<M: Messenger> Core<M> {
             method = error.method.as_str(),
             code = error.code.as_str()
         );
+        self.report_error(error);
         self.reply(&error.to_string());
     }
 
@@ -277,6 +284,7 @@ impl<M: Messenger> Core<M> {
         };
         let request = self.open.remove(index);
         self.cards.close(id);
+        self.request_closed(&request.kind, "declined");
         if let Some(responder) = request.responder {
             responder.answer(Answer::Decline);
         }

@@ -4,8 +4,10 @@
 
 mod control;
 mod conversation;
+mod report;
 mod requests;
 mod turns;
+mod upgrade;
 
 #[cfg(test)]
 mod tests;
@@ -16,6 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use push_bridge_control::{AgentInfo, BridgeState};
 use push_sdk::{
     ActivityState, CardBook, ClientMsgId, ConnectionState, ConversationId, Event, SdkError, UserId,
 };
@@ -24,10 +27,11 @@ use tokio::time::{Instant, MissedTickBehavior};
 
 use crate::backend::{
     Backend, BackendCommand, BackendError, BackendEvent, Capability, CommandReply, PermissionMode,
-    Responder, TextFormat,
+    Prepared, Responder, TextFormat,
 };
 use crate::backoff::Backoff;
 use crate::cards::CardKind;
+use crate::control::{Calls, ControlCall, ControlHandle};
 use crate::messenger::Messenger;
 use crate::render::{TurnRenderer, reply_bodies};
 use crate::state::{State, StateFile};
@@ -97,6 +101,10 @@ pub struct Bridge<M: Messenger> {
     messenger_events: mpsc::Receiver<Event>,
     state: Arc<StateFile>,
     options: BridgeOptions,
+    control: ControlHandle,
+    calls: Calls,
+    /// Keeps a bridge without a control channel's actions channel open.
+    _calls: Option<mpsc::Sender<ControlCall>>,
 }
 
 impl<M: Messenger> Bridge<M> {
@@ -108,6 +116,7 @@ impl<M: Messenger> Bridge<M> {
         state: Arc<StateFile>,
         options: BridgeOptions,
     ) -> Self {
+        let (sender, receiver) = mpsc::channel(1);
         Self {
             messenger,
             backend,
@@ -115,6 +124,20 @@ impl<M: Messenger> Bridge<M> {
             messenger_events,
             state,
             options,
+            control: ControlHandle::detached(),
+            calls: Arc::new(tokio::sync::Mutex::new(receiver)),
+            _calls: Some(sender),
+        }
+    }
+
+    /// Reports to the control channel through `handle` and takes its actions from
+    /// `calls` while it runs.
+    pub fn with_control(self, handle: ControlHandle, calls: Calls) -> Self {
+        Self {
+            control: handle,
+            calls,
+            _calls: None,
+            ..self
         }
     }
 
@@ -128,12 +151,24 @@ impl<M: Messenger> Bridge<M> {
             mut messenger_events,
             state,
             options,
+            control,
+            calls,
+            _calls,
         } = self;
+        let mut calls = calls.lock().await;
         let owner = messenger.owner().await.map_err(BridgeError::Messenger)?;
         let conversation = messenger
             .direct(owner)
             .await
             .map_err(BridgeError::Messenger)?;
+        if let Some((display_name, handle)) = messenger.profile().await {
+            control.update(|status| {
+                status.agent = Some(AgentInfo {
+                    display_name,
+                    handle,
+                });
+            });
+        }
         let (internal, mut internal_events) = mpsc::unbounded_channel();
         let mut core = Core::new(
             messenger,
@@ -144,8 +179,10 @@ impl<M: Messenger> Bridge<M> {
             owner,
             conversation,
         );
+        core.control = control;
         tracing::info!(event = "bridge_started", backend = core.name.as_str());
         core.boot().await;
+        core.publish();
         let mut ticker = tokio::time::interval(TICK);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         tokio::pin!(shutdown);
@@ -154,6 +191,10 @@ impl<M: Messenger> Bridge<M> {
             tokio::select! {
                 biased;
                 () = &mut shutdown => break Ok(()),
+                Some(call) = calls.recv() => match core.on_control(call).await {
+                    Flow::Continue => {}
+                    Flow::Stop => break Ok(()),
+                },
                 Some(event) = backend_events.recv() => core.on_backend(event).await,
                 Some(done) = internal_events.recv() => core.on_internal(done).await,
                 event = messenger_events.recv() => match event {
@@ -168,11 +209,18 @@ impl<M: Messenger> Bridge<M> {
                     if restart_at.is_some() => core.restart().await,
                 _ = ticker.tick() => core.on_tick().await,
             }
+            core.publish();
         };
         core.close().await;
         tracing::info!(event = "bridge_stopped", ok = result.is_ok());
         result
     }
+}
+
+/// Whether the run goes on after a control action.
+enum Flow {
+    Continue,
+    Stop,
 }
 
 /// Results of backend calls the core does not wait for.
@@ -190,6 +238,11 @@ enum Internal {
         folder: PathBuf,
         session: Option<String>,
         result: Result<CommandReply, BackendError>,
+    },
+    /// `prepare_restart` answered for the pause with this id.
+    Prepared {
+        pause: u64,
+        result: Result<Prepared, BackendError>,
     },
 }
 
@@ -273,6 +326,15 @@ struct Core<M: Messenger> {
     seen_order: VecDeque<(ConversationId, i64)>,
     connection: Option<ConnectionState>,
 
+    /// The control channel: the status snapshot and the events.
+    control: ControlHandle,
+    /// The state last reported, with its detail.
+    reported: Option<(BridgeState, Option<String>)>,
+    /// The bridge is closing.
+    stopping: bool,
+    /// The backend's tasks that started and have not completed.
+    running_tasks: HashSet<String>,
+
     backoff: Backoff,
     running_since: Option<Instant>,
     restart_at: Option<Instant>,
@@ -280,6 +342,17 @@ struct Core<M: Messenger> {
     announce_restart: bool,
     /// The last start failed (its error was shown once).
     start_failing: bool,
+
+    /// Upgrade mode: the backend is paused (see [`upgrade`]).
+    pause: Option<upgrade::Pause>,
+    /// Pauses so far (each one's id).
+    pauses: u64,
+    /// The backend saved its state for a restart that did not happen: the next start
+    /// of the current session restores it.
+    restore_next: bool,
+    /// A start after a pause failed: the next successful start says how the backend
+    /// came back and asks to confirm approvals again.
+    pending_resume: Option<upgrade::ResumeCarry>,
 }
 
 impl<M: Messenger> Core<M> {
@@ -322,11 +395,19 @@ impl<M: Messenger> Core<M> {
             seen: HashSet::new(),
             seen_order: VecDeque::new(),
             connection: None,
+            control: ControlHandle::detached(),
+            reported: None,
+            stopping: false,
+            running_tasks: HashSet::new(),
             backoff: Backoff::new(),
             running_since: None,
             restart_at: None,
             announce_restart: false,
             start_failing: false,
+            pause: None,
+            pauses: 0,
+            restore_next: false,
+            pending_resume: None,
         }
     }
 
@@ -384,13 +465,15 @@ impl<M: Messenger> Core<M> {
         }
     }
 
-    /// Waiting while a card is open, working while a turn runs, else idle.
+    /// Waiting while a card is open, working while paused or a turn runs, else idle.
     fn wanted_activity(&self) -> (ActivityState, Option<String>) {
         if let Some(request) = self.open.first() {
             (
                 ActivityState::Waiting,
                 Some(request.waiting_label.to_owned()),
             )
+        } else if self.pause.is_some() {
+            (ActivityState::Working, Some(self.pause_label()))
         } else if let Some(turn) = &self.turn {
             (ActivityState::Working, Some(turn.renderer.current_label()))
         } else {
@@ -414,31 +497,48 @@ impl<M: Messenger> Core<M> {
             } => {
                 self.commanded(command, &folder, session.as_deref(), result);
                 self.send_queued();
+                self.release_when_idle().await;
             }
+            Internal::Prepared { pause, result } => self.prepared(pause, result).await,
         }
     }
 
     async fn on_tick(&mut self) {
         self.poll_turn();
         self.expire_requests().await;
+        self.watch_pause().await;
         self.update_activity(false).await;
     }
 
-    /// Ends what is open as the bridge stops: the reply, the cards (declined), the
-    /// activity and the backend.
+    /// Ends what is open as the bridge stops: the reply, the requests (declined, said
+    /// once), the activity and the backend.
     async fn close(&mut self) {
+        self.stopping = true;
+        self.end_pause_at_close();
+        self.publish();
         if let Some(mut turn) = self.turn.take() {
             turn.renderer.note("(The bridge stopped.)");
             let updates = turn.renderer.finish(false);
             self.apply(&mut turn.pages, updates);
+            self.report_turn_ended(true);
         }
-        for request in std::mem::take(&mut self.open) {
+        let open = std::mem::take(&mut self.open);
+        for request in &open {
             if let Some(card) = request.card {
                 self.cards.close(card);
             }
+            self.request_closed(&request.kind, "declined");
+        }
+        if !open.is_empty() {
+            drop(open);
+            self.reply("Declined: the bridge was stopped.");
         }
         self.update_activity(false).await;
+        self.publish();
         self.backend.stop().await;
+        self.running_since = None;
+        self.running_tasks.clear();
+        self.publish();
     }
 }
 

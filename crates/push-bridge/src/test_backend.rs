@@ -2,6 +2,7 @@
 //! for and returns the results it queued. It proves the core runs without Coda.
 
 use std::collections::{BTreeSet, VecDeque};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use tokio::sync::{Notify, mpsc, oneshot};
@@ -9,8 +10,8 @@ use tokio::time::Instant;
 
 use crate::backend::{
     Answer, Backend, BackendCommand, BackendError, BackendEvent, BackendRequest, BackendStatus,
-    Capability, CommandReply, ErrorKind, PendingMessages, RequestKind, Responder, StartOptions,
-    Started, SteerOutcome, TextFormat, TurnSource,
+    Capability, CommandReply, ErrorKind, PendingMessages, PrepareOptions, Prepared, RequestKind,
+    Responder, StartOptions, Started, SteerOutcome, TextFormat, TurnSource,
 };
 use crate::messenger::wait;
 
@@ -36,6 +37,12 @@ struct Script {
     calls: Vec<(Instant, String)>,
     capabilities: BTreeSet<Capability>,
     starts: VecDeque<Result<Started, BackendError>>,
+    /// The next starts wait for these before they return.
+    start_holds: VecDeque<oneshot::Receiver<()>>,
+    prepares: VecDeque<Result<Prepared, BackendError>>,
+    /// The next prepares wait for these before they return.
+    prepare_holds: VecDeque<oneshot::Receiver<()>>,
+    executable: Option<PathBuf>,
     prompts: VecDeque<Result<(), BackendError>>,
     steers: VecDeque<Result<SteerOutcome, BackendError>>,
     commands: VecDeque<Result<CommandReply, BackendError>>,
@@ -66,6 +73,10 @@ impl TestBackend {
                 calls: Vec::new(),
                 capabilities: ALL_CAPABILITIES.into_iter().collect(),
                 starts: VecDeque::new(),
+                start_holds: VecDeque::new(),
+                prepares: VecDeque::new(),
+                prepare_holds: VecDeque::new(),
+                executable: None,
                 prompts: VecDeque::new(),
                 steers: VecDeque::new(),
                 commands: VecDeque::new(),
@@ -108,6 +119,33 @@ impl TestBackend {
     /// The next start fails with `kind`.
     pub fn fail_next_start(&self, kind: ErrorKind) {
         self.next_start(Err(error("initialize", kind)));
+    }
+
+    /// The next start (recorded at once) returns only once the sender is used or
+    /// dropped; its result is taken then.
+    pub fn hold_next_start(&self) -> oneshot::Sender<()> {
+        let (release, hold) = oneshot::channel();
+        self.lock().start_holds.push_back(hold);
+        release
+    }
+
+    /// The next `prepare_restart` returns `result`; unscripted ones are
+    /// [`ErrorKind::Unsupported`].
+    pub fn next_prepare(&self, result: Result<Prepared, BackendError>) {
+        self.lock().prepares.push_back(result);
+    }
+
+    /// The next `prepare_restart` (recorded at once) returns only once the sender is used
+    /// or dropped; its result is taken then.
+    pub fn hold_next_prepare(&self) -> oneshot::Sender<()> {
+        let (release, hold) = oneshot::channel();
+        self.lock().prepare_holds.push_back(hold);
+        release
+    }
+
+    /// The program file [`Backend::executable`] reports.
+    pub fn set_executable(&self, path: Option<PathBuf>) {
+        self.lock().executable = path;
     }
 
     pub fn next_prompt(&self, result: Result<(), BackendError>) {
@@ -208,6 +246,8 @@ pub fn error(method: &str, kind: ErrorKind) -> BackendError {
         ErrorKind::SessionNotFound => ("-32002", "session not found"),
         ErrorKind::NotRunning => ("exited", "not running"),
         ErrorKind::Refused => ("refused", "refused"),
+        ErrorKind::Unsupported => ("-32601", "method not found"),
+        ErrorKind::RestartPending => ("-32016", "restart pending"),
         ErrorKind::Other => ("-32000", "failed"),
     };
     BackendError {
@@ -234,11 +274,16 @@ impl Backend for TestBackend {
 
     async fn start(&self, options: StartOptions) -> Result<Started, BackendError> {
         self.record(format!(
-            "start folder={} session={} mode={}",
+            "start folder={} session={} mode={}{}",
             options.folder.display(),
             options.session.as_deref().unwrap_or("None"),
             options.permission_mode,
+            if options.restore { " restore=true" } else { "" },
         ));
+        let hold = self.lock().start_holds.pop_front();
+        if let Some(hold) = hold {
+            let _ = hold.await;
+        }
         let mut script = self.lock();
         if let Some(result) = script.starts.pop_front() {
             return result;
@@ -254,6 +299,7 @@ impl Backend for TestBackend {
             session_id,
             engine_instance: script.engine_instance.clone(),
             version: Some("1.0".to_owned()),
+            restored: None,
         })
     }
 
@@ -310,11 +356,34 @@ impl Backend for TestBackend {
         ));
         Ok(std::mem::take(&mut self.lock().pending))
     }
+
+    async fn prepare_restart(&self, options: PrepareOptions) -> Result<Prepared, BackendError> {
+        self.record(format!(
+            "prepare drain={} delivered={}",
+            options.drain.as_millis(),
+            options
+                .delivered_cursor
+                .map_or("None".to_owned(), |cursor| cursor.to_string()),
+        ));
+        let hold = self.lock().prepare_holds.pop_front();
+        if let Some(hold) = hold {
+            let _ = hold.await;
+        }
+        self.lock()
+            .prepares
+            .pop_front()
+            .unwrap_or_else(|| Err(error("session/prepareRestart", ErrorKind::Unsupported)))
+    }
+
+    fn executable(&self) -> Option<PathBuf> {
+        self.lock().executable.clone()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::time::Duration;
 
     use super::*;
     use crate::backend::PermissionMode;
@@ -324,7 +393,51 @@ mod tests {
             folder: PathBuf::from("work"),
             session: session.map(str::to_owned),
             permission_mode: PermissionMode::Default,
+            restore: false,
         }
+    }
+
+    #[tokio::test]
+    async fn restores_and_prepares_are_recorded_and_scripted() {
+        let (backend, _events) = TestBackend::channel();
+        let error = backend
+            .prepare_restart(PrepareOptions {
+                drain: Duration::from_secs(2),
+                reason: Some("upgrade".into()),
+                delivered_cursor: Some(4),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Unsupported);
+        let prepared = Prepared {
+            drained: false,
+            interrupted_tasks: 1,
+            ..Prepared::default()
+        };
+        backend.next_prepare(Ok(prepared.clone()));
+        assert_eq!(
+            backend
+                .prepare_restart(PrepareOptions {
+                    drain: Duration::from_millis(1500),
+                    ..PrepareOptions::default()
+                })
+                .await,
+            Ok(prepared)
+        );
+        let mut restore = options(Some("s"));
+        restore.restore = true;
+        backend.start(restore).await.unwrap();
+        assert_eq!(
+            backend.calls(),
+            [
+                "prepare drain=2000 delivered=4",
+                "prepare drain=1500 delivered=None",
+                "start folder=work session=s mode=default restore=true",
+            ]
+        );
+        assert_eq!(backend.executable(), None);
+        backend.set_executable(Some(PathBuf::from("coda.exe")));
+        assert_eq!(backend.executable(), Some(PathBuf::from("coda.exe")));
     }
 
     #[tokio::test]

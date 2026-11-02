@@ -5,15 +5,21 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use push_bridge_control::{
+    AgentInfo, BackendInfo, BridgeState, Event as ControlEvent, EventLine, PauseParams,
+};
 use push_sdk::{ActivityState, ClientMsgId, ConnectionState, Event, MessageKind, SdkError, UserId};
-use tokio::sync::oneshot;
+use serde_json::json;
+use tokio::sync::{broadcast, oneshot};
 use tokio::task::JoinHandle;
 
 use super::*;
 use crate::backend::{
-    Answer, BackendStatus, ErrorKind, PendingMessages, RequestKind, SteerOutcome, TaskStatus,
-    TurnSource,
+    Answer, BackendStatus, ErrorKind, NotRestored, PendingMessages, Prepared, RequestKind,
+    Restored, Started, SteerOutcome, TaskStatus, TurnSource,
 };
+use crate::cards;
+use crate::control::{Action, ControlHub, Reply};
 use crate::folders;
 use crate::messenger::{Call, TestMessenger, param, template};
 use crate::test_backend::{TestBackend, error};
@@ -31,6 +37,8 @@ struct Harness {
     channels: Option<Channels>,
     stop: Option<oneshot::Sender<()>>,
     run: Option<JoinHandle<Result<(), BridgeError>>>,
+    hub: ControlHub,
+    events: broadcast::Receiver<EventLine>,
     _dir: TestDir,
 }
 
@@ -47,6 +55,8 @@ impl Harness {
         let state = Arc::new(StateFile::load(&dir.path().join("state.json")).unwrap());
         let (messenger, messenger_events) = TestMessenger::new();
         let (backend, backend_events) = TestBackend::channel();
+        let hub = ControlHub::new("0011223344556677".into());
+        let events = hub.handle().subscribe();
         Self {
             messenger,
             backend,
@@ -57,6 +67,8 @@ impl Harness {
             channels: Some((backend_events, messenger_events)),
             stop: None,
             run: None,
+            hub,
+            events,
             _dir: dir,
         }
     }
@@ -74,7 +86,8 @@ impl Harness {
                 default_folder: self.work.clone(),
                 default_mode: PermissionMode::Default,
             },
-        );
+        )
+        .with_control(self.hub.handle(), self.hub.calls());
         let (stop, stopped) = oneshot::channel::<()>();
         self.stop = Some(stop);
         self.run = Some(tokio::spawn(bridge.run(async {
@@ -148,6 +161,66 @@ impl Harness {
             "start folder={} session={session} mode=default",
             folder.display()
         )
+    }
+
+    /// Asks the bridge to do `action` over the control channel.
+    async fn call(&self, action: Action) -> Reply {
+        self.hub.call(action).await
+    }
+
+    /// The control events emitted since the last look.
+    fn control_events(&mut self) -> Vec<ControlEvent> {
+        let mut events = Vec::new();
+        while let Ok(line) = self.events.try_recv() {
+            events.push(line.event);
+        }
+        events
+    }
+
+    /// The states in `events`, in order.
+    fn states(events: &[ControlEvent]) -> Vec<BridgeState> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                ControlEvent::StateChanged { state, .. } => Some(*state),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Writes the backend's program file with `content` and reports it as its executable.
+    fn program(&self, content: &str) -> PathBuf {
+        let path = self._dir.path().join("coda.exe");
+        std::fs::write(&path, content).unwrap();
+        self.backend.set_executable(Some(path.clone()));
+        path
+    }
+
+    /// Asks for a pause (reason "upgrade") over the control channel; the reply comes
+    /// once the backend is released.
+    fn pause(&self, drain_timeout_ms: Option<u64>) -> JoinHandle<Reply> {
+        let hub = self.hub.clone();
+        tokio::spawn(async move {
+            hub.call(Action::Pause(PauseParams {
+                reason: Some("upgrade".into()),
+                drain_timeout_ms,
+            }))
+            .await
+        })
+    }
+
+    /// The pause's phase on the control channel.
+    fn pause_phase(&self) -> Option<String> {
+        self.hub.handle().status().pause.map(|pause| pause.phase)
+    }
+
+    /// The `start` calls, in order.
+    fn starts(&self) -> Vec<String> {
+        self.backend
+            .calls()
+            .into_iter()
+            .filter(|call| call.starts_with("start"))
+            .collect()
     }
 }
 
@@ -1196,4 +1269,939 @@ async fn a_plain_backend_s_text_goes_out_as_reply_v1() {
             .iter()
             .all(|(tpl, _)| tpl == "agent.reply@1")
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn status_reports_state_folder_session_backend_and_counts() {
+    let mut h = Harness::new();
+    let work = h.work.clone();
+    h.state
+        .update(|state| {
+            state.sessions.insert(folder_key(&work), "s-9".into());
+        })
+        .unwrap();
+    h.start();
+    h.backend.wait_for("start", 1).await;
+    settle().await;
+    let status = h.hub.handle().status();
+    assert_eq!(status.state, Some(BridgeState::Idle));
+    assert_eq!(status.detail, None);
+    assert_eq!(status.folder, Some(h.work.display().to_string()));
+    assert_eq!(status.session.as_deref(), Some("s-9"));
+    assert_eq!(
+        status.backend,
+        Some(BackendInfo {
+            name: "Test".into(),
+            version: Some("1.0".into()),
+            running: true,
+            running_tasks: 0,
+        })
+    );
+    assert_eq!(
+        status.agent,
+        Some(AgentInfo {
+            display_name: "Coda on Devbox".into(),
+            handle: "coda-devbox".into(),
+        })
+    );
+    assert_eq!((status.open_requests, status.held_texts), (0, 0));
+    assert_eq!(status.instance, "0011223344556677");
+
+    h.backend.emit(BackendEvent::TaskStarted {
+        id: "t1".into(),
+        description: "build".into(),
+        background: true,
+    });
+    let _answer = h.backend.request(permission());
+    h.card(1).await;
+    settle().await;
+    let status = h.hub.handle().status();
+    assert_eq!(status.state, Some(BridgeState::Waiting));
+    assert_eq!(status.detail.as_deref(), Some("approval needed"));
+    assert_eq!((status.open_requests, status.held_texts), (1, 0));
+    assert_eq!(status.backend.map(|backend| backend.running_tasks), Some(1));
+    let events = h.control_events();
+    assert!(events.contains(&ControlEvent::StateChanged {
+        state: BridgeState::Waiting,
+        detail: Some("approval needed".into()),
+    }));
+    assert!(events.contains(&ControlEvent::RequestOpened {
+        kind: "permission".into(),
+        open: 1,
+    }));
+}
+
+#[tokio::test(start_paused = true)]
+async fn restart_backend_keeps_the_messenger_session() {
+    let mut h = Harness::started().await;
+    h.control_events();
+    assert_eq!(
+        h.call(Action::RestartBackend).await,
+        Ok(json!({"restarted": true}))
+    );
+    assert_eq!(h.count("stop"), 1);
+    assert_eq!(h.count("start"), 2);
+    assert_eq!(h.backend.calls()[2], h.start_call(&h.work, "session-1"));
+    h.reply_containing("Test restarted by the owner.").await;
+    assert_eq!(
+        h.replies(),
+        [
+            "(Test is restarting: the owner asked)",
+            "Test restarted by the owner. Undelivered background messages and in-memory \
+             schedules were lost.",
+        ]
+    );
+    assert!(!h.messenger.calls().contains(&Call::Reconnect));
+    let conversation = h.messenger.conversation();
+    assert!(h.messenger.calls().iter().all(|call| match call {
+        Call::SendRich {
+            conversation: c, ..
+        } => *c == conversation,
+        _ => true,
+    }));
+    settle().await;
+    let events = h.control_events();
+    assert_eq!(
+        Harness::states(&events),
+        [BridgeState::Restarting, BridgeState::Idle]
+    );
+    h.messenger.owner_says("still here");
+    h.backend.wait_for("prompt still here", 1).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn reconnect_signs_in_again_and_keeps_the_backend() {
+    let mut h = Harness::started().await;
+    h.backend.turn_started(TurnSource::Prompt);
+    settle().await;
+    h.control_events();
+    assert_eq!(
+        h.call(Action::Reconnect).await,
+        Ok(json!({"reconnected": true}))
+    );
+    let reconnects = h
+        .messenger
+        .calls()
+        .iter()
+        .filter(|call| **call == Call::Reconnect)
+        .count();
+    assert_eq!(reconnects, 1);
+    assert_eq!(h.count("start"), 1);
+    assert_eq!(h.count("stop"), 0);
+    settle().await;
+    assert_eq!(
+        h.hub.handle().status().state,
+        Some(BridgeState::Reconnecting)
+    );
+    let before = h.messenger.calls().len();
+    h.messenger
+        .inject(Event::ConnectionStateChanged(ConnectionState::Connected));
+    h.backend.wait_for("pending", 1).await;
+    settle().await;
+    let resent = h.messenger.calls()[before..].iter().any(|call| {
+        matches!(
+            call,
+            Call::Activity {
+                state: ActivityState::Working,
+                ..
+            }
+        )
+    });
+    assert!(resent, "the activity is sent again");
+    let status = h.hub.handle().status();
+    assert_eq!(status.state, Some(BridgeState::Working));
+    assert_eq!(status.connection.as_deref(), Some("connected"));
+    assert_eq!(
+        Harness::states(&h.control_events()),
+        [BridgeState::Reconnecting, BridgeState::Working]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn shutdown_declines_open_requests_and_stops_ok() {
+    let mut h = Harness::started().await;
+    let answer = h.backend.request(permission());
+    h.card(1).await;
+    settle().await;
+    h.control_events();
+    assert_eq!(
+        h.call(Action::Shutdown).await,
+        Ok(json!({"stopping": true}))
+    );
+    assert_eq!(h.run.take().unwrap().await.unwrap(), Ok(()));
+    assert!(answer.await.is_err(), "declined");
+    assert_eq!(
+        h.replies().last().map(String::as_str),
+        Some("Declined: the bridge was stopped.")
+    );
+    assert_eq!(h.backend.calls().last().map(String::as_str), Some("stop"));
+    let events = h.control_events();
+    assert!(events.contains(&ControlEvent::RequestClosed {
+        kind: "permission".into(),
+        outcome: "declined".into(),
+        open: 0,
+    }));
+    assert_eq!(Harness::states(&events), [BridgeState::Stopping]);
+    assert_eq!(h.hub.handle().status().state, Some(BridgeState::Stopping));
+}
+
+#[tokio::test(start_paused = true)]
+async fn status_shows_the_backend_stopped_after_the_bridge_stops() {
+    let mut h = Harness::started().await;
+    h.backend.emit(BackendEvent::TaskStarted {
+        id: "t1".into(),
+        description: "build".into(),
+        background: true,
+    });
+    settle().await;
+    let running = h.hub.handle().status().backend.unwrap();
+    assert_eq!((running.running, running.running_tasks), (true, 1));
+    assert_eq!(h.stop().await, Ok(()));
+    let status = h.hub.handle().status();
+    assert_eq!(status.state, Some(BridgeState::Stopping));
+    let stopped = status.backend.unwrap();
+    assert_eq!((stopped.running, stopped.running_tasks), (false, 0));
+}
+
+#[tokio::test(start_paused = true)]
+async fn events_and_status_carry_no_message_content() {
+    const SECRET: &str = "s3cr3t";
+    let mut h = Harness::started().await;
+    h.messenger.owner_says(&format!("do {SECRET}"));
+    h.backend.wait_for("prompt", 1).await;
+    h.backend.turn_started(TurnSource::Prompt);
+    h.backend
+        .emit(BackendEvent::ThinkingDelta(format!("think {SECRET}")));
+    h.backend.text(&format!("reply {SECRET}"));
+    h.backend.emit(BackendEvent::ToolStarted {
+        id: "tool-1".into(),
+        tool: format!("Bash {SECRET}"),
+        target: format!("{SECRET}/file"),
+        task: Some(format!("task {SECRET}")),
+    });
+    settle().await;
+    let permission = h.backend.request(RequestKind::Permission {
+        tool: "Bash".into(),
+        preview: format!("rm {SECRET}"),
+    });
+    h.card(1).await;
+    h.messenger.owner_says("y");
+    assert_eq!(permission.await, Ok(Answer::Permission(true)));
+    let question = h.backend.request(RequestKind::Question {
+        question: format!("Which {SECRET}?"),
+        options: vec![format!("{SECRET} A"), "B".into()],
+        multi_select: false,
+        allow_free_text: true,
+    });
+    h.card(2).await;
+    h.messenger.owner_says(&format!("answer {SECRET}"));
+    assert!(question.await.is_ok());
+    h.backend
+        .emit(BackendEvent::Error(format!("error {SECRET}")));
+    h.backend.emit(BackendEvent::TaskStarted {
+        id: "task-1".into(),
+        description: format!("task {SECRET}"),
+        background: true,
+    });
+    h.backend.emit(BackendEvent::TaskCompleted {
+        id: "task-1".into(),
+        description: format!("task {SECRET}"),
+        status: TaskStatus::Completed,
+        background: true,
+        report: Some(format!("report {SECRET}")),
+    });
+    h.backend.turn_ended(false);
+    h.idle().await;
+    h.backend.next_prompt(Err(BackendError {
+        method: "session/prompt".into(),
+        code: "-32000".into(),
+        message: format!("failed {SECRET}"),
+        kind: ErrorKind::Other,
+    }));
+    h.messenger.owner_says(&format!("again {SECRET}"));
+    h.reply_containing(&format!("failed {SECRET}")).await;
+    settle().await;
+
+    let events = h.control_events();
+    assert!(events.contains(&ControlEvent::TurnStarted {
+        source: "prompt".into()
+    }));
+    assert!(events.contains(&ControlEvent::TurnEnded { interrupted: false }));
+    assert!(events.contains(&ControlEvent::RequestClosed {
+        kind: "question".into(),
+        outcome: "answered".into(),
+        open: 0,
+    }));
+    assert!(events.contains(&ControlEvent::Error {
+        code: "-32000".into(),
+        method: Some("session/prompt".into()),
+    }));
+    for event in &events {
+        let line = serde_json::to_string(event).unwrap();
+        assert!(!line.contains(SECRET), "{line}");
+    }
+    let status = serde_json::to_string(&h.hub.handle().status()).unwrap();
+    assert!(!status.contains(SECRET), "{status}");
+    assert!(
+        status.contains("\"lastError\":{\"code\":\"-32000\""),
+        "{status}"
+    );
+}
+
+const UPGRADING: &str = "Test is being upgraded; your messages will be sent when it is back.";
+const PAUSED_COMMAND: &str = "Test is paused for an upgrade; try again when it is back.";
+const STOPPED_UNUSABLE: &str =
+    "(Test stopped and its program is missing or in use; waiting for it to come back)";
+const LOST: &str = "Undelivered background messages and in-memory schedules were lost.";
+
+fn prepared(interrupted_tasks: usize) -> Prepared {
+    Prepared {
+        drained: true,
+        interrupted_tasks,
+        ..Prepared::default()
+    }
+}
+
+/// The upgraded backend's start: the same session at `version`.
+fn upgraded(version: &str, restored: Option<Restored>) -> Started {
+    Started {
+        session_id: "session-1".into(),
+        engine_instance: Some("engine-1".into()),
+        version: Some(version.into()),
+        restored,
+    }
+}
+
+fn paused_activity() -> (ActivityState, Option<String>) {
+    (
+        ActivityState::Working,
+        Some("Paused: upgrading Test".to_owned()),
+    )
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_pause_during_a_turn_waits_for_it_and_holds_owner_text() {
+    let h = Harness::started().await;
+    h.program("build one");
+    h.messenger.owner_says("work");
+    h.backend.wait_for("prompt work", 1).await;
+    h.backend.turn_started(TurnSource::Prompt);
+    let answer = h.backend.request(permission());
+    h.card(1).await;
+    let release = h.backend.hold_next_prepare();
+    h.backend.next_prepare(Ok(prepared(0)));
+    let pausing = h.pause(None);
+    h.backend.wait_for("prepare drain=600000", 1).await;
+    settle().await;
+    assert!(!h.messenger.activities().contains(&paused_activity()));
+    assert_eq!(h.hub.handle().status().state, Some(BridgeState::Paused));
+
+    h.messenger.owner_says("y");
+    assert_eq!(answer.await, Ok(Answer::Permission(true)));
+    settle().await;
+    assert_eq!(h.messenger.activities().last(), Some(&paused_activity()));
+    h.messenger.owner_says("first");
+    h.reply_containing(UPGRADING).await;
+    h.messenger.owner_says("second");
+    h.messenger.owner_says("/compact");
+    h.reply_containing(PAUSED_COMMAND).await;
+    h.messenger.owner_says("/status");
+    h.backend.wait_for("status", 1).await;
+    settle().await;
+    let told = h
+        .replies()
+        .iter()
+        .filter(|reply| *reply == UPGRADING)
+        .count();
+    assert_eq!(told, 1);
+    assert_eq!(h.count("steer") + h.count("command") + h.count("prompt"), 1);
+    let status = h.hub.handle().status();
+    assert_eq!(status.held_texts, 2);
+    assert_eq!(h.pause_phase().as_deref(), Some("draining"));
+
+    h.backend.turn_ended(false);
+    settle().await;
+    assert_eq!(h.count("stop"), 0);
+    assert!(!pausing.is_finished());
+    drop(release);
+    assert_eq!(
+        pausing.await.unwrap(),
+        Ok(json!({"state": "paused", "prepared": true, "drained": true, "interruptedTasks": 0}))
+    );
+    assert_eq!(h.count("stop"), 1);
+    assert!(
+        h.replies().iter().all(|reply| !reply.contains("Declined")),
+        "{:?}",
+        h.replies()
+    );
+    assert_eq!(h.pause_phase().as_deref(), Some("released"));
+    assert_eq!(h.count("prompt"), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn after_the_file_changes_it_resumes_with_restore_and_announces() {
+    let mut h = Harness::started().await;
+    let program = h.program("build one");
+    h.backend.next_prepare(Ok(prepared(1)));
+    assert_eq!(
+        h.pause(None).await.unwrap(),
+        Ok(json!({"state": "paused", "prepared": true, "drained": true, "interruptedTasks": 1}))
+    );
+    h.messenger.owner_says("first");
+    h.reply_containing(UPGRADING).await;
+    h.messenger.owner_says("second");
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    assert_eq!(h.count("start"), 1);
+    assert_eq!(h.hub.handle().status().state, Some(BridgeState::Paused));
+
+    h.backend.next_start(Ok(upgraded(
+        "1.1",
+        Some(Restored {
+            schedules: 2,
+            messages: 1,
+            settings: vec!["model".into(), "goal".into()],
+            interrupted_tasks: 1,
+            ..Restored::default()
+        }),
+    )));
+    std::fs::write(&program, "build number two").unwrap();
+    h.backend.wait_for("start", 2).await;
+    assert_eq!(
+        h.starts()[1],
+        format!("{} restore=true", h.start_call(&h.work, "session-1"))
+    );
+    h.reply_containing("Test upgraded").await;
+    assert!(
+        h.replies().contains(
+            &"Test upgraded 1.0 → 1.1: 2 schedules, 1 message and the model/goal restored; 1 \
+          interrupted task reported to Test."
+                .to_owned()
+        )
+    );
+    h.backend.wait_for("prompt first\n\nsecond", 1).await;
+    settle().await;
+    let status = h.hub.handle().status();
+    assert_eq!((status.pause, status.held_texts), (None, 0));
+    assert_eq!(status.state, Some(BridgeState::Idle));
+    assert_eq!(
+        status
+            .backend
+            .and_then(|backend| backend.version)
+            .as_deref(),
+        Some("1.1")
+    );
+    let states = Harness::states(&h.control_events());
+    assert!(states.contains(&BridgeState::Paused), "{states:?}");
+    assert_eq!(states.last(), Some(&BridgeState::Idle));
+}
+
+#[tokio::test(start_paused = true)]
+async fn bypass_needs_a_new_confirmation_after_an_upgrade() {
+    let h = Harness::started().await;
+    h.messenger.owner_says("/mode bypass");
+    h.card(1).await;
+    h.messenger.owner_says("y");
+    h.reply_containing("Approvals are off until /new.").await;
+    let program = h.program("build one");
+    h.backend.next_prepare(Ok(prepared(0)));
+    h.pause(None).await.unwrap().unwrap();
+    h.backend.next_start(Ok(upgraded(
+        "1.1",
+        Some(Restored {
+            settings: vec![
+                "bypassPermissions".into(),
+                "permissionMode".into(),
+                "model".into(),
+            ],
+            ..Default::default()
+        }),
+    )));
+    std::fs::write(&program, "build number two").unwrap();
+    h.backend.wait_for("start", 2).await;
+    assert_eq!(
+        h.starts()[1],
+        format!("{} restore=true", h.start_call(&h.work, "session-1"))
+    );
+    h.card(2).await;
+    let cards = h.cards();
+    assert_eq!(cards[1].1, cards[0].1, "the bypass card again");
+    let replies = h.replies();
+    let announced = replies
+        .iter()
+        .position(|reply| reply == "Test upgraded 1.0 → 1.1: the model restored.")
+        .expect("announced");
+    assert_eq!(
+        replies[announced + 1],
+        "Approvals were off before the upgrade; confirm to turn them off again."
+    );
+    assert!(
+        replies
+            .iter()
+            .all(|reply| !reply.contains("bypassPermissions") && !reply.contains("permissionMode")),
+        "{replies:?}"
+    );
+    h.messenger.owner_says("y");
+    h.backend
+        .wait_for("command SetPermissionMode(bypassPermissions)", 2)
+        .await;
+}
+
+/// Approvals off, then a pause that saved the state; returns the program file.
+async fn bypassed_and_paused(h: &Harness) -> PathBuf {
+    h.messenger.owner_says("/mode bypass");
+    h.card(1).await;
+    h.messenger.owner_says("y");
+    h.reply_containing("Approvals are off until /new.").await;
+    let program = h.program("build one");
+    h.backend.next_prepare(Ok(prepared(0)));
+    h.pause(None).await.unwrap().unwrap();
+    program
+}
+
+/// The upgrade was announced and approvals are to be confirmed again.
+async fn announced_with_the_bypass_card(h: &Harness) {
+    h.card(2).await;
+    let cards = h.cards();
+    assert_eq!(cards[1].1, cards[0].1, "the bypass card again");
+    let replies = h.replies();
+    let announced = replies
+        .iter()
+        .position(|reply| reply == "Test upgraded 1.0 → 1.1: nothing to restore.")
+        .unwrap_or_else(|| panic!("announced: {replies:?}"));
+    assert_eq!(
+        replies[announced + 1],
+        "Approvals were off before the upgrade; confirm to turn them off again."
+    );
+    assert!(
+        replies
+            .iter()
+            .all(|reply| !reply.starts_with("Test restarted")),
+        "{replies:?}"
+    );
+}
+
+/// Pauses (the backend saves its state) and resumes into `started` once the program
+/// file changed.
+async fn upgraded_into(h: &Harness, started: Started) {
+    let program = h.program("build one");
+    h.backend.next_prepare(Ok(prepared(0)));
+    h.pause(None).await.unwrap().unwrap();
+    h.backend.next_start(Ok(started));
+    std::fs::write(&program, "build number two").unwrap();
+    h.backend.wait_for("start", 2).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_pause_tells_the_backend_the_last_message_shown() {
+    let h = Harness::started().await;
+    h.backend.emit(BackendEvent::AgentMessage {
+        cursor: 3,
+        label: "Note".into(),
+        text: "hello".into(),
+    });
+    h.reply_containing("hello").await;
+    h.backend.next_prepare(Ok(prepared(0)));
+    h.pause(None).await.unwrap().unwrap();
+    assert_eq!(h.count("prepare drain=600000 delivered=3"), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_announcement_prefers_the_versions_coda_restored_from_and_to() {
+    let h = Harness::started().await;
+    let mut started = upgraded("coda (contract 2026-09-1)", None);
+    started.restored = Some(Restored {
+        from_version: Some("0.1.176".into()),
+        to_version: Some("0.1.177".into()),
+        ..Restored::default()
+    });
+    upgraded_into(&h, started).await;
+    h.reply_containing("Test upgraded 0.1.176 → 0.1.177: nothing to restore.")
+        .await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_announcement_drops_the_program_name_from_versions() {
+    let mut h = Harness::new();
+    h.backend
+        .next_start(Ok(upgraded("coda 0.1.176 (contract 2026-09-1)", None)));
+    h.start();
+    h.backend.wait_for("start", 1).await;
+    settle().await;
+    upgraded_into(
+        &h,
+        upgraded(
+            "coda 0.1.177 (contract 2026-09-1)",
+            Some(Restored::default()),
+        ),
+    )
+    .await;
+    h.reply_containing("Test upgraded 0.1.176 → 0.1.177: nothing to restore.")
+        .await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_saved_state_that_was_not_applied_is_announced_as_lost() {
+    let h = Harness::started().await;
+    let restored = Restored {
+        applied: false,
+        ignored_reason: Some("expired".into()),
+        ..Restored::default()
+    };
+    upgraded_into(&h, upgraded("1.1", Some(restored))).await;
+    h.reply_containing(&format!(
+        "Test upgraded 1.0 → 1.1; its saved state was not restored (expired). {LOST}"
+    ))
+    .await;
+    assert!(
+        h.replies()
+            .iter()
+            .all(|reply| !reply.contains(" restored:")),
+        "{:?}",
+        h.replies()
+    );
+}
+
+fn bypass_not_restored() -> Restored {
+    Restored {
+        settings_not_restored: vec![NotRestored {
+            name: "permissionMode".into(),
+            value: Some("bypassPermissions".into()),
+            reason: None,
+        }],
+        ..Restored::default()
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn bypass_reported_not_restored_asks_for_a_confirmation() {
+    let h = Harness::started().await;
+    upgraded_into(&h, upgraded("1.1", Some(bypass_not_restored()))).await;
+    h.card(1).await;
+    let bypass = cards::bypass_card("Test").card.expect("a card");
+    assert_eq!(h.cards()[0].1, template(&bypass));
+    h.reply_containing("Approvals were off before the upgrade")
+        .await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn bypass_known_twice_asks_for_one_confirmation() {
+    let h = Harness::started().await;
+    let program = bypassed_and_paused(&h).await;
+    h.backend
+        .next_start(Ok(upgraded("1.1", Some(bypass_not_restored()))));
+    std::fs::write(&program, "build number two").unwrap();
+    h.backend.wait_for("start", 2).await;
+    announced_with_the_bypass_card(&h).await;
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    assert_eq!(h.cards().len(), 2);
+    let asked = h
+        .replies()
+        .iter()
+        .filter(|reply| reply.starts_with("Approvals were off"))
+        .count();
+    assert_eq!(asked, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_resume_keeps_the_restore_and_the_bypass_confirmation() {
+    let h = Harness::started().await;
+    let program = bypassed_and_paused(&h).await;
+    h.backend.fail_next_start(ErrorKind::Other);
+    h.backend
+        .next_start(Ok(upgraded("1.1", Some(Restored::default()))));
+    std::fs::write(&program, "build number two").unwrap();
+    h.backend.wait_for("start", 2).await;
+    h.reply_containing("retrying").await;
+    h.backend.wait_for("start", 3).await;
+    let restoring = format!("{} restore=true", h.start_call(&h.work, "session-1"));
+    assert_eq!(h.starts()[1..], [restoring.clone(), restoring]);
+    announced_with_the_bypass_card(&h).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_session_the_owner_picks_drops_a_failed_resume() {
+    for (command, reply) in [
+        ("/new", "New session"),
+        ("/cd ../other", "Folder "),
+        ("/resume s-7", "Resumed session s-7."),
+    ] {
+        let h = Harness::started().await;
+        let program = bypassed_and_paused(&h).await;
+        h.backend.fail_next_start(ErrorKind::Other);
+        std::fs::write(&program, "build number two").unwrap();
+        h.backend.wait_for("start", 2).await;
+        h.reply_containing("retrying").await;
+        h.messenger.owner_says(command);
+        h.reply_containing(reply).await;
+        h.backend.wait_for("start", 3).await;
+        tokio::time::sleep(Duration::from_secs(3_600)).await;
+        settle().await;
+        assert_eq!(h.count("start"), 3, "{command}: no start from the timer");
+        assert_eq!(h.cards().len(), 1, "{command}: no bypass card");
+        let replies = h.replies();
+        assert!(
+            replies
+                .iter()
+                .all(|reply| !reply.contains("upgraded") && !reply.contains("restarted")),
+            "{command}: {replies:?}"
+        );
+        h.messenger.owner_says("/status");
+        h.reply_containing("Permission mode: default").await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_resume_failing_on_a_missing_program_keeps_the_restore_and_the_bypass_confirmation() {
+    let h = Harness::started().await;
+    let program = bypassed_and_paused(&h).await;
+    let release = h.backend.hold_next_start();
+    h.backend.fail_next_start(ErrorKind::Other);
+    h.backend
+        .next_start(Ok(upgraded("1.1", Some(Restored::default()))));
+    std::fs::write(&program, "build number two").unwrap();
+    h.backend.wait_for("start", 2).await;
+    std::fs::remove_file(&program).unwrap();
+    drop(release);
+    h.reply_containing(STOPPED_UNUSABLE).await;
+    settle().await;
+    assert_eq!(h.pause_phase().as_deref(), Some("waiting_for_file"));
+    tokio::time::sleep(Duration::from_secs(300)).await;
+    assert_eq!(h.count("start"), 2);
+    std::fs::write(&program, "build number three").unwrap();
+    h.backend.wait_for("start", 3).await;
+    let restoring = format!("{} restore=true", h.start_call(&h.work, "session-1"));
+    assert_eq!(h.starts()[1..], [restoring.clone(), restoring]);
+    announced_with_the_bypass_card(&h).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_fallback_works_without_prepare_restart() {
+    let h = Harness::started().await;
+    let program = h.program("build one");
+    h.messenger.owner_says("work");
+    h.backend.wait_for("prompt work", 1).await;
+    h.backend.turn_started(TurnSource::Prompt);
+    let pausing = h.pause(None);
+    h.backend.wait_for("prepare", 1).await;
+    settle().await;
+    assert_eq!(h.count("stop"), 0);
+    h.messenger.owner_says("held");
+    h.reply_containing(UPGRADING).await;
+    h.backend.turn_ended(false);
+    assert_eq!(
+        pausing.await.unwrap(),
+        Ok(json!({"state": "paused", "prepared": false, "drained": true, "interruptedTasks": 0}))
+    );
+    assert_eq!(h.count("stop"), 1);
+    h.backend.next_start(Ok(upgraded("1.1", None)));
+    std::fs::write(&program, "build number two").unwrap();
+    h.backend.wait_for("start", 2).await;
+    assert_eq!(h.starts()[1], h.start_call(&h.work, "session-1"));
+    h.reply_containing(&format!("Test upgraded 1.0 → 1.1. {LOST}"))
+        .await;
+    h.backend.wait_for("prompt held", 1).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_fallback_cuts_a_turn_at_the_drain_deadline() {
+    let h = Harness::started().await;
+    h.program("build one");
+    h.messenger.owner_says("work");
+    h.backend.wait_for("prompt work", 1).await;
+    h.backend.turn_started(TurnSource::Prompt);
+    h.backend.text("partial");
+    let answer = h.backend.request(permission());
+    h.card(1).await;
+    let pausing = h.pause(Some(5_000));
+    h.backend.wait_for("prepare drain=5000", 1).await;
+    assert_eq!(
+        pausing.await.unwrap(),
+        Ok(json!({"state": "paused", "prepared": false, "drained": false, "interruptedTasks": 0}))
+    );
+    assert!(answer.await.is_err(), "declined");
+    h.reply_containing("Declined: Test is being upgraded.")
+        .await;
+    h.reply_containing("(Test paused for an upgrade)").await;
+    assert_eq!(h.count("stop"), 1);
+    assert_eq!(h.hub.handle().status().open_requests, 0);
+}
+
+#[cfg(windows)]
+#[tokio::test(start_paused = true)]
+async fn a_killed_coda_with_a_locked_exe_pauses_instead_of_restarting() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let h = Harness::started().await;
+    let program = h.program("build one");
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(&program)
+        .unwrap();
+    h.backend.emit(exited());
+    h.reply_containing(STOPPED_UNUSABLE).await;
+    tokio::time::sleep(Duration::from_secs(300)).await;
+    assert_eq!(h.count("start"), 1);
+    assert_eq!(h.hub.handle().status().state, Some(BridgeState::Paused));
+    assert_eq!(h.pause_phase().as_deref(), Some("waiting_for_file"));
+    drop(held);
+    h.backend.wait_for("start", 2).await;
+    assert_eq!(h.starts()[1], h.start_call(&h.work, "session-1"));
+    h.reply_containing(&format!("Test restarted. {LOST}")).await;
+    settle().await;
+    assert_eq!(h.hub.handle().status().state, Some(BridgeState::Idle));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_killed_coda_with_a_missing_exe_pauses_instead_of_restarting() {
+    let h = Harness::started().await;
+    let program = h.program("build one");
+    std::fs::remove_file(&program).unwrap();
+    h.backend.emit(exited());
+    h.reply_containing(STOPPED_UNUSABLE).await;
+    h.messenger.owner_says("meanwhile");
+    h.reply_containing(UPGRADING).await;
+    tokio::time::sleep(Duration::from_secs(300)).await;
+    assert_eq!(h.count("start"), 1);
+    assert_eq!(h.hub.handle().status().state, Some(BridgeState::Paused));
+    assert_eq!(h.pause_phase().as_deref(), Some("waiting_for_file"));
+    assert_eq!(
+        h.messenger.activities().last(),
+        Some(&(
+            ActivityState::Working,
+            Some("Waiting for Test's program".to_owned())
+        ))
+    );
+    std::fs::write(&program, "build two").unwrap();
+    h.backend.wait_for("start", 2).await;
+    assert_eq!(h.starts()[1], h.start_call(&h.work, "session-1"));
+    h.reply_containing(&format!("Test restarted. {LOST}")).await;
+    h.backend.wait_for("prompt meanwhile", 1).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_start_with_a_missing_exe_pauses_too() {
+    let h = Harness::started().await;
+    let program = h.program("build one");
+    h.backend.emit(exited());
+    h.reply_containing("(Test stopped; restarting)").await;
+    std::fs::remove_file(&program).unwrap();
+    h.backend.fail_next_start(ErrorKind::Other);
+    h.backend.wait_for("start", 2).await;
+    settle().await;
+    assert_eq!(h.pause_phase().as_deref(), Some("waiting_for_file"));
+    tokio::time::sleep(Duration::from_secs(300)).await;
+    assert_eq!(h.count("start"), 2);
+    std::fs::write(&program, "build one").unwrap();
+    h.backend.wait_for("start", 3).await;
+    settle().await;
+    assert_eq!(h.hub.handle().status().state, Some(BridgeState::Idle));
+}
+
+#[tokio::test(start_paused = true)]
+async fn resume_without_pause_is_an_error() {
+    let h = Harness::started().await;
+    let error = h.call(Action::Resume).await.unwrap_err();
+    assert_eq!(error.code, "not_paused");
+    assert_eq!(h.count("stop"), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn pause_is_idempotent_and_resume_restarts_at_once() {
+    let h = Harness::started().await;
+    h.program("build one");
+    h.backend.next_prepare(Ok(prepared(0)));
+    h.pause(None).await.unwrap().unwrap();
+    assert_eq!(
+        h.call(Action::Pause(PauseParams::default())).await,
+        Ok(json!({"state": "paused", "phase": "released"}))
+    );
+    assert_eq!((h.count("prepare"), h.count("stop")), (1, 1));
+    assert_eq!(h.call(Action::Resume).await, Ok(json!({"resumed": true})));
+    h.backend.wait_for("start", 2).await;
+    assert_eq!(
+        h.starts()[1],
+        format!("{} restore=true", h.start_call(&h.work, "session-1"))
+    );
+    h.reply_containing("Test restarted.").await;
+    settle().await;
+    assert_eq!(h.hub.handle().status().state, Some(BridgeState::Idle));
+}
+
+#[tokio::test(start_paused = true)]
+async fn resume_waits_for_a_usable_program() {
+    let h = Harness::started().await;
+    let program = h.program("build one");
+    h.backend.next_prepare(Ok(prepared(0)));
+    h.pause(None).await.unwrap().unwrap();
+    std::fs::remove_file(&program).unwrap();
+    let error = h.call(Action::Resume).await.unwrap_err();
+    assert_eq!(error.code, "exe_unavailable");
+    assert_eq!(h.count("start"), 1);
+    assert_eq!(h.pause_phase().as_deref(), Some("released"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn resume_while_draining_cancels_the_pause() {
+    let h = Harness::started().await;
+    h.program("build one");
+    h.messenger.owner_says("work");
+    h.backend.wait_for("prompt work", 1).await;
+    h.backend.turn_started(TurnSource::Prompt);
+    let release = h.backend.hold_next_prepare();
+    h.backend.next_prepare(Ok(prepared(0)));
+    let pausing = h.pause(None);
+    h.backend.wait_for("prepare", 1).await;
+    h.messenger.owner_says("held");
+    h.reply_containing(UPGRADING).await;
+    assert_eq!(
+        h.call(Action::Resume).await,
+        Ok(json!({"resumed": true, "cancelled": true}))
+    );
+    assert_eq!(pausing.await.unwrap().unwrap_err().code, "cancelled");
+    settle().await;
+    let status = h.hub.handle().status();
+    assert_eq!(
+        (status.pause, status.state),
+        (None, Some(BridgeState::Working))
+    );
+    h.backend.turn_ended(false);
+    h.backend.wait_for("prompt held", 1).await;
+    drop(release);
+    settle().await;
+    assert_eq!(h.count("stop"), 0);
+    // Coda saved its state: the next start restores it.
+    h.backend.emit(exited());
+    h.backend.wait_for("start", 2).await;
+    assert_eq!(
+        h.starts()[1],
+        format!("{} restore=true", h.start_call(&h.work, "session-1"))
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_pause_s_events_and_status_carry_no_held_text() {
+    const SECRET: &str = "s3cr3t";
+    let mut h = Harness::started().await;
+    h.program("build one");
+    h.backend.next_prepare(Ok(prepared(0)));
+    h.pause(None).await.unwrap().unwrap();
+    h.messenger.owner_says(&format!("do {SECRET}"));
+    h.reply_containing(UPGRADING).await;
+    settle().await;
+    let status = h.hub.handle().status();
+    assert_eq!(status.held_texts, 1);
+    assert_eq!(
+        status
+            .pause
+            .as_ref()
+            .and_then(|pause| pause.reason.as_deref()),
+        Some("upgrade")
+    );
+    let line = serde_json::to_string(&status).unwrap();
+    assert!(!line.contains(SECRET), "{line}");
+    for event in h.control_events() {
+        let line = serde_json::to_string(&event).unwrap();
+        assert!(!line.contains(SECRET), "{line}");
+    }
 }

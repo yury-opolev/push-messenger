@@ -8,6 +8,7 @@ members = [
     "crates/push-auth",
     "crates/push-auth-core",
     "crates/push-bridge",
+    "crates/push-bridge-control",
     "crates/push-credentials",
     "crates/push-domain",
     "crates/push-email",
@@ -18,9 +19,12 @@ members = [
     "crates/push-sdk",
     "crates/push-smoke",
     "crates/push-store",
+    "crates/push-tray-core",
     "crates/push-testkit",
     "crates/push-worker",
 ]
+# The tray app's Tauri shell is its own workspace (apps/push-agent-tray/Cargo.toml).
+exclude = ["apps/push-agent-tray"]
 
 [workspace.package]
 version = "0.1.0"
@@ -48,6 +52,7 @@ protoc-bin-vendored = "3"
 pulldown-cmark = { version = "0.13.5", default-features = false }
 push-agent-key = { path = "crates/push-agent-key" }
 push-auth-core = { path = "crates/push-auth-core" }
+push-bridge-control = { path = "crates/push-bridge-control" }
 push-credentials = { path = "crates/push-credentials" }
 push-domain = { path = "crates/push-domain" }
 push-email = { path = "crates/push-email" }

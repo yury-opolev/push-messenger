@@ -1,14 +1,21 @@
 //! The owner's commands: the core's own (`/new`, `/cd`, `/stop`, `/status`, `/help`,
-//! `/mode bypass`, `/resume`) and the ones the backend runs.
+//! `/mode bypass`, `/resume`) and the ones the backend runs; and the control channel's
+//! actions (`restart_backend`, `reconnect`, `shutdown`, and `pause_backend` /
+//! `resume_backend`, see [`super::upgrade`]).
 
 use std::path::Path;
 
-use super::{Core, Internal};
+use push_sdk::ConnectionState;
+use serde_json::json;
+use tokio::sync::oneshot;
+
+use super::{Core, Flow, Internal};
 use crate::backend::{
     BackendCommand, BackendError, Capability, CommandReply, ErrorKind, PermissionMode,
 };
 use crate::cards;
 use crate::commands::{Command, HELP};
+use crate::control::{Action, ControlCall, Reply, error};
 use crate::folders;
 use crate::messenger::Messenger;
 
@@ -40,8 +47,86 @@ fn needs(command: &Command) -> Option<Capability> {
     })
 }
 
+/// Sends an action's result to its caller (who may have gone).
+fn answer(reply: oneshot::Sender<Reply>, result: Reply) {
+    let _ = reply.send(result);
+}
+
 impl<M: Messenger> Core<M> {
+    /// A control-channel action. Each one answers its `reply` (now or, for a later
+    /// action, once done); `shutdown` stops the run.
+    pub(super) async fn on_control(&mut self, call: ControlCall) -> Flow {
+        let ControlCall { action, reply } = call;
+        tracing::info!(event = "control_action", action = action.name());
+        match action {
+            Action::RestartBackend if self.pause.is_some() => answer(
+                reply,
+                Err(error(
+                    "paused",
+                    format!("{} is paused for an upgrade: resume it instead", self.name),
+                )),
+            ),
+            Action::RestartBackend => {
+                let result = self.restart_by_owner().await;
+                answer(reply, result);
+            }
+            Action::Reconnect => {
+                let result = self.reconnect().await;
+                answer(reply, result);
+            }
+            Action::Shutdown => {
+                answer(reply, Ok(json!({"stopping": true})));
+                return Flow::Stop;
+            }
+            Action::Pause(params) => self.pause_backend(params, reply).await,
+            Action::Resume => self.resume_backend(reply).await,
+        }
+        Flow::Continue
+    }
+
+    /// The owner restarts the backend: what runs is ended and declined, the backend is
+    /// stopped and started again at once (no backoff); the messenger is untouched.
+    async fn restart_by_owner(&mut self) -> Reply {
+        tracing::info!(event = "backend_restart_by_owner");
+        let note = format!("({} is restarting: the owner asked)", self.name);
+        self.backend_gone(&note, &format!("Declined: {} restarted.", self.name));
+        self.backend.stop().await;
+        self.running_since = None;
+        self.restart_at = None;
+        self.announce_restart = false;
+        self.publish();
+        match self.start_or_retry(Some("restarted by the owner")).await {
+            Ok(()) => Ok(json!({"restarted": true})),
+            Err(failure) => Err(error(
+                "start_failed",
+                format!("{} failed ({})", failure.method, failure.code),
+            )),
+        }
+    }
+
+    /// Signs the messenger in again and reconnects; the backend is untouched. The next
+    /// `Connected` counts as a reconnect (activity sent again, missed messages fetched).
+    async fn reconnect(&mut self) -> Reply {
+        tracing::info!(event = "messenger_reconnect");
+        match self.messenger.reconnect().await {
+            Ok(()) => {
+                self.connection = Some(ConnectionState::Connecting);
+                Ok(json!({"reconnected": true}))
+            }
+            Err(failure) => {
+                tracing::warn!(event = "messenger_reconnect_failed", code = failure.code());
+                Err(error(
+                    failure.code(),
+                    format!("signing in again failed ({})", failure.code()),
+                ))
+            }
+        }
+    }
+
     pub(super) async fn command(&mut self, command: Command) {
+        if !self.allowed_while_paused(&command) {
+            return;
+        }
         if let Some(capability) = needs(&command) {
             if !self.has(capability) {
                 self.reply(&format!("Not supported by {}.", self.name));
@@ -202,7 +287,7 @@ impl<M: Messenger> Core<M> {
     pub(super) async fn new_session(&mut self) {
         let mode = self.options.default_mode;
         match self
-            .start_session(self.folder.clone(), None, mode, false)
+            .start_session(self.folder.clone(), None, mode, false, false)
             .await
         {
             Ok(started) => {
@@ -241,7 +326,7 @@ impl<M: Messenger> Core<M> {
             mode => mode,
         };
         match self
-            .start_session(folder.clone(), stored.clone(), mode, true)
+            .start_session(folder.clone(), stored.clone(), mode, true, false)
             .await
         {
             Ok(started) => {
@@ -263,7 +348,13 @@ impl<M: Messenger> Core<M> {
 
     async fn resume(&mut self, id: &str) {
         match self
-            .start_session(self.folder.clone(), Some(id.to_owned()), self.mode, false)
+            .start_session(
+                self.folder.clone(),
+                Some(id.to_owned()),
+                self.mode,
+                false,
+                false,
+            )
             .await
         {
             Ok(started) => {

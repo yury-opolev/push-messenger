@@ -1,0 +1,23 @@
+[package]
+name = "push-tray-core"
+description = "The agent tray's testable core: states, icons, restart policy, tray.json, autostart, Scheduled Task switch-over, supervisor, control client and menu model."
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+push-bridge-control.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "process", "rt", "sync", "time"] }
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

@@ -16,8 +16,9 @@ use tokio::sync::{mpsc, oneshot, watch};
 use super::rpc::{Incoming, RpcError, RpcPeer};
 use crate::backend::{
     Answer, Backend, BackendCommand, BackendError, BackendEvent, BackendRequest, BackendStatus,
-    Capability, CommandReply, ErrorKind, PendingMessages, PermissionMode, RequestKind, Responder,
-    ScheduleWhen, StartOptions, Started, SteerOutcome, TaskStatus, TextFormat, TurnSource,
+    Capability, CommandReply, ErrorKind, NotRestored, PendingMessages, PermissionMode,
+    PrepareOptions, Prepared, RequestKind, Responder, Restored, ScheduleWhen, StartOptions,
+    Started, SteerOutcome, TaskStatus, TextFormat, TurnSource,
 };
 use crate::config::CodaConfig;
 use crate::mask;
@@ -34,6 +35,10 @@ pub const SCHEDULE_NOTE: &str = "Schedules live in Coda's memory and are lost wh
 
 const SESSION_NOT_FOUND: i64 = -32002;
 const METHOD_NOT_FOUND: i64 = -32601;
+/// Coda is draining for a planned restart and takes no new work ("restart pending").
+const RESTART_PENDING: i64 = -32016;
+/// The restart file is in a newer format than this Coda reads.
+const UNSUPPORTED_RESTART_FORMAT: i64 = -32017;
 /// The canonical "declined" reply to a request from Coda.
 const REQUEST_DECLINED: i64 = -32800;
 
@@ -43,6 +48,8 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(60);
 /// Coda abandons a side question after 120 s.
 const ASIDE_TIMEOUT: Duration = Duration::from_secs(150);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+/// How much longer than its drain time `session/prepareRestart` may take to save.
+const PREPARE_GRACE: Duration = Duration::from_secs(60);
 /// How long a closed stream waits for the process's exit status.
 const EXIT_STATUS_WAIT: Duration = Duration::from_secs(1);
 
@@ -404,6 +411,9 @@ impl Session {
                     events.push(BackendEvent::ToolFinished { id, failed });
                 }
             }
+            "event/lifecycle" => {
+                tracing::debug!(lifecycle = %text(params, "lifecycle"), "Coda lifecycle");
+            }
             "event/error" => events.push(BackendEvent::Error(text(params, "message"))),
             "event/agentMessage" => events.push(BackendEvent::AgentMessage {
                 cursor: params.get("cursor").and_then(Value::as_u64).unwrap_or(0),
@@ -617,6 +627,10 @@ fn backend_error(method: &str, error: RpcError) -> BackendError {
         RpcError::Remote { code, message } => {
             let kind = if code == SESSION_NOT_FOUND {
                 ErrorKind::SessionNotFound
+            } else if code == METHOD_NOT_FOUND {
+                ErrorKind::Unsupported
+            } else if code == RESTART_PENDING {
+                ErrorKind::RestartPending
             } else if message.to_lowercase().contains("busy") {
                 ErrorKind::Busy
             } else {
@@ -676,6 +690,87 @@ fn version_text(result: &Value) -> Option<String> {
         (Some(server), None) => Some(server),
         (None, Some(contract)) => Some(format!("contract {contract}")),
         (None, None) => None,
+    }
+}
+
+/// A count Coda reports as a number or as a list (its length); 0 when absent or other.
+fn count(value: &Value, key: &str) -> usize {
+    match value.get(key) {
+        Some(Value::Number(number)) => number
+            .as_u64()
+            .map_or(0, |n| usize::try_from(n).unwrap_or(usize::MAX)),
+        Some(Value::Array(items)) => items.len(),
+        _ => 0,
+    }
+}
+
+/// What `initialize` says about the restore (`result.restored`), read leniently: every
+/// field optional (`applied` defaults to true), counts as numbers or lists, `settings`
+/// as a list of names or an object keyed by name.
+fn restored(result: &Value) -> Option<Restored> {
+    let restored = match result.get("restored") {
+        Some(restored @ Value::Object(_)) => restored,
+        Some(Value::Bool(true)) => return Some(Restored::default()),
+        _ => return None,
+    };
+    let settings = match restored.get("settings") {
+        Some(Value::Array(names)) => names
+            .iter()
+            .filter_map(|name| match name {
+                Value::String(name) => Some(name.clone()),
+                other => optional_text(other, "name"),
+            })
+            .collect(),
+        Some(Value::Object(fields)) => fields.keys().cloned().collect(),
+        _ => Vec::new(),
+    };
+    let settings_not_restored = items(restored, "settingsNotRestored")
+        .iter()
+        .filter_map(|setting| match setting {
+            Value::String(name) => Some(NotRestored {
+                name: name.clone(),
+                ..NotRestored::default()
+            }),
+            other => optional_text(other, "name").map(|name| NotRestored {
+                name,
+                value: match other.get("value") {
+                    Some(Value::String(value)) => Some(value.clone()),
+                    Some(value @ (Value::Number(_) | Value::Bool(_))) => Some(value.to_string()),
+                    _ => None,
+                },
+                reason: optional_text(other, "reason"),
+            }),
+        })
+        .collect();
+    Some(Restored {
+        applied: restored
+            .get("applied")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+        ignored_reason: optional_text(restored, "ignoredReason"),
+        from_version: optional_text(restored, "fromVersion"),
+        to_version: optional_text(restored, "toVersion"),
+        schedules: count(restored, "schedules"),
+        messages: count(restored, "messages"),
+        settings,
+        settings_not_restored,
+        interrupted_tasks: count(restored, "interruptedTasks"),
+        interrupted_requests: count(restored, "interruptedRequests"),
+        steering: count(restored, "steering"),
+        tasks_suspended: count(restored, "tasksSuspended"),
+    })
+}
+
+/// A `session/prepareRestart` result, read leniently: `drained` defaults to true.
+fn prepared(result: &Value) -> Prepared {
+    Prepared {
+        drained: result
+            .get("drained")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+        interrupted_tasks: count(result, "interruptedTasks"),
+        interrupted_requests: count(result, "interruptedRequests"),
+        suspended_tasks: count(result, "suspendedTasks"),
     }
 }
 
@@ -841,12 +936,21 @@ pub struct CodaBackend {
     /// Serializes start and stop.
     lifecycle: tokio::sync::Mutex<()>,
     active: Mutex<Option<Arc<Session>>>,
+    /// The program file, for upgrade detection.
+    executable: Option<PathBuf>,
 }
 
 impl CodaBackend {
     /// Runs `coda serve` as configured.
     pub fn new(config: CodaConfig, events: mpsc::UnboundedSender<BackendEvent>) -> Self {
-        Self::with_launcher(Arc::new(ProcessLauncher::new(config)), events)
+        let exe = config.exe.clone();
+        Self::with_launcher(Arc::new(ProcessLauncher::new(config)), events).with_executable(exe)
+    }
+
+    /// Reports `path` as the program file ([`Backend::executable`]).
+    pub fn with_executable(mut self, path: PathBuf) -> Self {
+        self.executable = Some(path);
+        self
     }
 
     pub fn with_launcher(
@@ -858,6 +962,7 @@ impl CodaBackend {
             events,
             lifecycle: tokio::sync::Mutex::new(()),
             active: Mutex::new(None),
+            executable: None,
         }
     }
 
@@ -955,9 +1060,33 @@ impl Backend for CodaBackend {
         if let Some(id) = &options.session {
             params["sessionId"] = json!(id);
         }
-        let result = session
-            .call(METHOD, params, Some(INITIALIZE_TIMEOUT))
-            .await?;
+        if options.restore {
+            params["restore"] = json!(true);
+        }
+        let result = match session
+            .call(METHOD, params.clone(), Some(INITIALIZE_TIMEOUT))
+            .await
+        {
+            Err(failure)
+                if options.restore
+                    && failure.code.parse::<i64>() == Ok(UNSUPPORTED_RESTART_FORMAT) =>
+            {
+                // A newer Coda saved the state: the session opens without it.
+                tracing::warn!(event = "restore_unsupported_format");
+                if let Some(fields) = params.as_object_mut() {
+                    fields.remove("restore");
+                }
+                let mut result = session
+                    .call(METHOD, params, Some(INITIALIZE_TIMEOUT))
+                    .await?;
+                result["restored"] = json!({
+                    "applied": false,
+                    "ignoredReason": "unsupportedFormat",
+                });
+                result
+            }
+            other => other?,
+        };
         let session_id = optional_text(&result, "sessionId").ok_or_else(|| BackendError {
             method: METHOD.to_owned(),
             code: "protocol".to_owned(),
@@ -980,6 +1109,7 @@ impl Backend for CodaBackend {
             session_id,
             engine_instance: optional_text(&result, "engineInstanceId"),
             version,
+            restored: restored(&result),
         })
     }
 
@@ -1220,6 +1350,31 @@ impl Backend for CodaBackend {
             }
         }
         Ok(pending)
+    }
+
+    async fn prepare_restart(&self, options: PrepareOptions) -> Result<Prepared, BackendError> {
+        const METHOD: &str = "session/prepareRestart";
+        let session = self.session(METHOD)?;
+        let millis = u64::try_from(options.drain.as_millis()).unwrap_or(u64::MAX);
+        let mut params = json!({ "drainTimeoutMs": millis });
+        if let Some(reason) = &options.reason {
+            params["reason"] = json!(reason);
+        }
+        if let Some(cursor) = options.delivered_cursor {
+            params["deliveredCursor"] = json!(cursor);
+        }
+        let result = Self::simple(
+            &session,
+            METHOD,
+            params,
+            Some(options.drain.saturating_add(PREPARE_GRACE)),
+        )
+        .await?;
+        Ok(prepared(&result))
+    }
+
+    fn executable(&self) -> Option<PathBuf> {
+        self.executable.clone()
     }
 }
 

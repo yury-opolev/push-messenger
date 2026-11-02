@@ -10,13 +10,17 @@ use push_bridge::backend::{
 };
 use push_bridge::coda::CodaBackend;
 use push_bridge::coda::testing::{FakeCoda, FakeLauncher};
+use push_bridge::control::ControlHub;
 use push_bridge::core::{Bridge, BridgeError, BridgeOptions, PRIVATE};
 use push_bridge::folders;
 use push_bridge::messenger::{Call, TestMessenger, param, template};
 use push_bridge::state::StateFile;
 use push_bridge::test_backend::{TestBackend, error};
+use push_bridge_control::transport::{Listener, connect};
+use push_bridge_control::{BridgeState, Event as ControlEvent, ServerLine, Status, endpoint_for};
 use push_sdk::{ActivityState, ClientMsgId, UserId};
 use serde_json::json;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
@@ -59,6 +63,15 @@ struct Harness {
 impl Harness {
     /// Runs the bridge over `backend`, which reports through `events`.
     fn run(backend: Arc<dyn Backend>, events: mpsc::UnboundedReceiver<BackendEvent>) -> Self {
+        Self::run_with(backend, events, None)
+    }
+
+    /// [`Harness::run`], reporting to `hub` and taking its actions.
+    fn run_with(
+        backend: Arc<dyn Backend>,
+        events: mpsc::UnboundedReceiver<BackendEvent>,
+        hub: Option<&ControlHub>,
+    ) -> Self {
         let scratch = Scratch::new();
         let (root, work, outside) = (
             scratch.real("root"),
@@ -67,7 +80,7 @@ impl Harness {
         );
         let state = Arc::new(StateFile::load(&scratch.0.join("state.json")).unwrap());
         let (messenger, messenger_events) = TestMessenger::new();
-        let bridge = Bridge::new(
+        let mut bridge = Bridge::new(
             Arc::clone(&messenger),
             backend,
             events,
@@ -79,6 +92,9 @@ impl Harness {
                 default_mode: PermissionMode::Default,
             },
         );
+        if let Some(hub) = hub {
+            bridge = bridge.with_control(hub.handle(), hub.calls());
+        }
         let (stop, stopped) = oneshot::channel::<()>();
         let run = tokio::spawn(bridge.run(async {
             let _ = stopped.await;
@@ -681,4 +697,73 @@ impl std::io::Write for LogSink {
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
     }
+}
+
+/// The control channel end to end, through a real per-user endpoint: `hello`, `status`
+/// over the transport, and `shutdown` ending the run with `Ok`.
+#[tokio::test]
+async fn the_control_channel_serves_status_and_shutdown() {
+    let id = format!(
+        "test-{}-{}",
+        std::process::id(),
+        &uuid::Uuid::new_v4().simple().to_string()[..8]
+    );
+    let hub = ControlHub::new(id.clone());
+    let (backend, events) = TestBackend::channel();
+    let mut h = Harness::run_with(Arc::clone(&backend) as Arc<dyn Backend>, events, Some(&hub));
+    within(backend.wait_for("start", 1)).await;
+    // Unix: the socket lives under a runtime dir of our own inside the scratch folder.
+    let endpoint = endpoint_for(&id, Some(h._scratch.0.as_os_str())).expect("an endpoint");
+    let serving = hub.serve(Listener::bind(&endpoint).unwrap());
+    let (reader, mut writer) = tokio::io::split(within(connect(&endpoint)).await.unwrap());
+    let mut lines = BufReader::new(reader).lines();
+    let mut next = async || -> ServerLine {
+        let line = within(lines.next_line()).await.unwrap().expect("a line");
+        serde_json::from_str(&line).unwrap()
+    };
+    let ServerLine::Event(hello) = next().await else {
+        panic!("hello first");
+    };
+    assert!(
+        matches!(&hello.event, ControlEvent::Hello { instance, .. } if *instance == id),
+        "{hello:?}"
+    );
+
+    let mut request = 0;
+    let status = loop {
+        request += 1;
+        let line = format!("{{\"id\":{request},\"method\":\"status\"}}\n");
+        writer.write_all(line.as_bytes()).await.unwrap();
+        let response = loop {
+            if let ServerLine::Response(response) = next().await {
+                break response;
+            }
+        };
+        assert_eq!(response.id, request);
+        let status: Status = serde_json::from_value(response.result.unwrap()).unwrap();
+        if status.state == Some(BridgeState::Idle) {
+            break status;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(status.instance, id);
+    assert_eq!(status.folder, Some(h.work.display().to_string()));
+    assert_eq!(status.session.as_deref(), Some("session-1"));
+
+    writer
+        .write_all(b"{\"id\":100,\"method\":\"shutdown\"}\n")
+        .await
+        .unwrap();
+    let response = loop {
+        if let ServerLine::Response(response) = next().await {
+            break response;
+        }
+    };
+    assert_eq!(
+        (response.id, response.result),
+        (100, Some(json!({"stopping": true})))
+    );
+    assert_eq!(within(h.run.take().unwrap()).await.unwrap(), Ok(()));
+    assert_eq!(backend.calls().last().map(String::as_str), Some("stop"));
+    serving.abort();
 }

@@ -1,0 +1,45 @@
+# The tray app's Tauri shell. Its own workspace (excluded from the root one): Tauri and its
+# WebView dependencies stay out of the root lockfile, MSRV and Linux CI. All testable logic
+# lives in crates/push-tray-core. Build: cargo build --manifest-path
+# apps/push-agent-tray/Cargo.toml --release
+[workspace]
+
+[package]
+name = "push-agent-tray"
+description = "Tray app that supervises the push-agent-bridge instances on this machine."
+publish = false
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/yury-opolev/push-messenger"
+
+[dependencies]
+push-bridge-control = { path = "../../crates/push-bridge-control" }
+push-tray-core = { path = "../../crates/push-tray-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-notification = "2"
+tauri-plugin-single-instance = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tracing = "0.1"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[features]
+default = ["custom-protocol"]
+# Serve the bundled `dist` (embedded at compile time) instead of a dev server.
+custom-protocol = ["tauri/custom-protocol"]
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

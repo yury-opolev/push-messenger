@@ -80,6 +80,25 @@ jobs:
       - run: npm run typecheck
         working-directory: bindings/node
 
+  # The tray app (its own workspace, apps/push-agent-tray) builds on Windows, and the
+  # Windows-only tests run: the control channel's pipe ACL and peer check, and the locked
+  # exe probe.
+  tray-windows:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: "apps/push-agent-tray -> target"
+      - run: cargo clippy --manifest-path apps/push-agent-tray/Cargo.toml --locked -- -D warnings
+      - run: cargo build --manifest-path apps/push-agent-tray/Cargo.toml --release --locked
+      - run: cargo test -p push-bridge-control -p push-tray-core -p push-bridge --locked --lib
+
   # The container images build (nothing is pushed). Deploying them is verified on
   # minikube before merge: deploy/minikube/up.ps1 -Smoke.
   images:
