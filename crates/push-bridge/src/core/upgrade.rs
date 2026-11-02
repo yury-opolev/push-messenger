@@ -7,6 +7,7 @@
 //! A backend that stops on its own (or fails to start) while its program is missing or
 //! in use is paused the same way instead of being restarted with the backoff.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use push_bridge_control::{PauseInfo, PauseParams};
@@ -15,7 +16,7 @@ use tokio::sync::oneshot;
 use tokio::time::Instant;
 
 use super::{Core, Internal};
-use crate::backend::{BackendError, ErrorKind, PermissionMode, Prepared, Restored};
+use crate::backend::{BackendError, ErrorKind, PermissionMode, Prepared, Restored, Started};
 use crate::cards;
 use crate::commands::Command;
 use crate::control::{Reply, error};
@@ -103,6 +104,15 @@ impl Pause {
             Phase::Resuming => "resuming",
         }
     }
+}
+
+/// A pause's resume whose start failed, carried to the next start that works: the
+/// owner hears how the backend came back, confirms approvals that were off again, and
+/// what was saved is restored.
+pub(super) struct ResumeCarry {
+    version_before: Option<String>,
+    bypass_before: bool,
+    restore: bool,
 }
 
 /// Sends an action's result to its caller (who may have gone).
@@ -561,23 +571,38 @@ impl<M: Messenger> Core<M> {
     }
 
     /// Starts the backend again after a pause, restoring what it saved, and says what
-    /// came back; a failed start retries with the backoff (or waits for the program).
+    /// came back; a failed start retries with the backoff (or waits for the program),
+    /// and the next start that works restores and says so instead (see
+    /// [`ResumeCarry`]).
     async fn resume_after_pause(&mut self) {
         let restore_next = self.restore_next;
         let default_mode = self.options.default_mode;
         let current_mode = self.mode;
+        let carry = self.pending_resume.take();
         let Some(pause) = self.pause.as_mut() else {
+            self.pending_resume = carry;
             return;
         };
         pause.phase = Phase::Resuming;
-        let restore = (pause.prepared.is_some() || restore_next) && !pause.killed;
-        let mode = if pause.bypass_before {
+        // A pause entered after a failed resume is a killed one, yet what the earlier
+        // pause saved is still there to restore.
+        let saved = (pause.prepared.is_some() || restore_next) && !pause.killed;
+        let restore = saved || carry.as_ref().is_some_and(|carry| carry.restore);
+        let bypass_before =
+            pause.bypass_before || carry.as_ref().is_some_and(|carry| carry.bypass_before);
+        let mode = if bypass_before {
             default_mode
         } else {
             current_mode
         };
-        let before = pause.version_before.clone();
-        let bypass_before = pause.bypass_before;
+        let version_before = carry
+            .and_then(|carry| carry.version_before)
+            .or_else(|| pause.version_before.clone());
+        let resume = ResumeCarry {
+            version_before,
+            bypass_before,
+            restore,
+        };
         self.publish();
         tracing::info!(event = "backend_resuming", restore);
         let folder = self.folder.clone();
@@ -588,44 +613,59 @@ impl<M: Messenger> Core<M> {
         {
             Ok(started) => {
                 self.pause = None;
-                let file_version = match self.backend.executable().map(|path| exe::probe(&path)) {
-                    Some(Probe::Usable(fingerprint)) => fingerprint.version,
-                    _ => None,
-                };
-                let after = started
-                    .version
-                    .clone()
-                    .filter(|version| Some(version) != before.as_ref())
-                    .or(file_version);
-                let restored = started.restored.clone();
                 self.mode = mode;
                 self.start_failing = false;
-                self.adopt(folder, started).await;
-                let lost = self.lost_items();
-                self.reply(&announcement(
-                    &self.name,
-                    before.as_deref(),
-                    after.as_deref(),
-                    restored.as_ref(),
-                    &lost,
-                ));
-                if bypass_before {
-                    self.reply(
-                        "Approvals were off before the upgrade; confirm to turn them off again.",
-                    );
-                    let card = cards::bypass_card(&self.name);
-                    self.post_card(card, None).await;
-                }
+                self.back_after_pause(folder, started, resume).await;
                 self.publish();
                 self.update_activity(false).await;
                 self.send_queued();
             }
             Err(failure) => {
                 self.pause = None;
+                // Approvals stay off until confirmed again, whichever start works.
+                self.mode = mode;
+                self.restore_next = restore;
+                self.pending_resume = Some(resume);
                 self.retry_start(&failure, Some("restarted"));
                 self.publish();
                 self.update_activity(false).await;
             }
+        }
+    }
+
+    /// The backend started after a pause: takes the session and says how it came back
+    /// (versions, what it restored or lost); approvals that were off are to be
+    /// confirmed again.
+    pub(super) async fn back_after_pause(
+        &mut self,
+        folder: PathBuf,
+        started: Started,
+        resume: ResumeCarry,
+    ) {
+        let before = resume.version_before;
+        let file_version = match self.backend.executable().map(|path| exe::probe(&path)) {
+            Some(Probe::Usable(fingerprint)) => fingerprint.version,
+            _ => None,
+        };
+        let after = started
+            .version
+            .clone()
+            .filter(|version| Some(version) != before.as_ref())
+            .or(file_version);
+        let restored = started.restored.clone();
+        self.adopt(folder, started).await;
+        let lost = self.lost_items();
+        self.reply(&announcement(
+            &self.name,
+            before.as_deref(),
+            after.as_deref(),
+            restored.as_ref(),
+            &lost,
+        ));
+        if resume.bypass_before {
+            self.reply("Approvals were off before the upgrade; confirm to turn them off again.");
+            let card = cards::bypass_card(&self.name);
+            self.post_card(card, None).await;
         }
     }
 

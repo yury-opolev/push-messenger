@@ -272,11 +272,15 @@ impl<M: Messenger> Core<M> {
             Ok(started) => {
                 let was_failing = std::mem::take(&mut self.start_failing);
                 self.announce_restart = false;
-                self.adopt(folder, started).await;
-                if let Some(how) = announce {
-                    self.reply(&self.restarted_note(how));
-                } else if was_failing {
-                    self.reply(&format!("{} started.", self.name));
+                if let Some(resume) = self.pending_resume.take() {
+                    self.back_after_pause(folder, started, resume).await;
+                } else {
+                    self.adopt(folder, started).await;
+                    if let Some(how) = announce {
+                        self.reply(&self.restarted_note(how));
+                    } else if was_failing {
+                        self.reply(&format!("{} started.", self.name));
+                    }
                 }
                 self.send_queued();
                 Ok(())

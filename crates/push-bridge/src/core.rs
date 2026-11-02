@@ -350,6 +350,9 @@ struct Core<M: Messenger> {
     /// The backend saved its state for a restart that did not happen: the next start
     /// of the current session restores it.
     restore_next: bool,
+    /// A start after a pause failed: the next successful start says how the backend
+    /// came back and asks to confirm approvals again.
+    pending_resume: Option<upgrade::ResumeCarry>,
 }
 
 impl<M: Messenger> Core<M> {
@@ -404,6 +407,7 @@ impl<M: Messenger> Core<M> {
             pause: None,
             pauses: 0,
             restore_next: false,
+            pending_resume: None,
         }
     }
 

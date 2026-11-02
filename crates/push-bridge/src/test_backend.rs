@@ -38,6 +38,8 @@ struct Script {
     calls: Vec<(Instant, String)>,
     capabilities: BTreeSet<Capability>,
     starts: VecDeque<Result<Started, BackendError>>,
+    /// The next starts wait for these before they return.
+    start_holds: VecDeque<oneshot::Receiver<()>>,
     prepares: VecDeque<Result<Prepared, BackendError>>,
     /// The next prepares wait for these before they return.
     prepare_holds: VecDeque<oneshot::Receiver<()>>,
@@ -72,6 +74,7 @@ impl TestBackend {
                 calls: Vec::new(),
                 capabilities: ALL_CAPABILITIES.into_iter().collect(),
                 starts: VecDeque::new(),
+                start_holds: VecDeque::new(),
                 prepares: VecDeque::new(),
                 prepare_holds: VecDeque::new(),
                 executable: None,
@@ -117,6 +120,14 @@ impl TestBackend {
     /// The next start fails with `kind`.
     pub fn fail_next_start(&self, kind: ErrorKind) {
         self.next_start(Err(error("initialize", kind)));
+    }
+
+    /// The next start (recorded at once) returns only once the sender is used or
+    /// dropped; its result is taken then.
+    pub fn hold_next_start(&self) -> oneshot::Sender<()> {
+        let (release, hold) = oneshot::channel();
+        self.lock().start_holds.push_back(hold);
+        release
     }
 
     /// The next `prepare_restart` returns `result`; unscripted ones are
@@ -270,6 +281,10 @@ impl Backend for TestBackend {
             options.permission_mode,
             if options.restore { " restore=true" } else { "" },
         ));
+        let hold = self.lock().start_holds.pop_front();
+        if let Some(hold) = hold {
+            let _ = hold.await;
+        }
         let mut script = self.lock();
         if let Some(result) = script.starts.pop_front() {
             return result;

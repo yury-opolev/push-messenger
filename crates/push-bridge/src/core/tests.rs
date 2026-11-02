@@ -1744,6 +1744,80 @@ async fn bypass_needs_a_new_confirmation_after_an_upgrade() {
         .await;
 }
 
+/// Approvals off, then a pause that saved the state; returns the program file.
+async fn bypassed_and_paused(h: &Harness) -> PathBuf {
+    h.messenger.owner_says("/mode bypass");
+    h.card(1).await;
+    h.messenger.owner_says("y");
+    h.reply_containing("Approvals are off until /new.").await;
+    let program = h.program("build one");
+    h.backend.next_prepare(Ok(prepared(0)));
+    h.pause(None).await.unwrap().unwrap();
+    program
+}
+
+/// The upgrade was announced and approvals are to be confirmed again.
+async fn announced_with_the_bypass_card(h: &Harness) {
+    h.card(2).await;
+    let cards = h.cards();
+    assert_eq!(cards[1].1, cards[0].1, "the bypass card again");
+    let replies = h.replies();
+    let announced = replies
+        .iter()
+        .position(|reply| reply == "Test upgraded 1.0 → 1.1: nothing to restore.")
+        .unwrap_or_else(|| panic!("announced: {replies:?}"));
+    assert_eq!(
+        replies[announced + 1],
+        "Approvals were off before the upgrade; confirm to turn them off again."
+    );
+    assert!(
+        replies
+            .iter()
+            .all(|reply| !reply.starts_with("Test restarted")),
+        "{replies:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_resume_keeps_the_restore_and_the_bypass_confirmation() {
+    let h = Harness::started().await;
+    let program = bypassed_and_paused(&h).await;
+    h.backend.fail_next_start(ErrorKind::Other);
+    h.backend
+        .next_start(Ok(upgraded("1.1", Some(Restored::default()))));
+    std::fs::write(&program, "build number two").unwrap();
+    h.backend.wait_for("start", 2).await;
+    h.reply_containing("retrying").await;
+    h.backend.wait_for("start", 3).await;
+    let restoring = format!("{} restore=true", h.start_call(&h.work, "session-1"));
+    assert_eq!(h.starts()[1..], [restoring.clone(), restoring]);
+    announced_with_the_bypass_card(&h).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_resume_failing_on_a_missing_program_keeps_the_restore_and_the_bypass_confirmation() {
+    let h = Harness::started().await;
+    let program = bypassed_and_paused(&h).await;
+    let release = h.backend.hold_next_start();
+    h.backend.fail_next_start(ErrorKind::Other);
+    h.backend
+        .next_start(Ok(upgraded("1.1", Some(Restored::default()))));
+    std::fs::write(&program, "build number two").unwrap();
+    h.backend.wait_for("start", 2).await;
+    std::fs::remove_file(&program).unwrap();
+    drop(release);
+    h.reply_containing(STOPPED_UNUSABLE).await;
+    settle().await;
+    assert_eq!(h.pause_phase().as_deref(), Some("waiting_for_file"));
+    tokio::time::sleep(Duration::from_secs(300)).await;
+    assert_eq!(h.count("start"), 2);
+    std::fs::write(&program, "build number three").unwrap();
+    h.backend.wait_for("start", 3).await;
+    let restoring = format!("{} restore=true", h.start_call(&h.work, "session-1"));
+    assert_eq!(h.starts()[1..], [restoring.clone(), restoring]);
+    announced_with_the_bypass_card(&h).await;
+}
+
 #[tokio::test(start_paused = true)]
 async fn the_fallback_works_without_prepare_restart() {
     let h = Harness::started().await;
