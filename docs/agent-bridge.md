@@ -1078,13 +1078,15 @@ tray's "Pause Coda for upgrade", or `push-agent-bridge pause`).
    - commands other than `/status` and `/help` (Coda's own included) are answered "Coda is
      paused for an upgrade; try again when it is back.";
    - answers to open cards, by card or typed, still count;
-   - a prompt Coda refuses with -32012 (restart pending) is held too.
+   - a prompt Coda refuses with -32016 (restart pending) is held too.
 
    A second `pause_backend` while draining waits for the same release; once released it
    is answered at once with `{"state": "paused", "phase": "<phase>"}`. When Coda is not
    running at that moment (it is restarting), it is released at once.
-2. **Drain.** The bridge calls Coda's `session/prepareRestart {drainTimeoutMs, reason?}`
-   (it waits up to the drain timeout plus 60 s). Meanwhile turns, cards and answers go on.
+2. **Drain.** The bridge calls Coda's `session/prepareRestart {drainTimeoutMs, reason?,
+   deliveredCursor?}` (`deliveredCursor` is the last background message the bridge
+   showed, so Coda does not deliver it again after the restore; it waits up to the drain
+   timeout plus 60 s). Meanwhile turns, cards and answers go on.
    Coda's answer releases it. A Coda without that method (-32601) gets the
    [fallback](#older-coda-fallback). Any other error ends the pause: the callers get
    `prepare_failed` ("session/prepareRestart failed (<code>)"), the owner hears "Pausing
@@ -1108,20 +1110,33 @@ tray's "Pause Coda for upgrade", or `push-agent-bridge pause`).
    with `restore: true` when `prepareRestart` succeeded, in `default_permission_mode` when
    approvals were off (else in the current mode). Then it tells the owner how Coda came
    back:
-   - with Coda's `restored`: "Coda upgraded 0.1.176 → 0.1.177: 2 schedules, 1 message and
-     the model/goal restored; 1 interrupted task reported to Coda." The head is "Coda
-     upgraded <before> → <after>" when both versions are known and differ, "Coda upgraded
-     to <after>" when only the new one is, else "Coda restarted"; the items are "N
-     schedule(s)", "N message(s)" and "the <settings joined by />" (without
-     `bypassPermissions` and `permissionMode`), joined "a, b and c" + " restored", or
-     "nothing to restore"; then "; N interrupted task(s) reported to Coda" when there are
-     any; then ".". "Before" is the version Coda reported before the pause (else the
-     program's file version then); "after" is the version Coda reports now, or the new
-     file version when it reports none or the same one;
+   - with Coda's `restored` (applied): "Coda upgraded 0.1.176 → 0.1.177: 2 schedules, 1
+     message and the model/goal restored; 1 interrupted task and 1 interrupted request
+     reported to Coda." The head is "Coda upgraded <before> → <after>" when both versions
+     are known and differ, "Coda upgraded to <after>" when only the new one is, else "Coda
+     restarted"; the items are "N schedule(s)", "N message(s)" and "the <settings joined by
+     />" (without `bypassPermissions`, `permissionMode` and anything in
+     `settingsNotRestored`), joined "a, b and c" + " restored", or "nothing to restore";
+     then "; N interrupted task(s) and N interrupted request(s) reported to Coda" (each
+     when there are any); then ".". "Before" is `restored.fromVersion`, else the version
+     Coda reported before the pause (else the program's file version then); "after" is
+     `restored.toVersion`, else the version Coda reports now, or the new file version when
+     it reports none or the same one. Versions taken from Coda's `serverInfo` lose a
+     leading program name and a " (contract …)" suffix ("coda 0.1.177 (contract …)" reads
+     "0.1.177"; "coda (contract …)" is no version);
+   - with `restored.applied: false`: the head, that the state was not restored and why,
+     then what was lost, e.g. "Coda upgraded 0.1.176 → 0.1.177; its saved state was not
+     restored (expired). Undelivered background messages and in-memory schedules were
+     lost." (reasons: `missing` "none was found", `unreadable` "it could not be read",
+     `sessionMismatch` "it belongs to another session", `workingDirMismatch` "it belongs
+     to another folder", `expired`, `consumeFailed` "it could not be taken",
+     `unsupportedFormat` "its format is newer");
    - without `restored`: the head, then what was lost, e.g. "Coda upgraded 0.1.176 →
      0.1.177. Undelivered background messages and in-memory schedules were lost.";
-   - when approvals were off: "Approvals were off before the upgrade; confirm to turn them
-     off again." and a new "Turn off approvals?" card.
+   - when approvals were off before the pause, or `restored.settingsNotRestored` names
+     `permissionMode: bypassPermissions` (once, however many say so): "Approvals were off
+     before the upgrade; confirm to turn them off again." and a new "Turn off approvals?"
+     card.
 
    Then the pause ends, the state is published, and the held texts go to Coda as one prompt
    (separated by blank lines). A failed start is reported once ("… ; retrying.") and retried
@@ -1130,16 +1145,21 @@ tray's "Pause Coda for upgrade", or `push-agent-bridge pause`).
 
 ### The Coda contract
 
+As shipped in Coda 0.1.177 (coda-cli PR #214):
+
 | Call | Bridge sends | Bridge reads |
 |---|---|---|
-| `session/prepareRestart` | `{"drainTimeoutMs": <ms>, "reason"?: "<text>"}` | `drained` (default `true`), `interruptedTasks` (a number or a list: its length; default 0); `ok: false` is a refusal; error -32601: not supported ([fallback](#older-coda-fallback)) |
-| any call while draining | | error -32012 "restart pending": a prompt is held |
+| `session/prepareRestart` | `{"drainTimeoutMs": <ms>, "reason"?: "<text>", "deliveredCursor"?: <the last background message shown>}` | `drained` (default `true`), `interruptedTasks`, `interruptedRequests`, `suspendedTasks` (each a number or a list: its length; default 0; logged as counts); `ok`, `restartFile` are not used; `ok: false` is a refusal; error -32601: not supported ([fallback](#older-coda-fallback)) |
+| any call while draining | | error -32016 "restart pending": a prompt is held (-32012, a stale epoch, is an ordinary refusal) |
 | `event/lifecycle` | | `{"lifecycle": "draining"}` and the like: logged at debug, otherwise ignored |
-| `initialize` | as always, plus `"restore": true` after a successful `prepareRestart` | `restored`: `schedules`, `messages`, `interruptedTasks`, `steering` (each a number or a list: its length; missing: 0), `settings` (a list of names, or of objects with `name`, or an object whose keys are the names); `restored: true` means restored with nothing to list; absent or anything else: no restore |
+| `initialize` | as always, plus `"restore": true` after a successful `prepareRestart` | `restored`: `applied` (default `true`), `ignoredReason`, `fromVersion`, `toVersion`, `schedules`, `messages`, `interruptedTasks`, `interruptedRequests`, `steering`, `tasksSuspended` (counts: a number or a list: its length; missing: 0), `settings` (a list of names, or of objects with `name`, or an object whose keys are the names), `settingsNotRestored` (a list of `{name, value?, reason?}` or of names); `preparedAt`, `reason` and `tasks` are not used; `restored: true` means restored with nothing to list; absent or anything else: no restore |
+| `initialize` failing with -32017 | | the restart file is in a newer format: the bridge calls `initialize` again for the same session without `restore`, and announces it as `applied: false` with the reason `unsupportedFormat` |
 
-Every field is optional and parsed leniently. `bypassPermissions` is never restored: the
-bridge starts Coda in the default mode and asks the owner to confirm with a new card, and
-never names `bypassPermissions` or `permissionMode` among the restored settings.
+Every field is optional and parsed leniently. `bypassPermissions` is never restored (Coda
+lists it in `settingsNotRestored` as `permissionMode: bypassPermissions`): the bridge
+starts Coda in the default mode and asks the owner to confirm with a new card, and never
+names `bypassPermissions`, `permissionMode` or any setting not restored among the restored
+settings. `session/getState` and `coda serve --restore` are not used.
 
 ### Older Coda (fallback)
 
@@ -1158,8 +1178,9 @@ opened (an installer that replaces it, or a wrong `coda.exe`), the bridge does n
 restarts: it says "(Coda stopped and its program is missing or in use; waiting for it to
 come back)" (as the end of the running turn's reply, else as a reply), declines open
 requests ("Declined: Coda stopped."), and pauses with phase `waiting_for_file` (detail
-"waiting for Coda's program", reason "Coda's program is missing or in use"). Held texts
-and commands work as in a pause. Once the file is usable and looked the same twice, 2 s
+"waiting for Coda's program", reason "Coda's program is missing or in use"; the owner's
+activity shows working "Waiting for Coda's program", not "Paused: upgrading Coda"). Held
+texts and commands work as in a pause. Once the file is usable and looked the same twice, 2 s
 apart, Coda starts again, without `restore` (nothing was saved), and the owner hears the
 announcement with what was lost. `resume_backend` starts it at once when the file is
 usable, else answers `exe_unavailable`.

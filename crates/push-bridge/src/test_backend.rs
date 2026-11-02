@@ -4,15 +4,14 @@
 use std::collections::{BTreeSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Duration;
 
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::time::Instant;
 
 use crate::backend::{
     Answer, Backend, BackendCommand, BackendError, BackendEvent, BackendRequest, BackendStatus,
-    Capability, CommandReply, ErrorKind, PendingMessages, Prepared, RequestKind, Responder,
-    StartOptions, Started, SteerOutcome, TextFormat, TurnSource,
+    Capability, CommandReply, ErrorKind, PendingMessages, PrepareOptions, Prepared, RequestKind,
+    Responder, StartOptions, Started, SteerOutcome, TextFormat, TurnSource,
 };
 use crate::messenger::wait;
 
@@ -248,7 +247,7 @@ pub fn error(method: &str, kind: ErrorKind) -> BackendError {
         ErrorKind::NotRunning => ("exited", "not running"),
         ErrorKind::Refused => ("refused", "refused"),
         ErrorKind::Unsupported => ("-32601", "method not found"),
-        ErrorKind::RestartPending => ("-32012", "restart pending"),
+        ErrorKind::RestartPending => ("-32016", "restart pending"),
         ErrorKind::Other => ("-32000", "failed"),
     };
     BackendError {
@@ -358,12 +357,14 @@ impl Backend for TestBackend {
         Ok(std::mem::take(&mut self.lock().pending))
     }
 
-    async fn prepare_restart(
-        &self,
-        drain: Duration,
-        _reason: Option<&str>,
-    ) -> Result<Prepared, BackendError> {
-        self.record(format!("prepare drain={}", drain.as_millis()));
+    async fn prepare_restart(&self, options: PrepareOptions) -> Result<Prepared, BackendError> {
+        self.record(format!(
+            "prepare drain={} delivered={}",
+            options.drain.as_millis(),
+            options
+                .delivered_cursor
+                .map_or("None".to_owned(), |cursor| cursor.to_string()),
+        ));
         let hold = self.lock().prepare_holds.pop_front();
         if let Some(hold) = hold {
             let _ = hold.await;
@@ -382,6 +383,7 @@ impl Backend for TestBackend {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::time::Duration;
 
     use super::*;
     use crate::backend::PermissionMode;
@@ -399,18 +401,26 @@ mod tests {
     async fn restores_and_prepares_are_recorded_and_scripted() {
         let (backend, _events) = TestBackend::channel();
         let error = backend
-            .prepare_restart(Duration::from_secs(2), Some("upgrade"))
+            .prepare_restart(PrepareOptions {
+                drain: Duration::from_secs(2),
+                reason: Some("upgrade".into()),
+                delivered_cursor: Some(4),
+            })
             .await
             .unwrap_err();
         assert_eq!(error.kind, ErrorKind::Unsupported);
         let prepared = Prepared {
             drained: false,
             interrupted_tasks: 1,
+            ..Prepared::default()
         };
         backend.next_prepare(Ok(prepared.clone()));
         assert_eq!(
             backend
-                .prepare_restart(Duration::from_millis(1500), None)
+                .prepare_restart(PrepareOptions {
+                    drain: Duration::from_millis(1500),
+                    ..PrepareOptions::default()
+                })
                 .await,
             Ok(prepared)
         );
@@ -420,8 +430,8 @@ mod tests {
         assert_eq!(
             backend.calls(),
             [
-                "prepare drain=2000",
-                "prepare drain=1500",
+                "prepare drain=2000 delivered=4",
+                "prepare drain=1500 delivered=None",
                 "start folder=work session=s mode=default restore=true",
             ]
         );

@@ -16,7 +16,9 @@ use tokio::sync::oneshot;
 use tokio::time::Instant;
 
 use super::{Core, Internal};
-use crate::backend::{BackendError, ErrorKind, PermissionMode, Prepared, Restored, Started};
+use crate::backend::{
+    BackendError, ErrorKind, PermissionMode, PrepareOptions, Prepared, Restored, Started,
+};
 use crate::cards;
 use crate::commands::Command;
 use crate::control::{Reply, error};
@@ -151,6 +153,42 @@ pub(super) fn lost_sentence(lost: &[&str]) -> Option<String> {
     ))
 }
 
+/// A version as the owner reads it: without a leading program name (`coda 0.1.177`)
+/// or a trailing ` (contract …)`; `None` when no version is left.
+pub(super) fn display_version(text: &str) -> Option<String> {
+    let text = match text.find(" (contract ") {
+        Some(at) => &text[..at],
+        None => text,
+    };
+    let text = text.trim();
+    if text.is_empty() || text.starts_with("contract ") {
+        return None;
+    }
+    let version = match text.split_once(char::is_whitespace) {
+        Some((first, rest)) if !first.starts_with(|c: char| c.is_ascii_digit()) => rest.trim(),
+        _ => text,
+    };
+    if version.chars().any(|c| c.is_ascii_digit()) {
+        Some(version.to_owned())
+    } else {
+        None
+    }
+}
+
+/// Why a backend's saved state was not applied, in the owner's words.
+fn ignored_reason_text(reason: &str) -> String {
+    match reason {
+        "missing" => "none was found".to_owned(),
+        "unreadable" => "it could not be read".to_owned(),
+        "sessionMismatch" => "it belongs to another session".to_owned(),
+        "workingDirMismatch" => "it belongs to another folder".to_owned(),
+        "expired" => "expired".to_owned(),
+        "consumeFailed" => "it could not be taken".to_owned(),
+        "unsupportedFormat" => "its format is newer".to_owned(),
+        other => other.chars().take(REASON_CHARS).collect(),
+    }
+}
+
 /// What the owner hears when the backend is back after a pause: how it came back
 /// (versions), and what it restored, or what was lost without a restore.
 pub(super) fn announcement(
@@ -167,12 +205,21 @@ pub(super) fn announcement(
         (None, Some(after)) => format!("{name} upgraded to {after}"),
         _ => format!("{name} restarted"),
     };
-    let Some(restored) = restored else {
-        return match lost_sentence(lost) {
-            Some(lost) => format!("{head}. {lost}"),
-            None => format!("{head}."),
-        };
+    let without_restore = |head: String| match lost_sentence(lost) {
+        Some(lost) => format!("{head}. {lost}"),
+        None => format!("{head}."),
     };
+    let Some(restored) = restored else {
+        return without_restore(head);
+    };
+    if !restored.applied {
+        let why = restored
+            .ignored_reason
+            .as_deref()
+            .map(|reason| format!(" ({})", ignored_reason_text(reason)))
+            .unwrap_or_default();
+        return without_restore(format!("{head}; its saved state was not restored{why}"));
+    }
     let mut items = Vec::new();
     if restored.schedules > 0 {
         items.push(counted(restored.schedules, "schedule"));
@@ -184,7 +231,13 @@ pub(super) fn announcement(
         .settings
         .iter()
         .map(String::as_str)
-        .filter(|setting| !NOT_RESTORED.contains(setting))
+        .filter(|setting| {
+            !NOT_RESTORED.contains(setting)
+                && !restored
+                    .settings_not_restored
+                    .iter()
+                    .any(|not| not.name == *setting)
+        })
         .collect();
     if !settings.is_empty() {
         items.push(format!("the {}", settings.join("/")));
@@ -196,11 +249,18 @@ pub(super) fn announcement(
         text.push_str(&joined(&items));
         text.push_str(" restored");
     }
+    let mut interrupted = Vec::new();
     if restored.interrupted_tasks > 0 {
-        text.push_str(&format!(
-            "; {} reported to {name}",
-            counted(restored.interrupted_tasks, "interrupted task")
+        interrupted.push(counted(restored.interrupted_tasks, "interrupted task"));
+    }
+    if restored.interrupted_requests > 0 {
+        interrupted.push(counted(
+            restored.interrupted_requests,
+            "interrupted request",
         ));
+    }
+    if !interrupted.is_empty() {
+        text.push_str(&format!("; {} reported to {name}", joined(&interrupted)));
     }
     text.push('.');
     text
@@ -228,7 +288,11 @@ impl<M: Messenger> Core<M> {
 
     /// The activity's label while paused.
     pub(super) fn pause_label(&self) -> String {
-        format!("Paused: upgrading {}", self.name)
+        if self.pause.as_ref().is_some_and(|pause| pause.killed) {
+            format!("Waiting for {}'s program", self.name)
+        } else {
+            format!("Paused: upgrading {}", self.name)
+        }
     }
 
     /// While paused, a command other than `/status` and `/help` is refused (said so);
@@ -299,8 +363,13 @@ impl<M: Messenger> Core<M> {
         }
         let backend = self.backend.clone();
         let internal = self.internal.clone();
+        let options = PrepareOptions {
+            drain,
+            reason,
+            delivered_cursor: self.state.get().agent_message_cursor,
+        };
         tokio::spawn(async move {
-            let result = backend.prepare_restart(drain, reason.as_deref()).await;
+            let result = backend.prepare_restart(options).await;
             let _ = internal.send(Internal::Prepared { pause: id, result });
         });
     }
@@ -320,7 +389,9 @@ impl<M: Messenger> Core<M> {
                 tracing::info!(
                     event = "backend_prepared",
                     drained = prepared.drained,
-                    interrupted_tasks = prepared.interrupted_tasks
+                    interrupted_tasks = prepared.interrupted_tasks,
+                    interrupted_requests = prepared.interrupted_requests,
+                    suspended_tasks = prepared.suspended_tasks
                 );
                 pause.supported = Some(true);
                 pause.drained = prepared.drained;
@@ -384,11 +455,15 @@ impl<M: Messenger> Core<M> {
             Some(Probe::Usable(fingerprint)) => Some(fingerprint),
             _ => None,
         };
-        let version_before = self.version.clone().or_else(|| {
-            fingerprint
-                .as_ref()
-                .and_then(|fingerprint| fingerprint.version.clone())
-        });
+        let version_before = self
+            .version
+            .as_deref()
+            .and_then(display_version)
+            .or_else(|| {
+                fingerprint
+                    .as_ref()
+                    .and_then(|fingerprint| fingerprint.version.clone())
+            });
         let bypass_before = self.mode == PermissionMode::BypassPermissions;
         let note = format!("({} paused for an upgrade)", self.name);
         let cut = self.cut_turn(&note);
@@ -471,7 +546,7 @@ impl<M: Messenger> Core<M> {
             self.clock.now_ms(),
         );
         pause.killed = true;
-        pause.version_before = self.version.clone();
+        pause.version_before = self.version.as_deref().and_then(display_version);
         self.pause = Some(pause);
     }
 
@@ -642,17 +717,29 @@ impl<M: Messenger> Core<M> {
         started: Started,
         resume: ResumeCarry,
     ) {
-        let before = resume.version_before;
+        let restored = started.restored.clone();
+        let before = restored
+            .as_ref()
+            .and_then(|restored| restored.from_version.clone())
+            .or_else(|| resume.version_before.as_deref().and_then(display_version));
         let file_version = match self.backend.executable().map(|path| exe::probe(&path)) {
             Some(Probe::Usable(fingerprint)) => fingerprint.version,
             _ => None,
         };
-        let after = started
-            .version
-            .clone()
-            .filter(|version| Some(version) != before.as_ref())
-            .or(file_version);
-        let restored = started.restored.clone();
+        let after = restored
+            .as_ref()
+            .and_then(|restored| restored.to_version.clone())
+            .or_else(|| {
+                started
+                    .version
+                    .as_deref()
+                    .and_then(display_version)
+                    .filter(|version| Some(version) != before.as_ref())
+                    .or(file_version)
+            });
+        let bypass_not_restored = restored
+            .as_ref()
+            .is_some_and(|restored| restored.applied && restored.bypass_not_restored());
         self.adopt(folder, started).await;
         let lost = self.lost_items();
         self.reply(&announcement(
@@ -662,7 +749,7 @@ impl<M: Messenger> Core<M> {
             restored.as_ref(),
             &lost,
         ));
-        if resume.bypass_before {
+        if resume.bypass_before || bypass_not_restored {
             self.reply("Approvals were off before the upgrade; confirm to turn them off again.");
             let card = cards::bypass_card(&self.name);
             self.post_card(card, None).await;
@@ -696,7 +783,81 @@ mod tests {
             messages,
             settings: settings.iter().map(|&setting| setting.to_owned()).collect(),
             interrupted_tasks: interrupted,
-            steering: 0,
+            ..Restored::default()
+        }
+    }
+
+    #[test]
+    fn interrupted_requests_are_reported_with_the_tasks() {
+        let mut both = restored(0, 0, &[], 1);
+        both.interrupted_requests = 1;
+        assert_eq!(
+            announcement("Coda", None, None, Some(&both), &LOST),
+            "Coda restarted: nothing to restore; 1 interrupted task and 1 interrupted \
+             request reported to Coda."
+        );
+        both.interrupted_tasks = 0;
+        both.interrupted_requests = 2;
+        assert_eq!(
+            announcement("Coda", None, None, Some(&both), &LOST),
+            "Coda restarted: nothing to restore; 2 interrupted requests reported to Coda."
+        );
+    }
+
+    #[test]
+    fn a_state_that_was_not_applied_is_never_claimed_restored() {
+        let mut ignored = restored(2, 1, &["model"], 1);
+        ignored.applied = false;
+        ignored.ignored_reason = Some("expired".into());
+        assert_eq!(
+            announcement(
+                "Coda",
+                Some("0.1.176"),
+                Some("0.1.177"),
+                Some(&ignored),
+                &LOST[1..]
+            ),
+            "Coda upgraded 0.1.176 → 0.1.177; its saved state was not restored (expired). \
+             In-memory schedules were lost."
+        );
+        ignored.ignored_reason = Some("unsupportedFormat".into());
+        assert_eq!(
+            announcement("Coda", None, None, Some(&ignored), &[]),
+            "Coda restarted; its saved state was not restored (its format is newer)."
+        );
+        ignored.ignored_reason = None;
+        assert_eq!(
+            announcement("Coda", None, None, Some(&ignored), &[]),
+            "Coda restarted; its saved state was not restored."
+        );
+    }
+
+    #[test]
+    fn settings_not_restored_are_not_announced_as_restored() {
+        let mut settings = restored(0, 0, &["model", "effort"], 0);
+        settings.settings_not_restored = vec![crate::backend::NotRestored {
+            name: "effort".into(),
+            ..Default::default()
+        }];
+        assert_eq!(
+            announcement("Coda", None, None, Some(&settings), &LOST),
+            "Coda restarted: the model restored."
+        );
+    }
+
+    #[test]
+    fn versions_lose_the_program_name_and_the_contract() {
+        for (text, version) in [
+            ("coda 0.1.176 (contract 2026-09-1)", Some("0.1.176")),
+            ("Coda 0.1.177", Some("0.1.177")),
+            ("0.1.177", Some("0.1.177")),
+            ("1.0", Some("1.0")),
+            ("coda (contract 2026-09-1)", None),
+            ("contract 2026-09-1", None),
+            ("coda", None),
+            ("", None),
+        ] {
+            assert_eq!(display_version(text).as_deref(), version, "{text:?}");
         }
     }
 

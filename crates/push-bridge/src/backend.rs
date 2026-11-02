@@ -111,15 +111,77 @@ pub struct Started {
     pub restored: Option<Restored>,
 }
 
-/// What a backend restored after a planned restart: counts and setting names only.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// What a backend restored after a planned restart: counts, versions and setting names
+/// only. The default is an applied restore of nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Restored {
+    /// The saved state was applied; when not, [`Restored::ignored_reason`] says why.
+    pub applied: bool,
+    /// Why the saved state was not applied, such as `expired` or `unsupportedFormat`.
+    pub ignored_reason: Option<String>,
+    /// The version that saved the state.
+    pub from_version: Option<String>,
+    /// The version that restored it.
+    pub to_version: Option<String>,
     pub schedules: usize,
     pub messages: usize,
     /// The restored settings' names, such as `model` or `goal`.
     pub settings: Vec<String>,
+    /// Settings that were saved but not restored, such as approvals that were off.
+    pub settings_not_restored: Vec<NotRestored>,
     pub interrupted_tasks: usize,
+    pub interrupted_requests: usize,
     pub steering: usize,
+    pub tasks_suspended: usize,
+}
+
+impl Default for Restored {
+    fn default() -> Self {
+        Self {
+            applied: true,
+            ignored_reason: None,
+            from_version: None,
+            to_version: None,
+            schedules: 0,
+            messages: 0,
+            settings: Vec::new(),
+            settings_not_restored: Vec::new(),
+            interrupted_tasks: 0,
+            interrupted_requests: 0,
+            steering: 0,
+            tasks_suspended: 0,
+        }
+    }
+}
+
+impl Restored {
+    /// Approvals were off when the state was saved; they are to be confirmed again.
+    pub fn bypass_not_restored(&self) -> bool {
+        self.settings_not_restored.iter().any(|setting| {
+            setting.name == "bypassPermissions"
+                || (setting.name == "permissionMode"
+                    && setting.value.as_deref() == Some(PermissionMode::BypassPermissions.as_str()))
+        })
+    }
+}
+
+/// A saved setting a restore did not bring back.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NotRestored {
+    pub name: String,
+    pub value: Option<String>,
+    pub reason: Option<String>,
+}
+
+/// What `prepare_restart` is asked to do.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PrepareOptions {
+    /// How long running work may finish first.
+    pub drain: Duration,
+    pub reason: Option<String>,
+    /// The last background message the bridge showed: the backend does not deliver it
+    /// (or older ones) again after the restore.
+    pub delivered_cursor: Option<u64>,
 }
 
 /// How a backend prepared for a planned restart.
@@ -130,6 +192,10 @@ pub struct Prepared {
     /// Tasks still running when the drain time was up; the backend reports them after
     /// the restart.
     pub interrupted_tasks: usize,
+    /// Requests still open when the drain time was up.
+    pub interrupted_requests: usize,
+    /// Tasks saved to continue after the restart.
+    pub suspended_tasks: usize,
 }
 
 /// What kind of failure a [`BackendError`] is.
@@ -371,12 +437,9 @@ pub trait Backend: Send + Sync + 'static {
         engine_instance: Option<&str>,
     ) -> Result<PendingMessages, BackendError>;
     /// Saves the backend's state for a restart after letting running work finish (up to
-    /// `drain`). [`ErrorKind::Unsupported`] when the backend cannot (the default).
-    async fn prepare_restart(
-        &self,
-        _drain: Duration,
-        _reason: Option<&str>,
-    ) -> Result<Prepared, BackendError> {
+    /// `options.drain`). [`ErrorKind::Unsupported`] when the backend cannot (the
+    /// default).
+    async fn prepare_restart(&self, _options: PrepareOptions) -> Result<Prepared, BackendError> {
         Err(unsupported("session/prepareRestart"))
     }
     /// The program file the backend runs, for upgrade detection; `None` when unknown.

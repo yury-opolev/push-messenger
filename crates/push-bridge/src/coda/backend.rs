@@ -16,9 +16,9 @@ use tokio::sync::{mpsc, oneshot, watch};
 use super::rpc::{Incoming, RpcError, RpcPeer};
 use crate::backend::{
     Answer, Backend, BackendCommand, BackendError, BackendEvent, BackendRequest, BackendStatus,
-    Capability, CommandReply, ErrorKind, PendingMessages, PermissionMode, Prepared, RequestKind,
-    Responder, Restored, ScheduleWhen, StartOptions, Started, SteerOutcome, TaskStatus, TextFormat,
-    TurnSource,
+    Capability, CommandReply, ErrorKind, NotRestored, PendingMessages, PermissionMode,
+    PrepareOptions, Prepared, RequestKind, Responder, Restored, ScheduleWhen, StartOptions,
+    Started, SteerOutcome, TaskStatus, TextFormat, TurnSource,
 };
 use crate::config::CodaConfig;
 use crate::mask;
@@ -35,8 +35,10 @@ pub const SCHEDULE_NOTE: &str = "Schedules live in Coda's memory and are lost wh
 
 const SESSION_NOT_FOUND: i64 = -32002;
 const METHOD_NOT_FOUND: i64 = -32601;
-/// Coda is draining for a planned restart and takes no new work.
-const RESTART_PENDING: i64 = -32012;
+/// Coda is draining for a planned restart and takes no new work ("restart pending").
+const RESTART_PENDING: i64 = -32016;
+/// The restart file is in a newer format than this Coda reads.
+const UNSUPPORTED_RESTART_FORMAT: i64 = -32017;
 /// The canonical "declined" reply to a request from Coda.
 const REQUEST_DECLINED: i64 = -32800;
 
@@ -702,8 +704,9 @@ fn count(value: &Value, key: &str) -> usize {
     }
 }
 
-/// What `initialize` says it restored (`result.restored`), read leniently: counts as
-/// numbers or lists, `settings` as a list of names or an object keyed by name.
+/// What `initialize` says about the restore (`result.restored`), read leniently: every
+/// field optional (`applied` defaults to true), counts as numbers or lists, `settings`
+/// as a list of names or an object keyed by name.
 fn restored(result: &Value) -> Option<Restored> {
     let restored = match result.get("restored") {
         Some(restored @ Value::Object(_)) => restored,
@@ -721,12 +724,40 @@ fn restored(result: &Value) -> Option<Restored> {
         Some(Value::Object(fields)) => fields.keys().cloned().collect(),
         _ => Vec::new(),
     };
+    let settings_not_restored = items(restored, "settingsNotRestored")
+        .iter()
+        .filter_map(|setting| match setting {
+            Value::String(name) => Some(NotRestored {
+                name: name.clone(),
+                ..NotRestored::default()
+            }),
+            other => optional_text(other, "name").map(|name| NotRestored {
+                name,
+                value: match other.get("value") {
+                    Some(Value::String(value)) => Some(value.clone()),
+                    Some(value @ (Value::Number(_) | Value::Bool(_))) => Some(value.to_string()),
+                    _ => None,
+                },
+                reason: optional_text(other, "reason"),
+            }),
+        })
+        .collect();
     Some(Restored {
+        applied: restored
+            .get("applied")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+        ignored_reason: optional_text(restored, "ignoredReason"),
+        from_version: optional_text(restored, "fromVersion"),
+        to_version: optional_text(restored, "toVersion"),
         schedules: count(restored, "schedules"),
         messages: count(restored, "messages"),
         settings,
+        settings_not_restored,
         interrupted_tasks: count(restored, "interruptedTasks"),
+        interrupted_requests: count(restored, "interruptedRequests"),
         steering: count(restored, "steering"),
+        tasks_suspended: count(restored, "tasksSuspended"),
     })
 }
 
@@ -738,6 +769,8 @@ fn prepared(result: &Value) -> Prepared {
             .and_then(Value::as_bool)
             .unwrap_or(true),
         interrupted_tasks: count(result, "interruptedTasks"),
+        interrupted_requests: count(result, "interruptedRequests"),
+        suspended_tasks: count(result, "suspendedTasks"),
     }
 }
 
@@ -1030,9 +1063,30 @@ impl Backend for CodaBackend {
         if options.restore {
             params["restore"] = json!(true);
         }
-        let result = session
-            .call(METHOD, params, Some(INITIALIZE_TIMEOUT))
-            .await?;
+        let result = match session
+            .call(METHOD, params.clone(), Some(INITIALIZE_TIMEOUT))
+            .await
+        {
+            Err(failure)
+                if options.restore
+                    && failure.code.parse::<i64>() == Ok(UNSUPPORTED_RESTART_FORMAT) =>
+            {
+                // A newer Coda saved the state: the session opens without it.
+                tracing::warn!(event = "restore_unsupported_format");
+                if let Some(fields) = params.as_object_mut() {
+                    fields.remove("restore");
+                }
+                let mut result = session
+                    .call(METHOD, params, Some(INITIALIZE_TIMEOUT))
+                    .await?;
+                result["restored"] = json!({
+                    "applied": false,
+                    "ignoredReason": "unsupportedFormat",
+                });
+                result
+            }
+            other => other?,
+        };
         let session_id = optional_text(&result, "sessionId").ok_or_else(|| BackendError {
             method: METHOD.to_owned(),
             code: "protocol".to_owned(),
@@ -1298,23 +1352,22 @@ impl Backend for CodaBackend {
         Ok(pending)
     }
 
-    async fn prepare_restart(
-        &self,
-        drain: Duration,
-        reason: Option<&str>,
-    ) -> Result<Prepared, BackendError> {
+    async fn prepare_restart(&self, options: PrepareOptions) -> Result<Prepared, BackendError> {
         const METHOD: &str = "session/prepareRestart";
         let session = self.session(METHOD)?;
-        let millis = u64::try_from(drain.as_millis()).unwrap_or(u64::MAX);
+        let millis = u64::try_from(options.drain.as_millis()).unwrap_or(u64::MAX);
         let mut params = json!({ "drainTimeoutMs": millis });
-        if let Some(reason) = reason {
+        if let Some(reason) = &options.reason {
             params["reason"] = json!(reason);
+        }
+        if let Some(cursor) = options.delivered_cursor {
+            params["deliveredCursor"] = json!(cursor);
         }
         let result = Self::simple(
             &session,
             METHOD,
             params,
-            Some(drain.saturating_add(PREPARE_GRACE)),
+            Some(options.drain.saturating_add(PREPARE_GRACE)),
         )
         .await?;
         Ok(prepared(&result))

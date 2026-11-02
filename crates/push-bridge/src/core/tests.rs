@@ -15,9 +15,10 @@ use tokio::task::JoinHandle;
 
 use super::*;
 use crate::backend::{
-    Answer, BackendStatus, ErrorKind, PendingMessages, Prepared, RequestKind, Restored, Started,
-    SteerOutcome, TaskStatus, TurnSource,
+    Answer, BackendStatus, ErrorKind, NotRestored, PendingMessages, Prepared, RequestKind,
+    Restored, Started, SteerOutcome, TaskStatus, TurnSource,
 };
+use crate::cards;
 use crate::control::{Action, ControlHub, Reply};
 use crate::folders;
 use crate::messenger::{Call, TestMessenger, param, template};
@@ -1557,6 +1558,7 @@ fn prepared(interrupted_tasks: usize) -> Prepared {
     Prepared {
         drained: true,
         interrupted_tasks,
+        ..Prepared::default()
     }
 }
 
@@ -1659,7 +1661,7 @@ async fn after_the_file_changes_it_resumes_with_restore_and_announces() {
             messages: 1,
             settings: vec!["model".into(), "goal".into()],
             interrupted_tasks: 1,
-            steering: 0,
+            ..Restored::default()
         }),
     )));
     std::fs::write(&program, "build number two").unwrap();
@@ -1776,6 +1778,128 @@ async fn announced_with_the_bypass_card(h: &Harness) {
             .all(|reply| !reply.starts_with("Test restarted")),
         "{replies:?}"
     );
+}
+
+/// Pauses (the backend saves its state) and resumes into `started` once the program
+/// file changed.
+async fn upgraded_into(h: &Harness, started: Started) {
+    let program = h.program("build one");
+    h.backend.next_prepare(Ok(prepared(0)));
+    h.pause(None).await.unwrap().unwrap();
+    h.backend.next_start(Ok(started));
+    std::fs::write(&program, "build number two").unwrap();
+    h.backend.wait_for("start", 2).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_pause_tells_the_backend_the_last_message_shown() {
+    let h = Harness::started().await;
+    h.backend.emit(BackendEvent::AgentMessage {
+        cursor: 3,
+        label: "Note".into(),
+        text: "hello".into(),
+    });
+    h.reply_containing("hello").await;
+    h.backend.next_prepare(Ok(prepared(0)));
+    h.pause(None).await.unwrap().unwrap();
+    assert_eq!(h.count("prepare drain=600000 delivered=3"), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_announcement_prefers_the_versions_coda_restored_from_and_to() {
+    let h = Harness::started().await;
+    let mut started = upgraded("coda (contract 2026-09-1)", None);
+    started.restored = Some(Restored {
+        from_version: Some("0.1.176".into()),
+        to_version: Some("0.1.177".into()),
+        ..Restored::default()
+    });
+    upgraded_into(&h, started).await;
+    h.reply_containing("Test upgraded 0.1.176 → 0.1.177: nothing to restore.")
+        .await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_announcement_drops_the_program_name_from_versions() {
+    let mut h = Harness::new();
+    h.backend
+        .next_start(Ok(upgraded("coda 0.1.176 (contract 2026-09-1)", None)));
+    h.start();
+    h.backend.wait_for("start", 1).await;
+    settle().await;
+    upgraded_into(
+        &h,
+        upgraded(
+            "coda 0.1.177 (contract 2026-09-1)",
+            Some(Restored::default()),
+        ),
+    )
+    .await;
+    h.reply_containing("Test upgraded 0.1.176 → 0.1.177: nothing to restore.")
+        .await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_saved_state_that_was_not_applied_is_announced_as_lost() {
+    let h = Harness::started().await;
+    let restored = Restored {
+        applied: false,
+        ignored_reason: Some("expired".into()),
+        ..Restored::default()
+    };
+    upgraded_into(&h, upgraded("1.1", Some(restored))).await;
+    h.reply_containing(&format!(
+        "Test upgraded 1.0 → 1.1; its saved state was not restored (expired). {LOST}"
+    ))
+    .await;
+    assert!(
+        h.replies()
+            .iter()
+            .all(|reply| !reply.contains(" restored:")),
+        "{:?}",
+        h.replies()
+    );
+}
+
+fn bypass_not_restored() -> Restored {
+    Restored {
+        settings_not_restored: vec![NotRestored {
+            name: "permissionMode".into(),
+            value: Some("bypassPermissions".into()),
+            reason: None,
+        }],
+        ..Restored::default()
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn bypass_reported_not_restored_asks_for_a_confirmation() {
+    let h = Harness::started().await;
+    upgraded_into(&h, upgraded("1.1", Some(bypass_not_restored()))).await;
+    h.card(1).await;
+    let bypass = cards::bypass_card("Test").card.expect("a card");
+    assert_eq!(h.cards()[0].1, template(&bypass));
+    h.reply_containing("Approvals were off before the upgrade")
+        .await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn bypass_known_twice_asks_for_one_confirmation() {
+    let h = Harness::started().await;
+    let program = bypassed_and_paused(&h).await;
+    h.backend
+        .next_start(Ok(upgraded("1.1", Some(bypass_not_restored()))));
+    std::fs::write(&program, "build number two").unwrap();
+    h.backend.wait_for("start", 2).await;
+    announced_with_the_bypass_card(&h).await;
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    assert_eq!(h.cards().len(), 2);
+    let asked = h
+        .replies()
+        .iter()
+        .filter(|reply| reply.starts_with("Approvals were off"))
+        .count();
+    assert_eq!(asked, 1);
 }
 
 #[tokio::test(start_paused = true)]
@@ -1941,6 +2065,13 @@ async fn a_killed_coda_with_a_missing_exe_pauses_instead_of_restarting() {
     assert_eq!(h.count("start"), 1);
     assert_eq!(h.hub.handle().status().state, Some(BridgeState::Paused));
     assert_eq!(h.pause_phase().as_deref(), Some("waiting_for_file"));
+    assert_eq!(
+        h.messenger.activities().last(),
+        Some(&(
+            ActivityState::Working,
+            Some("Waiting for Test's program".to_owned())
+        ))
+    );
     std::fs::write(&program, "build two").unwrap();
     h.backend.wait_for("start", 2).await;
     assert_eq!(h.starts()[1], h.start_call(&h.work, "session-1"));

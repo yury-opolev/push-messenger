@@ -29,6 +29,16 @@ steering}}`; `bypassPermissions` never restored (it may be named in `restored.se
 Method-not-found (`-32601`) on `prepareRestart` → fallback. Parse leniently (every field
 optional; counts may be numbers or arrays — use the array length).
 
+**Updated to the shipped protocol** (coda-cli PR #214, v0.1.177): `prepareRestart` also
+takes `deliveredCursor` (the bridge sends its last shown background-message cursor) and
+returns `interruptedRequests` and `suspendedTasks[]`; the draining refusal is **-32016**
+(-32012 is a stale epoch, refused as before); `restored` adds `applied`, `ignoredReason`,
+`fromVersion`/`toVersion`, `settingsNotRestored[{name, value?, reason}]` (approvals that
+were off show there as `permissionMode: bypassPermissions`), `interruptedRequests` and
+`tasksSuspended`; a newer restart-file format fails `initialize` with -32017 (the bridge
+initializes again without `restore`). The bridge side is described in
+[agent-bridge.md §15](../../agent-bridge.md#15-upgrade-mode).
+
 ---
 
 ## Global rules for every task

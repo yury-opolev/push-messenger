@@ -947,25 +947,40 @@ impl Harness {
         &self,
         drain: Duration,
         reason: Option<&str>,
+        delivered_cursor: Option<u64>,
     ) -> tokio::task::JoinHandle<Result<Prepared, BackendError>> {
         let backend = Arc::clone(&self.backend);
-        let reason = reason.map(str::to_owned);
-        tokio::spawn(async move { backend.prepare_restart(drain, reason.as_deref()).await })
+        let options = PrepareOptions {
+            drain,
+            reason: reason.map(str::to_owned),
+            delivered_cursor,
+        };
+        tokio::spawn(async move { backend.prepare_restart(options).await })
     }
 }
 
 #[tokio::test]
-async fn prepare_restart_sends_the_drain_and_reads_counts() {
+async fn prepare_restart_sends_the_drain_and_cursor_and_reads_counts() {
     let mut h = harness();
     let mut fake = h.running().await;
-    let prepare = h.prepare(Duration::from_secs(5), Some("upgrade"));
+    let prepare = h.prepare(Duration::from_secs(5), Some("upgrade"), Some(7));
     let (id, params) = within(fake.expect("session/prepareRestart")).await;
-    assert_eq!(params, json!({"drainTimeoutMs": 5000, "reason": "upgrade"}));
+    assert_eq!(
+        params,
+        json!({"drainTimeoutMs": 5000, "reason": "upgrade", "deliveredCursor": 7})
+    );
     fake.notify("event/lifecycle", json!({"lifecycle": "draining"}))
         .await;
     fake.respond(
         &id,
-        json!({"ok": true, "restartFile": "r.json", "drained": false, "interruptedTasks": 2}),
+        json!({
+            "ok": true,
+            "restartFile": "r.json",
+            "drained": false,
+            "interruptedTasks": 2,
+            "interruptedRequests": 1,
+            "suspendedTasks": [{"id": "a"}, {"id": "b"}, {"id": "c"}],
+        }),
     )
     .await;
     assert_eq!(
@@ -973,6 +988,8 @@ async fn prepare_restart_sends_the_drain_and_reads_counts() {
         Prepared {
             drained: false,
             interrupted_tasks: 2,
+            interrupted_requests: 1,
+            suspended_tasks: 3,
         }
     );
     h.no_event().await;
@@ -982,7 +999,7 @@ async fn prepare_restart_sends_the_drain_and_reads_counts() {
 async fn prepare_restart_counts_arrays_and_defaults_to_drained() {
     let mut h = harness();
     let mut fake = h.running().await;
-    let prepare = h.prepare(Duration::from_millis(1500), None);
+    let prepare = h.prepare(Duration::from_millis(1500), None, None);
     let (id, params) = within(fake.expect("session/prepareRestart")).await;
     assert_eq!(params, json!({"drainTimeoutMs": 1500}));
     fake.respond(
@@ -995,6 +1012,7 @@ async fn prepare_restart_counts_arrays_and_defaults_to_drained() {
         Prepared {
             drained: true,
             interrupted_tasks: 2,
+            ..Prepared::default()
         }
     );
 }
@@ -1003,7 +1021,7 @@ async fn prepare_restart_counts_arrays_and_defaults_to_drained() {
 async fn prepare_restart_on_an_older_coda_is_unsupported() {
     let mut h = harness();
     let mut fake = h.running().await;
-    let prepare = h.prepare(Duration::from_secs(1), None);
+    let prepare = h.prepare(Duration::from_secs(1), None, None);
     let (id, _) = within(fake.expect("session/prepareRestart")).await;
     fake.respond_error(&id, -32601, "method not found").await;
     let error = within(prepare).await.unwrap().unwrap_err();
@@ -1018,7 +1036,7 @@ async fn prepare_restart_on_an_older_coda_is_unsupported() {
 async fn a_refused_prepare_restart_is_refused() {
     let mut h = harness();
     let mut fake = h.running().await;
-    let prepare = h.prepare(Duration::from_secs(1), None);
+    let prepare = h.prepare(Duration::from_secs(1), None, None);
     let (id, _) = within(fake.expect("session/prepareRestart")).await;
     fake.respond(&id, json!({"ok": false, "error": "cannot save"}))
         .await;
@@ -1035,44 +1053,136 @@ async fn a_prompt_while_draining_is_restart_pending() {
     let mut fake = h.running().await;
     let prompt = h.prompt("later");
     let (id, _) = within(fake.expect("session/prompt")).await;
-    fake.respond_error(&id, -32012, "restart pending (busy draining)")
-        .await;
+    fake.respond_error(&id, -32016, "restart pending").await;
     let error = within(prompt).await.unwrap().unwrap_err();
     assert_eq!(error.kind, ErrorKind::RestartPending);
+    assert_eq!(error.code, "-32016");
+}
+
+#[tokio::test]
+async fn a_stale_epoch_is_refused_not_restart_pending() {
+    let mut h = harness();
+    let mut fake = h.running().await;
+    let prompt = h.prompt("later");
+    let (id, _) = within(fake.expect("session/prompt")).await;
+    fake.respond_error(&id, -32012, "stale epoch").await;
+    let error = within(prompt).await.unwrap().unwrap_err();
+    assert_eq!(error.kind, ErrorKind::Refused);
     assert_eq!(error.code, "-32012");
+}
+
+/// Starts session `s-1` asking for a restore; returns the start and the fake.
+async fn restoring_start(
+    h: &mut Harness,
+) -> (
+    tokio::task::JoinHandle<Result<Started, BackendError>>,
+    FakeCoda,
+) {
+    let backend = Arc::clone(&h.backend);
+    let mut start_options = options("/work/a", Some("s-1"), PermissionMode::Default);
+    start_options.restore = true;
+    let start = tokio::spawn(async move { backend.start(start_options).await });
+    let fake = within(h.fakes.recv()).await.expect("a spawn");
+    (start, fake)
 }
 
 #[tokio::test]
 async fn initialize_with_restore_asks_for_it_and_reads_what_came_back() {
     let mut h = harness();
-    let backend = Arc::clone(&h.backend);
-    let mut start_options = options("/work/a", Some("s-1"), PermissionMode::Default);
-    start_options.restore = true;
-    let start = tokio::spawn(async move { backend.start(start_options).await });
-    let mut fake = within(h.fakes.recv()).await.expect("a spawn");
+    let (start, mut fake) = restoring_start(&mut h).await;
     let (id, params) = within(fake.expect("initialize")).await;
     assert_eq!(params["restore"], true);
     assert_eq!(params["sessionId"], "s-1");
     let mut result = FakeCoda::initialize_result("s-1");
     result["restored"] = json!({
+        "applied": true,
+        "preparedAt": "2026-11-02T10:00:00Z",
+        "reason": "upgrade",
+        "fromVersion": "0.1.176",
+        "toVersion": "0.1.177",
         "schedules": 2,
         "messages": [{"cursor": 1}],
-        "settings": ["model", "goal", "bypassPermissions"],
+        "settings": ["model", "goal"],
+        "settingsNotRestored": [
+            {"name": "permissionMode", "value": "bypassPermissions", "reason": "confirm"},
+            {"name": "effort"},
+        ],
         "interruptedTasks": [{"id": "t"}],
+        "interruptedRequests": 1,
         "steering": 0,
+        "tasks": [{"id": "a"}],
+        "tasksSuspended": 2,
     });
     fake.respond(&id, result).await;
     let started = within(start).await.unwrap().unwrap();
+    let restored = started.restored.expect("restored");
+    assert_eq!(
+        restored,
+        Restored {
+            applied: true,
+            ignored_reason: None,
+            from_version: Some("0.1.176".into()),
+            to_version: Some("0.1.177".into()),
+            schedules: 2,
+            messages: 1,
+            settings: vec!["model".into(), "goal".into()],
+            settings_not_restored: vec![
+                NotRestored {
+                    name: "permissionMode".into(),
+                    value: Some("bypassPermissions".into()),
+                    reason: Some("confirm".into()),
+                },
+                NotRestored {
+                    name: "effort".into(),
+                    ..NotRestored::default()
+                },
+            ],
+            interrupted_tasks: 1,
+            interrupted_requests: 1,
+            steering: 0,
+            tasks_suspended: 2,
+        }
+    );
+    assert!(restored.bypass_not_restored());
+}
+
+#[tokio::test]
+async fn a_newer_restart_format_starts_again_without_the_restore() {
+    let mut h = harness();
+    let (start, mut fake) = restoring_start(&mut h).await;
+    let (id, params) = within(fake.expect("initialize")).await;
+    assert_eq!(params["restore"], true);
+    fake.respond_error(&id, -32017, "unsupported restart file format")
+        .await;
+    let (id, params) = within(fake.expect("initialize")).await;
+    assert!(params.get("restore").is_none(), "{params}");
+    assert_eq!(params["sessionId"], "s-1");
+    fake.respond(&id, FakeCoda::initialize_result("s-1")).await;
+    let started = within(start).await.unwrap().unwrap();
+    assert_eq!(started.session_id, "s-1");
     assert_eq!(
         started.restored,
         Some(Restored {
-            schedules: 2,
-            messages: 1,
-            settings: vec!["model".into(), "goal".into(), "bypassPermissions".into()],
-            interrupted_tasks: 1,
-            steering: 0,
+            applied: false,
+            ignored_reason: Some("unsupportedFormat".into()),
+            ..Restored::default()
         })
     );
+    assert_eq!(h.launcher.spawns().len(), 1, "the same process");
+}
+
+#[tokio::test]
+async fn a_newer_restart_format_is_an_error_without_a_restore() {
+    let mut h = harness();
+    let backend = Arc::clone(&h.backend);
+    let start_options = options("/work/a", Some("s-1"), PermissionMode::Default);
+    let start = tokio::spawn(async move { backend.start(start_options).await });
+    let mut fake = within(h.fakes.recv()).await.expect("a spawn");
+    let (id, _) = within(fake.expect("initialize")).await;
+    fake.respond_error(&id, -32017, "unsupported restart file format")
+        .await;
+    let error = within(start).await.unwrap().unwrap_err();
+    assert_eq!(error.code, "-32017");
 }
 
 #[test]
@@ -1088,10 +1198,23 @@ fn restored_is_read_leniently() {
             "settings": {"model": "x", "effort": "high"},
             "steering": [1, 2, 3],
             "schedules": "many",
+            "settingsNotRestored": ["bypassPermissions", 3, {"value": "x"}],
         }})),
         Some(Restored {
             settings: vec!["effort".into(), "model".into()],
+            settings_not_restored: vec![NotRestored {
+                name: "bypassPermissions".into(),
+                ..NotRestored::default()
+            }],
             steering: 3,
+            ..Restored::default()
+        })
+    );
+    assert_eq!(
+        restored(&json!({"restored": {"applied": false, "ignoredReason": "expired"}})),
+        Some(Restored {
+            applied: false,
+            ignored_reason: Some("expired".into()),
             ..Restored::default()
         })
     );
@@ -1103,14 +1226,15 @@ fn prepared_is_read_leniently() {
         prepared(&json!({})),
         Prepared {
             drained: true,
-            interrupted_tasks: 0,
+            ..Prepared::default()
         }
     );
     assert_eq!(
-        prepared(&json!({"drained": "no", "interruptedTasks": 3})),
+        prepared(&json!({"drained": "no", "interruptedTasks": 3, "suspendedTasks": "x"})),
         Prepared {
             drained: true,
             interrupted_tasks: 3,
+            ..Prepared::default()
         }
     );
 }
