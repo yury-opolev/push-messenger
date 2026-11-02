@@ -1408,6 +1408,24 @@ async fn shutdown_declines_open_requests_and_stops_ok() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn status_shows_the_backend_stopped_after_the_bridge_stops() {
+    let mut h = Harness::started().await;
+    h.backend.emit(BackendEvent::TaskStarted {
+        id: "t1".into(),
+        description: "build".into(),
+        background: true,
+    });
+    settle().await;
+    let running = h.hub.handle().status().backend.unwrap();
+    assert_eq!((running.running, running.running_tasks), (true, 1));
+    assert_eq!(h.stop().await, Ok(()));
+    let status = h.hub.handle().status();
+    assert_eq!(status.state, Some(BridgeState::Stopping));
+    let stopped = status.backend.unwrap();
+    assert_eq!((stopped.running, stopped.running_tasks), (false, 0));
+}
+
+#[tokio::test(start_paused = true)]
 async fn pause_and_resume_are_not_supported_yet() {
     let h = Harness::started().await;
     for action in [Action::Pause(Default::default()), Action::Resume] {

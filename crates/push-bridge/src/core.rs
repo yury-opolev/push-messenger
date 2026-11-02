@@ -509,6 +509,9 @@ impl<M: Messenger> Core<M> {
         self.update_activity(false).await;
         self.publish();
         self.backend.stop().await;
+        self.running_since = None;
+        self.running_tasks.clear();
+        self.publish();
     }
 }
 
