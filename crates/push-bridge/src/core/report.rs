@@ -34,13 +34,16 @@ fn connection_name(state: ConnectionState) -> &'static str {
 }
 
 impl<M: Messenger> Core<M> {
-    /// The bridge's state and its detail, most important first: stopping; the
-    /// messenger connection down; the backend down; a card open (the detail is its
-    /// waiting label); a turn or a slot-holding command running (no detail: tool labels
-    /// can carry paths and commands); else idle.
+    /// The bridge's state and its detail, most important first: stopping; paused for an
+    /// upgrade; the messenger connection down; the backend down; a card open (the detail
+    /// is its waiting label); a turn or a slot-holding command running (no detail: tool
+    /// labels can carry paths and commands); else idle.
     pub(super) fn bridge_state(&self) -> (BridgeState, Option<String>) {
         if self.stopping {
             return (BridgeState::Stopping, None);
+        }
+        if self.pause.is_some() {
+            return (BridgeState::Paused, self.pause_detail());
         }
         if self
             .connection
@@ -83,6 +86,13 @@ impl<M: Messenger> Core<M> {
             running_tasks: self.running_tasks.len(),
         };
         let open_requests = self.open.len();
+        let pause = self.pause_info();
+        // A count only: the held texts themselves never leave the core.
+        let held_texts = if pause.is_some() {
+            self.queued.len()
+        } else {
+            0
+        };
         self.control.update(|status| {
             status.state = Some(state);
             status.detail = detail;
@@ -93,6 +103,8 @@ impl<M: Messenger> Core<M> {
             }
             status.backend = Some(backend);
             status.open_requests = open_requests;
+            status.held_texts = held_texts;
+            status.pause = pause;
         });
     }
 

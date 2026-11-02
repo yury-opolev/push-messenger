@@ -1,6 +1,7 @@
 //! The owner's commands: the core's own (`/new`, `/cd`, `/stop`, `/status`, `/help`,
 //! `/mode bypass`, `/resume`) and the ones the backend runs; and the control channel's
-//! actions (`restart_backend`, `reconnect`, `shutdown`).
+//! actions (`restart_backend`, `reconnect`, `shutdown`, and `pause_backend` /
+//! `resume_backend`, see [`super::upgrade`]).
 
 use std::path::Path;
 
@@ -58,6 +59,13 @@ impl<M: Messenger> Core<M> {
         let ControlCall { action, reply } = call;
         tracing::info!(event = "control_action", action = action.name());
         match action {
+            Action::RestartBackend if self.pause.is_some() => answer(
+                reply,
+                Err(error(
+                    "paused",
+                    format!("{} is paused for an upgrade: resume it instead", self.name),
+                )),
+            ),
             Action::RestartBackend => {
                 let result = self.restart_by_owner().await;
                 answer(reply, result);
@@ -70,10 +78,8 @@ impl<M: Messenger> Core<M> {
                 answer(reply, Ok(json!({"stopping": true})));
                 return Flow::Stop;
             }
-            Action::Pause(_) | Action::Resume => answer(
-                reply,
-                Err(error("unsupported", "upgrade mode is not available yet")),
-            ),
+            Action::Pause(params) => self.pause_backend(params, reply).await,
+            Action::Resume => self.resume_backend(reply).await,
         }
         Flow::Continue
     }
@@ -118,6 +124,9 @@ impl<M: Messenger> Core<M> {
     }
 
     pub(super) async fn command(&mut self, command: Command) {
+        if !self.allowed_while_paused(&command) {
+            return;
+        }
         if let Some(capability) = needs(&command) {
             if !self.has(capability) {
                 self.reply(&format!("Not supported by {}.", self.name));
@@ -278,7 +287,7 @@ impl<M: Messenger> Core<M> {
     pub(super) async fn new_session(&mut self) {
         let mode = self.options.default_mode;
         match self
-            .start_session(self.folder.clone(), None, mode, false)
+            .start_session(self.folder.clone(), None, mode, false, false)
             .await
         {
             Ok(started) => {
@@ -317,7 +326,7 @@ impl<M: Messenger> Core<M> {
             mode => mode,
         };
         match self
-            .start_session(folder.clone(), stored.clone(), mode, true)
+            .start_session(folder.clone(), stored.clone(), mode, true, false)
             .await
         {
             Ok(started) => {
@@ -339,7 +348,13 @@ impl<M: Messenger> Core<M> {
 
     async fn resume(&mut self, id: &str) {
         match self
-            .start_session(self.folder.clone(), Some(id.to_owned()), self.mode, false)
+            .start_session(
+                self.folder.clone(),
+                Some(id.to_owned()),
+                self.mode,
+                false,
+                false,
+            )
             .await
         {
             Ok(started) => {

@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use push_sdk::ClientMsgId;
 use tokio::time::Instant;
 
+use super::upgrade::lost_sentence;
 use super::{Core, Turn, folder_key};
 use crate::backend::{
     BackendError, BackendEvent, Capability, ErrorKind, PermissionMode, StartOptions, Started,
@@ -144,12 +145,17 @@ impl<M: Messenger> Core<M> {
             self.new_session().await;
         }
         self.send_queued();
+        self.release_when_idle().await;
     }
 
     /// The owner's texts that waited for the turn (or a slot-holding command) to end, as
-    /// one prompt.
+    /// one prompt; while paused they wait for the backend to be back.
     pub(super) fn send_queued(&mut self) {
-        if self.turn.is_none() && self.slot_commands == 0 && !self.queued.is_empty() {
+        if self.pause.is_none()
+            && self.turn.is_none()
+            && self.slot_commands == 0
+            && !self.queued.is_empty()
+        {
             let text = std::mem::take(&mut self.queued).join("\n\n");
             self.prompt(text, 0);
         }
@@ -248,17 +254,19 @@ impl<M: Messenger> Core<M> {
         let _ = self.start_or_retry(announce).await;
     }
 
-    /// Starts the current folder's stored session; on failure, retries with backoff.
-    /// With `announce`, a success says how the backend came back ("<name> <announce>.")
-    /// and what that lost.
+    /// Starts the current folder's stored session; on failure, retries with backoff
+    /// (or waits for the backend's program, see [`Self::retry_start`]). With `announce`,
+    /// a success says how the backend came back ("<name> <announce>.") and what that
+    /// lost.
     pub(super) async fn start_or_retry(
         &mut self,
         announce: Option<&str>,
     ) -> Result<(), BackendError> {
         let stored = self.stored_session(&self.folder.clone());
         let folder = self.folder.clone();
+        let restore = self.restore_next;
         match self
-            .start_session(folder.clone(), stored, self.mode, true)
+            .start_session(folder.clone(), stored, self.mode, true, restore)
             .await
         {
             Ok(started) => {
@@ -274,21 +282,44 @@ impl<M: Messenger> Core<M> {
                 Ok(())
             }
             Err(error) => {
-                tracing::warn!(event = "backend_start_failed", code = error.code.as_str());
-                self.report_error(&error);
-                if !std::mem::replace(&mut self.start_failing, true) {
-                    self.reply(&format!("{error}; retrying."));
-                }
-                self.announce_restart = announce.is_some();
-                self.schedule_restart();
+                self.retry_start(&error, announce);
                 Err(error)
             }
         }
     }
 
-    /// "<name> <how>." (such as "restarted") and what the restart lost, by the
-    /// backend's capabilities.
-    fn restarted_note(&self, how: &str) -> String {
+    /// A start failed: it is said once and retried after the backoff; when the
+    /// backend's program is missing or in use, the bridge waits for it instead (a
+    /// pause, see [`super::upgrade`]).
+    pub(super) fn retry_start(&mut self, error: &BackendError, announce: Option<&str>) {
+        tracing::warn!(event = "backend_start_failed", code = error.code.as_str());
+        self.report_error(error);
+        let first = !std::mem::replace(&mut self.start_failing, true);
+        if self.program_unusable() {
+            if first {
+                self.reply(&self.program_unusable_note());
+            }
+            self.wait_for_program();
+            return;
+        }
+        if first {
+            self.reply(&format!("{error}; retrying."));
+        }
+        self.announce_restart = announce.is_some();
+        self.schedule_restart();
+    }
+
+    /// "(<name> stopped and its program is missing or in use; waiting for it to come
+    /// back)".
+    fn program_unusable_note(&self) -> String {
+        format!(
+            "({} stopped and its program is missing or in use; waiting for it to come back)",
+            self.name
+        )
+    }
+
+    /// What a restart without a restore loses, by the backend's capabilities.
+    pub(super) fn lost_items(&self) -> Vec<&'static str> {
         let mut lost = Vec::new();
         if self.has(Capability::AgentMessages) {
             lost.push("undelivered background messages");
@@ -296,16 +327,15 @@ impl<M: Messenger> Core<M> {
         if self.has(Capability::Schedules) {
             lost.push("in-memory schedules");
         }
+        lost
+    }
+
+    /// "<name> <how>." (such as "restarted") and what the restart lost.
+    fn restarted_note(&self, how: &str) -> String {
         let mut note = format!("{} {how}.", self.name);
-        if !lost.is_empty() {
-            let lost = lost.join(" and ");
-            let mut chars = lost.chars();
-            let first = chars.next().map(|c| c.to_uppercase().to_string());
-            note.push_str(&format!(
-                " {}{} were lost.",
-                first.unwrap_or_default(),
-                chars.as_str()
-            ));
+        if let Some(lost) = lost_sentence(&self.lost_items()) {
+            note.push(' ');
+            note.push_str(&lost);
         }
         note
     }
@@ -320,11 +350,22 @@ impl<M: Messenger> Core<M> {
     }
 
     /// The backend stopped: the reply says so, its cards close, and it restarts after
-    /// the backoff.
+    /// the backoff, or, when its program is missing or in use, once that is back.
+    /// While draining for a pause it counts as released.
     async fn exited(&mut self) {
         tracing::warn!(event = "backend_exited");
+        if self.pause.is_some() {
+            return self.exited_while_paused().await;
+        }
+        let declined = format!("Declined: {} stopped.", self.name);
+        if self.program_unusable() {
+            self.backend_gone(&self.program_unusable_note(), &declined);
+            self.wait_for_program();
+            self.update_activity(false).await;
+            return;
+        }
         let note = format!("({} stopped; restarting)", self.name);
-        self.backend_gone(&note, &format!("Declined: {} stopped.", self.name));
+        self.backend_gone(&note, &declined);
         let now = Instant::now();
         if self
             .running_since
@@ -342,15 +383,27 @@ impl<M: Messenger> Core<M> {
     /// `note` (else `note` is a reply), its requests are declined saying `declined`, and
     /// a `/new` that waited for the turn makes the next start a new session.
     pub(super) fn backend_gone(&mut self, note: &str, declined: &str) {
-        match self.turn.take() {
-            Some(mut turn) => {
-                turn.renderer.note(note);
-                let updates = turn.renderer.finish(false);
-                self.apply(&mut turn.pages, updates);
-                self.report_turn_ended(true);
-            }
-            None => self.reply(note),
+        if !self.cut_turn(note) {
+            self.reply(note);
         }
+        self.backend_requests_gone(declined);
+    }
+
+    /// Ends the running turn with `note`; `false` when none runs.
+    pub(super) fn cut_turn(&mut self, note: &str) -> bool {
+        let Some(mut turn) = self.turn.take() else {
+            return false;
+        };
+        turn.renderer.note(note);
+        let updates = turn.renderer.finish(false);
+        self.apply(&mut turn.pages, updates);
+        self.report_turn_ended(true);
+        true
+    }
+
+    /// The backend's requests are declined saying `declined`, its tasks are gone, and a
+    /// `/new` that waited for the turn makes the next start a new session.
+    pub(super) fn backend_requests_gone(&mut self, declined: &str) {
         self.close_backend_requests(declined);
         self.running_tasks.clear();
         if std::mem::take(&mut self.new_after_turn) {
@@ -368,19 +421,21 @@ impl<M: Messenger> Core<M> {
     }
 
     /// Starts `session` in `folder`; with `fall_back`, an unknown session starts a new
-    /// one (ids never move between folders).
+    /// one (ids never move between folders). With `restore`, the backend restores the
+    /// state it saved before a planned restart.
     pub(super) async fn start_session(
         &self,
         folder: PathBuf,
         session: Option<String>,
         mode: PermissionMode,
         fall_back: bool,
+        restore: bool,
     ) -> Result<Started, BackendError> {
         let options = StartOptions {
             folder,
             session,
             permission_mode: mode,
-            restore: false,
+            restore,
         };
         match self.backend.start(options.clone()).await {
             Err(error)
@@ -423,6 +478,7 @@ impl<M: Messenger> Core<M> {
         self.version = started.version;
         self.running_since = Some(Instant::now());
         self.running_tasks.clear();
+        self.restore_next = false;
         if same_engine {
             self.fetch_pending().await;
         }

@@ -7,6 +7,7 @@ mod conversation;
 mod report;
 mod requests;
 mod turns;
+mod upgrade;
 
 #[cfg(test)]
 mod tests;
@@ -26,7 +27,7 @@ use tokio::time::{Instant, MissedTickBehavior};
 
 use crate::backend::{
     Backend, BackendCommand, BackendError, BackendEvent, Capability, CommandReply, PermissionMode,
-    Responder, TextFormat,
+    Prepared, Responder, TextFormat,
 };
 use crate::backoff::Backoff;
 use crate::cards::CardKind;
@@ -238,6 +239,11 @@ enum Internal {
         session: Option<String>,
         result: Result<CommandReply, BackendError>,
     },
+    /// `prepare_restart` answered for the pause with this id.
+    Prepared {
+        pause: u64,
+        result: Result<Prepared, BackendError>,
+    },
 }
 
 /// The running turn's reply.
@@ -336,6 +342,14 @@ struct Core<M: Messenger> {
     announce_restart: bool,
     /// The last start failed (its error was shown once).
     start_failing: bool,
+
+    /// Upgrade mode: the backend is paused (see [`upgrade`]).
+    pause: Option<upgrade::Pause>,
+    /// Pauses so far (each one's id).
+    pauses: u64,
+    /// The backend saved its state for a restart that did not happen: the next start
+    /// of the current session restores it.
+    restore_next: bool,
 }
 
 impl<M: Messenger> Core<M> {
@@ -387,6 +401,9 @@ impl<M: Messenger> Core<M> {
             restart_at: None,
             announce_restart: false,
             start_failing: false,
+            pause: None,
+            pauses: 0,
+            restore_next: false,
         }
     }
 
@@ -444,13 +461,15 @@ impl<M: Messenger> Core<M> {
         }
     }
 
-    /// Waiting while a card is open, working while a turn runs, else idle.
+    /// Waiting while a card is open, working while paused or a turn runs, else idle.
     fn wanted_activity(&self) -> (ActivityState, Option<String>) {
         if let Some(request) = self.open.first() {
             (
                 ActivityState::Waiting,
                 Some(request.waiting_label.to_owned()),
             )
+        } else if self.pause.is_some() {
+            (ActivityState::Working, Some(self.pause_label()))
         } else if let Some(turn) = &self.turn {
             (ActivityState::Working, Some(turn.renderer.current_label()))
         } else {
@@ -474,13 +493,16 @@ impl<M: Messenger> Core<M> {
             } => {
                 self.commanded(command, &folder, session.as_deref(), result);
                 self.send_queued();
+                self.release_when_idle().await;
             }
+            Internal::Prepared { pause, result } => self.prepared(pause, result).await,
         }
     }
 
     async fn on_tick(&mut self) {
         self.poll_turn();
         self.expire_requests().await;
+        self.watch_pause().await;
         self.update_activity(false).await;
     }
 
@@ -488,6 +510,7 @@ impl<M: Messenger> Core<M> {
     /// once), the activity and the backend.
     async fn close(&mut self) {
         self.stopping = true;
+        self.end_pause_at_close();
         self.publish();
         if let Some(mut turn) = self.turn.take() {
             turn.renderer.note("(The bridge stopped.)");

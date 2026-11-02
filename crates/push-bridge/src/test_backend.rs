@@ -39,6 +39,8 @@ struct Script {
     capabilities: BTreeSet<Capability>,
     starts: VecDeque<Result<Started, BackendError>>,
     prepares: VecDeque<Result<Prepared, BackendError>>,
+    /// The next prepares wait for these before they return.
+    prepare_holds: VecDeque<oneshot::Receiver<()>>,
     executable: Option<PathBuf>,
     prompts: VecDeque<Result<(), BackendError>>,
     steers: VecDeque<Result<SteerOutcome, BackendError>>,
@@ -71,6 +73,7 @@ impl TestBackend {
                 capabilities: ALL_CAPABILITIES.into_iter().collect(),
                 starts: VecDeque::new(),
                 prepares: VecDeque::new(),
+                prepare_holds: VecDeque::new(),
                 executable: None,
                 prompts: VecDeque::new(),
                 steers: VecDeque::new(),
@@ -120,6 +123,14 @@ impl TestBackend {
     /// [`ErrorKind::Unsupported`].
     pub fn next_prepare(&self, result: Result<Prepared, BackendError>) {
         self.lock().prepares.push_back(result);
+    }
+
+    /// The next `prepare_restart` (recorded at once) returns only once the sender is used
+    /// or dropped; its result is taken then.
+    pub fn hold_next_prepare(&self) -> oneshot::Sender<()> {
+        let (release, hold) = oneshot::channel();
+        self.lock().prepare_holds.push_back(hold);
+        release
     }
 
     /// The program file [`Backend::executable`] reports.
@@ -338,6 +349,10 @@ impl Backend for TestBackend {
         _reason: Option<&str>,
     ) -> Result<Prepared, BackendError> {
         self.record(format!("prepare drain={}", drain.as_millis()));
+        let hold = self.lock().prepare_holds.pop_front();
+        if let Some(hold) = hold {
+            let _ = hold.await;
+        }
         self.lock()
             .prepares
             .pop_front()
