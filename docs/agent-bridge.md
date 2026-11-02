@@ -270,11 +270,16 @@ push-agent-bridge [--dir <folder>] <command>
 | `enroll --code <code>` | enrolls with the owner's one-time code and registers this device |
 | `run` | runs the bridge until Ctrl-C (what the logon task runs) |
 | `status` | prints the configuration path (and what is wrong with it), the key and its thumbprint, the agent user, the device, the folder, the sessions per folder and the log's path; no secrets |
+| `pause [--reason <text>] [--drain-timeout <seconds>]` | asks the running bridge (through its control channel) to pause Coda for an upgrade: Coda finishes its work (600 s at most by default), saves its state and is stopped; prints "Coda is paused; its program is released." once its program can be replaced. The bridge starts Coda again with its state once the program file changed, and holds the owner's texts meanwhile |
+| `resume` | asks the running bridge to start the paused Coda now (its program must be usable), or cancels a pause that is still draining |
 | `help`, `--help`, `-h` | prints the usage |
 
 `--dir` may come anywhere; `--dir=<folder>` and `--code=<code>` work too. `keygen`,
 `thumbprint` and `status` read `config.json` without validating it; `enroll` and `run`
-validate it first. `enroll` and `run` write the log; the others print only.
+validate it first. `enroll` and `run` write the log; the others print only. `pause` and
+`resume` fail with exit code 1 when no bridge runs for the folder ("The bridge in <dir> is
+not running (no control channel).") or when the bridge refuses (the message and its code,
+such as `not_paused` or `exe_unavailable`).
 
 | Exit code | Meaning |
 |---|---|

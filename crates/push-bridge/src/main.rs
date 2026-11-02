@@ -2,6 +2,7 @@
 //! private agent contact. A console program: the logon task runs it in the background.
 
 mod cli;
+mod remote;
 mod signer;
 
 use std::path::{Path, PathBuf};
@@ -18,18 +19,27 @@ use push_bridge::logging;
 use push_bridge::messenger::{EVENT_QUEUE, Reconnect, SdkMessenger};
 use push_bridge::state::{self, BridgeSecretStore, StateFile};
 use push_bridge_control::transport::Listener;
-use push_bridge_control::{BridgeState, Event as ControlEvent, endpoint, instance_id};
+use push_bridge_control::{
+    BridgeState, Call, ErrorBody, Event as ControlEvent, PauseParams, endpoint, instance_id,
+};
 use push_sdk::{Client, Event, Events, Platform, SdkError};
 use serde_json::json;
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 
 use crate::cli::{Cli, Command, USAGE};
+use crate::remote::RemoteError;
 use crate::signer::{KeyError, open_key};
 
 /// A new sign-in after the server signed the agent out waits at least this long after the
 /// one before.
 const SIGN_IN_INTERVAL: Duration = Duration::from_secs(30);
+/// How long the backend may drain when `pause` does not say.
+const DEFAULT_DRAIN_SECONDS: u64 = 600;
+/// `pause` waits this much longer than the drain for the bridge's answer.
+const PAUSE_GRACE: Duration = Duration::from_secs(120);
+/// How long `resume` waits for the bridge's answer.
+const RESUME_TIMEOUT: Duration = Duration::from_secs(30);
 
 const ENROLL_HINT: &str = "This agent is not enrolled: run `push-agent-bridge enroll --code <code>` with a code from the agents page.";
 
@@ -108,6 +118,11 @@ async fn main() -> ExitCode {
         Command::Status => status(&dir),
         Command::Enroll { code } => enroll(&dir, &code).await,
         Command::Run => run(&dir).await,
+        Command::Pause {
+            reason,
+            drain_timeout,
+        } => pause(&dir, reason, drain_timeout).await,
+        Command::Resume => resume(&dir).await,
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -190,6 +205,75 @@ fn status(dir: &Path) -> Result<(), Failure> {
         }
     }
     println!("Log:           {}", logging::path(dir).display());
+    Ok(())
+}
+
+/// The control channel could not be used.
+fn remote_failure(dir: &Path, error: RemoteError) -> Failure {
+    match error {
+        RemoteError::NotRunning => Failure::general(format!(
+            "The bridge in {} is not running (no control channel).",
+            dir.display()
+        )),
+        RemoteError::Timeout => Failure::general("The bridge did not answer in time."),
+        RemoteError::Broken(reason) => {
+            Failure::general(format!("The control channel failed: {reason}"))
+        }
+    }
+}
+
+/// The bridge refused a request.
+fn refused(error: ErrorBody) -> Failure {
+    Failure::general(format!("{} ({})", error.message, error.code))
+}
+
+/// Asks the running bridge to pause its backend for an upgrade and waits until the
+/// backend's program is released.
+async fn pause(
+    dir: &Path,
+    reason: Option<String>,
+    drain_timeout: Option<u64>,
+) -> Result<(), Failure> {
+    let mut remote = remote::connect(dir)
+        .await
+        .map_err(|error| remote_failure(dir, error))?;
+    let name = remote
+        .backend_name()
+        .await
+        .unwrap_or_else(|| "The agent".to_owned());
+    let drain = Duration::from_secs(drain_timeout.unwrap_or(DEFAULT_DRAIN_SECONDS));
+    let params = PauseParams {
+        reason,
+        drain_timeout_ms: drain_timeout.map(|seconds| seconds.saturating_mul(1000)),
+    };
+    let result = remote
+        .call(Call::PauseBackend(params), drain + PAUSE_GRACE)
+        .await
+        .map_err(|error| remote_failure(dir, error))?;
+    result.map_err(refused)?;
+    println!("{name} is paused; its program is released.");
+    Ok(())
+}
+
+/// Asks the running bridge to start its paused backend again now.
+async fn resume(dir: &Path) -> Result<(), Failure> {
+    let mut remote = remote::connect(dir)
+        .await
+        .map_err(|error| remote_failure(dir, error))?;
+    let name = remote
+        .backend_name()
+        .await
+        .unwrap_or_else(|| "The agent".to_owned());
+    let result = remote
+        .call(Call::ResumeBackend, RESUME_TIMEOUT)
+        .await
+        .map_err(|error| remote_failure(dir, error))?
+        .map_err(refused)?;
+    if result.get("cancelled") == Some(&json!(true)) {
+        println!("The pause was cancelled; {name} keeps running.");
+    } else {
+        println!("{name} is resuming.");
+    }
     Ok(())
 }
 
