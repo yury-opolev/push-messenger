@@ -6,6 +6,34 @@ Notable changes for consumers of push-messenger. Newest first.
 
 ### Added
 
+- **Agent bridge control channel**: every `push-agent-bridge run` serves a local,
+  per-user channel of newline-delimited JSON (Windows: the named pipe
+  `\\.\pipe\push-agent-bridge-<instance id>` with a user-and-SYSTEM DACL and a peer SID
+  check both ways; Unix: a 0600 socket under `$XDG_RUNTIME_DIR`): `hello`, content-free
+  events (`state_changed`, turns, requests opened and closed, errors), `status`, and the
+  actions `restart_backend` (restart Coda, the chat stays connected), `reconnect`,
+  `shutdown` (open cards declined: "Declined: the bridge was stopped."), `pause_backend`
+  and `resume_backend`. `"control": false` turns it off. New crate `push-bridge-control`.
+  Guide: [docs/agent-bridge.md](docs/agent-bridge.md#14-control-channel-for-other-tools).
+- **Agent bridge upgrade mode**: `pause_backend` lets Coda drain and save its state
+  (`session/prepareRestart`, a fallback for Coda without it), stops it so its program can be
+  replaced, holds the owner's texts, watches the program file and starts Coda again with
+  `restore` once it changed, announcing what came back ("Coda upgraded 0.1.176 → 0.1.177:
+  2 schedules, 1 message and the model/goal restored; …") and asking again to turn
+  approvals off. A Coda that stops while its program is missing or locked waits for it
+  instead of burning restarts. CLI: `push-agent-bridge pause [--reason <text>]
+  [--drain-timeout <seconds>]` and `resume`, so `push-agent-bridge pause; dotnet tool update
+  -g coda; push-agent-bridge resume` upgrades Coda without losing the chat. Guide:
+  [docs/agent-bridge.md](docs/agent-bridge.md#15-upgrade-mode).
+- **push-agent-tray**: a Tauri v2 tray app (`apps/push-agent-tray`, Windows first) that
+  supervises the user's bridges in place of the Scheduled Task: an icon coloured by the most
+  urgent agent's state, a menu per agent (Start, Stop, Restart Coda, Reconnect, Pause Coda
+  for upgrade, Resume, Open log, Open folder, Details…), restarts with backoff (giving up
+  after 5 exits in 10 minutes; exit 2 is "Not set up"), "Start at logon" through the
+  `HKCU\…\Run` key, `tray.json`, and a switch-over from the Scheduled Task (never both).
+  Strict CSP, bundled page only, no permissions for the details window, no network
+  listener. Its testable logic is the new crate `push-tray-core`. Guide:
+  [docs/agent-bridge.md](docs/agent-bridge.md#13-the-tray-app-push-agent-tray).
 - **Safe Markdown in templates**: a tpl/1 `markdown` block (`{"type": "markdown", "param":
   "<multiline string>"}`, no literal, no label) whose value the server checks against a
   CommonMark subset: paragraphs, emphasis, strikethrough, code spans, fenced and indented

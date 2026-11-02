@@ -4,7 +4,8 @@ The tray app that supervises the `push-agent-bridge` instances on this machine: 
 icon whose colour shows the most urgent agent's state, a menu per agent (start, stop,
 restart Coda, reconnect, pause for an upgrade, resume, log, folder, details), its own
 start at logon, and the switch-over from Scheduled Tasks. Everything testable lives in
-[`crates/push-tray-core`](../../crates/push-tray-core); this is the Tauri v2 shell.
+[`crates/push-tray-core`](../../crates/push-tray-core); this is the Tauri v2 shell. The
+guide: [docs/agent-bridge.md](../../docs/agent-bridge.md#13-the-tray-app-push-agent-tray).
 
 ## Build
 

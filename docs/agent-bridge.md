@@ -21,12 +21,22 @@ and the plan differ, this guide describes what the code does.
 - [10. Files](#10-files)
 - [11. Troubleshooting](#11-troubleshooting)
 - [12. Live smoke test](#12-live-smoke-test-opt-in)
+- [13. The tray app (push-agent-tray)](#13-the-tray-app-push-agent-tray)
+- [14. Control channel (for other tools)](#14-control-channel-for-other-tools)
+- [15. Upgrade mode](#15-upgrade-mode)
+- [16. Linux plan](#16-linux-plan)
+- [17. Manual smoke test on Windows](#17-manual-smoke-test-on-windows)
+
+Design of the tray, the control channel and upgrade mode: the plan
+[2026-11-02-agent-tray-upgrade-mode](superpowers/plans/2026-11-02-agent-tray-upgrade-mode.md);
+here too, this guide describes what the code does.
 
 ## 1. Overview
 
 | | |
 |---|---|
-| What runs | one `push-agent-bridge.exe run` per agent, as the logged-on user, started at logon by a Scheduled Task |
+| What runs | one `push-agent-bridge.exe run` per agent, as the logged-on user, started at logon by a Scheduled Task or by the [tray app](#13-the-tray-app-push-agent-tray) (never both) |
+| Local control | each bridge serves a per-user [control channel](#14-control-channel-for-other-tools) (a named pipe): states and counts out, `restart_backend`, `reconnect`, `shutdown`, `pause_backend` and `resume_backend` in; never message content |
 | Identity | an owned agent signed in with [agent-key](agent-key-sign-in.md): a non-exportable P-256 key in the TPM (or the software key storage provider) |
 | Who may use it | only the agent's owner (`owner_user_id` of the agent's own profile); anyone else gets "This agent is private." |
 | The agent | `coda serve` over stdio (JSON-RPC 2.0 with Content-Length framing), started and restarted by the bridge |
@@ -101,6 +111,14 @@ including a fake `coda serve` for the Coda backend.
 3. Build the backend for that kind in `main.rs`, where `CodaBackend::new` is built today.
 4. Test it against the core with the core's tests as a model.
 
+**The control channel** (crate `push-bridge-control`: the wire protocol, the endpoint names
+and the per-user transport) is served by `push_bridge::control::ControlHub`: the core
+publishes its state and content-free events into it and takes the channel's actions from
+it. **`push-tray-core`** holds everything the tray app does that can be tested without a
+UI (states, icons, restart policy, `tray.json`, start at logon, Scheduled Tasks, the
+supervisor and the menu model); **`apps/push-agent-tray`** is the Tauri v2 shell around
+it, a Cargo workspace of its own outside the root one.
+
 ## 3. Requirements
 
 - Windows 10 or 11, or a Windows 365 Cloud PC (no managed identity needed). A TPM 2.0 is
@@ -147,7 +165,8 @@ Create `%LOCALAPPDATA%\push-messenger\coda-bridge\config.json`. Every field:
   "default_folder": "C:\\src\\app",
   "default_permission_mode": "default",
   "backend": "coda",
-  "coda": { "exe": "C:\\Tools\\coda\\coda.exe", "args": [] }
+  "coda": { "exe": "C:\\Tools\\coda\\coda.exe", "args": [] },
+  "control": true
 }
 ```
 
@@ -167,6 +186,7 @@ Create `%LOCALAPPDATA%\push-messenger\coda-bridge\config.json`. Every field:
 | `backend` | yes | `coda`, the only backend | |
 | `coda.exe` | with `coda` | the path to `coda.exe` (a bare name is looked up on `PATH`) | |
 | `coda.args` | no | extra arguments after `serve`, as a list | `[]` |
+| `control` | no | serve the local [control channel](#14-control-channel-for-other-tools) (the tray's status and actions, `pause`, `resume`); `false` turns it off, and the bridge works as without it (the tray then cannot see or reach it) | `true` |
 
 Unknown fields are refused (a typo is an error, not ignored), and a UTF-8 byte order mark
 as Notepad writes it is fine. In JSON, double every backslash. `push-agent-bridge status`
@@ -215,6 +235,11 @@ device and stores the agent's user id and device id in `state.json`. Then check 
 If they differ, delete the agent and start again.
 
 ### 6. Install the logon task
+
+Either install the Scheduled Task below, or use the [tray app](#13-the-tray-app-push-agent-tray)
+instead: it starts the bridges at logon itself, shows their state and restarts them. Never
+both for the same folder: the tray detects a task that runs one of its folders, does not
+start that bridge itself, and offers to switch over ([details](#scheduled-tasks-and-the-switch-over)).
 
 ```powershell
 & .\crates\push-bridge\scripts\install.ps1 -Exe C:\Tools\push-agent-bridge.exe
@@ -270,20 +295,24 @@ push-agent-bridge [--dir <folder>] <command>
 | `enroll --code <code>` | enrolls with the owner's one-time code and registers this device |
 | `run` | runs the bridge until Ctrl-C (what the logon task runs) |
 | `status` | prints the configuration path (and what is wrong with it), the key and its thumbprint, the agent user, the device, the folder, the sessions per folder and the log's path; no secrets |
-| `pause [--reason <text>] [--drain-timeout <seconds>]` | asks the running bridge (through its control channel) to pause Coda for an upgrade: Coda finishes its work (600 s at most by default), saves its state and is stopped; prints "Coda is paused; its program is released." once its program can be replaced. The bridge starts Coda again with its state once the program file changed, and holds the owner's texts meanwhile |
-| `resume` | asks the running bridge to start the paused Coda now (its program must be usable), or cancels a pause that is still draining |
+| `pause [--reason <text>] [--drain-timeout <seconds>]` | asks the running bridge (through its [control channel](#14-control-channel-for-other-tools)) to [pause Coda for an upgrade](#15-upgrade-mode): Coda finishes its work (600 s at most by default), saves its state and is stopped; prints "Coda is paused; its program is released." once its program can be replaced. The bridge starts Coda again with its state once the program file changed, and holds the owner's texts meanwhile |
+| `resume` | asks the running bridge to start the paused Coda now (its program must be usable) and prints "Coda is resuming."; a pause that is still draining is cancelled instead: "The pause was cancelled; Coda keeps running." |
 | `help`, `--help`, `-h` | prints the usage |
 
-`--dir` may come anywhere; `--dir=<folder>` and `--code=<code>` work too. `keygen`,
-`thumbprint` and `status` read `config.json` without validating it; `enroll` and `run`
-validate it first. `enroll` and `run` write the log; the others print only. `pause` and
-`resume` fail with exit code 1 when no bridge runs for the folder ("The bridge in <dir> is
-not running (no control channel).") or when the bridge refuses (the message and its code,
-such as `not_paused` or `exe_unavailable`).
+`--dir` may come anywhere; `--dir=<folder>`, `--code=<code>`, `--reason=<text>` and
+`--drain-timeout=<seconds>` work too. `keygen`, `thumbprint` and `status` read
+`config.json` without validating it; `enroll` and `run` validate it first. `enroll` and
+`run` write the log; the others print only. `pause` and `resume` find the bridge by its
+folder (the `--dir`), name the backend as the bridge's status does ("The agent" while the
+bridge is still signing in), and fail with exit code 1 when no bridge runs for the folder
+("The bridge in <dir> is not running (no control channel)."), when it does not answer in
+time ("The bridge did not answer in time."; `pause` waits the drain timeout plus 120 s,
+`resume` 30 s), or when the bridge refuses (its message and code, such as "Coda is not
+paused (not_paused)", `exe_unavailable`, or `unavailable` while it signs in).
 
 | Exit code | Meaning |
 |---|---|
-| 0 | done (`run`: stopped by Ctrl-C) |
+| 0 | done (`run`: stopped by Ctrl-C or by a `shutdown` on the control channel, such as the tray's Stop) |
 | 1 | failed: a bad command line, an unreadable or invalid `config.json` or `state.json`, a wrong, expired or spent enrollment code (`enrollment_invalid`), another refused sign-in or enrollment (for example `identity_in_use`, `rate_limited`, the network), the account is not an owned agent, the device was removed, or the bridge's data was opened elsewhere |
 | 2 | not set up: no key (`run keygen first`), not enrolled (`run push-agent-bridge enroll --code <code>`), or the server does not accept the key (`token_invalid`: enroll again) |
 | 3 | the key provider failed: the message carries its code, such as `NTE_BAD_KEYSET (0x80090016)`, never key material |
@@ -390,7 +419,18 @@ stopped."), and Coda is started again after 1 s, then 2 s, 4 s, … up to 60 s b
 attempts (the backoff starts over once Coda has run for 60 s). After a restart the bridge
 resumes the session and replies "Coda restarted. Undelivered background messages and
 in-memory schedules were lost." A start that fails is reported once ("… ; retrying.") and
-retried with the same backoff.
+retried with the same backoff. When Coda stops (or fails to start) while its program file
+(`coda.exe`) is missing or in use, as during an upgrade, the bridge says "(Coda stopped
+and its program is missing or in use; waiting for it to come back)" and waits for the file
+instead of spending restarts ([upgrade mode](#15-upgrade-mode)). The owner can also
+restart Coda at once from the tray (Restart Coda): "(Coda is restarting: the owner
+asked)", open requests "Declined: Coda restarted.", then "Coda restarted by the owner."
+with what was lost; the chat connection is untouched.
+
+**Stopping the bridge.** On Ctrl-C or a `shutdown` request (the tray's Stop), a running
+turn ends with "(The bridge stopped.)", open requests are declined and the owner hears
+"Declined: the bridge was stopped." once, the activity goes idle and Coda is stopped. The
+device stays enrolled: the next `run` signs in again with a fresh assertion.
 
 **Strangers.** Text and cards from anyone but the owner, in any conversation, get the plain
 text "This agent is private." at most once per sender per hour; nothing they send reaches
@@ -440,6 +480,9 @@ was declined."
 Only the owner's commands run. Arguments are checked; a bad one is answered with the usage
 line (`Usage: /effort <low|medium|high|xhigh|max|auto>`). Command names are case-sensitive:
 `/NEW` goes to Coda as a prompt. Results come back as masked `agent.reply@1` text (plain, never Markdown).
+While Coda is [paused for an upgrade](#15-upgrade-mode), only `/status` and `/help` run;
+every other command (Coda's own included) is answered "Coda is paused for an upgrade; try
+again when it is back."
 
 | Command | Effect |
 |---|---|
@@ -483,6 +526,7 @@ restarts."
 | Credentials in Coda's hands | The bridge never sets `CODA_SERVE_API_KEY` (an LLM credential in Coda's engine) and removes it from Coda's environment; stdio needs no key |
 | Logs | Names, codes, counts and durations only: never message bodies, previews, plans, typed answers, tokens or assertions |
 | Secrets at rest | Tokens stay in memory; the SDK's database is in memory; `state.json` holds ids only |
+| Another local user drives the bridge | The [control channel](#access-rules) is a local pipe whose DACL admits only the user and SYSTEM, and each side checks the other's user SID (Unix: a 0600 socket in a 0700 folder and a peer uid check); it carries states, counts, names and error codes only, never message content; `"control": false` turns it off |
 
 **Masking.** Previews, plans, step labels, thinking, text, command results, background
 messages and questions are masked before they leave the machine. Each match becomes
@@ -535,7 +579,15 @@ the folder. Log events include `started`, `signed_in`, `bridge_started`, `turn_s
 `turn_ended`, `request_opened`, `card_answered`, `answer_refused`, `card_expired`,
 `stranger_refused`, `command` (its name only), `backend_exited`,
 `backend_restart_scheduled` (`delay_ms`), `backend_start_failed`, `session_not_found`,
-`sign_in_failed`, `signed_out`, `send_failed` and `exit` (`code`).
+`sign_in_failed`, `signed_out`, `send_failed` and `exit` (`code`). The control channel
+and upgrade mode add `control_listening` (`instance`), `control_unavailable` (`reason` or
+`kind`), `control_request` and `control_action` (the method), `control_peer_refused`,
+`pause_started` (`drain_ms`), `backend_prepared`, `prepare_unsupported`, `pause_failed`,
+`backend_released`, `program_changed`, `backend_resuming` (`restore`),
+`pause_cancelled`, `backend_program_unusable` and `backend_restart_by_owner`.
+
+The tray keeps `tray.json` outside the bridge folders
+([location](#trayjson)).
 
 ## 11. Troubleshooting
 
@@ -548,7 +600,8 @@ the folder. Log events include `started`, `signed_in`, `bridge_started`, `turn_s
 | Exit 1, "Sign-in failed: … identity_in_use" | The key is already bound to a live agent: it is enrolled, so just `run` (or install the task) |
 | Exit 3, "The key provider failed: NTE_…" | CNG refused; the code says why, for example `NTE_DEVICE_NOT_READY` or `NTE_PERM` (TPM busy, locked out by too many failures, or policy), `NTE_BAD_KEYSET`/`NTE_NOT_FOUND` (the key was deleted), `NTE_SILENT_CONTEXT` (the provider wanted a UI). Check `Get-Tpm`, wait for a TPM lockout to end, run as the user who created the key (keys are per user) |
 | `Key storage: Microsoft Software Key Storage Provider` | The TPM is missing, disabled or cannot create P-256 keys. The key still cannot be exported. To move to the TPM later, fix the TPM, delete the agent and the key (`uninstall.ps1 -DeleteKey`), and enroll again |
-| "spawn failed (spawn): cannot start Coda: …; retrying." | Coda is not at the path in `coda.exe` (or a bare name is not on the user's `PATH`). Fix `config.json`; the bridge keeps retrying with backoff meanwhile |
+| "(Coda stopped and its program is missing or in use; waiting for it to come back)" | `coda.exe` is not at the path in `coda.exe` (or a bare name is not on the user's `PATH`), or an installer holds it. The bridge waits (state paused, phase `waiting_for_file`) and starts Coda once the file is there and unchanged for 2 s; fix `config.json` if the path is wrong. `push-agent-bridge resume` starts it at once when the file is usable |
+| "spawn failed (spawn): cannot start Coda: …; retrying." | The file is there but cannot be started. The bridge keeps retrying with backoff meanwhile |
 | "initialize failed (…)" or Coda restarting again and again | Coda starts but fails: its stderr is discarded, so run `coda serve --cwd <folder>` by hand in that folder to see why (sign-in, model configuration, MCP servers). Restarts wait 1 s, 2 s, … up to 60 s |
 | "Coda stayed busy; this was not delivered, send it again" | Coda reported busy for 30 s with no turn to wait for (a compaction or maintenance). Send the text again; `/status` shows the state |
 | "Wait until the turn ends." | `/cd`, `/resume`, `/compact` and `/fork` need an idle agent: `/stop` first, or wait |
@@ -559,6 +612,11 @@ the folder. Log events include `started`, `signed_in`, `bridge_started`, `turn_s
 | "The bridge stopped: this device was removed" (exit 1) | The device was revoked (the agent was deleted, or its devices revoked); the task restarts it and sign-in tells what is wrong |
 | A console window shows | The task runs without `conhost --headless` (no `conhost.exe`, or an old task): reinstall with `install.ps1 -Force`. Closing that window stops the bridge until the task restarts it |
 | More detail | Set `PUSH_BRIDGE_LOG=debug` for the user and restart the task; the log never holds bodies or tokens |
+| "The bridge in <dir> is not running (no control channel)." | No bridge serves that folder's control channel: it is not running, `--dir` names another folder, `"control": false`, or the bridge could not bind its pipe (the log says `control_unavailable`; `kind` `AddrInUse` means another bridge already serves that folder) |
+| The tray shows an agent red with "Not set up: run keygen and enroll" | The bridge exited with code 2: run `keygen` and `enroll` for that folder, then Start it from the tray |
+| The tray shows "stopped after 5 failures (exit N)" | The bridge exited 5 times within 10 minutes; Open log from its menu, fix the cause, then Start |
+| The tray shows "running (Scheduled Task)" | The tray did not start that process (a Scheduled Task, a console, or an earlier tray process did). Stop asks it to shut down through the control channel; Quit leaves it running; the tray never restarts it |
+| "Coda is paused for an upgrade; try again when it is back." | Upgrade mode: wait for the upgrade, or `push-agent-bridge resume` |
 
 ## 12. Live smoke test (opt-in)
 
@@ -578,3 +636,654 @@ owner's app. Use a scratch root folder.
 5. **Check that a stranger gets the fixed reply.** From another account, message the
    agent: it answers "This agent is private." once, and nothing reaches Coda (the log shows
    `stranger_refused`).
+
+## 13. The tray app (push-agent-tray)
+
+`push-agent-tray` is a small Tauri v2 app (Windows first; [Linux later](#16-linux-plan))
+that supervises the bridge instances of the logged-on user: a tray icon whose colour shows
+the most urgent agent's state, a native menu with a submenu per agent, a small details
+window per agent and notifications. It replaces the Scheduled Task as the way the bridges
+start at logon. Everything it decides lives in the crate `push-tray-core` (tested on every
+platform); `apps/push-agent-tray` is the shell around it.
+
+It runs once per user: a second launch exits and leaves the running one alone. At start it
+reads [`tray.json`](#trayjson), looks for [Scheduled Tasks](#scheduled-tasks-and-the-switch-over)
+that run its folders, and then, for every folder marked `autostart` that no task runs,
+first connects to the folder's [control channel](#14-control-channel-for-other-tools): a
+bridge that already answers is only shown (the tray did not start it), else the tray starts
+`push-agent-bridge.exe --dir <folder> run` from its own folder, with no window and no
+console input or output (the bridge logs to its folder). It keeps a control connection to
+each bridge (retried every 0.5 s for 30 s after a start, then every 10 s), follows its
+events, and asks for its status every 10 s.
+
+### What it shows
+
+The icon is a filled circle in the colour of the most urgent agent ("worst wins": the
+first row below that applies to any agent); with no agents it is green.
+
+| Icon | Colour | Agent states (menu label) | From the bridge's state |
+|---|---|---|---|
+| error | red `#d13438` | "stopped", "failed (exit N), retrying in S s", "stopped after 5 failures (exit N)", "Not set up: run keygen and enroll" | none: the bridge is not running |
+| disconnected | grey `#8c8c8c` | "starting", "disconnected, reconnecting", "Coda restarting", "stopping" | `starting`, `reconnecting`, `restarting`, `stopping` |
+| waiting for you | amber `#e8a317` | "waiting for you (approval needed)", "… (question)", "… (plan approval)" | `waiting` with its detail |
+| paused | purple `#8a5cd1` | "paused for an upgrade" | `paused` |
+| busy | blue `#2f6fdf` | "working" | `working` |
+| normal | green `#2e9d4f` | "connected, idle"; "running (Scheduled Task)" | `idle` (the second label when the tray did not start the process) |
+
+A stopped agent is red, so stopping one agent turns the icon red. The tooltip has a line
+per agent, "`<name>: <label>`" (for example "Coda on Devbox (coda-devbox): waiting for
+you (approval needed)"), cut at 127 characters with "…"; without agents it reads
+"push-agent-tray" and "No agents". An agent's name is "`<display name> (<handle>)`" once
+its bridge has signed in, else its folder's name.
+
+### The menu
+
+The menu opens with a left or a right click. From the top: a line "tray.json: <error>"
+when [`tray.json`](#trayjson) could not be read; a submenu per agent ("No agents" when
+there are none); "Add agent folder…"; the check item "Start at logon"; "Switch from
+Scheduled Task to tray…" when [offered](#scheduled-tasks-and-the-switch-over); "Quit".
+
+Each agent's submenu shows its state label, "Folder: <folder>" and "Session: <session id
+or none>", then:
+
+| Item | Does | Enabled when |
+|---|---|---|
+| Start | starts the bridge (or runs its Scheduled Task); starts the failure count over | stopped, failed, stopped after 5 failures, not set up |
+| Stop | [stops](#stop-and-quit) the bridge gracefully | running (any running state, also one the tray did not start) or failed (cancels the pending restart) |
+| Restart Coda | `restart_backend`: Coda is stopped and started again at once; the chat stays connected | the control channel is connected (not while stopping) |
+| Reconnect | `reconnect`: the bridge signs in again and reconnects; Coda is untouched | the same |
+| Pause Coda for upgrade | `pause_backend` with the reason "paused from the tray" and the default drain ([upgrade mode](#15-upgrade-mode)) | the same, and not paused |
+| Resume | `resume_backend` | the same, and paused |
+| Open log | opens `<folder>\logs\bridge.log` (says so when there is none yet) | always |
+| Open folder | opens the folder in Explorer | always |
+| Details… | the agent's details window | always |
+
+An agent whose bridge exited with code 2 shows "Not set up: run keygen and enroll"; only
+Start, Open folder and Details… are enabled. A refused action is not a dialog: its error
+shows as the last error in Details.
+
+The details window ("<name> — details", 420 × 520) shows the state, folder, session,
+Coda's version, running tasks, the last error (the tray's own, else the bridge's error
+code), the last exit code, and the last 50 states with their times, newest first. It
+refreshes every 2 s. Closing it does not quit the tray.
+
+### Start at logon
+
+The check item writes the value `push-agent-tray` under
+`HKCU\Software\Microsoft\Windows\CurrentVersion\Run` (with `reg.exe`), with the data
+`"<path to push-agent-tray.exe>" --autostart`; clearing it deletes the value. Per user, no
+admin rights. `--autostart` changes nothing: whenever the tray starts, it starts the
+folders marked `autostart`. Toggling the item starts or stops no bridge. On Linux the same
+item writes the XDG autostart entry `$XDG_CONFIG_HOME/autostart/push-agent-tray.desktop`
+(default `~/.config/autostart`), see the [Linux plan](#16-linux-plan).
+
+### tray.json
+
+The folders the tray supervises: `%LOCALAPPDATA%\push-messenger\tray.json` on Windows,
+`$XDG_CONFIG_HOME/push-messenger/tray.json` (default `~/.config/push-messenger/tray.json`)
+on Linux.
+
+```json
+{
+  "version": 1,
+  "instances": [
+    { "dir": "C:\\Users\\me\\AppData\\Local\\push-messenger\\coda-bridge", "autostart": true },
+    { "dir": "C:\\Users\\me\\AppData\\Local\\push-messenger\\coda-bridge-docs", "autostart": false }
+  ]
+}
+```
+
+| Field | Meaning | Default |
+|---|---|---|
+| `version` | must be `1` | `1` |
+| `instances[].dir` | a bridge folder (the bridge's `--dir`) | |
+| `instances[].autostart` | start it when the tray starts | `true` |
+
+Unknown fields are refused; a byte order mark is fine; a missing file means no folders.
+Two entries for the same folder (by [instance id](#endpoints): case, `/` and a trailing
+separator do not matter on Windows) count once.
+
+- **The default folder** `%LOCALAPPDATA%\push-messenger\coda-bridge` is added by itself
+  (with `autostart`) when it holds a `config.json` and is not listed yet, and the file is
+  saved.
+- **"Add agent folder…"** opens a folder picker. The folder must hold `config.json` ("<folder>
+  is not a bridge folder: it has no config.json"); one already listed is refused ("… is
+  already in the tray."). It is added with `autostart` and started (unless a Scheduled Task
+  runs it).
+- The tray writes the file atomically (`tray.json.tmp`, then renamed over it). To remove a
+  folder or turn its `autostart` off, edit the file while the tray is not running.
+- A file that cannot be read or parsed (or has another `version`) is never overwritten:
+  the menu's first line shows the error, the default folder is still supervised, and "Add
+  agent folder…" and the switch-over refuse until the file is fixed (or deleted) and the
+  tray restarted.
+
+### Scheduled Tasks and the switch-over
+
+At start the tray (Windows) lists the Scheduled Tasks with `Get-ScheduledTask` (through
+`powershell.exe`, no window) and finds those whose action runs `push-agent-bridge(.exe)`,
+directly or as `conhost.exe --headless "<exe>"` (what `install.ps1` registers), with the
+command `run` and `--dir "<folder>"`, `--dir=<folder>` or no `--dir` (the default folder).
+A task is matched to a `tray.json` folder by instance id. The tray never starts a bridge
+that a task runs (never both): it does not start it at logon, it only connects to it (an
+idle one shows "running (Scheduled Task)"), Start runs the task (`Start-ScheduledTask`) and
+Stop asks the bridge to shut down.
+
+While such a task exists, the menu offers "Switch from Scheduled Task to tray…". After the
+confirmation ("Stop and remove the Scheduled Task(s) <names>, start push-agent-tray at
+logon, and run these agents under the tray instead?", Switch or Cancel) the tray:
+
+1. stops each task (`Stop-ScheduledTask`; this is not the graceful Stop, so cards open at
+   that moment are not declined) and removes it (`Unregister-ScheduledTask
+   -Confirm:$false`), each addressed by its Task Scheduler folder and name;
+2. turns its own "Start at logon" on;
+3. marks each switched folder `autostart` in `tray.json` (adding it if absent; folders added
+   meanwhile are kept) and saves it;
+4. starts each switched bridge under the tray once the task's bridge is gone (it waits up
+   to 15 s).
+
+It stops at the first failure and says so: a task that could not be stopped or removed
+leaves "Start at logon" off and `tray.json` unchanged, so a folder never ends up started by
+both. Tasks for folders not in `tray.json` are not touched.
+
+### Restarts and failures
+
+When a bridge the tray started exits without a Stop (whatever its exit code, 0 included),
+the tray starts it again after a delay:
+
+| Rule | Value |
+|---|---|
+| Delay | 1 s, then 2 s, 4 s, … up to 60 s; a run of 60 s or more starts the delay over; shown as "failed (exit N), retrying in S s" |
+| Giving up | at the 5th exit within 10 minutes: "stopped after 5 failures (exit N)" and the notification "<name> stopped after 5 failures (exit N). Open its log from the tray menu." |
+| Exit code 2 (no key, not enrolled, key not accepted) | never retried: "Not set up: run keygen and enroll" and the notification "<name> is not set up: run keygen and enroll." |
+| A bridge that cannot be started (no `push-agent-bridge.exe` next to the tray) | counts as an exit |
+| Start | forgets the exits and starts the delay over |
+
+Coda's own restarts happen inside the bridge (its [backoff](#6-behaviour)) and show as
+"Coda restarting"; they do not count here. A bridge the tray did not start is never
+restarted by it; when it goes away it shows "stopped".
+
+### Stop and Quit
+
+**Stop** sends `shutdown` over the control channel. The bridge ends a running turn with
+"(The bridge stopped.)", declines the open requests and tells the owner once "Declined: the
+bridge was stopped.", stops Coda and exits with 0; the device stays enrolled and the next
+Start signs in again. For a bridge the tray started, the tray waits up to 5 s for the
+answer and then 20 s for the exit before it kills the process; one it cannot reach over
+the control channel is killed at once (no graceful decline then). A stopped bridge is not
+restarted.
+
+**Quit** stops (as above, all at once) only the bridges this tray process started, waits
+for them to exit, and leaves the others running (a Scheduled Task's, one started in a
+console, or one an earlier tray process started: the bridges are not tied to the tray's
+life, so after a tray crash they keep running and the next tray only shows them).
+
+### What it never does
+
+The tray never runs `keygen` or `enroll`, never touches keys, tokens, `config.json` or
+`state.json`, and never sees message content: the control channel carries states, counts,
+names and error codes only, and so do its menu, tooltip, details window and
+notifications. It changes Scheduled Tasks only in a switch-over the user confirmed.
+
+### Security
+
+- No network listener: the tray is only a client of the bridges' local, per-user [control
+  channels](#access-rules).
+- The details window loads only the page bundled into the exe at build time (`dist/`), no
+  remote content, under this CSP (`tauri.conf.json`):
+
+  ```text
+  default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src ipc: http://ipc.localhost; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'
+  ```
+
+- The details windows (`details-*`) are granted no IPC permissions at all
+  (`capabilities/default.json` has `"permissions": []`: no core or plugin command such as
+  tray, menu, window or event), and the global Tauri API is off. They reach the app only
+  through its one `details` command, which answers for the window's own agent with
+  content-free fields; the page renders with `textContent`, never HTML.
+- Helper programs run without a shell, with full paths under `%SystemRoot%` where they are
+  Windows tools (`reg.exe`, `powershell.exe` with `-EncodedCommand`, `explorer.exe`), and
+  without windows.
+
+### Install (per user, no admin rights)
+
+Copy `push-agent-tray.exe` next to `push-agent-bridge.exe` (for example into `C:\Tools`):
+the tray starts the bridge from its own folder. Run it, check that the agents show, and
+turn on "Start at logon". Remove the bridges' Scheduled Tasks first, or let the tray's
+switch-over do it. `tauri.conf.json` also describes an MSI (`cargo tauri build`, with the
+Tauri CLI); it installs per machine (admin rights) and `push-agent-bridge.exe` would still
+have to be placed next to the installed exe, so the portable exe is the supported way.
+
+### Build
+
+```powershell
+cargo build --manifest-path apps/push-agent-tray/Cargo.toml --release
+```
+
+The exe is `apps/push-agent-tray/target/release/push-agent-tray.exe`. The app is its own
+Cargo workspace (excluded from the root one, so Tauri stays out of the root lockfile and
+MSRV); no Tauri CLI and no Node are needed. It needs the WebView2 runtime, part of Windows
+10 and 11, for the details window. CI builds it on Windows (job `tray-windows`).
+
+**Signed builds:** not yet. The exe is unsigned, so SmartScreen may warn on first run;
+code signing is a follow-up.
+
+## 14. Control channel (for other tools)
+
+Every `push-agent-bridge run` serves a local control channel: the tray uses it, `pause` and
+`resume` use it, and other tools of the same user may too. It is newline-delimited JSON
+over a named pipe (Windows) or a Unix socket.
+
+### Endpoints
+
+| Platform | Endpoint |
+|---|---|
+| Windows | the named pipe `\\.\pipe\push-agent-bridge-<instance id>` |
+| Linux and other Unix | the socket `$XDG_RUNTIME_DIR/push-agent-bridge/<instance id>.sock`; without an absolute `$XDG_RUNTIME_DIR` there is no control channel (the log says `control_unavailable`, `reason` `no_runtime_dir`) |
+
+The **instance id** names a bridge by its folder: the first 8 bytes (16 lowercase hex
+characters) of the SHA-256 of the normalized folder path, as UTF-8. Normalized means: the
+real path (`std::fs::canonicalize`: symlinks and junctions resolved; for a folder that does
+not exist the absolute path, else the path as given), as a string; on Windows with `/`
+replaced by `\`, a leading `\\?\` removed (`\\?\UNC\` becomes `\\`) and in lowercase; on
+Unix with its case kept; without trailing separators. So
+`C:\Users\Me\AppData\Local\push-messenger\coda-bridge\` and
+`c:/users/me/appdata/local/push-messenger/coda-bridge` are the same instance. The bridge
+logs its id (`control_listening`, `instance`).
+
+### Access rules
+
+- **Windows.** The pipe is created as the first instance of its name (a pipe that already
+  exists, another bridge on the same folder or a squatter, makes the bind fail), rejects
+  remote clients, and has the protected DACL `D:P(A;;GA;;;<user SID>)(A;;GA;;;SY)`: the
+  user and SYSTEM only. The bridge checks each client's process user SID
+  (`GetNamedPipeClientProcessId`) and drops any that is not the user's or SYSTEM's (logged
+  as `control_peer_refused`); a client checks the server the same way
+  (`GetNamedPipeServerProcessId`) and refuses a server of another user.
+- **Unix.** The socket's folder `$XDG_RUNTIME_DIR/push-agent-bridge` is created with mode
+  0700; an existing one must be a folder owned by the owner of `$XDG_RUNTIME_DIR` with no
+  group or other bits, else the bind fails. A stale socket file is replaced only when
+  nobody answers on it; the socket is made 0600 and removed when the bridge exits. Both
+  sides check the peer's uid (the socket's peer credentials) against the owner of
+  `$XDG_RUNTIME_DIR`.
+
+When the bind fails, the bridge logs `control_unavailable` with the error's kind and runs
+on without a control channel.
+
+**Turning it off:** `"control": false` in `config.json`. The bridge then opens no endpoint
+and behaves as before; the tray cannot see it (an autostart folder would be started again
+by the tray, so do not list such a folder in `tray.json`), and `pause`/`resume` say it is
+not running.
+
+### Lines
+
+One JSON object per line, UTF-8, ended by `\n` (a `\r` before it is ignored, blank lines
+are skipped), at most 64 KiB (65,536 bytes) without the newline: a longer line closes the
+connection. Right after connecting, the bridge sends `hello` and then a `state_changed`
+with the current state. A client sends requests; the bridge answers each with a response
+carrying the request's `id`, and sends events as things happen. A client may send several
+requests without waiting: `status` is answered at once, the others when done, each with
+its `id`.
+
+```text
+request   {"id": <u64>, "method": "<method>", "params": {…}}       params optional (absent, null or {})
+response  {"id": <u64>, "ok": true,  "result": {…}}
+          {"id": <u64>, "ok": false, "error": {"code": "<code>", "message": "<text>"}}
+event     {"event": "<name>", …fields, "at": <unix ms>}
+```
+
+A line that is not a request gets `bad_request` (with the request's `id` when it could be
+read, else `id` 0) and the connection stays; an unknown method gets `unknown_method`.
+
+### Requests
+
+| Method | Params | Result | Errors (`code`) |
+|---|---|---|---|
+| `status` | none | the [status object](#the-status-object) | `internal` (cannot happen in practice) |
+| `restart_backend` | none | `{"restarted": true}`: Coda was stopped and started again at once (no backoff); what ran is cut and declined ("Declined: Coda restarted."); the chat connection is untouched | `paused` (resume instead), `start_failed` (the start failed; the bridge retries with its backoff), `unavailable`, `timeout` |
+| `reconnect` | none | `{"reconnected": true}`: signed in again with a fresh assertion and reconnected; Coda is untouched. While the bridge waits to sign in again, it signs in at once | the SDK's error code (such as `network`), `timeout` |
+| `shutdown` | none | `{"stopping": true}`, then the bridge [stops](#stop-and-quit) and exits with 0 | `timeout` |
+| `pause_backend` | `reason` (string, trimmed, at most 100 characters kept), `drainTimeoutMs` (default 600,000) | at the release: `{"state": "paused", "prepared": <bool>, "drained": <bool>, "interruptedTasks": <n>}`; already released: at once `{"state": "paused", "phase": "<phase>"}` ([upgrade mode](#15-upgrade-mode)) | `prepare_failed`, `cancelled` (a `resume_backend` cancelled the drain), `stopping` (the bridge stopped meanwhile), `unavailable`, `timeout` |
+| `resume_backend` | none | `{"resumed": true}`; a draining pause is cancelled: `{"resumed": true, "cancelled": true}` | `not_paused`, `exe_unavailable` ("coda.exe is missing or in use"), `unavailable`, `timeout` |
+
+`unavailable` ("the bridge is signing in") answers every action but `shutdown` and
+`reconnect` while the bridge signs in or waits to sign in again. `timeout` is the hub's own
+limit: 30 s for an action, 15 minutes for `pause_backend`; the action may still finish
+afterwards. So a `pause_backend` whose drain (plus Coda's 60 s to save) takes longer than
+15 minutes is answered `timeout` while the pause goes on; `status` shows how it ends.
+
+### Events
+
+| Event | Fields | When |
+|---|---|---|
+| `hello` | `protocol` (1), `bridge` (its version), `pid`, `instance` | first line of every connection |
+| `state_changed` | `state`, `detail` (only when there is one) | the state or its detail changed; second line of every connection |
+| `turn_started` | `source`: `prompt` or `engine` | a turn starts |
+| `turn_ended` | `interrupted` | a turn ends |
+| `request_opened` | `kind`: `permission`, `question`, `plan` or `bypass`; `open`: the open requests now | a card opens |
+| `request_closed` | `kind`; `outcome`: `answered`, `declined` or `expired`; `open` | a card is answered, declined or expires |
+| `error` | `code` (Coda's JSON-RPC code or the bridge's, such as `-32603`, `exited`, `spawn`, `timeout`), `method` (such as `session/prompt`, `initialize`) | a Coda call failed |
+
+States, from the most important: `stopping`; `paused` (detail "upgrading Coda", or
+"waiting for Coda's program"); `reconnecting` (the messenger connection is down, or the
+bridge waits to sign in again); `restarting` (Coda is not running); `waiting` (a card is
+open; detail "approval needed", "question" or "plan approval"); `working` (a turn,
+`/compact` or `/fork` runs; no detail, since tool labels can hold paths and commands);
+`idle`. `starting` until the bridge has signed in and started Coda. A slow client that
+falls more than 256 events behind skips the missed ones.
+
+### The status object
+
+Field names are camelCase; absent values are `null`.
+
+| Field | Meaning |
+|---|---|
+| `protocol` | 1 |
+| `instance` | the instance id |
+| `pid` | the bridge's process id |
+| `bridgeVersion` | the bridge's version |
+| `state`, `detail` | as in `state_changed` |
+| `agent` | `{displayName, handle}` once signed in |
+| `connection` | `connected`, `connecting`, `reconnecting`, `offline`, `signed_out`, `device_removed` or `opened_elsewhere` |
+| `folder` | Coda's current folder |
+| `session` | Coda's session id |
+| `backend` | `{name, version, running, runningTasks}`: "Coda", Coda's `serverInfo` as it reports it, whether it runs, its running background tasks |
+| `openRequests` | open cards |
+| `heldTexts` | the owner's texts held during a pause (a count) |
+| `pause` | `{phase, reason, since}` while paused: `phase` is `draining`, `released`, `waiting_for_file` or `resuming`; `since` in Unix ms |
+| `lastError` | `{code, at}` of the last failed Coda call |
+| `startedAt` | when the bridge started, Unix ms |
+
+### Limits
+
+| | |
+|---|---|
+| Line length | 64 KiB; longer closes the connection |
+| Connections | 8 at once per bridge; more are closed at once (no `hello`) |
+| Action timeout | 30 s (`pause_backend`: 15 minutes) |
+| Events a connection may fall behind | 256 (then skipped) |
+
+### Example session
+
+`→` is the client, `←` the bridge (times shortened).
+
+```text
+← {"event":"hello","protocol":1,"bridge":"0.1.0","pid":4242,"instance":"2612a5f44f292114","at":1793660033911}
+← {"event":"state_changed","state":"idle","at":1793660033911}
+→ {"id":1,"method":"status"}
+← {"id":1,"ok":true,"result":{"agent":{"displayName":"Coda on Devbox","handle":"coda-devbox"},"backend":{"name":"Coda","runningTasks":0,"running":true,"version":"0.1.176"},"bridgeVersion":"0.1.0","connection":"connected","detail":null,"folder":"C:\\src\\app","heldTexts":0,"instance":"2612a5f44f292114","lastError":null,"openRequests":0,"pause":null,"pid":4242,"protocol":1,"session":"0b9c…","startedAt":1793659000000,"state":"idle"}}
+← {"event":"turn_started","source":"prompt","at":1793660040100}
+← {"event":"state_changed","state":"working","at":1793660040100}
+← {"event":"request_opened","kind":"permission","open":1,"at":1793660043500}
+← {"event":"state_changed","state":"waiting","detail":"approval needed","at":1793660043500}
+← {"event":"request_closed","kind":"permission","outcome":"answered","open":0,"at":1793660051200}
+← {"event":"state_changed","state":"working","at":1793660051200}
+← {"event":"turn_ended","interrupted":false,"at":1793660060000}
+← {"event":"state_changed","state":"idle","at":1793660060000}
+→ {"id":2,"method":"resume_backend"}
+← {"id":2,"ok":false,"error":{"code":"not_paused","message":"Coda is not paused"}}
+```
+
+### From PowerShell
+
+The instance id of a folder (an existing folder reached through a junction or symlink
+needs its real path; `Get-ChildItem \\.\pipe\ | Where-Object Name -like
+'push-agent-bridge-*'` lists the bridges' pipes), then `status`:
+
+```powershell
+$dir  = "$env:LOCALAPPDATA\push-messenger\coda-bridge"
+$full = [IO.Path]::GetFullPath($dir).TrimEnd('\').ToLowerInvariant()
+$hash = [Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes($full))
+$id   = -join ($hash[0..7] | ForEach-Object { $_.ToString('x2') })
+$pipe = [IO.Pipes.NamedPipeClientStream]::new('.', "push-agent-bridge-$id", [IO.Pipes.PipeDirection]::InOut)
+$pipe.Connect(5000)
+$reader = [IO.StreamReader]::new($pipe)
+$writer = [IO.StreamWriter]::new($pipe)
+$writer.AutoFlush = $true
+$reader.ReadLine()                                  # hello
+$writer.WriteLine('{"id":1,"method":"status"}')
+do { $line = $reader.ReadLine() } until ($line -like '{"id":1,*')
+$line | ConvertFrom-Json
+$pipe.Dispose()
+```
+
+### Guarantees
+
+- Content-free: no message bodies, previews, plans, answers, tool targets or labels,
+  thinking, tokens, keys or enrollment codes, in events, in the status or in the bridge's
+  logs about the channel; only states, counts, names (the agent's display name and handle,
+  the backend's name and version, the folder, the session id) and error codes.
+- Per user: only the same user (or SYSTEM) can connect, and clients can check that the
+  bridge is the user's too.
+- Every request gets exactly one response with its `id`; `hello` and the current state
+  always come first.
+- The protocol version is 1; a later version may add fields, events and methods, which
+  clients should ignore.
+
+## 15. Upgrade mode
+
+Upgrade mode lets Coda's program be replaced (`dotnet tool update -g coda`, say) while the
+bridge keeps the chat: Coda finishes its work and saves its state, is stopped so that its
+files are free, and starts again with its state once the program changed. The owner's
+texts meanwhile are held and sent afterwards. It is started with `pause_backend` (the
+tray's "Pause Coda for upgrade", or `push-agent-bridge pause`).
+
+### The steps
+
+1. **Pause.** `pause_backend {reason?, drainTimeoutMs?}` (default 600,000 ms; the reason
+   trimmed and cut to 100 characters). The state becomes `paused` (detail "upgrading
+   Coda", phase `draining`), and the owner's activity shows working "Paused: upgrading
+   Coda" (waiting while a card is open). From now on:
+   - text that would go to Coda is held; the first held text of a pause is answered
+     "Coda is being upgraded; your messages will be sent when it is back." (once);
+   - commands other than `/status` and `/help` (Coda's own included) are answered "Coda is
+     paused for an upgrade; try again when it is back.";
+   - answers to open cards, by card or typed, still count;
+   - a prompt Coda refuses with -32012 (restart pending) is held too.
+
+   A second `pause_backend` while draining waits for the same release; once released it
+   is answered at once with `{"state": "paused", "phase": "<phase>"}`. When Coda is not
+   running at that moment (it is restarting), it is released at once.
+2. **Drain.** The bridge calls Coda's `session/prepareRestart {drainTimeoutMs, reason?}`
+   (it waits up to the drain timeout plus 60 s). Meanwhile turns, cards and answers go on.
+   Coda's answer releases it. A Coda without that method (-32601) gets the
+   [fallback](#older-coda-fallback). Any other error ends the pause: the callers get
+   `prepare_failed` ("session/prepareRestart failed (<code>)"), the owner hears "Pausing
+   Coda failed: session/prepareRestart failed (<code>): <message>", and the held texts are
+   sent. If Coda exits while draining, it counts as released.
+3. **Release.** The bridge fingerprints Coda's program file (its path, length,
+   modification time and, on Windows, its file version), notes Coda's version and whether
+   approvals were off (`/mode bypass`), ends a turn still running with "(Coda paused for
+   an upgrade)", declines Coda's open requests ("Declined: Coda is being upgraded."), and
+   stops Coda, which frees its files; a pending restart is cancelled. The `pause_backend`
+   callers get `{"state": "paused", "prepared": <prepareRestart succeeded>, "drained": <the
+   work finished first>, "interruptedTasks": <n>}`; `pause` prints "Coda is paused; its
+   program is released." The phase is `released`.
+4. **Watch.** Every 2 s the bridge looks at the program file (`coda.exe` as configured, a
+   bare name through `PATH` and `PATHEXT`). It resumes once the file is usable (it exists,
+   can be opened for reading and is not empty), differs from the fingerprint at the
+   release, and looked the same at two looks in a row (so a file still being written is
+   not taken). A missing or locked file just waits. `resume_backend` resumes at once
+   instead.
+5. **Resume.** The phase is `resuming`. The bridge starts the folder's stored session,
+   with `restore: true` when `prepareRestart` succeeded, in `default_permission_mode` when
+   approvals were off (else in the current mode). Then it tells the owner how Coda came
+   back:
+   - with Coda's `restored`: "Coda upgraded 0.1.176 → 0.1.177: 2 schedules, 1 message and
+     the model/goal restored; 1 interrupted task reported to Coda." The head is "Coda
+     upgraded <before> → <after>" when both versions are known and differ, "Coda upgraded
+     to <after>" when only the new one is, else "Coda restarted"; the items are "N
+     schedule(s)", "N message(s)" and "the <settings joined by />" (without
+     `bypassPermissions` and `permissionMode`), joined "a, b and c" + " restored", or
+     "nothing to restore"; then "; N interrupted task(s) reported to Coda" when there are
+     any; then ".". "Before" is the version Coda reported before the pause (else the
+     program's file version then); "after" is the version Coda reports now, or the new
+     file version when it reports none or the same one;
+   - without `restored`: the head, then what was lost, e.g. "Coda upgraded 0.1.176 →
+     0.1.177. Undelivered background messages and in-memory schedules were lost.";
+   - when approvals were off: "Approvals were off before the upgrade; confirm to turn them
+     off again." and a new "Turn off approvals?" card.
+
+   Then the pause ends, the state is published, and the held texts go to Coda as one prompt
+   (separated by blank lines). A failed start is reported once ("… ; retrying.") and retried
+   with the normal backoff (or waits for the program, below); the start that finally works
+   still restores, announces and asks for the confirmation.
+
+### The Coda contract
+
+| Call | Bridge sends | Bridge reads |
+|---|---|---|
+| `session/prepareRestart` | `{"drainTimeoutMs": <ms>, "reason"?: "<text>"}` | `drained` (default `true`), `interruptedTasks` (a number or a list: its length; default 0); `ok: false` is a refusal; error -32601: not supported ([fallback](#older-coda-fallback)) |
+| any call while draining | | error -32012 "restart pending": a prompt is held |
+| `event/lifecycle` | | `{"lifecycle": "draining"}` and the like: logged at debug, otherwise ignored |
+| `initialize` | as always, plus `"restore": true` after a successful `prepareRestart` | `restored`: `schedules`, `messages`, `interruptedTasks`, `steering` (each a number or a list: its length; missing: 0), `settings` (a list of names, or of objects with `name`, or an object whose keys are the names); `restored: true` means restored with nothing to list; absent or anything else: no restore |
+
+Every field is optional and parsed leniently. `bypassPermissions` is never restored: the
+bridge starts Coda in the default mode and asks the owner to confirm with a new card, and
+never names `bypassPermissions` or `permissionMode` among the restored settings.
+
+### Older Coda (fallback)
+
+When Coda answers `session/prepareRestart` with -32601, the bridge waits until no turn and
+no `/compact` or `/fork` runs, or until the drain timeout, whichever comes first (a turn
+still running then is cut with "(Coda paused for an upgrade)" and `drained` is `false`),
+then releases Coda as above (`prepared: false`). The restart starts Coda without
+`restore`, and the announcement lists what was lost: "Coda upgraded 0.1.176 → 0.1.177.
+Undelivered background messages and in-memory schedules were lost." (or "Coda restarted.
+…" when the version did not change or is unknown).
+
+### Coda stops while its program is missing or locked
+
+When Coda exits on its own, or a start fails, and its program file is missing or cannot be
+opened (an installer that replaces it, or a wrong `coda.exe`), the bridge does not burn its
+restarts: it says "(Coda stopped and its program is missing or in use; waiting for it to
+come back)" (as the end of the running turn's reply, else as a reply), declines open
+requests ("Declined: Coda stopped."), and pauses with phase `waiting_for_file` (detail
+"waiting for Coda's program", reason "Coda's program is missing or in use"). Held texts
+and commands work as in a pause. Once the file is usable and looked the same twice, 2 s
+apart, Coda starts again, without `restore` (nothing was saved), and the owner hears the
+announcement with what was lost. `resume_backend` starts it at once when the file is
+usable, else answers `exe_unavailable`.
+
+### resume_backend
+
+| Phase | `resume_backend` |
+|---|---|
+| not paused | error `not_paused` ("Coda is not paused") |
+| `draining` | cancels the pause: Coda keeps running, the held texts are sent, waiting `pause_backend` callers get `cancelled`; answer `{"resumed": true, "cancelled": true}`. If Coda had already saved its state, its next start restores it |
+| `released`, `waiting_for_file` | when the program file is usable (changed or not): starts Coda now ([step 5](#the-steps)), answer `{"resumed": true}`; else error `exe_unavailable` ("coda.exe is missing or in use") |
+| `resuming` | `{"resumed": true}` |
+
+`restart_backend` is refused while paused (`paused`): resume instead.
+
+### From the command line
+
+```text
+push-agent-bridge [--dir <folder>] pause [--reason <text>] [--drain-timeout <seconds>]
+push-agent-bridge [--dir <folder>] resume
+```
+
+| Command | Prints (exit 0) | Fails (exit 1) |
+|---|---|---|
+| `pause` | "Coda is paused; its program is released." once released (at once when it already was); it waits up to the drain timeout plus 120 s | "The bridge in <dir> is not running (no control channel).", "The bridge did not answer in time.", or the bridge's refusal "<message> (<code>)" such as "session/prepareRestart failed (-32603) (prepare_failed)" |
+| `resume` | "Coda is resuming.", or "The pause was cancelled; Coda keeps running." for a pause still draining; it waits up to 30 s | the same, such as "Coda is not paused (not_paused)" or "coda.exe is missing or in use (exe_unavailable)" |
+
+"Coda" is the backend's name from the bridge's status ("The agent" while the bridge is
+still signing in).
+
+### Upgrading Coda from a script
+
+```powershell
+push-agent-bridge pause; dotnet tool update -g coda; push-agent-bridge resume
+```
+
+`pause` returns once Coda's files are free. `resume` is optional: the bridge sees the new
+program file by itself (within a few seconds) and starts Coda; if it already did, `resume`
+answers `not_paused` (exit 1), which is harmless here. With `--dir`, give it to both
+commands.
+
+## 16. Linux plan
+
+The bridge, its control channel and `push-tray-core` already build and are tested on
+Linux; the tray shell is built and tested on Windows only. The plan for Linux:
+
+- **Tray:** the same Tauri app; its tray icon on Linux is a StatusNotifierItem through
+  AppIndicator, so it needs `libayatana-appindicator3` (or `libappindicator3`) and a
+  desktop that shows such items (GNOME needs the AppIndicator extension), plus WebKitGTK
+  for the details window.
+- **Start at logon:** the tray's "Start at logon" writes the XDG autostart entry
+  `$XDG_CONFIG_HOME/autostart/push-agent-tray.desktop` (implemented in `push-tray-core`):
+
+  ```ini
+  [Desktop Entry]
+  Type=Application
+  Name=push-agent-tray
+  Exec="/home/me/.local/bin/push-agent-tray" --autostart
+  X-GNOME-Autostart-enabled=true
+  ```
+
+  Without the tray, a systemd user unit runs a bridge (exit code 2, not set up, is not
+  retried):
+
+  ```ini
+  # ~/.config/systemd/user/push-agent-bridge.service
+  [Unit]
+  Description=push-agent-bridge (Coda)
+
+  [Service]
+  ExecStart=%h/.local/bin/push-agent-bridge --dir %h/.local/state/push-messenger/coda-bridge run
+  Restart=on-failure
+  RestartSec=5
+  RestartPreventExitStatus=2
+
+  [Install]
+  WantedBy=default.target
+  ```
+
+  `systemctl --user enable --now push-agent-bridge`. Like a Scheduled Task, a unit and the
+  tray must not both run the same folder; the tray does not detect units yet.
+- **Key storage:** off Windows the bridge has only `"storage": "software-file"` (a plain
+  key file, for development); a platform key store is to come.
+- **Control channel:** the socket `$XDG_RUNTIME_DIR/push-agent-bridge/<id>.sock`
+  ([access rules](#access-rules)). `$XDG_RUNTIME_DIR` is required (systemd's user session
+  sets it); without it the bridge runs without a control channel and the tray cannot see
+  it.
+- **Default folders:** the bridge's `$XDG_STATE_HOME/push-messenger/coda-bridge` (default
+  `~/.local/state/…`) and the tray's `$XDG_CONFIG_HOME/push-messenger/tray.json`.
+- **Packaging:** an AppImage and a `.deb`, later.
+
+## 17. Manual smoke test on Windows
+
+Not run in CI. It needs two enrolled agents (section [4](#4-setup-on-windows), steps 1–5,
+without the logon task: the second agent as in [several agents](#several-agents-on-one-machine)),
+Coda, the owner's app, and `push-agent-tray.exe` next to `push-agent-bridge.exe`. Remove
+any Scheduled Task of these folders first (`scripts\uninstall.ps1`, or the tray's
+switch-over).
+
+1. **Two agents show in the tray, each with its state.** Start `push-agent-tray.exe`. The
+   default folder is added by itself; add the second with "Add agent folder…". Expected:
+   two submenus named "<display name> (<handle>)", each with "connected, idle", its folder
+   and session; a green icon; the tooltip has one line per agent; `tray.json` lists both
+   folders.
+2. **A card opening turns the icon to "waiting for you".** Ask one agent to edit a scratch
+   file. While the turn runs the icon is blue ("working"); when the "Allow …?" card
+   opens it turns amber, and the tooltip and the submenu say "waiting for you (approval
+   needed)". Approve: blue again, then green when the turn ends.
+3. **Restart Coda keeps the chat connected.** Choose the agent's "Restart Coda". Expected
+   in the chat: "(Coda is restarting: the owner asked)", then "Coda restarted by the
+   owner." with what was lost; the icon is grey ("Coda restarting") for a moment, then
+   green. The agent stays online, the next message is answered, and `/status` shows the
+   same session.
+4. **Reconnect signs in again.** Choose "Reconnect". Expected: "disconnected,
+   reconnecting" for a moment, then "connected, idle"; the log shows `messenger_reconnect`
+   and no `backend_exited`; Coda was not restarted (no "Coda restarted" in the chat, the
+   same session in `/status`).
+5. **Stop declines open cards.** Open a card as in step 2 and, without answering it,
+   choose "Stop". Expected: the chat says "Declined: the bridge was stopped." (and the turn's
+   reply ends with "(The bridge stopped.)"); answering the card now has no effect; the
+   agent shows "stopped" (red icon) and is not restarted. "Start" brings it back,
+   "connected, idle".
+6. **Start at logon works after signing out and back in.** Check "Start at logon";
+   `reg query HKCU\Software\Microsoft\Windows\CurrentVersion\Run /v push-agent-tray` shows
+   `"<path>\push-agent-tray.exe" --autostart`. Sign out of Windows and back in. Expected:
+   the tray icon appears without a console window, both agents come back "connected,
+   idle" (started by the tray: Quit stops them), and both answer a message.
