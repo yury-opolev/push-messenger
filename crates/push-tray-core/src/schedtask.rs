@@ -13,15 +13,37 @@ use crate::tray_config::{Instance, TrayConfig};
 /// A Scheduled Task's action (a task with several actions gives one per action).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TaskInfo {
+    /// The task's Task Scheduler folder (`\` for the root, `\Folder\` below it).
+    pub path: String,
     pub name: String,
     pub execute: String,
     pub arguments: String,
     pub state: String,
 }
 
-/// Reads [`LIST_SCRIPT`]'s output: one object or an array of objects with `name`,
-/// `execute`, `arguments` and `state`. Lenient: a missing or non-string field is empty,
-/// entries without a name are skipped, anything else is no tasks.
+impl TaskInfo {
+    pub fn id(&self) -> TaskId {
+        TaskId {
+            path: self.path.clone(),
+            name: self.name.clone(),
+        }
+    }
+}
+
+/// A Scheduled Task: a name is unique only within its Task Scheduler folder.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TaskId {
+    pub path: String,
+    pub name: String,
+}
+
+/// The root Task Scheduler folder.
+pub const ROOT_TASK_PATH: &str = "\\";
+
+/// Reads [`LIST_SCRIPT`]'s output: one object or an array of objects with `path`, `name`,
+/// `execute`, `arguments` and `state`. Lenient: a missing or non-string field is empty
+/// (a missing path is the root folder), entries without a name are skipped, anything else
+/// is no tasks.
 pub fn parse_tasks(json: &str) -> Vec<TaskInfo> {
     let json = json.trim_start_matches('\u{feff}').trim();
     let Ok(value) = serde_json::from_str::<Value>(json) else {
@@ -45,7 +67,13 @@ pub fn parse_tasks(json: &str) -> Vec<TaskInfo> {
             if name.is_empty() {
                 return None;
             }
+            let path = field("path");
             Some(TaskInfo {
+                path: if path.is_empty() {
+                    ROOT_TASK_PATH.to_owned()
+                } else {
+                    path
+                },
                 name,
                 execute: field("execute"),
                 arguments: field("arguments"),
@@ -164,6 +192,8 @@ fn split_command_line(line: &str) -> Vec<String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskFor {
     pub task: String,
+    /// The task's Task Scheduler folder.
+    pub path: String,
     /// The folder as configured in `tray.json`.
     pub dir: PathBuf,
 }
@@ -185,6 +215,7 @@ pub fn tasks_for_instances(
         for (dir, _) in dirs.iter().zip(&ids).filter(|(_, dir_id)| **dir_id == id) {
             let item = TaskFor {
                 task: task.name.clone(),
+                path: task.path.clone(),
                 dir: dir.clone(),
             };
             if !found.contains(&item) {
@@ -218,10 +249,19 @@ pub struct SwitchPlan {
     pub steps: Vec<Step>,
 }
 
+impl TaskFor {
+    pub fn id(&self) -> TaskId {
+        TaskId {
+            path: self.path.clone(),
+            name: self.task.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Step {
-    StopTask(String),
-    UnregisterTask(String),
+    StopTask(TaskId),
+    UnregisterTask(TaskId),
     EnableTrayAutostart,
     MarkAutostart(PathBuf),
     StartBridge(PathBuf),
@@ -231,12 +271,13 @@ pub enum Step {
 /// instance autostart and start it under the tray.
 pub fn plan_switch(found: &[TaskFor]) -> SwitchPlan {
     let mut steps = Vec::new();
-    let mut tasks: Vec<&str> = Vec::new();
+    let mut tasks: Vec<TaskId> = Vec::new();
     for item in found {
-        if !tasks.contains(&item.task.as_str()) {
-            tasks.push(&item.task);
-            steps.push(Step::StopTask(item.task.clone()));
-            steps.push(Step::UnregisterTask(item.task.clone()));
+        let id = item.id();
+        if !tasks.contains(&id) {
+            steps.push(Step::StopTask(id.clone()));
+            steps.push(Step::UnregisterTask(id.clone()));
+            tasks.push(id);
         }
     }
     if found.is_empty() {
@@ -267,13 +308,13 @@ pub fn execute_switch(
 ) -> io::Result<()> {
     for step in &plan.steps {
         match step {
-            Step::StopTask(name) => {
-                tracing::info!(event = "switch_over", step = "stop_task", task = %name);
-                scheduler.stop(name)?;
+            Step::StopTask(task) => {
+                tracing::info!(event = "switch_over", step = "stop_task", path = %task.path, task = %task.name);
+                scheduler.stop(task)?;
             }
-            Step::UnregisterTask(name) => {
-                tracing::info!(event = "switch_over", step = "unregister_task", task = %name);
-                scheduler.unregister(name)?;
+            Step::UnregisterTask(task) => {
+                tracing::info!(event = "switch_over", step = "unregister_task", path = %task.path, task = %task.name);
+                scheduler.unregister(task)?;
             }
             Step::EnableTrayAutostart => autostart.set(true)?,
             Step::MarkAutostart(dir) => {
@@ -293,13 +334,14 @@ pub fn execute_switch(
 /// The Scheduled Tasks of the current user.
 pub trait Scheduler {
     fn list(&self) -> io::Result<Vec<TaskInfo>>;
-    fn stop(&self, name: &str) -> io::Result<()>;
-    fn unregister(&self, name: &str) -> io::Result<()>;
-    fn run(&self, name: &str) -> io::Result<()>;
+    fn stop(&self, task: &TaskId) -> io::Result<()>;
+    fn unregister(&self, task: &TaskId) -> io::Result<()>;
+    fn run(&self, task: &TaskId) -> io::Result<()>;
 }
 
-/// Lists every task's actions as JSON, flattened to `{name, execute, arguments, state}`.
-pub const LIST_SCRIPT: &str = "Get-ScheduledTask | ForEach-Object { foreach ($a in $_.Actions) { [pscustomobject]@{ name = $_.TaskName; execute = $a.Execute; arguments = $a.Arguments; state = [string]$_.State } } } | ConvertTo-Json -Compress";
+/// Lists every task's actions as JSON, flattened to `{path, name, execute, arguments,
+/// state}`.
+pub const LIST_SCRIPT: &str = "Get-ScheduledTask | ForEach-Object { foreach ($a in $_.Actions) { [pscustomobject]@{ path = $_.TaskPath; name = $_.TaskName; execute = $a.Execute; arguments = $a.Arguments; state = [string]$_.State } } } | ConvertTo-Json -Compress";
 
 /// Runs the ScheduledTasks cmdlets through `powershell.exe` (no window, no profile),
 /// passing the script as `-EncodedCommand`. Windows only: elsewhere every call fails with
@@ -312,27 +354,32 @@ impl Scheduler for PowerShellScheduler {
         Ok(parse_tasks(&run_powershell(LIST_SCRIPT)?))
     }
 
-    fn stop(&self, name: &str) -> io::Result<()> {
-        run_powershell(&task_script("Stop-ScheduledTask", name)).map(drop)
+    fn stop(&self, task: &TaskId) -> io::Result<()> {
+        run_powershell(&task_script("Stop-ScheduledTask", task)).map(drop)
     }
 
-    fn unregister(&self, name: &str) -> io::Result<()> {
-        run_powershell(&task_script("Unregister-ScheduledTask", name)).map(drop)
+    fn unregister(&self, task: &TaskId) -> io::Result<()> {
+        run_powershell(&task_script("Unregister-ScheduledTask", task)).map(drop)
     }
 
-    fn run(&self, name: &str) -> io::Result<()> {
-        run_powershell(&task_script("Start-ScheduledTask", name)).map(drop)
+    fn run(&self, task: &TaskId) -> io::Result<()> {
+        run_powershell(&task_script("Start-ScheduledTask", task)).map(drop)
     }
 }
 
-/// `<cmdlet> -TaskName '<name>'` (and `-Confirm:$false` to unregister).
-fn task_script(cmdlet: &str, name: &str) -> String {
+/// `<cmdlet> -TaskPath '<path>' -TaskName '<name>'` (and `-Confirm:$false` to
+/// unregister): the name alone matches same-named tasks in every folder.
+fn task_script(cmdlet: &str, task: &TaskId) -> String {
     let confirm = if cmdlet == "Unregister-ScheduledTask" {
         " -Confirm:$false"
     } else {
         ""
     };
-    format!("{cmdlet} -TaskName {}{confirm}", ps_quote(name))
+    format!(
+        "{cmdlet} -TaskPath {} -TaskName {}{confirm}",
+        ps_quote(&task.path),
+        ps_quote(&task.name)
+    )
 }
 
 /// A PowerShell single-quoted string: every quote character (PowerShell also takes the
@@ -432,6 +479,7 @@ mod tests {
 
     fn task(name: &str, execute: &str, arguments: &str) -> TaskInfo {
         TaskInfo {
+            path: ROOT_TASK_PATH.into(),
             name: name.into(),
             execute: execute.into(),
             arguments: arguments.into(),
@@ -445,10 +493,11 @@ mod tests {
 
     #[test]
     fn parse_reads_an_object_an_array_and_ignores_garbage() {
-        let one = r#"{"name":"push-agent-bridge","execute":"C:\\Windows\\System32\\conhost.exe","arguments":"--headless \"C:\\b.exe\" run","state":"Running"}"#;
+        let one = r#"{"path":"\\Push\\","name":"push-agent-bridge","execute":"C:\\Windows\\System32\\conhost.exe","arguments":"--headless \"C:\\b.exe\" run","state":"Running"}"#;
         assert_eq!(
             parse_tasks(one),
             [TaskInfo {
+                path: r"\Push\".into(),
                 name: "push-agent-bridge".into(),
                 execute: r"C:\Windows\System32\conhost.exe".into(),
                 arguments: r#"--headless "C:\b.exe" run"#.into(),
@@ -460,6 +509,7 @@ mod tests {
         assert_eq!(tasks.len(), 2);
         assert_eq!(tasks[0], task("a", "x.exe", ""));
         assert_eq!(tasks[1].name, "b");
+        assert_eq!(tasks[1].path, ROOT_TASK_PATH);
         assert_eq!(tasks[1].execute, "");
         for garbage in ["", "   ", "nope", "42", "\"text\"", "{", "null"] {
             assert!(parse_tasks(garbage).is_empty(), "{garbage:?}");
@@ -587,6 +637,10 @@ mod tests {
                 &format!("--dir \"{}\" run", a.display()),
             ),
             task("task-default", "push-agent-bridge", "run"),
+            TaskInfo {
+                path: r"\Other\".into(),
+                ..task("task-default", "push-agent-bridge", "run")
+            },
             task(
                 "task-other",
                 "push-agent-bridge",
@@ -600,10 +654,17 @@ mod tests {
             [
                 TaskFor {
                     task: "task-a".into(),
+                    path: ROOT_TASK_PATH.into(),
                     dir: a.clone(),
                 },
                 TaskFor {
                     task: "task-default".into(),
+                    path: ROOT_TASK_PATH.into(),
+                    dir: default.clone(),
+                },
+                TaskFor {
+                    task: "task-default".into(),
+                    path: r"\Other\".into(),
                     dir: default.clone(),
                 },
             ]
@@ -616,25 +677,32 @@ mod tests {
         assert_eq!(offer(&[]), Offer::None);
         let found = vec![TaskFor {
             task: "t".into(),
+            path: ROOT_TASK_PATH.into(),
             dir: PathBuf::from("d"),
         }];
         assert_eq!(offer(&found), Offer::SwitchOver(found.clone()));
     }
 
+    fn found(task: &str, path: &str, dir: &str) -> TaskFor {
+        TaskFor {
+            task: task.into(),
+            path: path.into(),
+            dir: PathBuf::from(dir),
+        }
+    }
+
+    fn id(path: &str, name: &str) -> TaskId {
+        TaskId {
+            path: path.into(),
+            name: name.into(),
+        }
+    }
+
     fn found_two() -> Vec<TaskFor> {
         vec![
-            TaskFor {
-                task: "t1".into(),
-                dir: PathBuf::from("d1"),
-            },
-            TaskFor {
-                task: "t2".into(),
-                dir: PathBuf::from("d2"),
-            },
-            TaskFor {
-                task: "t2".into(),
-                dir: PathBuf::from("d2"),
-            },
+            found("t1", ROOT_TASK_PATH, "d1"),
+            found("t2", r"\Push\", "d2"),
+            found("t2", r"\Push\", "d2"),
         ]
     }
 
@@ -644,10 +712,10 @@ mod tests {
         assert_eq!(
             plan_switch(&found_two()).steps,
             [
-                Step::StopTask("t1".into()),
-                Step::UnregisterTask("t1".into()),
-                Step::StopTask("t2".into()),
-                Step::UnregisterTask("t2".into()),
+                Step::StopTask(id(ROOT_TASK_PATH, "t1")),
+                Step::UnregisterTask(id(ROOT_TASK_PATH, "t1")),
+                Step::StopTask(id(r"\Push\", "t2")),
+                Step::UnregisterTask(id(r"\Push\", "t2")),
                 Step::EnableTrayAutostart,
                 Step::MarkAutostart(PathBuf::from("d1")),
                 Step::StartBridge(PathBuf::from("d1")),
@@ -655,6 +723,22 @@ mod tests {
                 Step::StartBridge(PathBuf::from("d2")),
             ]
         );
+    }
+
+    #[test]
+    fn same_named_tasks_in_other_folders_are_other_tasks() {
+        let steps =
+            plan_switch(&[found("t", ROOT_TASK_PATH, "d"), found("t", r"\Push\", "d")]).steps;
+        assert_eq!(
+            steps[..4],
+            [
+                Step::StopTask(id(ROOT_TASK_PATH, "t")),
+                Step::UnregisterTask(id(ROOT_TASK_PATH, "t")),
+                Step::StopTask(id(r"\Push\", "t")),
+                Step::UnregisterTask(id(r"\Push\", "t")),
+            ]
+        );
+        assert_eq!(steps.len(), 7);
     }
 
     #[derive(Default)]
@@ -667,19 +751,25 @@ mod tests {
         fn list(&self) -> io::Result<Vec<TaskInfo>> {
             Ok(Vec::new())
         }
-        fn stop(&self, name: &str) -> io::Result<()> {
-            self.calls.borrow_mut().push(format!("stop {name}"));
+        fn stop(&self, task: &TaskId) -> io::Result<()> {
+            self.calls
+                .borrow_mut()
+                .push(format!("stop {}{}", task.path, task.name));
             Ok(())
         }
-        fn unregister(&self, name: &str) -> io::Result<()> {
-            self.calls.borrow_mut().push(format!("unregister {name}"));
-            if self.fail_unregister.as_deref() == Some(name) {
+        fn unregister(&self, task: &TaskId) -> io::Result<()> {
+            self.calls
+                .borrow_mut()
+                .push(format!("unregister {}{}", task.path, task.name));
+            if self.fail_unregister.as_deref() == Some(task.name.as_str()) {
                 return Err(io::Error::other("access denied"));
             }
             Ok(())
         }
-        fn run(&self, name: &str) -> io::Result<()> {
-            self.calls.borrow_mut().push(format!("run {name}"));
+        fn run(&self, task: &TaskId) -> io::Result<()> {
+            self.calls
+                .borrow_mut()
+                .push(format!("run {}{}", task.path, task.name));
             Ok(())
         }
     }
@@ -739,10 +829,10 @@ mod tests {
         assert_eq!(
             *scheduler.calls.borrow(),
             [
-                "stop t1",
-                "unregister t1",
-                "stop t2",
-                "unregister t2",
+                r"stop \t1",
+                r"unregister \t1",
+                r"stop \Push\t2",
+                r"unregister \Push\t2",
                 "autostart true",
                 "start d1",
                 "start d2",
@@ -775,7 +865,12 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(
             *scheduler.calls.borrow(),
-            ["stop t1", "unregister t1", "stop t2", "unregister t2"]
+            [
+                r"stop \t1",
+                r"unregister \t1",
+                r"stop \Push\t2",
+                r"unregister \Push\t2",
+            ]
         );
         assert!(!autostart.enabled().unwrap());
         assert!(config.instances.iter().all(|instance| !instance.autostart));
@@ -788,16 +883,16 @@ mod tests {
         assert_eq!(ps_quote("it's"), "'it''s'");
         assert_eq!(ps_quote("a\u{2019}b"), "'a\u{2019}\u{2019}b'");
         assert_eq!(
-            task_script("Stop-ScheduledTask", "x'; Remove-Item C:\\"),
-            "Stop-ScheduledTask -TaskName 'x''; Remove-Item C:\\'"
+            task_script("Stop-ScheduledTask", &id(r"\it's\", "x'; Remove-Item C:\\")),
+            r"Stop-ScheduledTask -TaskPath '\it''s\' -TaskName 'x''; Remove-Item C:\'"
         );
         assert_eq!(
-            task_script("Unregister-ScheduledTask", "t"),
-            "Unregister-ScheduledTask -TaskName 't' -Confirm:$false"
+            task_script("Unregister-ScheduledTask", &id(ROOT_TASK_PATH, "t")),
+            r"Unregister-ScheduledTask -TaskPath '\' -TaskName 't' -Confirm:$false"
         );
         assert_eq!(
-            task_script("Start-ScheduledTask", "t"),
-            "Start-ScheduledTask -TaskName 't'"
+            task_script("Start-ScheduledTask", &id(r"\Push\", "t")),
+            r"Start-ScheduledTask -TaskPath '\Push\' -TaskName 't'"
         );
     }
 
