@@ -10,6 +10,7 @@ pub mod commands;
 pub mod config;
 pub mod control;
 pub mod core;
+pub mod exe;
 pub mod folders;
 pub mod logging;
 pub mod mask;
