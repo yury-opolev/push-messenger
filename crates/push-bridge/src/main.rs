@@ -241,18 +241,23 @@ async fn pause(
         .backend_name()
         .await
         .unwrap_or_else(|| "The agent".to_owned());
-    let drain = Duration::from_secs(drain_timeout.unwrap_or(DEFAULT_DRAIN_SECONDS));
     let params = PauseParams {
         reason,
         drain_timeout_ms: drain_timeout.map(|seconds| seconds.saturating_mul(1000)),
     };
     let result = remote
-        .call(Call::PauseBackend(params), drain + PAUSE_GRACE)
+        .call(Call::PauseBackend(params), pause_limit(drain_timeout))
         .await
         .map_err(|error| remote_failure(dir, error))?;
     result.map_err(refused)?;
     println!("{name} is paused; its program is released.");
     Ok(())
+}
+
+/// How long `pause` waits for the bridge's answer: the drain and a grace (however
+/// long the drain).
+fn pause_limit(drain_timeout: Option<u64>) -> Duration {
+    Duration::from_secs(drain_timeout.unwrap_or(DEFAULT_DRAIN_SECONDS)).saturating_add(PAUSE_GRACE)
 }
 
 /// Asks the running bridge to start its paused backend again now.
@@ -555,4 +560,16 @@ fn forward(mut events: Events) -> Arc<Mutex<mpsc::Sender<Event>>> {
         }
     });
     target
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_pause_limit_is_the_drain_and_a_grace_even_for_a_huge_drain() {
+        assert_eq!(pause_limit(None), Duration::from_secs(720));
+        assert_eq!(pause_limit(Some(30)), Duration::from_secs(150));
+        assert_eq!(pause_limit(Some(u64::MAX)), Duration::MAX);
+    }
 }
