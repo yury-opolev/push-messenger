@@ -2,16 +2,20 @@
 //! labels ([`state`], [`icon`]), the restart policy ([`policy`]), a state history
 //! ([`history`]), the tray's `tray.json` ([`tray_config`]) and folders ([`paths`]), the
 //! tray's own start at logon ([`autostart`]), the switch-over from Scheduled Tasks
-//! ([`schedtask`]) and opening a file or folder ([`open`]).
+//! ([`schedtask`]), opening a file or folder ([`open`]), the bridges' control channel
+//! ([`client`]), the bridges' supervision ([`supervisor`]) and the tray menu ([`menu`]).
 
 pub mod autostart;
+pub mod client;
 pub mod history;
 pub mod icon;
+pub mod menu;
 pub mod open;
 pub mod paths;
 pub mod policy;
 pub mod schedtask;
 pub mod state;
+pub mod supervisor;
 pub mod tray_config;
 
 #[cfg(test)]
