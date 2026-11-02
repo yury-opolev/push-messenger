@@ -36,8 +36,9 @@ use crate::signer::{KeyError, open_key};
 const SIGN_IN_INTERVAL: Duration = Duration::from_secs(30);
 /// How long the backend may drain when `pause` does not say.
 const DEFAULT_DRAIN_SECONDS: u64 = 600;
-/// `pause` waits this much longer than the drain for the bridge's answer.
-const PAUSE_GRACE: Duration = Duration::from_secs(120);
+/// `pause` waits this much longer than the drain for the bridge's answer: longer than
+/// the bridge's own grace (120 s), so its answer (even `timeout`) comes first.
+const PAUSE_GRACE: Duration = Duration::from_secs(150);
 /// How long `resume` waits for the bridge's answer.
 const RESUME_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -568,8 +569,8 @@ mod tests {
 
     #[test]
     fn the_pause_limit_is_the_drain_and_a_grace_even_for_a_huge_drain() {
-        assert_eq!(pause_limit(None), Duration::from_secs(720));
-        assert_eq!(pause_limit(Some(30)), Duration::from_secs(150));
+        assert_eq!(pause_limit(None), Duration::from_secs(750));
+        assert_eq!(pause_limit(Some(30)), Duration::from_secs(180));
         assert_eq!(pause_limit(Some(u64::MAX)), Duration::MAX);
     }
 }

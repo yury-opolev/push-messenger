@@ -306,7 +306,7 @@ push-agent-bridge [--dir <folder>] <command>
 folder (the `--dir`), name the backend as the bridge's status does ("The agent" while the
 bridge is still signing in), and fail with exit code 1 when no bridge runs for the folder
 ("The bridge in <dir> is not running (no control channel)."), when it does not answer in
-time ("The bridge did not answer in time."; `pause` waits the drain timeout plus 120 s,
+time ("The bridge did not answer in time."; `pause` waits the drain timeout plus 150 s,
 `resume` 30 s), or when the bridge refuses (its message and code, such as "Coda is not
 paused (not_paused)", `exe_unavailable`, or `unavailable` while it signs in).
 
@@ -947,9 +947,10 @@ read, else `id` 0) and the connection stays; an unknown method gets `unknown_met
 
 `unavailable` ("the bridge is signing in") answers every action but `shutdown` and
 `reconnect` while the bridge signs in or waits to sign in again. `timeout` is the hub's own
-limit: 30 s for an action, 15 minutes for `pause_backend`; the action may still finish
-afterwards. So a `pause_backend` whose drain (plus Coda's 60 s to save) takes longer than
-15 minutes is answered `timeout` while the pause goes on; `status` shows how it ends.
+limit: 30 s for an action, and for `pause_backend` its `drainTimeoutMs` (10 minutes when it
+does not say) plus 2 minutes; the action may still finish afterwards (`status` shows
+how it ends). The drain is cut at its timeout and Coda's save takes at most 60 s more, so
+a pause normally answers within that limit.
 
 ### Events
 
@@ -999,7 +1000,7 @@ Field names are camelCase; absent values are `null`.
 |---|---|
 | Line length | 64 KiB; longer closes the connection |
 | Connections | 8 at once per bridge; more are closed at once (no `hello`) |
-| Action timeout | 30 s (`pause_backend`: 15 minutes) |
+| Action timeout | 30 s (`pause_backend`: its drain timeout, default 10 minutes, plus 2 minutes) |
 | Events a connection may fall behind | 256 (then skipped) |
 
 ### Example session
@@ -1205,7 +1206,7 @@ push-agent-bridge [--dir <folder>] resume
 
 | Command | Prints (exit 0) | Fails (exit 1) |
 |---|---|---|
-| `pause` | "Coda is paused; its program is released." once released (at once when it already was); it waits up to the drain timeout plus 120 s | "The bridge in <dir> is not running (no control channel).", "The bridge did not answer in time.", or the bridge's refusal "<message> (<code>)" such as "session/prepareRestart failed (-32603) (prepare_failed)" |
+| `pause` | "Coda is paused; its program is released." once released (at once when it already was); it waits up to the drain timeout plus 150 s (the bridge answers `timeout` after the drain plus 120 s) | "The bridge in <dir> is not running (no control channel).", "The bridge did not answer in time.", or the bridge's refusal "<message> (<code>)" such as "session/prepareRestart failed (-32603) (prepare_failed)" |
 | `resume` | "Coda is resuming.", or "The pause was cancelled; Coda keeps running." for a pause still draining; it waits up to 30 s | the same, such as "Coda is not paused (not_paused)" or "coda.exe is missing or in use (exe_unavailable)" |
 
 "Coda" is the backend's name from the bridge's status ("The agent" while the bridge is

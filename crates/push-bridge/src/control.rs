@@ -23,8 +23,10 @@ use tokio::task::JoinHandle;
 pub const MAX_CONNECTIONS: usize = 8;
 /// How long an action may take before its caller hears `timeout`.
 const ACTION_TIMEOUT: Duration = Duration::from_secs(30);
-/// `pause_backend` waits for the backend to drain.
-const PAUSE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// How long the backend may drain when `pause_backend` does not say.
+const DEFAULT_PAUSE_DRAIN: Duration = Duration::from_secs(10 * 60);
+/// How much longer than its drain `pause_backend` may take (saving, stopping).
+const PAUSE_GRACE: Duration = Duration::from_secs(2 * 60);
 /// Events a slow connection may fall behind before it skips some.
 const EVENT_BUFFER: usize = 256;
 /// Actions waiting for the bridge.
@@ -298,7 +300,10 @@ impl ControlHub {
             Call::RestartBackend => (Action::RestartBackend, ACTION_TIMEOUT),
             Call::Reconnect => (Action::Reconnect, ACTION_TIMEOUT),
             Call::Shutdown => (Action::Shutdown, ACTION_TIMEOUT),
-            Call::PauseBackend(params) => (Action::Pause(params), PAUSE_TIMEOUT),
+            Call::PauseBackend(params) => {
+                let limit = pause_timeout(&params);
+                (Action::Pause(params), limit)
+            }
             Call::ResumeBackend => (Action::Resume, ACTION_TIMEOUT),
         };
         tracing::info!(event = "control_request", method = action.name());
@@ -316,6 +321,15 @@ impl ControlHub {
 
 fn unavailable() -> ErrorBody {
     error("unavailable", "the bridge is not taking requests")
+}
+
+/// How long a `pause_backend` call may take: its drain (10 minutes when it does not say)
+/// and a grace, however long the drain.
+fn pause_timeout(params: &PauseParams) -> Duration {
+    params
+        .drain_timeout_ms
+        .map_or(DEFAULT_PAUSE_DRAIN, Duration::from_millis)
+        .saturating_add(PAUSE_GRACE)
 }
 
 fn response(id: u64, result: Reply) -> Response {
@@ -543,6 +557,44 @@ mod tests {
         let response = client.response().await;
         assert_eq!(response.id, 4);
         assert_eq!(response.error.unwrap().code, "timeout");
+    }
+
+    #[test]
+    fn a_pause_may_take_its_drain_and_a_grace() {
+        let pause = |drain_timeout_ms| PauseParams {
+            reason: None,
+            drain_timeout_ms,
+        };
+        assert_eq!(pause_timeout(&pause(None)), Duration::from_secs(12 * 60));
+        assert_eq!(
+            pause_timeout(&pause(Some(30 * 60 * 1000))),
+            Duration::from_secs(32 * 60)
+        );
+        assert_eq!(
+            pause_timeout(&pause(Some(u64::MAX))),
+            Duration::from_millis(u64::MAX) + PAUSE_GRACE
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_long_drain_is_answered_after_the_old_fifteen_minutes() {
+        let hub = hub();
+        let calls = hub.calls();
+        let bridge = tokio::spawn(async move {
+            let call = calls.lock().await.recv().await.expect("a call");
+            tokio::time::sleep(Duration::from_secs(20 * 60)).await;
+            let _ = call.reply.send(Ok(json!({"state": "paused"})));
+        });
+        let mut client = Client::greeted(&hub).await;
+        client
+            .send(r#"{"id":5,"method":"pause_backend","params":{"drainTimeoutMs":1200000}}"#)
+            .await;
+        let response = client.response().await;
+        assert_eq!(
+            (response.id, response.result),
+            (5, Some(json!({"state": "paused"})))
+        );
+        bridge.await.unwrap();
     }
 
     #[tokio::test]

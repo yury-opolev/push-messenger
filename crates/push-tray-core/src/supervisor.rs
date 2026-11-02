@@ -49,7 +49,8 @@ pub const EXIT_GRACE: Duration = Duration::from_secs(20);
 /// How long `restart_backend`, `reconnect` and `resume_backend` may take (the bridge's
 /// own limit is 30 s).
 pub const CALL_TIMEOUT: Duration = Duration::from_secs(35);
-/// How long `pause_backend` may take (the bridge's own limit is 15 min).
+/// How long `pause_backend` (with the default drain) may take (the bridge's own limit is
+/// the drain plus 2 min: 12 min).
 pub const PAUSE_TIMEOUT: Duration = Duration::from_secs(15 * 60 + 30);
 /// Notices waiting for the shell.
 const NOTICE_BUFFER: usize = 32;
