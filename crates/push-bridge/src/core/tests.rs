@@ -5,8 +5,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use push_bridge_control::{AgentInfo, BackendInfo, BridgeState, Event as ControlEvent, EventLine};
 use push_sdk::{ActivityState, ClientMsgId, ConnectionState, Event, MessageKind, SdkError, UserId};
-use tokio::sync::oneshot;
+use serde_json::json;
+use tokio::sync::{broadcast, oneshot};
 use tokio::task::JoinHandle;
 
 use super::*;
@@ -14,6 +16,7 @@ use crate::backend::{
     Answer, BackendStatus, ErrorKind, PendingMessages, RequestKind, SteerOutcome, TaskStatus,
     TurnSource,
 };
+use crate::control::{Action, ControlHub, Reply};
 use crate::folders;
 use crate::messenger::{Call, TestMessenger, param, template};
 use crate::test_backend::{TestBackend, error};
@@ -31,6 +34,8 @@ struct Harness {
     channels: Option<Channels>,
     stop: Option<oneshot::Sender<()>>,
     run: Option<JoinHandle<Result<(), BridgeError>>>,
+    hub: ControlHub,
+    events: broadcast::Receiver<EventLine>,
     _dir: TestDir,
 }
 
@@ -47,6 +52,8 @@ impl Harness {
         let state = Arc::new(StateFile::load(&dir.path().join("state.json")).unwrap());
         let (messenger, messenger_events) = TestMessenger::new();
         let (backend, backend_events) = TestBackend::channel();
+        let hub = ControlHub::new("0011223344556677".into());
+        let events = hub.handle().subscribe();
         Self {
             messenger,
             backend,
@@ -57,6 +64,8 @@ impl Harness {
             channels: Some((backend_events, messenger_events)),
             stop: None,
             run: None,
+            hub,
+            events,
             _dir: dir,
         }
     }
@@ -74,7 +83,8 @@ impl Harness {
                 default_folder: self.work.clone(),
                 default_mode: PermissionMode::Default,
             },
-        );
+        )
+        .with_control(self.hub.handle(), self.hub.calls());
         let (stop, stopped) = oneshot::channel::<()>();
         self.stop = Some(stop);
         self.run = Some(tokio::spawn(bridge.run(async {
@@ -148,6 +158,31 @@ impl Harness {
             "start folder={} session={session} mode=default",
             folder.display()
         )
+    }
+
+    /// Asks the bridge to do `action` over the control channel.
+    async fn call(&self, action: Action) -> Reply {
+        self.hub.call(action).await
+    }
+
+    /// The control events emitted since the last look.
+    fn control_events(&mut self) -> Vec<ControlEvent> {
+        let mut events = Vec::new();
+        while let Ok(line) = self.events.try_recv() {
+            events.push(line.event);
+        }
+        events
+    }
+
+    /// The states in `events`, in order.
+    fn states(events: &[ControlEvent]) -> Vec<BridgeState> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                ControlEvent::StateChanged { state, .. } => Some(*state),
+                _ => None,
+            })
+            .collect()
     }
 }
 
@@ -1195,5 +1230,274 @@ async fn a_plain_backend_s_text_goes_out_as_reply_v1() {
         reply_templates(&h)
             .iter()
             .all(|(tpl, _)| tpl == "agent.reply@1")
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn status_reports_state_folder_session_backend_and_counts() {
+    let mut h = Harness::new();
+    let work = h.work.clone();
+    h.state
+        .update(|state| {
+            state.sessions.insert(folder_key(&work), "s-9".into());
+        })
+        .unwrap();
+    h.start();
+    h.backend.wait_for("start", 1).await;
+    settle().await;
+    let status = h.hub.handle().status();
+    assert_eq!(status.state, Some(BridgeState::Idle));
+    assert_eq!(status.detail, None);
+    assert_eq!(status.folder, Some(h.work.display().to_string()));
+    assert_eq!(status.session.as_deref(), Some("s-9"));
+    assert_eq!(
+        status.backend,
+        Some(BackendInfo {
+            name: "Test".into(),
+            version: Some("1.0".into()),
+            running: true,
+            running_tasks: 0,
+        })
+    );
+    assert_eq!(
+        status.agent,
+        Some(AgentInfo {
+            display_name: "Coda on Devbox".into(),
+            handle: "coda-devbox".into(),
+        })
+    );
+    assert_eq!((status.open_requests, status.held_texts), (0, 0));
+    assert_eq!(status.instance, "0011223344556677");
+
+    h.backend.emit(BackendEvent::TaskStarted {
+        id: "t1".into(),
+        description: "build".into(),
+        background: true,
+    });
+    let _answer = h.backend.request(permission());
+    h.card(1).await;
+    settle().await;
+    let status = h.hub.handle().status();
+    assert_eq!(status.state, Some(BridgeState::Waiting));
+    assert_eq!(status.detail.as_deref(), Some("approval needed"));
+    assert_eq!((status.open_requests, status.held_texts), (1, 0));
+    assert_eq!(status.backend.map(|backend| backend.running_tasks), Some(1));
+    let events = h.control_events();
+    assert!(events.contains(&ControlEvent::StateChanged {
+        state: BridgeState::Waiting,
+        detail: Some("approval needed".into()),
+    }));
+    assert!(events.contains(&ControlEvent::RequestOpened {
+        kind: "permission".into(),
+        open: 1,
+    }));
+}
+
+#[tokio::test(start_paused = true)]
+async fn restart_backend_keeps_the_messenger_session() {
+    let mut h = Harness::started().await;
+    h.control_events();
+    assert_eq!(
+        h.call(Action::RestartBackend).await,
+        Ok(json!({"restarted": true}))
+    );
+    assert_eq!(h.count("stop"), 1);
+    assert_eq!(h.count("start"), 2);
+    assert_eq!(h.backend.calls()[2], h.start_call(&h.work, "session-1"));
+    h.reply_containing("Test restarted by the owner.").await;
+    assert_eq!(
+        h.replies(),
+        [
+            "(Test is restarting: the owner asked)",
+            "Test restarted by the owner. Undelivered background messages and in-memory \
+             schedules were lost.",
+        ]
+    );
+    assert!(!h.messenger.calls().contains(&Call::Reconnect));
+    let conversation = h.messenger.conversation();
+    assert!(h.messenger.calls().iter().all(|call| match call {
+        Call::SendRich {
+            conversation: c, ..
+        } => *c == conversation,
+        _ => true,
+    }));
+    settle().await;
+    let events = h.control_events();
+    assert_eq!(
+        Harness::states(&events),
+        [BridgeState::Restarting, BridgeState::Idle]
+    );
+    h.messenger.owner_says("still here");
+    h.backend.wait_for("prompt still here", 1).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn reconnect_signs_in_again_and_keeps_the_backend() {
+    let mut h = Harness::started().await;
+    h.backend.turn_started(TurnSource::Prompt);
+    settle().await;
+    h.control_events();
+    assert_eq!(
+        h.call(Action::Reconnect).await,
+        Ok(json!({"reconnected": true}))
+    );
+    let reconnects = h
+        .messenger
+        .calls()
+        .iter()
+        .filter(|call| **call == Call::Reconnect)
+        .count();
+    assert_eq!(reconnects, 1);
+    assert_eq!(h.count("start"), 1);
+    assert_eq!(h.count("stop"), 0);
+    settle().await;
+    assert_eq!(
+        h.hub.handle().status().state,
+        Some(BridgeState::Reconnecting)
+    );
+    let before = h.messenger.calls().len();
+    h.messenger
+        .inject(Event::ConnectionStateChanged(ConnectionState::Connected));
+    h.backend.wait_for("pending", 1).await;
+    settle().await;
+    let resent = h.messenger.calls()[before..].iter().any(|call| {
+        matches!(
+            call,
+            Call::Activity {
+                state: ActivityState::Working,
+                ..
+            }
+        )
+    });
+    assert!(resent, "the activity is sent again");
+    let status = h.hub.handle().status();
+    assert_eq!(status.state, Some(BridgeState::Working));
+    assert_eq!(status.connection.as_deref(), Some("connected"));
+    assert_eq!(
+        Harness::states(&h.control_events()),
+        [BridgeState::Reconnecting, BridgeState::Working]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn shutdown_declines_open_requests_and_stops_ok() {
+    let mut h = Harness::started().await;
+    let answer = h.backend.request(permission());
+    h.card(1).await;
+    settle().await;
+    h.control_events();
+    assert_eq!(
+        h.call(Action::Shutdown).await,
+        Ok(json!({"stopping": true}))
+    );
+    assert_eq!(h.run.take().unwrap().await.unwrap(), Ok(()));
+    assert!(answer.await.is_err(), "declined");
+    assert_eq!(
+        h.replies().last().map(String::as_str),
+        Some("Declined: the bridge was stopped.")
+    );
+    assert_eq!(h.backend.calls().last().map(String::as_str), Some("stop"));
+    let events = h.control_events();
+    assert!(events.contains(&ControlEvent::RequestClosed {
+        kind: "permission".into(),
+        outcome: "declined".into(),
+        open: 0,
+    }));
+    assert_eq!(Harness::states(&events), [BridgeState::Stopping]);
+    assert_eq!(h.hub.handle().status().state, Some(BridgeState::Stopping));
+}
+
+#[tokio::test(start_paused = true)]
+async fn pause_and_resume_are_not_supported_yet() {
+    let h = Harness::started().await;
+    for action in [Action::Pause(Default::default()), Action::Resume] {
+        let error = h.call(action).await.unwrap_err();
+        assert_eq!(error.code, "unsupported");
+    }
+    assert_eq!(h.count("stop"), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn events_and_status_carry_no_message_content() {
+    const SECRET: &str = "s3cr3t";
+    let mut h = Harness::started().await;
+    h.messenger.owner_says(&format!("do {SECRET}"));
+    h.backend.wait_for("prompt", 1).await;
+    h.backend.turn_started(TurnSource::Prompt);
+    h.backend
+        .emit(BackendEvent::ThinkingDelta(format!("think {SECRET}")));
+    h.backend.text(&format!("reply {SECRET}"));
+    h.backend.emit(BackendEvent::ToolStarted {
+        id: "tool-1".into(),
+        tool: format!("Bash {SECRET}"),
+        target: format!("{SECRET}/file"),
+        task: Some(format!("task {SECRET}")),
+    });
+    settle().await;
+    let permission = h.backend.request(RequestKind::Permission {
+        tool: "Bash".into(),
+        preview: format!("rm {SECRET}"),
+    });
+    h.card(1).await;
+    h.messenger.owner_says("y");
+    assert_eq!(permission.await, Ok(Answer::Permission(true)));
+    let question = h.backend.request(RequestKind::Question {
+        question: format!("Which {SECRET}?"),
+        options: vec![format!("{SECRET} A"), "B".into()],
+        multi_select: false,
+        allow_free_text: true,
+    });
+    h.card(2).await;
+    h.messenger.owner_says(&format!("answer {SECRET}"));
+    assert!(question.await.is_ok());
+    h.backend
+        .emit(BackendEvent::Error(format!("error {SECRET}")));
+    h.backend.emit(BackendEvent::TaskStarted {
+        id: "task-1".into(),
+        description: format!("task {SECRET}"),
+        background: true,
+    });
+    h.backend.emit(BackendEvent::TaskCompleted {
+        id: "task-1".into(),
+        description: format!("task {SECRET}"),
+        status: TaskStatus::Completed,
+        background: true,
+        report: Some(format!("report {SECRET}")),
+    });
+    h.backend.turn_ended(false);
+    h.idle().await;
+    h.backend.next_prompt(Err(BackendError {
+        method: "session/prompt".into(),
+        code: "-32000".into(),
+        message: format!("failed {SECRET}"),
+        kind: ErrorKind::Other,
+    }));
+    h.messenger.owner_says(&format!("again {SECRET}"));
+    h.reply_containing(&format!("failed {SECRET}")).await;
+    settle().await;
+
+    let events = h.control_events();
+    assert!(events.contains(&ControlEvent::TurnStarted {
+        source: "prompt".into()
+    }));
+    assert!(events.contains(&ControlEvent::TurnEnded { interrupted: false }));
+    assert!(events.contains(&ControlEvent::RequestClosed {
+        kind: "question".into(),
+        outcome: "answered".into(),
+        open: 0,
+    }));
+    assert!(events.contains(&ControlEvent::Error {
+        code: "-32000".into(),
+        method: Some("session/prompt".into()),
+    }));
+    for event in &events {
+        let line = serde_json::to_string(event).unwrap();
+        assert!(!line.contains(SECRET), "{line}");
+    }
+    let status = serde_json::to_string(&h.hub.handle().status()).unwrap();
+    assert!(!status.contains(SECRET), "{status}");
+    assert!(
+        status.contains("\"lastError\":{\"code\":\"-32000\""),
+        "{status}"
     );
 }

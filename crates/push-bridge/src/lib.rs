@@ -8,6 +8,7 @@ pub mod cards;
 pub mod coda;
 pub mod commands;
 pub mod config;
+pub mod control;
 pub mod core;
 pub mod folders;
 pub mod logging;

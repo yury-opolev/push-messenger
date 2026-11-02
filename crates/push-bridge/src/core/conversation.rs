@@ -262,6 +262,7 @@ impl<M: Messenger> Core<M> {
             method = error.method.as_str(),
             code = error.code.as_str()
         );
+        self.report_error(error);
         self.reply(&error.to_string());
     }
 
@@ -277,6 +278,7 @@ impl<M: Messenger> Core<M> {
         };
         let request = self.open.remove(index);
         self.cards.close(id);
+        self.request_closed(&request.kind, "declined");
         if let Some(responder) = request.responder {
             responder.answer(Answer::Decline);
         }

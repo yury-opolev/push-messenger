@@ -2,6 +2,8 @@
 //! over a signed-in `push_sdk::Client`, and the [`TestMessenger`] tests drive the core with.
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -42,19 +44,42 @@ pub trait Messenger: Send + Sync + 'static {
         state: ActivityState,
         label: Option<&str>,
     ) -> Result<(), SdkError>;
+    /// The agent's own display name and handle, for the control channel's status.
+    async fn profile(&self) -> Option<(String, String)> {
+        None
+    }
+    /// Drops the connection and signs in again with a fresh assertion, then connects.
+    async fn reconnect(&self) -> Result<(), SdkError> {
+        Err(SdkError::Invalid("reconnect is not available".into()))
+    }
 }
+
+/// Signs the client in again and connects it (see [`Messenger::reconnect`]).
+pub type Reconnect =
+    Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Result<(), SdkError>> + Send>> + Send + Sync>;
 
 /// A [`Messenger`] over a signed-in client.
 pub struct SdkMessenger {
     client: Client,
     me: UserId,
+    reconnect: Option<Reconnect>,
 }
 
 impl SdkMessenger {
     /// `NotSignedIn` when the client has no signed-in account.
     pub fn new(client: Client) -> Result<Self, SdkError> {
         let me = client.account()?.ok_or(SdkError::NotSignedIn)?.user_id;
-        Ok(Self { client, me })
+        Ok(Self {
+            client,
+            me,
+            reconnect: None,
+        })
+    }
+
+    /// How [`Messenger::reconnect`] signs in again.
+    pub fn with_reconnect(mut self, reconnect: Reconnect) -> Self {
+        self.reconnect = Some(reconnect);
+        self
     }
 
     pub fn client(&self) -> &Client {
@@ -119,6 +144,27 @@ impl Messenger for SdkMessenger {
     ) -> Result<(), SdkError> {
         self.client.send_activity(conversation, state, label).await
     }
+
+    async fn profile(&self) -> Option<(String, String)> {
+        let profiles = match self.client.profiles(vec![self.me]).await {
+            Ok(profiles) => profiles,
+            Err(error) => {
+                tracing::debug!(event = "profile_failed", code = error.code());
+                return None;
+            }
+        };
+        profiles
+            .into_iter()
+            .find(|profile| profile.user_id == self.me)
+            .map(|profile| (profile.display_name, profile.handle))
+    }
+
+    async fn reconnect(&self) -> Result<(), SdkError> {
+        match &self.reconnect {
+            Some(reconnect) => reconnect().await,
+            None => Err(SdkError::Invalid("reconnect is not available".into())),
+        }
+    }
 }
 
 /// One call the core made on a [`TestMessenger`].
@@ -144,6 +190,8 @@ pub enum Call {
         state: ActivityState,
         label: Option<String>,
     },
+    /// Signed in again and connected.
+    Reconnect,
 }
 
 #[derive(Default)]
@@ -460,6 +508,15 @@ impl Messenger for TestMessenger {
             state,
             label: label.map(str::to_owned),
         });
+        Ok(())
+    }
+
+    async fn profile(&self) -> Option<(String, String)> {
+        Some(("Coda on Devbox".into(), "coda-devbox".into()))
+    }
+
+    async fn reconnect(&self) -> Result<(), SdkError> {
+        self.record(Call::Reconnect);
         Ok(())
     }
 }

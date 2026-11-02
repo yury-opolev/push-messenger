@@ -75,6 +75,9 @@ impl<M: Messenger> Core<M> {
             deadline: Instant::now() + CARD_TIMEOUT,
             waiting_label: plan.waiting_label,
         });
+        if let Some(request) = self.open.last() {
+            self.request_opened(&request.kind);
+        }
         self.update_activity(false).await;
     }
 
@@ -83,6 +86,7 @@ impl<M: Messenger> Core<M> {
         if let Some(card) = request.card {
             self.cards.close(card);
         }
+        self.request_closed(&request.kind, "answered");
         match request.responder {
             Some(responder) => responder.answer(answer),
             None if answer == Answer::Permission(true) => {
@@ -110,6 +114,7 @@ impl<M: Messenger> Core<M> {
             if let Some(card) = request.card {
                 self.cards.close(card);
             }
+            self.request_closed(&request.kind, "expired");
             let answer = cards::timeout_answer(&request.kind);
             if let (Some(responder), Some(answer)) = (request.responder, answer) {
                 responder.answer(answer);
@@ -133,6 +138,7 @@ impl<M: Messenger> Core<M> {
             if let Some(card) = request.card {
                 self.cards.close(card);
             }
+            self.request_closed(&request.kind, "declined");
         }
         self.reply(why);
     }
@@ -151,6 +157,7 @@ impl<M: Messenger> Core<M> {
             if let Some(card) = request.card {
                 self.cards.close(card);
             }
+            self.request_closed(&request.kind, "declined");
         }
         self.reply("Turning approvals off was cancelled: the session changed.");
     }

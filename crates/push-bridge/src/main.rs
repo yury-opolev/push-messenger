@@ -11,12 +11,16 @@ use std::time::Duration;
 
 use push_bridge::coda::CodaBackend;
 use push_bridge::config::{self, Config};
+use push_bridge::control::{Action, Calls, ControlCall, ControlHandle, ControlHub, error};
 use push_bridge::core::{Bridge, BridgeError, BridgeOptions};
 use push_bridge::folders;
 use push_bridge::logging;
-use push_bridge::messenger::{EVENT_QUEUE, SdkMessenger};
+use push_bridge::messenger::{EVENT_QUEUE, Reconnect, SdkMessenger};
 use push_bridge::state::{self, BridgeSecretStore, StateFile};
+use push_bridge_control::transport::Listener;
+use push_bridge_control::{BridgeState, Event as ControlEvent, endpoint, instance_id};
 use push_sdk::{Client, Event, Events, Platform, SdkError};
+use serde_json::json;
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 
@@ -242,6 +246,10 @@ async fn run(dir: &Path) -> Result<(), Failure> {
     if state.get().enrolled_user_id.is_none() {
         return Err(Failure::setup(ENROLL_HINT));
     }
+    let hub = config.control.then(|| ControlHub::new(instance_id(dir)));
+    let serving = hub.as_ref().and_then(serve_control);
+    let control = hub.as_ref().map(ControlHub::handle);
+    let calls = hub.as_ref().map(ControlHub::calls);
     let coda = config
         .coda
         .clone()
@@ -266,24 +274,41 @@ async fn run(dir: &Path) -> Result<(), Failure> {
 
     let (audience, device_name) = (config.audience(), config.device_name());
     let mut last_sign_in: Option<Instant> = None;
-    let result = loop {
+    let result = 'run: loop {
         if let Some(last) = last_sign_in {
+            set_state(control.as_ref(), BridgeState::Reconnecting, "offline");
             let mut stopping = stopped.clone();
-            tokio::select! {
-                () = tokio::time::sleep_until(last + SIGN_IN_INTERVAL) => {}
-                _ = stopping.wait_for(|stop| *stop) => break Ok(()),
+            loop {
+                tokio::select! {
+                    () = tokio::time::sleep_until(last + SIGN_IN_INTERVAL) => break,
+                    _ = stopping.wait_for(|stop| *stop) => break 'run Ok(()),
+                    call = next_call(calls.as_ref()) => match between_runs(call) {
+                        Between::Stop => break 'run Ok(()),
+                        Between::SignInNow => break,
+                        Between::Wait => {}
+                    },
+                }
             }
         }
         last_sign_in = Some(Instant::now());
         let mut stopping = stopped.clone();
-        let signed_in = tokio::select! {
-            signed_in = client.sign_in_with_agent_key(
-                Arc::clone(&key.signer),
-                Some(&audience),
-                &device_name,
-                Platform::Desktop,
-            ) => signed_in,
-            _ = stopping.wait_for(|stop| *stop) => break Ok(()),
+        let sign_in = client.sign_in_with_agent_key(
+            Arc::clone(&key.signer),
+            Some(&audience),
+            &device_name,
+            Platform::Desktop,
+        );
+        tokio::pin!(sign_in);
+        let signed_in = loop {
+            tokio::select! {
+                signed_in = &mut sign_in => break signed_in,
+                _ = stopping.wait_for(|stop| *stop) => break 'run Ok(()),
+                call = next_call(calls.as_ref()) => {
+                    if between_runs(call) == Between::Stop {
+                        break 'run Ok(());
+                    }
+                }
+            }
         };
         if let Err(error) = signed_in {
             tracing::warn!(event = "sign_in_failed", code = error.code());
@@ -296,13 +321,14 @@ async fn run(dir: &Path) -> Result<(), Failure> {
         if let Err(error) = client.connect() {
             break Err(Failure::general(format!("Cannot connect: {error}")));
         }
+        let reconnect = reconnect(&client, &key.signer, &audience, &device_name);
         let messenger = match SdkMessenger::new(client.clone()) {
-            Ok(messenger) => Arc::new(messenger),
+            Ok(messenger) => Arc::new(messenger.with_reconnect(reconnect)),
             Err(error) => break Err(Failure::general(format!("Cannot start: {error}"))),
         };
         let (backend_sender, backend_events) = mpsc::unbounded_channel();
         let backend = Arc::new(CodaBackend::new(coda.clone(), backend_sender));
-        let bridge = Bridge::new(
+        let mut bridge = Bridge::new(
             messenger,
             backend,
             backend_events,
@@ -310,6 +336,9 @@ async fn run(dir: &Path) -> Result<(), Failure> {
             Arc::clone(&state),
             options.clone(),
         );
+        if let (Some(control), Some(calls)) = (&control, &calls) {
+            bridge = bridge.with_control(control.clone(), Arc::clone(calls));
+        }
         let mut stopping = stopped.clone();
         let shutdown = async move {
             let _ = stopping.wait_for(|stop| *stop).await;
@@ -320,11 +349,110 @@ async fn run(dir: &Path) -> Result<(), Failure> {
             Err(error) => break Err(Failure::general(format!("The bridge stopped: {error}"))),
         }
     };
+    set_state(control.as_ref(), BridgeState::Stopping, "offline");
     if client.close().await.is_err() {
         tracing::warn!(event = "client_close_failed");
     }
+    if let Some(serving) = serving {
+        serving.abort();
+    }
     tracing::info!(event = "stopped", ok = result.is_ok());
     result
+}
+
+/// Binds the control channel's endpoint and serves it; without it (no endpoint, or
+/// another bridge on the same folder) the bridge runs on without a control channel.
+fn serve_control(hub: &ControlHub) -> Option<tokio::task::JoinHandle<()>> {
+    let id = hub.handle().status().instance;
+    let Some(endpoint) = endpoint(&id) else {
+        tracing::warn!(event = "control_unavailable", reason = "no_runtime_dir");
+        return None;
+    };
+    match Listener::bind(&endpoint) {
+        Ok(listener) => {
+            tracing::info!(event = "control_listening", instance = id.as_str());
+            Some(hub.serve(listener))
+        }
+        Err(error) => {
+            tracing::warn!(event = "control_unavailable", kind = ?error.kind());
+            None
+        }
+    }
+}
+
+/// Sets the state shown on the control channel while no bridge runs.
+fn set_state(control: Option<&ControlHandle>, state: BridgeState, connection: &str) {
+    let Some(control) = control else {
+        return;
+    };
+    if control.status().state != Some(state) {
+        control.emit(ControlEvent::StateChanged {
+            state,
+            detail: None,
+        });
+    }
+    control.update(|status| {
+        status.state = Some(state);
+        status.detail = None;
+        status.connection = Some(connection.to_owned());
+    });
+}
+
+/// Signs the client in again and connects it: the messenger's `reconnect`. A failed
+/// sign-in connects anyway, so the old session keeps working when it still can.
+fn reconnect(
+    client: &Client,
+    signer: &Arc<dyn push_sdk::AgentSigner>,
+    audience: &str,
+    device_name: &str,
+) -> Reconnect {
+    let (client, signer) = (client.clone(), Arc::clone(signer));
+    let (audience, device_name) = (audience.to_owned(), device_name.to_owned());
+    Arc::new(move || {
+        let (client, signer) = (client.clone(), Arc::clone(&signer));
+        let (audience, device_name) = (audience.clone(), device_name.clone());
+        Box::pin(async move {
+            let signed_in = client
+                .sign_in_with_agent_key(signer, Some(&audience), &device_name, Platform::Desktop)
+                .await;
+            let connected = client.connect();
+            signed_in.map(drop)?;
+            connected
+        })
+    })
+}
+
+/// The next control action while no bridge runs; never without a control channel.
+async fn next_call(calls: Option<&Calls>) -> ControlCall {
+    if let Some(calls) = calls {
+        if let Some(call) = calls.lock().await.recv().await {
+            return call;
+        }
+    }
+    std::future::pending().await
+}
+
+/// What the sign-in loop does after a control action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Between {
+    Stop,
+    SignInNow,
+    Wait,
+}
+
+/// Answers a control action that came while no bridge runs: `shutdown` stops,
+/// `reconnect` signs in now, the others wait for the bridge.
+fn between_runs(call: ControlCall) -> Between {
+    let (reply, between) = match call.action {
+        Action::Shutdown => (Ok(json!({"stopping": true})), Between::Stop),
+        Action::Reconnect => (Ok(json!({"reconnected": true})), Between::SignInNow),
+        _ => (
+            Err(error("unavailable", "the bridge is signing in")),
+            Between::Wait,
+        ),
+    };
+    let _ = call.reply.send(reply);
+    between
 }
 
 /// Forwards the client's events to the bridge loop that currently runs: the returned

@@ -48,6 +48,14 @@ pub struct Config {
     /// Required when `backend` is `coda`.
     #[serde(default)]
     pub coda: Option<CodaConfig>,
+    /// Serves the local control channel (the tray's status and actions); `false` turns
+    /// it off.
+    #[serde(default = "yes")]
+    pub control: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 /// The agent's signing key.
@@ -358,6 +366,15 @@ mod tests {
         assert_eq!(config.default_permission_mode, PermissionMode::Default);
         assert_eq!(config.backend, BackendKind::Coda);
         assert!(!config.device_name().is_empty());
+        assert!(config.control);
+    }
+
+    #[test]
+    fn the_control_channel_can_be_turned_off() {
+        let fixture = fixture();
+        let mut config = minimal(&fixture);
+        config["control"] = json!(false);
+        assert!(!load(&fixture, &config).unwrap().control);
     }
 
     #[test]

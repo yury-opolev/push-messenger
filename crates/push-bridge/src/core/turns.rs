@@ -45,16 +45,18 @@ impl<M: Messenger> Core<M> {
                 label,
                 text,
             } => self.agent_message(cursor, &label, &text),
-            BackendEvent::TaskStarted { background, .. } => {
+            BackendEvent::TaskStarted { id, background, .. } => {
                 tracing::debug!(event = "task_started", background);
+                self.running_tasks.insert(id);
             }
             BackendEvent::TaskCompleted {
+                id,
                 description,
                 status,
                 background,
                 report,
-                ..
             } => {
+                self.running_tasks.remove(&id);
                 if background {
                     self.task_completed(&description, status, report.as_deref());
                 }
@@ -79,6 +81,7 @@ impl<M: Messenger> Core<M> {
 
     async fn begin_turn(&mut self, source: TurnSource) {
         tracing::info!(event = "turn_started", source = ?source);
+        self.report_turn_started(source);
         if let Some(mut turn) = self.turn.take() {
             let updates = turn.renderer.finish(false);
             self.apply(&mut turn.pages, updates);
@@ -128,6 +131,7 @@ impl<M: Messenger> Core<M> {
 
     async fn end_turn(&mut self, interrupted: bool) {
         tracing::info!(event = "turn_ended", interrupted);
+        self.report_turn_ended(interrupted);
         if let Some(mut turn) = self.turn.take() {
             let updates = turn.renderer.finish(interrupted);
             self.apply(&mut turn.pages, updates);
@@ -234,18 +238,23 @@ impl<M: Messenger> Core<M> {
             .or_else(|| allowed(default).ok())
             .unwrap_or_else(|| default.clone());
         self.folder = folder;
-        self.start_or_retry(false).await;
+        let _ = self.start_or_retry(None).await;
     }
 
     /// The restart timer fired.
     pub(super) async fn restart(&mut self) {
         self.restart_at = None;
-        let announce = self.announce_restart;
-        self.start_or_retry(announce).await;
+        let announce = self.announce_restart.then_some("restarted");
+        let _ = self.start_or_retry(announce).await;
     }
 
     /// Starts the current folder's stored session; on failure, retries with backoff.
-    async fn start_or_retry(&mut self, announce: bool) {
+    /// With `announce`, a success says how the backend came back ("<name> <announce>.")
+    /// and what that lost.
+    pub(super) async fn start_or_retry(
+        &mut self,
+        announce: Option<&str>,
+    ) -> Result<(), BackendError> {
         let stored = self.stored_session(&self.folder.clone());
         let folder = self.folder.clone();
         match self
@@ -256,26 +265,30 @@ impl<M: Messenger> Core<M> {
                 let was_failing = std::mem::take(&mut self.start_failing);
                 self.announce_restart = false;
                 self.adopt(folder, started).await;
-                if announce {
-                    self.reply(&self.restarted_note());
+                if let Some(how) = announce {
+                    self.reply(&self.restarted_note(how));
                 } else if was_failing {
                     self.reply(&format!("{} started.", self.name));
                 }
                 self.send_queued();
+                Ok(())
             }
             Err(error) => {
                 tracing::warn!(event = "backend_start_failed", code = error.code.as_str());
+                self.report_error(&error);
                 if !std::mem::replace(&mut self.start_failing, true) {
                     self.reply(&format!("{error}; retrying."));
                 }
-                self.announce_restart = announce;
+                self.announce_restart = announce.is_some();
                 self.schedule_restart();
+                Err(error)
             }
         }
     }
 
-    /// "<name> restarted." and what the restart lost, by the backend's capabilities.
-    fn restarted_note(&self) -> String {
+    /// "<name> <how>." (such as "restarted") and what the restart lost, by the
+    /// backend's capabilities.
+    fn restarted_note(&self, how: &str) -> String {
         let mut lost = Vec::new();
         if self.has(Capability::AgentMessages) {
             lost.push("undelivered background messages");
@@ -283,7 +296,7 @@ impl<M: Messenger> Core<M> {
         if self.has(Capability::Schedules) {
             lost.push("in-memory schedules");
         }
-        let mut note = format!("{} restarted.", self.name);
+        let mut note = format!("{} {how}.", self.name);
         if !lost.is_empty() {
             let lost = lost.join(" and ");
             let mut chars = lost.chars();
@@ -311,23 +324,7 @@ impl<M: Messenger> Core<M> {
     async fn exited(&mut self) {
         tracing::warn!(event = "backend_exited");
         let note = format!("({} stopped; restarting)", self.name);
-        match self.turn.take() {
-            Some(mut turn) => {
-                turn.renderer.note(&note);
-                let updates = turn.renderer.finish(false);
-                self.apply(&mut turn.pages, updates);
-            }
-            None => self.reply(&note),
-        }
-        self.close_backend_requests(&format!("Declined: {} stopped.", self.name));
-        if std::mem::take(&mut self.new_after_turn) {
-            // The `/new` that waited for the turn: the restart starts the new session.
-            let key = folder_key(&self.folder);
-            self.save(|state| {
-                state.sessions.remove(&key);
-            });
-            self.mode = self.options.default_mode;
-        }
+        self.backend_gone(&note, &format!("Declined: {} stopped.", self.name));
         let now = Instant::now();
         if self
             .running_since
@@ -339,6 +336,31 @@ impl<M: Messenger> Core<M> {
         self.announce_restart = true;
         self.schedule_restart();
         self.update_activity(false).await;
+    }
+
+    /// The backend is gone (it stopped, or is restarted): the running turn ends with
+    /// `note` (else `note` is a reply), its requests are declined saying `declined`, and
+    /// a `/new` that waited for the turn makes the next start a new session.
+    pub(super) fn backend_gone(&mut self, note: &str, declined: &str) {
+        match self.turn.take() {
+            Some(mut turn) => {
+                turn.renderer.note(note);
+                let updates = turn.renderer.finish(false);
+                self.apply(&mut turn.pages, updates);
+                self.report_turn_ended(true);
+            }
+            None => self.reply(note),
+        }
+        self.close_backend_requests(declined);
+        self.running_tasks.clear();
+        if std::mem::take(&mut self.new_after_turn) {
+            // The `/new` that waited for the turn: the restart starts the new session.
+            let key = folder_key(&self.folder);
+            self.save(|state| {
+                state.sessions.remove(&key);
+            });
+            self.mode = self.options.default_mode;
+        }
     }
 
     pub(super) fn stored_session(&self, folder: &std::path::Path) -> Option<String> {
@@ -399,6 +421,7 @@ impl<M: Messenger> Core<M> {
         self.engine_instance = started.engine_instance;
         self.version = started.version;
         self.running_since = Some(Instant::now());
+        self.running_tasks.clear();
         if same_engine {
             self.fetch_pending().await;
         }

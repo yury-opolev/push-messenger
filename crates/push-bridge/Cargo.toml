@@ -15,6 +15,7 @@ path = "src/main.rs"
 [dependencies]
 async-trait.workspace = true
 push-agent-key.workspace = true
+push-bridge-control.workspace = true
 push-domain.workspace = true
 push-sdk.workspace = true
 regex.workspace = true
