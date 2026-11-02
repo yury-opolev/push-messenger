@@ -8,6 +8,7 @@
 use std::collections::BTreeSet;
 use std::fmt;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
@@ -93,6 +94,8 @@ pub struct StartOptions {
     /// The session to resume; `None` starts a new one.
     pub session: Option<String>,
     pub permission_mode: PermissionMode,
+    /// Restore the state the backend saved before a planned restart.
+    pub restore: bool,
 }
 
 /// A started (or resumed) session.
@@ -103,6 +106,30 @@ pub struct Started {
     /// only from the same instance.
     pub engine_instance: Option<String>,
     pub version: Option<String>,
+    /// What the backend restored after a planned restart; `None` when it restored nothing
+    /// (or was not asked to).
+    pub restored: Option<Restored>,
+}
+
+/// What a backend restored after a planned restart: counts and setting names only.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Restored {
+    pub schedules: usize,
+    pub messages: usize,
+    /// The restored settings' names, such as `model` or `goal`.
+    pub settings: Vec<String>,
+    pub interrupted_tasks: usize,
+    pub steering: usize,
+}
+
+/// How a backend prepared for a planned restart.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Prepared {
+    /// Running work finished before the backend saved its state.
+    pub drained: bool,
+    /// Tasks still running when the drain time was up; the backend reports them after
+    /// the restart.
+    pub interrupted_tasks: usize,
 }
 
 /// What kind of failure a [`BackendError`] is.
@@ -116,6 +143,10 @@ pub enum ErrorKind {
     NotRunning,
     /// The agent refused the call, for example while busy or for bad arguments.
     Refused,
+    /// The backend has no such method (an older version).
+    Unsupported,
+    /// The backend is draining for a restart.
+    RestartPending,
     Other,
 }
 
@@ -339,6 +370,29 @@ pub trait Backend: Send + Sync + 'static {
         after: Option<u64>,
         engine_instance: Option<&str>,
     ) -> Result<PendingMessages, BackendError>;
+    /// Saves the backend's state for a restart after letting running work finish (up to
+    /// `drain`). [`ErrorKind::Unsupported`] when the backend cannot (the default).
+    async fn prepare_restart(
+        &self,
+        _drain: Duration,
+        _reason: Option<&str>,
+    ) -> Result<Prepared, BackendError> {
+        Err(unsupported("session/prepareRestart"))
+    }
+    /// The program file the backend runs, for upgrade detection; `None` when unknown.
+    fn executable(&self) -> Option<PathBuf> {
+        None
+    }
+}
+
+/// A [`ErrorKind::Unsupported`] error for `method`.
+pub fn unsupported(method: &str) -> BackendError {
+    BackendError {
+        method: method.to_owned(),
+        code: "unsupported".to_owned(),
+        message: "not supported by this backend".to_owned(),
+        kind: ErrorKind::Unsupported,
+    }
 }
 
 /// `<n chars>`: how much text there is, never the text.

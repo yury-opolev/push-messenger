@@ -15,6 +15,7 @@ fn options(folder: &str, session: Option<&str>, mode: PermissionMode) -> StartOp
         folder: PathBuf::from(folder),
         session: session.map(str::to_owned),
         permission_mode: mode,
+        restore: false,
     }
 }
 
@@ -97,8 +98,10 @@ async fn initialize_negotiates_state_events_and_reports_the_session() {
             session_id: "s-1".into(),
             engine_instance: Some("engine-1".into()),
             version: Some("coda (contract 2026-09-1)".into()),
+            restored: None,
         }
     );
+    assert!(params.get("restore").is_none(), "{params}");
     assert_eq!(params["protocolVersion"], "1");
     assert_eq!(params["clientInfo"], CLIENT_INFO);
     assert_eq!(params["clientCapabilities"], json!({ "stateEvents": true }));
@@ -936,5 +939,197 @@ async fn status_reads_model_tasks_and_version() {
             version: Some("coda (contract 2026-09-1)".into()),
             running_tasks: Some(1),
         }
+    );
+}
+
+impl Harness {
+    fn prepare(
+        &self,
+        drain: Duration,
+        reason: Option<&str>,
+    ) -> tokio::task::JoinHandle<Result<Prepared, BackendError>> {
+        let backend = Arc::clone(&self.backend);
+        let reason = reason.map(str::to_owned);
+        tokio::spawn(async move { backend.prepare_restart(drain, reason.as_deref()).await })
+    }
+}
+
+#[tokio::test]
+async fn prepare_restart_sends_the_drain_and_reads_counts() {
+    let mut h = harness();
+    let mut fake = h.running().await;
+    let prepare = h.prepare(Duration::from_secs(5), Some("upgrade"));
+    let (id, params) = within(fake.expect("session/prepareRestart")).await;
+    assert_eq!(params, json!({"drainTimeoutMs": 5000, "reason": "upgrade"}));
+    fake.notify("event/lifecycle", json!({"lifecycle": "draining"}))
+        .await;
+    fake.respond(
+        &id,
+        json!({"ok": true, "restartFile": "r.json", "drained": false, "interruptedTasks": 2}),
+    )
+    .await;
+    assert_eq!(
+        within(prepare).await.unwrap().unwrap(),
+        Prepared {
+            drained: false,
+            interrupted_tasks: 2,
+        }
+    );
+    h.no_event().await;
+}
+
+#[tokio::test]
+async fn prepare_restart_counts_arrays_and_defaults_to_drained() {
+    let mut h = harness();
+    let mut fake = h.running().await;
+    let prepare = h.prepare(Duration::from_millis(1500), None);
+    let (id, params) = within(fake.expect("session/prepareRestart")).await;
+    assert_eq!(params, json!({"drainTimeoutMs": 1500}));
+    fake.respond(
+        &id,
+        json!({"ok": true, "interruptedTasks": [{"id": "a"}, {"id": "b"}]}),
+    )
+    .await;
+    assert_eq!(
+        within(prepare).await.unwrap().unwrap(),
+        Prepared {
+            drained: true,
+            interrupted_tasks: 2,
+        }
+    );
+}
+
+#[tokio::test]
+async fn prepare_restart_on_an_older_coda_is_unsupported() {
+    let mut h = harness();
+    let mut fake = h.running().await;
+    let prepare = h.prepare(Duration::from_secs(1), None);
+    let (id, _) = within(fake.expect("session/prepareRestart")).await;
+    fake.respond_error(&id, -32601, "method not found").await;
+    let error = within(prepare).await.unwrap().unwrap_err();
+    assert_eq!(error.kind, ErrorKind::Unsupported);
+    assert_eq!(
+        (error.method.as_str(), error.code.as_str()),
+        ("session/prepareRestart", "-32601")
+    );
+}
+
+#[tokio::test]
+async fn a_refused_prepare_restart_is_refused() {
+    let mut h = harness();
+    let mut fake = h.running().await;
+    let prepare = h.prepare(Duration::from_secs(1), None);
+    let (id, _) = within(fake.expect("session/prepareRestart")).await;
+    fake.respond(&id, json!({"ok": false, "error": "cannot save"}))
+        .await;
+    let error = within(prepare).await.unwrap().unwrap_err();
+    assert_eq!(
+        (error.kind, error.message.as_str()),
+        (ErrorKind::Refused, "cannot save")
+    );
+}
+
+#[tokio::test]
+async fn a_prompt_while_draining_is_restart_pending() {
+    let mut h = harness();
+    let mut fake = h.running().await;
+    let prompt = h.prompt("later");
+    let (id, _) = within(fake.expect("session/prompt")).await;
+    fake.respond_error(&id, -32012, "restart pending (busy draining)")
+        .await;
+    let error = within(prompt).await.unwrap().unwrap_err();
+    assert_eq!(error.kind, ErrorKind::RestartPending);
+    assert_eq!(error.code, "-32012");
+}
+
+#[tokio::test]
+async fn initialize_with_restore_asks_for_it_and_reads_what_came_back() {
+    let mut h = harness();
+    let backend = Arc::clone(&h.backend);
+    let mut start_options = options("/work/a", Some("s-1"), PermissionMode::Default);
+    start_options.restore = true;
+    let start = tokio::spawn(async move { backend.start(start_options).await });
+    let mut fake = within(h.fakes.recv()).await.expect("a spawn");
+    let (id, params) = within(fake.expect("initialize")).await;
+    assert_eq!(params["restore"], true);
+    assert_eq!(params["sessionId"], "s-1");
+    let mut result = FakeCoda::initialize_result("s-1");
+    result["restored"] = json!({
+        "schedules": 2,
+        "messages": [{"cursor": 1}],
+        "settings": ["model", "goal", "bypassPermissions"],
+        "interruptedTasks": [{"id": "t"}],
+        "steering": 0,
+    });
+    fake.respond(&id, result).await;
+    let started = within(start).await.unwrap().unwrap();
+    assert_eq!(
+        started.restored,
+        Some(Restored {
+            schedules: 2,
+            messages: 1,
+            settings: vec!["model".into(), "goal".into(), "bypassPermissions".into()],
+            interrupted_tasks: 1,
+            steering: 0,
+        })
+    );
+}
+
+#[test]
+fn restored_is_read_leniently() {
+    assert_eq!(restored(&json!({"sessionId": "s"})), None);
+    assert_eq!(restored(&json!({"restored": null})), None);
+    assert_eq!(
+        restored(&json!({"restored": {}})),
+        Some(Restored::default())
+    );
+    assert_eq!(
+        restored(&json!({"restored": {
+            "settings": {"model": "x", "effort": "high"},
+            "steering": [1, 2, 3],
+            "schedules": "many",
+        }})),
+        Some(Restored {
+            settings: vec!["effort".into(), "model".into()],
+            steering: 3,
+            ..Restored::default()
+        })
+    );
+}
+
+#[test]
+fn prepared_is_read_leniently() {
+    assert_eq!(
+        prepared(&json!({})),
+        Prepared {
+            drained: true,
+            interrupted_tasks: 0,
+        }
+    );
+    assert_eq!(
+        prepared(&json!({"drained": "no", "interruptedTasks": 3})),
+        Prepared {
+            drained: true,
+            interrupted_tasks: 3,
+        }
+    );
+}
+
+#[test]
+fn the_executable_is_known_only_when_set() {
+    let (sender, _events) = mpsc::unbounded_channel();
+    let (launcher, _fakes) = FakeLauncher::new();
+    let backend = CodaBackend::with_launcher(launcher.clone(), sender.clone());
+    assert_eq!(backend.executable(), None);
+    let backend = CodaBackend::with_launcher(launcher, sender.clone())
+        .with_executable(PathBuf::from("c.exe"));
+    assert_eq!(backend.executable(), Some(PathBuf::from("c.exe")));
+    let config = CodaConfig {
+        exe: PathBuf::from("coda"),
+        args: Vec::new(),
+    };
+    assert_eq!(
+        CodaBackend::new(config, sender).executable(),
+        Some(PathBuf::from("coda"))
     );
 }

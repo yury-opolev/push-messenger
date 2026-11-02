@@ -380,6 +380,7 @@ impl<M: Messenger> Core<M> {
             folder,
             session,
             permission_mode: mode,
+            restore: false,
         };
         match self.backend.start(options.clone()).await {
             Err(error)
