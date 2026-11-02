@@ -296,14 +296,15 @@ pub fn plan_switch(found: &[TaskFor]) -> SwitchPlan {
     SwitchPlan { steps }
 }
 
-/// Runs `plan` in order and stops at the first failure: a task that could not be stopped
-/// or removed leaves the tray's autostart off and the instances unmarked (never both).
-/// The caller saves `config`.
+/// Runs `plan`'s side effects in order and stops at the first failure: a task that could
+/// not be stopped or removed leaves the tray's autostart off. It does not touch the tray
+/// config: only once this succeeded does the caller [`apply_switch`] to the config as it is
+/// then (not a copy taken before the slow steps) and save it, so the instances are never
+/// marked without the tasks being gone.
 pub fn execute_switch(
     plan: &SwitchPlan,
     scheduler: &dyn Scheduler,
     autostart: &dyn Autostart,
-    config: &mut TrayConfig,
     start: &mut dyn FnMut(&Path),
 ) -> io::Result<()> {
     for step in &plan.steps {
@@ -317,18 +318,26 @@ pub fn execute_switch(
                 scheduler.unregister(task)?;
             }
             Step::EnableTrayAutostart => autostart.set(true)?,
-            Step::MarkAutostart(dir) => {
-                if !config.set_autostart(dir, true) {
-                    config.instances.push(Instance {
-                        dir: dir.clone(),
-                        autostart: true,
-                    });
-                }
-            }
+            Step::MarkAutostart(_) => {}
             Step::StartBridge(dir) => start(dir),
         }
     }
     Ok(())
+}
+
+/// Applies `plan`'s config edits to `config`: marks each switched instance autostart,
+/// adding it if absent. Every other instance (one added while the switch ran, say) is kept.
+pub fn apply_switch(plan: &SwitchPlan, config: &mut TrayConfig) {
+    for step in &plan.steps {
+        if let Step::MarkAutostart(dir) = step {
+            if !config.set_autostart(dir, true) {
+                config.instances.push(Instance {
+                    dir: dir.clone(),
+                    autostart: true,
+                });
+            }
+        }
+    }
 }
 
 /// The Scheduled Tasks of the current user.
@@ -812,20 +821,16 @@ mod tests {
         };
         let mut config = config_with(&["d1", "d2"]);
         let mut started = Vec::new();
-        execute_switch(
-            &plan_switch(&found_two()),
-            &scheduler,
-            &autostart,
-            &mut config,
-            &mut |dir: &Path| {
-                scheduler
-                    .calls
-                    .borrow_mut()
-                    .push(format!("start {}", dir.display()));
-                started.push(dir.to_path_buf());
-            },
-        )
+        let plan = plan_switch(&found_two());
+        execute_switch(&plan, &scheduler, &autostart, &mut |dir: &Path| {
+            scheduler
+                .calls
+                .borrow_mut()
+                .push(format!("start {}", dir.display()));
+            started.push(dir.to_path_buf());
+        })
         .unwrap();
+        apply_switch(&plan, &mut config);
         assert_eq!(
             *scheduler.calls.borrow(),
             [
@@ -844,7 +849,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failing_unregister_leaves_autostart_off_and_instances_unmarked() {
+    fn a_failing_unregister_leaves_autostart_off() {
         let scheduler = FakeScheduler {
             fail_unregister: Some("t2".into()),
             ..FakeScheduler::default()
@@ -853,13 +858,11 @@ mod tests {
             calls: &scheduler.calls,
             on: RefCell::new(false),
         };
-        let mut config = config_with(&["d1", "d2"]);
         let mut started = 0;
         let result = execute_switch(
             &plan_switch(&found_two()),
             &scheduler,
             &autostart,
-            &mut config,
             &mut |_: &Path| started += 1,
         );
         assert!(result.is_err());
@@ -873,8 +876,28 @@ mod tests {
             ]
         );
         assert!(!autostart.enabled().unwrap());
-        assert!(config.instances.iter().all(|instance| !instance.autostart));
         assert_eq!(started, 0);
+    }
+
+    #[test]
+    fn the_switch_marks_its_instances_and_keeps_one_added_meanwhile() {
+        let plan = plan_switch(&found_two());
+        // d1 was in the config when the switch began; d2 was not; d3 was added while it ran.
+        let mut config = config_with(&["d1", "d3"]);
+        apply_switch(&plan, &mut config);
+        let instances: Vec<(PathBuf, bool)> = config
+            .instances
+            .iter()
+            .map(|instance| (instance.dir.clone(), instance.autostart))
+            .collect();
+        assert_eq!(
+            instances,
+            [
+                (PathBuf::from("d1"), true),
+                (PathBuf::from("d3"), false),
+                (PathBuf::from("d2"), true),
+            ]
+        );
     }
 
     #[test]

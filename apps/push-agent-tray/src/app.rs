@@ -517,6 +517,9 @@ fn add_folder(app: &AppHandle) {
     if !config_writable(app) {
         return;
     }
+    if refuse_while_switching(app) {
+        return;
+    }
     let handle = app.clone();
     app.dialog()
         .file()
@@ -529,10 +532,26 @@ fn add_folder(app: &AppHandle) {
         });
 }
 
+const SWITCHING: &str = "A switch-over is running. Try again once it has finished.";
+
+/// Tells the user to try again when a switch-over is running (it rewrites tray.json).
+fn refuse_while_switching(app: &AppHandle) -> bool {
+    let switching = app.state::<Shell>().state().switching;
+    if switching {
+        message(app, SWITCHING, MessageDialogKind::Info);
+    }
+    switching
+}
+
 async fn add_dir(app: AppHandle, dir: PathBuf) {
     let added = {
         let shell = app.state::<Shell>();
         let mut state = shell.state();
+        if state.switching {
+            drop(state);
+            message(&app, SWITCHING, MessageDialogKind::Info);
+            return;
+        }
         let mut config = state.config.clone();
         match config.add(&dir) {
             Ok(true) => config.save(&shell.config_path).map(|()| {
@@ -622,13 +641,13 @@ async fn switch_over(app: AppHandle) {
     let worker = app.clone();
     let outcome = tauri::async_runtime::spawn_blocking(move || {
         let shell = worker.state::<Shell>();
-        let (mut config, found) = {
+        let found = {
             let mut state = shell.state();
             if state.switching {
                 return None;
             }
             state.switching = true;
-            (state.config.clone(), state.found.clone())
+            state.found.clone()
         };
         shell.request_refresh();
         let plan = schedtask::plan_switch(&found);
@@ -637,21 +656,27 @@ async fn switch_over(app: AppHandle) {
             &plan,
             &PowerShellScheduler,
             shell.autostart.as_ref(),
-            &mut config,
             &mut |dir| started.push(dir.to_path_buf()),
         );
-        let executed_ok = executed.is_ok();
-        let saved = match executed {
-            Ok(()) => config.save(&shell.config_path).map_err(io::Error::other),
-            Err(error) => Err(error),
-        };
-        let found = scan(&dirs(&config), &shell.default_dir);
         let tray_autostart = shell.autostart.enabled().unwrap_or(false);
+        // The config may have changed during the slow steps: edit the current one.
+        let (saved, scan_dirs) = {
+            let mut state = shell.state();
+            let saved = match executed {
+                Ok(()) => {
+                    let mut config = state.config.clone();
+                    schedtask::apply_switch(&plan, &mut config);
+                    let saved = config.save(&shell.config_path).map_err(io::Error::other);
+                    state.config = config;
+                    saved
+                }
+                Err(error) => Err(error),
+            };
+            (saved, dirs(&state.config))
+        };
+        let found = scan(&scan_dirs, &shell.default_dir);
         {
             let mut state = shell.state();
-            if executed_ok {
-                state.config = config;
-            }
             state.found = found;
             state.tray_autostart = tray_autostart;
             state.switching = false;

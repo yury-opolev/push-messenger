@@ -29,7 +29,9 @@ describes an MSI (`cargo tauri build`), which installs per machine.
 ## Security
 
 No network listener and no remote content: the details window loads only the bundled
-page under a strict CSP, has only Tauri's core default permissions
-(`capabilities/default.json`), and talks to the app through the one `details` command,
-which returns states, names, counts and error codes only. The page renders with
+page under a strict CSP, is granted no permissions at all (`capabilities/default.json`:
+no core or plugin command, so no tray, menu, image, event or window API), and talks to the
+app through the one `details` command, which returns states, names, counts and error codes
+only. That app command needs no permission: Tauri checks app commands against the ACL only
+when the app ships an ACL manifest (this one does not) or the origin is remote. The page renders with
 `textContent`, never HTML.
