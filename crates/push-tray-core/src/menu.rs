@@ -206,7 +206,10 @@ fn agent_menu(view: &InstanceView) -> Item {
 pub fn enabled(view: &InstanceView, action: MenuAction) -> bool {
     let state = &view.state;
     if *state == AgentState::NotSetUp {
-        return matches!(action, MenuAction::OpenFolder | MenuAction::Details);
+        return matches!(
+            action,
+            MenuAction::Start | MenuAction::OpenFolder | MenuAction::Details
+        );
     }
     let running = matches!(
         state,
@@ -486,7 +489,11 @@ mod tests {
                 false,
                 &["start", "open_log", "open_folder", "details"],
             ),
-            (AgentState::NotSetUp, false, &["open_folder", "details"]),
+            (
+                AgentState::NotSetUp,
+                false,
+                &["start", "open_folder", "details"],
+            ),
         ];
         for (state, connected, expected) in cases {
             let menu = build(
@@ -513,7 +520,7 @@ mod tests {
             items[0],
             Item::Info("Not set up: run keygen and enroll".into())
         );
-        assert_eq!(enabled_ids(items), ["open_folder", "details"]);
+        assert_eq!(enabled_ids(items), ["start", "open_folder", "details"]);
     }
 
     #[test]
