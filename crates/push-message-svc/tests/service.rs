@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use prost::Message;
-use push_message_svc::{Config, Listeners, serve};
+use push_message_svc::{CallsConfig, Config, Listeners, serve};
 use push_proto::internal::v1::accounts_client::AccountsClient;
 use push_proto::internal::v1::directory_client::DirectoryClient;
 use push_proto::internal::v1::messaging_client::MessagingClient;
@@ -103,6 +103,10 @@ async fn start() -> Running {
         accounts_token: Some(ACCOUNTS_TOKEN.to_owned()),
         directory_token: Some(DIRECTORY_TOKEN.to_owned()),
         messaging_token: Some(MESSAGING_TOKEN.to_owned()),
+        calls: CallsConfig {
+            enabled: true,
+            ..CallsConfig::default()
+        },
     };
     let shutdown = CancellationToken::new();
     let server = tokio::spawn(serve(
@@ -252,6 +256,7 @@ async fn shutdown_is_honoured_while_the_database_is_unreachable() {
         accounts_token: None,
         directory_token: None,
         messaging_token: None,
+        calls: CallsConfig::default(),
     };
     let shutdown = CancellationToken::new();
     let server = tokio::spawn(serve(
@@ -266,6 +271,8 @@ async fn shutdown_is_honoured_while_the_database_is_unreachable() {
     ));
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(get(health_addr, "/readyz").await.0, 503);
+    // Calls are disabled: no call families.
+    assert_eq!(get(health_addr, "/metrics").await, (200, String::new()));
 
     let started = std::time::Instant::now();
     shutdown.cancel();
@@ -306,6 +313,10 @@ async fn a_message_goes_from_send_to_ack_and_rings_the_recipient() {
         get(running.health, "/readyz").await,
         (200, "ready".to_owned())
     );
+    let (status, metrics) = get(running.health, "/metrics").await;
+    assert_eq!(status, 200);
+    assert!(metrics.contains("push_calls_live 0\n"), "{metrics}");
+    assert!(metrics.contains("# TYPE push_calls_started_total counter\n"));
 
     let url = format!("http://{}", running.grpc);
     let mut accounts = accounts_client(format!("http://{}", running.accounts)).await;
@@ -449,7 +460,16 @@ async fn accounts_are_served_only_with_the_workers_token() {
         Ok(request)
     });
     accounts.device_registered(event.clone()).await.unwrap();
-    messaging.identify(identify.clone()).await.unwrap();
+    let identified = messaging
+        .identify(identify.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    // Calls are enabled in these tests: message-svc offers them.
+    assert_eq!(
+        identified.capabilities,
+        [push_proto::v1::Capability::Calls as i32]
+    );
 
     // A revocation kicks the device through its Redis channel.
     let mut bell = redis::Client::open(running.redis_url.as_str())

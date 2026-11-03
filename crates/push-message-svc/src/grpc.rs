@@ -16,10 +16,11 @@ use push_proto::internal::v1::{
     SyncRequest, SyncResponse, VisibleUsersRequest, VisibleUsersResponse, accounts_server,
     directory_server, messaging_server,
 };
-use push_proto::v1::{CallSync, ContentType, ErrorCode, SendAck};
+use push_proto::v1::{CallSync, Capability, ContentType, ErrorCode, SendAck};
 use tonic::service::Interceptor;
 use tonic::{Request, Response, Status};
 
+use crate::calls::CallsApi;
 use crate::convert::{
     activity_state_from_wire, deliver, domain_error, from_micros, invalid, parse_id, send_ack,
 };
@@ -31,6 +32,7 @@ use crate::requests;
 pub struct MessagingApi<S, C, N> {
     messaging: Arc<Messaging<S, C, N>>,
     presence: Arc<dyn PresenceStates>,
+    calls: Option<Arc<dyn CallsApi>>,
 }
 
 impl<S, C, N> MessagingApi<S, C, N> {
@@ -48,7 +50,19 @@ impl<S, C, N> MessagingApi<S, C, N> {
         Self {
             messaging,
             presence,
+            calls: None,
         }
+    }
+
+    /// With the call engine: `Identify` offers `CAPABILITY_CALLS` and the call RPCs run
+    /// on `calls`. Without it they answer `FAILED_PRECONDITION` `NOT_AVAILABLE`.
+    pub fn with_calls(mut self, calls: Arc<dyn CallsApi>) -> Self {
+        self.calls = Some(calls);
+        self
+    }
+
+    fn calls(&self) -> Result<&dyn CallsApi, Status> {
+        self.calls.as_deref().ok_or_else(calls_not_available)
     }
 }
 
@@ -73,7 +87,11 @@ where
             .await
             .map_err(domain_error)?;
         Ok(Response::new(IdentifyResponse {
-            capabilities: Vec::new(),
+            capabilities: if self.calls.is_some() {
+                vec![Capability::Calls.into()]
+            } else {
+                Vec::new()
+            },
         }))
     }
 
@@ -203,22 +221,29 @@ where
         Ok(Response::new(AnnouncePresenceResponse {}))
     }
 
-    async fn call(&self, _request: Request<CallRequest>) -> Result<Response<CallReply>, Status> {
-        Err(calls_not_available())
+    async fn call(&self, request: Request<CallRequest>) -> Result<Response<CallReply>, Status> {
+        self.calls()?
+            .call(request.into_inner())
+            .await
+            .map(Response::new)
     }
 
     async fn call_attach(
         &self,
-        _request: Request<CallDeviceRequest>,
+        request: Request<CallDeviceRequest>,
     ) -> Result<Response<CallSync>, Status> {
-        Err(calls_not_available())
+        self.calls()?
+            .attach(request.into_inner())
+            .await
+            .map(Response::new)
     }
 
     async fn call_detach(
         &self,
-        _request: Request<CallDeviceRequest>,
+        request: Request<CallDeviceRequest>,
     ) -> Result<Response<CallDetachResponse>, Status> {
-        Err(calls_not_available())
+        self.calls()?.detach(request.into_inner()).await?;
+        Ok(Response::new(CallDetachResponse {}))
     }
 }
 

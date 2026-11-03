@@ -11,6 +11,7 @@ use push_proto::v1::ActivityEvent;
 use push_proto::{id_bytes, kick_channel, notify_channel};
 use redis::aio::ConnectionManager;
 
+use crate::calls::RedisCalls;
 use crate::convert::{activity_state_to_wire, contact_state, presence};
 use crate::presence::RedisPresence;
 
@@ -47,6 +48,19 @@ impl RedisNotifier {
     /// The presence reader on this notifier's connection.
     pub fn presence(&self) -> RedisPresence {
         RedisPresence::new(self.connection.clone())
+    }
+
+    /// The call state store on this notifier's connection.
+    pub fn calls(&self) -> RedisCalls {
+        RedisCalls::new(self.connection.clone())
+    }
+
+    /// Publishes prepared `(channel, payload)` messages in one pipeline.
+    pub(crate) async fn publish_raw(
+        &self,
+        messages: &[(String, Vec<u8>)],
+    ) -> redis::RedisResult<()> {
+        self.send(messages).await
     }
 
     async fn send(&self, messages: &[(String, Vec<u8>)]) -> redis::RedisResult<()> {

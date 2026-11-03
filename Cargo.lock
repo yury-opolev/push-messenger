@@ -2449,6 +2449,7 @@ dependencies = [
  "push-proto",
  "push-store",
  "redis",
+ "serde_json",
  "testcontainers-modules",
  "thiserror",
  "tokio",

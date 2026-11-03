@@ -6,7 +6,8 @@ use std::time::Duration;
 use anyhow::Context;
 use axum::Router;
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{StatusCode, header};
+use axum::response::IntoResponse;
 use axum::routing::get;
 use push_credentials::startup::{redis_permanent, retry};
 use push_credentials::{AuthMode, AzureConfig, RedisConnector};
@@ -21,8 +22,10 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tokio_util::sync::CancellationToken;
 
 use crate::Listeners;
+use crate::calls::{CallService, CallsApi, RedisCalls};
 use crate::config::{Config, MigrateConfig};
 use crate::grpc::{AccountsApi, DirectoryApi, InternalToken, MessagingApi};
+use crate::metrics::Metrics;
 use crate::notify::RedisNotifier;
 use crate::templates::{TemplatesApi, seed_builtins, seeding_is_permanent};
 
@@ -35,7 +38,9 @@ const RETRY_DELAY: Duration = Duration::from_secs(2);
 /// The health endpoints answer at once: `/healthz` always, `/readyz` only once the
 /// database is migrated and answers a ping, Redis has connected and the built-in templates
 /// are seeded, and never after shutdown began. Postgres, Redis and seeding are retried
-/// until they succeed, so the service may start before its datastores.
+/// until they succeed, so the service may start before its datastores. `/metrics` serves
+/// the call metrics in the Prometheus text format (empty with calls disabled). With calls
+/// enabled the call sweeper runs beside the APIs until shutdown.
 pub async fn serve(
     config: Config,
     listeners: Listeners,
@@ -50,6 +55,10 @@ pub async fn serve(
     let ready = Health {
         store: Arc::new(OnceLock::new()),
         shutdown: shutdown.clone(),
+        calls: config.calls.enabled.then(|| CallsHealth {
+            metrics: Arc::new(Metrics::new()),
+            redis: Arc::new(OnceLock::new()),
+        }),
     };
     let health_server = tokio::spawn(
         axum::serve(health, health_router(ready.clone()))
@@ -122,6 +131,7 @@ pub async fn serve(
         return finish(health_server).await;
     };
     let presence = Arc::new(notifier.presence());
+    let call_notifier = notifier.clone();
     let messaging = Arc::new(Messaging::new(store.clone(), SystemClock, notifier));
     // Before readiness and serving, so clients find the built-ins in the first catalog.
     let seeding_fatal = |error: &anyhow::Error| {
@@ -146,6 +156,25 @@ pub async fn serve(
         }
     }
     let _ = ready.store.set(store.clone());
+    let calls = ready.calls.as_ref().map(|health| {
+        let _ = health.redis.set(call_notifier.calls());
+        tracing::info!(
+            ring_s = config.calls.ring.as_secs(),
+            grace_s = config.calls.grace.as_secs(),
+            "calls are enabled"
+        );
+        Arc::new(CallService::new(
+            Arc::clone(&messaging),
+            call_notifier.calls(),
+            call_notifier.clone(),
+            config.calls.timing(),
+            Arc::clone(&health.metrics),
+        ))
+    });
+    let mut messaging_api = MessagingApi::with_presence(Arc::clone(&messaging), presence);
+    if let Some(calls) = &calls {
+        messaging_api = messaging_api.with_calls(Arc::clone(calls) as Arc<dyn CallsApi>);
+    }
 
     // Every socket is already listening, so connections wait in the backlog until
     // the corresponding tonic server starts accepting.
@@ -154,7 +183,7 @@ pub async fn serve(
     servers.spawn(
         tonic::transport::Server::builder()
             .add_service(MessagingServer::with_interceptor(
-                MessagingApi::with_presence(Arc::clone(&messaging), presence),
+                messaging_api,
                 InternalToken::messaging(config.messaging_token),
             ))
             .serve_with_incoming_shutdown(
@@ -191,6 +220,13 @@ pub async fn serve(
                 shutdown.clone().cancelled_owned(),
             ),
     );
+    if let Some(calls) = calls {
+        let shutdown = shutdown.clone();
+        servers.spawn(async move {
+            calls.run_sweeper(shutdown).await;
+            Ok(())
+        });
+    }
     let result = supervise(servers, &shutdown).await;
     store.close().await;
     let health_result = finish(health_server).await;
@@ -275,13 +311,44 @@ async fn finish(health_server: tokio::task::JoinHandle<std::io::Result<()>>) -> 
 struct Health {
     store: Arc<OnceLock<PgStore>>,
     shutdown: CancellationToken,
+    /// With calls enabled: the call metrics, and the call store once Redis connected.
+    calls: Option<CallsHealth>,
+}
+
+#[derive(Clone)]
+struct CallsHealth {
+    metrics: Arc<Metrics>,
+    redis: Arc<OnceLock<RedisCalls>>,
 }
 
 fn health_router(health: Health) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/readyz", get(readyz))
+        .route("/metrics", get(metrics))
         .with_state(health)
+}
+
+/// Prometheus text: the call families with calls enabled (`push_calls_live` while Redis
+/// answers), else nothing.
+async fn metrics(State(health): State<Health>) -> impl IntoResponse {
+    let body = match &health.calls {
+        None => String::new(),
+        Some(calls) => {
+            let live = match calls.redis.get() {
+                Some(redis) => match redis.live_count().await {
+                    Ok(live) => Some(live),
+                    Err(error) => {
+                        tracing::debug!(%error, "push_calls_live could not be read");
+                        None
+                    }
+                },
+                None => None,
+            };
+            calls.metrics.render(live)
+        }
+    };
+    ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body)
 }
 
 async fn readyz(State(health): State<Health>) -> (StatusCode, &'static str) {

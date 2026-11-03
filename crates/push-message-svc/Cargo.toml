@@ -19,6 +19,7 @@ push-domain.workspace = true
 push-proto.workspace = true
 push-store.workspace = true
 redis.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
 tokio-stream.workspace = true

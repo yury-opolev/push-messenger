@@ -3,6 +3,7 @@
 //! Internal API tokens also accept `_FILE` alternatives, read once at startup.
 
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use push_credentials::{AzureConfig, ConfigProblem, RedisTarget, azure_for};
 use push_store::{DatabaseTarget, DatabaseVars, StoreOptions, postgres_auth};
@@ -27,6 +28,9 @@ use push_store::{DatabaseTarget, DatabaseVars, StoreOptions, postgres_auth};
 /// | `PUSH_ACCOUNTS_TOKEN` | the worker's token for the `Accounts` API, 32 to 256 visible ASCII characters; without it `Accounts` refuses every call | none |
 /// | `PUSH_DIRECTORY_TOKEN` | auth-svc's token for the `Directory` API, 32 to 256 visible ASCII characters and different from `PUSH_ACCOUNTS_TOKEN`; without it `Directory` refuses every call | none |
 /// | `PUSH_MESSAGING_TOKEN` | the gateway's token for the `Messaging` API, 32 to 256 visible ASCII characters and different from the other two; without it `Messaging` refuses every call | none |
+/// | `PUSH_CALLS_ENABLED` | `1` or `0`: run the call engine (docs/calls.md); enable once every gateway and message-svc replica has calls | `0` |
+/// | `PUSH_CALLS_RING_SECONDS` | how long a call rings, 10 to 120 | `45` |
+/// | `PUSH_CALLS_DISCONNECT_GRACE_SECONDS` | how long a party device may be gone before its call fails, 5 to 120 | `30` |
 #[derive(Clone, PartialEq, Eq)]
 pub struct Config {
     pub database: DatabaseTarget,
@@ -43,6 +47,73 @@ pub struct Config {
     pub accounts_token: Option<String>,
     pub directory_token: Option<String>,
     pub messaging_token: Option<String>,
+    pub calls: CallsConfig,
+}
+
+/// The call engine's settings (spec §12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CallsConfig {
+    /// Whether message-svc offers calls (`PUSH_CALLS_ENABLED`).
+    pub enabled: bool,
+    /// How long a call rings (`PUSH_CALLS_RING_SECONDS`).
+    pub ring: Duration,
+    /// How long a party device may be gone before its call fails
+    /// (`PUSH_CALLS_DISCONNECT_GRACE_SECONDS`).
+    pub grace: Duration,
+}
+
+impl Default for CallsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ring: Duration::from_secs(45),
+            grace: Duration::from_secs(30),
+        }
+    }
+}
+
+impl CallsConfig {
+    fn from_lookup(lookup: &impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
+        let enabled = match lookup("PUSH_CALLS_ENABLED").as_deref().map(str::trim) {
+            None | Some("" | "0") => false,
+            Some("1") => true,
+            Some(other) => {
+                return Err(ConfigError::Invalid {
+                    name: "PUSH_CALLS_ENABLED",
+                    value: other.to_owned(),
+                    reason: "expected 1 or 0".to_owned(),
+                });
+            }
+        };
+        Ok(Self {
+            enabled,
+            ring: seconds_in(lookup, "PUSH_CALLS_RING_SECONDS", 45, 10..=120)?,
+            grace: seconds_in(lookup, "PUSH_CALLS_DISCONNECT_GRACE_SECONDS", 30, 5..=120)?,
+        })
+    }
+}
+
+/// A whole number of seconds within `range`, or `default` when unset or empty.
+fn seconds_in(
+    lookup: &impl Fn(&str) -> Option<String>,
+    name: &'static str,
+    default: u64,
+    range: std::ops::RangeInclusive<u64>,
+) -> Result<Duration, ConfigError> {
+    let seconds: u64 = parsed(lookup, name, default)?;
+    if range.contains(&seconds) {
+        Ok(Duration::from_secs(seconds))
+    } else {
+        Err(ConfigError::Invalid {
+            name,
+            value: seconds.to_string(),
+            reason: format!(
+                "expected an integer from {} to {}",
+                range.start(),
+                range.end()
+            ),
+        })
+    }
 }
 
 impl std::fmt::Debug for Config {
@@ -70,6 +141,7 @@ impl std::fmt::Debug for Config {
                 "messaging_token",
                 &self.messaging_token.as_ref().map(|_| "<redacted>"),
             )
+            .field("calls", &self.calls)
             .finish()
     }
 }
@@ -156,6 +228,7 @@ impl Config {
             accounts_token,
             directory_token,
             messaging_token,
+            calls: CallsConfig::from_lookup(&lookup)?,
         })
     }
 }
@@ -383,6 +456,58 @@ mod tests {
         assert!(!entra.run_migrations);
         let defaults = config(&REQUIRED).unwrap();
         assert!(defaults.run_migrations && defaults.azure.is_none());
+    }
+
+    #[test]
+    fn calls_are_off_by_default_with_the_spec_durations() {
+        let defaults = config(&REQUIRED).unwrap();
+        assert_eq!(
+            defaults.calls,
+            CallsConfig {
+                enabled: false,
+                ring: Duration::from_secs(45),
+                grace: Duration::from_secs(30),
+            }
+        );
+        let mut variables = REQUIRED.to_vec();
+        variables.extend([
+            ("PUSH_CALLS_ENABLED", "1"),
+            ("PUSH_CALLS_RING_SECONDS", "10"),
+            ("PUSH_CALLS_DISCONNECT_GRACE_SECONDS", "120"),
+        ]);
+        let calls = config(&variables).unwrap().calls;
+        assert!(calls.enabled);
+        assert_eq!(calls.ring, Duration::from_secs(10));
+        assert_eq!(calls.grace, Duration::from_secs(120));
+        for off in ["0", ""] {
+            let mut variables = REQUIRED.to_vec();
+            variables.push(("PUSH_CALLS_ENABLED", off));
+            assert!(!config(&variables).unwrap().calls.enabled, "{off:?}");
+        }
+    }
+
+    #[test]
+    fn calls_settings_out_of_range_name_their_variable() {
+        let cases = [
+            ("PUSH_CALLS_ENABLED", "true"),
+            ("PUSH_CALLS_ENABLED", "yes"),
+            ("PUSH_CALLS_RING_SECONDS", "9"),
+            ("PUSH_CALLS_RING_SECONDS", "121"),
+            ("PUSH_CALLS_RING_SECONDS", "forty"),
+            ("PUSH_CALLS_DISCONNECT_GRACE_SECONDS", "4"),
+            ("PUSH_CALLS_DISCONNECT_GRACE_SECONDS", "121"),
+            ("PUSH_CALLS_DISCONNECT_GRACE_SECONDS", "-1"),
+        ];
+        for (name, value) in cases {
+            let mut variables = REQUIRED.to_vec();
+            variables.push((name, value));
+            let error = config(&variables).unwrap_err();
+            assert!(
+                matches!(&error, ConfigError::Invalid { name: named, .. } if *named == name),
+                "{name}={value}: {error}"
+            );
+            assert!(error.to_string().contains(name), "{error}");
+        }
     }
 
     #[test]
