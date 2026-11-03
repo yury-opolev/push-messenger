@@ -1,0 +1,111 @@
+<!doctype html>
+<!--
+  A minimal browser client for push-messenger voice calls: docs/calls.md, "Browser recipe".
+  Serve it with serve.mjs (same origin as the API, which the ice-servers request needs):
+    node docs/examples/calls/serve.mjs --api https://push.example.com
+  then open http://127.0.0.1:8080/ in two browsers, paste each user's access token and
+  call the other user's id. Both users must be accepted contacts and the server must
+  have calls enabled.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>push-messenger calls example</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!-- protobuf.js, pinned and verified by its hash (Subresource Integrity). -->
+  <script src="https://cdn.jsdelivr.net/npm/protobufjs@8.8.1/dist/protobuf.min.js"
+          integrity="sha384-BDtXTtEay9czigGtCwQwZtKJfHLxtAotATCkSAAz1pQT5KN/bNAO0JdMq2VU1vBR"
+          crossorigin="anonymous"></script>
+  <style>
+    body { font: 14px system-ui, sans-serif; margin: 1.5rem; max-width: 52rem; }
+    label { display: block; margin: .4rem 0; }
+    input[type=text], input[type=password] { width: 100%; font-family: monospace; }
+    button { margin: .2rem .3rem .2rem 0; }
+    #log { background: #f4f4f4; padding: .5rem; height: 16rem; overflow: auto; font-size: 12px; }
+    .call { border: 1px solid #ccc; padding: .5rem; margin: .5rem 0; }
+  </style>
+</head>
+<body>
+  <h1>Calls example</h1>
+  <form id="settings">
+    <label>API base URL <input id="api" type="text" placeholder="same origin"></label>
+    <label>Access token <input id="token" type="password" autocomplete="off"></label>
+    <label><input id="relay" type="checkbox"> Relay only (iceTransportPolicy "relay": hides IP addresses)</label>
+    <button id="connect" type="submit">Connect</button>
+  </form>
+  <p>Status: <strong id="status">not connected</strong> <span id="me"></span></p>
+  <form id="dial">
+    <label>Call user id <input id="peer" type="text" placeholder="00000000-0000-7000-8000-000000000000"></label>
+    <button id="call" type="submit" disabled>Call</button>
+  </form>
+  <div id="calls"></div>
+  <audio id="remote" autoplay></audio>
+  <pre id="log"></pre>
+  <script type="module">
+    import { CallClient } from "./calls.js";
+
+    const $ = (id) => document.getElementById(id);
+    let client = null;
+
+    function render() {
+      const list = $("calls");
+      list.replaceChildren();
+      for (const call of client.calls.values()) {
+        const box = document.createElement("div");
+        box.className = "call";
+        box.dataset.callId = call.id;
+        box.dataset.status = call.status;
+        const state = call.pc ? ` (${call.pc.connectionState})` : "";
+        box.append(`${call.role === "caller" ? "To" : "From"} ${call.peerUserId}: ${call.status}${state} `);
+        const button = (label, action) => {
+          const b = document.createElement("button");
+          b.textContent = label;
+          b.className = label.toLowerCase();
+          b.onclick = action;
+          box.append(b);
+        };
+        if (call.status === "incoming") {
+          button("Answer", () => client.answer(call.id));
+          button("Decline", () => client.decline(call.id));
+        } else {
+          button("Hang up", () => client.hangup(call.id));
+        }
+        list.append(box);
+        if (call.remoteStream && $("remote").srcObject !== call.remoteStream) $("remote").srcObject = call.remoteStream;
+      }
+    }
+
+    $("settings").onsubmit = async (event) => {
+      event.preventDefault();
+      if (client) client.close();
+      client = new CallClient({
+        apiBase: $("api").value.trim() || location.origin,
+        token: $("token").value.trim(),
+        protoUrl: "frame.proto",
+        relayOnly: $("relay").checked,
+        onEvent: (kind, value) => {
+          if (kind === "log") $("log").append(`${value}\n`);
+          if (kind === "status") {
+            $("status").textContent = value;
+            $("me").textContent = client.userId ? `as ${client.userId}` : "";
+            $("call").disabled = !(client.connected && client.callsAvailable);
+          }
+          if (kind === "call") render();
+        },
+      });
+      // For tests and the console.
+      window.callClient = client;
+      try {
+        await client.connect();
+      } catch (error) {
+        $("status").textContent = `failed: ${error.message}`;
+      }
+    };
+
+    $("dial").onsubmit = (event) => {
+      event.preventDefault();
+      client.call($("peer").value.trim());
+    };
+  </script>
+</body>
+</html>
