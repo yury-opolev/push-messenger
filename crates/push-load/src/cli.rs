@@ -8,19 +8,26 @@ use std::time::Duration;
 
 use anyhow::{Context, bail};
 
-use crate::config::{PrepareOptions, RunOptions, Target};
+use crate::config::{
+    CallsOptions, DEFAULT_CALL_ATTEMPTS_PER_HOUR, DEFAULT_SETUP_P95, PrepareOptions, RunOptions,
+    Target,
+};
 use crate::report::Status;
-use crate::{accounts, prepare, report, run};
+use crate::{accounts, calls, prepare, report, run};
 
 pub const USAGE: &str = "\
 usage:
   push-load prepare --target <url> --authorized-target <host[:port]> --accounts <file.jsonl>
                     --state <file.json> --devices-per-account <1-10>
-                    [--sample-pairs <0-50>] [--concurrency <1-16>] [--connect-to <ip>]
+                    [--sample-pairs <0-2000>] [--concurrency <1-16>] [--connect-to <ip>]
   push-load run     --target <url> --authorized-target <host[:port]> --state <file.json>
                     --connections <n> --ramp-per-second <n> --duration-seconds <n>
                     --target-build <label> --report <new-file.json>
                     [--message-interval-seconds <n>] [--connect-to <ip>] [--no-reconnect]
+  push-load calls   --target <url> --authorized-target <host[:port]> --state <file.json>
+                    --calls <n> --ramp-per-second <n> --duration-seconds <n>
+                    --hold-seconds <n> --target-build <label> --report <new-file.json>
+                    [--attempts-per-hour <n>] [--setup-p95-ms <n>] [--connect-to <ip>]
 
 Only test a deployment you own or are authorized to test (docs/consumer-verification.md).";
 
@@ -94,6 +101,7 @@ pub async fn main(args: Vec<String>) -> anyhow::Result<ExitCode> {
     match args.first().map(String::as_str) {
         Some("prepare") => prepare_command(&args[1..]).await,
         Some("run") => run_command(&args[1..]).await,
+        Some("calls") => calls_command(&args[1..]).await,
         _ => {
             eprintln!("{USAGE}");
             Ok(ExitCode::from(2))
@@ -179,30 +187,91 @@ async fn run_command(args: &[String]) -> anyhow::Result<ExitCode> {
         reconnect: !flags.switch("--no-reconnect"),
     };
     options.validate()?;
-    let report_path = PathBuf::from(flags.required("--report")?);
-    if report_path.exists() {
-        bail!("{} exists: name a new report file", report_path.display());
-    }
+    let report_path = new_report_path(&flags)?;
     let report = run::run(
         &target,
         &PathBuf::from(flags.required("--state")?),
         &options,
     )
     .await?;
-    let json = serde_json::to_string_pretty(&report).context("serialize the report")?;
+    write_report(&report_path, &report)?;
+    print!("{}", report::summary_text(&report));
+    println!("  report: {}", report_path.display());
+    Ok(exit_code(report.status))
+}
+
+const CALLS_FLAGS: [&str; 12] = [
+    "--target",
+    "--authorized-target",
+    "--state",
+    "--calls",
+    "--ramp-per-second",
+    "--duration-seconds",
+    "--hold-seconds",
+    "--attempts-per-hour",
+    "--setup-p95-ms",
+    "--target-build",
+    "--report",
+    "--connect-to",
+];
+
+fn calls_options(flags: &Flags) -> anyhow::Result<CallsOptions> {
+    let default_p95 = u64::try_from(DEFAULT_SETUP_P95.as_millis()).unwrap_or(u64::MAX);
+    let options = CallsOptions {
+        calls: flags.number("--calls", None)?,
+        ramp_per_second: flags.number("--ramp-per-second", None)?,
+        duration: Duration::from_secs(flags.number("--duration-seconds", None)?),
+        hold: Duration::from_secs(flags.number("--hold-seconds", None)?),
+        attempts_per_hour: flags
+            .number("--attempts-per-hour", Some(DEFAULT_CALL_ATTEMPTS_PER_HOUR))?,
+        setup_p95: Duration::from_millis(flags.number("--setup-p95-ms", Some(default_p95))?),
+        target_build: flags.required("--target-build")?.to_owned(),
+    };
+    options.validate()?;
+    Ok(options)
+}
+
+async fn calls_command(args: &[String]) -> anyhow::Result<ExitCode> {
+    let flags = parse(args, &CALLS_FLAGS, &[])?;
+    let target = flags.target()?;
+    let options = calls_options(&flags)?;
+    let report_path = new_report_path(&flags)?;
+    let report = calls::run(
+        &target,
+        &PathBuf::from(flags.required("--state")?),
+        &options,
+    )
+    .await?;
+    write_report(&report_path, &report)?;
+    print!("{}", calls::report::summary_text(&report));
+    println!("  report: {}", report_path.display());
+    Ok(exit_code(report.status))
+}
+
+fn new_report_path(flags: &Flags) -> anyhow::Result<PathBuf> {
+    let report_path = PathBuf::from(flags.required("--report")?);
+    if report_path.exists() {
+        bail!("{} exists: name a new report file", report_path.display());
+    }
+    Ok(report_path)
+}
+
+fn write_report(path: &std::path::Path, report: &impl serde::Serialize) -> anyhow::Result<()> {
+    let json = serde_json::to_string_pretty(report).context("serialize the report")?;
     std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(&report_path)
+        .open(path)
         .and_then(|mut file| std::io::Write::write_all(&mut file, json.as_bytes()))
-        .with_context(|| format!("write the report {}", report_path.display()))?;
-    print!("{}", report::summary_text(&report));
-    println!("  report: {}", report_path.display());
-    Ok(match report.status {
+        .with_context(|| format!("write the report {}", path.display()))
+}
+
+fn exit_code(status: Status) -> ExitCode {
+    match status {
         Status::Passed => ExitCode::SUCCESS,
         Status::Failed => ExitCode::from(1),
         Status::Interrupted => ExitCode::from(130),
-    })
+    }
 }
 
 #[cfg(test)]
@@ -255,6 +324,85 @@ mod tests {
         .await
         .unwrap_err()
         .to_string();
+        assert!(error.contains("--authorized-target"), "{error}");
+    }
+
+    fn calls_args(extra: &[&str]) -> Vec<String> {
+        let mut all = args(&[
+            "--target",
+            "https://api.example.com",
+            "--authorized-target",
+            "api.example.com",
+            "--state",
+            "unused.json",
+            "--calls",
+            "1000",
+            "--ramp-per-second",
+            "100",
+            "--duration-seconds",
+            "1200",
+            "--hold-seconds",
+            "60",
+            "--target-build",
+            "x",
+            "--report",
+            "unused-report.json",
+        ]);
+        all.extend(args(extra));
+        all
+    }
+
+    #[test]
+    fn calls_flags_default_to_the_gateway_limit_and_the_setup_target() {
+        let options = calls_options(&parse(&calls_args(&[]), &CALLS_FLAGS, &[]).unwrap()).unwrap();
+        assert_eq!(
+            (
+                options.calls,
+                options.hold,
+                options.attempts_per_hour,
+                options.setup_p95
+            ),
+            (
+                1000,
+                Duration::from_secs(60),
+                30,
+                Duration::from_millis(300)
+            )
+        );
+        let raised = calls_options(
+            &parse(
+                &calls_args(&["--attempts-per-hour", "500", "--setup-p95-ms", "150"]),
+                &CALLS_FLAGS,
+                &[],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            (raised.attempts_per_hour, raised.setup_p95),
+            (500, Duration::from_millis(150))
+        );
+        // Over the stated budget: refused before any request.
+        let error = calls_options(
+            &parse(
+                &calls_args(&["--attempts-per-hour", "5"]),
+                &CALLS_FLAGS,
+                &[],
+            )
+            .unwrap(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("--attempts-per-hour 5"), "{error}");
+        assert!(parse(&calls_args(&["--no-reconnect"]), &CALLS_FLAGS, &[]).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_calls_run_checks_the_authorization_before_any_request() {
+        let mut all = vec!["calls".to_owned()];
+        all.extend(calls_args(&[]));
+        all[4] = "other.example.com".to_owned();
+        let error = main(all).await.unwrap_err().to_string();
         assert!(error.contains("--authorized-target"), "{error}");
     }
 }

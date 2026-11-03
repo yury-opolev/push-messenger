@@ -27,9 +27,14 @@ impl Samples {
     }
 
     pub fn summary(&self) -> Summary {
+        Summary::of(&self.sorted())
+    }
+
+    /// Every sample, ascending.
+    pub fn sorted(&self) -> Vec<u32> {
         let mut values = self.0.lock().expect("samples lock").clone();
         values.sort_unstable();
-        Summary::of(&values)
+        values
     }
 }
 

@@ -121,6 +121,19 @@ pub async fn password_datastores() -> (Datastores, Containers) {
     (datastores, (postgres, redis))
 }
 
+/// Password-mode datastores with calls enabled on the gateway and message-svc, as the
+/// chart's `calls.enabled: true` sets them.
+pub async fn calls_datastores() -> (Datastores, Containers) {
+    let (mut datastores, containers) = password_datastores().await;
+    datastores
+        .gateway
+        .extend(owned(&[("PUSH_CALLS_ENABLED", "1")]));
+    datastores
+        .message_svc
+        .extend(owned(&[("PUSH_CALLS_ENABLED", "1")]));
+    (datastores, containers)
+}
+
 pub struct Stack {
     pub auth_url: String,
     pub socket_url: String,

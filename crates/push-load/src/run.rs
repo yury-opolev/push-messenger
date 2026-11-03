@@ -37,16 +37,16 @@ const REFRESH_CONCURRENCY: usize = 32;
 const REFRESH_PHASE_LIMIT: Duration = Duration::from_secs(180);
 const SAVE_EVERY: usize = 256;
 /// A connection must reach Ready within this long of its first attempt or of losing it.
-const READY_DEADLINE: Duration = Duration::from_secs(60);
-const PONG_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const READY_DEADLINE: Duration = Duration::from_secs(60);
+pub(crate) const PONG_TIMEOUT: Duration = Duration::from_secs(10);
 /// No sample message is sent in the last seconds of the run, so all can arrive.
 const DRAIN: Duration = Duration::from_secs(10);
-const STOP_GRACE: Duration = Duration::from_secs(15);
+pub(crate) const STOP_GRACE: Duration = Duration::from_secs(15);
 /// Acks are coalesced (the highest seq per conversation) and sent this often, inside the
 /// gateway's frame budget even for a large backlog.
 const ACK_EVERY: Duration = Duration::from_millis(250);
-const FIRST_BACKOFF: Duration = Duration::from_millis(500);
-const MAX_BACKOFF: Duration = Duration::from_secs(8);
+pub(crate) const FIRST_BACKOFF: Duration = Duration::from_millis(500);
+pub(crate) const MAX_BACKOFF: Duration = Duration::from_secs(8);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CloseAction {
@@ -67,7 +67,7 @@ pub fn close_action(code: u16) -> CloseAction {
 }
 
 /// `base` scaled by a random factor from 0.5 to 1.5.
-fn jitter(base: Duration) -> Duration {
+pub(crate) fn jitter(base: Duration) -> Duration {
     let random = Uuid::new_v4().as_bytes()[0];
     base.mul_f64(0.5 + f64::from(random) / 255.0)
 }
@@ -163,7 +163,12 @@ pub async fn run(
     tokio::spawn(watch_interrupt(interrupt.clone()));
 
     let tokens = refresh_all(
-        target, &mut state, state_path, &selected, &shared, &interrupt,
+        target,
+        &mut state,
+        state_path,
+        &selected,
+        &shared.counters,
+        &interrupt,
     )
     .await?;
 
@@ -293,7 +298,7 @@ pub async fn run(
 }
 
 /// Cancels `interrupt` on Ctrl-C, and on SIGTERM (`docker stop`) on Unix.
-async fn watch_interrupt(interrupt: CancellationToken) {
+pub(crate) async fn watch_interrupt(interrupt: CancellationToken) {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
@@ -317,12 +322,12 @@ async fn watch_interrupt(interrupt: CancellationToken) {
 /// timed-out request: auth-svc may have rotated it), is marked for `prepare` to sign in
 /// again rather than reusing a token auth-svc would treat as stolen. An interruption
 /// lets the refreshes in flight finish, saves, and stops before connecting.
-async fn refresh_all(
+pub(crate) async fn refresh_all(
     target: &Target,
     state: &mut State,
     path: &Path,
     selected: &[DeviceRef],
-    shared: &Shared,
+    counters: &Counters,
     interrupt: &CancellationToken,
 ) -> anyhow::Result<Vec<Option<String>>> {
     let api = AuthApi::new(target)?;
@@ -393,11 +398,11 @@ async fn refresh_all(
             }
             Some(Err(ApiError::Rejected { status: 401, .. })) => {
                 state.device_mut(device).needs_sign_in = true;
-                bump(&shared.counters.auth_failures);
+                bump(&counters.auth_failures);
             }
             Some(Err(_)) => {
                 state.device_mut(device).needs_sign_in = true;
-                bump(&shared.counters.connect_failures);
+                bump(&counters.connect_failures);
             }
         }
         unsaved += 1;
@@ -426,7 +431,7 @@ async fn connection(shared: Arc<Shared>, plan: Plan) {
     loop {
         let opened = tokio::select! {
             () = shared.cancel.cancelled() => return,
-            opened = socket::open(&shared.target, &plan.access_token) => opened,
+            opened = socket::open(&shared.target, &plan.access_token, &[]) => opened,
         };
         match opened {
             Ok(Opened::Ready(socket, ready)) => {
@@ -450,7 +455,7 @@ async fn connection(shared: Arc<Shared>, plan: Plan) {
                     Ended::Closed(code) => {
                         shared.closes.record(code);
                         bump(&shared.counters.disconnects);
-                        if stop_for(&shared, code) {
+                        if stop_for(&shared.counters, code) {
                             return;
                         }
                     }
@@ -472,7 +477,7 @@ async fn connection(shared: Arc<Shared>, plan: Plan) {
             }
             Ok(Opened::Closed(code)) => {
                 shared.refusals.record(code);
-                if stop_for(&shared, code) {
+                if stop_for(&shared.counters, code) {
                     return;
                 }
             }
@@ -495,12 +500,12 @@ async fn connection(shared: Arc<Shared>, plan: Plan) {
 }
 
 /// Counts a close that must not be retried; whether the connection stops.
-fn stop_for(shared: &Shared, code: u16) -> bool {
+pub(crate) fn stop_for(counters: &Counters, code: u16) -> bool {
     let counter = match close_action(code) {
         CloseAction::Reconnect => return false,
-        CloseAction::AuthFailure => &shared.counters.auth_failures,
-        CloseAction::Takeover => &shared.counters.takeovers,
-        CloseAction::RateLimited => &shared.counters.rate_limited,
+        CloseAction::AuthFailure => &counters.auth_failures,
+        CloseAction::Takeover => &counters.takeovers,
+        CloseAction::RateLimited => &counters.rate_limited,
     };
     bump(counter);
     true

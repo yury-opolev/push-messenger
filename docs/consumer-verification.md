@@ -52,7 +52,7 @@ chart-managed render contains credentials and must not reach shared logs.
 | `deploy/minikube/test-network-policy.ps1 -Context <ctx> [-Egress]` | existing cluster with an enforcing CNI | internal API isolation, by live allowed/denied connections; with `-Egress` also the egress rules (`networkPolicy.egress.enabled`) | deploys short-lived probe pods; run deliberately |
 | `push-smoke` (operator Entra mode, also available through `helm test`) | authorized deployment | two preexisting identities register/connect, become contacts, message and re-sign-in on the same device | yes, with dedicated test identities; creates devices, contacts and messages |
 | `push-smoke` (DEV mode) | local cluster only | the whole flow with the DEV ONLY mailbox and signing key, or the DEV Entra issuer | **no** |
-| `push-load` | any target you own or are authorized to test | connections, heartbeats, message/receipt latency, reconnects | yes, with dedicated test accounts and the limits below |
+| `push-load` | any target you own or are authorized to test | connections, heartbeats, message/receipt latency, reconnects; voice call setup latency and concurrent calls | yes, with dedicated test accounts and the limits below |
 
 ## push-load
 
@@ -112,7 +112,9 @@ push-load prepare --target https://api.example.com --authorized-target api.examp
 It signs each account in once (auth-svc allows 60 logins per IP per 15 minutes, so
 1,000 accounts take about 4 hours from one IP; the harness waits out every
 `Retry-After`), registers its devices and makes the sample pairs contacts with a direct
-conversation (at most 50 pairs: invites are limited per user and IP). Interrupt and
+conversation (at most 2,000 pairs, two accounts each). Invite redeems are limited to 60
+per IP and 20 per user an hour, so a preparation of many pairs stops with
+`RATE_LIMITED` after about 60 new pairs: rerun it after the stated retry time. Interrupt and
 rerun it at any time; it continues where it stopped, and it signs devices in again when
 a run found their tokens refused. Exit 0 means complete; failures name the accounts
 file entry and reason (`invalid_credentials`, `email_not_verified`, `too_many_devices`).
@@ -170,6 +172,71 @@ The harness proves what one run measured. Capacity claims need the consumer's re
 deployment, its load balancer and monitoring, repeated runs and their own acceptance
 criteria. When the campaign ends, revoke the test devices through your normal account
 processes and delete the state file.
+
+### Voice calls
+
+`push-load calls` checks [voice call](calls.md) signalling under load. It places
+concurrent 1:1 calls between the prepared sample pairs and measures **call setup
+latency**: from sending `CallInvite` to the caller's `CallAccepted`. The callee answers
+at once, so a person's response time is not included. The targets are a setup p95 under
+300 ms within a region, and 1,000 concurrent ringing or active calls per gateway replica
+without errors. No media flows: the SDP is synthetic and audio-only, and the one
+candidate each side trickles names a documentation address (192.0.2.1).
+
+```text
+push-load calls --target https://api.example.com --authorized-target api.example.com \
+  --state /private/state.json --calls 1000 --ramp-per-second 100 \
+  --duration-seconds 1200 --hold-seconds 60 \
+  --target-build "gateway@sha256:..., chart 1.2.3" --report /private/calls-1.json
+```
+
+- **Sizing.** Each concurrent call needs one sample pair: two accounts that are
+  contacts (a user has at most one call). For 1,000 calls, prepare 2,000 accounts with
+  `--devices-per-account 1 --sample-pairs 1000`. A run with fewer ready pairs than
+  `--calls` is refused.
+- **Calls enabled.** The target needs `calls.enabled: true`. When `Ready` does not list
+  `CAPABILITY_CALLS`, the run stops at once and fails with "calls are not enabled on the
+  target".
+- **What it does.** It refreshes the pairs' tokens as `run` does and connects both
+  devices of each pair, advertising `CAPABILITY_CALLS`, at the ramp rate (two
+  connections per call). It pings at the heartbeat. Each pair then places one call after
+  another: invite, accept, one candidate each way, hold for `--hold-seconds`, the caller
+  hangs up, both parties await `CallEnded`. The next invite comes at least 1 s after the
+  end. No call is placed in the last hold plus 10 s; at the end, live calls are hung up.
+  Connections are not reconnected: a dropped one fails the run.
+- **Attempts budget.** The gateway allows `calls.attemptsPerHour` invites per user an
+  hour (default 30), refused or not. push-load computes the most invites one pair can
+  send in the run (at most one per hold plus 1 s) and refuses a run above
+  `--attempts-per-hour` (default 30) before any request. The example above sends at most
+  19 per pair. For shorter holds, raise `calls.attemptsPerHour` on the load deployment
+  (at most 1000) and pass the same value. The budget covers one run: before running
+  again on the same pairs, wait an hour or keep the limit raised.
+- **Per replica.** To check the per-replica figure, run 1,000 calls with the gateway
+  scaled to one replica, or divide by the replicas that served the run.
+- **The server side.** During the run, watch message-svc's `/metrics` (health port
+  8081): `push_call_signal_seconds` (time to handle each call frame),
+  `push_call_setup_seconds`, `push_calls_live` (it should follow the run's ringing and
+  active calls) and `push_call_frames_refused_total`. Watch Redis load, which push-load
+  does not measure, with Redis `INFO` (`instantaneous_ops_per_sec`, `used_memory`) or
+  the deployment's Redis metrics.
+
+The report has the run's `connections`, `close_codes`, `generator` and `workload`
+(with `hold_s`, `attempts_per_hour` and `attempts_per_pair_max`), and:
+
+- `calls`: `placed`, `accepted`, `completed`, `unanswered` (not accepted within 10 s),
+  `endings_missing` (a party heard no `CallEnded` within 10 s of the hangup), `ended`
+  (the `CallEnded` reasons callers heard), `errors` (`CallError` by code),
+  `unexpected_frames`, `ice_sent`, `ice_received`, `call_syncs`, `stale_calls` (calls
+  left from an earlier run, hung up first), `peak_active` and `peak_ringing_or_active`.
+- `latency.setup`: count, p50, p95, p99 and max in milliseconds; also `connect` and
+  `ping_rtt`.
+
+`passed` requires every connection to have reached Ready, all open at once, each with
+its `CallSync`; no connection dropped, failed or rate limited; calls placed and no
+`CallError`; every call accepted within 10 s and ended `COMPLETED` for both parties; no
+unexpected call frame; a setup p95 at most `--setup-p95-ms` (default 300); and an
+unsaturated generator. Exit codes are those of `run`. Each call leaves a call history
+row per participant, kept for `calls.historyDays`.
 
 ### Local functional check
 

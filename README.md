@@ -259,8 +259,8 @@ or restrict the sign-in check
 ([your own wrapper](docs/entra-sign-in.md#your-own-wrapper)).
 [docs/consumer-verification.md](docs/consumer-verification.md) gives the build, image,
 chart packaging and verification commands, and `push-load`, an explicitly targeted,
-bounded harness for connection, heartbeat, message-latency and reconnect checks with
-dedicated test accounts.
+bounded harness for connection, heartbeat, message-latency, reconnect and voice call
+signalling checks with dedicated test accounts.
 
 ## Configuration
 

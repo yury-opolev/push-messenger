@@ -11,8 +11,10 @@ use reqwest::Url;
 pub const MAX_CONNECTIONS: usize = 20_000;
 /// auth-svc's limit of active devices per account (`MAX_ACTIVE_DEVICES`).
 pub const MAX_DEVICES_PER_ACCOUNT: usize = 10;
-/// Most sender/receiver pairs; the gateway allows 20 redeems per user and 60 per IP an hour.
-pub const MAX_SAMPLE_PAIRS: usize = 50;
+/// Most sender/receiver pairs: enough for 1,000 concurrent calls with room to spare. The
+/// gateway allows 20 redeems per user and 60 per IP an hour, so a large preparation takes
+/// several runs of `prepare` (each resumes where the last stopped).
+pub const MAX_SAMPLE_PAIRS: usize = 2000;
 pub const MAX_RAMP_PER_SECOND: u32 = 500;
 pub const MAX_PREPARE_CONCURRENCY: usize = 16;
 /// Ramp plus duration. Access tokens last 30 minutes and `AuthExpiring` comes a minute
@@ -199,16 +201,122 @@ impl RunOptions {
         if !(MIN_MESSAGE_INTERVAL..=MAX_MESSAGE_INTERVAL).contains(&self.message_interval) {
             bail!("--message-interval-seconds must be 1 to 300");
         }
-        let build = self.target_build.trim();
-        if build.is_empty()
-            || build.len() > MAX_BUILD_LABEL
-            || !build.chars().all(|c| c.is_ascii_graphic() || c == ' ')
-        {
+        validate_build(&self.target_build)
+    }
+}
+
+fn validate_build(build: &str) -> anyhow::Result<()> {
+    let build = build.trim();
+    if build.is_empty()
+        || build.len() > MAX_BUILD_LABEL
+        || !build.chars().all(|c| c.is_ascii_graphic() || c == ' ')
+    {
+        bail!(
+            "--target-build must be 1 to {MAX_BUILD_LABEL} printable ASCII characters naming what is deployed"
+        );
+    }
+    Ok(())
+}
+
+/// The gateway's default `calls.attemptsPerHour`.
+pub const DEFAULT_CALL_ATTEMPTS_PER_HOUR: u32 = 30;
+/// The gateway's largest `calls.attemptsPerHour`.
+pub const MAX_CALL_ATTEMPTS_PER_HOUR: u32 = 1000;
+/// The setup target within a region: p95 from `CallInvite` to `CallAccepted`.
+pub const DEFAULT_SETUP_P95: Duration = Duration::from_millis(300);
+pub const MAX_SETUP_P95: Duration = Duration::from_secs(10);
+pub const MAX_HOLD: Duration = Duration::from_secs(20 * 60);
+/// At least this long passes between a pair's call ending and its next invite.
+pub const CALL_PAUSE: Duration = Duration::from_secs(1);
+/// No call is placed unless its hold ends this long before the run does, so every call
+/// placed can be answered (within this long) and hung up in time.
+pub const CALL_MARGIN: Duration = Duration::from_secs(10);
+
+/// The bounds of a calls run: `calls` prepared pairs, each placing one call after another.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallsOptions {
+    /// Concurrent calls: one per prepared pair, two connections each.
+    pub calls: usize,
+    /// Connections opened per second.
+    pub ramp_per_second: u32,
+    pub duration: Duration,
+    /// How long each call stays active before the caller hangs up.
+    pub hold: Duration,
+    /// The target's `calls.attemptsPerHour`, as the operator states it.
+    pub attempts_per_hour: u32,
+    /// The run fails when the setup latency's p95 is above this.
+    pub setup_p95: Duration,
+    pub target_build: String,
+}
+
+impl CallsOptions {
+    pub fn connections(&self) -> usize {
+        self.calls * 2
+    }
+
+    pub fn ramp_time(&self) -> Duration {
+        Duration::from_secs_f64(self.connections() as f64 / f64::from(self.ramp_per_second.max(1)))
+    }
+
+    /// The shortest time from one invite of a pair to its next.
+    pub fn period(&self) -> Duration {
+        self.hold + CALL_PAUSE
+    }
+
+    /// The most invites one pair's caller can send in the run: one every [`period`]
+    /// (at least) from its connection, the last one `hold` plus [`CALL_MARGIN`] before
+    /// the run ends.
+    ///
+    /// [`period`]: Self::period
+    pub fn attempts_per_pair(&self) -> u64 {
+        let window = (self.ramp_time() + self.duration).saturating_sub(self.hold + CALL_MARGIN);
+        let period = self.period().as_millis().max(1);
+        u64::try_from(window.as_millis() / period).unwrap_or(u64::MAX) + 1
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if !(1..=MAX_SAMPLE_PAIRS).contains(&self.calls) {
+            bail!("--calls must be 1 to {MAX_SAMPLE_PAIRS}");
+        }
+        if !(1..=MAX_RAMP_PER_SECOND).contains(&self.ramp_per_second) {
+            bail!("--ramp-per-second must be 1 to {MAX_RAMP_PER_SECOND}");
+        }
+        if self.duration < MIN_DURATION {
             bail!(
-                "--target-build must be 1 to {MAX_BUILD_LABEL} printable ASCII characters naming what is deployed"
+                "--duration-seconds must be at least {}",
+                MIN_DURATION.as_secs()
             );
         }
-        Ok(())
+        if self.ramp_time() + self.duration > MAX_RUN {
+            bail!(
+                "the ramp ({:.0} s) plus the duration must stay within {} minutes: access tokens last 30 minutes and push-load does not re-authenticate",
+                self.ramp_time().as_secs_f64(),
+                MAX_RUN.as_secs() / 60
+            );
+        }
+        if !(Duration::from_secs(1)..=MAX_HOLD).contains(&self.hold) {
+            bail!("--hold-seconds must be 1 to {}", MAX_HOLD.as_secs());
+        }
+        if self.hold + CALL_MARGIN > self.duration {
+            bail!(
+                "--duration-seconds must be at least --hold-seconds plus {} s, so a call can be placed and hung up in time",
+                CALL_MARGIN.as_secs()
+            );
+        }
+        if !(1..=MAX_CALL_ATTEMPTS_PER_HOUR).contains(&self.attempts_per_hour) {
+            bail!("--attempts-per-hour must be 1 to {MAX_CALL_ATTEMPTS_PER_HOUR}");
+        }
+        let attempts = self.attempts_per_pair();
+        if attempts > u64::from(self.attempts_per_hour) {
+            bail!(
+                "each pair could place {attempts} calls in this run, above --attempts-per-hour {}: the gateway would refuse the rest with RATE_LIMITED. Hold calls longer (--hold-seconds), shorten the run, or raise calls.attemptsPerHour on the target (at most {MAX_CALL_ATTEMPTS_PER_HOUR}) and pass the new value",
+                self.attempts_per_hour
+            );
+        }
+        if !(Duration::from_millis(1)..=MAX_SETUP_P95).contains(&self.setup_p95) {
+            bail!("--setup-p95-ms must be 1 to {}", MAX_SETUP_P95.as_millis());
+        }
+        validate_build(&self.target_build)
     }
 }
 
@@ -338,6 +446,108 @@ mod tests {
         }
     }
 
+    fn calls_options() -> CallsOptions {
+        CallsOptions {
+            calls: 1000,
+            ramp_per_second: 100,
+            duration: Duration::from_secs(20 * 60),
+            hold: Duration::from_secs(60),
+            attempts_per_hour: DEFAULT_CALL_ATTEMPTS_PER_HOUR,
+            setup_p95: DEFAULT_SETUP_P95,
+            target_build: "gateway@sha256:0123".to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_full_scale_calls_run_fits_the_default_attempts_budget() {
+        let ok = calls_options();
+        ok.validate().unwrap();
+        assert_eq!(ok.connections(), 2000);
+        assert_eq!(ok.ramp_time(), Duration::from_secs(20));
+        // 20 s of ramp and 1200 s of run, less 60 s of hold and 10 s of margin: 1150 s
+        // at one call per 61 s is 18 periods, 19 invites.
+        assert_eq!(ok.attempts_per_pair(), 19);
+    }
+
+    #[test]
+    fn a_calls_run_beyond_the_attempts_budget_is_refused_up_front() {
+        let short_holds = CallsOptions {
+            hold: Duration::from_secs(10),
+            ..calls_options()
+        };
+        let error = short_holds.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("--attempts-per-hour 30") && error.contains("calls.attemptsPerHour"),
+            "{error}"
+        );
+        // The same run passes once the target allows more.
+        CallsOptions {
+            attempts_per_hour: 200,
+            ..short_holds
+        }
+        .validate()
+        .unwrap();
+    }
+
+    #[test]
+    fn calls_runs_are_bounded() {
+        let ok = calls_options();
+        for bad in [
+            CallsOptions {
+                calls: 0,
+                ..ok.clone()
+            },
+            CallsOptions {
+                calls: MAX_SAMPLE_PAIRS + 1,
+                ..ok.clone()
+            },
+            CallsOptions {
+                ramp_per_second: 0,
+                ..ok.clone()
+            },
+            CallsOptions {
+                duration: Duration::from_secs(5),
+                ..ok.clone()
+            },
+            CallsOptions {
+                duration: Duration::from_secs(25 * 60),
+                ..ok.clone()
+            },
+            CallsOptions {
+                hold: Duration::ZERO,
+                ..ok.clone()
+            },
+            CallsOptions {
+                hold: MAX_HOLD + Duration::from_secs(1),
+                ..ok.clone()
+            },
+            // The hold must leave the margin inside the duration.
+            CallsOptions {
+                duration: Duration::from_secs(30),
+                hold: Duration::from_secs(25),
+                ..ok.clone()
+            },
+            CallsOptions {
+                attempts_per_hour: 0,
+                ..ok.clone()
+            },
+            CallsOptions {
+                attempts_per_hour: MAX_CALL_ATTEMPTS_PER_HOUR + 1,
+                ..ok.clone()
+            },
+            CallsOptions {
+                setup_p95: Duration::ZERO,
+                ..ok.clone()
+            },
+            CallsOptions {
+                target_build: " ".to_owned(),
+                ..ok.clone()
+            },
+        ] {
+            assert!(bad.validate().is_err(), "{bad:?}");
+        }
+    }
+
     #[test]
     fn preparation_is_bounded() {
         let ok = PrepareOptions {
@@ -356,7 +566,7 @@ mod tests {
                 ..ok
             },
             PrepareOptions {
-                sample_pairs: 51,
+                sample_pairs: MAX_SAMPLE_PAIRS + 1,
                 ..ok
             },
             PrepareOptions {
