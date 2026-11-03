@@ -163,7 +163,7 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - run: cargo test -p push-sdk --features calls-media --locked --lib media::
+      - run: "cargo test -p push-sdk --features calls-media --locked --lib -- media::"
 
   # The container images build (nothing is pushed). Deploying them is verified on
   # minikube before merge: deploy/minikube/up.ps1 -Smoke.
