@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use push_bridge_control::transport::Listener;
 use push_bridge_control::{
-    BridgeState, Call, ErrorBody, Event, EventLine, MAX_LINE, PROTOCOL, PauseParams, Response,
-    Status, encode, now_ms, parse_request,
+    BridgeState, Call, ErrorBody, Event, EventLine, MAX_LINE, PEEK_DISABLED, PROTOCOL, PauseParams,
+    Response, Status, encode, now_ms, parse_request,
 };
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
@@ -315,6 +315,12 @@ impl ControlHub {
                 (Action::Pause(params), limit)
             }
             Call::ResumeBackend => (Action::Resume, ACTION_TIMEOUT),
+            Call::Peek(_) => {
+                return Some(response(
+                    id,
+                    Err(error(PEEK_DISABLED, "the chat peek is off")),
+                ));
+            }
         };
         tracing::info!(event = "control_request", method = action.name());
         let hub = self.clone();

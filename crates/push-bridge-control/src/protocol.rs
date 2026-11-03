@@ -1,7 +1,9 @@
 //! The wire format: newline-delimited JSON, one UTF-8 object per line, at most
 //! [`MAX_LINE`] bytes. Clients send [`Request`]s; the bridge sends [`ServerLine`]s, a
 //! [`Response`] per request and [`EventLine`]s as things happen. Everything here is
-//! content-free: states, counts, names and error codes, never message text.
+//! content-free (states, counts, names and error codes, never message text) except the
+//! `peek` result ([`PeekResult`]), which carries the owner conversation's last messages,
+//! masked and capped, and only when the bridge's config allows it.
 
 use serde::de::Error as _;
 use serde::ser::SerializeMap;
@@ -12,6 +14,14 @@ use serde_json::Value;
 pub const PROTOCOL: u32 = 1;
 /// The longest line either side accepts, in bytes.
 pub const MAX_LINE: usize = 64 * 1024;
+/// The most entries a bridge keeps and a `peek` returns.
+pub const PEEK_CAP: usize = 50;
+/// Entries a `peek` without `limit` returns.
+pub const PEEK_DEFAULT: usize = 20;
+/// The longest entry text, in characters.
+pub const PEEK_TEXT_MAX: usize = 300;
+/// The error code of a `peek` when the bridge's config.json has `"peek": false`.
+pub const PEEK_DISABLED: &str = "peek_disabled";
 
 /// A client's request line: `{"id":1,"method":"status","params":{}}`.
 ///
@@ -28,8 +38,12 @@ impl Serialize for Request {
         let mut map = serializer.serialize_map(None)?;
         map.serialize_entry("id", &self.id)?;
         map.serialize_entry("method", self.call.method())?;
-        if let Call::PauseBackend(params) = &self.call {
-            map.serialize_entry("params", params)?;
+        match &self.call {
+            Call::PauseBackend(params) => map.serialize_entry("params", params)?,
+            Call::Peek(params) if params.limit.is_some() => {
+                map.serialize_entry("params", params)?;
+            }
+            _ => {}
         }
         map.end()
     }
@@ -53,6 +67,8 @@ pub enum Call {
     Shutdown,
     PauseBackend(PauseParams),
     ResumeBackend,
+    /// The owner conversation's last messages; see [`PeekResult`].
+    Peek(PeekParams),
 }
 
 impl Call {
@@ -65,8 +81,72 @@ impl Call {
             Call::Shutdown => "shutdown",
             Call::PauseBackend(_) => "pause_backend",
             Call::ResumeBackend => "resume_backend",
+            Call::Peek(_) => "peek",
         }
     }
+}
+
+/// `peek`'s parameters.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PeekParams {
+    /// How many entries; see [`peek_limit`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+/// The number of entries a peek returns: `limit` (default [`PEEK_DEFAULT`]) clamped to
+/// `1..=PEEK_CAP`.
+pub fn peek_limit(params: &PeekParams) -> usize {
+    params.limit.unwrap_or(PEEK_DEFAULT).clamp(1, PEEK_CAP)
+}
+
+/// One message in the peek.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeekEntry {
+    /// Unix milliseconds.
+    pub time: i64,
+    pub from: PeekFrom,
+    pub kind: PeekKind,
+    /// Masked as sent, at most [`PEEK_TEXT_MAX`] characters.
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub card_state: Option<CardState>,
+}
+
+/// Who sent a peek entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PeekFrom {
+    Owner,
+    Agent,
+}
+
+/// What a peek entry is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PeekKind {
+    Text,
+    Reply,
+    Card,
+    Answer,
+    Step,
+    Note,
+}
+
+/// A card entry's state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CardState {
+    Open,
+    Answered,
+    Declined,
+    Expired,
+}
+
+/// The `peek` result: oldest first (newest last).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PeekResult {
+    pub entries: Vec<PeekEntry>,
 }
 
 /// `pause_backend`'s parameters.
@@ -155,6 +235,8 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         method: Option<String>,
     },
+    /// The peek's entries changed (content-free: no entry in it).
+    PeekChanged,
 }
 
 /// The bridge's state, as the tray shows it.
@@ -306,6 +388,18 @@ fn request_from_value(value: Value) -> Result<Request, (Option<u64>, ErrorBody)>
                 call: Call::PauseBackend(params),
             })
         }
+        "peek" => {
+            let params = match params {
+                None => PeekParams::default(),
+                Some(params @ Value::Object(_)) => serde_json::from_value(params)
+                    .map_err(|_| bad_request(Some(id), "bad peek params"))?,
+                Some(_) => return Err(bad_request(Some(id), "params must be an object")),
+            };
+            Ok(Request {
+                id,
+                call: Call::Peek(params),
+            })
+        }
         _ => Err((
             Some(id),
             ErrorBody {
@@ -352,6 +446,14 @@ mod tests {
                     drain_timeout_ms: Some(5),
                 }),
                 r#"{"id":7,"method":"pause_backend","params":{"reason":"x","drainTimeoutMs":5}}"#,
+            ),
+            (
+                Call::Peek(PeekParams::default()),
+                r#"{"id":7,"method":"peek"}"#,
+            ),
+            (
+                Call::Peek(PeekParams { limit: Some(5) }),
+                r#"{"id":7,"method":"peek","params":{"limit":5}}"#,
             ),
         ];
         for (call, wire) in cases {
@@ -584,6 +686,179 @@ mod tests {
         assert_eq!(value["lastError"]["code"], "x");
         assert_eq!(value["startedAt"], 5);
         assert_eq!(serde_json::from_value::<Status>(value).unwrap(), status);
+    }
+
+    #[test]
+    fn peek_params_are_optional() {
+        for line in [
+            r#"{"id":3,"method":"peek"}"#,
+            r#"{"id":3,"method":"peek","params":null}"#,
+            r#"{"id":3,"method":"peek","params":{}}"#,
+        ] {
+            assert_eq!(
+                parse_request(line).unwrap(),
+                req(3, Call::Peek(PeekParams::default())),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn bad_peek_params_are_bad_request_with_the_id() {
+        for line in [
+            r#"{"id":4,"method":"peek","params":{"limit":"x"}}"#,
+            r#"{"id":4,"method":"peek","params":{"limit":-1}}"#,
+            r#"{"id":4,"method":"peek","params":[1]}"#,
+        ] {
+            let (id, error) = parse_request(line).unwrap_err();
+            assert_eq!(
+                (id, error.code.as_str()),
+                (Some(4), "bad_request"),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn peek_limit_defaults_and_clamps() {
+        let limit = |limit| peek_limit(&PeekParams { limit });
+        assert_eq!(limit(None), PEEK_DEFAULT);
+        assert_eq!(limit(None), 20);
+        assert_eq!(limit(Some(0)), 1);
+        assert_eq!(limit(Some(7)), 7);
+        assert_eq!(limit(Some(50)), 50);
+        assert_eq!(limit(Some(500)), PEEK_CAP);
+    }
+
+    #[test]
+    fn peek_entries_serialize_as_documented() {
+        let card = PeekEntry {
+            time: 5,
+            from: PeekFrom::Agent,
+            kind: PeekKind::Card,
+            text: "Allow x? [Approve] [Reject]".into(),
+            card_state: Some(CardState::Open),
+        };
+        assert_eq!(
+            serde_json::to_string(&card).unwrap(),
+            r#"{"time":5,"from":"agent","kind":"card","text":"Allow x? [Approve] [Reject]","card_state":"open"}"#
+        );
+        let text = PeekEntry {
+            time: 6,
+            from: PeekFrom::Owner,
+            kind: PeekKind::Text,
+            text: "hi".into(),
+            card_state: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&text).unwrap(),
+            r#"{"time":6,"from":"owner","kind":"text","text":"hi"}"#
+        );
+        let result = PeekResult {
+            entries: vec![card, text],
+        };
+        let value = serde_json::to_value(&result).unwrap();
+        assert_eq!(value["entries"].as_array().unwrap().len(), 2);
+        assert_eq!(serde_json::from_value::<PeekResult>(value).unwrap(), result);
+    }
+
+    #[test]
+    fn peek_changed_is_a_bare_event() {
+        let line = EventLine {
+            event: Event::PeekChanged,
+            at: 5,
+        };
+        let wire = r#"{"event":"peek_changed","at":5}"#;
+        assert_eq!(encode(&line), format!("{wire}\n"));
+        assert_eq!(
+            serde_json::from_str::<ServerLine>(wire).unwrap(),
+            ServerLine::Event(line)
+        );
+    }
+
+    /// Only `peek` may carry message text. Both matches are exhaustive on purpose: a new
+    /// call or event does not compile until someone decides whether it carries content.
+    #[test]
+    fn only_peek_carries_message_text() {
+        fn carries_text(call: &Call) -> bool {
+            match call {
+                // No parameters; the result is the content-free `Status`.
+                Call::Status => false,
+                // No parameters; the result is ok or an error code.
+                Call::RestartBackend | Call::Reconnect | Call::Shutdown => false,
+                Call::ResumeBackend => false,
+                // A reason for people from the caller, and a timeout; nothing from chats.
+                Call::PauseBackend(_) => false,
+                // The owner conversation's last messages, masked and capped, when allowed.
+                Call::Peek(_) => true,
+            }
+        }
+        fn event_carries_text(event: &Event) -> bool {
+            match event {
+                // Versions, a pid and the instance id.
+                Event::Hello { .. } => false,
+                // A state and a short fixed detail.
+                Event::StateChanged { .. } => false,
+                // A fixed source name.
+                Event::TurnStarted { .. } | Event::TurnEnded { .. } => false,
+                // Kinds, outcomes and counts.
+                Event::RequestOpened { .. } | Event::RequestClosed { .. } => false,
+                // An error code and a method name.
+                Event::Error { .. } => false,
+                // Only that the peek changed; clients ask `peek` for the entries.
+                Event::PeekChanged => false,
+            }
+        }
+        let calls = [
+            Call::Status,
+            Call::RestartBackend,
+            Call::Reconnect,
+            Call::Shutdown,
+            Call::PauseBackend(PauseParams::default()),
+            Call::ResumeBackend,
+            Call::Peek(PeekParams::default()),
+        ];
+        for call in &calls {
+            assert_eq!(
+                carries_text(call),
+                matches!(call, Call::Peek(_)),
+                "{}",
+                call.method()
+            );
+        }
+        let events = [
+            Event::Hello {
+                protocol: PROTOCOL,
+                bridge: "0.1.0".into(),
+                pid: 1,
+                instance: "x".into(),
+            },
+            Event::StateChanged {
+                state: BridgeState::Idle,
+                detail: None,
+            },
+            Event::TurnStarted {
+                source: "prompt".into(),
+            },
+            Event::TurnEnded { interrupted: false },
+            Event::RequestOpened {
+                kind: "plan".into(),
+                open: 1,
+            },
+            Event::RequestClosed {
+                kind: "plan".into(),
+                outcome: "answered".into(),
+                open: 0,
+            },
+            Event::Error {
+                code: "x".into(),
+                method: None,
+            },
+            Event::PeekChanged,
+        ];
+        for event in &events {
+            assert!(!event_carries_text(event), "{event:?}");
+        }
     }
 
     #[test]
