@@ -15,6 +15,7 @@ pub mod folders;
 pub mod logging;
 pub mod mask;
 pub mod messenger;
+pub mod peek;
 pub mod render;
 pub mod state;
 pub mod test_backend;

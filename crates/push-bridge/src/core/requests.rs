@@ -1,6 +1,7 @@
 //! The agent's requests as cards: posting them, settling them with the owner's answer,
 //! and their deadlines.
 
+use push_bridge_control::{CardState, PeekKind};
 use push_sdk::OpenCard;
 use tokio::time::Instant;
 
@@ -38,7 +39,12 @@ impl<M: Messenger> Core<M> {
         self.seal_turn();
         let card = match &plan.card {
             Some(body) => match self.messenger.send_rich(self.conversation, body) {
-                Ok(id) => Some(id),
+                Ok(id) => {
+                    let time = self.clock.now_ms();
+                    self.control
+                        .record(|ring| ring.sent(time, Some(id), body, PeekKind::Reply));
+                    Some(id)
+                }
                 Err(error) => {
                     tracing::warn!(event = "card_refused", code = error.code());
                     if let Some(responder) = responder {
@@ -86,6 +92,7 @@ impl<M: Messenger> Core<M> {
         if let Some(card) = request.card {
             self.cards.close(card);
         }
+        self.peek_card(request.card, CardState::Answered);
         self.request_closed(&request.kind, "answered");
         match request.responder {
             Some(responder) => responder.answer(answer),
@@ -114,6 +121,7 @@ impl<M: Messenger> Core<M> {
             if let Some(card) = request.card {
                 self.cards.close(card);
             }
+            self.peek_card(request.card, CardState::Expired);
             self.request_closed(&request.kind, "expired");
             let answer = cards::timeout_answer(&request.kind);
             if let (Some(responder), Some(answer)) = (request.responder, answer) {
@@ -138,6 +146,7 @@ impl<M: Messenger> Core<M> {
             if let Some(card) = request.card {
                 self.cards.close(card);
             }
+            self.peek_card(request.card, CardState::Declined);
             self.request_closed(&request.kind, "declined");
         }
         self.reply(why);
@@ -157,6 +166,7 @@ impl<M: Messenger> Core<M> {
             if let Some(card) = request.card {
                 self.cards.close(card);
             }
+            self.peek_card(request.card, CardState::Declined);
             self.request_closed(&request.kind, "declined");
         }
         self.reply("Turning approvals off was cancelled: the session changed.");

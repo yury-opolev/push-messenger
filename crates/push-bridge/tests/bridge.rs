@@ -708,7 +708,7 @@ async fn the_control_channel_serves_status_and_shutdown() {
         std::process::id(),
         &uuid::Uuid::new_v4().simple().to_string()[..8]
     );
-    let hub = ControlHub::new(id.clone());
+    let hub = ControlHub::new(id.clone(), true);
     let (backend, events) = TestBackend::channel();
     let mut h = Harness::run_with(Arc::clone(&backend) as Arc<dyn Backend>, events, Some(&hub));
     within(backend.wait_for("start", 1)).await;
@@ -766,4 +766,158 @@ async fn the_control_channel_serves_status_and_shutdown() {
     assert_eq!(within(h.run.take().unwrap()).await.unwrap(), Ok(()));
     assert_eq!(backend.calls().last().map(String::as_str), Some("stop"));
     serving.abort();
+}
+
+/// A control client over an in-process stream that keeps every line it receives.
+struct PeekClient {
+    lines: Arc<Mutex<Vec<String>>>,
+    writer: tokio::io::WriteHalf<tokio::io::DuplexStream>,
+    reading: JoinHandle<()>,
+}
+
+impl PeekClient {
+    fn connect(hub: &ControlHub) -> Self {
+        let (client, server) = tokio::io::duplex(1 << 20);
+        hub.serve_stream(server);
+        let (reader, writer) = tokio::io::split(client);
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let kept = Arc::clone(&lines);
+        let reading = tokio::spawn(async move {
+            let mut reader = BufReader::new(reader).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                kept.lock().unwrap().push(line);
+            }
+        });
+        Self {
+            lines,
+            writer,
+            reading,
+        }
+    }
+
+    fn lines(&self) -> Vec<String> {
+        self.lines.lock().unwrap().clone()
+    }
+
+    /// Sends request `id` and returns its response line.
+    async fn request(&mut self, id: u64, method: &str) -> String {
+        let line = format!("{{\"id\":{id},\"method\":\"{method}\"}}\n");
+        self.writer.write_all(line.as_bytes()).await.unwrap();
+        let wanted = format!("{{\"id\":{id},");
+        within(async {
+            loop {
+                if let Some(line) = self.lines().into_iter().find(|l| l.starts_with(&wanted)) {
+                    return line;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+    }
+}
+
+/// Everything on the control channel is content-free except the `peek` response: the
+/// owner's text, the agent's reply and step and a card's question never show anywhere
+/// else, and `peek` returns them.
+#[tokio::test(start_paused = true)]
+async fn only_the_peek_carries_the_conversation_over_the_control_channel() {
+    const MARKER: &str = "zq-marker-7731";
+    let hub = ControlHub::new("0011223344556677".into(), true);
+    let (backend, events) = TestBackend::channel();
+    let mut h = Harness::run_with(Arc::clone(&backend) as Arc<dyn Backend>, events, Some(&hub));
+    let mut client = PeekClient::connect(&hub);
+    within(backend.wait_for("start", 1)).await;
+    settle().await;
+
+    h.messenger.owner_says(&format!("look for {MARKER}"));
+    within(backend.wait_for("prompt", 1)).await;
+    backend.turn_started(TurnSource::Prompt);
+    backend.emit(BackendEvent::ToolStarted {
+        id: "1".into(),
+        tool: "Bash".into(),
+        target: format!("grep -r {MARKER}"),
+        task: None,
+    });
+    backend.emit(BackendEvent::ToolFinished {
+        id: "1".into(),
+        failed: false,
+    });
+    backend.text(&format!("Found {MARKER} twice."));
+    backend.turn_ended(false);
+    within(h.activity(ActivityState::Idle)).await;
+    let answer = backend.request(RequestKind::Question {
+        question: format!("Remove {MARKER}?"),
+        options: vec!["Yes".into(), "No".into()],
+        multi_select: false,
+        allow_free_text: false,
+    });
+    let (card, _) = h.card(1).await;
+    h.messenger.answer(card, &["o1"]);
+    assert_eq!(within(answer).await, Ok(Answer::Question("Yes".into())));
+    settle().await;
+
+    let status = client.request(8, "status").await;
+    let lines = client.lines();
+    for method in ["hello", "state_changed", "turn_started", "turn_ended"] {
+        assert!(
+            lines.iter().any(|l| l.contains(&format!("\"{method}\""))),
+            "{method}: {lines:#?}"
+        );
+    }
+    for event in ["request_opened", "request_closed", "peek_changed"] {
+        assert!(
+            lines.iter().any(|l| l.contains(event)),
+            "{event}: {lines:#?}"
+        );
+    }
+    assert!(status.contains("\"ok\":true"), "{status}");
+    for line in &lines {
+        assert!(!line.contains(MARKER), "{line}");
+    }
+
+    let peek = client.request(9, "peek").await;
+    let response: serde_json::Value = serde_json::from_str(&peek).unwrap();
+    let texts: Vec<&str> = response["result"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["text"].as_str().unwrap())
+        .collect();
+    for wanted in [
+        format!("look for {MARKER}"),
+        format!("✓ Bash grep -r {MARKER}"),
+        format!("Found {MARKER} twice."),
+        format!("Remove {MARKER}? [Yes] [No]"),
+        "Yes".to_owned(),
+    ] {
+        assert!(texts.contains(&wanted.as_str()), "{wanted}: {texts:#?}");
+    }
+    client.reading.abort();
+    h.stop().await.unwrap();
+}
+
+/// With `"peek": false`, nothing is recorded: `peek` answers `peek_disabled` and no
+/// `peek_changed` goes out.
+#[tokio::test(start_paused = true)]
+async fn a_bridge_without_the_peek_answers_peek_disabled() {
+    let hub = ControlHub::new("0011223344556677".into(), false);
+    let (backend, events) = TestBackend::channel();
+    let mut h = Harness::run_with(Arc::clone(&backend) as Arc<dyn Backend>, events, Some(&hub));
+    let mut client = PeekClient::connect(&hub);
+    within(backend.wait_for("start", 1)).await;
+    h.messenger.owner_says("hello");
+    within(backend.wait_for("prompt hello", 1)).await;
+    backend.turn_started(TurnSource::Prompt);
+    backend.text("Hi.");
+    backend.turn_ended(false);
+    within(h.activity(ActivityState::Idle)).await;
+    let peek = client.request(3, "peek").await;
+    assert!(peek.contains("\"peek_disabled\""), "{peek}");
+    assert!(
+        !client.lines().iter().any(|l| l.contains("peek_changed")),
+        "{:#?}",
+        client.lines()
+    );
+    client.reading.abort();
+    h.stop().await.unwrap();
 }

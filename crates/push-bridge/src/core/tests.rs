@@ -55,7 +55,7 @@ impl Harness {
         let state = Arc::new(StateFile::load(&dir.path().join("state.json")).unwrap());
         let (messenger, messenger_events) = TestMessenger::new();
         let (backend, backend_events) = TestBackend::channel();
-        let hub = ControlHub::new("0011223344556677".into());
+        let hub = ControlHub::new("0011223344556677".into(), true);
         let events = hub.handle().subscribe();
         Self {
             messenger,
@@ -2204,4 +2204,152 @@ async fn a_pause_s_events_and_status_carry_no_held_text() {
         let line = serde_json::to_string(&event).unwrap();
         assert!(!line.contains(SECRET), "{line}");
     }
+}
+
+/// The peek's entries now.
+fn peeked(h: &Harness) -> Vec<push_bridge_control::PeekEntry> {
+    h.hub
+        .handle()
+        .peek(push_bridge_control::PEEK_CAP)
+        .expect("the peek is on")
+}
+
+/// A turn with one finished tool step and `text`.
+async fn turn_with_a_step(h: &Harness, target: &str, text: &str) {
+    h.backend.turn_started(TurnSource::Prompt);
+    h.backend.emit(BackendEvent::ToolStarted {
+        id: "1".into(),
+        tool: "Bash".into(),
+        target: target.into(),
+        task: None,
+    });
+    h.backend.emit(BackendEvent::ToolFinished {
+        id: "1".into(),
+        failed: false,
+    });
+    h.backend.text(text);
+    h.backend.turn_ended(false);
+    h.idle().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_peek_follows_the_owner_conversation() {
+    use push_bridge_control::{CardState, PeekFrom, PeekKind};
+    let mut h = Harness::started().await;
+    h.control_events();
+    h.messenger.owner_says("hello api_key=hunter2");
+    h.backend.wait_for("prompt hello", 1).await;
+    let stranger = h.messenger.says(UserId::new(), "let me in");
+    h.messenger.inject(Event::MessageAdded(stranger));
+    settle().await;
+    let entries = peeked(&h);
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert_eq!(
+        (entries[0].from, entries[0].kind),
+        (PeekFrom::Owner, PeekKind::Text)
+    );
+    assert!(entries[0].text.starts_with("hello api_key="), "{entries:?}");
+    assert!(!entries[0].text.contains("hunter2"));
+    assert!(h.control_events().contains(&ControlEvent::PeekChanged));
+
+    turn_with_a_step(&h, "cargo test", "All green.").await;
+    let entries = peeked(&h);
+    let shown: Vec<_> = entries[1..]
+        .iter()
+        .map(|e| (e.from, e.kind, e.text.as_str()))
+        .collect();
+    assert_eq!(
+        shown,
+        [
+            (PeekFrom::Agent, PeekKind::Step, "✓ Bash cargo test"),
+            (PeekFrom::Agent, PeekKind::Reply, "All green."),
+        ]
+    );
+
+    let answer = h.backend.request(permission());
+    let card = h.card(1).await;
+    let last = peeked(&h).pop().unwrap();
+    assert_eq!(
+        (last.kind, last.text.as_str(), last.card_state),
+        (
+            PeekKind::Card,
+            "Allow Bash? [Approve] [Reject]",
+            Some(CardState::Open)
+        )
+    );
+    h.messenger.answer(card, &["approve"]);
+    assert_eq!(answer.await, Ok(Answer::Permission(true)));
+    let entries = peeked(&h);
+    let answered = entries.last().unwrap();
+    assert_eq!(
+        (answered.from, answered.kind, answered.text.as_str()),
+        (PeekFrom::Owner, PeekKind::Answer, "Approve")
+    );
+    let card_entry = &entries[entries.len() - 2];
+    assert_eq!(card_entry.card_state, Some(CardState::Answered));
+
+    h.messenger.owner_says("/status");
+    h.reply_containing("Session:").await;
+    let entries = peeked(&h);
+    let tail: Vec<_> = entries[entries.len() - 2..]
+        .iter()
+        .map(|e| (e.from, e.kind))
+        .collect();
+    assert_eq!(
+        tail,
+        [
+            (PeekFrom::Owner, PeekKind::Text),
+            (PeekFrom::Agent, PeekKind::Note)
+        ]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_peek_shows_expired_and_declined_cards() {
+    use push_bridge_control::{CardState, PeekKind};
+    let h = Harness::started().await;
+    let first = h.backend.request(permission());
+    h.card(1).await;
+    tokio::time::sleep(cards::CARD_TIMEOUT + Duration::from_secs(1)).await;
+    assert_eq!(first.await, Ok(Answer::Permission(false)));
+    h.backend.request(permission());
+    h.card(2).await;
+    h.messenger.owner_says("/new");
+    h.reply_containing("Declined: ").await;
+    let states: Vec<_> = peeked(&h)
+        .into_iter()
+        .filter(|e| e.kind == PeekKind::Card)
+        .map(|e| e.card_state)
+        .collect();
+    assert_eq!(
+        states,
+        [Some(CardState::Expired), Some(CardState::Declined)]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_peek_writes_nothing_to_disk() {
+    const MARKER: &str = "zq-marker-7731";
+    let mut h = Harness::started().await;
+    h.messenger.owner_says(&format!("say {MARKER}"));
+    h.backend.wait_for("prompt", 1).await;
+    turn_with_a_step(&h, &format!("grep {MARKER}"), &format!("found {MARKER}")).await;
+    assert!(peeked(&h).iter().any(|e| e.text.contains(MARKER)));
+    h.stop().await.unwrap();
+    let mut folders = vec![h._dir.path().to_path_buf()];
+    let mut files = 0;
+    while let Some(folder) = folders.pop() {
+        for item in std::fs::read_dir(&folder).unwrap() {
+            let path = item.unwrap().path();
+            if path.is_dir() {
+                folders.push(path);
+            } else {
+                files += 1;
+                let bytes = std::fs::read(&path).unwrap();
+                let text = String::from_utf8_lossy(&bytes);
+                assert!(!text.contains(MARKER), "{}", path.display());
+            }
+        }
+    }
+    assert!(files > 0, "the state file was written");
 }

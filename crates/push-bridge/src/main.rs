@@ -336,7 +336,9 @@ async fn run(dir: &Path) -> Result<(), Failure> {
     if state.get().enrolled_user_id.is_none() {
         return Err(Failure::setup(ENROLL_HINT));
     }
-    let hub = config.control.then(|| ControlHub::new(instance_id(dir)));
+    let hub = config
+        .control
+        .then(|| ControlHub::new(instance_id(dir), config.peek));
     let serving = hub.as_ref().and_then(serve_control);
     let control = hub.as_ref().map(ControlHub::handle);
     let calls = hub.as_ref().map(ControlHub::calls);
