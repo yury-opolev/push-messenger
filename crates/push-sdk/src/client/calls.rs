@@ -7,7 +7,7 @@ use push_proto::v1::{self, frame::Body};
 
 use super::Client;
 use crate::SdkError;
-use crate::calls::{IceCandidate, SdpKind};
+use crate::calls::{CallPage, IceCandidate, IceServers, SdpKind};
 use crate::connection::Command;
 use crate::model::ConnectionState;
 use crate::store::bytes;
@@ -167,6 +167,90 @@ impl Calls {
             sdp: sdp.to_owned(),
             r#type: kind.to_wire().into(),
         }))
+    }
+
+    /// The STUN and TURN servers for a call, with short-lived TURN credentials. Needs a
+    /// signed-in client only (not a connection, nor [`Calls::available`]).
+    ///
+    /// Fetch them for every call, or when fewer than 60 s are left before
+    /// [`IceServers::expires_at_ms`]; give them unchanged to the peer connection
+    /// (`RTCConfiguration.iceServers`), and to a running call with `setConfiguration`
+    /// before an ICE restart. [`IceServers::relay`] false means no TURN server (calls
+    /// between symmetric NATs fail). For IP privacy, use relay-only ICE
+    /// (`iceTransportPolicy: "relay"`, only with `relay`).
+    ///
+    /// Errors: the server's `turn_unavailable` (retryable, `retry_after_s` 30) when no
+    /// relay is configured or the provider failed; `rate_limited` with `retry_after_s`.
+    ///
+    /// [`IceServers::expires_at_ms`]: crate::IceServers::expires_at_ms
+    /// [`IceServers::relay`]: crate::IceServers::relay
+    pub async fn ice_servers(&self) -> Result<IceServers, SdkError> {
+        let inner = self.client.inner.clone();
+        self.client
+            .run(async move {
+                let session = inner.credentials.fresh().await?;
+                inner.auth.ice_servers(&session.access_token).await
+            })
+            .await
+    }
+
+    /// A page of the user's call history, newest first (ended calls only; ringing and
+    /// active ones are in [`CallEvent::Synced`]). Needs a signed-in client only.
+    ///
+    /// `before` and `since` are cursors ([`CallLogEntry::cursor`], [`CallPage::next`]),
+    /// passed back unchanged: `before` pages back to older calls, `since` lists the calls
+    /// newer than one already seen; they combine. `limit` is 1 to 100 (50 when `None`);
+    /// anything else is [`SdkError::Invalid`]. For a missed-call badge, ask with `since`
+    /// on [`CallEvent::HistoryChanged`] and after every reconnect (docs/calls.md §12).
+    ///
+    /// Errors: the server's `invalid` (a cursor it does not know), `rate_limited` with
+    /// `retry_after_s`, `unavailable` (retryable).
+    ///
+    /// [`CallEvent::Synced`]: crate::CallEvent::Synced
+    /// [`CallEvent::HistoryChanged`]: crate::CallEvent::HistoryChanged
+    /// [`CallLogEntry::cursor`]: crate::CallLogEntry::cursor
+    /// [`CallPage::next`]: crate::CallPage::next
+    pub async fn history(
+        &self,
+        before: Option<&str>,
+        since: Option<&str>,
+        limit: Option<u32>,
+    ) -> Result<CallPage, SdkError> {
+        if limit.is_some_and(|limit| !(1..=100).contains(&limit)) {
+            return Err(SdkError::Invalid(
+                "the call history limit is 1 to 100".to_owned(),
+            ));
+        }
+        let inner = self.client.inner.clone();
+        let (before, since) = (before.map(str::to_owned), since.map(str::to_owned));
+        self.client
+            .run(async move {
+                let session = inner.credentials.fresh().await?;
+                inner
+                    .auth
+                    .call_history(
+                        &session.access_token,
+                        before.as_deref(),
+                        since.as_deref(),
+                        limit,
+                    )
+                    .await
+            })
+            .await
+    }
+
+    /// Hides a call from the user's history, on all their devices (the other participant
+    /// still sees it). `Ok` whether or not the user had such a call. Needs a signed-in
+    /// client only. Errors: the server's `rate_limited` with `retry_after_s`,
+    /// `unavailable` (retryable).
+    pub async fn hide(&self, call: CallId) -> Result<(), SdkError> {
+        let inner = self.client.inner.clone();
+        self.client
+            .run(async move {
+                let session = inner.credentials.fresh().await?;
+                inner.auth.hide_call(&session.access_token, call).await
+            })
+            .await
     }
 
     /// A call frame may go now: a connection serves and calls are available on it. The
@@ -629,5 +713,14 @@ mod tests {
         );
         let end = IceCandidate::end_of_candidates();
         assert!(end.end_of_candidates && end.candidate.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_history_limit_out_of_range_is_refused_locally() {
+        let f = Fixture::new().await;
+        for limit in [0, 101] {
+            let result = f.client.calls().history(None, None, Some(limit)).await;
+            assert!(matches!(result, Err(SdkError::Invalid(_))), "{result:?}");
+        }
     }
 }

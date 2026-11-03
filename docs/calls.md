@@ -767,7 +767,8 @@ Errors use the API's format (`{"error": {"code", "message", "retryable"}}`):
 | 429 | `rate_limited` (`Retry-After`) | more than 60 requests per user per hour (600 per IP) |
 | 503 | `turn_unavailable` (`Retry-After: 30`, retryable) | no TURN configured (`calls.enabled` false), or the provider failed or answered with nothing usable. The API never returns servers that could not work |
 
-Client SDKs: the push-sdk `Calls::ice_servers()` arrives with the SDK calls API.
+Client SDKs: push-sdk's `Calls::ice_servers()` (and `Calls::history()` / `Calls::hide()`
+for [§12](#12-call-history)).
 
 ### 13.2 Security
 

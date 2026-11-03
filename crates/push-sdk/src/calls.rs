@@ -138,6 +138,20 @@ impl CallEndReason {
         }
     }
 
+    /// The reason [`CallEndReason::as_str`] names; any other name is `Failed`, as an
+    /// unknown wire reason is.
+    pub(crate) fn from_name(name: &str) -> Self {
+        match name {
+            "completed" => Self::Completed,
+            "missed" => Self::Missed,
+            "declined" => Self::Declined,
+            "cancelled" => Self::Cancelled,
+            "busy" => Self::Busy,
+            "unreachable" => Self::Unreachable,
+            _ => Self::Failed,
+        }
+    }
+
     pub(crate) fn from_wire(reason: v1::CallEndReason) -> Self {
         match reason {
             v1::CallEndReason::Completed => Self::Completed,
@@ -263,6 +277,72 @@ impl std::fmt::Debug for CallState {
             .field("this_device", &self.this_device)
             .finish()
     }
+}
+
+/// One STUN or TURN server, an entry of `RTCConfiguration.iceServers` as is. `Debug`
+/// never shows the username or the credential.
+#[derive(Clone, PartialEq, Eq)]
+pub struct IceServer {
+    /// `stun:`, `turn:` or `turns:` URLs.
+    pub urls: Vec<String>,
+    /// TURN only.
+    pub username: Option<String>,
+    /// TURN only.
+    pub credential: Option<String>,
+}
+
+impl std::fmt::Debug for IceServer {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IceServer")
+            .field("urls", &self.urls)
+            .field("username", &redacted(&self.username))
+            .field("credential", &redacted(&self.credential))
+            .finish()
+    }
+}
+
+/// The ICE servers for the user's calls ([`crate::Calls::ice_servers`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IceServers {
+    /// The peer connection's `iceServers`, unchanged.
+    pub servers: Vec<IceServer>,
+    /// When the credentials stop working (server clock); an allocation made before keeps
+    /// working while it is refreshed.
+    pub expires_at_ms: i64,
+    /// Whether a TURN server is among them. Without one, calls between symmetric NATs
+    /// fail.
+    pub relay: bool,
+}
+
+/// One ended call of the user's history ([`crate::Calls::history`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallLogEntry {
+    pub call_id: CallId,
+    /// The other participant.
+    pub peer_user_id: UserId,
+    pub direction: CallDirection,
+    /// When the call was invited (server clock).
+    pub started_at_ms: i64,
+    /// When it was answered; `None` for calls never answered.
+    pub answered_at_ms: Option<i64>,
+    /// When it ended.
+    pub ended_at_ms: i64,
+    /// Whole seconds from the answer to the end; `0` for calls never answered.
+    pub duration_s: u32,
+    /// How it ended. A reason this client does not know is `Failed`.
+    pub outcome: CallEndReason,
+    /// This call's position, for `before` and `since`: an opaque string, passed back
+    /// unchanged.
+    pub cursor: String,
+}
+
+/// A page of the user's call history, newest first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallPage {
+    pub calls: Vec<CallLogEntry>,
+    /// Only when the page is full: ask again with `before` set to it for older calls.
+    pub next: Option<String>,
 }
 
 /// What happened to a call, as [`crate::Event::Call`]. Only on a connection where calls

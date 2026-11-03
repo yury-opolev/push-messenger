@@ -36,8 +36,8 @@ pub use agent_key::{
 };
 pub use auth::{Device, Platform, Profile};
 pub use calls::{
-    CallDirection, CallEndReason, CallErrorCode, CallEvent, CallState, CallStatus, IceCandidate,
-    SdpKind,
+    CallDirection, CallEndReason, CallErrorCode, CallEvent, CallLogEntry, CallPage, CallState,
+    CallStatus, IceCandidate, IceServer, IceServers, SdpKind,
 };
 pub use cards::{CardBook, CardCheck, CardRefusal, OpenCard};
 pub use client::{Account, Calls, Client, Config, EDIT_WINDOW, Events};

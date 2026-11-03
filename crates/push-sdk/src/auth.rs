@@ -13,13 +13,14 @@
 
 use std::time::Duration;
 
-use push_domain::{DeviceId, UserId};
+use push_domain::{CallId, DeviceId, UserId};
 use reqwest::{Method, RequestBuilder, StatusCode};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::SdkError;
+use crate::calls::{CallDirection, CallEndReason, CallLogEntry, CallPage, IceServer, IceServers};
 
 /// How long one HTTP request may take.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
@@ -488,6 +489,146 @@ impl AuthApi {
             .map(Profile::from)
             .map_err(|_| unreadable("the profile"))
     }
+
+    /// `GET /v1/calls/ice-servers`: the STUN and TURN servers for the user's calls.
+    pub async fn ice_servers(&self, access_token: &str) -> Result<IceServers, SdkError> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Urls {
+            One(String),
+            Many(Vec<String>),
+        }
+        #[derive(Deserialize)]
+        struct ServerBody {
+            urls: Urls,
+            username: Option<String>,
+            credential: Option<String>,
+        }
+        #[derive(Deserialize)]
+        struct ServersBody {
+            ice_servers: Vec<ServerBody>,
+            expires_at: String,
+            relay: bool,
+        }
+        let answer = retried(Attempts::ORDINARY, || {
+            self.request(Method::GET, "/v1/calls/ice-servers")
+                .bearer_auth(access_token)
+        })
+        .await?;
+        let body: ServersBody =
+            serde_json::from_value(answer).map_err(|_| unreadable("the ICE servers"))?;
+        Ok(IceServers {
+            servers: body
+                .ice_servers
+                .into_iter()
+                .map(|server| IceServer {
+                    urls: match server.urls {
+                        Urls::One(url) => vec![url],
+                        Urls::Many(urls) => urls,
+                    },
+                    username: server.username,
+                    credential: server.credential,
+                })
+                .collect(),
+            expires_at_ms: millis(&body.expires_at).ok_or_else(|| unreadable("the ICE servers"))?,
+            relay: body.relay,
+        })
+    }
+
+    /// `GET /v1/calls?before=…&since=…&limit=…`: a page of the user's call history; absent
+    /// parameters are not sent.
+    pub async fn call_history(
+        &self,
+        access_token: &str,
+        before: Option<&str>,
+        since: Option<&str>,
+        limit: Option<u32>,
+    ) -> Result<CallPage, SdkError> {
+        #[derive(Deserialize)]
+        struct EntryBody {
+            call_id: CallId,
+            peer_user_id: UserId,
+            direction: String,
+            started_at: String,
+            answered_at: Option<String>,
+            ended_at: String,
+            duration_s: u32,
+            outcome: String,
+            cursor: String,
+        }
+        #[derive(Deserialize)]
+        struct PageBody {
+            calls: Vec<EntryBody>,
+            next: Option<String>,
+        }
+        let mut query: Vec<(&str, String)> = Vec::new();
+        if let Some(before) = before {
+            query.push(("before", before.to_owned()));
+        }
+        if let Some(since) = since {
+            query.push(("since", since.to_owned()));
+        }
+        if let Some(limit) = limit {
+            query.push(("limit", limit.to_string()));
+        }
+        let answer = retried(Attempts::ORDINARY, || {
+            self.request(Method::GET, "/v1/calls")
+                .query(&query)
+                .bearer_auth(access_token)
+        })
+        .await?;
+        let body: PageBody =
+            serde_json::from_value(answer).map_err(|_| unreadable("the call history"))?;
+        let entry = |entry: EntryBody| -> Option<CallLogEntry> {
+            Some(CallLogEntry {
+                call_id: entry.call_id,
+                peer_user_id: entry.peer_user_id,
+                direction: match entry.direction.as_str() {
+                    "in" => CallDirection::Incoming,
+                    "out" => CallDirection::Outgoing,
+                    _ => return None,
+                },
+                started_at_ms: millis(&entry.started_at)?,
+                answered_at_ms: match entry.answered_at {
+                    Some(time) => Some(millis(&time)?),
+                    None => None,
+                },
+                ended_at_ms: millis(&entry.ended_at)?,
+                duration_s: entry.duration_s,
+                outcome: CallEndReason::from_name(&entry.outcome),
+                cursor: entry.cursor,
+            })
+        };
+        let calls = body
+            .calls
+            .into_iter()
+            .map(entry)
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| unreadable("the call history"))?;
+        Ok(CallPage {
+            calls,
+            next: body.next,
+        })
+    }
+
+    /// `DELETE /v1/calls/{call_id}`: hides the call from the user's history; `204`
+    /// whether or not they had such a call.
+    pub async fn hide_call(&self, access_token: &str, call: CallId) -> Result<(), SdkError> {
+        let path = format!("/v1/calls/{call}");
+        retried(Attempts::ORDINARY, || {
+            self.request(Method::DELETE, &path)
+                .bearer_auth(access_token)
+        })
+        .await?;
+        Ok(())
+    }
+}
+
+/// An RFC 3339 time as milliseconds since the Unix epoch.
+fn millis(time: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(time)
+        .ok()
+        .map(|time| time.timestamp_millis())
 }
 
 fn tokens(answer: Value) -> Result<Tokens, SdkError> {
@@ -594,15 +735,18 @@ fn refusal(status: StatusCode, body: &[u8], retry_after_s: Option<u32>) -> SdkEr
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use axum::Router;
+    use axum::extract::{Path, Query};
     use axum::http::{HeaderMap, StatusCode as Status};
     use axum::response::IntoResponse;
-    use axum::routing::post;
+    use axum::routing::{delete, get, post};
 
     use super::*;
+    use crate::calls::{CallDirection, CallEndReason, CallLogEntry, IceServer};
 
     async fn serve(router: Router) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -745,5 +889,241 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(tokens.refresh_token, "refresh-1");
+    }
+
+    fn bearer(headers: &HeaderMap) -> &str {
+        headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+    }
+
+    #[tokio::test]
+    async fn ice_servers_are_read_as_the_guide_shows_them() {
+        let router = Router::new().route(
+            "/v1/calls/ice-servers",
+            get(|headers: HeaderMap| async move {
+                if bearer(&headers) != "Bearer access-1" {
+                    return Status::UNAUTHORIZED.into_response();
+                }
+                axum::Json(json!({
+                    "ice_servers": [
+                        { "urls": ["stun:turn.example.com:3478"] },
+                        {
+                            "urls": [
+                                "turn:turn.example.com:3478?transport=udp",
+                                "turns:turn.example.com:5349?transport=tcp"
+                            ],
+                            "username": "1793729000:0193f0c2-6f0e-7c4d-9a2b-1c3d4e5f6a7b",
+                            "credential": "VQi7KgKAXiAc6ZhbTP2coGjJMjw="
+                        },
+                        { "urls": "stun:stun.example.org" }
+                    ],
+                    "expires_at": "2026-11-03T18:43:20Z",
+                    "relay": true
+                }))
+                .into_response()
+            }),
+        );
+        let api = AuthApi::new(&serve(router).await, None).unwrap();
+        let servers = api.ice_servers("access-1").await.unwrap();
+        assert_eq!(
+            servers,
+            IceServers {
+                servers: vec![
+                    IceServer {
+                        urls: vec!["stun:turn.example.com:3478".to_owned()],
+                        username: None,
+                        credential: None,
+                    },
+                    IceServer {
+                        urls: vec![
+                            "turn:turn.example.com:3478?transport=udp".to_owned(),
+                            "turns:turn.example.com:5349?transport=tcp".to_owned(),
+                        ],
+                        username: Some(
+                            "1793729000:0193f0c2-6f0e-7c4d-9a2b-1c3d4e5f6a7b".to_owned()
+                        ),
+                        credential: Some("VQi7KgKAXiAc6ZhbTP2coGjJMjw=".to_owned()),
+                    },
+                    IceServer {
+                        urls: vec!["stun:stun.example.org".to_owned()],
+                        username: None,
+                        credential: None,
+                    },
+                ],
+                expires_at_ms: 1_793_731_400_000,
+                relay: true,
+            }
+        );
+        let debug = format!("{servers:?}");
+        assert!(!debug.contains("VQi7KgKAXiAc6ZhbTP2coGjJMjw="));
+        assert!(!debug.contains("1793729000:"));
+        assert!(debug.contains("turn.example.com"));
+    }
+
+    #[tokio::test]
+    async fn turn_unavailable_is_returned_at_once() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let router = Router::new().route(
+            "/v1/calls/ice-servers",
+            get(move || {
+                let counter = counter.clone();
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    let error = json!({"error": {"code": "turn_unavailable", "message": "no relay", "retryable": true}});
+                    (Status::SERVICE_UNAVAILABLE, [("retry-after", "30")], axum::Json(error))
+                }
+            }),
+        );
+        let api = AuthApi::new(&serve(router).await, None).unwrap();
+        let error = api.ice_servers("access-1").await.unwrap_err();
+        assert_eq!(
+            error,
+            SdkError::Server {
+                code: "turn_unavailable".to_owned(),
+                message: "no relay".to_owned(),
+                retryable: true,
+                retry_after_s: Some(30),
+            }
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_ice_answer_is_a_network_error() {
+        let router = Router::new().route(
+            "/v1/calls/ice-servers",
+            get(|| async {
+                axum::Json(json!({"ice_servers": [], "expires_at": "soon", "relay": false}))
+            }),
+        );
+        let api = AuthApi::new(&serve(router).await, None).unwrap();
+        let error = api.ice_servers("access-1").await.unwrap_err();
+        assert_eq!(error.code(), "network");
+    }
+
+    #[tokio::test]
+    async fn the_call_history_sends_its_query_and_reads_the_page() {
+        let (call, peer) = (CallId::new(), UserId::new());
+        let router = Router::new().route(
+            "/v1/calls",
+            get(
+                move |headers: HeaderMap, Query(query): Query<HashMap<String, String>>| async move {
+                    let expected: HashMap<String, String> = [
+                        ("before", "b-cursor"),
+                        ("since", "s-cursor"),
+                        ("limit", "2"),
+                    ]
+                    .into_iter()
+                    .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                    .collect();
+                    if bearer(&headers) != "Bearer access-1" || query != expected {
+                        return Status::BAD_REQUEST.into_response();
+                    }
+                    axum::Json(json!({
+                        "calls": [
+                            {
+                                "call_id": call,
+                                "peer_user_id": peer,
+                                "direction": "in",
+                                "started_at": "2026-11-03T17:41:05.120Z",
+                                "answered_at": "2026-11-03T17:41:09.002Z",
+                                "ended_at": "2026-11-03T17:43:10.877Z",
+                                "duration_s": 121,
+                                "outcome": "completed",
+                                "cursor": "c1"
+                            },
+                            {
+                                "call_id": call,
+                                "peer_user_id": peer,
+                                "direction": "out",
+                                "started_at": "2026-11-03T17:40:00Z",
+                                "ended_at": "2026-11-03T17:40:30Z",
+                                "duration_s": 0,
+                                "outcome": "something-new",
+                                "cursor": "c2"
+                            }
+                        ],
+                        "next": "c2"
+                    }))
+                    .into_response()
+                },
+            ),
+        );
+        let api = AuthApi::new(&serve(router).await, None).unwrap();
+        let page = api
+            .call_history("access-1", Some("b-cursor"), Some("s-cursor"), Some(2))
+            .await
+            .unwrap();
+        assert_eq!(page.next.as_deref(), Some("c2"));
+        assert_eq!(
+            page.calls[0],
+            CallLogEntry {
+                call_id: call,
+                peer_user_id: peer,
+                direction: CallDirection::Incoming,
+                started_at_ms: 1_793_727_665_120,
+                answered_at_ms: Some(1_793_727_669_002),
+                ended_at_ms: 1_793_727_790_877,
+                duration_s: 121,
+                outcome: CallEndReason::Completed,
+                cursor: "c1".to_owned(),
+            }
+        );
+        assert_eq!(page.calls[1].direction, CallDirection::Outgoing);
+        assert_eq!(page.calls[1].answered_at_ms, None);
+        assert_eq!(page.calls[1].outcome, CallEndReason::Failed);
+    }
+
+    #[tokio::test]
+    async fn the_call_history_omits_absent_parameters_and_rejects_garbled_entries() {
+        let router = Router::new().route(
+            "/v1/calls",
+            get(|Query(query): Query<HashMap<String, String>>| async move {
+                if !query.is_empty() {
+                    return Status::BAD_REQUEST.into_response();
+                }
+                axum::Json(json!({
+                    "calls": [{
+                        "call_id": Uuid::now_v7(),
+                        "peer_user_id": Uuid::now_v7(),
+                        "direction": "sideways",
+                        "started_at": "2026-11-03T17:40:00Z",
+                        "ended_at": "2026-11-03T17:40:30Z",
+                        "duration_s": 0,
+                        "outcome": "missed",
+                        "cursor": "c"
+                    }]
+                }))
+                .into_response()
+            }),
+        );
+        let api = AuthApi::new(&serve(router).await, None).unwrap();
+        let error = api
+            .call_history("access-1", None, None, None)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "network");
+    }
+
+    #[tokio::test]
+    async fn hiding_a_call_deletes_it_by_id() {
+        let call = CallId::new();
+        let router = Router::new().route(
+            "/v1/calls/{call_id}",
+            delete(
+                move |headers: HeaderMap, Path(id): Path<String>| async move {
+                    if bearer(&headers) == "Bearer access-1" && id == call.to_string() {
+                        Status::NO_CONTENT
+                    } else {
+                        Status::BAD_REQUEST
+                    }
+                },
+            ),
+        );
+        let api = AuthApi::new(&serve(router).await, None).unwrap();
+        api.hide_call("access-1", call).await.unwrap();
     }
 }
