@@ -56,10 +56,378 @@ pub struct Config {
     /// over the control channel (kept in memory only); `false` turns it off.
     #[serde(default = "yes")]
     pub peek: bool,
+    /// Voice calls with the owner; absent, calls are declined.
+    #[serde(default)]
+    pub calls: Option<CallsConfig>,
 }
 
 fn yes() -> bool {
     true
+}
+
+/// Voice calls with the owner: speech-to-text for what the owner says, text-to-speech
+/// for the agent's replies.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CallsConfig {
+    /// How a call is answered: `auto` (the default); `ask` comes with a later release.
+    #[serde(default)]
+    pub answer: AnswerMode,
+    /// The language spoken, a BCP 47 tag: `en-US` by default.
+    #[serde(default = "default_language")]
+    pub language: String,
+    /// Speech-to-text; `{"provider": "none"}` declines calls (there is nobody to listen).
+    pub stt: SttConfig,
+    /// Text-to-speech; `none` (the default) keeps the replies in the chat.
+    #[serde(default)]
+    pub tts: TtsConfig,
+    /// The voice activity detector: when an utterance ends.
+    #[serde(default)]
+    pub vad: VadSettings,
+}
+
+fn default_language() -> String {
+    "en-US".to_owned()
+}
+
+/// How a call is answered.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AnswerMode {
+    /// At once.
+    #[default]
+    Auto,
+    /// After the owner confirms on this machine (not supported yet).
+    Ask,
+}
+
+/// The speech-to-text provider.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    from = "ProviderWire<AzureSpeechConfig, LocalSttConfig>",
+    into = "ProviderWire<AzureSpeechConfig, LocalSttConfig>"
+)]
+pub enum SttConfig {
+    /// Azure AI Speech's REST API for short audio.
+    AzureSpeech(AzureSpeechConfig),
+    /// A whisper.cpp-compatible server or command on this machine.
+    Local(LocalSttConfig),
+    /// No speech-to-text: calls are declined.
+    None,
+}
+
+/// The text-to-speech provider.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    from = "ProviderWire<AzureSpeechConfig, LocalTtsConfig>",
+    into = "ProviderWire<AzureSpeechConfig, LocalTtsConfig>"
+)]
+pub enum TtsConfig {
+    /// Azure AI Speech's REST API.
+    AzureSpeech(AzureSpeechConfig),
+    /// A server or command on this machine (such as piper).
+    Local(LocalTtsConfig),
+    /// No text-to-speech: replies stay in the chat.
+    #[default]
+    None,
+}
+
+/// A provider section as written: `provider` names the variant. `none` holds an empty
+/// struct so that its unknown fields are refused too (serde ignores the fields of a
+/// unit variant in an internally tagged enum).
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "provider", rename_all = "kebab-case")]
+enum ProviderWire<A, L> {
+    AzureSpeech(A),
+    Local(L),
+    None(NoFields),
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NoFields {}
+
+impl From<ProviderWire<AzureSpeechConfig, LocalSttConfig>> for SttConfig {
+    fn from(wire: ProviderWire<AzureSpeechConfig, LocalSttConfig>) -> Self {
+        match wire {
+            ProviderWire::AzureSpeech(azure) => Self::AzureSpeech(azure),
+            ProviderWire::Local(local) => Self::Local(local),
+            ProviderWire::None(NoFields {}) => Self::None,
+        }
+    }
+}
+
+impl From<SttConfig> for ProviderWire<AzureSpeechConfig, LocalSttConfig> {
+    fn from(config: SttConfig) -> Self {
+        match config {
+            SttConfig::AzureSpeech(azure) => Self::AzureSpeech(azure),
+            SttConfig::Local(local) => Self::Local(local),
+            SttConfig::None => Self::None(NoFields {}),
+        }
+    }
+}
+
+impl From<ProviderWire<AzureSpeechConfig, LocalTtsConfig>> for TtsConfig {
+    fn from(wire: ProviderWire<AzureSpeechConfig, LocalTtsConfig>) -> Self {
+        match wire {
+            ProviderWire::AzureSpeech(azure) => Self::AzureSpeech(azure),
+            ProviderWire::Local(local) => Self::Local(local),
+            ProviderWire::None(NoFields {}) => Self::None,
+        }
+    }
+}
+
+impl From<TtsConfig> for ProviderWire<AzureSpeechConfig, LocalTtsConfig> {
+    fn from(config: TtsConfig) -> Self {
+        match config {
+            TtsConfig::AzureSpeech(azure) => Self::AzureSpeech(azure),
+            TtsConfig::Local(local) => Self::Local(local),
+            TtsConfig::None => Self::None(NoFields {}),
+        }
+    }
+}
+
+/// Azure AI Speech: a `region` with a key, or a resource's custom domain `endpoint` with
+/// a key or Entra sign-in.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AzureSpeechConfig {
+    /// The resource's region, such as `westeurope`: the regional endpoints, key auth.
+    #[serde(default)]
+    pub region: Option<String>,
+    /// The resource's custom domain: `https://<name>.cognitiveservices.azure.com`.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    /// The environment variable holding the key; `AZURE_SPEECH_KEY` by default.
+    #[serde(default)]
+    pub key_env: Option<String>,
+    /// Signs in with an Entra token instead of a key (needs `endpoint`).
+    #[serde(default)]
+    pub entra: Option<EntraConfig>,
+    /// The voice, for `calls.tts` only: `en-US-JennyNeural` by default.
+    #[serde(default)]
+    pub voice: Option<String>,
+}
+
+/// Entra sign-in for Azure AI Speech.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EntraConfig {
+    /// The Speech resource's Azure resource ID; when given, the token is sent as
+    /// `aad#<resource_id>#<token>`.
+    #[serde(default)]
+    pub resource_id: Option<String>,
+    /// The command printing an access token (run without a shell); by default
+    /// `az account get-access-token --resource https://cognitiveservices.azure.com
+    /// --query accessToken -o tsv`.
+    #[serde(default)]
+    pub token_command: Option<Vec<String>>,
+}
+
+/// Local speech-to-text: a whisper.cpp server's `/inference` URL, or a command whose
+/// arguments name the audio as `{wav}` (and may use `{language}`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalSttConfig {
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub command: Option<Vec<String>>,
+}
+
+/// Local text-to-speech: a URL answering a text body with a WAV, or a command reading the
+/// text on stdin and writing raw 16-bit mono samples at `sample_rate` to stdout.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalTtsConfig {
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub command: Option<Vec<String>>,
+    /// The command's sample rate (required with `command`).
+    #[serde(default)]
+    pub sample_rate: Option<u32>,
+}
+
+/// The voice activity detector's settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct VadSettings {
+    /// The silence that ends an utterance, 200–5000 ms.
+    pub silence_ms: u32,
+    /// Shorter speech is a noise, 100–5000 ms.
+    pub min_speech_ms: u32,
+}
+
+impl Default for VadSettings {
+    fn default() -> Self {
+        Self {
+            silence_ms: 700,
+            min_speech_ms: 300,
+        }
+    }
+}
+
+impl VadSettings {
+    /// The detector's configuration.
+    pub fn to_vad(&self) -> crate::voice::vad::VadConfig {
+        crate::voice::vad::VadConfig {
+            silence_ms: self.silence_ms,
+            min_speech_ms: self.min_speech_ms,
+        }
+    }
+}
+
+impl CallsConfig {
+    fn validate(&self) -> Result<(), String> {
+        if self.answer == AnswerMode::Ask {
+            return Err("calls.answer \"ask\" is not supported yet: use \"auto\"".to_owned());
+        }
+        if !matches(r"^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*$", &self.language) {
+            return Err("calls.language must be a language tag such as \"en-US\"".to_owned());
+        }
+        match &self.stt {
+            SttConfig::AzureSpeech(azure) => validate_azure(azure, "calls.stt", false)?,
+            SttConfig::Local(local) => validate_local_stt(local)?,
+            SttConfig::None => {}
+        }
+        match &self.tts {
+            TtsConfig::AzureSpeech(azure) => validate_azure(azure, "calls.tts", true)?,
+            TtsConfig::Local(local) => validate_local_tts(local)?,
+            TtsConfig::None => {}
+        }
+        if !(200..=5000).contains(&self.vad.silence_ms) {
+            return Err("calls.vad.silence_ms must be 200 to 5000".to_owned());
+        }
+        if !(100..=5000).contains(&self.vad.min_speech_ms) {
+            return Err("calls.vad.min_speech_ms must be 100 to 5000".to_owned());
+        }
+        Ok(())
+    }
+}
+
+fn matches(pattern: &str, text: &str) -> bool {
+    regex::Regex::new(pattern)
+        .map(|regex| regex.is_match(text))
+        .unwrap_or(false)
+}
+
+fn validate_azure(azure: &AzureSpeechConfig, at: &str, tts: bool) -> Result<(), String> {
+    match (&azure.region, &azure.endpoint) {
+        (Some(_), Some(_)) | (None, None) => {
+            return Err(format!(
+                "{at}: set exactly one of {at}.region or {at}.endpoint"
+            ));
+        }
+        (Some(region), None) if !matches(r"^[a-z0-9]{2,32}$", region) => {
+            return Err(format!(
+                "{at}.region must be an Azure region such as \"westeurope\""
+            ));
+        }
+        (None, Some(endpoint)) if !endpoint.starts_with("https://") => {
+            return Err(format!("{at}.endpoint must start with https://"));
+        }
+        _ => {}
+    }
+    if let Some(entra) = &azure.entra {
+        if azure.endpoint.is_none() {
+            return Err(format!(
+                "{at}.entra: Entra sign-in needs {at}.endpoint, the resource's custom domain"
+            ));
+        }
+        if azure.key_env.is_some() {
+            return Err(format!("{at}: set {at}.entra or {at}.key_env, not both"));
+        }
+        if let Some(command) = &entra.token_command {
+            if command.first().is_none_or(|program| program.is_empty()) {
+                return Err(format!("{at}.entra.token_command must name a program"));
+            }
+        }
+    }
+    if let Some(key_env) = &azure.key_env {
+        if !matches(r"^[A-Za-z_][A-Za-z0-9_]*$", key_env) {
+            return Err(format!(
+                "{at}.key_env must be an environment variable's name"
+            ));
+        }
+    }
+    if let Some(voice) = &azure.voice {
+        if !tts {
+            return Err(format!("{at}.voice is only for calls.tts"));
+        }
+        if !matches(r"^[A-Za-z0-9-]{1,100}$", voice) {
+            return Err(format!(
+                "{at}.voice must be a voice name such as \"en-US-JennyNeural\""
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_url(url: &str, at: &str) -> Result<(), String> {
+    if url.starts_with("http://") || url.starts_with("https://") {
+        Ok(())
+    } else {
+        Err(format!("{at}.url must start with http:// or https://"))
+    }
+}
+
+fn validate_command(command: &[String], at: &str) -> Result<(), String> {
+    if command.first().is_none_or(|program| program.is_empty()) {
+        return Err(format!("{at}.command must name a program"));
+    }
+    Ok(())
+}
+
+fn validate_local_stt(local: &LocalSttConfig) -> Result<(), String> {
+    let at = "calls.stt";
+    match (&local.url, &local.command) {
+        (Some(_), Some(_)) | (None, None) => {
+            Err(format!("{at}: set exactly one of {at}.url or {at}.command"))
+        }
+        (Some(url), None) => validate_url(url, at),
+        (None, Some(command)) => {
+            validate_command(command, at)?;
+            if !command
+                .iter()
+                .skip(1)
+                .any(|argument| argument.contains("{wav}"))
+            {
+                return Err(format!(
+                    "{at}.command must pass the audio file as {{wav}} in an argument"
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
+fn validate_local_tts(local: &LocalTtsConfig) -> Result<(), String> {
+    let at = "calls.tts";
+    match (&local.url, &local.command) {
+        (Some(_), Some(_)) | (None, None) => {
+            Err(format!("{at}: set exactly one of {at}.url or {at}.command"))
+        }
+        (Some(url), None) => {
+            validate_url(url, at)?;
+            if local.sample_rate.is_some() {
+                return Err(format!(
+                    "{at}.sample_rate is only for {at}.command: the WAV header says"
+                ));
+            }
+            Ok(())
+        }
+        (None, Some(command)) => {
+            validate_command(command, at)?;
+            match local.sample_rate {
+                None => Err(format!("{at}.sample_rate is required with {at}.command")),
+                Some(rate) if !(8000..=48000).contains(&rate) => {
+                    Err(format!("{at}.sample_rate must be 8000 to 48000"))
+                }
+                Some(_) => Ok(()),
+            }
+        }
+    }
 }
 
 /// The agent's signing key.
@@ -197,8 +565,8 @@ impl Config {
     }
 
     /// Checks what parsing cannot: the URLs' schemes, the roots, the default folder (a
-    /// real folder inside the roots), the default permission mode and the backend's
-    /// section.
+    /// real folder inside the roots), the default permission mode, the calls section
+    /// and the backend's section.
     pub fn validate(&self) -> Result<(), ConfigError> {
         let invalid = |message: &str| Err(ConfigError::Invalid(message.to_owned()));
         if !(self.api_url.starts_with("https://") || self.api_url.starts_with("http://")) {
@@ -228,6 +596,9 @@ impl Config {
                 "default_folder {}: {error}",
                 self.default_folder.display()
             )));
+        }
+        if let Some(calls) = &self.calls {
+            calls.validate().map_err(ConfigError::Invalid)?;
         }
         match (self.backend, &self.coda) {
             (BackendKind::Coda, None) => invalid("backend \"coda\" needs a \"coda\" section"),
@@ -490,5 +861,308 @@ mod tests {
             &|config| config["socket_url"] = json!("https://x/v1/socket")
         ));
         assert!(refused(&|config| config["key"] = json!({ "name": " " })));
+    }
+
+    fn with_calls(fixture: &Fixture, calls: serde_json::Value) -> Result<Config, ConfigError> {
+        let mut config = minimal(fixture);
+        config["calls"] = calls;
+        load(fixture, &config)
+    }
+
+    fn calls_error(fixture: &Fixture, calls: serde_json::Value) -> String {
+        let config = with_calls(fixture, calls).unwrap();
+        match config.validate() {
+            Err(ConfigError::Invalid(message)) => message,
+            other => panic!("expected an invalid configuration, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn calls_are_absent_by_default() {
+        let fixture = fixture();
+        assert_eq!(load(&fixture, &minimal(&fixture)).unwrap().calls, None);
+    }
+
+    #[test]
+    fn a_calls_section_parses_with_its_defaults() {
+        let fixture = fixture();
+        let config = with_calls(
+            &fixture,
+            json!({ "stt": { "provider": "azure-speech", "region": "westeurope" } }),
+        )
+        .unwrap();
+        config.validate().unwrap();
+        let calls = config.calls.unwrap();
+        assert_eq!(calls.answer, AnswerMode::Auto);
+        assert_eq!(calls.language, "en-US");
+        assert_eq!(
+            calls.stt,
+            SttConfig::AzureSpeech(AzureSpeechConfig {
+                region: Some("westeurope".into()),
+                ..AzureSpeechConfig::default()
+            })
+        );
+        assert_eq!(calls.tts, TtsConfig::None);
+        assert_eq!(
+            serde_json::to_value(&calls.tts).unwrap(),
+            json!({ "provider": "none" })
+        );
+        let written = serde_json::to_value(&calls).unwrap();
+        assert_eq!(
+            serde_json::from_value::<CallsConfig>(written).unwrap(),
+            calls
+        );
+        assert_eq!(calls.vad, VadSettings::default());
+        let vad = calls.vad.to_vad();
+        assert_eq!((vad.silence_ms, vad.min_speech_ms), (700, 300));
+    }
+
+    #[test]
+    fn every_provider_shape_parses_and_validates() {
+        let fixture = fixture();
+        let shapes = [
+            json!({
+                "answer": "auto",
+                "language": "de-DE",
+                "stt": { "provider": "azure-speech", "region": "westeurope", "key_env": "MY_KEY" },
+                "tts": { "provider": "azure-speech", "region": "westeurope", "voice": "de-DE-KatjaNeural" },
+                "vad": { "silence_ms": 900, "min_speech_ms": 200 },
+            }),
+            json!({
+                "stt": {
+                    "provider": "azure-speech",
+                    "endpoint": "https://my-speech.cognitiveservices.azure.com/",
+                    "entra": { "resource_id": "/subscriptions/x/resourceGroups/y/providers/Microsoft.CognitiveServices/accounts/z" },
+                },
+                "tts": {
+                    "provider": "azure-speech",
+                    "endpoint": "https://my-speech.cognitiveservices.azure.com",
+                    "entra": { "token_command": ["az.cmd", "account", "get-access-token"] },
+                },
+            }),
+            json!({
+                "stt": { "provider": "local", "url": "http://127.0.0.1:8080/inference" },
+                "tts": { "provider": "local", "url": "http://127.0.0.1:5000/tts" },
+            }),
+            json!({
+                "language": "en",
+                "stt": { "provider": "local", "command": ["whisper-cli", "-m", "model.bin", "-f", "{wav}", "-l", "{language}", "-nt", "-np"] },
+                "tts": { "provider": "local", "command": ["piper", "--model", "voice.onnx", "--output_raw"], "sample_rate": 22050 },
+            }),
+            json!({ "stt": { "provider": "none" }, "tts": { "provider": "none" } }),
+        ];
+        for shape in shapes {
+            let config = with_calls(&fixture, shape.clone())
+                .unwrap_or_else(|error| panic!("{shape}: {error}"));
+            config
+                .validate()
+                .unwrap_or_else(|error| panic!("{shape}: {error}"));
+        }
+        let config = with_calls(
+            &fixture,
+            json!({
+                "stt": { "provider": "local", "command": ["whisper-cli", "-f", "{wav}"] },
+                "tts": { "provider": "local", "command": ["piper"], "sample_rate": 22050 },
+            }),
+        )
+        .unwrap();
+        let calls = config.calls.unwrap();
+        assert_eq!(
+            calls.stt,
+            SttConfig::Local(LocalSttConfig {
+                url: None,
+                command: Some(vec!["whisper-cli".into(), "-f".into(), "{wav}".into()]),
+            })
+        );
+        assert_eq!(
+            calls.tts,
+            TtsConfig::Local(LocalTtsConfig {
+                url: None,
+                command: Some(vec!["piper".into()]),
+                sample_rate: Some(22050),
+            })
+        );
+    }
+
+    #[test]
+    fn calls_mistakes_are_refused_by_field() {
+        let fixture = fixture();
+        let azure = |extra: serde_json::Value| {
+            let mut stt = json!({ "provider": "azure-speech" });
+            for (key, value) in extra.as_object().unwrap() {
+                stt[key] = value.clone();
+            }
+            stt
+        };
+        let endpoint = "https://x.cognitiveservices.azure.com";
+        let cases = [
+            (
+                json!({ "answer": "ask", "stt": { "provider": "none" } }),
+                "calls.answer \"ask\" is not supported yet: use \"auto\"",
+            ),
+            (
+                json!({ "language": "english!", "stt": { "provider": "none" } }),
+                "calls.language",
+            ),
+            (
+                json!({ "stt": azure(json!({})) }),
+                "set exactly one of calls.stt.region or calls.stt.endpoint",
+            ),
+            (
+                json!({ "stt": azure(json!({ "region": "westeurope", "endpoint": endpoint })) }),
+                "set exactly one of calls.stt.region or calls.stt.endpoint",
+            ),
+            (
+                json!({ "stt": azure(json!({ "region": "West Europe" })) }),
+                "calls.stt.region must be",
+            ),
+            (
+                json!({ "stt": azure(json!({ "endpoint": "http://x.example.com" })) }),
+                "calls.stt.endpoint must start with https://",
+            ),
+            (
+                json!({ "stt": azure(json!({ "region": "westeurope", "entra": {} })) }),
+                "Entra sign-in needs calls.stt.endpoint, the resource's custom domain",
+            ),
+            (
+                json!({ "stt": azure(json!({ "region": "westeurope", "key_env": "1KEY" })) }),
+                "calls.stt.key_env",
+            ),
+            (
+                json!({ "stt": azure(json!({ "endpoint": endpoint, "entra": {}, "key_env": "KEY" })) }),
+                "calls.stt.entra or calls.stt.key_env, not both",
+            ),
+            (
+                json!({ "stt": azure(json!({ "endpoint": endpoint, "entra": { "token_command": [] } })) }),
+                "calls.stt.entra.token_command",
+            ),
+            (
+                json!({ "stt": azure(json!({ "endpoint": endpoint, "entra": { "token_command": [""] } })) }),
+                "calls.stt.entra.token_command",
+            ),
+            (
+                json!({ "stt": azure(json!({ "region": "westeurope", "voice": "en-US-JennyNeural" })) }),
+                "calls.stt.voice is only for calls.tts",
+            ),
+            (
+                json!({
+                    "stt": { "provider": "none" },
+                    "tts": { "provider": "azure-speech", "region": "westeurope", "voice": "<x>" },
+                }),
+                "calls.tts.voice must be",
+            ),
+            (
+                json!({ "stt": { "provider": "none" }, "tts": { "provider": "azure-speech" } }),
+                "set exactly one of calls.tts.region or calls.tts.endpoint",
+            ),
+            (
+                json!({ "stt": { "provider": "local" } }),
+                "set exactly one of calls.stt.url or calls.stt.command",
+            ),
+            (
+                json!({ "stt": { "provider": "local", "url": "http://a", "command": ["w", "{wav}"] } }),
+                "set exactly one of calls.stt.url or calls.stt.command",
+            ),
+            (
+                json!({ "stt": { "provider": "local", "url": "ftp://a" } }),
+                "calls.stt.url must start with http:// or https://",
+            ),
+            (
+                json!({ "stt": { "provider": "local", "command": [] } }),
+                "calls.stt.command must name a program",
+            ),
+            (
+                json!({ "stt": { "provider": "local", "command": ["", "{wav}"] } }),
+                "calls.stt.command must name a program",
+            ),
+            (
+                json!({ "stt": { "provider": "local", "command": ["whisper-cli", "-f", "audio.wav"] } }),
+                "calls.stt.command must pass the audio file as {wav}",
+            ),
+            (
+                json!({ "stt": { "provider": "none" }, "tts": { "provider": "local" } }),
+                "set exactly one of calls.tts.url or calls.tts.command",
+            ),
+            (
+                json!({ "stt": { "provider": "none" }, "tts": { "provider": "local", "url": "file://x" } }),
+                "calls.tts.url must start with http:// or https://",
+            ),
+            (
+                json!({ "stt": { "provider": "none" }, "tts": { "provider": "local", "command": [] , "sample_rate": 22050 } }),
+                "calls.tts.command must name a program",
+            ),
+            (
+                json!({ "stt": { "provider": "none" }, "tts": { "provider": "local", "command": ["piper"] } }),
+                "calls.tts.sample_rate is required with calls.tts.command",
+            ),
+            (
+                json!({ "stt": { "provider": "none" }, "tts": { "provider": "local", "command": ["piper"], "sample_rate": 4000 } }),
+                "calls.tts.sample_rate must be 8000 to 48000",
+            ),
+            (
+                json!({ "stt": { "provider": "none" }, "tts": { "provider": "local", "url": "http://a", "sample_rate": 22050 } }),
+                "calls.tts.sample_rate is only for calls.tts.command",
+            ),
+            (
+                json!({ "stt": { "provider": "none" }, "vad": { "silence_ms": 100 } }),
+                "calls.vad.silence_ms must be 200 to 5000",
+            ),
+            (
+                json!({ "stt": { "provider": "none" }, "vad": { "min_speech_ms": 6000 } }),
+                "calls.vad.min_speech_ms must be 100 to 5000",
+            ),
+        ];
+        for (calls, expected) in cases {
+            let message = calls_error(&fixture, calls.clone());
+            assert!(message.contains(expected), "{calls}: {message}");
+        }
+    }
+
+    #[test]
+    fn unknown_calls_fields_are_refused_by_name() {
+        let fixture = fixture();
+        let cases = [
+            (
+                json!({ "stt": { "provider": "none" }, "anwser": "auto" }),
+                "anwser",
+            ),
+            (
+                json!({ "stt": { "provider": "azure-speech", "regoin": "westeurope" } }),
+                "regoin",
+            ),
+            (
+                json!({ "stt": { "provider": "local", "url": "http://a", "lang": "en" } }),
+                "lang",
+            ),
+            (
+                json!({ "stt": { "provider": "azure-speech", "endpoint": "https://a", "entra": { "resource": "x" } } }),
+                "resource",
+            ),
+            (
+                json!({ "stt": { "provider": "none" }, "tts": { "provider": "azure-speech", "region": "westeurope", "voise": "x" } }),
+                "voise",
+            ),
+            (
+                json!({ "stt": { "provider": "none" }, "tts": { "provider": "local", "command": ["piper"], "rate": 22050 } }),
+                "rate",
+            ),
+            (
+                json!({ "stt": { "provider": "none" }, "vad": { "silence": 700 } }),
+                "silence",
+            ),
+            (
+                json!({ "stt": { "provider": "none", "region": "westeurope" } }),
+                "region",
+            ),
+            (json!({ "stt": { "provider": "whisper" } }), "whisper"),
+            (json!({ "stt": { "region": "westeurope" } }), "provider"),
+        ];
+        for (calls, field) in cases {
+            let error = with_calls(&fixture, calls.clone()).unwrap_err();
+            assert!(
+                matches!(&error, ConfigError::Parse { message, .. } if message.contains(field)),
+                "{calls}: {error}"
+            );
+        }
     }
 }

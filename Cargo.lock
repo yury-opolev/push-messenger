@@ -2686,6 +2686,7 @@ dependencies = [
  "push-domain",
  "push-sdk",
  "regex",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror",

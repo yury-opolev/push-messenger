@@ -189,6 +189,7 @@ Create `%LOCALAPPDATA%\push-messenger\coda-bridge\config.json`. Every field:
 | `coda.args` | no | extra arguments after `serve`, as a list | `[]` |
 | `control` | no | serve the local [control channel](#14-control-channel-for-other-tools) (the tray's status and actions, `pause`, `resume`); `false` turns it off, and the bridge works as without it (the tray then cannot see or reach it) | `true` |
 | `peek` | no | keep the owner conversation's last 50 messages in memory, masked, for the tray's [chat peek](#chat-peek) (the control channel's `peek`); `false` keeps nothing and answers `peek_disabled` | `true` |
+| `calls` | no | voice calls with the owner: `answer` (`auto`), `language` (`en-US`), `stt` and `tts` (`{"provider": "azure-speech" \| "local" \| "none", …}`), `vad` (`silence_ms` 700, `min_speech_ms` 300); `stt` `none` declines calls, `tts` `none` keeps replies in the chat | absent: calls are declined |
 
 Unknown fields are refused (a typo is an error, not ignored), and a UTF-8 byte order mark
 as Notepad writes it is fine. In JSON, double every backslash. `push-agent-bridge status`

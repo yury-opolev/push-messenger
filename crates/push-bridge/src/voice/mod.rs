@@ -3,10 +3,17 @@
 //! the agent's Markdown reply becomes short plain sentences that are synthesized and played
 //! back; open approval and question cards can be answered by voice. These are the pure
 //! building blocks: WAV files and resampling, the detector, the spoken text and voice
-//! answers.
+//! answers. [`provider`] runs the speech services: Azure AI Speech, local servers or
+//! commands, and tone-based fakes for tests.
 
+pub mod azure;
 pub mod confirm;
+pub mod fake;
+pub mod local;
+pub mod provider;
 pub mod speech;
+#[cfg(test)]
+pub(crate) mod test_server;
 pub mod vad;
 pub mod wav;
 
