@@ -12,6 +12,11 @@ repository.workspace = true
 name = "push-agent-bridge"
 path = "src/main.rs"
 
+[features]
+# Voice calls with the owner: the media helper (push-sdk `calls-media`: str0m, Opus; Rust 1.89 and CMake).
+# Without it the bridge does not advertise calls. Release builds: `cargo build --release -p push-bridge --features voice`.
+voice = ["push-sdk/calls-media"]
+
 [dependencies]
 async-trait.workspace = true
 push-agent-key.workspace = true

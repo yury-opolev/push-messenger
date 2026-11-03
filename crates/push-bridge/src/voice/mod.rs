@@ -4,13 +4,19 @@
 //! back; open approval and question cards can be answered by voice. These are the pure
 //! building blocks: WAV files and resampling, the detector, the spoken text and voice
 //! answers. [`provider`] runs the speech services: Azure AI Speech, local servers or
-//! commands, and tone-based fakes for tests.
+//! commands, and tone-based fakes for tests. [`phone`] answers calls (push-sdk's media
+//! helper in `media`, feature `voice`; a fake in tests) and [`session`] runs one call's
+//! pipeline: listening, transcribing, speaking, barge-in.
 
 pub mod azure;
 pub mod confirm;
 pub mod fake;
 pub mod local;
+#[cfg(feature = "voice")]
+pub mod media;
+pub mod phone;
 pub mod provider;
+pub mod session;
 pub mod speech;
 #[cfg(test)]
 pub(crate) mod test_server;
