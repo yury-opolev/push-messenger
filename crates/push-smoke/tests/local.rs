@@ -252,6 +252,12 @@ async fn push_load_calls_place_and_complete_calls_against_the_whole_stack() {
         "{calls:?}"
     );
     assert_eq!(calls.call_syncs, 4);
+    let completed = std::collections::BTreeMap::from([("completed".to_owned(), calls.completed)]);
+    assert_eq!(
+        (&calls.ended, &calls.callee_ended),
+        (&completed, &completed),
+        "both parties heard every call end COMPLETED"
+    );
     assert_eq!(calls.ice_received, calls.ice_sent, "{calls:?}");
     assert_eq!(calls.peak_active, 2, "both pairs were in a call at once");
     assert_eq!(report.latency.setup.count as u64, calls.accepted);

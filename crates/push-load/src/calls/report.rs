@@ -62,10 +62,12 @@ pub struct CallCounts {
     pub completed: u64,
     /// Not accepted within 10 s of the invite (the caller then hung up).
     pub unanswered: u64,
-    /// A party heard no `CallEnded` within 10 s of the hangup.
+    /// A party heard no `CallEnded` within 10 s of the hangup, or before the run ended.
     pub endings_missing: u64,
     /// `CallEnded` reasons the callers heard, by name.
     pub ended: BTreeMap<String, u64>,
+    /// `CallEnded` reasons the callees heard, by name (none for a call that never rang).
+    pub callee_ended: BTreeMap<String, u64>,
     /// `CallError` frames, by code.
     pub errors: BTreeMap<String, u64>,
     /// Call frames that fit no call of the pair.
@@ -183,7 +185,7 @@ pub fn judge(report: &CallsReport, interrupted: bool) -> (Status, Vec<String>) {
         ),
         (
             calls.endings_missing,
-            "calls did not end for both parties within 10 s of the hangup",
+            "calls did not end for both parties within 10 s of the hangup or before the run ended",
         ),
         (
             calls.unexpected_frames,
@@ -204,20 +206,29 @@ pub fn judge(report: &CallsReport, interrupted: bool) -> (Status, Vec<String>) {
     if calls.not_offered == 0 && calls.placed == 0 {
         failures.push("no calls were placed".to_owned());
     }
+    if calls.placed > 0
+        && u64::try_from(calls.peak_active).unwrap_or(0) < report.workload.calls as u64
+    {
+        failures.push(format!(
+            "at most {} of {} calls were active at once",
+            calls.peak_active, report.workload.calls
+        ));
+    }
     if !calls.errors.is_empty() {
         failures.push(format!("CallError frames: {}", listed(&calls.errors)));
     }
-    let other_endings: BTreeMap<String, u64> = calls
-        .ended
-        .iter()
-        .filter(|(reason, _)| reason.as_str() != "completed")
-        .map(|(reason, count)| (reason.clone(), *count))
-        .collect();
-    if !other_endings.is_empty() {
-        failures.push(format!(
-            "calls ended other than COMPLETED: {}",
-            listed(&other_endings)
-        ));
+    for (endings, party) in [(&calls.ended, "callers"), (&calls.callee_ended, "callees")] {
+        let other: BTreeMap<String, u64> = endings
+            .iter()
+            .filter(|(reason, _)| reason.as_str() != "completed")
+            .map(|(reason, count)| (reason.clone(), *count))
+            .collect();
+        if !other.is_empty() {
+            failures.push(format!(
+                "calls ended other than COMPLETED for {party}: {}",
+                listed(&other)
+            ));
+        }
     }
     if let Some(p95) = report.latency.setup.p95_ms {
         if u64::from(p95) > report.workload.setup_p95_limit_ms {
@@ -340,6 +351,7 @@ mod tests {
                 accepted: 10,
                 completed: 10,
                 ended: BTreeMap::from([("completed".to_owned(), 10)]),
+                callee_ended: BTreeMap::from([("completed".to_owned(), 10)]),
                 call_syncs: 4,
                 ice_sent: 40,
                 ice_received: 40,
@@ -417,10 +429,20 @@ mod tests {
                 }),
             ),
             (
-                "ended other than COMPLETED: busy x1",
+                "calls ended other than COMPLETED for callers: busy x1",
                 Box::new(|r| {
                     r.calls.ended.insert("busy".to_owned(), 1);
                 }),
+            ),
+            (
+                "calls ended other than COMPLETED for callees: cancelled x1",
+                Box::new(|r| {
+                    r.calls.callee_ended.insert("cancelled".to_owned(), 1);
+                }),
+            ),
+            (
+                "at most 1 of 2 calls were active at once",
+                Box::new(|r| r.calls.peak_active = 1),
             ),
             (
                 "not accepted within 10 s",

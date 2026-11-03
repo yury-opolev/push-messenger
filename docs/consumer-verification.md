@@ -130,10 +130,12 @@ push-load run --target https://api.example.com --authorized-target api.example.c
 
 It refreshes every selected device's token once, opens one connection per device at the
 ramp rate, keeps each alive with application Pings at the announced heartbeat, and sends
-a sample message every `--message-interval-seconds` (default 10) on each pair. Ramp plus
-duration is limited to 25 minutes (tokens last 30 minutes; the harness does not
-re-authenticate). At the end, or on Ctrl-C (or SIGTERM on Unix), it closes every socket
-and writes the report. An interruption during the token refresh lets the refreshes in
+a sample message every `--message-interval-seconds` (default 10) on each prepared pair
+whose two devices are both selected, at most 50 pairs (more pairs serve `calls`, not a
+larger message load). Ramp plus duration is limited to 25 minutes (tokens last 30
+minutes; the harness does not re-authenticate). At the end, or on Ctrl-C (or SIGTERM on
+Unix), it closes every socket and writes the report. An interruption during the token
+refresh lets the refreshes in
 flight finish, saves every rotated token and connects nothing. A device whose refresh
 failed without an answer is marked for the next `prepare` to sign in again, because
 auth-svc may have rotated its token; each refresh is retried only within 25 s, inside
@@ -203,6 +205,8 @@ push-load calls --target https://api.example.com --authorized-target api.example
   another: invite, accept, one candidate each way, hold for `--hold-seconds`, the caller
   hangs up, both parties await `CallEnded`. The next invite comes at least 1 s after the
   end. No call is placed in the last hold plus 10 s; at the end, live calls are hung up.
+  `--hold-seconds` must be longer than the ramp (`2 x --calls / --ramp-per-second`
+  seconds), so every pair's first call is still active when the last pair's starts.
   Connections are not reconnected: a dropped one fails the run.
 - **Attempts budget.** The gateway allows `calls.attemptsPerHour` invites per user an
   hour (default 30), refused or not. push-load computes the most invites one pair can
@@ -224,16 +228,20 @@ The report has the run's `connections`, `close_codes`, `generator` and `workload
 (with `hold_s`, `attempts_per_hour` and `attempts_per_pair_max`), and:
 
 - `calls`: `placed`, `accepted`, `completed`, `unanswered` (not accepted within 10 s),
-  `endings_missing` (a party heard no `CallEnded` within 10 s of the hangup), `ended`
-  (the `CallEnded` reasons callers heard), `errors` (`CallError` by code),
-  `unexpected_frames`, `ice_sent`, `ice_received`, `call_syncs`, `stale_calls` (calls
-  left from an earlier run, hung up first), `peak_active` and `peak_ringing_or_active`.
+  `endings_missing` (a party heard no `CallEnded` within 10 s of the hangup, or by the end
+  of the run), `ended` and `callee_ended` (the `CallEnded` reasons callers and callees
+  heard), `errors` (`CallError` by code), `unexpected_frames`, `ice_sent`,
+  `ice_received`, `call_syncs`, `stale_calls` (calls left from an earlier run, hung up
+  first: by the caller when both devices of the pair hold it, else by the device that
+  holds it), `peak_active` and `peak_ringing_or_active`.
 - `latency.setup`: count, p50, p95, p99 and max in milliseconds; also `connect` and
   `ping_rtt`.
 
 `passed` requires every connection to have reached Ready, all open at once, each with
 its `CallSync`; no connection dropped, failed or rate limited; calls placed and no
-`CallError`; every call accepted within 10 s and ended `COMPLETED` for both parties; no
+`CallError` (a refused hangup of a leftover call is not one); every call accepted within
+10 s and ended `COMPLETED` for both parties (no other reason in `ended` or
+`callee_ended`); every pair in a call at once (`peak_active` equal to `--calls`); no
 unexpected call frame; a setup p95 at most `--setup-p95-ms` (default 300); and an
 unsaturated generator. Exit codes are those of `run`. Each call leaves a call history
 row per participant, kept for `calls.historyDays`.

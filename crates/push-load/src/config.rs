@@ -15,6 +15,9 @@ pub const MAX_DEVICES_PER_ACCOUNT: usize = 10;
 /// gateway allows 20 redeems per user and 60 per IP an hour, so a large preparation takes
 /// several runs of `prepare` (each resumes where the last stopped).
 pub const MAX_SAMPLE_PAIRS: usize = 2000;
+/// Most pairs a `run` sends sample messages on, whatever the preparation holds: more
+/// pairs serve `calls`, not a larger message load.
+pub const RUN_SAMPLE_PAIRS_MAX: usize = 50;
 pub const MAX_RAMP_PER_SECOND: u32 = 500;
 pub const MAX_PREPARE_CONCURRENCY: usize = 16;
 /// Ramp plus duration. Access tokens last 30 minutes and `AuthExpiring` comes a minute
@@ -303,6 +306,15 @@ impl CallsOptions {
                 CALL_MARGIN.as_secs()
             );
         }
+        if self.hold <= self.ramp_time() {
+            bail!(
+                "--hold-seconds must be longer than the ramp ({:.1} s: {} connections at --ramp-per-second {}), so every pair's first call is still active when the last pair's starts and all --calls {} can be active at once",
+                self.ramp_time().as_secs_f64(),
+                self.connections(),
+                self.ramp_per_second,
+                self.calls
+            );
+        }
         if !(1..=MAX_CALL_ATTEMPTS_PER_HOUR).contains(&self.attempts_per_hour) {
             bail!("--attempts-per-hour must be 1 to {MAX_CALL_ATTEMPTS_PER_HOUR}");
         }
@@ -472,6 +484,7 @@ mod tests {
     #[test]
     fn a_calls_run_beyond_the_attempts_budget_is_refused_up_front() {
         let short_holds = CallsOptions {
+            ramp_per_second: 400,
             hold: Duration::from_secs(10),
             ..calls_options()
         };
@@ -484,6 +497,27 @@ mod tests {
         CallsOptions {
             attempts_per_hour: 200,
             ..short_holds
+        }
+        .validate()
+        .unwrap();
+    }
+
+    #[test]
+    fn a_hold_shorter_than_the_ramp_is_refused_as_the_calls_could_never_all_be_active() {
+        // 2,000 connections at 100 a second ramp for 20 s.
+        let short = CallsOptions {
+            hold: Duration::from_secs(20),
+            attempts_per_hour: MAX_CALL_ATTEMPTS_PER_HOUR,
+            ..calls_options()
+        };
+        let error = short.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("--hold-seconds") && error.contains("ramp"),
+            "{error}"
+        );
+        CallsOptions {
+            hold: Duration::from_secs(21),
+            ..short
         }
         .validate()
         .unwrap();

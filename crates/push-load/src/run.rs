@@ -23,7 +23,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::config::{RunOptions, Target};
+use crate::config::{RUN_SAMPLE_PAIRS_MAX, RunOptions, Target};
 use crate::http::{ApiError, AuthApi};
 use crate::metrics::{
     self, CloseCodes, Counters, LAG_LIMIT, Messages, PERCENTILES, Samples, bump, read,
@@ -102,6 +102,22 @@ struct Plan {
     sends_to: Option<Vec<u8>>,
 }
 
+/// The senders of the ready pairs whose both devices are chosen, at most
+/// [`RUN_SAMPLE_PAIRS_MAX`], and the conversation each sends sample messages to.
+fn sample_senders(state: &State, chosen: &HashSet<DeviceRef>) -> HashMap<DeviceRef, Vec<u8>> {
+    state
+        .pairs
+        .iter()
+        .filter(|pair| {
+            state.pair_is_ready(pair)
+                && chosen.contains(&pair.sender)
+                && chosen.contains(&pair.receiver)
+        })
+        .take(RUN_SAMPLE_PAIRS_MAX)
+        .map(|pair| (pair.sender, id_bytes(pair.conversation_id)))
+        .collect()
+}
+
 pub async fn run(
     target: &Target,
     state_path: &Path,
@@ -129,16 +145,7 @@ pub async fn run(
     }
     let selected: Vec<DeviceRef> = ready[..options.connections].to_vec();
     let chosen: HashSet<DeviceRef> = selected.iter().copied().collect();
-    let sends_to: HashMap<DeviceRef, Vec<u8>> = state
-        .pairs
-        .iter()
-        .filter(|pair| {
-            state.pair_is_ready(pair)
-                && chosen.contains(&pair.sender)
-                && chosen.contains(&pair.receiver)
-        })
-        .map(|pair| (pair.sender, id_bytes(pair.conversation_id)))
-        .collect();
+    let sends_to = sample_senders(&state, &chosen);
     let started_unix_s = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |since| since.as_secs());
@@ -629,6 +636,36 @@ mod tests {
         for code in [1000, 1001, 1002, 1006, 1008, 1011, 4005, 4006] {
             assert_eq!(close_action(code), CloseAction::Reconnect, "{code}");
         }
+    }
+
+    #[test]
+    fn a_run_sends_sample_messages_on_at_most_fifty_pairs() {
+        use crate::state::{AccountState, DeviceState, Pair};
+        let mut state = State::new("push.test");
+        for account in 0..2 * (RUN_SAMPLE_PAIRS_MAX + 10) {
+            let mut prepared = AccountState::new(&format!("{account}@x.test"));
+            prepared.devices.push(DeviceState {
+                device_id: Some(Uuid::now_v7()),
+                refresh_token: Some("refresh".to_owned()),
+                ..DeviceState::new()
+            });
+            state.accounts.push(prepared);
+        }
+        let device = |account| DeviceRef { account, device: 0 };
+        for pair in 0..RUN_SAMPLE_PAIRS_MAX + 10 {
+            state.pairs.push(Pair {
+                sender: device(2 * pair),
+                receiver: device(2 * pair + 1),
+                conversation_id: Uuid::now_v7(),
+            });
+        }
+        let chosen: HashSet<DeviceRef> = state.ready_devices().into_iter().collect();
+        let senders = sample_senders(&state, &chosen);
+        assert_eq!(senders.len(), RUN_SAMPLE_PAIRS_MAX);
+        assert!(senders.contains_key(&device(0)));
+        // A pair only partly chosen sends nothing.
+        let chosen: HashSet<DeviceRef> = [device(0), device(1), device(2)].into();
+        assert_eq!(sample_senders(&state, &chosen).len(), 1);
     }
 
     #[test]

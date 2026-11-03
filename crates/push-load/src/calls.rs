@@ -18,8 +18,8 @@ use anyhow::{Context, bail};
 use futures_util::StreamExt;
 use push_proto::v1::frame::Body;
 use push_proto::v1::{
-    CallAccept, CallEndReason, CallHangup, CallIce, CallInvite, CallMedia, Capability, ErrorCode,
-    Ping,
+    CallAccept, CallEndReason, CallHangup, CallIce, CallInvite, CallMedia, CallSync, Capability,
+    ErrorCode, Ping,
 };
 use push_proto::{decode_frame, id_bytes};
 use tokio::task::JoinSet;
@@ -110,7 +110,10 @@ pub struct CallStats {
     pub call_syncs: AtomicU64,
     pub stale_calls: AtomicU64,
     pub not_offered: AtomicU64,
+    /// `CallEnded` reasons the callers heard.
     pub ended: Tally,
+    /// `CallEnded` reasons the callees heard.
+    pub callee_ended: Tally,
     pub errors: Tally,
     /// Calls ringing or active.
     pub live: Gauge,
@@ -127,6 +130,7 @@ impl CallStats {
             unanswered: read(&self.unanswered),
             endings_missing: read(&self.endings_missing),
             ended: self.ended.snapshot(),
+            callee_ended: self.callee_ended.snapshot(),
             errors: self.errors.snapshot(),
             unexpected_frames: read(&self.unexpected_frames),
             ice_sent: read(&self.ice_sent),
@@ -165,7 +169,7 @@ fn code_name(code: i32) -> String {
     )
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Side {
     Caller,
     Callee,
@@ -229,6 +233,7 @@ enum Phase {
 #[derive(Debug)]
 pub struct PairCalls<'a> {
     stats: &'a CallStats,
+    caller_user: Vec<u8>,
     callee_user: Vec<u8>,
     hold: Duration,
     period: Duration,
@@ -237,8 +242,15 @@ pub struct PairCalls<'a> {
     phase: Phase,
     synced: [bool; 2],
     sync_by: Instant,
-    /// Leftover calls a `CallSync` listed, until they end.
-    stale: HashSet<Vec<u8>>,
+    /// Leftover calls each side's `CallSync` listed, until that side hears `CallEnded`.
+    stale: HashSet<(Side, Vec<u8>)>,
+    /// Every leftover call listed: a refused hangup of one is no error of the run.
+    leftovers: HashSet<Vec<u8>>,
+    /// Leftover calls a device of the pair hung up: each is hung up once.
+    hung_up: HashSet<Vec<u8>>,
+    /// The callee's leftover calls with the caller, until the caller's `CallSync`: the
+    /// caller hangs up those its device holds, the callee the rest.
+    deferred: HashSet<Vec<u8>>,
     /// A `CallError` came: the pair places no further call.
     refused: bool,
     stopping: bool,
@@ -247,6 +259,7 @@ pub struct PairCalls<'a> {
 impl<'a> PairCalls<'a> {
     pub fn new(
         stats: &'a CallStats,
+        caller_user: Uuid,
         callee_user: Uuid,
         options: &CallsOptions,
         last_invite: Instant,
@@ -254,6 +267,7 @@ impl<'a> PairCalls<'a> {
     ) -> Self {
         Self {
             stats,
+            caller_user: id_bytes(caller_user),
             callee_user: id_bytes(callee_user),
             hold: options.hold,
             period: options.period(),
@@ -262,6 +276,9 @@ impl<'a> PairCalls<'a> {
             synced: [false; 2],
             sync_by: now + SYNC_WAIT,
             stale: HashSet::new(),
+            leftovers: HashSet::new(),
+            hung_up: HashSet::new(),
+            deferred: HashSet::new(),
             refused: false,
             stopping: false,
         }
@@ -325,14 +342,7 @@ impl<'a> PairCalls<'a> {
             }
             Phase::Live(call) => {
                 if call.hangup_sent.is_some() {
-                    bump(&self.stats.endings_missing);
-                    if !call.caller_ended {
-                        self.stats.live.down();
-                        if call.accepted {
-                            self.stats.active.down();
-                        }
-                    }
-                    self.phase = Phase::Quiet;
+                    self.abandon();
                     return Vec::new();
                 }
                 if !call.accepted {
@@ -361,6 +371,74 @@ impl<'a> PairCalls<'a> {
         }
     }
 
+    /// The stop grace ran out: a call still live never ended.
+    pub fn out_of_time(&mut self) {
+        if !self.idle() {
+            self.abandon();
+        }
+    }
+
+    /// Gives up on the live call, as a party heard no `CallEnded`.
+    fn abandon(&mut self) {
+        if let Phase::Live(call) = &self.phase {
+            bump(&self.stats.endings_missing);
+            if !call.caller_ended {
+                self.stats.live.down();
+                if call.accepted {
+                    self.stats.active.down();
+                }
+            }
+        }
+        self.phase = Phase::Quiet;
+    }
+
+    /// A hangup of a leftover call from `side`, unless the pair hung it up already.
+    fn hang_up_leftover(&mut self, side: Side, call_id: &[u8]) -> Option<(Side, Body)> {
+        self.hung_up
+            .insert(call_id.to_vec())
+            .then(|| (side, hangup(call_id)))
+    }
+
+    /// A side's `CallSync`: each leftover call is hung up once, by the caller when both
+    /// devices of the pair hold it, else by the device that holds it.
+    fn on_sync(&mut self, side: Side, sync: CallSync) -> Vec<(Side, Body)> {
+        bump(&self.stats.call_syncs);
+        self.synced[side.index()] = true;
+        let mut out = Vec::new();
+        for call in sync.calls {
+            let id = call.call_id;
+            if self.leftovers.insert(id.clone()) {
+                bump(&self.stats.stale_calls);
+            }
+            self.stale.insert((side, id.clone()));
+            match side {
+                Side::Caller => {
+                    let owed_by_callee = self.deferred.remove(&id);
+                    if call.this_device {
+                        out.extend(self.hang_up_leftover(Side::Caller, &id));
+                    } else if owed_by_callee {
+                        out.extend(self.hang_up_leftover(Side::Callee, &id));
+                    }
+                }
+                Side::Callee if call.this_device => {
+                    if call.peer_user_id == self.caller_user && !self.synced[Side::Caller.index()] {
+                        self.deferred.insert(id);
+                    } else {
+                        out.extend(self.hang_up_leftover(Side::Callee, &id));
+                    }
+                }
+                Side::Callee => {}
+            }
+        }
+        if side == Side::Caller {
+            // The caller's device does not hold these: the callee hangs them up.
+            for id in std::mem::take(&mut self.deferred) {
+                out.extend(self.hang_up_leftover(Side::Callee, &id));
+            }
+        }
+        out
+    }
+
     fn unexpected(&self) -> Vec<(Side, Body)> {
         bump(&self.stats.unexpected_frames);
         Vec::new()
@@ -369,19 +447,7 @@ impl<'a> PairCalls<'a> {
     /// A call frame from the gateway; other frames are ignored.
     pub fn on_frame(&mut self, side: Side, body: Body, now: Instant) -> Vec<(Side, Body)> {
         match body {
-            Body::CallSync(sync) => {
-                bump(&self.stats.call_syncs);
-                self.synced[side.index()] = true;
-                let mut out = Vec::new();
-                for call in sync.calls {
-                    bump(&self.stats.stale_calls);
-                    if call.this_device {
-                        out.push((side, hangup(&call.call_id)));
-                    }
-                    self.stale.insert(call.call_id);
-                }
-                out
-            }
+            Body::CallSync(sync) => self.on_sync(side, sync),
             Body::CallIncoming(incoming) => match &mut self.phase {
                 Phase::Live(call)
                     if side == Side::Callee && incoming.call_id == call.id && !call.rang =>
@@ -418,7 +484,7 @@ impl<'a> PairCalls<'a> {
                 _ => self.unexpected(),
             },
             Body::CallEnded(ended) => {
-                if self.stale.remove(&ended.call_id) {
+                if self.stale.remove(&(side, ended.call_id.clone())) {
                     return Vec::new();
                 }
                 let Phase::Live(call) = &mut self.phase else {
@@ -439,7 +505,10 @@ impl<'a> PairCalls<'a> {
                             }
                         }
                     }
-                    Side::Callee if !call.callee_ended => call.callee_ended = true,
+                    Side::Callee if !call.callee_ended => {
+                        call.callee_ended = true;
+                        self.stats.callee_ended.add(reason_name(ended.reason));
+                    }
                     _ => return self.unexpected(),
                 }
                 if call.caller_ended && (call.callee_ended || !call.rang) {
@@ -453,11 +522,11 @@ impl<'a> PairCalls<'a> {
                 Vec::new()
             }
             Body::CallError(error) => {
-                self.stats.errors.add(code_name(error.code));
-                self.refused = true;
-                if self.stale.remove(&error.call_id) {
+                if self.leftovers.contains(&error.call_id) {
                     return Vec::new();
                 }
+                self.stats.errors.add(code_name(error.code));
+                self.refused = true;
                 if let Phase::Live(call) = &self.phase {
                     // Refused before any accept or hangup: the invite itself, so there
                     // is no call.
@@ -833,10 +902,11 @@ async fn pair(shared: Arc<Shared>, caller_token: String, callee_token: String) {
             return;
         }
     };
+    let caller_user = caller.1.user;
     let callee_user = callee.1.user;
     let mut caller = Link::new(caller.0, caller.1);
     let mut callee = Link::new(callee.0, callee.1);
-    let lost = drive(&shared, &mut caller, &mut callee, callee_user).await;
+    let lost = drive(&shared, &mut caller, &mut callee, caller_user, callee_user).await;
     match lost {
         None => {}
         Some(Lost::Closed(code)) => {
@@ -864,10 +934,12 @@ async fn drive(
     shared: &Shared,
     caller: &mut Link,
     callee: &mut Link,
+    caller_user: Uuid,
     callee_user: Uuid,
 ) -> Option<Lost> {
     let mut calls = PairCalls::new(
         &shared.calls,
+        caller_user,
         callee_user,
         &shared.options,
         shared.last_invite,
@@ -882,7 +954,10 @@ async fn drive(
                 stop_by = Some(Instant::now() + HANGUP_GRACE);
                 calls.stop(Instant::now())
             }
-            () = tokio::time::sleep_until(stop_by.unwrap_or(far)), if stop_by.is_some() => return None,
+            () = tokio::time::sleep_until(stop_by.unwrap_or(far)), if stop_by.is_some() => {
+                calls.out_of_time();
+                return None;
+            }
             () = tokio::time::sleep_until(wake.unwrap_or(far)), if wake.is_some() => {
                 calls.on_timer(Instant::now())
             }
@@ -968,6 +1043,7 @@ mod tests {
         let callee = Uuid::now_v7();
         let mut calls = PairCalls::new(
             &stats,
+            Uuid::now_v7(),
             callee,
             &options(),
             start + Duration::from_secs(45),
@@ -1019,6 +1095,10 @@ mod tests {
             stats.ended.snapshot(),
             BTreeMap::from([("completed".to_owned(), 1)])
         );
+        assert_eq!(
+            stats.callee_ended.snapshot(),
+            BTreeMap::from([("completed".to_owned(), 1)])
+        );
         assert_eq!((stats.active.now(), stats.live.now()), (0, 0));
         assert_eq!((stats.active.peak(), stats.live.peak()), (1, 1));
         // The next invite comes a pause after the end (and a period after the last invite).
@@ -1030,13 +1110,21 @@ mod tests {
     fn no_call_is_placed_after_the_last_invite_time_or_once_stopping() {
         let stats = CallStats::default();
         let start = Instant::now();
-        let mut calls = PairCalls::new(&stats, Uuid::now_v7(), &options(), start, start);
+        let mut calls = PairCalls::new(
+            &stats,
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            &options(),
+            start,
+            start,
+        );
         synced(&mut calls, start);
         assert!(calls.on_timer(start + Duration::from_secs(1)).is_empty());
         assert_eq!(calls.wake_at(), None);
 
         let mut stopped = PairCalls::new(
             &stats,
+            Uuid::now_v7(),
             Uuid::now_v7(),
             &options(),
             start + Duration::from_secs(60),
@@ -1054,6 +1142,7 @@ mod tests {
         let start = Instant::now();
         let mut calls = PairCalls::new(
             &stats,
+            Uuid::now_v7(),
             Uuid::now_v7(),
             &options(),
             start + Duration::from_secs(45),
@@ -1077,6 +1166,7 @@ mod tests {
         let start = Instant::now();
         let mut calls = PairCalls::new(
             &stats,
+            Uuid::now_v7(),
             Uuid::now_v7(),
             &options(),
             start + Duration::from_secs(45),
@@ -1109,48 +1199,150 @@ mod tests {
         assert_eq!((stats.live.now(), calls.wake_at()), (0, None));
     }
 
+    fn sync_of(call_id: &[u8], peer: Uuid) -> Body {
+        Body::CallSync(CallSync {
+            calls: vec![CallState {
+                call_id: call_id.to_vec(),
+                peer_user_id: id_bytes(peer),
+                this_device: true,
+                ..CallState::default()
+            }],
+        })
+    }
+
+    fn not_found(call_id: &[u8]) -> Body {
+        Body::CallError(CallError {
+            call_id: call_id.to_vec(),
+            code: ErrorCode::CallNotFound.into(),
+            ..CallError::default()
+        })
+    }
+
     #[test]
-    fn leftover_calls_are_hung_up_before_the_first_call_and_strays_are_unexpected() {
+    fn a_leftover_call_of_the_pair_is_hung_up_once_by_the_caller_and_both_endings_absorbed() {
+        for callee_first in [false, true] {
+            let stats = CallStats::default();
+            let start = Instant::now();
+            let (caller, callee) = (Uuid::now_v7(), Uuid::now_v7());
+            let mut calls = PairCalls::new(
+                &stats,
+                caller,
+                callee,
+                &options(),
+                start + Duration::from_secs(45),
+                start,
+            );
+            let stale = id_bytes(Uuid::now_v7());
+            let mut out = Vec::new();
+            if callee_first {
+                out.extend(calls.on_frame(Side::Callee, sync_of(&stale, caller), start));
+                out.extend(calls.on_frame(Side::Caller, sync_of(&stale, callee), start));
+            } else {
+                out.extend(calls.on_frame(Side::Caller, sync_of(&stale, callee), start));
+                out.extend(calls.on_frame(Side::Callee, sync_of(&stale, caller), start));
+            }
+            assert!(
+                matches!(&out[..], [(Side::Caller, Body::CallHangup(h))] if h.call_id == stale),
+                "callee first {callee_first}: {out:?}"
+            );
+            assert_eq!(
+                calls.wake_at(),
+                Some(start + SYNC_WAIT),
+                "waits for the leftover to end"
+            );
+            calls.on_frame(Side::Callee, ended(&stale, CallEndReason::Completed), start);
+            assert_eq!(
+                calls.wake_at(),
+                Some(start + SYNC_WAIT),
+                "the caller's is due"
+            );
+            calls.on_frame(Side::Caller, ended(&stale, CallEndReason::Completed), start);
+            // A hangup that crossed the ending is refused: not an error of the run.
+            calls.on_frame(Side::Callee, not_found(&stale), start);
+            assert_eq!(calls.wake_at(), Some(start));
+            assert_eq!(read(&stats.stale_calls), 1);
+            assert_eq!(read(&stats.unexpected_frames), 0);
+            assert!(stats.errors.snapshot().is_empty());
+            assert!(
+                stats.ended.snapshot().is_empty() && stats.callee_ended.snapshot().is_empty(),
+                "a leftover's ending is not counted"
+            );
+            invite_id(&calls.on_timer(start));
+        }
+    }
+
+    #[test]
+    fn a_leftover_call_with_someone_else_is_hung_up_by_its_own_device_and_strays_are_unexpected() {
         let stats = CallStats::default();
         let start = Instant::now();
+        let caller = Uuid::now_v7();
         let mut calls = PairCalls::new(
             &stats,
+            caller,
             Uuid::now_v7(),
             &options(),
             start + Duration::from_secs(45),
             start,
         );
         let stale = id_bytes(Uuid::now_v7());
-        let sync = CallSync {
-            calls: vec![CallState {
-                call_id: stale.clone(),
-                this_device: true,
-                ..CallState::default()
-            }],
-        };
-        let out = calls.on_frame(Side::Caller, Body::CallSync(sync), start);
-        assert!(matches!(&out[..], [(Side::Caller, Body::CallHangup(h))] if h.call_id == stale));
-        calls.on_frame(Side::Callee, Body::CallSync(CallSync::default()), start);
-        assert_eq!(
-            calls.wake_at(),
-            Some(start + SYNC_WAIT),
-            "waits for the leftover to end"
-        );
-        calls.on_frame(Side::Caller, ended(&stale, CallEndReason::Completed), start);
-        assert_eq!(calls.wake_at(), Some(start));
-        assert_eq!(read(&stats.stale_calls), 1);
+        let out = calls.on_frame(Side::Callee, sync_of(&stale, Uuid::now_v7()), start);
+        assert!(matches!(&out[..], [(Side::Callee, Body::CallHangup(h))] if h.call_id == stale));
+        // A leftover with the caller that the caller's device does not hold.
+        let other = id_bytes(Uuid::now_v7());
         assert!(
-            stats.ended.snapshot().is_empty(),
-            "a leftover's ending is not counted"
+            calls
+                .on_frame(Side::Callee, sync_of(&other, caller), start)
+                .is_empty()
         );
+        let out = calls.on_frame(Side::Caller, Body::CallSync(CallSync::default()), start);
+        assert!(matches!(&out[..], [(Side::Callee, Body::CallHangup(h))] if h.call_id == other));
+        calls.on_frame(Side::Callee, ended(&stale, CallEndReason::Completed), start);
+        calls.on_frame(Side::Callee, ended(&other, CallEndReason::Completed), start);
+        assert_eq!(calls.wake_at(), Some(start));
+        assert_eq!(read(&stats.stale_calls), 2);
 
+        calls.on_frame(Side::Callee, ended(&stale, CallEndReason::Completed), start);
         calls.on_frame(Side::Caller, ended(&stale, CallEndReason::Completed), start);
         calls.on_frame(
             Side::Callee,
             Body::CallAccepted(CallAccepted::default()),
             start,
         );
-        assert_eq!(read(&stats.unexpected_frames), 2);
+        assert_eq!(read(&stats.unexpected_frames), 3);
+    }
+
+    #[test]
+    fn a_call_still_live_when_the_stop_grace_runs_out_is_an_ending_missing() {
+        let stats = CallStats::default();
+        let start = Instant::now();
+        let mut calls = PairCalls::new(
+            &stats,
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            &options(),
+            start + Duration::from_secs(45),
+            start,
+        );
+        synced(&mut calls, start);
+        let id = invite_id(&calls.on_timer(start));
+        calls.on_frame(
+            Side::Caller,
+            Body::CallAccepted(CallAccepted {
+                call_id: id.clone(),
+                ..CallAccepted::default()
+            }),
+            start,
+        );
+        assert!(
+            matches!(&calls.stop(start)[..], [(Side::Caller, Body::CallHangup(h))] if h.call_id == id)
+        );
+        calls.out_of_time();
+        assert_eq!(read(&stats.endings_missing), 1);
+        assert_eq!((stats.live.now(), stats.active.now()), (0, 0));
+        assert!(calls.idle());
+        // Nothing live: nothing missing.
+        calls.out_of_time();
+        assert_eq!(read(&stats.endings_missing), 1);
     }
 
     #[test]
