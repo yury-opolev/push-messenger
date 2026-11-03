@@ -53,7 +53,12 @@ pub enum SessionEvent {
     Ended(LineEnded),
 }
 
-/// Where a session reports its events (called from its tasks: keep it quick).
+/// Where a session reports its events.
+///
+/// It is called from the session's tasks and from [`Session::hush`], sometimes while
+/// the session holds its speech lock (so that `Speaking` events stay in order with
+/// barge-ins and hushes): it must not block and must never call back into the
+/// [`Session`] (the core's sink only sends into a channel).
 pub type EventSink = Arc<dyn Fn(SessionEvent) + Send + Sync>;
 
 const FRAME_TIME: Duration = Duration::from_millis(20);
@@ -93,6 +98,13 @@ struct Speech {
     playing_until: Option<Instant>,
 }
 
+impl Speech {
+    /// Whether sentences of `generation` are queued, synthesized or playing.
+    fn active(&self, generation: u64) -> bool {
+        self.speaking || self.busy == Some(generation) || !self.queue.is_empty()
+    }
+}
+
 impl Shared {
     fn emit(&self, event: SessionEvent) {
         (self.events)(event);
@@ -108,24 +120,39 @@ impl Shared {
         self.generation.load(Ordering::Acquire)
     }
 
-    fn speaking(&self) -> bool {
-        let speech = self.speech();
-        speech.speaking || speech.busy == Some(self.generation()) || !speech.queue.is_empty()
+    fn ended(&self) -> bool {
+        self.ended.load(Ordering::Acquire)
     }
 
-    /// Stops speaking at once; whether `Speaking(true)` was reported (and so
-    /// `Speaking(false)` is due).
-    fn stop_speaking(&self) -> bool {
-        let was_speaking = {
+    fn speaking(&self) -> bool {
+        self.speech().active(self.generation())
+    }
+
+    /// Stops speaking at once, reporting `Speaking(false)` if `Speaking(true)` was
+    /// reported. A barge-in only stops an agent that speaks and reports `BargedIn` first;
+    /// whether it did. Nothing happens once the call ended.
+    ///
+    /// The events are emitted under the speech lock, as the speaker worker's are: a
+    /// `Speaking(true)` can never follow the `Speaking(false)` that ends it.
+    fn stop_speaking(&self, barge_in: bool) -> bool {
+        {
             let mut speech = self.speech();
+            if self.ended() || (barge_in && !speech.active(self.generation())) {
+                return false;
+            }
             self.generation.fetch_add(1, Ordering::AcqRel);
             speech.queue.clear();
             speech.playing_until = None;
-            std::mem::take(&mut speech.speaking)
-        };
+            if barge_in {
+                self.emit(SessionEvent::BargedIn);
+            }
+            if std::mem::take(&mut speech.speaking) {
+                self.emit(SessionEvent::Speaking(false));
+            }
+        }
         self.speaker.clear();
         self.wake.notify_one();
-        was_speaking
+        true
     }
 }
 
@@ -178,22 +205,25 @@ impl Session {
 
     /// Queues one sentence to speak (ignored without TTS).
     pub fn say(&self, text: impl Into<String>) {
-        if !self.shared.speaks || self.shared.ended.load(Ordering::Acquire) {
+        if !self.shared.speaks {
             return;
         }
-        let generation = self.shared.generation();
-        self.shared
-            .speech()
-            .queue
-            .push_back((generation, text.into()));
+        {
+            // Under the lock: the watcher resets the speech state under it once ended.
+            let mut speech = self.shared.speech();
+            if self.shared.ended() {
+                return;
+            }
+            let generation = self.shared.generation();
+            speech.queue.push_back((generation, text.into()));
+        }
         self.shared.wake.notify_one();
     }
 
-    /// Stops speaking: drops the queued sentences and the queued audio.
+    /// Stops speaking: drops the queued sentences and the queued audio (nothing once the
+    /// call ended).
     pub fn hush(&self) {
-        if self.shared.stop_speaking() {
-            self.shared.emit(SessionEvent::Speaking(false));
-        }
+        self.shared.stop_speaking(false);
     }
 
     /// Forwards a call event to the line; `true` when it was about this call.
@@ -220,7 +250,7 @@ impl Drop for Session {
         for task in &self.tasks {
             task.abort();
         }
-        if !self.shared.ended.load(Ordering::Acquire) {
+        if !self.shared.ended() {
             if let Ok(runtime) = tokio::runtime::Handle::try_current() {
                 let control = self.control.clone();
                 runtime.spawn(async move {
@@ -247,6 +277,17 @@ async fn watch(shared: Arc<Shared>, control: Arc<dyn LineControl>, workers: Vec<
     for worker in workers {
         let _ = worker.await;
     }
+    {
+        // The aborted speaker worker may have left a sentence busy, sentences queued or
+        // `Speaking(true)` unanswered: the end stops the speech too.
+        let mut speech = shared.speech();
+        speech.queue.clear();
+        speech.busy = None;
+        speech.playing_until = None;
+        if std::mem::take(&mut speech.speaking) {
+            shared.emit(SessionEvent::Speaking(false));
+        }
+    }
     tracing::info!(
         event = "voice_call_ended",
         reason = end.reason.as_str(),
@@ -265,13 +306,8 @@ async fn listen(
     while let Some(frame) = incoming.recv().await {
         match vad.push(&frame) {
             Some(VadEvent::SpeechStarted) => {
-                if shared.speaking() {
-                    let was_speaking = shared.stop_speaking();
+                if shared.stop_speaking(true) {
                     tracing::info!(event = "voice_barge_in");
-                    shared.emit(SessionEvent::BargedIn);
-                    if was_speaking {
-                        shared.emit(SessionEvent::Speaking(false));
-                    }
                 }
                 shared.emit(SessionEvent::Listening(true));
             }
@@ -320,7 +356,7 @@ enum Next {
     Sentence(u64, String),
     /// Nothing queued: the audio plays until then.
     Playing(Instant),
-    /// The audio played: `Speaking(false)` is due.
+    /// The audio played: `Speaking(false)` was reported.
     Done,
     Idle,
 }
@@ -341,6 +377,7 @@ async fn speak(shared: Arc<Shared>, tts: Arc<dyn Tts>) {
                     _ => {
                         speech.speaking = false;
                         speech.playing_until = None;
+                        shared.emit(SessionEvent::Speaking(false));
                         Next::Done
                     }
                 }
@@ -360,7 +397,7 @@ async fn speak(shared: Arc<Shared>, tts: Arc<dyn Tts>) {
                     () = shared.wake.notified() => {}
                 }
             }
-            Next::Done => shared.emit(SessionEvent::Speaking(false)),
+            Next::Done => {}
             Next::Idle => shared.wake.notified().await,
         }
     }
@@ -383,15 +420,14 @@ async fn say_sentence(shared: &Shared, tts: &dyn Tts, generation: u64, text: &st
             return true;
         }
     };
-    let started = {
+    {
         let mut speech = shared.speech();
         if generation != shared.generation() {
             return true;
         }
-        !std::mem::replace(&mut speech.speaking, true)
-    };
-    if started {
-        shared.emit(SessionEvent::Speaking(true));
+        if !std::mem::replace(&mut speech.speaking, true) {
+            shared.emit(SessionEvent::Speaking(true));
+        }
     }
     let frames = wav::frames(&samples);
     tracing::info!(
@@ -407,6 +443,11 @@ async fn say_sentence(shared: &Shared, tts: &dyn Tts, generation: u64, text: &st
         }
         let mut speech = shared.speech();
         if generation != shared.generation() {
+            drop(speech);
+            // A barge-in or a hush overtook the frame while the speaker took it: its
+            // `clear()` may have run before the frame was queued, which then carries the
+            // speaker's new generation and would play after the cut. Clear again.
+            shared.speaker.clear();
             return true;
         }
         let now = Instant::now();
@@ -624,6 +665,112 @@ mod tests {
         assert!(!call.owner.hung_up());
         call.session.say("too late");
         assert!(call.during(Duration::from_millis(100)).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_call_ending_mid_speech_stops_the_speech_first() {
+        let mut call = call().await;
+        call.session.say(words(50));
+        call.session.say(words(50));
+        call.until(&SessionEvent::Speaking(true)).await;
+        call.owner.end(CallEndReason::Completed);
+        let seen = call
+            .until(&SessionEvent::Ended(LineEnded {
+                reason: CallEndReason::Completed,
+                duration_s: Some(0),
+            }))
+            .await;
+        assert_eq!(
+            seen[seen.len() - 2..],
+            [
+                SessionEvent::Speaking(false),
+                SessionEvent::Ended(LineEnded {
+                    reason: CallEndReason::Completed,
+                    duration_s: Some(0),
+                }),
+            ],
+            "{seen:?}"
+        );
+        assert_eq!(
+            seen.iter()
+                .filter(|e| **e == SessionEvent::Speaking(false))
+                .count(),
+            1,
+            "{seen:?}"
+        );
+        assert!(!call.session.speaking());
+        call.session.hush();
+        call.session.say("too late");
+        assert!(!call.session.speaking());
+        assert!(call.during(Duration::from_millis(200)).await.is_empty());
+    }
+
+    /// The line's speaker, holding its first frame until released.
+    struct HeldSpeaker {
+        inner: Arc<dyn Speaker>,
+        held: AtomicBool,
+        taking: Notify,
+        release: Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl Speaker for HeldSpeaker {
+        async fn send(&self, frame: Frame) -> bool {
+            if !self.held.swap(true, Ordering::AcqRel) {
+                self.taking.notify_one();
+                self.release.notified().await;
+            }
+            self.inner.send(frame).await
+        }
+
+        fn clear(&self) {
+            self.inner.clear();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_frame_overtaken_by_a_hush_does_not_play() {
+        let phone = FakePhone::new();
+        let mut line = phone.answer(CallId::new(), "offer").await.unwrap();
+        let owner = phone.wait_answered().await;
+        let held = Arc::new(HeldSpeaker {
+            inner: line.speaker.clone(),
+            held: AtomicBool::new(false),
+            taking: Notify::new(),
+            release: Notify::new(),
+        });
+        line.speaker = held.clone();
+        let (sender, events) = mpsc::unbounded_channel();
+        let sink: EventSink = Arc::new(move |event| {
+            let _ = sender.send(event);
+        });
+        let session = Session::start(
+            line,
+            stt(),
+            Some(Arc::new(FakeTts::new())),
+            VadConfig::default(),
+            sink,
+        );
+        let mut call = Call {
+            session,
+            owner,
+            events,
+        };
+        call.until(&SessionEvent::Connected).await;
+        call.session.say("one two");
+        held.taking.notified().await;
+        call.session.hush();
+        assert_eq!(call.owner.clears(), 1);
+        held.release.notify_one();
+        call.owner
+            .wait_until("the second clear", |owner| owner.clears() == 2)
+            .await;
+        assert_eq!(
+            call.during(Duration::from_millis(300)).await,
+            vec![SessionEvent::Speaking(true), SessionEvent::Speaking(false)]
+        );
+        assert!(call.owner.heard().is_empty());
+        assert!(!call.session.speaking());
     }
 
     #[tokio::test]
