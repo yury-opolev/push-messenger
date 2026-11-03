@@ -1,7 +1,8 @@
 //! The public HTTP API (spec §2, §5; Entra ID sign-in: spec 2026-10-19 §4): `/v1/auth/*`,
 //! `/v1/devices/*`, `/v1/agents*`, `/v1/users*`, `/v1/templates` (spec 2026-10-26 rich
-//! message templates) and `/v1/calls` (call history, voice calls spec §9), JSON in and out,
-//! plus the two small pages that email links open.
+//! message templates), `/v1/calls` (call history, voice calls spec §9) and
+//! `/v1/calls/ice-servers` (TURN credentials, voice calls spec §8), JSON in and out, plus
+//! the two small pages that email links open.
 //!
 //! Errors are `{"error": {"code", "message", "retryable"}}` with the status of
 //! [`AuthError::status`]; 429 answers carry `Retry-After`, 401 answers
@@ -42,6 +43,7 @@ use crate::limits::{Action, Limits};
 use crate::rules::{self, Invalid};
 use crate::service::{Auth, Signup};
 use crate::templates::{TemplateRegistry, rfc3339};
+use crate::turn::Turn;
 
 /// Largest request body accepted.
 pub(crate) const MAX_BODY_BYTES: usize = 16 * 1024;
@@ -61,6 +63,8 @@ pub struct Api {
     pub templates: Arc<dyn TemplateRegistry>,
     /// The call history: message-svc's `Calls` API.
     pub call_history: Arc<dyn CallLog>,
+    /// TURN credentials for voice calls (`GET /v1/calls/ice-servers`).
+    pub turn: Arc<Turn>,
 }
 
 /// The router of the public API. Without email and password sign-in its routes do not
@@ -104,6 +108,7 @@ pub fn router(api: Api) -> Router {
         .route("/v1/templates", post(submit_template).get(template_catalog))
         .route("/v1/calls", get(call_history))
         .route("/v1/calls/{call_id}", delete(hide_call))
+        .route("/v1/calls/ice-servers", get(ice_servers))
         .route_layer(axum::middleware::from_fn_with_state(
             api.clone(),
             audit::audit,
@@ -143,6 +148,9 @@ impl IntoResponse for AuthError {
             }
             Self::EntraUnavailable | Self::IdentityUnavailable => {
                 headers.insert(RETRY_AFTER, HeaderValue::from_static("5"));
+            }
+            Self::TurnUnavailable => {
+                headers.insert(RETRY_AFTER, HeaderValue::from_static("30"));
             }
             Self::Unauthorized
             | Self::TokenExpired
@@ -809,6 +817,29 @@ async fn profiles(
         })
         .collect();
     Ok(Json(json!({ "users": users })).into_response())
+}
+
+/// `GET /v1/calls/ice-servers` (spec 2026-11-03 voice calls §8): the caller's ICE servers
+/// for `RTCPeerConnection`, `{"ice_servers": [{urls, username?, credential?}],
+/// "expires_at", "relay"}`; `turn_unavailable` (503) instead of servers that could not
+/// work. Credentials are scoped to the caller and never logged.
+async fn ice_servers(
+    State(api): State<Api>,
+    headers: HeaderMap,
+    ClientIp(ip): ClientIp,
+) -> Result<Response, AuthError> {
+    let caller = caller(&api, &headers).await?;
+    let user = caller.user_id.to_string();
+    api.limits
+        .check(Action::TurnCredentials, ip, Some(&user))
+        .await?;
+    let servers = api.turn.ice_servers(caller.user_id).await?;
+    Ok(Json(json!({
+        "ice_servers": servers.servers,
+        "expires_at": servers.expires_at.to_rfc3339_opts(SecondsFormat::Secs, true),
+        "relay": servers.relay,
+    }))
+    .into_response())
 }
 
 /// Whether the body is declared as JSON (`application/json`, any parameters).

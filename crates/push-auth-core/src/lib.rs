@@ -29,6 +29,7 @@ mod server;
 mod service;
 pub mod templates;
 pub mod tokens;
+pub mod turn;
 
 pub use admin::{AdminApi, UserSelector, admin_router};
 pub use agent_key::{AgentKeySettings, AgentKeySignIn};

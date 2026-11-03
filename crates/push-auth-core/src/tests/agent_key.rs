@@ -44,6 +44,7 @@ pub(super) async fn key_world() -> (World, Auth, Router) {
         directory: Arc::new(NoDirectory),
         templates: Arc::new(crate::templates::NoTemplates),
         call_history: Arc::new(crate::calls::NoCalls),
+        turn: Arc::new(crate::turn::Turn::disabled()),
     });
     (world, auth, router)
 }
@@ -333,6 +334,7 @@ async fn agent_key_sign_ins_are_audited() {
         directory: Arc::new(NoDirectory),
         templates: Arc::new(crate::templates::NoTemplates),
         call_history: Arc::new(crate::calls::NoCalls),
+        turn: Arc::new(crate::turn::Turn::disabled()),
     });
     let [a, b, c, _] = rand::random::<u32>().to_be_bytes();
     let success_ip = format!("10.{a}.{b}.{}", c & 0xfe);

@@ -34,6 +34,7 @@ use crate::password::Passwords;
 use crate::service::{Auth, Settings, SignIn};
 use crate::templates::{GrpcTemplates, NoTemplates, TemplateRegistry};
 use crate::tokens::AccessTokens;
+use crate::turn::Turn;
 
 /// How long to wait before trying an unreachable dependency again.
 const RETRY_DELAY: Duration = Duration::from_secs(2);
@@ -108,9 +109,20 @@ pub async fn serve_with(
             )
         }
     };
+    let turn = Arc::new(Turn::new(config.turn.clone()).map_err(anyhow::Error::msg)?);
+    match turn.mode() {
+        Some(mode) => tracing::info!(
+            mode,
+            "voice call relays: GET /v1/calls/ice-servers is served"
+        ),
+        None => tracing::info!(
+            "PUSH_TURN_MODE is not set: GET /v1/calls/ice-servers answers turn_unavailable"
+        ),
+    }
     let ready = Health {
         pool: Arc::new(OnceLock::new()),
         shutdown: shutdown.clone(),
+        turn: Arc::clone(&turn),
     };
     let health_server = tokio::spawn(
         axum::serve(health, health_router(ready.clone()))
@@ -272,6 +284,7 @@ pub async fn serve_with(
         directory,
         templates: Arc::clone(&templates),
         call_history,
+        turn,
     });
     // The admin listener exists only with its token (spec D15).
     let admin_server = match &config.admin_token {
@@ -433,13 +446,27 @@ async fn finish(health_server: tokio::task::JoinHandle<std::io::Result<()>>) -> 
 struct Health {
     pool: Arc<OnceLock<PgPool>>,
     shutdown: CancellationToken,
+    turn: Arc<Turn>,
 }
 
 fn health_router(health: Health) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/readyz", get(readyz))
+        .route("/metrics", get(metrics))
         .with_state(health)
+}
+
+/// The TURN credential counters in the Prometheus text format 0.0.4; empty without TURN
+/// settings.
+async fn metrics(State(health): State<Health>) -> impl axum::response::IntoResponse {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        health.turn.render_metrics(),
+    )
 }
 
 /// Ready once the database is migrated and answers. Start-up waits for the first Redis
