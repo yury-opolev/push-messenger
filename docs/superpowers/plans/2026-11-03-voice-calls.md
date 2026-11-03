@@ -825,13 +825,13 @@ File map (`crates/push-bridge/src/voice/`):
 Core: `core/voice.rs` (call events, session events, transcripts, voice answers, speech of
 replies and cards, activity labels); config `calls` section in `config.rs`.
 
-- [ ] **7.1** `agent.transcript@1` + seeding counts + docs/rich-messages.md.
-- [ ] **7.2** `wav.rs`, `vad.rs`, `speech.rs`, `confirm.rs` (+ `CardPlan::title`/`spoken`).
-- [ ] **7.3** config `calls` + providers (`provider.rs`, `azure.rs`, `local.rs`, `fake.rs`).
-- [ ] **7.4** `phone.rs`, `session.rs`, `media.rs`, feature `voice`.
-- [ ] **7.5** `core/voice.rs` + core tests with fixtures.
-- [ ] **7.6** `main.rs` wiring, push-smoke E2E, CI job, live smoke.
-- [ ] **7.7** docs (agent-bridge.md voice, calls.md cross-ref, CHANGELOG, spec §15).
+- [x] **7.1** `agent.transcript@1` + seeding counts + docs/rich-messages.md.
+- [x] **7.2** `wav.rs`, `vad.rs`, `speech.rs`, `confirm.rs` (+ `CardPlan::title`/`spoken`).
+- [x] **7.3** config `calls` + providers (`provider.rs`, `azure.rs`, `local.rs`, `fake.rs`).
+- [x] **7.4** `phone.rs`, `session.rs`, `media.rs`, feature `voice`.
+- [x] **7.5** `core/voice.rs` + core tests with fixtures.
+- [x] **7.6** `main.rs` wiring, push-smoke E2E, CI job, live smoke.
+- [x] **7.7** docs (agent-bridge.md voice, calls.md cross-ref, CHANGELOG, spec §15).
 
 PR 8 then adds: `calls.answer: "ask"`, `notify_by_call` (outgoing calls through
 `MediaPhone` as `Role::Caller`, spoken summary, missed → card stays, rate limit, DND), and

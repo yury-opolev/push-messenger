@@ -804,3 +804,85 @@ Decisions taken while implementing §9, beyond or refining it:
   after 90 s plus `connect_timeout`. A server refusal (`NOT_CONTACT`, `IN_CALL`, …) ends
   the helper's call only while it is being set up; later refusals of ICE or
   renegotiation frames leave it running.
+
+### PR 7 (bridge voice pipeline): decisions and deviations
+
+- **Build.** push-bridge's optional feature `voice = ["push-sdk/calls-media"]` (Rust 1.89,
+  CMake) gates only the media adapter (`voice/media.rs`, `MediaPhone`) and its wiring in
+  `main.rs`. The pipeline, providers, detector, spoken text, voice answers and the core
+  integration always compile with Rust 1.85 and are tested through a `FakePhone`; the
+  `msrv` job never builds the feature, push-smoke enables it as a dev-dependency. A build
+  without the feature does not advertise calls and warns once about a `calls` section;
+  `status` prints a `Voice:` line.
+- **Answering.** `calls.answer` accepts only `auto` in PR 7 (`ask` is refused by
+  validation until PR 8). The owner's call is answered; anyone else's is declined (the
+  server refuses non-contacts first with `NOT_CONTACT`), a second call while one runs (or
+  is being answered, or the bridge stops) is declined busy. With no `calls` section or
+  `calls.stt` `none` the client does not advertise calls at all, so the server answers
+  the owner `UNREACHABLE` instead of the bridge declining.
+- **D22 refined.** `agent.transcript@1` has no `voice` param: the template always means a
+  voice transcript, and tpl/1 requires every param to be shown. Params `speaker`
+  (`owner`|`agent`) and `text` (4,000 characters), a literal heading "🎤 voice", fallback
+  "🎤 voice: <text>". Masked like everything the bridge sends; the peek shows it as the
+  owner's text "🎤 …". The bridge posts only `speaker: owner`; its spoken replies stay the
+  turn's `agent.reply@2`.
+- **Voice answers edit the card** instead of an ANSWER with `via: "voice"`: the bridge
+  sent the card and the server refuses a sender's own answer, and tpl/1's strict ANSWER
+  format has no room for `via`. The request is settled locally (as a typed answer) and the
+  card is edited into a closed `agent.reply@1` "<card title>" / "🎤 Answered by voice:
+  <label>."; the new body is not interactive, so the server refuses later answers to it.
+  Matching (§10.3's "exact / ordinal / synonyms") became: approve and reject word lists
+  with exactly one side heard, a negation never approving and a question asked again;
+  options by cardinal ("option two", a bare "two"), ordinal ("the second one") or label;
+  several for a multi-select; free text when allowed. Unclear → a fixed "Sorry, …"
+  sentence and the card stays open. Only the oldest open card is spoken and answered.
+- **Providers.** REST only, no new crates (reqwest with rustls): Azure AI Speech
+  short-audio STT and TTS (`raw-16khz-16bit-mono-pcm`, SSML with `voice`, default
+  `en-US-JennyNeural`); a key from an environment variable (`key_env`, default
+  `AZURE_SPEECH_KEY`) with `region`, or an Entra token from a command (default `az account
+  get-access-token …`, reused 30 minutes, refreshed once on a 401) with the custom-domain
+  `endpoint` and optional `resource_id` (`aad#…`). No websocket or streaming recognition:
+  each utterance is one request. `local`: a whisper.cpp server URL (multipart built by
+  hand) or a command with `{wav}`/`{language}` for STT; a command writing raw s16le at
+  `sample_rate` (piper `--output_raw`) or a URL answering a WAV for TTS. Commands run
+  without a shell with a 30 s limit; the temporary WAV is readable only by the user and
+  removed after each utterance. Errors carry content-free codes only.
+- **VAD.** Energy only (§10.3 said energy plus zero-crossing): RMS dBFS per 20 ms frame against a noise floor that is the
+  quietest frame of a sliding 1.5 s window (clamped to -70..-30 dBFS), speech at floor
+  +10 dB and above -55 dBFS, so a steady noise cannot hold the detector in speech. Onset
+  after 3 frames with 200 ms pre-roll, end after `silence_ms` with at most 200 ms kept,
+  `min_speech_ms` of speech or the utterance is dropped, a cut at 30 s.
+- **Speech text.** Line-based and incremental: code fences → "I've put the code in the
+  chat.", tables (a `|` line or a delimiter row; a header line with `|` waits for the next
+  line) → "I've put a table in the chat." (not repeated back to back), headings and list
+  items as sentences of their own, links → their text, bare URLs → "a link", code spans
+  unwrapped, emphasis/quotes/rules/HTML removed; sentences split after `.`/`!`/`?`/`…`
+  except common abbreviations, at most 300 characters. Background messages are spoken as
+  "<label>." and their text.
+- **Barge-in and the session mute.** An onset while the agent speaks bumps a generation:
+  the queued sentences and the sink's queued audio are dropped (`clear()`), and the session
+  mutes the reply itself (`say_reply` drops sentences until the core unmutes it on the
+  next transcript, voice answer or turn start), so reply text the core handles before the
+  `BargedIn` event is not spoken either. The bridge's own sentences (greeting, card
+  questions, confirmations) are never muted.
+- **Activity.** A card open or a pause keeps its label; otherwise during a call, working
+  with "speaking" > "listening" > "thinking" (a turn runs) > "on a call". The greeting is
+  "Connected to <name> in <folder>." (with a period), followed by the oldest open card.
+- **Tests.** Tone-based fakes: `FakeStt` hears a word per frequency (Goertzel), `FakeTts`
+  speaks 600 Hz for a length that follows the text. Recorded fixtures
+  (`tests/fixtures/voice/*.json`: prompt, barge-in, approve, option two, ambiguous) with
+  frequency rules (350–2400 Hz, 200 Hz apart, never within 150 Hz of 600 Hz). Core tests
+  in paused time through `FakePhone`; a public-API test in `tests/bridge.rs`; the E2E
+  `crates/push-smoke/tests/bridge_voice.rs` (CI job `bridge-voice`, `PUSH_BRIDGE_VOICE=1`)
+  runs the bridge with `SdkMessenger`, `MediaPhone` and a scripted backend against the
+  owner's `MediaCall` over real Opus media; `calls-media-windows` also runs the bridge's
+  `voice::` tests with the feature. Live providers: `PUSH_BRIDGE_LIVE_SPEECH=1`, not in CI.
+- **SDK pacing fix found by the E2E.** The media helper's 20 ms clock used
+  `MissedTickBehavior::Delay`; on Windows' ~15.6 ms timer a late tick came every ~31 ms
+  (about 32 frames a second), so the agent's voice arrived with gaps. It now uses `Burst`
+  and resets after a stall over 100 ms (PR 6's helper, fixed here).
+- **Other details.** Utterances are transcribed one at a time, in order; an STT failure is
+  said as "Sorry, I couldn't make that out.", a TTS failure skips the sentence. Up to 5 s
+  of the owner's audio waits for the pipeline, newer frames are dropped beyond. Without
+  TTS the call is silent (no greeting) and replies stay in the chat. Call events that
+  arrive while the answer is in progress are buffered and handed to the line after it.

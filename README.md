@@ -106,6 +106,9 @@ troubleshooting: [docs/agent-bridge.md](docs/agent-bridge.md).
 - `crates/push-bridge-control`: each bridge's local control channel, for the tray, `pause`
   / `resume` around a Coda upgrade, and other tools
   ([guide](docs/agent-bridge.md#14-control-channel-for-other-tools)).
+- Voice calls: built with `--features voice`, the bridge answers its owner's calls, turns
+  speech into prompts, speaks the replies and takes spoken answers to its cards (Azure AI
+  Speech or local engines) ([guide](docs/agent-bridge.md#18-voice-calls)).
 
 ## Run it on minikube
 
