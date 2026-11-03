@@ -146,6 +146,11 @@ cargo build --release -p push-bridge
 Copy-Item target\release\push-agent-bridge.exe C:\Tools\push-agent-bridge.exe
 ```
 
+For voice calls with the owner (the `calls` section), build with `--features voice`
+(push-sdk's media helper: Rust 1.89 and CMake). A build without it ignores `calls`, warns
+once, and does not advertise calls, so the owner's app shows the agent as unreachable.
+`status` prints a `Voice:` line saying which applies.
+
 Keep the program somewhere stable: the logon task runs it from that path.
 
 ### 2. Write `config.json`
@@ -297,7 +302,7 @@ push-agent-bridge [--dir <folder>] <command>
 | `thumbprint` | prints the thumbprint of the existing key |
 | `enroll --code <code>` | enrolls with the owner's one-time code and registers this device |
 | `run` | runs the bridge until Ctrl-C (what the logon task runs) |
-| `status` | prints the configuration path (and what is wrong with it), the key and its thumbprint, the agent user, the device, the folder, the sessions per folder and the log's path; no secrets |
+| `status` | prints the configuration path (and what is wrong with it), the key and its thumbprint, the agent user, the device, the folder, the sessions per folder, voice (`off (no calls section)`, `on: stt <provider>, tts <provider>`, `off (calls.stt is none)`, or configured in a build without voice) and the log's path; no secrets |
 | `pause [--reason <text>] [--drain-timeout <seconds>]` | asks the running bridge (through its [control channel](#14-control-channel-for-other-tools)) to [pause Coda for an upgrade](#15-upgrade-mode): Coda finishes its work (600 s at most by default), saves its state and is stopped; prints "Coda is paused; its program is released." once its program can be replaced. The bridge starts Coda again with its state once the program file changed, and holds the owner's texts meanwhile |
 | `resume` | asks the running bridge to start the paused Coda now (its program must be usable) and prints "Coda is resuming."; a pause that is still draining is cancelled instead: "The pause was cancelled; Coda keeps running." |
 | `help`, `--help`, `-h` | prints the usage |
@@ -641,6 +646,24 @@ owner's app. Use a scratch root folder.
 5. **Check that a stranger gets the fixed reply.** From another account, message the
    agent: it answers "This agent is private." once, and nothing reaches Coda (the log shows
    `stranger_refused`).
+
+**Speech providers.** `crates/push-bridge/tests/live_speech.rs` tries the configured
+providers against the real services (Azure AI Speech or local engines): text-to-speech
+says "Please run the unit tests now." and speech-to-text must hear "test" in it. With
+speech-to-text only, it transcribes a recording instead. It prints provider names and
+timings only:
+
+```powershell
+$env:PUSH_BRIDGE_LIVE_SPEECH = "1"
+$env:PUSH_BRIDGE_LIVE_SPEECH_CONFIG = "$env:LOCALAPPDATA\push-messenger\coda-bridge\config.json"  # or a file with just the calls section
+# $env:PUSH_BRIDGE_LIVE_SPEECH_WAV = "C:\scratch\run-the-tests.wav"  # speech-to-text only
+cargo test -p push-bridge --test live_speech -- --nocapture
+```
+
+The voice pipeline itself is tested end to end in CI (`bridge-voice`:
+`crates/push-smoke/tests/bridge_voice.rs`, opt in locally with `PUSH_BRIDGE_VOICE=1` and
+Docker): the owner's call over real media, a prompt, a spoken reply, barge-in, a voice
+approval and a stranger refused, with tone-based speech fakes.
 
 ## 13. The tray app (push-agent-tray)
 

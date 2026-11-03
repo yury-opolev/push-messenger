@@ -147,6 +147,28 @@ enum ProviderWire<A, L> {
 #[serde(deny_unknown_fields)]
 struct NoFields {}
 
+impl SttConfig {
+    /// The provider's name as written in `config.json`.
+    pub fn provider(&self) -> &'static str {
+        match self {
+            Self::AzureSpeech(_) => "azure-speech",
+            Self::Local(_) => "local",
+            Self::None => "none",
+        }
+    }
+}
+
+impl TtsConfig {
+    /// The provider's name as written in `config.json`.
+    pub fn provider(&self) -> &'static str {
+        match self {
+            Self::AzureSpeech(_) => "azure-speech",
+            Self::Local(_) => "local",
+            Self::None => "none",
+        }
+    }
+}
+
 impl From<ProviderWire<AzureSpeechConfig, LocalSttConfig>> for SttConfig {
     fn from(wire: ProviderWire<AzureSpeechConfig, LocalSttConfig>) -> Self {
         match wire {
@@ -279,7 +301,8 @@ impl VadSettings {
 }
 
 impl CallsConfig {
-    fn validate(&self) -> Result<(), String> {
+    /// Checks the section as [`Config::validate`] does; the error names the field.
+    pub fn validate(&self) -> Result<(), String> {
         if self.answer == AnswerMode::Ask {
             return Err("calls.answer \"ask\" is not supported yet: use \"auto\"".to_owned());
         }

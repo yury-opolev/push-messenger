@@ -11,13 +11,14 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use push_bridge::coda::CodaBackend;
-use push_bridge::config::{self, Config};
+use push_bridge::config::{self, CallsConfig, Config, SttConfig};
 use push_bridge::control::{Action, Calls, ControlCall, ControlHandle, ControlHub, error};
 use push_bridge::core::{Bridge, BridgeError, BridgeOptions};
 use push_bridge::folders;
 use push_bridge::logging;
 use push_bridge::messenger::{EVENT_QUEUE, Reconnect, SdkMessenger};
 use push_bridge::state::{self, BridgeSecretStore, StateFile};
+use push_bridge::voice::VoiceSetup;
 use push_bridge_control::transport::Listener;
 use push_bridge_control::{
     BridgeState, Call, ErrorBody, Event as ControlEvent, PauseParams, endpoint, instance_id,
@@ -43,6 +44,9 @@ const PAUSE_GRACE: Duration = Duration::from_secs(150);
 const RESUME_TIMEOUT: Duration = Duration::from_secs(30);
 
 const ENROLL_HINT: &str = "This agent is not enrolled: run `push-agent-bridge enroll --code <code>` with a code from the agents page.";
+
+/// Whether this build has voice (feature `voice`: push-sdk's media helper).
+const VOICE_BUILT: bool = cfg!(feature = "voice");
 
 /// Why a command failed, and the exit code that says so.
 struct Failure {
@@ -205,8 +209,73 @@ fn status(dir: &Path) -> Result<(), Failure> {
             println!("  {folder}: {session}");
         }
     }
+    println!(
+        "Voice:         {}",
+        voice_status(config.calls.as_ref(), VOICE_BUILT)
+    );
     println!("Log:           {}", logging::path(dir).display());
     Ok(())
+}
+
+/// The calls section, when it has someone to listen (an STT provider).
+fn listening(calls: Option<&CallsConfig>) -> Option<&CallsConfig> {
+    calls.filter(|calls| calls.stt != SttConfig::None)
+}
+
+/// Whether the client advertises calls: only a build with voice whose config listens.
+/// Otherwise the owner's app shows the agent as unreachable.
+fn advertises_calls(calls: Option<&CallsConfig>, voice_built: bool) -> bool {
+    voice_built && listening(calls).is_some()
+}
+
+/// `status`'s voice line: provider names only, never their settings.
+fn voice_status(calls: Option<&CallsConfig>, voice_built: bool) -> String {
+    match calls {
+        None => "off (no calls section)".to_owned(),
+        Some(calls) if calls.stt == SttConfig::None => "off (calls.stt is none)".to_owned(),
+        Some(_) if !voice_built => {
+            "configured, but this build has no voice (build with --features voice)".to_owned()
+        }
+        Some(calls) => format!(
+            "on: stt {}, tts {}",
+            calls.stt.provider(),
+            calls.tts.provider()
+        ),
+    }
+}
+
+/// The owner's calls are answered with push-sdk's media helper and the configured
+/// speech providers; `None` when the config does not listen.
+#[cfg(feature = "voice")]
+fn voice_setup(config: &Config, client: &Client) -> Option<VoiceSetup> {
+    use push_bridge::voice::media::MediaPhone;
+    use push_bridge::voice::provider;
+
+    let calls = listening(config.calls.as_ref())?;
+    let providers = provider::build(calls);
+    tracing::info!(
+        event = "voice_enabled",
+        stt = providers.stt.as_ref().map_or("none", |stt| stt.name()),
+        tts = providers.tts.as_ref().map_or("none", |tts| tts.name()),
+    );
+    Some(VoiceSetup {
+        phone: Arc::new(MediaPhone::new(client)),
+        stt: providers.stt,
+        tts: providers.tts,
+        vad: calls.vad.to_vad(),
+    })
+}
+
+/// Without the media helper there is no voice: a calls section only gets a warning.
+#[cfg(not(feature = "voice"))]
+fn voice_setup(config: &Config, _client: &Client) -> Option<VoiceSetup> {
+    if config.calls.is_some() {
+        tracing::warn!(event = "voice_unavailable");
+        eprintln!(
+            "push-agent-bridge: calls is set in config.json, but this build has no voice: build with --features voice"
+        );
+    }
+    None
 }
 
 /// The control channel could not be used.
@@ -288,6 +357,7 @@ fn open_client(config: &Config, state: &Arc<StateFile>) -> Result<(Client, Event
     let mut sdk = push_sdk::Config::new(&config.api_url, &config.socket_url(), ":memory:");
     sdk.host = config.host.clone();
     sdk.allow_insecure_transport = config.allow_insecure_transport;
+    sdk.calls = advertises_calls(config.calls.as_ref(), VOICE_BUILT);
     let secrets = Arc::new(BridgeSecretStore::new(Arc::clone(state)));
     Client::open(sdk, secrets).map_err(|e| Failure::general(format!("Cannot start: {e}")))
 }
@@ -354,6 +424,7 @@ async fn run(dir: &Path) -> Result<(), Failure> {
         default_mode: config.default_permission_mode,
     };
     let (client, events) = open_client(&config, &state)?;
+    let voice = voice_setup(&config, &client);
     let target = forward(events);
     let (stop, stopped) = watch::channel(false);
     tokio::spawn(async move {
@@ -431,6 +502,9 @@ async fn run(dir: &Path) -> Result<(), Failure> {
         if let (Some(control), Some(calls)) = (&control, &calls) {
             bridge = bridge.with_control(control.clone(), Arc::clone(calls));
         }
+        if let Some(voice) = &voice {
+            bridge = bridge.with_voice(voice.clone());
+        }
         let mut stopping = stopped.clone();
         let shutdown = async move {
             let _ = stopping.wait_for(|stop| *stop).await;
@@ -442,6 +516,8 @@ async fn run(dir: &Path) -> Result<(), Failure> {
         }
     };
     set_state(control.as_ref(), BridgeState::Stopping, "offline");
+    // The phone holds a handle of the client: only the last one closes it.
+    drop(voice);
     if client.close().await.is_err() {
         tracing::warn!(event = "client_close_failed");
     }
@@ -575,5 +651,40 @@ mod tests {
         assert_eq!(pause_limit(None), Duration::from_secs(750));
         assert_eq!(pause_limit(Some(30)), Duration::from_secs(180));
         assert_eq!(pause_limit(Some(u64::MAX)), Duration::MAX);
+    }
+
+    fn calls(stt: &str, tts: &str) -> CallsConfig {
+        let provider = |name: &str| match name {
+            "azure-speech" => json!({"provider": name, "region": "westeurope", "key_env": "K"}),
+            "local" => json!({"provider": name, "url": "http://127.0.0.1:8080/x"}),
+            _ => json!({"provider": name}),
+        };
+        serde_json::from_value(json!({"stt": provider(stt), "tts": provider(tts)})).unwrap()
+    }
+
+    #[test]
+    fn calls_are_advertised_only_by_a_voice_build_that_listens() {
+        let on = calls("local", "none");
+        assert!(advertises_calls(Some(&on), true));
+        assert!(!advertises_calls(Some(&on), false));
+        assert!(!advertises_calls(Some(&calls("none", "local")), true));
+        assert!(!advertises_calls(None, true));
+    }
+
+    #[test]
+    fn the_voice_line_names_the_providers_only() {
+        assert_eq!(voice_status(None, true), "off (no calls section)");
+        assert_eq!(
+            voice_status(Some(&calls("none", "azure-speech")), true),
+            "off (calls.stt is none)"
+        );
+        assert_eq!(
+            voice_status(Some(&calls("azure-speech", "local")), true),
+            "on: stt azure-speech, tts local"
+        );
+        assert_eq!(
+            voice_status(Some(&calls("local", "none")), false),
+            "configured, but this build has no voice (build with --features voice)"
+        );
     }
 }
