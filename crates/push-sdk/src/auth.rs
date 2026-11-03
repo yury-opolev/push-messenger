@@ -2,7 +2,9 @@
 //!
 //! Requests that are safe to repeat are retried up to three times on transport errors and
 //! on 502, 503 and 504, after 0.5, 1 and 2 s: registering a device (the `registration_id`
-//! makes it idempotent), reads, revocations and refreshing. auth-svc accepts a rotated
+//! makes it idempotent), reads, revocations and refreshing; of the calls API (docs/calls.md
+//! §12, §13.1), `GET /v1/calls/ice-servers` and `GET /v1/calls` (reads) and
+//! `DELETE /v1/calls/{id}` (hiding is idempotent). auth-svc accepts a rotated
 //! refresh token again only for 30 s, so a refresh attempt may take 8 s at most and no
 //! attempt starts that could end later than 25 s after the first one. Signing up, signing
 //! in and the email requests are never repeated by the SDK: they count against rate
@@ -495,6 +497,7 @@ impl AuthApi {
         #[derive(Deserialize)]
         #[serde(untagged)]
         enum Urls {
+            // The WebRTC dictionary allows a string.
             One(String),
             Many(Vec<String>),
         }
@@ -586,6 +589,8 @@ impl AuthApi {
                 direction: match entry.direction.as_str() {
                     "in" => CallDirection::Incoming,
                     "out" => CallDirection::Outgoing,
+                    // The direction set is closed, so an unknown one is a broken answer
+                    // and fails the page; outcomes may grow, so an unknown one is Failed.
                     _ => return None,
                 },
                 started_at_ms: millis(&entry.started_at)?,

@@ -154,9 +154,11 @@ impl App {
     }
 
     /// Connects and waits until the connection serves; with calls, until the call
-    /// registry knows it (its `CallSync`, after which it rings), returning that sync.
-    /// A device just registered is closed 4006 until the worker relays it: the SDK
-    /// reconnects by itself.
+    /// registry knows it (its `CallSync`), returning that sync. It may not ring yet: the
+    /// gateway writes the device's presence lease in a background task alongside the
+    /// attach, so the sync can arrive before the lease exists (see [`ring`]). A device
+    /// just registered is closed 4006 until the worker relays it: the SDK reconnects by
+    /// itself.
     async fn connect(&mut self) -> Option<(Vec<CallState>, Vec<CallId>)> {
         self.client.connect().unwrap();
         if !self.calls {
@@ -331,33 +333,57 @@ async fn befriend(a: &mut App, b: &mut App) {
     .await;
 }
 
-/// `caller` calls `callee` until it rings on `callee`'s device: a device whose
-/// connection the call engine does not know yet makes the invite end `Unreachable`.
-async fn ring(caller: &mut App, callee: &mut App) -> CallId {
-    let (caller_user, callee_user) = (caller.user, callee.user);
+/// `caller` calls the user of `callees` until it rings on every one of their devices.
+/// The gateway writes a device's presence lease in a background task alongside the call
+/// attach, so a device's `CallSync` can arrive before its lease exists: a callee with no
+/// lease yet makes the invite end `Unreachable`, and one device without it misses the
+/// ring while the others ring (the call is cancelled and placed again).
+async fn ring(caller: &mut App, callees: &mut [&mut App]) -> CallId {
+    let caller_user = caller.user;
+    let callee_user = callees[0].user;
     for _ in 0..40 {
+        let ringing_at = now_ms();
         let call = caller
             .client
             .calls()
             .invite(callee_user, OFFER)
             .await
             .unwrap();
-        let ringing_at = now_ms();
         tokio::select! {
             (reason, _) = caller.ended(call) => {
                 assert_eq!(reason, CallEndReason::Unreachable, "the invite ended {reason:?}");
-                tokio::time::sleep(Duration::from_millis(250)).await;
             }
-            incoming = callee.wait_call(
-                "the incoming call",
-                |event| matches!(event, CallEvent::Incoming { call_id, .. } if *call_id == call),
-            ) => {
-                assert_incoming(&incoming, call, caller_user, ringing_at);
-                return call;
+            rung = tokio::time::timeout(Duration::from_secs(5), incoming(callees, call)) => {
+                if let Ok(incoming) = rung {
+                    for event in &incoming {
+                        assert_incoming(event, call, caller_user, ringing_at);
+                    }
+                    return call;
+                }
+                caller.client.calls().cancel(call).await.unwrap();
+                let (reason, _) = caller.ended(call).await;
+                assert_eq!(reason, CallEndReason::Cancelled, "the retried invite ended {reason:?}");
             }
         }
+        tokio::time::sleep(Duration::from_millis(250)).await;
     }
-    panic!("the call never rang");
+    panic!("the call never rang on every device");
+}
+
+/// The `Incoming` of `call` on each of `callees`, in turn.
+async fn incoming(callees: &mut [&mut App], call: CallId) -> Vec<CallEvent> {
+    let mut events = Vec::with_capacity(callees.len());
+    for callee in callees.iter_mut() {
+        events.push(
+            callee
+                .wait_call(
+                    "the incoming call",
+                    |event| matches!(event, CallEvent::Incoming { call_id, .. } if *call_id == call),
+                )
+                .await,
+        );
+    }
+    events
 }
 
 fn assert_incoming(incoming: &CallEvent, call: CallId, caller: UserId, ringing_at: i64) {
@@ -431,7 +457,7 @@ async fn history_changed(app: &mut App, ended_at_ms: Option<i64>) {
     .await;
 }
 
-fn assert_not_available(result: Result<(), SdkError>, what: &str) {
+fn assert_not_available<T: std::fmt::Debug>(result: Result<T, SdkError>, what: &str) {
     match result {
         Err(SdkError::Server { code, .. }) if code == "not_available" => {}
         other => panic!("{what}: {other:?}"),
@@ -462,18 +488,11 @@ async fn two_sdk_clients_complete_a_call() {
     assert_eq!(servers.servers[0].username, None);
     assert_eq!(servers.servers[0].credential, None);
 
-    let ringing_at = now_ms();
-    let call = ring(&mut alice, &mut bob1).await;
-    let incoming = bob2
-        .wait_call(
-            "the incoming call",
-            |event| matches!(event, CallEvent::Incoming { call_id, .. } if *call_id == call),
-        )
-        .await;
-    assert_incoming(&incoming, call, alice.user, ringing_at);
+    let call = ring(&mut alice, &mut [&mut bob1, &mut bob2]).await;
 
     // Alice trickles while it rings: the server buffers her candidates for the answerer.
-    let alice_candidates: Vec<IceCandidate> = (1..=3).map(candidate).collect();
+    let mut alice_candidates: Vec<IceCandidate> = (1..=3).map(candidate).collect();
+    alice_candidates.push(IceCandidate::end_of_candidates());
     for candidate in &alice_candidates {
         alice
             .client
@@ -482,6 +501,13 @@ async fn two_sdk_clients_complete_a_call() {
             .await
             .unwrap();
     }
+    // The gateway handles a connection's frames one at a time, each once message-svc has
+    // answered it: when a frame for an unknown call is refused, her candidates are
+    // buffered, before Bob answers.
+    let probe = CallId::new();
+    alice.client.calls().hangup(probe, false).await.unwrap();
+    let (code, error) = alice.refused(probe).await;
+    assert_eq!(code, CallErrorCode::CallNotFound, "{error:?}");
 
     answer(&mut alice, &mut bob1, call).await;
     bob2.wait_call(
@@ -536,14 +562,6 @@ async fn two_sdk_clients_complete_a_call() {
             app.name
         );
     }
-    let bob2_events = bob2.call_events_within(Duration::ZERO).await;
-    assert!(
-        !bob2_events
-            .iter()
-            .any(|event| matches!(event, CallEvent::Ended { call_id, .. } if *call_id == call)),
-        "the call was taken from Bob's second device: {bob2_events:?}"
-    );
-
     let outgoing = alice.history_entry(call).await;
     let incoming = bob1.history_entry(call).await;
     for (entry, direction, peer) in [
@@ -565,6 +583,13 @@ async fn two_sdk_clients_complete_a_call() {
     assert!(!bob2.lists(call).await, "hidden on all Bob's devices");
     assert!(alice.lists(call).await, "Alice still sees it");
     history_changed(&mut bob2, None).await;
+    let bob2_events = bob2.call_events_within(Duration::from_secs(1)).await;
+    assert!(
+        !bob2_events
+            .iter()
+            .any(|event| matches!(event, CallEvent::Ended { call_id, .. } if *call_id == call)),
+        "the call was taken from Bob's second device: {bob2_events:?}"
+    );
 
     for app in [alice, bob1, bob2] {
         app.close().await;
@@ -596,19 +621,19 @@ async fn declined_cancelled_busy_and_unreachable_calls_end_as_such() {
         (false, CallEndReason::Declined),
         (true, CallEndReason::Busy),
     ] {
-        let call = ring(&mut alice, &mut bob).await;
+        let call = ring(&mut alice, &mut [&mut bob]).await;
         bob.client.calls().decline(call, busy).await.unwrap();
         assert_eq!(alice.ended(call).await, (expected, None));
         assert_eq!(bob.ended(call).await, (expected, None));
     }
 
-    let call = ring(&mut alice, &mut bob).await;
+    let call = ring(&mut alice, &mut [&mut bob]).await;
     alice.client.calls().cancel(call).await.unwrap();
     assert_eq!(alice.ended(call).await, (CallEndReason::Cancelled, None));
     assert_eq!(bob.ended(call).await, (CallEndReason::Cancelled, None));
 
     // Alice, ringing Bob, cannot call anyone else.
-    let call = ring(&mut alice, &mut bob).await;
+    let call = ring(&mut alice, &mut [&mut bob]).await;
     let second = alice
         .client
         .calls()
@@ -646,10 +671,7 @@ async fn declined_cancelled_busy_and_unreachable_calls_end_as_such() {
     // Without calls advertised, the API is there but unavailable.
     let calls = dave.client.calls();
     assert!(!calls.available());
-    match calls.invite(alice.user, OFFER).await {
-        Err(SdkError::Server { code, .. }) if code == "not_available" => {}
-        other => panic!("invite: {other:?}"),
-    }
+    assert_not_available(calls.invite(alice.user, OFFER).await, "invite");
     assert_not_available(calls.accept(call, ANSWER).await, "accept");
     assert_not_available(calls.decline(call, false).await, "decline");
     assert_not_available(calls.cancel(call).await, "cancel");
@@ -684,7 +706,7 @@ async fn call_sync_after_a_reconnect_lists_the_active_call() {
     let mut bob = App::start(&stack, &dir, "bob", &credentials[1], true).await;
     befriend(&mut alice, &mut bob).await;
 
-    let call = ring(&mut alice, &mut bob).await;
+    let call = ring(&mut alice, &mut [&mut bob]).await;
     answer(&mut alice, &mut bob, call).await;
 
     bob.client.disconnect().unwrap();

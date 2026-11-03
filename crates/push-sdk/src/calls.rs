@@ -474,3 +474,23 @@ impl std::fmt::Debug for CallEvent {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_end_reason_reads_back_from_its_name() {
+        for reason in [
+            CallEndReason::Completed,
+            CallEndReason::Missed,
+            CallEndReason::Declined,
+            CallEndReason::Cancelled,
+            CallEndReason::Busy,
+            CallEndReason::Failed,
+            CallEndReason::Unreachable,
+        ] {
+            assert_eq!(CallEndReason::from_name(reason.as_str()), reason);
+        }
+    }
+}
