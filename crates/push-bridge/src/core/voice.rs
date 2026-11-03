@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use push_sdk::{CallEvent, CallId, SdkError, UserId};
 use serde_json::{Map, json};
+use tokio::time::Instant;
 
 use super::{Core, Internal, OpenRequest};
 use crate::backend::Answer;
@@ -51,10 +52,11 @@ impl ActiveCall {
         }
     }
 
-    /// The reply is spoken again; after a barge-in, from a new sentence.
+    /// The reply is spoken again; after a barge-in, from a new sentence (an open code
+    /// block or table stays silent).
     fn unmute(&mut self) {
         if self.session.unmute() {
-            self.speech = SpeechText::new();
+            self.speech.interrupt();
         }
     }
 }
@@ -197,8 +199,8 @@ impl<M: Messenger> Core<M> {
             SessionEvent::Listening(listening) => call.listening = listening,
             SessionEvent::Speaking(speaking) => call.speaking = speaking,
             // The session logs the barge-in and mutes the reply.
-            SessionEvent::BargedIn => call.speech = SpeechText::new(),
-            SessionEvent::Transcript(text) => self.on_transcript(text).await,
+            SessionEvent::BargedIn => call.speech.interrupt(),
+            SessionEvent::Transcript { text, started } => self.on_transcript(text, started).await,
             SessionEvent::SpeechFailed(_) => call.session.say(NOT_UNDERSTOOD),
             SessionEvent::Ended(end) => {
                 self.call = None;
@@ -228,13 +230,14 @@ impl<M: Messenger> Core<M> {
         }
     }
 
-    /// The owner said `text`: it is posted as a transcript, then answers the oldest open
-    /// card, else goes to the agent (a prompt, or a steer while a turn runs; never a
-    /// command).
-    async fn on_transcript(&mut self, text: String) {
+    /// The owner said `text`, beginning at `started`: it is posted as a transcript, then
+    /// answers the oldest open card, else goes to the agent (a prompt, or a steer while a
+    /// turn runs; never a command). An utterance begun before the card was posted was not
+    /// meant for it: it goes to the agent and the card stays open.
+    async fn on_transcript(&mut self, text: String, started: Instant) {
         tracing::info!(event = "voice_transcript", chars = text.chars().count());
         self.post_transcript(&text);
-        if let Some(request) = self.open.first() {
+        if let Some(request) = self.open.first().filter(|request| started > request.opened) {
             match confirm::match_answer(&request.kind, &text) {
                 VoiceAnswer::Answer {
                     answer,
@@ -249,8 +252,7 @@ impl<M: Messenger> Core<M> {
             return;
         }
         if let Some(call) = &mut self.call {
-            call.session.unmute();
-            call.speech = SpeechText::new();
+            call.unmute();
         }
         self.send_to_agent(text).await;
     }
@@ -351,6 +353,7 @@ impl<M: Messenger> Core<M> {
     /// Speaks a background message: "<label>." then its text.
     pub(super) fn speak_agent_message(&self, label: &str, text: &str) {
         if let Some(call) = self.call.as_ref().filter(|call| call.connected) {
+            let label = speech::hide_secrets(label);
             call.session
                 .say_reply(format!("{}.", label.trim_end_matches('.')));
             call.say_reply(speech::sentences(text));

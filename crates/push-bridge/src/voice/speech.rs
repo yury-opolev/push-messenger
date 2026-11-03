@@ -9,16 +9,25 @@
 //! row is never said (and a line that is not one is said as usual). A paragraph's text is
 //! cut into sentences after `.`, `!`, `?` or `…` and whitespace (not after abbreviations
 //! such as "e.g."), and sentences over 300 characters at a comma or space.
+//!
+//! Each complete line is masked ([`crate::mask::mask`]) before it is read, so a secret
+//! is never cut across sentences and code spans are masked too; a masked secret is said
+//! as [`HIDDEN`]. [`SpeechText::interrupt`] drops what was not said yet but keeps an open
+//! code fence or table open.
 
 use std::mem;
 use std::sync::LazyLock;
 
 use regex::Regex;
 
+use crate::mask;
+
 /// Said instead of a code block.
 pub const CODE_NOTE: &str = "I've put the code in the chat.";
 /// Said instead of a table.
 pub const TABLE_NOTE: &str = "I've put a table in the chat.";
+/// Said instead of a masked secret.
+pub const HIDDEN: &str = "hidden";
 
 /// Characters of the longest sentence.
 const MAX_SENTENCE: usize = 300;
@@ -64,6 +73,8 @@ pub struct SpeechText {
     held: Option<String>,
     /// The note said last, with nothing said since.
     last_note: Option<&'static str>,
+    /// The line still arriving began before an interrupt: it is read, not said.
+    skip_line: bool,
     out: Vec<String>,
 }
 
@@ -78,17 +89,28 @@ impl SpeechText {
         self.line.push_str(delta);
         while let Some(at) = self.line.find('\n') {
             let line: String = self.line.drain(..=at).collect();
-            self.read_line(line.trim_end_matches(['\n', '\r']));
+            self.complete_line(line.trim_end_matches(['\n', '\r']));
         }
         self.complete();
         mem::take(&mut self.out)
+    }
+
+    /// The owner spoke: what was not said yet is dropped (the paragraph so far, a held
+    /// line, and the line still arriving, which is read when it completes but not said),
+    /// while an open code fence or table stays open.
+    pub fn interrupt(&mut self) {
+        self.paragraph.clear();
+        self.held = None;
+        self.last_note = None;
+        self.out.clear();
+        self.skip_line = !self.line.is_empty();
     }
 
     /// The rest, at the end of the reply.
     pub fn finish(&mut self) -> Vec<String> {
         let line = mem::take(&mut self.line);
         if !line.is_empty() {
-            self.read_line(line.trim_end_matches('\r'));
+            self.complete_line(line.trim_end_matches('\r'));
         }
         if let Some(held) = self.held.take() {
             self.read(&held, false);
@@ -97,6 +119,23 @@ impl SpeechText {
         let out = mem::take(&mut self.out);
         *self = Self::default();
         out
+    }
+
+    /// Reads a complete line, its secrets masked; after an interrupt, the line that was
+    /// arriving only moves the fence and table state.
+    fn complete_line(&mut self, raw: &str) {
+        let line = hide_secrets(raw);
+        if !mem::take(&mut self.skip_line) {
+            self.read_line(&line);
+            return;
+        }
+        let said = self.out.len();
+        let last_note = self.last_note;
+        self.read_line(&line);
+        self.out.truncate(said);
+        self.last_note = last_note;
+        self.paragraph.clear();
+        self.held = None;
     }
 
     fn read_line(&mut self, raw: &str) {
@@ -228,6 +267,11 @@ pub fn sentences(markdown: &str) -> Vec<String> {
     out
 }
 
+/// `text` with its secrets masked ([`mask::mask`]), each said as [`HIDDEN`].
+pub fn hide_secrets(text: &str) -> String {
+    mask::mask(text).replace(mask::MASK, HIDDEN)
+}
+
 /// The fence character and length a (trimmed) line starts with: three or more backticks
 /// (with no backtick after them) or tildes.
 fn fence_of(line: &str) -> Option<(char, usize)> {
@@ -287,7 +331,8 @@ fn code_spans(text: &str) -> String {
                 rest = &body[close + ticks..];
             }
             None => {
-                out.push_str(&after[..ticks]);
+                // A run without its closing run (a secret's mask can take the closing
+                // backtick) is not said.
                 rest = body;
             }
         }
@@ -607,6 +652,73 @@ Bob | 3\nAmy | 4\n\nUse a | b to pipe.\nDone… Shall I go on?";
         assert!(out[0].ends_with(','));
         let unbroken = "x".repeat(700);
         assert!(all(&unbroken).iter().all(|s| s.chars().count() <= 300));
+    }
+
+    #[test]
+    fn secrets_are_masked_before_they_are_spoken() {
+        let token = "ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8";
+        let reply = format!(
+            "I set api_key=sk-abc123def456 for you. Then `{token}` works.\n\
+             Also `TOKEN={token}` too.\n```\nkey={token}\n```\nDone."
+        );
+        let expected = [
+            "I set api_key=hidden for you.",
+            "Then hidden works.",
+            "Also TOKEN=hidden too.",
+            CODE_NOTE,
+            "Done.",
+        ];
+        assert_eq!(all(&reply), expected);
+        let mut text = SpeechText::new();
+        let mut out = Vec::new();
+        for c in reply.chars() {
+            out.extend(text.push(&c.to_string()));
+        }
+        out.extend(text.finish());
+        assert_eq!(out, expected);
+        assert_eq!(
+            hide_secrets("Deploy with password=hunter2"),
+            "Deploy with password=hidden"
+        );
+    }
+
+    #[test]
+    fn an_interrupt_keeps_an_open_fence_and_drops_what_was_pending() {
+        let mut text = SpeechText::new();
+        assert_eq!(
+            text.push("Here:\n```\nlet a = 1;\nlet b"),
+            ["Here:", CODE_NOTE]
+        );
+        text.interrupt();
+        assert_eq!(
+            text.push(" = 2;\nlet c = 3;\n```\nAfter the code.\nAnd"),
+            ["After the code."]
+        );
+        assert_eq!(text.finish(), ["And"]);
+
+        let mut text = SpeechText::new();
+        assert_eq!(text.push("One.\nTwo. Thr"), ["One."]);
+        text.interrupt();
+        assert_eq!(
+            text.push("ee.\nFive.\nSix"),
+            ["Five."],
+            "the rest of the line is dropped"
+        );
+
+        let mut text = SpeechText::new();
+        assert!(text.push("Look:\n``").is_empty());
+        text.interrupt();
+        assert!(text.push("`\nlet code = 1;\n```\n").is_empty());
+        assert_eq!(text.push("After.\n"), ["After."]);
+
+        let mut text = SpeechText::new();
+        assert_eq!(
+            text.push("Results:\n|a|b|\n|-|-|\n|1|2|\n"),
+            ["Results:", TABLE_NOTE]
+        );
+        text.interrupt();
+        assert!(text.push("|3|4|\n").is_empty());
+        assert_eq!(text.push("That is all.\n"), ["That is all."]);
     }
 
     #[test]

@@ -291,6 +291,8 @@ struct OpenRequest {
     /// The card; `None` for a question shown as text only.
     card: Option<ClientMsgId>,
     deadline: Instant,
+    /// When the card was posted: only an utterance begun after it answers it.
+    opened: Instant,
     waiting_label: &'static str,
     /// The card's title as shown (a voice answer keeps it).
     title: String,

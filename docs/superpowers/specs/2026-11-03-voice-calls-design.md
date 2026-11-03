@@ -835,7 +835,11 @@ Decisions taken while implementing §9, beyond or refining it:
   with exactly one side heard, a negation never approving and a question asked again;
   options by cardinal ("option two", a bare "two"), ordinal ("the second one") or label;
   several for a multi-select; free text when allowed. Unclear → a fixed "Sorry, …"
-  sentence and the card stays open. Only the oldest open card is spoken and answered.
+  sentence and the card stays open. Only the oldest open card is spoken and answered, and
+  only by an utterance whose onset (the VAD's `SpeechStarted`, carried in
+  `SessionEvent::Transcript { text, started }`) came after the card was posted
+  (`OpenRequest::opened`); an utterance begun earlier is a prompt or steer and the card
+  stays open.
 - **Providers.** REST only, no new crates (reqwest with rustls): Azure AI Speech
   short-audio STT and TTS (`raw-16khz-16bit-mono-pcm`, SSML with `voice`, default
   `en-US-JennyNeural`); a key from an environment variable (`key_env`, default
@@ -858,13 +862,18 @@ Decisions taken while implementing §9, beyond or refining it:
   items as sentences of their own, links → their text, bare URLs → "a link", code spans
   unwrapped, emphasis/quotes/rules/HTML removed; sentences split after `.`/`!`/`?`/`…`
   except common abbreviations, at most 300 characters. Background messages are spoken as
-  "<label>." and their text.
+  "<label>." and their text. Each complete line (and a background message's label) is
+  masked (`mask::mask`) before it is read, so a secret never reaches the TTS provider nor
+  splits across sentences; the mask is said as "hidden".
 - **Barge-in and the session mute.** An onset while the agent speaks bumps a generation:
   the queued sentences and the sink's queued audio are dropped (`clear()`), and the session
   mutes the reply itself (`say_reply` drops sentences until the core unmutes it on the
   next transcript, voice answer or turn start), so reply text the core handles before the
   `BargedIn` event is not spoken either. The bridge's own sentences (greeting, card
-  questions, confirmations) are never muted.
+  questions, confirmations) are never muted. A barge-in (and the unmute after one)
+  interrupts the speech text (`SpeechText::interrupt`): the pending paragraph, a held line
+  and the rest of the arriving line are dropped, but an open fence or table stays open. A
+  transcript without a barge-in changes nothing in the speech text.
 - **Activity.** A card open or a pause keeps its label; otherwise during a call, working
   with "speaking" > "listening" > "thinking" (a turn runs) > "on a call". The greeting is
   "Connected to <name> in <folder>." (with a period), followed by the oldest open card.

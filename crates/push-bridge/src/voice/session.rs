@@ -12,8 +12,9 @@
 //!   until [`Session::unmute`], so the rest of the interrupted reply is not spoken even
 //!   when the core handles reply text before it handles the `BargedIn` event.
 //! - The STT worker transcribes one utterance at a time, in order: a non-empty text is a
-//!   [`SessionEvent::Transcript`], a failure a [`SessionEvent::SpeechFailed`] with the
-//!   provider's content-free code.
+//!   [`SessionEvent::Transcript`] (stamped with when the detector heard the utterance's
+//!   speech start), a failure a [`SessionEvent::SpeechFailed`] with the provider's
+//!   content-free code.
 //! - The speaker worker synthesizes the queued sentences one by one and queues their
 //!   frames on the line's speaker, which plays them in real time (and may queue seconds
 //!   ahead): it keeps when the queued audio will have played and reports
@@ -46,8 +47,9 @@ pub enum SessionEvent {
     Listening(bool),
     /// The owner spoke over the agent: its speech was cut.
     BargedIn,
-    /// An utterance's text (never empty).
-    Transcript(String),
+    /// An utterance's text (never empty), and when the detector heard its speech start
+    /// (its onset, not its pre-roll).
+    Transcript { text: String, started: Instant },
     /// The STT provider failed on an utterance (content-free code).
     SpeechFailed(String),
     /// The agent started (true) or stopped (false) speaking.
@@ -327,11 +329,13 @@ async fn listen(
     shared: Arc<Shared>,
     mut incoming: mpsc::Receiver<Frame>,
     mut vad: Vad,
-    utterances: mpsc::UnboundedSender<Vec<i16>>,
+    utterances: mpsc::UnboundedSender<(Vec<i16>, Instant)>,
 ) {
+    let mut started = Instant::now();
     while let Some(frame) = incoming.recv().await {
         match vad.push(&frame) {
             Some(VadEvent::SpeechStarted) => {
+                started = Instant::now();
                 if shared.stop_speaking(true) {
                     tracing::info!(event = "voice_barge_in");
                 }
@@ -339,7 +343,7 @@ async fn listen(
             }
             Some(VadEvent::Utterance(samples)) => {
                 shared.emit(SessionEvent::Listening(false));
-                if utterances.send(samples).is_err() {
+                if utterances.send((samples, started)).is_err() {
                     return;
                 }
             }
@@ -353,16 +357,19 @@ async fn listen(
 async fn transcribe(
     shared: Arc<Shared>,
     stt: Arc<dyn Stt>,
-    mut utterances: mpsc::UnboundedReceiver<Vec<i16>>,
+    mut utterances: mpsc::UnboundedReceiver<(Vec<i16>, Instant)>,
 ) {
-    while let Some(samples) = utterances.recv().await {
+    while let Some((samples, started)) = utterances.recv().await {
         let ms = samples.len() as u64 * 1000 / u64::from(SAMPLE_RATE);
         tracing::info!(event = "voice_utterance", ms);
         match stt.transcribe(&samples).await {
             Ok(text) => {
                 let text = text.trim();
                 if !text.is_empty() {
-                    shared.emit(SessionEvent::Transcript(text.to_owned()));
+                    shared.emit(SessionEvent::Transcript {
+                        text: text.to_owned(),
+                        started,
+                    });
                 }
             }
             Err(error) => {
@@ -536,7 +543,7 @@ mod tests {
             loop {
                 match tokio::time::timeout_at(deadline, self.events.recv()).await {
                     Ok(Some(event)) => {
-                        let found = event == *wanted;
+                        let found = same(&event, wanted);
                         seen.push(event);
                         if found {
                             return seen;
@@ -559,6 +566,25 @@ mod tests {
         }
     }
 
+    /// A transcript of `text`; [`same`] does not compare its onset.
+    fn transcript(text: &str) -> SessionEvent {
+        SessionEvent::Transcript {
+            text: text.into(),
+            started: Instant::now(),
+        }
+    }
+
+    /// Whether `event` is `wanted`, but for a transcript's onset.
+    fn same(event: &SessionEvent, wanted: &SessionEvent) -> bool {
+        match (event, wanted) {
+            (
+                SessionEvent::Transcript { text, .. },
+                SessionEvent::Transcript { text: wanted, .. },
+            ) => text == wanted,
+            _ => event == wanted,
+        }
+    }
+
     fn words(count: usize) -> String {
         vec!["word"; count].join(" ")
     }
@@ -573,18 +599,25 @@ mod tests {
     #[tokio::test]
     async fn an_utterance_becomes_a_transcript() {
         let mut call = call().await;
-        call.owner.say(&utterance(900.0)).await;
-        let seen = call
-            .until(&SessionEvent::Transcript("approve".into()))
-            .await;
+        let before = Instant::now();
+        call.owner.say_paced(&utterance(900.0)).await;
+        let said = Instant::now();
+        let seen = call.until(&transcript("approve")).await;
         assert_eq!(
-            seen,
-            vec![
+            seen[..2],
+            [
                 SessionEvent::Listening(true),
-                SessionEvent::Listening(false),
-                SessionEvent::Transcript("approve".into()),
+                SessionEvent::Listening(false)
             ]
         );
+        assert_eq!(seen.len(), 3);
+        let SessionEvent::Transcript { text, started } = &seen[2] else {
+            panic!("{seen:?}");
+        };
+        assert_eq!(text, "approve");
+        // The onset: after the 200 ms of silence, long before the utterance ended.
+        assert!(*started >= before + Duration::from_millis(200), "{seen:?}");
+        assert!(*started + Duration::from_millis(500) < said, "{seen:?}");
         assert!(!call.session.speaking());
     }
 
@@ -636,7 +669,7 @@ mod tests {
         assert!(!call.session.speaking());
         let heard = call.owner.heard().len();
         assert!(heard < 1500 * SAMPLES_PER_MS, "heard {heard} samples");
-        let seen = call.until(&SessionEvent::Transcript("hello".into())).await;
+        let seen = call.until(&transcript("hello")).await;
         assert!(!seen.contains(&SessionEvent::Speaking(true)), "{seen:?}");
         speaking.await.unwrap();
         assert_eq!(
@@ -665,7 +698,7 @@ mod tests {
         call.until(&SessionEvent::Speaking(true)).await;
         call.owner.say(&utterance(450.0)).await;
         call.until(&SessionEvent::BargedIn).await;
-        call.until(&SessionEvent::Transcript("hello".into())).await;
+        call.until(&transcript("hello")).await;
         // The core has not handled `BargedIn` yet: the reply's next sentence is dropped.
         call.session.say_reply("the rest of the reply");
         assert!(!call.session.speaking());
@@ -878,7 +911,7 @@ mod tests {
         assert!(call.during(Duration::from_millis(300)).await.is_empty());
         assert!(call.owner.heard().is_empty());
         call.owner.say(&utterance(450.0)).await;
-        call.until(&SessionEvent::Transcript("hello".into())).await;
+        call.until(&transcript("hello")).await;
     }
 
     struct FailingStt;
@@ -904,7 +937,7 @@ mod tests {
         assert!(
             !seen
                 .iter()
-                .any(|e| matches!(e, SessionEvent::Transcript(_)))
+                .any(|e| matches!(e, SessionEvent::Transcript { .. }))
         );
     }
 

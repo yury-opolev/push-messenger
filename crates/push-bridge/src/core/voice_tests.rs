@@ -9,7 +9,7 @@ use std::time::Duration;
 use push_sdk::{ActivityState, CallEndReason, CallEvent, CallId, Event, UserId};
 
 use super::tests::{Harness, peeked, permission, settle};
-use crate::backend::{Answer, RequestKind, TurnSource};
+use crate::backend::{Answer, BackendEvent, RequestKind, TurnSource};
 use crate::messenger::{param, template};
 use crate::voice::VoiceSetup;
 use crate::voice::confirm::APPROVE_OR_REJECT;
@@ -564,6 +564,77 @@ async fn a_transcript_is_masked_and_peeked_as_the_owner_s_text() {
     let peek = peeked(&v.h).pop().unwrap();
     assert!(peek.text.starts_with("🎤 my token="), "{peek:?}");
     assert!(!peek.text.contains("abc123def"), "{peek:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn spoken_replies_and_background_messages_are_masked() {
+    let v = Voice::new().await;
+    let _call = v.call().await;
+    let token = "ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8";
+    v.h.backend.turn_started(TurnSource::Prompt);
+    v.h.backend.text(&format!(
+        "I set api_key=sk-abc123def456 for you. Run `{token}` next.\n"
+    ));
+    v.h.backend.turn_ended(false);
+    v.until_said("Run hidden next.").await;
+    v.h.backend.emit(BackendEvent::AgentMessage {
+        cursor: 1,
+        label: "Deploy with password=hunter2xyz".into(),
+        text: format!("The key is `token: {token}` now."),
+    });
+    v.until_said("The key is token: hidden now.").await;
+    let spoken = v.tts.spoken();
+    assert!(spoken.contains(&"I set api_key=hidden for you.".to_owned()));
+    assert!(spoken.contains(&"Deploy with password=hidden.".to_owned()));
+    for secret in ["sk-abc123def456", token, "hunter2xyz"] {
+        assert!(
+            !spoken.iter().any(|said| said.contains(secret)),
+            "{spoken:?}"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_owner_speaking_during_a_code_block_keeps_the_code_silent() {
+    let v = Voice::new().await;
+    let call = v.call().await;
+    v.h.backend.turn_started(TurnSource::Prompt);
+    v.h.backend.text("Here is the fix:\n```\nlet first = 1;\n");
+    v.until_said(CODE_NOTE).await;
+    quiet().await;
+    call.say(&fixture("prompt").audio()).await;
+    v.h.backend.wait_for("steer run the tests", 1).await;
+    v.h.backend.text("let second = 2;\n```\nThat is all.\n");
+    v.h.backend.turn_ended(false);
+    v.until_said("That is all.").await;
+    let spoken = v.tts.spoken();
+    assert!(
+        !spoken.iter().any(|said| said.contains("second")),
+        "{spoken:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_utterance_begun_before_a_card_opened_does_not_answer_it() {
+    // The STT takes 2 s: the card opens while the utterance is transcribed.
+    let v = Voice::with_stt(Some(stt().with_delay(Duration::from_secs(2)))).await;
+    let call = v.call().await;
+    let approve = fixture("approve").audio();
+    call.say(&approve).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut answer = v.h.backend.request(permission());
+    let card = v.card("agent.approval@1").await;
+    v.h.backend.wait_for("prompt approve", 1).await;
+    v.until_said("Coda wants to use Bash. Approve or reject?")
+        .await;
+    quiet().await;
+    assert!(answer.try_recv().is_err(), "still open");
+    assert!(v.edits_of(card).is_empty());
+
+    call.say(&approve).await;
+    assert_eq!(answer.await, Ok(Answer::Permission(true)));
+    v.until_said("Approved.").await;
+    assert_eq!(v.h.count("prompt"), 1);
 }
 
 #[tokio::test(start_paused = true)]

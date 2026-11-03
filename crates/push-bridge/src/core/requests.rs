@@ -79,6 +79,7 @@ impl<M: Messenger> Core<M> {
             responder,
             card,
             deadline: Instant::now() + CARD_TIMEOUT,
+            opened: Instant::now(),
             waiting_label: plan.waiting_label,
             title: plan.title,
             spoken: plan.spoken,

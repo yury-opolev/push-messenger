@@ -1678,7 +1678,10 @@ says "Sorry, I couldn't make that out." Each transcript is then:
    [`agent.transcript@1`](rich-messages.md#agenttranscript1) card (`speaker: owner`, the
    text masked and cut at 4,000 characters; fallback "🎤 voice: <text>"; heading "🎤
    voice"), and kept in the [chat peek](#chat-peek) as the owner's text "🎤 <text>";
-2. with a card open, an answer to the oldest one ([voice answers](#voice-answers-to-cards));
+2. with a card open, an answer to the oldest one ([voice answers](#voice-answers-to-cards)),
+   but only when the utterance began (its onset) after that card was posted: words begun
+   before the card existed were not meant for it ("yes, go ahead" said as a steer never
+   approves a permission card that opened while it was transcribed);
 3. otherwise sent to the agent as typed text is ([the owner's text](#6-behaviour), steps
    3 and 4): a prompt when the agent is idle, a steer while a turn runs (or waiting for it
    to end), held while Coda is paused. A transcript is **never a `/` command**, whatever it
@@ -1695,13 +1698,16 @@ end. The Markdown becomes plain sentences:
 | a heading, a list item (also a task list item) | a sentence of its own, ending with a period if it has none |
 | a link, an image | its text |
 | a bare URL, an autolink | "a link" |
-| a code span | its content |
+| a code span | its content (a stray backtick is not said) |
 | emphasis, strikethrough, quote markers, rules, HTML tags, backslash escapes | removed (`snake_case` and `2*3` stay) |
 
 Sentences end after `.`, `!`, `?` or `…` and a space, but not after abbreviations such as
 "e.g.", "i.e.", "etc.", "Dr."; a sentence over 300 characters is cut at a comma or space.
-Background messages (`notify_user`) are spoken too: "<label>." then their text. The
-sentences are synthesized one by one and played in real time; a sentence the provider
+Background messages (`notify_user`) are spoken too: "<label>." then their text. What is
+spoken is [masked](#9-security-model) like what is posted, before it reaches the text-to-speech
+provider: each complete line (and a background message's label) is masked before it is
+read, so a secret is never split across sentences and code spans are masked too; a
+masked secret is said as "hidden" ("api_key=hidden"). The sentences are synthesized one by one and played in real time; a sentence the provider
 fails on is skipped (`tts_failed`).
 
 **Barge-in.** When the owner starts speaking (an utterance's 60 ms onset) while the agent's
@@ -1709,7 +1715,10 @@ voice is queued or playing, the agent stops at once: the sentences waiting and t
 already queued are dropped, and the rest of that reply is not spoken. The turn itself goes
 on. When the owner's utterance ends it is transcribed and steered into the running turn
 (or prompts, if the turn ended); from then on the reply is spoken again, from its next
-sentence. Speech while the agent is silent is simply an utterance.
+sentence (the rest of the line that was arriving is skipped too). A code block or table
+that was open stays one: its remaining lines stay silent and what follows its end is
+spoken. Speech while the agent is silent is simply an utterance and changes nothing in how
+the reply is spoken (a code block streaming silently stays silent).
 
 **Activity** during a call, when no card is open and Coda is not paused (cards and a pause
 keep their labels, [activity](#6-behaviour)):
@@ -1725,7 +1734,9 @@ keep their labels, [activity](#6-behaviour)):
 
 When a card opens during a call (and it is the only open one), the reply so far is spoken,
 then its question; at the greeting and after each voice answer, the oldest open card's
-question is spoken. A spoken transcript answers the **oldest** open card.
+question is spoken. A spoken transcript answers the **oldest** open card, if the utterance
+began after that card was posted; an utterance begun earlier goes to the agent (a prompt
+or steer) and the card stays open, its question spoken as usual.
 
 | Card | Said |
 |---|---|
