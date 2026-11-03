@@ -64,13 +64,18 @@ impl Calls {
         }
         self.usable()?;
         let call = CallId::new();
-        self.send(Body::CallInvite(v1::CallInvite {
+        // Recorded first: the answer may arrive before this returns.
+        self.client.inner.shared.call_invited(call);
+        let sent = self.send(Body::CallInvite(v1::CallInvite {
             call_id: bytes(call.0),
             callee_user_id: bytes(peer.0),
             offer_sdp: offer_sdp.to_owned(),
             media: vec![v1::CallMedia::Audio.into()],
-        }))?;
-        self.client.inner.shared.call_invited(call);
+        }));
+        if let Err(error) = sent {
+            self.client.inner.shared.call_unsent(call);
+            return Err(error);
+        }
         Ok(call)
     }
 
@@ -81,12 +86,16 @@ impl Calls {
     pub async fn accept(&self, call: CallId, answer_sdp: &str) -> Result<(), SdkError> {
         checked_sdp(answer_sdp)?;
         self.usable()?;
-        self.send(Body::CallAccept(v1::CallAccept {
+        // Recorded first: the call may end before this returns.
+        let new = self.client.inner.shared.call_live(call);
+        let sent = self.send(Body::CallAccept(v1::CallAccept {
             call_id: bytes(call.0),
             answer_sdp: answer_sdp.to_owned(),
-        }))?;
-        self.client.inner.shared.call_live(call);
-        Ok(())
+        }));
+        if sent.is_err() && new {
+            self.client.inner.shared.call_unsent(call);
+        }
+        sent
     }
 
     /// Refuses a ringing call: declined, or busy when `busy` (the user is in a call
@@ -332,9 +341,14 @@ mod tests {
         // The 4002 refresh stalls: the state stays Connected meanwhile.
         f.auth.refresh_delay_ms.store(10_000, Ordering::SeqCst);
         close(&mut socket, 4002).await;
-        while f.auth.refreshes.load(Ordering::SeqCst) == 0 {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        let refreshed = async {
+            while f.auth.refreshes.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), refreshed)
+            .await
+            .expect("a refresh within 10 s");
         assert_eq!(f.client.connection_state(), ConnectionState::Connected);
         let calls = f.client.calls();
         assert!(!calls.available());
@@ -578,30 +592,25 @@ mod tests {
         }
         assert_eq!(sent, expected);
 
-        // The calls invited and accepted here are live: a CallSync without them says so.
-        send(
-            &mut socket,
-            Body::CallSync(v1::CallSync { calls: Vec::new() }),
-        )
-        .await;
+        // The calls invited and accepted here are live. The connection's first CallSync
+        // went out before the gateway read them, so it cannot list them; a later one
+        // without them says they are gone.
+        assert_eq!(
+            synced_after_an_empty_sync(&mut f, &mut socket).await,
+            CallEvent::Synced {
+                calls: Vec::new(),
+                gone: Vec::new(),
+            }
+        );
         let mut gone = vec![invited, call];
         gone.sort();
-        loop {
-            let event = tokio::time::timeout(Duration::from_secs(10), f.events.next())
-                .await
-                .expect("an event within 10 s")
-                .expect("the event stream is open");
-            if let Event::Call(synced) = event {
-                assert_eq!(
-                    synced,
-                    CallEvent::Synced {
-                        calls: Vec::new(),
-                        gone,
-                    }
-                );
-                break;
+        assert_eq!(
+            synced_after_an_empty_sync(&mut f, &mut socket).await,
+            CallEvent::Synced {
+                calls: Vec::new(),
+                gone,
             }
-        }
+        );
     }
 
     #[test]

@@ -310,8 +310,9 @@ pub enum CallEvent {
         error: SdkError,
     },
     /// The user's calls, after every (re)connect. `gone` are the calls this client knew
-    /// as live that are not listed: drop them. Restart ICE for the listed calls whose
-    /// [`CallState::needs_ice_restart`].
+    /// as live that are not listed: drop them (a call invited or accepted on this
+    /// connection before the list arrived is not one of them: the list predates it).
+    /// Restart ICE for the listed calls whose [`CallState::needs_ice_restart`].
     Synced {
         calls: Vec<CallState>,
         gone: Vec<CallId>,

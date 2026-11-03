@@ -57,6 +57,12 @@ struct LiveCalls {
     /// The live calls this client invited to that were neither answered nor ended yet:
     /// a refusal of one means the server never had the call.
     unanswered: BTreeSet<CallId>,
+    /// The serving connection has not had its `CallSync` yet.
+    awaiting_sync: bool,
+    /// The calls this client invited to or accepted on the serving connection before
+    /// its first `CallSync`: the gateway lists the calls before it reads any frame of
+    /// the connection, so that sync cannot name them.
+    unsynced: BTreeSet<CallId>,
 }
 
 /// The sending end of the event queue.
@@ -102,6 +108,9 @@ impl Shared {
             Some(false) => SERVING,
             Some(true) => SERVING_CALLS,
         };
+        let mut calls = self.live_calls();
+        calls.awaiting_sync = offered.is_some();
+        calls.unsynced.clear();
         self.calls_offered.store(value, Ordering::SeqCst);
     }
 
@@ -118,16 +127,36 @@ impl Shared {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// A call this client accepted or heard of is live.
-    pub fn call_live(&self, call: CallId) {
-        self.live_calls().live.insert(call);
+    /// A call this client accepted is live. Whether it was not known as live before.
+    pub fn call_live(&self, call: CallId) -> bool {
+        let mut calls = self.live_calls();
+        if calls.awaiting_sync {
+            calls.unsynced.insert(call);
+        }
+        calls.live.insert(call)
     }
 
     /// A call this client invited to is live, until the server refuses the invite.
     pub fn call_invited(&self, call: CallId) {
         let mut calls = self.live_calls();
+        if calls.awaiting_sync {
+            calls.unsynced.insert(call);
+        }
         calls.live.insert(call);
         calls.unanswered.insert(call);
+    }
+
+    /// The frame that made `call` live was not sent after all.
+    pub fn call_unsent(&self, call: CallId) {
+        let mut calls = self.live_calls();
+        calls.unsynced.remove(&call);
+        calls.live.remove(&call);
+        calls.unanswered.remove(&call);
+    }
+
+    /// A call this client heard of is live.
+    fn call_heard(&self, call: CallId) {
+        self.live_calls().live.insert(call);
     }
 
     /// The call was answered: it exists for the server.
@@ -143,22 +172,39 @@ impl Shared {
         calls.unanswered.remove(&call);
     }
 
-    /// The server refused a frame of `call`: an invite it refused was never a call.
-    fn call_refused(&self, call: CallId) {
+    /// The server refused a frame of `call` with `code`: an invite refused with a code
+    /// only an invite can get was never a call. Any other refusal (of a buffered
+    /// `CallIce`, say) leaves the call as it was.
+    fn call_refused(&self, call: CallId, code: CallErrorCode) {
+        if !matches!(
+            code,
+            CallErrorCode::InCall | CallErrorCode::NotContact | CallErrorCode::RateLimited
+        ) {
+            return;
+        }
         let mut calls = self.live_calls();
         if calls.unanswered.remove(&call) {
             calls.live.remove(&call);
+            calls.unsynced.remove(&call);
         }
     }
 
     /// The server listed the user's calls (`listed`, every id it named, readable entry
-    /// or not): they are the live ones now. The calls known as live before that are not
-    /// listed, in id order.
+    /// or not): they are the live ones now, with those made on this connection before
+    /// its first sync. The calls known as live before that are not, in id order.
     fn calls_synced(&self, listed: BTreeSet<CallId>) -> Vec<CallId> {
         let mut calls = self.live_calls();
-        // Listed, an invite exists; not listed, it is gone.
-        calls.unanswered.clear();
+        calls.awaiting_sync = false;
+        let unsynced = std::mem::take(&mut calls.unsynced);
         let previous = std::mem::replace(&mut calls.live, listed);
+        let kept: Vec<CallId> = unsynced.intersection(&previous).copied().collect();
+        calls.live.extend(kept);
+        // Listed, an invite exists; not listed, it is gone (unless the sync could not
+        // name it).
+        let live = calls.live.clone();
+        calls
+            .unanswered
+            .retain(|call| unsynced.contains(call) && live.contains(call));
         previous.difference(&calls.live).copied().collect()
     }
 
@@ -825,7 +871,7 @@ impl Engine {
             _ => return None,
         };
         match &event {
-            CallEvent::Incoming { call_id, .. } => self.shared.call_live(*call_id),
+            CallEvent::Incoming { call_id, .. } => self.shared.call_heard(*call_id),
             CallEvent::Accepted { call_id, .. } => self.shared.call_answered(*call_id),
             CallEvent::Taken { call_id }
             | CallEvent::Ended { call_id, .. }
@@ -834,7 +880,7 @@ impl Engine {
                 code: CallErrorCode::CallNotFound,
                 ..
             } => self.shared.call_over(*call_id),
-            CallEvent::Error { call_id, .. } => self.shared.call_refused(*call_id),
+            CallEvent::Error { call_id, code, .. } => self.shared.call_refused(*call_id, *code),
             _ => {}
         }
         Some(event)
@@ -1958,6 +2004,94 @@ mod tests {
                 gone,
             })]
         );
+    }
+
+    #[test]
+    fn only_a_refusal_that_can_only_answer_an_invite_means_it_never_was_a_call() {
+        let mut f = fixture();
+        let error = |call: CallId, code: v1::ErrorCode| {
+            Body::CallError(v1::CallError {
+                call_id: bytes(call.0),
+                code: code.into(),
+                ..Default::default()
+            })
+        };
+        let mut kept = Vec::new();
+        for code in [
+            v1::ErrorCode::CallLimit,
+            v1::ErrorCode::Unavailable,
+            v1::ErrorCode::Invalid,
+            v1::ErrorCode::NotAvailable,
+            v1::ErrorCode::AlreadyAnswered,
+        ] {
+            let call = CallId::new();
+            f.shared.call_invited(call);
+            // The refused frame was a buffered CallIce, say: the invite still stands.
+            call_frame(&mut f, error(call, code), 0);
+            kept.push(call);
+        }
+        for code in [
+            v1::ErrorCode::InCall,
+            v1::ErrorCode::NotContact,
+            v1::ErrorCode::RateLimited,
+        ] {
+            let call = CallId::new();
+            f.shared.call_invited(call);
+            call_frame(&mut f, error(call, code), 0);
+        }
+        f.events();
+
+        call_frame(
+            &mut f,
+            Body::CallSync(v1::CallSync { calls: Vec::new() }),
+            0,
+        );
+        kept.sort();
+        assert_eq!(
+            f.events(),
+            [Event::Call(CallEvent::Synced {
+                calls: Vec::new(),
+                gone: kept,
+            })]
+        );
+    }
+
+    #[test]
+    fn the_first_call_sync_of_a_connection_keeps_the_calls_made_on_it_before() {
+        let mut f = fixture();
+        let empty_sync = |f: &mut Fixture| {
+            call_frame(f, Body::CallSync(v1::CallSync { calls: Vec::new() }), 0);
+            match f.events().as_slice() {
+                [Event::Call(CallEvent::Synced { gone, .. })] => gone.clone(),
+                events => panic!("one Synced, not {events:?}"),
+            }
+        };
+        let (before, invited, accepted, refused) =
+            (CallId::new(), CallId::new(), CallId::new(), CallId::new());
+        f.shared.call_live(before);
+        f.shared.set_calls_offered(Some(true));
+        f.shared.call_invited(invited);
+        f.shared.call_live(accepted);
+        f.shared.call_invited(refused);
+        // The gateway's CallSync went out before it read these frames.
+        assert_eq!(empty_sync(&mut f), [before]);
+
+        // Kept as unanswered invites: a refusal still means there never was a call.
+        call_frame(
+            &mut f,
+            Body::CallError(v1::CallError {
+                call_id: bytes(refused.0),
+                code: v1::ErrorCode::NotContact.into(),
+                ..Default::default()
+            }),
+            0,
+        );
+        f.events();
+        f.shared.set_calls_offered(None);
+        f.shared.set_calls_offered(Some(true));
+        let mut gone = vec![invited, accepted];
+        gone.sort();
+        assert_eq!(empty_sync(&mut f), gone);
     }
 
     #[test]
