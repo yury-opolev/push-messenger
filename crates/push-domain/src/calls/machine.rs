@@ -174,8 +174,9 @@ pub enum CallEvent {
     /// The registered connection of `device` (of `user`) detached.
     Detach { user: UserId, device: DeviceId },
     /// The call's due time passed. `gone` lists the sides whose party device the liveness
-    /// read found without a live connection.
-    Tick { gone: Vec<Side> },
+    /// read found without a live connection, `live` those it found connected (an active
+    /// call clears their away time before checking the grace: the device came back).
+    Tick { gone: Vec<Side>, live: Vec<Side> },
 }
 
 /// Why a frame was refused, answered with `CallError` to the sender only.
@@ -234,7 +235,7 @@ pub struct Outcome {
     /// The event answered the call.
     pub answered: bool,
     /// Whether the record changed (an ended call always did). The service skips the write
-    /// otherwise.
+    /// otherwise, but still publishes `deliveries` (a repeated accept has one).
     pub changed: bool,
 }
 
@@ -321,7 +322,7 @@ pub fn transition(
     match event {
         CallEvent::Attach { user, device } => Ok(attach(record, user, device, now_ms, timing)),
         CallEvent::Detach { user, device } => Ok(detach(record, user, device, now_ms, timing)),
-        CallEvent::Tick { gone } => Ok(tick(record, &gone, now_ms, timing)),
+        CallEvent::Tick { gone, live } => Ok(tick(record, &gone, &live, now_ms, timing)),
         frame => {
             let sender = sender.ok_or(Refusal::NotFound)?;
             on_frame(record, sender, frame, now_ms, timing)
@@ -388,7 +389,21 @@ fn on_frame(
     match event {
         CallEvent::Accept { device, answer } => {
             if !ringing {
-                return if sender == record.callee {
+                return if sender == record.callee && record.callee_device == Some(device) {
+                    // A retry of the accept that answered (its reply was lost): the caller
+                    // gets `CallAccepted` again; nothing else changes.
+                    Ok(Outcome {
+                        record: Some(record.clone()),
+                        deliveries: vec![Delivery::Accepted {
+                            to: record.caller_device,
+                            answer,
+                            device,
+                        }],
+                        ended: None,
+                        answered: false,
+                        changed: false,
+                    })
+                } else if sender == record.callee {
                     Err(Refusal::AlreadyAnswered)
                 } else {
                     Err(Refusal::NotFound)
@@ -627,7 +642,13 @@ fn detach(
     continues(next, Vec::new())
 }
 
-fn tick(record: &CallRecord, gone: &[Side], now_ms: i64, timing: &Timing) -> Outcome {
+fn tick(
+    record: &CallRecord,
+    gone: &[Side],
+    live: &[Side],
+    now_ms: i64,
+    timing: &Timing,
+) -> Outcome {
     let mut next = record.clone();
     match record.state {
         CallState::Ringing => {
@@ -640,8 +661,13 @@ fn tick(record: &CallRecord, gone: &[Side], now_ms: i64, timing: &Timing) -> Out
             next.due_ms = ringing_due(&next, timing);
         }
         CallState::Active => {
-            if grace_over(record.caller_away_ms, now_ms, timing)
-                || grace_over(record.callee_away_ms, now_ms, timing)
+            // A side found connected is back, even if no attach cleared its away time
+            // (an away time written by a tick racing the attach).
+            for side in live {
+                *away_mut(&mut next, *side) = None;
+            }
+            if grace_over(next.caller_away_ms, now_ms, timing)
+                || grace_over(next.callee_away_ms, now_ms, timing)
             {
                 return end(record, EndReason::Failed, now_ms);
             }

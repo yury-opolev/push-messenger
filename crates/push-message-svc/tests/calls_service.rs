@@ -246,6 +246,10 @@ async fn an_invite_rings_and_an_accept_connects() {
     assert_eq!(incoming.offer_sdp, OFFER);
     assert!((44_000..=45_000).contains(&incoming.expires_in_ms));
 
+    // The invite sent again (its reply was lost) is accepted without effect.
+    let reply = env.invite(alice, bob.user, call).await.unwrap();
+    assert_eq!(reply.ended, None);
+
     // A reconnecting ringing device finds the call in its CallSync.
     let sync = env
         .service
@@ -315,6 +319,18 @@ async fn an_invite_rings_and_an_accept_connects() {
     assert_eq!(to, devices(&[bob.device]));
     assert_eq!(frame, call_signal::Frame::Ice(ice));
 
+    // The accept sent again (its reply was lost) only repeats `CallAccepted`.
+    env.send(bob, call_request::Frame::Accept(accept.clone()))
+        .await
+        .unwrap();
+    let (channel, to, frame) = next_signal(&mut signals).await;
+    assert_eq!(
+        (channel, to),
+        (notify_channel(alice.user.0), devices(&[alice.device]))
+    );
+    assert!(matches!(frame, call_signal::Frame::Accepted(_)));
+    nothing_more(&mut signals).await;
+
     let late = Party {
         user: bob.user,
         device: bob_laptop,
@@ -361,7 +377,7 @@ async fn an_invite_rings_and_an_accept_connects() {
     assert!(text.contains("push_call_frames_refused_total{code=\"call_not_found\"} 1\n"));
     assert!(text.contains("push_call_frames_refused_total{code=\"already_answered\"} 1\n"));
     assert!(text.contains("push_call_setup_seconds_count 1\n"));
-    assert!(text.contains("push_call_signal_seconds_count{frame=\"invite\"} 1\n"));
+    assert!(text.contains("push_call_signal_seconds_count{frame=\"invite\"} 2\n"));
 }
 
 #[tokio::test]
@@ -424,6 +440,16 @@ async fn a_busy_callee_gets_busy_reply() {
         (Code::InvalidArgument, ErrorCode::Invalid)
     );
     let status = env.invite(carol, alice.user, call).await.unwrap_err();
+    assert_eq!(
+        error_from_status(&status).message,
+        "call_id is already used"
+    );
+    // Only the device that sent it may send an invite again.
+    let alice_tablet = Party {
+        user: alice.user,
+        device: DeviceId::new(),
+    };
+    let status = env.invite(alice_tablet, bob.user, call).await.unwrap_err();
     assert_eq!(
         error_from_status(&status).message,
         "call_id is already used"
@@ -545,6 +571,75 @@ async fn a_party_device_gone_past_the_grace_fails_the_call_and_a_reattach_resume
         env.service.redis().user_call(alice.user).await.unwrap(),
         None
     );
+}
+
+#[tokio::test]
+async fn a_tick_that_finds_an_away_device_live_again_keeps_the_call() {
+    let timing = Timing {
+        ring_ms: 45_000,
+        grace_ms: 1_000,
+        liveness_ms: 200,
+    };
+    let mut env = env(timing).await;
+    let (alice, bob) = (env.user().await, env.user().await);
+    env.contacts(alice, bob).await;
+    env.online(alice.user, alice.device).await;
+    let (bob_conn, _) = env.online(bob.user, bob.device).await;
+    let call = Uuid::now_v7();
+    env.invite(alice, bob.user, call).await.unwrap();
+    let accept = v1::CallAccept {
+        call_id: id_bytes(call),
+        answer_sdp: ANSWER.to_owned(),
+    };
+    env.send(bob, call_request::Frame::Accept(accept))
+        .await
+        .unwrap();
+
+    // An attach of a connected party device changes nothing but still bumps the version,
+    // so a tick that read the registry before it re-reads.
+    let (before, _) = env.service.redis().load(call).await.unwrap();
+    env.service
+        .attach(device_request(bob.user, bob.device, bob_conn))
+        .await
+        .unwrap();
+    let (after, _) = env.service.redis().load(call).await.unwrap();
+    let ((before_version, before_record), (after_version, after_record)) =
+        (before.unwrap(), after.unwrap());
+    assert_eq!(after_version, before_version + 1);
+    assert_eq!(after_record, before_record);
+
+    // A liveness tick finds Bob's lease gone and marks him away...
+    let _: () = redis::cmd("DEL")
+        .arg(presence_conns_key(bob.user.0))
+        .query_async(&mut env.admin)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    env.service.sweep_once().await.unwrap();
+    let (stored, _) = env.service.redis().load(call).await.unwrap();
+    assert!(!stored.unwrap().1.contains("\"callee_away_ms\":null"));
+    // ...but his connection is live again without an attach clearing it (the attach lost
+    // the race to that tick): the next tick clears it and the grace end passes.
+    let now = env.service.redis().now().await.unwrap();
+    let _: () = redis::cmd("ZADD")
+        .arg(presence_conns_key(bob.user.0))
+        .arg(now + 90_000)
+        .arg(bob_conn.to_string())
+        .query_async(&mut env.admin)
+        .await
+        .unwrap();
+    let mut signals = env.subscribe(&[alice.user, bob.user]).await;
+    for _ in 0..6 {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        env.service.sweep_once().await.unwrap();
+    }
+    nothing_more(&mut signals).await;
+    assert_eq!(
+        env.service.redis().user_call(alice.user).await.unwrap(),
+        Some(call)
+    );
+    let (stored, _) = env.service.redis().load(call).await.unwrap();
+    assert!(stored.unwrap().1.contains("\"callee_away_ms\":null"));
 }
 
 #[tokio::test]

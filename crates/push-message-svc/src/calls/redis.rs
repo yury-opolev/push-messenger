@@ -279,8 +279,10 @@ impl RedisCalls {
         id.map(|id| parse_uuid(&id)).transpose()
     }
 
-    /// Writes `write` atomically. A write sent twice (the connection dropped after the
-    /// first was sent) that then finds a conflict checks whether its first attempt landed.
+    /// Writes `write` atomically. When the answer is lost (a timeout, a dropped connection,
+    /// a failed retry) or a write sent twice finds a conflict, the record is read again:
+    /// a write that landed is `Ok`, so its frames are still published. A failed read
+    /// answers the error.
     pub async fn apply(&self, write: &Write<'_>) -> RedisResult<Applied> {
         let mut keys = vec![call_key(write.call), DUE_KEY.to_owned()];
         keys.extend(write.lock.iter().map(|user| user_key(*user)));
@@ -298,7 +300,18 @@ impl RedisCalls {
             write.release.len().to_string(),
         ];
         let (answer, retried): (String, bool) =
-            bounded(self.apply.run(&self.connection, &keys, &args)).await?;
+            match bounded(self.apply.run(&self.connection, &keys, &args)).await {
+                Ok(answered) => answered,
+                // The script may have run. The read goes on the same multiplexed
+                // connection after it, so it sees the write if it was sent.
+                Err(error) => {
+                    return if self.landed(write).await? {
+                        Ok(Applied::Ok)
+                    } else {
+                        Err(error)
+                    };
+                }
+            };
         let applied = match answer.as_str() {
             "OK" => Applied::Ok,
             "CONFLICT" => Applied::Conflict,
@@ -312,18 +325,27 @@ impl RedisCalls {
                 )));
             }
         };
-        if retried && matches!(applied, Applied::Conflict | Applied::Exists) {
-            let (stored, _) = self.load(write.call).await?;
-            let landed = match (write.record, stored) {
-                (None, None) => true,
-                (Some(record), Some((_, stored))) => stored == record,
-                _ => false,
-            };
-            if landed {
-                return Ok(Applied::Ok);
-            }
+        if retried
+            && matches!(applied, Applied::Conflict | Applied::Exists)
+            && self.landed(write).await?
+        {
+            return Ok(Applied::Ok);
         }
         Ok(applied)
+    }
+
+    /// Whether the call is as `write` left it: deleted for an end, else the written
+    /// record at the version after the expected one.
+    async fn landed(&self, write: &Write<'_>) -> RedisResult<bool> {
+        let (stored, _) = self.load(write.call).await?;
+        let version = write.expected.map_or(1, |expected| expected + 1);
+        Ok(match (write.record, stored) {
+            (None, None) => true,
+            (Some(record), Some((stored_version, stored))) => {
+                stored_version == version && stored == record
+            }
+            _ => false,
+        })
     }
 
     /// Up to `max` due calls, each leased for `lease_ms`, and Redis time in ms.

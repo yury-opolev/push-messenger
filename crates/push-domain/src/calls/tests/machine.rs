@@ -136,6 +136,8 @@ enum Expect {
         answered: bool,
     },
     Unchanged,
+    /// The record stays as it is (no write), but these frames are published.
+    Repeated(Vec<Delivery>),
 }
 
 struct Case {
@@ -180,6 +182,13 @@ fn check(case: Case) {
         Expect::Unchanged => Ok(Outcome {
             record: Some(case.record.clone()),
             deliveries: Vec::new(),
+            ended: None,
+            answered: false,
+            changed: false,
+        }),
+        Expect::Repeated(deliveries) => Ok(Outcome {
+            record: Some(case.record.clone()),
+            deliveries,
             ended: None,
             answered: false,
             changed: false,
@@ -266,12 +275,16 @@ fn every_transition_of_the_spec() {
             },
         },
         Case {
-            name: "active: accept from the answering device",
+            name: "active: accept again from the answering device (a retry)",
             record: active(),
             sender: Some(callee()),
             event: accept(d1()),
             now: ANSWERED + 1,
-            expect: Expect::Refused(Refusal::AlreadyAnswered),
+            expect: Expect::Repeated(vec![Delivery::Accepted {
+                to: caller_dev(),
+                answer: "answer".into(),
+                device: d1(),
+            }]),
         },
         Case {
             name: "active: accept from another callee device",
@@ -652,7 +665,10 @@ fn every_transition_of_the_spec() {
             name: "ringing: tick at the deadline is missed",
             record: ringing(),
             sender: None,
-            event: CallEvent::Tick { gone: Vec::new() },
+            event: CallEvent::Tick {
+                gone: Vec::new(),
+                live: Vec::new(),
+            },
             now: DEADLINE,
             expect: Expect::Ended {
                 reason: EndReason::Missed,
@@ -663,7 +679,10 @@ fn every_transition_of_the_spec() {
             name: "ringing: tick after the caller's grace fails",
             record: caller_away.clone(),
             sender: None,
-            event: CallEvent::Tick { gone: Vec::new() },
+            event: CallEvent::Tick {
+                gone: Vec::new(),
+                live: Vec::new(),
+            },
             now: NOW + 31_000,
             expect: Expect::Ended {
                 reason: EndReason::Failed,
@@ -674,7 +693,10 @@ fn every_transition_of_the_spec() {
             name: "ringing: an early tick reschedules",
             record: with(caller_away.clone(), |r| r.caller_away_ms = None),
             sender: None,
-            event: CallEvent::Tick { gone: Vec::new() },
+            event: CallEvent::Tick {
+                gone: Vec::new(),
+                live: Vec::new(),
+            },
             now: NOW + 31_000,
             expect: next(
                 with(caller_away.clone(), |r| {
@@ -688,7 +710,10 @@ fn every_transition_of_the_spec() {
             name: "active: tick after a side's grace fails",
             record: callee_away.clone(),
             sender: None,
-            event: CallEvent::Tick { gone: Vec::new() },
+            event: CallEvent::Tick {
+                gone: Vec::new(),
+                live: Vec::new(),
+            },
             now: ANSWERED + 31_000,
             expect: Expect::Ended {
                 reason: EndReason::Failed,
@@ -701,6 +726,7 @@ fn every_transition_of_the_spec() {
             sender: None,
             event: CallEvent::Tick {
                 gone: vec![Side::Callee],
+                live: Vec::new(),
             },
             now: ANSWERED + 15_000,
             expect: next(
@@ -717,6 +743,7 @@ fn every_transition_of_the_spec() {
             sender: None,
             event: CallEvent::Tick {
                 gone: vec![Side::Callee],
+                live: Vec::new(),
             },
             now: ANSWERED + 16_000,
             expect: next(
@@ -725,10 +752,48 @@ fn every_transition_of_the_spec() {
             ),
         },
         Case {
+            name: "active: liveness tick finds an away side live: away cleared, no end",
+            record: callee_away.clone(),
+            sender: None,
+            event: CallEvent::Tick {
+                gone: Vec::new(),
+                live: vec![Side::Caller, Side::Callee],
+            },
+            now: ANSWERED + 31_000,
+            expect: next(
+                with(callee_away.clone(), |r| {
+                    r.callee_away_ms = None;
+                    r.due_ms = ANSWERED + 46_000;
+                }),
+                Vec::new(),
+            ),
+        },
+        Case {
+            name: "active: liveness tick clears a live side and marks a gone one",
+            record: callee_away.clone(),
+            sender: None,
+            event: CallEvent::Tick {
+                gone: vec![Side::Caller],
+                live: vec![Side::Callee],
+            },
+            now: ANSWERED + 16_000,
+            expect: next(
+                with(callee_away.clone(), |r| {
+                    r.callee_away_ms = None;
+                    r.caller_away_ms = Some(ANSWERED + 16_000);
+                    r.due_ms = ANSWERED + 31_000;
+                }),
+                Vec::new(),
+            ),
+        },
+        Case {
             name: "active: tick otherwise reschedules the liveness check",
             record: active(),
             sender: None,
-            event: CallEvent::Tick { gone: Vec::new() },
+            event: CallEvent::Tick {
+                gone: Vec::new(),
+                live: Vec::new(),
+            },
             now: ANSWERED + 15_000,
             expect: next(with(active(), |r| r.due_ms = ANSWERED + 30_000), Vec::new()),
         },
@@ -841,6 +906,75 @@ fn two_devices_accepting_at_once() {
         transition(&record, Some(callee()), accept(d2()), ANSWERED, &timing()),
         Err(Refusal::AlreadyAnswered)
     );
+}
+
+#[test]
+fn accepting_twice_from_the_same_device_repeats_the_accepted_frame() {
+    let first = ok(transition(
+        &ringing(),
+        Some(callee()),
+        accept(d1()),
+        ANSWERED,
+        &timing(),
+    ));
+    let record = first.record.unwrap();
+    let again = ok(transition(
+        &record,
+        Some(callee()),
+        accept(d1()),
+        ANSWERED + 500,
+        &timing(),
+    ));
+    assert!(!again.changed);
+    assert!(!again.answered);
+    assert_eq!(again.ended, None);
+    assert_eq!(again.record, Some(record.clone()));
+    assert_eq!(
+        again.deliveries,
+        vec![Delivery::Accepted {
+            to: caller_dev(),
+            answer: "answer".into(),
+            device: d1(),
+        }]
+    );
+    // Only the answering device may repeat it; the caller may not.
+    assert_eq!(
+        transition(&record, Some(caller()), accept(d1()), ANSWERED, &timing()),
+        Err(Refusal::NotFound)
+    );
+}
+
+#[test]
+fn a_tick_racing_an_attach_never_fails_the_device() {
+    // The tick read the registry before the device reattached and marked it away.
+    let marked = ok(transition(
+        &active(),
+        None,
+        CallEvent::Tick {
+            gone: vec![Side::Callee],
+            live: vec![Side::Caller],
+        },
+        ANSWERED + 15_000,
+        &timing(),
+    ))
+    .record
+    .unwrap();
+    assert_eq!(marked.callee_away_ms, Some(ANSWERED + 15_000));
+    // The next ticks find it connected: its away time goes, the grace end passes.
+    let tick = ok(transition(
+        &marked,
+        None,
+        CallEvent::Tick {
+            gone: Vec::new(),
+            live: vec![Side::Caller, Side::Callee],
+        },
+        ANSWERED + 45_000,
+        &timing(),
+    ));
+    assert_eq!(tick.ended, None);
+    let record = tick.record.unwrap();
+    assert_eq!(record.callee_away_ms, None);
+    assert_eq!(record.due_ms, ANSWERED + 60_000);
 }
 
 #[test]
@@ -969,7 +1103,10 @@ fn tick_after_attach_only_reschedules() {
     let tick = ok(transition(
         &attach,
         None,
-        CallEvent::Tick { gone: Vec::new() },
+        CallEvent::Tick {
+            gone: Vec::new(),
+            live: Vec::new(),
+        },
         ANSWERED + 31_000,
         &timing(),
     ));
@@ -1435,7 +1572,10 @@ fn ringing_ends_on_no_callee_device_without_a_callee_delivery() {
     let outcome = ok(transition(
         &record,
         None,
-        CallEvent::Tick { gone: Vec::new() },
+        CallEvent::Tick {
+            gone: Vec::new(),
+            live: Vec::new(),
+        },
         DEADLINE,
         &timing(),
     ));

@@ -121,10 +121,12 @@ registry entry, or its connection holds no live presence lease.
 | — | `Invite`, caller already in a call | — | `CallError{IN_CALL}` |
 | — | `Invite`, callee busy (in or ringing for a call) | — | reply `CallEnded{busy}`; audit `call.ended` busy |
 | — | `Invite`, callee has no attached live device | — | reply `CallEnded{unreachable}`; audit `call.ended` unreachable |
+| ringing | `Invite` again with the same `call_id` from the same caller device (a retry) | ringing | ok, no reply and no frames; another sender: `CallError{INVALID}` |
 | — | `Invite`, ok | ringing | `CallIncoming` to every live attached callee device; due = `now + ring`; audit `call.started` |
 | ringing | `Accept` from a ringing device, `now < ring_deadline` | active | `CallAccepted` to the caller device; `CallTaken` to the other ringing devices; buffered caller ICE to the answering device; offer dropped; due = `now + LIVENESS` |
 | ringing | `Accept`, `now ≥ ring_deadline` | — | `CallEnded{missed}` to all involved (the late accepter included) |
-| active | `Accept` from a callee device | active | `CallError{ALREADY_ANSWERED}` to the sender only |
+| active | `Accept` from the answering device (a retry) | active | `CallAccepted` to the caller device again; no write |
+| active | `Accept` from another callee device | active | `CallError{ALREADY_ANSWERED}` to the sender only |
 | ringing | `Decline(declined)` from a ringing device | — | `CallEnded{declined}` to all involved |
 | ringing | `Decline(busy)` from a ringing device | — | `CallEnded{busy}` to all involved |
 | ringing | `Cancel` from the caller device | — | `CallEnded{cancelled}` to all involved |
@@ -145,6 +147,7 @@ registry entry, or its connection holds no live presence lease.
 | active | `Detach` of a party device | active | that side's away = `now`; due = min(due, `now + grace`) |
 | ringing | `Tick`, `now ≥ ring_deadline` | — | `CallEnded{missed}` to all involved |
 | ringing | `Tick`, caller away and `now ≥ away + grace` | — | `CallEnded{failed}` to all involved |
+| active | `Tick`, liveness: a party device found live | (checked first) | that side's away cleared, before the grace check (an away time a tick wrote while the device reattached) |
 | active | `Tick`, a side away and `now ≥ away + grace` | — | `CallEnded{failed, duration_s}` to both party devices |
 | active | `Tick`, liveness: a party device gone, not marked away | active | that side's away = `now`; due = `now + grace` |
 | active | `Tick`, otherwise | active | due = `now + LIVENESS`; TTLs refreshed |
@@ -155,7 +158,11 @@ Ties: the first CAS wins. Two accepts: one becomes active, the other re-reads an
 `CALL_NOT_FOUND` (call gone) or `ALREADY_ANSWERED`. Hangup vs reconnect: a `Hangup` ends
 the call; a later `Attach` finds no call and the device's `CallSync` is empty. Grace end
 vs reconnect: the `Tick` re-reads the record; an `Attach` that committed first cleared
-the away time, so the tick only reschedules.
+the away time, so the tick only reschedules. An `Attach` of a party device always writes (bumping the version) so
+a tick that read the registry before it loses its CAS and reads the device again; a tick
+that finds a party device live clears its away time. A write whose reply was lost (a
+timeout or a dropped connection) re-reads the record: if it landed, its frames are
+published; retried `Invite` and `Accept` frames are idempotent (rows above).
 
 `duration_s` = `(end − answered_ms) / 1000`, rounded down; only for calls that were
 answered.

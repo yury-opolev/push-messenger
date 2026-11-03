@@ -186,13 +186,12 @@ where
             .map_err(redis_failed)?;
         if ringing.is_empty() {
             // As the create would answer: the caller's own call first, then busy.
-            if self
-                .redis
-                .user_call(caller)
-                .await
-                .map_err(redis_failed)?
-                .is_some()
-            {
+            if let Some(current) = self.redis.user_call(caller).await.map_err(redis_failed)? {
+                if current == invite.call_id
+                    && self.repeated_invite(current, caller, device).await?
+                {
+                    return Ok(CallReply::default());
+                }
                 return Err(in_call());
             }
             let busy = self
@@ -234,7 +233,13 @@ where
             Applied::Busy => {
                 return Ok(self.not_ringing(invite.call_id, caller, callee, EndReason::Busy));
             }
-            Applied::Exists => return Err(invalid("call_id is already used")),
+            Applied::Exists => {
+                return if self.repeated_invite(record.call_id, caller, device).await? {
+                    Ok(CallReply::default())
+                } else {
+                    Err(invalid("call_id is already used"))
+                };
+            }
             Applied::Conflict => return Err(unavailable()),
         }
         self.publish(&record, deliveries, now).await;
@@ -248,6 +253,22 @@ where
         );
         self.metrics.call_started();
         Ok(CallReply::default())
+    }
+
+    /// Whether `call` is a ringing call of `device` of `caller`: an invite sent again
+    /// (its reply was lost) is accepted without effect.
+    async fn repeated_invite(
+        &self,
+        call: Uuid,
+        caller: UserId,
+        device: DeviceId,
+    ) -> Result<bool, Status> {
+        let (stored, _) = self.redis.load(call).await.map_err(redis_failed)?;
+        Ok(decode(call, stored).is_some_and(|(_, record)| {
+            record.caller == caller
+                && record.caller_device == device
+                && record.state == CallState::Ringing
+        }))
     }
 
     /// An invite that cannot ring: answered `CallEnded` at once, audited as an end.
@@ -312,7 +333,13 @@ where
                 return Ok(CallSync::default());
             };
             let event = CallEvent::Attach { user, device };
-            let outcome = transition(&record, None, event, now, &self.timing).map_err(refused)?;
+            let mut outcome =
+                transition(&record, None, event, now, &self.timing).map_err(refused)?;
+            if is_party_device(&record, user, device) {
+                // Always bump the version, so a tick that read the registry before this
+                // attach loses its compare-and-set and reads the device as live.
+                outcome.changed = true;
+            }
             let next = outcome.record.clone();
             if self.commit(&record, version, outcome, now, None).await? {
                 let calls = next
@@ -369,13 +396,13 @@ where
                 // Rescheduled by a write after the claim, which also set its due entry.
                 return Ok(());
             }
-            let gone = if record.state == CallState::Active {
-                self.gone(&record, now).await?
+            let (gone, live) = if record.state == CallState::Active {
+                self.liveness(&record, now).await?
             } else {
-                Vec::new()
+                (Vec::new(), Vec::new())
             };
-            let outcome = transition(&record, None, CallEvent::Tick { gone }, now, &self.timing)
-                .map_err(refused)?;
+            let event = CallEvent::Tick { gone, live };
+            let outcome = transition(&record, None, event, now, &self.timing).map_err(refused)?;
             if self.commit(&record, version, outcome, now, None).await? {
                 return Ok(());
             }
@@ -384,13 +411,18 @@ where
     }
 
     /// The sides of an active call whose party device has no registered connection, or
-    /// one without a live presence lease.
-    async fn gone(&self, record: &CallRecord, now: i64) -> Result<Vec<Side>, Status> {
+    /// one without a live presence lease (gone), and the other sides (live).
+    async fn liveness(
+        &self,
+        record: &CallRecord,
+        now: i64,
+    ) -> Result<(Vec<Side>, Vec<Side>), Status> {
         let parties = [
             (Side::Caller, record.caller, Some(record.caller_device)),
             (Side::Callee, record.callee, record.callee_device),
         ];
         let mut gone = Vec::new();
+        let mut connected = Vec::new();
         for (side, user, device) in parties {
             let Some(device) = device else { continue };
             let conn = self
@@ -406,11 +438,13 @@ where
                     .await
                     .map_err(redis_failed)?,
             };
-            if !live {
+            if live {
+                connected.push(side);
+            } else {
                 gone.push(side);
             }
         }
-        Ok(gone)
+        Ok((gone, connected))
     }
 
     /// Writes `outcome` over `before`, read at `version`, then publishes, audits and
@@ -424,6 +458,10 @@ where
         received: Option<Instant>,
     ) -> Result<bool, Status> {
         if !outcome.changed {
+            // Nothing to write; a repeated accept still re-sends its frame.
+            if !outcome.deliveries.is_empty() {
+                self.publish(before, outcome.deliveries, now).await;
+            }
             return Ok(true);
         }
         let json;
@@ -526,6 +564,15 @@ where
         let (user, device, conn) = device_request(&request)?;
         self.detach_device(user, device, conn).await
     }
+}
+
+/// Whether `device` of `user` is the caller's device, or the answering device of an active
+/// call.
+fn is_party_device(record: &CallRecord, user: UserId, device: DeviceId) -> bool {
+    (user == record.caller && device == record.caller_device)
+        || (record.state == CallState::Active
+            && user == record.callee
+            && record.callee_device == Some(device))
 }
 
 fn device_request(request: &CallDeviceRequest) -> Result<(UserId, DeviceId, Uuid), Status> {
