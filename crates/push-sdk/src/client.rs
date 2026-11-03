@@ -648,7 +648,9 @@ impl Client {
             let tail = inner.clone();
             shielded(async move {
                 stop_connection(&tail).await?;
-                blocking(&tail.shared, move |store| store.bind_owner(user)).await?;
+                if blocking(&tail.shared, move |store| store.bind_owner(user)).await? {
+                    tail.shared.forget_calls();
+                }
                 Ok(())
             })
             .await?;
@@ -694,6 +696,7 @@ impl Client {
                 let (session, forgotten) = local.credentials.sign_out_for_good().await;
                 let stopped = stop_connection(&local).await.err();
                 let erased = if stopped.is_none() {
+                    local.shared.forget_calls();
                     blocking(&local.shared, |store| store.erase_all())
                         .await
                         .err()

@@ -70,7 +70,7 @@ impl Calls {
             offer_sdp: offer_sdp.to_owned(),
             media: vec![v1::CallMedia::Audio.into()],
         }))?;
-        self.client.inner.shared.call_live(call);
+        self.client.inner.shared.call_invited(call);
         Ok(call)
     }
 
@@ -160,7 +160,9 @@ impl Calls {
         }))
     }
 
-    /// A call frame may go now: the client is connected and calls are available.
+    /// A call frame may go now: a connection serves and calls are available on it. The
+    /// state can still say `Connected` for a moment after the connection ended (while
+    /// the token is refreshed, say): that is offline too.
     fn usable(&self) -> Result<(), SdkError> {
         match self.client.connection_state() {
             ConnectionState::Connected => {}
@@ -169,7 +171,10 @@ impl Calls {
             ConnectionState::OpenedElsewhere => return Err(SdkError::OpenedElsewhere),
             _ => return Err(SdkError::Offline),
         }
-        if !self.available() {
+        let Some(offered) = self.client.inner.shared.calls_offered() else {
+            return Err(SdkError::Offline);
+        };
+        if !offered {
             return Err(SdkError::Server {
                 code: "not_available".to_owned(),
                 message: "calls are not offered on this connection".to_owned(),
@@ -195,15 +200,18 @@ fn checked_sdp(sdp: &str) -> Result<(), SdkError> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
 
+    use push_domain::DeviceId;
     use push_proto::v1::Capability;
 
     use super::*;
+    use crate::Platform;
     use crate::calls::CallEvent;
     use crate::client::tests::Fixture;
     use crate::model::Event;
-    use crate::testing::{Server, recv_until, send};
+    use crate::testing::{Server, close, recv, recv_until, send};
 
     const OFFER: &str =
         "v=0\r\no=- 1 2 IN IP4 127.0.0.1\r\ns=-\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n";
@@ -316,6 +324,126 @@ mod tests {
         assert!(offline(
             calls.renegotiate(call, OFFER, SdpKind::Offer).await
         ));
+    }
+
+    #[tokio::test]
+    async fn a_connection_that_ended_is_offline_for_calls_before_the_state_says_so() {
+        let (f, mut socket) = connected().await;
+        // The 4002 refresh stalls: the state stays Connected meanwhile.
+        f.auth.refresh_delay_ms.store(10_000, Ordering::SeqCst);
+        close(&mut socket, 4002).await;
+        while f.auth.refreshes.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(f.client.connection_state(), ConnectionState::Connected);
+        let calls = f.client.calls();
+        assert!(!calls.available());
+        assert_eq!(
+            calls.hangup(CallId::new(), false).await,
+            Err(SdkError::Offline)
+        );
+        assert_eq!(
+            calls.invite(UserId::new(), OFFER).await.map(|_| ()),
+            Err(SdkError::Offline)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reconnect_whose_ready_does_not_offer_calls_makes_them_unavailable() {
+        let (mut f, socket) = connected().await;
+        assert!(f.client.calls().available());
+        drop(socket);
+        let (_socket, _) = f.ready_with(Vec::new()).await;
+        f.client
+            .wait_connected(Duration::from_secs(10))
+            .await
+            .unwrap();
+        let calls = f.client.calls();
+        assert!(!calls.available());
+        assert!(not_available(calls.cancel(CallId::new()).await));
+    }
+
+    #[tokio::test]
+    async fn invalid_input_is_refused_as_such_while_offline() {
+        let f = Fixture::with_calls().await;
+        let calls = f.client.calls();
+        let call = CallId::new();
+        let invalid = |result: Result<(), SdkError>| matches!(result, Err(SdkError::Invalid(_)));
+        assert!(invalid(
+            calls.invite(UserId::new(), "v=0\r\n").await.map(|_| ())
+        ));
+        assert!(invalid(calls.accept(call, "").await));
+        assert!(invalid(
+            calls.renegotiate(call, "v=0\r\n", SdpKind::Offer).await
+        ));
+        assert!(invalid(calls.send_ice(call, IceCandidate::default()).await));
+    }
+
+    /// The next [`CallEvent::Synced`] after an empty `CallSync`.
+    async fn synced_after_an_empty_sync(f: &mut Fixture, socket: &mut Server) -> CallEvent {
+        send(socket, Body::CallSync(v1::CallSync { calls: Vec::new() })).await;
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(10), f.events.next())
+                .await
+                .expect("an event within 10 s")
+                .expect("the event stream is open");
+            if let Event::Call(synced @ CallEvent::Synced { .. }) = event {
+                return synced;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn signing_out_forgets_the_calls() {
+        let (mut f, _socket) = connected().await;
+        f.client.calls().invite(UserId::new(), OFFER).await.unwrap();
+        f.client.sign_out().await.unwrap();
+        assert!(!f.client.calls().available());
+        f.client
+            .sign_in("a@example.com", "password", "phone", Platform::Ios)
+            .await
+            .unwrap();
+        f.client.connect().unwrap();
+        let (mut socket, _) = f.ready_with(offered()).await;
+        assert_eq!(
+            synced_after_an_empty_sync(&mut f, &mut socket).await,
+            CallEvent::Synced {
+                calls: Vec::new(),
+                gone: Vec::new(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn another_account_does_not_inherit_the_calls() {
+        let (mut f, _socket) = connected().await;
+        f.client.calls().invite(UserId::new(), OFFER).await.unwrap();
+        let (user_b, device_b) = (UserId::new(), DeviceId::new());
+        *f.auth.identity.lock().unwrap() = (user_b, device_b);
+        f.client
+            .sign_in("b@example.com", "password", "tablet", Platform::Ios)
+            .await
+            .unwrap();
+        assert!(!f.client.calls().available());
+        f.client.connect().unwrap();
+        let mut socket = f.gateway.next().await;
+        let Body::Identify(_) = recv(&mut socket).await else {
+            panic!("Identify first");
+        };
+        let ready = v1::Ready {
+            user_id: bytes(user_b.0),
+            device_id: bytes(device_b.0),
+            heartbeat_ms: 30_000,
+            capabilities: offered(),
+        };
+        send(&mut socket, Body::Ready(ready)).await;
+        assert_eq!(
+            synced_after_an_empty_sync(&mut f, &mut socket).await,
+            CallEvent::Synced {
+                calls: Vec::new(),
+                gone: Vec::new(),
+            }
+        );
     }
 
     #[tokio::test]

@@ -353,7 +353,7 @@ impl Connection {
             }
         };
         let (user, device) = (session.user_id, session.device_id);
-        let (bind_shared, bind_credentials) = (shared, credentials.clone());
+        let (bind_shared, bind_credentials) = (shared.clone(), credentials.clone());
         // Whole-file work (an erase may truncate the log): off the async workers. The
         // session is checked again under the store's lock: a sign-out or sign-in that
         // changed it has wiped or is about to rebind the store, and a bind for the old
@@ -372,6 +372,7 @@ impl Connection {
         .unwrap_or_else(|_| Err(SdkError::Storage("the store task ended".to_owned())));
         match bound {
             Ok(Some(true)) => {
+                shared.forget_calls();
                 tracing::info!("another user signed in: the local store was emptied");
             }
             Ok(Some(false)) => {}
@@ -448,7 +449,7 @@ impl Connection {
             reauth_at: None,
         };
         let calls = self.calls && ready.capabilities.contains(&Capability::Calls.into());
-        self.shared.set_calls_available(calls);
+        self.shared.set_calls_offered(Some(calls));
         self.set_state(ConnectionState::Connected);
         let mut out = Vec::new();
         self.engine.start(unix_ms(), &mut out);
@@ -624,7 +625,7 @@ impl Connection {
     /// finish: auth-svc may have rotated the token already, and the refresh saves the new
     /// one; aborting it could lose the only refresh token that still works.
     fn end(&mut self, live: &mut Live) {
-        self.shared.set_calls_available(false);
+        self.shared.set_calls_offered(None);
         self.engine.stop();
         for (_, reply) in live.pending.drain() {
             let _ = reply.send(Err(SdkError::Disconnected));

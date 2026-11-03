@@ -6,7 +6,7 @@
 //! engine asks for.
 
 use std::collections::{BTreeSet, HashMap};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use push_domain::{CallId, ClientMsgId, ConversationId, DeviceId, UserId};
@@ -36,10 +36,27 @@ pub(crate) struct Shared {
     /// The user and whether they share presence, as last answered to this client; `None`
     /// (unknown) counts as sharing.
     presence_sharing: Mutex<Option<(UserId, bool)>>,
-    /// The live connection offers calls and the client asked for them.
-    calls_available: AtomicBool,
+    /// Whether a connection serves, and whether calls are available on it: one of
+    /// [`NOT_SERVING`], [`SERVING`] and [`SERVING_CALLS`].
+    calls_offered: AtomicU8,
     /// The calls this client knows to be live, for [`CallEvent::Synced`]'s `gone`.
-    live_calls: Mutex<BTreeSet<CallId>>,
+    live_calls: Mutex<LiveCalls>,
+}
+
+/// No connection serves.
+const NOT_SERVING: u8 = 0;
+/// A connection serves, without calls (the client did not ask, or its server does not
+/// offer them).
+const SERVING: u8 = 1;
+/// A connection serves, and calls are available on it.
+const SERVING_CALLS: u8 = 2;
+
+#[derive(Default)]
+struct LiveCalls {
+    live: BTreeSet<CallId>,
+    /// The live calls this client invited to that were neither answered nor ended yet:
+    /// a refusal of one means the server never had the call.
+    unanswered: BTreeSet<CallId>,
 }
 
 /// The sending end of the event queue.
@@ -59,42 +76,90 @@ impl Shared {
                 lost: false,
             }),
             presence_sharing: Mutex::new(None),
-            calls_available: AtomicBool::new(false),
-            live_calls: Mutex::new(BTreeSet::new()),
+            calls_offered: AtomicU8::new(NOT_SERVING),
+            live_calls: Mutex::new(LiveCalls::default()),
         }
     }
 
-    /// Whether calls are available on the live connection.
+    /// Whether calls are available on the serving connection: `None` while no
+    /// connection serves, `Some(offered)` while one does.
+    pub fn calls_offered(&self) -> Option<bool> {
+        match self.calls_offered.load(Ordering::SeqCst) {
+            NOT_SERVING => None,
+            serving => Some(serving == SERVING_CALLS),
+        }
+    }
+
+    /// Whether calls are available now: a connection serves and offers them.
     pub fn calls_available(&self) -> bool {
-        self.calls_available.load(Ordering::SeqCst)
+        self.calls_offered() == Some(true)
     }
 
-    /// Set when a connection starts serving, cleared when it ends.
-    pub fn set_calls_available(&self, available: bool) {
-        self.calls_available.store(available, Ordering::SeqCst);
+    /// `Some(offered)` when a connection starts serving, `None` when it stops.
+    pub fn set_calls_offered(&self, offered: Option<bool>) {
+        let value = match offered {
+            None => NOT_SERVING,
+            Some(false) => SERVING,
+            Some(true) => SERVING_CALLS,
+        };
+        self.calls_offered.store(value, Ordering::SeqCst);
     }
 
-    fn live_calls(&self) -> MutexGuard<'_, BTreeSet<CallId>> {
+    /// Forgets what is known of calls (a sign-out, or the store changed hands): no
+    /// connection serves, and no call is live.
+    pub fn forget_calls(&self) {
+        self.set_calls_offered(None);
+        *self.live_calls() = LiveCalls::default();
+    }
+
+    fn live_calls(&self) -> MutexGuard<'_, LiveCalls> {
         self.live_calls
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// A call this client invited to, accepted or heard of is live.
+    /// A call this client accepted or heard of is live.
     pub fn call_live(&self, call: CallId) {
-        self.live_calls().insert(call);
+        self.live_calls().live.insert(call);
+    }
+
+    /// A call this client invited to is live, until the server refuses the invite.
+    pub fn call_invited(&self, call: CallId) {
+        let mut calls = self.live_calls();
+        calls.live.insert(call);
+        calls.unanswered.insert(call);
+    }
+
+    /// The call was answered: it exists for the server.
+    fn call_answered(&self, call: CallId) {
+        let mut calls = self.live_calls();
+        calls.live.insert(call);
+        calls.unanswered.remove(&call);
     }
 
     fn call_over(&self, call: CallId) {
-        self.live_calls().remove(&call);
+        let mut calls = self.live_calls();
+        calls.live.remove(&call);
+        calls.unanswered.remove(&call);
     }
 
-    /// The server listed the user's calls: they are the live ones now. The calls known
-    /// as live before that are not listed, in id order.
-    fn calls_synced(&self, listed: &[CallState]) -> Vec<CallId> {
-        let listed: BTreeSet<CallId> = listed.iter().map(|call| call.call_id).collect();
-        let previous = std::mem::replace(&mut *self.live_calls(), listed.clone());
-        previous.difference(&listed).copied().collect()
+    /// The server refused a frame of `call`: an invite it refused was never a call.
+    fn call_refused(&self, call: CallId) {
+        let mut calls = self.live_calls();
+        if calls.unanswered.remove(&call) {
+            calls.live.remove(&call);
+        }
+    }
+
+    /// The server listed the user's calls (`listed`, every id it named, readable entry
+    /// or not): they are the live ones now. The calls known as live before that are not
+    /// listed, in id order.
+    fn calls_synced(&self, listed: BTreeSet<CallId>) -> Vec<CallId> {
+        let mut calls = self.live_calls();
+        // Listed, an invite exists; not listed, it is gone.
+        calls.unanswered.clear();
+        let previous = std::mem::replace(&mut calls.live, listed);
+        previous.difference(&calls.live).copied().collect()
     }
 
     /// Records the presence sharing setting of `user` that the server answered.
@@ -730,12 +795,17 @@ impl Engine {
                 },
             },
             Body::CallSync(sync) => {
+                let listed = sync
+                    .calls
+                    .iter()
+                    .filter_map(|state| call(&state.call_id))
+                    .collect();
                 let calls: Vec<CallState> = sync
                     .calls
                     .into_iter()
                     .filter_map(|state| CallState::from_wire(state, now_ms))
                     .collect();
-                let gone = self.shared.calls_synced(&calls);
+                let gone = self.shared.calls_synced(listed);
                 return Some(CallEvent::Synced { calls, gone });
             }
             Body::PeerCallIce(ice) => CallEvent::PeerIce {
@@ -755,9 +825,8 @@ impl Engine {
             _ => return None,
         };
         match &event {
-            CallEvent::Incoming { call_id, .. } | CallEvent::Accepted { call_id, .. } => {
-                self.shared.call_live(*call_id);
-            }
+            CallEvent::Incoming { call_id, .. } => self.shared.call_live(*call_id),
+            CallEvent::Accepted { call_id, .. } => self.shared.call_answered(*call_id),
             CallEvent::Taken { call_id }
             | CallEvent::Ended { call_id, .. }
             | CallEvent::Error {
@@ -765,6 +834,7 @@ impl Engine {
                 code: CallErrorCode::CallNotFound,
                 ..
             } => self.shared.call_over(*call_id),
+            CallEvent::Error { call_id, .. } => self.shared.call_refused(*call_id),
             _ => {}
         }
         Some(event)
@@ -1791,6 +1861,95 @@ mod tests {
             0,
         );
         let mut gone = vec![accepted, listed_elsewhere];
+        gone.sort();
+        assert_eq!(
+            f.events(),
+            [Event::Call(CallEvent::Synced {
+                calls: Vec::new(),
+                gone,
+            })]
+        );
+    }
+
+    #[test]
+    fn call_sync_entries_with_an_unknown_kind_still_count_as_listed() {
+        let mut f = fixture();
+        let (odd_direction, odd_status) = (CallId::new(), CallId::new());
+        f.shared.call_live(odd_direction);
+        f.shared.call_live(odd_status);
+        let state = |call: CallId| v1::CallState {
+            call_id: bytes(call.0),
+            peer_user_id: bytes(f.peer.0),
+            direction: v1::CallDirection::Out.into(),
+            status: v1::CallStatus::Active.into(),
+            ..Default::default()
+        };
+        let calls = vec![
+            v1::CallState {
+                direction: v1::CallDirection::Unspecified.into(),
+                ..state(odd_direction)
+            },
+            v1::CallState {
+                status: v1::CallStatus::Unspecified.into(),
+                ..state(odd_status)
+            },
+        ];
+        call_frame(&mut f, Body::CallSync(v1::CallSync { calls }), 0);
+        assert_eq!(
+            f.events(),
+            [Event::Call(CallEvent::Synced {
+                calls: Vec::new(),
+                gone: Vec::new(),
+            })]
+        );
+    }
+
+    #[test]
+    fn a_refused_invite_is_not_live() {
+        let mut f = fixture();
+        let (refused, answered, incoming) = (CallId::new(), CallId::new(), CallId::new());
+        let peer = f.peer;
+        f.shared.call_invited(refused);
+        f.shared.call_invited(answered);
+        let error = |call: CallId, code: v1::ErrorCode| {
+            Body::CallError(v1::CallError {
+                call_id: bytes(call.0),
+                code: code.into(),
+                ..Default::default()
+            })
+        };
+        call_frame(&mut f, error(refused, v1::ErrorCode::NotContact), 0);
+        call_frame(
+            &mut f,
+            Body::CallAccepted(v1::CallAccepted {
+                call_id: bytes(answered.0),
+                answer_sdp: "v=0\n".to_owned(),
+                answered_device_id: bytes(DeviceId::new().0),
+            }),
+            0,
+        );
+        // Once answered, the call exists: a refused frame of it does not end it.
+        call_frame(&mut f, error(answered, v1::ErrorCode::CallLimit), 0);
+        call_frame(
+            &mut f,
+            Body::CallIncoming(v1::CallIncoming {
+                call_id: bytes(incoming.0),
+                caller_user_id: bytes(peer.0),
+                offer_sdp: "v=0\n".to_owned(),
+                expires_in_ms: 1_000,
+                ..Default::default()
+            }),
+            0,
+        );
+        call_frame(&mut f, error(incoming, v1::ErrorCode::AlreadyAnswered), 0);
+        f.events();
+
+        call_frame(
+            &mut f,
+            Body::CallSync(v1::CallSync { calls: Vec::new() }),
+            0,
+        );
+        let mut gone = vec![answered, incoming];
         gone.sort();
         assert_eq!(
             f.events(),

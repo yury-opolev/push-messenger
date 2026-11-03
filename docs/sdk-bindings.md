@@ -171,8 +171,9 @@ The protocol, the rules and an agent recipe: [activity-presence.md](activity-pre
 push-sdk carries the signalling of 1:1 audio calls (the protocol: [calls.md](calls.md)).
 The bindings do not expose the calls functions or a `calls` config option yet, so these
 events do not occur through the bindings yet: they arrive with the bindings' calls API
-later. Their JSON form is fixed already: `{"type": "call", "call": {"type": …, …}}`, the
-inner `type` one of:
+later. Their JSON form is fixed already: `{"type": "call", "call": {"type": …, …}}`. Each
+row below is written `call.<type>`: the inner `type` value is the part after `call.`
+(`incoming`, `accepted`, …), not the whole name.
 
 | `call.type` | Fields |
 |---|---|
@@ -183,7 +184,7 @@ inner `type` one of:
 | `call.peerIce` | `callId`, `candidate`: `{candidate, sdpMid, sdpMLineIndex, usernameFragment, endOfCandidates}` |
 | `call.peerRenegotiate` | `callId`, `sdp`, `kind` (`offer` or `answer`) |
 | `call.error` | `callId`, `error`: a refused call frame; `error.code` is the server's (`already_answered`, `call_not_found`, `in_call`, `call_limit`, `not_contact`, `invalid`, `rate_limited`, `not_available`, `unavailable`) |
-| `call.synced` | `calls` (after every connect: `[{callId, peerUserId, direction, status, offerSdp, expiresAtMs, answeredAtMs, thisDevice}]`), `gone` (ids of calls the client knew as live that are not listed: drop them) |
+| `call.synced` | `calls` (after every connect: `[{callId, peerUserId, direction, status, offerSdp, expiresAtMs, answeredAtMs, thisDevice}]`; `direction` is `incoming` or `outgoing`, `status` is `ringing` or `active`), `gone` (ids of calls the client knew as live that are not listed: drop them) |
 | `call.historyChanged` | `latestEndedAtMs` (`null` when a call was hidden): refresh the call history |
 
 SDP and candidate strings are in the JSON because the app needs them; never log them.
