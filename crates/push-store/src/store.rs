@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use push_domain::calls::{CallDirection, CallHistoryRow, EndReason, HistoryCursor};
 use push_domain::templates::TemplateRef;
 use push_domain::{
     ClientMsgId, ContactState, Conversation, ConversationId, ConversationOverview, DeviceId,
@@ -1392,6 +1393,163 @@ impl Tx for PgTx {
         .map_err(store_error)?;
         read_all(rows, rows::template_event)
     }
+
+    async fn insert_call_history(&mut self, rows: &[CallHistoryRow]) -> DomainResult<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let users: Vec<Uuid> = rows.iter().map(|row| row.user.0).collect();
+        let calls: Vec<Uuid> = rows.iter().map(|row| row.call_id).collect();
+        let peers: Vec<Uuid> = rows.iter().map(|row| row.peer.0).collect();
+        let directions: Vec<&str> = rows.iter().map(|row| direction(row.direction)).collect();
+        let started: Vec<DateTime<Utc>> = rows.iter().map(|row| row.started_at).collect();
+        let answered: Vec<Option<DateTime<Utc>>> = rows.iter().map(|row| row.answered_at).collect();
+        let ended: Vec<DateTime<Utc>> = rows.iter().map(|row| row.ended_at).collect();
+        let durations = rows
+            .iter()
+            .map(|row| to_integer(row.duration_s, "duration_s"))
+            .collect::<DomainResult<Vec<i32>>>()?;
+        let outcomes: Vec<&str> = rows.iter().map(|row| row.outcome.as_str()).collect();
+        sqlx::query(
+            "INSERT INTO messaging.call_history \
+             (user_id, call_id, peer_user_id, direction, started_at, answered_at, ended_at, \
+              duration_s, outcome) \
+             SELECT * FROM UNNEST($1::uuid[], $2::uuid[], $3::uuid[], $4::text[], \
+                $5::timestamptz[], $6::timestamptz[], $7::timestamptz[], $8::integer[], \
+                $9::text[]) \
+             ON CONFLICT (user_id, call_id) DO NOTHING",
+        )
+        .bind(users)
+        .bind(calls)
+        .bind(peers)
+        .bind(directions)
+        .bind(started)
+        .bind(answered)
+        .bind(ended)
+        .bind(durations)
+        .bind(outcomes)
+        .execute(self.conn())
+        .await
+        .map_err(store_error)?;
+        Ok(())
+    }
+
+    async fn call_history(
+        &mut self,
+        user: UserId,
+        before: Option<HistoryCursor>,
+        since: Option<HistoryCursor>,
+        limit: u32,
+    ) -> DomainResult<Vec<CallHistoryRow>> {
+        let rows = sqlx::query(
+            "SELECT user_id, call_id, peer_user_id, direction, started_at, answered_at, \
+                    ended_at, duration_s, outcome \
+             FROM messaging.call_history \
+             WHERE user_id = $1 AND hidden_at IS NULL \
+               AND ($2::timestamptz IS NULL OR (ended_at, call_id) < ($2, $3::uuid)) \
+               AND ($4::timestamptz IS NULL OR (ended_at, call_id) > ($4, $5::uuid)) \
+             ORDER BY ended_at DESC, call_id DESC \
+             LIMIT $6",
+        )
+        .bind(user.0)
+        .bind(before.map(|cursor| cursor.ended_at))
+        .bind(before.map(|cursor| cursor.call_id))
+        .bind(since.map(|cursor| cursor.ended_at))
+        .bind(since.map(|cursor| cursor.call_id))
+        .bind(i64::from(limit))
+        .fetch_all(self.conn())
+        .await
+        .map_err(store_error)?;
+        read_all(rows, call_history_row)
+    }
+
+    async fn hide_call(
+        &mut self,
+        user: UserId,
+        call: Uuid,
+        at: DateTime<Utc>,
+    ) -> DomainResult<bool> {
+        let hidden = sqlx::query(
+            "UPDATE messaging.call_history SET hidden_at = $3 \
+             WHERE user_id = $1 AND call_id = $2 AND hidden_at IS NULL",
+        )
+        .bind(user.0)
+        .bind(call)
+        .bind(at)
+        .execute(self.conn())
+        .await
+        .map_err(store_error)?
+        .rows_affected();
+        Ok(hidden == 1)
+    }
+
+    async fn delete_call_history_before(
+        &mut self,
+        cutoff: DateTime<Utc>,
+        batch: u32,
+    ) -> DomainResult<u64> {
+        let deleted = sqlx::query(
+            "DELETE FROM messaging.call_history WHERE (user_id, call_id) IN ( \
+                SELECT user_id, call_id FROM messaging.call_history \
+                WHERE ended_at < $1 LIMIT $2)",
+        )
+        .bind(cutoff)
+        .bind(i64::from(batch))
+        .execute(self.conn())
+        .await
+        .map_err(store_error)?
+        .rows_affected();
+        Ok(deleted)
+    }
+}
+
+fn direction(direction: CallDirection) -> &'static str {
+    match direction {
+        CallDirection::In => "in",
+        CallDirection::Out => "out",
+    }
+}
+
+/// One row of `messaging.call_history`.
+fn call_history_row(row: &PgRow) -> Result<CallHistoryRow, sqlx::Error> {
+    let decode_error = |column: &str, value: &str| sqlx::Error::ColumnDecode {
+        index: column.to_owned(),
+        source: format!("unknown value {value:?}").into(),
+    };
+    let direction: String = row.try_get("direction")?;
+    let direction = match direction.as_str() {
+        "in" => CallDirection::In,
+        "out" => CallDirection::Out,
+        other => return Err(decode_error("direction", other)),
+    };
+    let outcome: String = row.try_get("outcome")?;
+    let outcome = [
+        EndReason::Completed,
+        EndReason::Missed,
+        EndReason::Declined,
+        EndReason::Cancelled,
+        EndReason::Busy,
+        EndReason::Failed,
+        EndReason::Unreachable,
+    ]
+    .into_iter()
+    .find(|reason| reason.as_str() == outcome)
+    .ok_or_else(|| decode_error("outcome", &outcome))?;
+    let duration_s: i32 = row.try_get("duration_s")?;
+    Ok(CallHistoryRow {
+        call_id: row.try_get("call_id")?,
+        user: UserId(row.try_get("user_id")?),
+        peer: UserId(row.try_get("peer_user_id")?),
+        direction,
+        started_at: row.try_get("started_at")?,
+        answered_at: row.try_get("answered_at")?,
+        ended_at: row.try_get("ended_at")?,
+        duration_s: u32::try_from(duration_s).map_err(|_| sqlx::Error::ColumnDecode {
+            index: "duration_s".to_owned(),
+            source: "negative".into(),
+        })?,
+        outcome,
+    })
 }
 
 /// One row of the `conversation_overviews` query.
