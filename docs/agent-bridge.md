@@ -166,7 +166,8 @@ Create `%LOCALAPPDATA%\push-messenger\coda-bridge\config.json`. Every field:
   "default_permission_mode": "default",
   "backend": "coda",
   "coda": { "exe": "C:\\Tools\\coda\\coda.exe", "args": [] },
-  "control": true
+  "control": true,
+  "peek": true
 }
 ```
 
@@ -187,6 +188,7 @@ Create `%LOCALAPPDATA%\push-messenger\coda-bridge\config.json`. Every field:
 | `coda.exe` | with `coda` | the path to `coda.exe` (a bare name is looked up on `PATH`) | |
 | `coda.args` | no | extra arguments after `serve`, as a list | `[]` |
 | `control` | no | serve the local [control channel](#14-control-channel-for-other-tools) (the tray's status and actions, `pause`, `resume`); `false` turns it off, and the bridge works as without it (the tray then cannot see or reach it) | `true` |
+| `peek` | no | keep the owner conversation's last 50 messages in memory, masked, for the tray's [chat peek](#chat-peek) (the control channel's `peek`); `false` keeps nothing and answers `peek_disabled` | `true` |
 
 Unknown fields are refused (a typo is an error, not ignored), and a UTF-8 byte order mark
 as Notepad writes it is fine. In JSON, double every backslash. `push-agent-bridge status`
@@ -526,7 +528,7 @@ restarts."
 | Credentials in Coda's hands | The bridge never sets `CODA_SERVE_API_KEY` (an LLM credential in Coda's engine) and removes it from Coda's environment; stdio needs no key |
 | Logs | Names, codes, counts and durations only: never message bodies, previews, plans, typed answers, tokens or assertions |
 | Secrets at rest | Tokens stay in memory; the SDK's database is in memory; `state.json` holds ids only |
-| Another local user drives the bridge | The [control channel](#access-rules) is a local pipe whose DACL admits only the user and SYSTEM, and each side checks the other's user SID (Unix: a 0600 socket in a 0700 folder and a peer uid check); it carries states, counts, names and error codes only, never message content; `"control": false` turns it off |
+| Another local user drives the bridge | The [control channel](#access-rules) is a local pipe whose DACL admits only the user and SYSTEM, and each side checks the other's user SID (Unix: a 0600 socket in a 0700 folder and a peer uid check); it carries states, counts, names and error codes only, except the [chat peek](#chat-peek) (the owner conversation's last messages, masked, in memory only; `"peek": false` turns it off); `"control": false` turns the channel off |
 
 **Masking.** Previews, plans, step labels, thinking, text, command results, background
 messages and questions are masked before they leave the machine. Each match becomes
@@ -615,9 +617,9 @@ The tray keeps `tray.json` outside the bridge folders
 | "The bridge in <dir> is not running (no control channel)." | No bridge serves that folder's control channel: it is not running, `--dir` names another folder, `"control": false`, or the bridge could not bind its pipe (the log says `control_unavailable`; `kind` `AddrInUse` means another bridge already serves that folder) |
 | The tray shows an agent red with "Not set up: run keygen and enroll" | The bridge exited with code 2: run `keygen` and `enroll` for that folder, then Start it from the tray |
 | The tray shows "stopped after 5 failures (exit N)" | The bridge exited 5 times within 10 minutes; Open log from its menu, fix the cause, then Start |
-| The tray shows "running (Scheduled Task)" | The folder's Scheduled Task runs that bridge, not the tray. Stop asks it to shut down through the control channel; Quit leaves it running; the tray never restarts it; "Switch from Scheduled Task to tray…" moves it under the tray |
+| The tray shows "running (Scheduled Task)" | The folder's Scheduled Task runs that bridge, not the tray. Stop asks it to shut down through the control channel; Quit leaves it running; the tray never restarts it; "Switch from Scheduled Task…" moves it under the tray |
 | The tray shows "running (started outside the tray)" | The bridge answers but the tray did not start it and no Scheduled Task runs it: it was started in a console, by a script, or by an earlier tray process. Stop, Quit and restarts as for a Scheduled Task's bridge |
-| The tray shows "stopped" and Details lists "stopped outside the tray (exit 0)" | A bridge the tray started was stopped on purpose elsewhere: Ctrl-C, or `shutdown` from another tool (`push-agent-bridge` CLI or another control-channel client). The tray does not restart it and does not count it as a failure; Start runs it again |
+| The tray shows "stopped" and its history in the window lists "stopped outside the tray (exit 0)" | A bridge the tray started was stopped on purpose elsewhere: Ctrl-C, or `shutdown` from another tool (`push-agent-bridge` CLI or another control-channel client). The tray does not restart it and does not count it as a failure; Start runs it again |
 | "Coda is paused for an upgrade; try again when it is back." | Upgrade mode: wait for the upgrade, or `push-agent-bridge resume` |
 
 ## 12. Live smoke test (opt-in)
@@ -642,9 +644,9 @@ owner's app. Use a scratch root folder.
 ## 13. The tray app (push-agent-tray)
 
 `push-agent-tray` is a small Tauri v2 app (Windows first; [Linux later](#16-linux-plan))
-that supervises the bridge instances of the logged-on user: a tray icon whose colour shows
-the most urgent agent's state, a native menu with a submenu per agent, a small details
-window per agent and notifications. It replaces the Scheduled Task as the way the bridges
+that supervises the bridge instances of the logged-on user: a tray icon (the app's glyph
+with a badge that shows the most urgent agent's state), a slim native menu, one
+management window and notifications. It replaces the Scheduled Task as the way the bridges
 start at logon. Everything it decides lives in the crate `push-tray-core` (tested on every
 platform); `apps/push-agent-tray` is the shell around it.
 
@@ -660,19 +662,34 @@ events, and asks for its status every 10 s.
 
 ### What it shows
 
-The icon is a filled circle in the colour of the most urgent agent ("worst wins": the
-first row below that applies to any agent); with no agents it is green.
+The icon is the app's glyph, two linked chat bubbles (the owner and the agent): an
+outlined bubble top left, a solid one overlapping it bottom right. It is drawn in one
+colour that follows the taskbar: `#1b1b1b` on a light taskbar, `#ffffff` on a dark one
+(Windows: `SystemUsesLightTheme` under
+`HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize`, checked every 5 s).
+It is rendered for its size (crisp at 16, 20, 24 and 32 px). The SVG source is
+`crates/push-tray-core/assets/glyph.svg`; the app's own icon (the glyph in white on a
+rounded blue tile, used for the exe and the window) is generated from it by the build
+(`apps/push-agent-tray/build.rs` writes `icons/icon.ico` and `icons/icon.png`).
 
-| Icon | Colour | Agent states (menu label) | From the bridge's state |
-|---|---|---|---|
-| error | red `#d13438` | "stopped", "failed (exit N), retrying in S s", "stopped after 5 failures (exit N)", "Not set up: run keygen and enroll" | none: the bridge is not running |
-| disconnected | grey `#8c8c8c` | "starting", "disconnected, reconnecting", "Coda restarting", "stopping" | `starting`, `reconnecting`, `restarting`, `stopping` |
-| waiting for you | amber `#e8a317` | "waiting for you (approval needed)", "… (question)", "… (plan approval)" | `waiting` with its detail |
-| paused | purple `#8a5cd1` | "paused for an upgrade" | `paused` |
-| busy | blue `#2f6fdf` | "working" | `working` |
-| normal | green `#2e9d4f` | "connected, idle"; "running (Scheduled Task)"; "running (started outside the tray)" | `idle` (the second label when the tray did not start the process and the folder's Scheduled Task runs it, the third when no task runs it) |
+On the solid bubble's corner sits a badge, a dot in the colour of the most urgent agent
+("worst wins": the first row below that applies to any agent), with a transparent ring
+around it so it reads on any taskbar. With no agents there is no badge.
 
-A stopped agent is red, so stopping one agent turns the icon red. The tooltip has a line
+| Badge | Agent states (label) | From the bridge's state |
+|---|---|---|
+| red `#d13438` | "stopped", "failed (exit N), retrying in S s", "stopped after 5 failures (exit N)", "Not set up: run keygen and enroll" | none: the bridge is not running |
+| grey `#8c8c8c` | an agent that is up (idle, working, waiting, paused, running) while the tray has no control connection to it | |
+| amber `#e8a317` | "waiting for you (approval needed)", "… (question)", "… (plan approval)" | `waiting` with its detail |
+| purple `#8a5cd1` | "paused for an upgrade" | `paused` |
+| blue, pulsing `#3b7be8` | "starting", "stopping", "Coda restarting", "disconnected, reconnecting" | `starting`, `stopping`, `restarting`, `reconnecting` |
+| blue `#3b7be8` | "working" | `working` |
+| green `#2e9d4f` | "connected, idle"; "running (Scheduled Task)"; "running (started outside the tray)" | `idle` (the second label when the tray did not start the process and the folder's Scheduled Task runs it, the third when no task runs it) |
+
+The pulsing badge alternates two frames (full and dimmed, 0.5 s each) only while that
+state is the worst; with "Reduce motion" (the window's setting, or the system's "reduce
+motion" as the window reports it) it is a steady dot. A stopped agent is red, so stopping
+one agent turns the badge red. The tooltip has a line
 per agent, "`<name>: <label>`" (for example "Coda on Devbox (coda-devbox): waiting for
 you (approval needed)"), cut at 127 characters with "…"; without agents it reads
 "push-agent-tray" and "No agents". An agent's name is "`<display name> (<handle>)`" once
@@ -680,35 +697,86 @@ its bridge has signed in, else its folder's name.
 
 ### The menu
 
-The menu opens with a left or a right click. From the top: a line "tray.json: <error>"
-when [`tray.json`](#trayjson) could not be read; a submenu per agent ("No agents" when
-there are none); "Add agent folder…"; the check item "Start at logon"; "Switch from
-Scheduled Task to tray…" when [offered](#scheduled-tasks-and-the-switch-over); "Quit".
+A left click on the icon opens the [window](#the-window); a right click opens the menu.
+From the top: a line "tray.json: <error>" when [`tray.json`](#trayjson) could not be read;
+one line per agent, "`<name>: <state label>`" with a small dot in its badge colour ("No
+agents" when there are none), which opens the window on that agent; "Open…" (the window);
+"Add agent folder…"; the check item "Start at logon"; "Switch from Scheduled Task…" when
+[offered](#scheduled-tasks-and-the-switch-over); "Quit". Every item has an access key
+(`&` mnemonics), so the menu works without a mouse.
 
-Each agent's submenu shows its state label, "Folder: <folder>" and "Session: <session id
-or none>", then:
+With "Show last agent line in the menu" on (the window's setting, off by default), an
+agent's line shows the last line the agent wrote in its conversation instead of its
+state, cut to 60 characters ("Coda: Tests pass; 3 files changed…"). This is the only
+place outside the window where [chat peek](#chat-peek) text appears; never in the tooltip
+or a notification.
 
-| Item | Does | Enabled when |
-|---|---|---|
-| Start | starts the bridge (or runs its Scheduled Task); starts the failure count over | stopped, failed, stopped after 5 failures, not set up |
-| Stop | [stops](#stop-and-quit) the bridge gracefully | running (any running state, also one the tray did not start) or failed (cancels the pending restart) |
-| Restart Coda | `restart_backend`: Coda is stopped and started again at once; the chat stays connected | the control channel is connected (not while stopping) |
-| Reconnect | `reconnect`: the bridge signs in again and reconnects; Coda is untouched | the same |
-| Pause Coda for upgrade | `pause_backend` with the reason "paused from the tray" and the default drain ([upgrade mode](#15-upgrade-mode)) | the same, and not paused |
-| Resume | `resume_backend` | the same, and paused |
-| Open log | opens `<folder>\logs\bridge.log` (says so when there is none yet) | always |
-| Open folder | opens the folder in Explorer | always |
-| Details… | the agent's details window | always |
+### The window
 
-An agent whose bridge exited with code 2 shows "Not set up: run keygen and enroll"; only
-Start, Open folder and Details… are enabled. A refused action is not a dialog: its error
-shows as the last error in Details.
+One window, "push-agent-tray" (900 × 600 at first, resizable; its size and position are
+kept in `tray.json`). A left click on the icon, "Open…", an agent's menu line and a second
+launch of the tray show and focus it; closing it hides it (the tray keeps running).
+Everything in it works with the keyboard (Tab, the arrow keys in the agent list and the
+tabs).
 
-The details window ("<name> — details", 420 × 520) shows the state, folder, session,
-Coda's version, running tasks, the last error (the tray's own, else the bridge's error
-code), the last exit code, and the last 50 states with their times, newest first. It
-refreshes every 2 s. Closing it does not quit the tray.
+**Left:** the agents, each with its name (display name and handle), its badge, its state
+label and its folder; below them "Add agent folder…".
 
+**Right:** the selected agent, in four tabs.
+
+- **Overview:** the state with its badge and label; the actions; the folder, session,
+  Coda's version, uptime, running tasks, last error (the tray's own, else the bridge's
+  error code) and last exit code; "Open folder"; the last 50 states with their times,
+  newest first. A refused action says so next to its button, not in a dialog.
+
+  | Action | Does | Enabled when |
+  |---|---|---|
+  | Start | starts the bridge (or runs its Scheduled Task); starts the failure count over | stopped, failed, stopped after 5 failures, not set up |
+  | Stop | [stops](#stop-and-quit) the bridge gracefully | running (any running state, also one the tray did not start) or failed (cancels the pending restart) |
+  | Restart Coda | `restart_backend`: Coda is stopped and started again at once; the chat stays connected | the control channel is connected (not while stopping) |
+  | Reconnect | `reconnect`: the bridge signs in again and reconnects; Coda is untouched | the same |
+  | Pause for upgrade | `pause_backend` with the reason "paused from the tray" and the default drain ([upgrade mode](#15-upgrade-mode)) | the same, and not paused |
+  | Resume | `resume_backend` | the same, and paused |
+
+  An agent whose bridge exited with code 2 shows "Not set up: run keygen and enroll"; only
+  Start is enabled.
+- **Chat:** the [chat peek](#chat-peek): the last messages of the agent's conversation
+  with its owner, newest last, each with its time, as plain text. "Open in messenger"
+  opens `https://<host>/`, the host of `api_url` in the bridge's `config.json`, when that
+  is an `https://` URL. The tab refreshes when the bridge says the peek changed, and at
+  least every 2 s while it is shown; never while the window is hidden.
+- **Logs:** a live tail of `<folder>\logs\bridge.log`: the last 500 lines, followed as the
+  file grows (and read again when it is rotated). Each JSON line is shown as time, level,
+  event and its other fields; "Raw" shows the lines as written. A level filter (Info: all;
+  Warn: warnings and errors; Error), a search box, "Copy" (the shown lines) and "Open in
+  editor". The log holds no message content.
+- **Settings:** "Autostart" (start this agent with the tray); "Show chat peek" (on by
+  default) and "Messages kept" (10–50, default 20); the bridge's `config.json` path,
+  read-only, and "Open config" (opens it in its editor: the tray itself never writes
+  `config.json`); "Remove agent from tray" (asks again inline; the folder leaves
+  `tray.json` and the tray stops the bridge if it runs it; the agent stays enrolled and
+  its folder is untouched).
+
+**Bottom:** "Start at logon", "Reduce motion", "Show last agent line in the menu",
+"Switch from Scheduled Task…" (when offered) and "Quit".
+
+### Chat peek
+
+The bridge keeps, in memory only, the last 50 messages of the conversation with its owner:
+what the owner sent (texts and card answers), what the bridge sent (reply text, card
+titles with their choices, the bridge's own notes) and one line per tool step ("✓
+run_command dotnet test"). Each entry is masked exactly as it was sent (the bridge masks
+before sending; the owner's texts are masked the same way) and cut to 300 characters.
+Nothing is written to disk, and the entries are gone when the bridge exits. The window
+asks for the last 20 (the agent's "Messages kept") with the control channel's
+[`peek`](#requests) request.
+
+**Privacy.** Peek is the one place where (masked) message text crosses the control
+channel; everything else on it stays content-free. It is local and per user like the rest
+of the channel ([access rules](#access-rules)). It can be turned off per agent in the
+bridge (`"peek": false` in `config.json`: the bridge keeps nothing and answers
+`peek_disabled`) and in the tray ("Show chat peek" off: the tray does not ask). Logs,
+notifications and the tooltip never show it.
 ### Start at logon
 
 The check item writes the value `push-agent-tray` under
@@ -740,6 +808,14 @@ on Linux.
 | `version` | must be `1` | `1` |
 | `instances[].dir` | a bridge folder (the bridge's `--dir`) | |
 | `instances[].autostart` | start it when the tray starts | `true` |
+| `instances[].show_peek` | the window's Chat tab asks this bridge for its [chat peek](#chat-peek) | `true` |
+| `instances[].peek_messages` | how many peek entries the Chat tab shows (10–50) | `20` |
+| `menu_peek` | an agent's menu line shows its last line ("Show last agent line in the menu") | `false` |
+| `reduce_motion` | the badge does not pulse | `false` |
+| `window` | `{x, y, width, height}`: where the window was last closed | |
+
+Fields at their default are not written. The window's settings change this file (only
+when it could be read).
 
 Unknown fields are refused; a byte order mark is fine; a missing file means no folders.
 Two entries for the same folder (by [instance id](#endpoints): case, `/` and a trailing
@@ -752,8 +828,8 @@ separator do not matter on Windows) count once.
   is not a bridge folder: it has no config.json"); one already listed is refused ("… is
   already in the tray."). It is added with `autostart` and started (unless a Scheduled Task
   runs it).
-- The tray writes the file atomically (`tray.json.tmp`, then renamed over it). To remove a
-  folder or turn its `autostart` off, edit the file while the tray is not running.
+- The tray writes the file atomically (`tray.json.tmp`, then renamed over it). The
+  window's Settings turn an agent's `autostart` on or off and remove it from the tray.
 - A file that cannot be read or parsed (or has another `version`) is never overwritten:
   the menu's first line shows the error, the default folder is still supervised, and "Add
   agent folder…" and the switch-over refuse until the file is fixed (or deleted) and the
@@ -770,7 +846,7 @@ that a task runs (never both): it does not start it at logon, it only connects t
 idle one shows "running (Scheduled Task)"), Start runs the task (`Start-ScheduledTask`) and
 Stop asks the bridge to shut down.
 
-While such a task exists, the menu offers "Switch from Scheduled Task to tray…". After the
+While such a task exists, the menu offers "Switch from Scheduled Task…". After the
 confirmation ("Stop and remove the Scheduled Task(s) <names>, start push-agent-tray at
 logon, and run these agents under the tray instead?", Switch or Cancel) the tray:
 
@@ -800,9 +876,9 @@ delay, except after exit code 0 or 2:
 | Rule | Value |
 |---|---|
 | Delay | 1 s, then 2 s, 4 s, … up to 60 s; a run of 60 s or more starts the delay over; shown as "failed (exit N), retrying in S s" |
-| Giving up | at the 5th exit within 10 minutes: "stopped after 5 failures (exit N)" and the notification "<name> stopped after 5 failures (exit N). Open its log from the tray menu." |
+| Giving up | at the 5th exit within 10 minutes: "stopped after 5 failures (exit N)" and the notification "<name> stopped after 5 failures (exit N). Open its log from the tray window." |
 | Exit code 2 (no key, not enrolled, key not accepted) | never retried: "Not set up: run keygen and enroll" and the notification "<name> is not set up: run keygen and enroll." |
-| Exit code 0 the tray did not ask for | the bridge exits 0 only when stopped on purpose (Ctrl-C, or `shutdown` from another tool such as the CLI): "stopped", with "stopped outside the tray (exit 0)" in the details' history; never restarted and not counted |
+| Exit code 0 the tray did not ask for | the bridge exits 0 only when stopped on purpose (Ctrl-C, or `shutdown` from another tool such as the CLI): "stopped", with "stopped outside the tray (exit 0)" in the window's history; never restarted and not counted |
 | A bridge that cannot be started (no `push-agent-bridge.exe` next to the tray) | counts as an exit |
 | Start | forgets the exits and starts the delay over |
 
@@ -830,26 +906,36 @@ life, so after a tray crash they keep running and the next tray only shows them,
 ### What it never does
 
 The tray never runs `keygen` or `enroll`, never touches keys, tokens, `config.json` or
-`state.json`, and never sees message content: the control channel carries states, counts,
-names and error codes only, and so do its menu, tooltip, details window and
-notifications. It changes Scheduled Tasks only in a switch-over the user confirmed.
+`state.json` (it only reads `config.json`'s `api_url` for "Open in messenger" and opens the
+file in its editor when asked), and never sees message content except the masked [chat
+peek](#chat-peek) in the window's Chat tab (and, when turned on, the menu's last agent
+line): the control channel's other requests and events carry states, counts, names and
+error codes only, and so do the tooltip and the notifications. It changes Scheduled Tasks
+only in a switch-over the user confirmed.
 
 ### Security
 
 - No network listener: the tray is only a client of the bridges' local, per-user [control
   channels](#access-rules).
-- The details window loads only the page bundled into the exe at build time (`dist/`), no
+- The window loads only the page bundled into the exe at build time (`dist/`), no
   remote content, under this CSP (`tauri.conf.json`):
 
   ```text
   default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src ipc: http://ipc.localhost; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'
   ```
 
-- The details windows (`details-*`) are granted no IPC permissions at all
-  (`capabilities/default.json` has `"permissions": []`: no core or plugin command such as
-  tray, menu, window or event), and the global Tauri API is off. They reach the app only
-  through its one `details` command, which answers for the window's own agent with
-  content-free fields; the page renders with `textContent`, never HTML.
+- The window (`main`) is granted no IPC permissions at all (`capabilities/default.json`
+  has `"permissions": []`: no core or plugin command such as tray, menu, window or event),
+  and the global Tauri API is off. It reaches the app only through the app's own commands
+  (`window_view`, `agent_view`, `act`, `open_folder`, `open_config`, `open_log`,
+  `log_tail`, `peek`, `open_messenger`, `set_agent_setting`, `set_global_setting`,
+  `remove_agent`, `add_folder`, `set_start_at_logon`, `switch_over`, `quit`,
+  `report_motion`), which answer only the `main` window. The page renders everything with
+  `textContent`, never HTML or Markdown, and shows no links. `peek` answers only while the
+  window is visible.
+- "Open in messenger" opens only `https://<host>/` built from the bridge's own
+  `config.json` (`api_url`, which must be `https://`, with a plain host name), never a URL
+  from the page or from a message.
 - Helper programs run without a shell, with full paths under `%SystemRoot%` where they are
   Windows tools (`reg.exe`, `powershell.exe` with `-EncodedCommand`, `explorer.exe`), and
   without windows.
@@ -872,7 +958,9 @@ cargo build --manifest-path apps/push-agent-tray/Cargo.toml --release
 The exe is `apps/push-agent-tray/target/release/push-agent-tray.exe`. The app is its own
 Cargo workspace (excluded from the root one, so Tauri stays out of the root lockfile and
 MSRV); no Tauri CLI and no Node are needed. It needs the WebView2 runtime, part of Windows
-10 and 11, for the details window. CI builds it on Windows (job `tray-windows`).
+10 and 11, for the window. CI builds it on Windows (job `tray-windows`). The build
+renders the app icon (`icons/icon.ico`, `icons/icon.png`) from the glyph's SVG; these two
+files are generated, not checked in.
 
 **Signed builds:** not yet. The exe is unsigned, so SmartScreen may warn on first run;
 code signing is a follow-up.
@@ -954,6 +1042,17 @@ read, else `id` 0) and the connection stays; an unknown method gets `unknown_met
 | `shutdown` | none | `{"stopping": true}`, then the bridge [stops](#stop-and-quit) and exits with 0 | `timeout` |
 | `pause_backend` | `reason` (string, trimmed, at most 100 characters kept), `drainTimeoutMs` (default 600,000) | at the release: `{"state": "paused", "prepared": <bool>, "drained": <bool>, "interruptedTasks": <n>}`; already released: at once `{"state": "paused", "phase": "<phase>"}` ([upgrade mode](#15-upgrade-mode)) | `prepare_failed`, `cancelled` (a `resume_backend` cancelled the drain), `stopping` (the bridge stopped meanwhile), `unavailable`, `timeout` |
 | `resume_backend` | none | `{"resumed": true}`; a draining pause is cancelled: `{"resumed": true, "cancelled": true}` | `not_paused`, `exe_unavailable` ("coda.exe is missing or in use"), `unavailable`, `timeout` |
+| `peek` | `limit` (default 20, clamped to 1–50) | `{"entries": [...]}`: the [chat peek](#chat-peek)'s last `limit` entries, oldest first (newest last), at once | `peek_disabled` (`"peek": false` in the bridge's `config.json`) |
+
+A peek entry is `{"time": <unix ms>, "from": "owner"|"agent", "kind": "text"|"reply"|"card"|"answer"|"step"|"note", "text": "…", "card_state": "open"|"answered"|"declined"|"expired"}`
+(`card_state` only for cards). `text` is masked as it was sent and at most 300
+characters. Kinds: `text` the owner's message, `answer` the owner's card answer (the
+chosen choices), `reply` the agent's reply (with its title, "Title: text"), `card` a card's
+title or question and its choices ("Allow run_command? [Approve] [Reject]"), `step` one
+line per tool step ("✓ run_command dotnet test", "✗ …" failed, "… …" running), `note` the
+bridge's own words ("(Coda stopped; restarting)"). An edited reply (a streaming one)
+replaces its entries in place. `peek` is answered while the bridge signs in too (with what
+it has).
 
 `unavailable` ("the bridge is signing in") answers every action but `shutdown` and
 `reconnect` while the bridge signs in or waits to sign in again. `timeout` is the hub's own
@@ -973,6 +1072,7 @@ a pause normally answers within that limit.
 | `request_opened` | `kind`: `permission`, `question`, `plan` or `bypass`; `open`: the open requests now | a card opens |
 | `request_closed` | `kind`; `outcome`: `answered`, `declined` or `expired`; `open` | a card is answered, declined or expires |
 | `error` | `code` (Coda's JSON-RPC code or the bridge's, such as `-32603`, `exited`, `spawn`, `timeout`), `method` (such as `session/prompt`, `initialize`) | a Coda call failed |
+| `peek_changed` | none | the [chat peek](#chat-peek) changed (only with `"peek": true`); ask `peek` for the entries |
 
 States, from the most important: `stopping`; `paused` (detail "upgrading Coda", or
 "waiting for Coda's program"); `reconnecting` (the messenger connection is down, or the
@@ -1062,7 +1162,12 @@ $pipe.Dispose()
 - Content-free: no message bodies, previews, plans, answers, tool targets or labels,
   thinking, tokens, keys or enrollment codes, in events, in the status or in the bridge's
   logs about the channel; only states, counts, names (the agent's display name and handle,
-  the backend's name and version, the folder, the session id) and error codes.
+  the backend's name and version, the folder, the session id) and error codes. The one
+  exception is the `peek` result: the owner conversation's last messages, masked as sent
+  and cut to 300 characters, kept in memory only, and only when `config.json` has
+  `"peek": true` (the default). Tests check this: the protocol's types classify every
+  request, event and status field, and a bridge test sends a marker through a whole
+  conversation and finds it on the channel only in `peek`.
 - Per user: only the same user (or SYSTEM) can connect, and clients can check that the
   bridge is the user's too.
 - Every request gets exactly one response with its `id`; `hello` and the current state
@@ -1241,7 +1346,8 @@ Linux; the tray shell is built and tested on Windows only. The plan for Linux:
 - **Tray:** the same Tauri app; its tray icon on Linux is a StatusNotifierItem through
   AppIndicator, so it needs `libayatana-appindicator3` (or `libappindicator3`) and a
   desktop that shows such items (GNOME needs the AppIndicator extension), plus WebKitGTK
-  for the details window.
+  for the window. The glyph's colour should follow the panel's theme (dark until that is
+  wired).
 - **Start at logon:** the tray's "Start at logon" writes the XDG autostart entry
   `$XDG_CONFIG_HOME/autostart/push-agent-tray.desktop` (implemented in `push-tray-core`):
 
@@ -1293,19 +1399,22 @@ switch-over).
 
 1. **Two agents show in the tray, each with its state.** Start `push-agent-tray.exe`. The
    default folder is added by itself; add the second with "Add agent folder…". Expected:
-   two submenus named "<display name> (<handle>)", each with "connected, idle", its folder
-   and session; a green icon; the tooltip has one line per agent; `tray.json` lists both
-   folders.
-2. **A card opening turns the icon to "waiting for you".** Ask one agent to edit a scratch
-   file. While the turn runs the icon is blue ("working"); when the "Allow …?" card
-   opens it turns amber, and the tooltip and the submenu say "waiting for you (approval
-   needed)". Approve: blue again, then green when the turn ends.
-3. **Restart Coda keeps the chat connected.** Choose the agent's "Restart Coda". Expected
-   in the chat: "(Coda is restarting: the owner asked)", then "Coda restarted by the
-   owner." with what was lost; the icon is grey ("Coda restarting") for a moment, then
-   green. The agent stays online, the next message is answered, and `/status` shows the
-   same session.
-4. **Reconnect signs in again.** Choose "Reconnect". Expected: "disconnected,
+   the glyph in the taskbar's colour (switch Windows between light and dark mode: it
+   follows within 5 s) with a green badge; two menu lines "<display name> (<handle>):
+   connected, idle" with green dots; the tooltip has one line per agent; `tray.json` lists
+   both folders. A left click opens the window with both agents; a second launch of the
+   exe focuses it; closing and reopening it keeps its size and position.
+2. **A card opening turns the badge to "waiting for you".** Ask one agent to edit a scratch
+   file. While the turn runs the badge is blue ("working"); when the "Allow …?" card opens
+   it turns amber, and the tooltip, the menu line and the window say "waiting for you
+   (approval needed)". The Chat tab shows the request, the tool steps and the card "Allow
+   …? [Approve] [Reject]" (open); approve: the card shows answered, the badge goes blue
+   again, then green when the turn ends.
+3. **Restart Coda keeps the chat connected.** Choose the agent's "Restart Coda" in the
+   window. Expected in the chat: "(Coda is restarting: the owner asked)", then "Coda
+   restarted by the owner." with what was lost; the badge pulses blue ("Coda restarting")
+   for a moment (steady with "Reduce motion" checked), then green. The agent stays online,
+   the next message is answered, and `/status` shows the same session.4. **Reconnect signs in again.** Choose "Reconnect". Expected: "disconnected,
    reconnecting" for a moment, then "connected, idle"; the log shows `messenger_reconnect`
    and no `backend_exited`; Coda was not restarted (no "Coda restarted" in the chat, the
    same session in `/status`).
@@ -1319,3 +1428,14 @@ switch-over).
    `"<path>\push-agent-tray.exe" --autostart`. Sign out of Windows and back in. Expected:
    the tray icon appears without a console window, both agents come back "connected,
    idle" (started by the tray: Quit stops them), and both answer a message.
+7. **Logs, settings and the chat peek's switches.** In the Logs tab, the last lines show
+   formatted and new ones appear as the agent works; "Warn" hides the info lines, the
+   search filters, "Raw" shows the JSON, "Copy" copies, "Open in editor" opens the file.
+   In Settings, change "Messages kept" to 10 and turn "Show chat peek" off: the Chat tab
+   says the peek is off; restart the tray: the settings are kept. Set `"peek": false` in
+   the bridge's `config.json` and restart that agent: the Chat tab says the bridge has
+   the peek turned off. Turn "Show last agent line in the menu" on: the agent's menu line
+   shows its last reply (60 characters at most).
+8. **The keyboard is enough.** With the window focused, Tab through the agent list (Up
+   and Down select), the tabs (Left and Right switch) and the buttons; open the tray menu
+   with Win+B and the arrow keys, the context-menu key (or Shift+F10), and the access keys.

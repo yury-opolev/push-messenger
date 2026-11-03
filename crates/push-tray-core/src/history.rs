@@ -1,4 +1,4 @@
-//! An agent's recent states, for the details window.
+//! An agent's recent states, for the window's Overview.
 
 use std::collections::VecDeque;
 
