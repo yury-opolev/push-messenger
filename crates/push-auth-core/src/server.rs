@@ -19,6 +19,7 @@ use tokio_util::sync::CancellationToken;
 use crate::admin::{AdminApi, admin_router};
 use crate::agent_key::AgentKeySignIn;
 use crate::api::{Api, router};
+use crate::calls::{CallLog, GrpcCalls, NoCalls};
 use crate::config::{Config, MigrateConfig};
 use crate::db::{MIGRATOR, grant_worker_access_on};
 use crate::directory::{Directory, GrpcDirectory, NoDirectory, message_svc};
@@ -80,25 +81,33 @@ pub async fn serve_with(
     let tokens = AccessTokens::from_seed(&config.signing_key, config.token_audience.clone())
         .map_err(anyhow::Error::msg)?;
     let links = LinkSigner::new(config.link_key.clone()).map_err(anyhow::Error::msg)?;
-    let (directory, templates): (Arc<dyn Directory>, Arc<dyn TemplateRegistry>) =
-        match (&config.message_svc_url, &config.directory_token) {
-            (Some(url), Some(token)) => {
-                // One channel for both APIs: they are served on the same listener.
-                let channel = message_svc(url, token).map_err(anyhow::Error::msg)?;
-                (
-                    Arc::new(GrpcDirectory::over(channel.clone())),
-                    Arc::new(GrpcTemplates::over(channel)),
-                )
-            }
-            _ => {
-                tracing::warn!(
-                    "PUSH_MESSAGE_SVC_URL is not set: GET /v1/users and the template routes \
-                     answer 503, since only message-svc knows whose profiles a user may see \
-                     and keeps the templates"
-                );
-                (Arc::new(NoDirectory), Arc::new(NoTemplates))
-            }
-        };
+    let (directory, templates, call_history): (
+        Arc<dyn Directory>,
+        Arc<dyn TemplateRegistry>,
+        Arc<dyn CallLog>,
+    ) = match (&config.message_svc_url, &config.directory_token) {
+        (Some(url), Some(token)) => {
+            // One channel for every API: they are served on the same listener.
+            let channel = message_svc(url, token).map_err(anyhow::Error::msg)?;
+            (
+                Arc::new(GrpcDirectory::over(channel.clone())),
+                Arc::new(GrpcTemplates::over(channel.clone())),
+                Arc::new(GrpcCalls::over(channel)),
+            )
+        }
+        _ => {
+            tracing::warn!(
+                "PUSH_MESSAGE_SVC_URL is not set: GET /v1/users, the template routes and \
+                     the call history answer 503, since only message-svc knows whose profiles \
+                     a user may see and keeps the templates and calls"
+            );
+            (
+                Arc::new(NoDirectory),
+                Arc::new(NoTemplates),
+                Arc::new(NoCalls),
+            )
+        }
+    };
     let ready = Health {
         pool: Arc::new(OnceLock::new()),
         shutdown: shutdown.clone(),
@@ -262,6 +271,7 @@ pub async fn serve_with(
         client_ip_header: config.client_ip_header.clone(),
         directory,
         templates: Arc::clone(&templates),
+        call_history,
     });
     // The admin listener exists only with its token (spec D15).
     let admin_server = match &config.admin_token {

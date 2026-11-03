@@ -123,6 +123,7 @@ pub(crate) fn event(
         ("DELETE", "/v1/devices/{device_id}") if ok => "auth.device.revoked",
         ("POST", "/v1/templates") if ok => "auth.template.submitted",
         ("POST", "/v1/templates") if status == StatusCode::CONFLICT => "auth.template.refused",
+        ("DELETE", "/v1/calls/{call_id}") if ok => "calls.history.hidden",
         _ if status == StatusCode::UNAUTHORIZED => "auth.token.refused",
         _ => return None,
     };
@@ -345,6 +346,21 @@ mod tests {
                 Some("auth.rate_limited"),
             ),
             (&Method::GET, "/v1/templates", 200, None, None),
+            (&Method::GET, "/v1/calls", 200, None, None),
+            (
+                &Method::DELETE,
+                "/v1/calls/{call_id}",
+                204,
+                None,
+                Some("calls.history.hidden"),
+            ),
+            (
+                &Method::DELETE,
+                "/v1/calls/{call_id}",
+                400,
+                Some("invalid"),
+                None,
+            ),
             (
                 &Method::GET,
                 "/v1/templates",

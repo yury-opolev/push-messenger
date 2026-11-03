@@ -10,6 +10,7 @@ pub mod agent_key;
 mod agents;
 pub mod api;
 mod audit;
+pub mod calls;
 mod config;
 mod db;
 mod devices;
@@ -34,6 +35,7 @@ pub use agent_key::{AgentKeySettings, AgentKeySignIn};
 /// The attribute an [`Authenticator`] or `Admission` implementation needs, so a binary of
 /// one's own uses the same version.
 pub use async_trait::async_trait;
+pub use calls::{CallLog, GrpcCalls, NoCalls};
 pub use config::{Config, ConfigError, MigrateConfig};
 pub use db::{
     MIGRATOR, grant_worker_access, grant_worker_access_on, is_role_name, migrate_database,

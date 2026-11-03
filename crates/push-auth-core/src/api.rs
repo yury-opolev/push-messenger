@@ -1,6 +1,7 @@
 //! The public HTTP API (spec §2, §5; Entra ID sign-in: spec 2026-10-19 §4): `/v1/auth/*`,
-//! `/v1/devices/*`, `/v1/agents*`, `/v1/users*` and `/v1/templates` (spec 2026-10-26 rich
-//! message templates), JSON in and out, plus the two small pages that email links open.
+//! `/v1/devices/*`, `/v1/agents*`, `/v1/users*`, `/v1/templates` (spec 2026-10-26 rich
+//! message templates) and `/v1/calls` (call history, voice calls spec §9), JSON in and out,
+//! plus the two small pages that email links open.
 //!
 //! Errors are `{"error": {"code", "message", "retryable"}}` with the status of
 //! [`AuthError::status`]; 429 answers carry `Retry-After`, 401 answers
@@ -32,6 +33,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::audit::{self, ErrorCode, Subject};
+use crate::calls::{CallCursor, CallLog};
 use crate::devices::{Caller, Tokens};
 use crate::directory::Directory;
 use crate::error::AuthError;
@@ -57,6 +59,8 @@ pub struct Api {
     pub directory: Arc<dyn Directory>,
     /// The template registry: message-svc's `Templates` API.
     pub templates: Arc<dyn TemplateRegistry>,
+    /// The call history: message-svc's `Calls` API.
+    pub call_history: Arc<dyn CallLog>,
 }
 
 /// The router of the public API. Without email and password sign-in its routes do not
@@ -98,6 +102,8 @@ pub fn router(api: Api) -> Router {
         .route("/v1/users/me", get(own_profile).patch(update_profile))
         .route("/v1/users/lookup", get(lookup))
         .route("/v1/templates", post(submit_template).get(template_catalog))
+        .route("/v1/calls", get(call_history))
+        .route("/v1/calls/{call_id}", delete(hide_call))
         .route_layer(axum::middleware::from_fn_with_state(
             api.clone(),
             audit::audit,
@@ -944,6 +950,104 @@ fn bad_since() -> AuthError {
         field: "since",
         reason: "expected a whole number of at least 0",
     })
+}
+
+#[derive(Deserialize)]
+struct CallsQuery {
+    #[serde(default)]
+    before: Option<String>,
+    #[serde(default)]
+    since: Option<String>,
+    #[serde(default)]
+    limit: Option<String>,
+}
+
+/// `GET /v1/calls?before=<cursor>&since=<cursor>&limit=N` (voice calls spec §9): the
+/// caller's own calls they did not hide, newest first, strictly older than `before` and
+/// newer than `since` when given, at most `limit` (1 to 100, default 50):
+/// `{calls: [{call_id, peer_user_id, direction, started_at, answered_at?, ended_at,
+/// duration_s, outcome, cursor}], next?}`. `next` (the last call's cursor) is present when
+/// the page is full: ask again with `before=<next>`. Rate limited per IP and per user.
+async fn call_history(
+    State(api): State<Api>,
+    headers: HeaderMap,
+    ClientIp(ip): ClientIp,
+    query: Result<Query<CallsQuery>, QueryRejection>,
+) -> Result<Response, AuthError> {
+    let caller = caller(&api, &headers).await?;
+    api.limits
+        .check(Action::CallHistory, ip, Some(&caller.user_id.to_string()))
+        .await?;
+    let Ok(Query(query)) = query else {
+        return Err(AuthError::Invalid(Invalid {
+            field: "query",
+            reason: "expected before, since and limit only once each",
+        }));
+    };
+    let limit = match query.limit.as_deref() {
+        None => 50,
+        Some(limit) => limit
+            .parse::<u32>()
+            .ok()
+            .filter(|limit| (1..=100).contains(limit))
+            .ok_or(AuthError::Invalid(Invalid {
+                field: "limit",
+                reason: "expected a whole number from 1 to 100",
+            }))?,
+    };
+    let before = call_cursor(query.before.as_deref(), "before")?;
+    let since = call_cursor(query.since.as_deref(), "since")?;
+    let calls = api
+        .call_history
+        .history(caller.user_id, before, since, limit)
+        .await?;
+    let mut answer = json!({
+        "calls": calls.iter().map(|call| call.to_json()).collect::<Vec<_>>(),
+    });
+    if let (Some(last), true, Value::Object(fields)) =
+        (calls.last(), calls.len() == limit as usize, &mut answer)
+    {
+        fields.insert("next".to_owned(), Value::String(last.cursor.encode()));
+    }
+    Ok(Json(answer).into_response())
+}
+
+fn call_cursor(text: Option<&str>, field: &'static str) -> Result<Option<CallCursor>, AuthError> {
+    text.map(|text| {
+        CallCursor::decode(text).ok_or(AuthError::Invalid(Invalid {
+            field,
+            reason: "expected a cursor from an earlier answer",
+        }))
+    })
+    .transpose()
+}
+
+/// `DELETE /v1/calls/{call_id}`: hides the call from the caller's own history only; the
+/// other participant still sees it. 204 whether or not the caller had such a call, so the
+/// answer never tells which calls exist. Rate limited per IP and per user.
+async fn hide_call(
+    State(api): State<Api>,
+    headers: HeaderMap,
+    ClientIp(ip): ClientIp,
+    Path(call_id): Path<String>,
+) -> Result<Response, AuthError> {
+    let caller = caller(&api, &headers).await?;
+    api.limits
+        .check(Action::CallHistory, ip, Some(&caller.user_id.to_string()))
+        .await?;
+    let call = call_id.parse::<Uuid>().map_err(|_| {
+        AuthError::Invalid(Invalid {
+            field: "call_id",
+            reason: "expected a call id (a UUID)",
+        })
+    })?;
+    api.call_history.hide(caller.user_id, call).await?;
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    response.extensions_mut().insert(Subject {
+        user: Some(caller.user_id),
+        device: Some(caller.device_id),
+    });
+    Ok(response)
 }
 
 /// Whether `If-None-Match` names `etag` (weakly compared, as RFC 9110 asks) or is `*`.
