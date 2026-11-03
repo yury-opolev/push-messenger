@@ -14,6 +14,7 @@ use push_store::{DatabaseTarget, DatabaseVars, StoreOptions, postgres_auth};
 use crate::agent_key::AgentKeySettings;
 use crate::db::is_role_name;
 use crate::entra::{EntraAppSettings, EntraSettings, Providers};
+use crate::turn::TurnSettings;
 
 /// How the service runs. Read from the environment by [`Config::from_env`]:
 ///
@@ -56,6 +57,16 @@ use crate::entra::{EntraAppSettings, EntraSettings, Providers};
 /// | `PUSH_AGENTS_PER_USER` | active + unexpired pending agents per human owner, 0 to 100; 0 disables reservation/redemption | `2` |
 /// | `PUSH_AUTH_ADMIN_TOKEN` | the admin API's bearer token, 32 to 256 visible ASCII characters; unset: no admin listener (spec 2026-10-19 D15) | none |
 /// | `PUSH_AUTH_ADMIN_ADDR` | address of the admin listener; never expose it publicly | `0.0.0.0:8082` |
+/// | `PUSH_TURN_MODE` | voice call relays: `internal`, `external` or `stun-only`; unset: `GET /v1/calls/ice-servers` answers `turn_unavailable` | none |
+/// | `PUSH_TURN_TTL_SECONDS` | credential lifetime, 60 to 86400 | `600` |
+/// | `PUSH_TURN_STUN_URLS` | comma-separated `stun:`/`stuns:` URLs listed first; required with `stun-only` | none |
+/// | `PUSH_TURN_URLS` | `internal` and `external` `generic`: comma-separated `turn:`/`turns:` URLs | required there |
+/// | `PUSH_TURN_PROVIDER` | `external`: `generic`, `cloudflare` or `twilio` | `generic` |
+/// | `PUSH_TURN_SHARED_SECRET` | `internal` and `generic`: the TURN REST shared secret, at least 16 visible ASCII characters | required there |
+/// | `PUSH_TURN_CLOUDFLARE_KEY_ID`, `PUSH_TURN_CLOUDFLARE_TOKEN` | `cloudflare`: the TURN key id and its API token | required there |
+/// | `PUSH_TURN_TWILIO_ACCOUNT_SID`, `PUSH_TURN_TWILIO_TOKEN` | `twilio`: the account SID and auth token | required there |
+///
+/// The TURN secrets also accept `_FILE` alternatives.
 ///
 /// `http://` public URLs and `ws://` audiences are accepted only for local hosts
 /// (`localhost`, `127.0.0.1`, `*.local`, `*.localhost`, `*.test`), like the chart's guard.
@@ -93,6 +104,8 @@ pub struct Config {
     pub admin_token: Option<String>,
     /// Where the admin listener listens.
     pub admin_addr: SocketAddr,
+    /// Voice call relays (TURN); none: `GET /v1/calls/ice-servers` answers unavailable.
+    pub turn: Option<TurnSettings>,
 }
 
 impl std::fmt::Debug for Config {
@@ -129,6 +142,7 @@ impl std::fmt::Debug for Config {
                 &self.admin_token.as_ref().map(|_| "<redacted>"),
             )
             .field("admin_addr", &self.admin_addr)
+            .field("turn", &self.turn)
             .finish()
     }
 }
@@ -322,6 +336,7 @@ impl Config {
                 ));
             }
         }
+        let turn = TurnSettings::from_lookup(lookup_dyn)?;
         Ok(Self {
             database,
             redis,
@@ -347,6 +362,7 @@ impl Config {
             agents_per_user,
             admin_token,
             admin_addr: parsed(&lookup, "PUSH_AUTH_ADMIN_ADDR", ([0, 0, 0, 0], 8082).into())?,
+            turn,
         })
     }
 }
@@ -478,7 +494,7 @@ fn runtime_role(lookup: &impl Fn(&str) -> Option<String>) -> Result<Option<Strin
 }
 
 /// A datastore or identity variable that is missing or invalid; values are never shown.
-fn problem(problem: ConfigProblem) -> ConfigError {
+pub(crate) fn problem(problem: ConfigProblem) -> ConfigError {
     match problem {
         ConfigProblem::Missing(name) => ConfigError::Missing(name),
         ConfigProblem::Invalid { name, reason } => redacted(name, reason),
@@ -503,7 +519,7 @@ fn flag(
     }
 }
 
-fn redacted(name: &'static str, reason: String) -> ConfigError {
+pub(crate) fn redacted(name: &'static str, reason: String) -> ConfigError {
     ConfigError::Invalid {
         name,
         value: "<redacted>".to_owned(),

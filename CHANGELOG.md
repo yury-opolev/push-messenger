@@ -6,6 +6,28 @@ Notable changes for consumers of push-messenger. Newest first.
 
 ### Added
 
+- **Voice call relays (TURN)**: `GET /v1/calls/ice-servers` on auth-svc (access token)
+  answers the browser-ready ICE servers with short-lived credentials,
+  `{"ice_servers": [{urls, username?, credential?}], "expires_at", "relay"}`, or
+  `503 turn_unavailable` instead of servers that could not work; 60 requests per user per
+  hour. Chart values `calls.turn.*` choose the relay: `internal` (default) deploys a
+  hardened coturn (`coturn/coturn:4.18.0-alpine` pinned by digest; TURN REST credentials
+  `<expiry>:<user id>` / `base64(HMAC-SHA1(turn-shared-secret, username))`; its own
+  UDP+TCP LoadBalancer Service with the relay port range; `denied-peer-ip` for RFC 1918,
+  CGNAT, loopback, link-local and cloud metadata addresses, their IPv6 equivalents and the
+  required `calls.turn.internal.deniedPeerCidrs`; per-user and total quotas and a
+  bandwidth cap; probes; a NetworkPolicy; Prometheus on 9641), `external` uses a generic
+  TURN REST provider, Cloudflare Realtime TURN or Twilio (minted through their APIs and
+  kept per user until shortly before expiry), `stun-only` is for development. New Secret
+  keys `turn-shared-secret` (generated for a chart-managed Secret in `internal` mode),
+  `turn-cloudflare-token` and `turn-twilio-token`; external providers need a
+  consumer-managed Secret or `secrets.volume`. auth-svc serves
+  `push_turn_credentials_issued_total`, `push_turn_credentials_failures_total` and
+  `push_turn_provider_requests_total` at `GET /metrics` on its health port. CI scans the coturn image with Trivy. Note: with
+  `calls.enabled: true` the default `internal` mode now requires
+  `calls.turn.internal.publicHost`, a public IP and `deniedPeerCidrs` (or another mode).
+  Guide: [docs/calls.md §13](docs/calls.md#13-turn).
+
 - **Call history** (voice calls, PR 2): every participant of an ended call gets a row in
   their own call history, kept apart from conversations (no "missed call" messages).
   auth-svc serves `GET /v1/calls?before=<cursor>&since=<cursor>&limit=50` (the caller's

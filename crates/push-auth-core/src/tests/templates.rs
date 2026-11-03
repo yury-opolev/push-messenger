@@ -163,6 +163,7 @@ fn public(world: &World, templates: Arc<dyn TemplateRegistry>) -> Router {
         directory: Arc::new(NoDirectory),
         templates,
         call_history: Arc::new(crate::calls::NoCalls),
+        turn: Arc::new(crate::turn::Turn::disabled()),
     })
 }
 

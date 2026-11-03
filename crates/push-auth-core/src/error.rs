@@ -69,6 +69,10 @@ pub enum AuthError {
     TemplateConflict(String),
     #[error("the service is unavailable; try again")]
     Unavailable,
+    /// No usable TURN servers: none configured, or the provider failed (spec 2026-11-03
+    /// voice calls §8). Clients may call without a relay or try again later.
+    #[error("call relays (TURN) are not available now; try again later")]
+    TurnUnavailable,
 }
 
 impl AuthError {
@@ -102,6 +106,7 @@ impl AuthError {
             Self::TemplateNotFound => "not_found",
             Self::TemplateConflict(_) => "conflict",
             Self::Unavailable => "unavailable",
+            Self::TurnUnavailable => "turn_unavailable",
         }
     }
 
@@ -130,7 +135,10 @@ impl AuthError {
             | Self::IdentityInUse
             | Self::TemplateConflict(_) => 409,
             Self::RateLimited { .. } => 429,
-            Self::Unavailable | Self::EntraUnavailable | Self::IdentityUnavailable => 503,
+            Self::Unavailable
+            | Self::EntraUnavailable
+            | Self::IdentityUnavailable
+            | Self::TurnUnavailable => 503,
         }
     }
 
@@ -142,6 +150,7 @@ impl AuthError {
                 | Self::Unavailable
                 | Self::EntraUnavailable
                 | Self::IdentityUnavailable
+                | Self::TurnUnavailable
         )
     }
 }

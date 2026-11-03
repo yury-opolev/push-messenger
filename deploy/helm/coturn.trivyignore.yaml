@@ -1,0 +1,55 @@
+# Accepted findings of the Trivy scan of the chart's pinned coturn image
+# (calls.turn.internal.image; the coturn-image job of .github/workflows/ci.yml). Each entry
+# says why it does not apply to coturn as the chart runs it and expires, so it is reviewed
+# again. Prefer moving to a coturn release that fixes it (docs/calls.md, "Upgrading
+# coturn"); add an entry only with a reason.
+vulnerabilities:
+  # bind-libs and bind-tools: the BIND resolver/server library and dig, used by the image's
+  # optional detect-external-ip helper. The chart sets external-ip and never runs it;
+  # coturn does no DNS resolution of peers.
+  - id: CVE-2026-19630
+    statement: BIND library/tools only; not used by turnserver with the chart's configuration
+    expired_at: 2027-02-01
+  - id: CVE-2026-19666
+    statement: BIND library/tools only; not used by turnserver with the chart's configuration
+    expired_at: 2027-02-01
+  - id: CVE-2026-19667
+    statement: BIND library/tools only; not used by turnserver with the chart's configuration
+    expired_at: 2027-02-01
+  - id: CVE-2026-76163
+    statement: BIND library/tools only; not used by turnserver with the chart's configuration
+    expired_at: 2027-02-01
+  - id: CVE-2026-77692
+    statement: BIND library/tools only; not used by turnserver with the chart's configuration
+    expired_at: 2027-02-01
+  - id: CVE-2026-80274
+    statement: BIND library/tools only; not used by turnserver with the chart's configuration
+    expired_at: 2027-02-01
+  - id: CVE-2026-81563
+    statement: BIND library/tools only; not used by turnserver with the chart's configuration
+    expired_at: 2027-02-01
+  - id: CVE-2026-81736
+    statement: BIND library/tools only; not used by turnserver with the chart's configuration
+    expired_at: 2027-02-01
+  - id: CVE-2026-94300
+    statement: BIND GSS-TSIG (server side); no BIND server runs in the pod
+    expired_at: 2027-02-01
+  - id: CVE-2026-96888
+    statement: BIND library/tools only; not used by turnserver with the chart's configuration
+    expired_at: 2027-02-01
+  - id: CVE-2026-97313
+    statement: BIND RPZ (server side); no BIND server runs in the pod
+    expired_at: 2027-02-01
+  # brotli-libs: a decoder linked for libcurl/HTTP backends; coturn decodes no Brotli
+  # content (no HTTP client use with the chart's configuration).
+  - id: CVE-2026-111497
+    statement: Brotli decoder; coturn decodes no Brotli data with the chart's configuration
+    expired_at: 2027-02-01
+  # libbson and mongo-c-driver: coturn's optional MongoDB user database. The chart uses
+  # TURN REST credentials (use-auth-secret) and configures no database.
+  - id: CVE-2026-84964
+    statement: MongoDB driver; the chart configures no MongoDB user database
+    expired_at: 2027-02-01
+  - id: CVE-2026-9100
+    statement: MongoDB GridFS API; the chart configures no MongoDB user database
+    expired_at: 2027-02-01

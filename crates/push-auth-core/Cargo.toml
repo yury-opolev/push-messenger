@@ -31,6 +31,7 @@ reqwest = { workspace = true, features = ["rustls-tls-native-roots"] }
 ring.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha1.workspace = true
 sha2.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
@@ -43,6 +44,7 @@ uuid.workspace = true
 
 [dev-dependencies]
 http-body-util.workspace = true
+md-5 = "0.10"
 testcontainers-modules.workspace = true
 tokio = { workspace = true, features = ["io-util"] }
 tokio-stream.workspace = true

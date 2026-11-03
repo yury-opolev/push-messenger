@@ -58,6 +58,8 @@ pub enum Action {
     TemplateCatalog,
     /// `GET /v1/calls` and `DELETE /v1/calls/{call_id}`: per IP and per user.
     CallHistory,
+    /// `GET /v1/calls/ice-servers`: per IP and per user.
+    TurnCredentials,
 }
 
 /// Whom a limit counts.
@@ -112,6 +114,7 @@ impl Action {
             Self::TemplateSubmit => "template_submit",
             Self::TemplateCatalog => "template_catalog",
             Self::CallHistory => "call_history",
+            Self::TurnCredentials => "turn",
         }
     }
 
@@ -157,6 +160,10 @@ impl Action {
             (Scope::Ip, per(600, MINUTE)),
             (Scope::Account, per(120, MINUTE)),
         ];
+        // Spec 2026-11-03 voice calls §8: 60 per user per hour (a client asks before each
+        // call and when its credentials near expiry), more per IP for shared addresses.
+        const TURN: &[(Scope, Limit)] =
+            &[(Scope::Ip, per(600, HOUR)), (Scope::Account, per(60, HOUR))];
         match self {
             Self::Signup => SIGNUP,
             Self::Login => LOGIN,
@@ -172,6 +179,7 @@ impl Action {
             Self::TemplateSubmit => TEMPLATE_SUBMIT,
             Self::TemplateCatalog => TEMPLATE_CATALOG,
             Self::CallHistory => CALL_HISTORY,
+            Self::TurnCredentials => TURN,
         }
     }
 }

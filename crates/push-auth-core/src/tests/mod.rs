@@ -16,6 +16,7 @@ mod identity_api;
 mod identity_server;
 mod switch;
 mod templates;
+mod turn;
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -125,6 +126,7 @@ pub(crate) async fn world_with(
         directory: Arc::new(NoDirectory),
         templates: Arc::new(crate::templates::NoTemplates),
         call_history: Arc::new(crate::calls::NoCalls),
+        turn: Arc::new(crate::turn::Turn::disabled()),
     });
     World {
         _container: container,

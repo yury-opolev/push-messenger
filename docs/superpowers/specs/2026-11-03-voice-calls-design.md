@@ -669,3 +669,57 @@ Decisions taken while implementing §9, beyond or refining it:
 - The gateway integration test `history_lists_both_sides_and_hiding_is_per_side` drives the
   `Calls` API in process (the HTTP layer is covered by auth-svc's tests with a fake log and
   its gRPC client by a stub server).
+
+### PR 3 (TURN): decisions and deviations
+
+- Provider APIs confirmed against the providers' docs (2026-11): Cloudflare Realtime TURN
+  `POST https://rtc.live.cloudflare.com/v1/turn/keys/<keyId>/credentials/generate-ice-servers`
+  (`Bearer` API token, `{"ttl"}`, `201 {"iceServers": [...]}`; URLs on port 53 dropped,
+  browsers block them); Twilio `POST https://api.twilio.com/2010-04-01/Accounts/<sid>/Tokens.json`
+  (Basic auth, form `Ttl`, `201 {"ice_servers": [{urls (a string), username?,
+  credential?}], "ttl": "<seconds>"}`; the shorter of `ttlSeconds` and `ttl` is used).
+- Twilio credentials are cached **per user** like Cloudflare's (not shared), so every
+  credential is scoped to one user (T6); per-user single flight, at most 10000 users in
+  memory per replica. Refresh margin: 60 s, or a fifth of a shorter `ttlSeconds`.
+- The provider base URL is a constructor parameter for tests
+  (`Turn::with_provider_base_url`), not an environment variable: nothing in production can
+  redirect provider calls.
+- Errors use the API's format: `503 {"error": {"code": "turn_unavailable", "retryable":
+  true, …}}` with `Retry-After: 30`; rate limit 60/user/hour and 600/IP/hour. Without
+  `PUSH_TURN_MODE` (calls off) the route exists and answers `turn_unavailable`.
+- STUN URLs are their own `ice_servers` entry without credentials; TURN URLs share one
+  entry with the credential. The chart builds every URL (internal mode: from `publicHost`
+  and `ports`), so auth-svc has one TURN REST path for `internal` and `generic`
+  (`PUSH_TURN_URLS`, not `PUSH_TURN_PUBLIC_HOST`/`PUSH_TURN_TLS`).
+- `external.sharedSecret`, `.cloudflare.apiTokenSecret` and `.twilio.authTokenSecret` name
+  a key of the app Secret (default `turn-shared-secret`, `turn-cloudflare-token`,
+  `turn-twilio-token`), never hold a value; `external` requires a consumer-managed Secret
+  or `secrets.volume`.
+- Image: `coturn/coturn:4.18.0-alpine@sha256:c29135c08565810d37053f384584392b7c24b69570fc81a721b878d6fe63e04e`
+  (not 4.6.3; alpine for the smaller package set). Its fixable HIGH/CRITICAL findings
+  (BIND tools, brotli, the MongoDB driver: unused by the chart's configuration) are
+  accepted with reasons and expiry in `deploy/helm/coturn.trivyignore.yaml`; the
+  `coturn-image` CI job uses `aquasecurity/trivy-action` v0.36.0 (pinned SHA, after the
+  March 2026 compromise of older tags) with Trivy v0.76.1.
+- coturn 4.18 facts found by the integration test and applied: `denied-peer-ip` takes
+  `IP` or `IP-IP` only (it aborts on CIDR), so the chart converts every CIDR to a range;
+  a range of the unspecified address `::` denies **every** peer, IPv4 included, so `::/128`
+  is not in the list and `deniedPeerCidrs` refuses prefixes shorter than /8 (IPv4) or /16
+  (IPv6) and ranges starting at `::`; `no-cli`, `no-dtls`, `no-tlsv1`, `no-tlsv1_1` and
+  `no-stun-backward-compatibility` are gone (the CLI, DTLS and classic STUN are off by
+  default; TLS below 1.2 is not offered), and `no-loopback-peers` is the default. The
+  integration test fails on any option coturn reports as unknown.
+- `user-quota` counts by the user id: coturn strips the REST timestamp, so one user's
+  credentials of different expiries share the quota (tested: the 13th allocation gets 486).
+- Values beyond the request: `internal.externalIp` (coturn's `external-ip`, required in
+  effect: else `loadBalancerIP` or an IP `publicHost`), `internal.deniedPeerCidrs`
+  (required), `internal.quotas`, `internal.image`, `internal.metricsPeers`. The Service
+  uses `externalTrafficPolicy: Local`, exposes the relay range over UDP and TCP (TCP
+  relay stays on), and coturn runs as one replica with `Recreate` updates. The coturn
+  NetworkPolicy repeats the denied ranges as egress exceptions.
+- With `calls.enabled: true` the default `internal` mode requires `publicHost`, a public
+  IP and `deniedPeerCidrs`; enabling calls without TURN settings now fails the render
+  (choose `stun-only` for development).
+- Local clusters: denied private ranges mean the chart's coturn cannot relay between
+  private addresses; docs recommend `stun-only` locally. PR 5's browser smoke test "through
+  internal TURN" will need either public addressing or a test-only allow list.

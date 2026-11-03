@@ -128,3 +128,31 @@ jobs:
           version: v3.16.3
       - run: python -m pip install --require-hashes --requirement deploy/helm/requirements-test.txt
       - run: pwsh deploy/helm/test-chart.ps1
+
+  # The chart's third-party coturn image (calls.turn.internal.image) is pinned by digest
+  # and has no HIGH or CRITICAL vulnerability with a fix, unless accepted with a reason in
+  # deploy/helm/coturn.trivyignore.yaml. Upgrade path: docs/calls.md, "Upgrading coturn".
+  coturn-image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: The pinned image
+        id: image
+        run: |
+          image=$(grep -E '^\s+image: coturn/coturn:' deploy/helm/push-messenger/values.yaml | awk '{print $2}')
+          if ! echo "$image" | grep -Eq '^coturn/coturn:[^@]+@sha256:[0-9a-f]{64}$'; then
+            echo "calls.turn.internal.image is not pinned by digest: '$image'" >&2
+            exit 1
+          fi
+          echo "ref=$image" >> "$GITHUB_OUTPUT"
+      - run: docker pull "${{ steps.image.outputs.ref }}"
+      - uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ steps.image.outputs.ref }}
+          version: v0.76.1
+          vuln-type: os,library
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          trivyignores: deploy/helm/coturn.trivyignore.yaml
+          exit-code: "1"

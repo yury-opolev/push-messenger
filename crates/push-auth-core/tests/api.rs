@@ -100,6 +100,7 @@ async fn world() -> World {
         directory: Arc::clone(&directory) as Arc<dyn Directory>,
         templates: Arc::new(push_auth_core::NoTemplates),
         call_history: Arc::new(push_auth_core::NoCalls),
+        turn: Arc::new(push_auth_core::turn::Turn::disabled()),
     });
     World {
         _container: container,
