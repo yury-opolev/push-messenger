@@ -35,7 +35,7 @@ written into conversation history ("missed call" messages).
 | D2 | State machine | Pure Rust in `push-domain` (`push_domain::calls`): `transition(record, event, now) -> Outcome`. No I/O, table-driven tests. Redis is storage with compare-and-set; Lua does atomic CAS and the busy locks, never policy. |
 | D3 | Redis layout | Every call key carries the hash tag `{calls}` so a call's record, both users' busy locks and the due set share one cluster slot (atomic scripts stay cluster-safe). Phase-1 volume (≤ thousands of live calls) fits one shard; documented as a scaling limit. |
 | D4 | Clock | Redis `TIME` is the only clock for deadlines (load and claim scripts return it). Clients get relative `expires_in_ms` as well as the absolute `expires_at`, so a skewed client clock never shortens or lengthens ringing. |
-| D5 | Timers | A sweeper in every message-svc replica claims due calls from the `calls:{calls}:due` sorted set every 500 ms; a claim pushes the entry 5 s ahead (a lease), so a replica that dies mid-claim is covered by another. Each live call has exactly one due entry. |
+| D5 | Timers | A sweeper in every message-svc replica claims due calls from the `calls:{calls}:due` sorted set every 500 ms; a claim pushes the entry 5 s ahead (a lease), so a replica that dies mid-claim is covered by another. Each live call has exactly one due entry. A claim takes at most 32; claims repeat at once while they come back full (up to 50 per wake), and the claimed calls are ticked 16 at a time (a tick is about 5 Redis round trips), so one replica ticks thousands of calls per second — far beyond the ~70 ticks/s of 1,000 active calls at the 15 s liveness interval. |
 | D6 | Device reachability | A connection is *calls-active* when the gateway has calls enabled, message-svc offers calls (its `IdentifyResponse.capabilities`), and the client advertised `CAPABILITY_CALLS` in `Identify`. Only calls-active connections are attached (registry `calls:{calls}:devices:<user>`: device → connection id). Liveness of an attached device = its connection still holds a presence lease (`presence:{<user>}:conns`, maintained by the gateway already). No extra refresh traffic. |
 | D7 | Resume | After `Ready`, a calls-active connection is attached and the server sends `CallSync`: the calls the user is in, as this device sees them (a ringing incoming call includes its offer). Covers reconnects within the grace, gateway restarts, lost `CallIncoming`/`CallEnded`. A client drops any local call that `CallSync` does not list. |
 | D8 | Pre-answer ICE | The caller trickles ICE while ringing; message-svc buffers up to 32 such candidates in the call record and relays them to the answering device right after the accept, in order. Ringing devices never receive the caller's candidates. |
@@ -378,10 +378,13 @@ Scripts (EVALSHA, reloaded on NOSCRIPT, as presence):
   everything or nothing. Returns `OK`, `CONFLICT`, `IN_CALL`, `BUSY` or `EXISTS`.
 - **claim**(`due`; max 32, lease 5000): due members ≤ `TIME`, each pushed to now + lease;
   returns them with `TIME`.
-- **attach**/**detach**(`devices:<user>`; device, connection): set / remove-if-equal.
+- **attach**(`devices:<user>`; device, connection): set unless a newer connection (UUIDv7
+  ids sort by time) is registered; a refused attach gets an empty `CallSync`.
+- **detach**(`devices:<user>`; device, connection): remove if equal.
 
 Liveness of an attached device: `ZSCORE presence:{<user>}:conns <connection>` > now
-(another slot: read outside the scripts, tolerant of races). If Redis loses everything,
+(another slot: read outside the scripts, tolerant of races; a tick pipelines the `HGET`s of
+both party devices, then their `ZSCORE`s). If Redis loses everything,
 calls in progress lose their state: the next frame of either side gets `CALL_NOT_FOUND`,
 media continues peer to peer until a side hangs up locally.
 
@@ -411,16 +414,16 @@ The record is bounded: offer ≤ 16 KiB (dropped when answered), ≤ 32 buffered
 
 | # | Threat | Mitigation | Test (file) | PR |
 |---|---|---|---|---|
-| T1 | Calls from non-contacts or blocked users | policy in message-svc: both directions `ACCEPTED`, no block either way; unknown ids look the same (`NOT_CONTACT`) | `calls_policy_*` in `push-domain/src/calls/tests.rs`; `a_stranger_or_blocked_user_cannot_call` in `push-gateway/tests/calls.rs` | 1 |
-| T2 | Ringing used to spam a user | one ringing call per caller (`IN_CALL`), busy lock per callee, `calls.attemptsPerHour` per user (also counts refused invites), frame budget, decline/block | `attempts_per_hour_are_limited`, `a_caller_has_one_call_at_a_time` (gateway calls tests); limiter unit test | 1 |
-| T3 | Call-state spoofing (accept/end another's call by `call_id`) | every frame checked against the record: sender user and device in their role; identical `CALL_NOT_FOUND`; call ids are unguessable UUIDv7 but never trusted | table tests `wrong_role_*`; `another_users_device_cannot_touch_the_call` (gateway) | 1 |
-| T4 | SDP / ICE injection, oversize or malformed | size caps (16 KiB SDP, 512 B candidate), line grammar, printable ASCII candidates, audio only, protobuf decode limits; never interpreted beyond that, relayed as opaque strings | proptest `sdp_*`, `ice_*` in `push-domain/src/calls/sdp.rs`; frame-decode proptest in push-proto; `oversize_and_video_offers_are_refused` (gateway) | 1 |
+| T1 | Calls from non-contacts or blocked users | policy in message-svc: both directions `ACCEPTED`, no block either way; unknown ids look the same (`NOT_CONTACT`) | `calls_policy_*` in `push-domain/src/calls/tests/policy.rs`; `a_stranger_or_blocked_user_cannot_call` in `push-gateway/tests/calls.rs` | 1 |
+| T2 | Ringing used to spam a user | one ringing call per caller (`IN_CALL`), busy lock per callee, `calls.attemptsPerHour` per user (also counts refused invites), frame budget, decline/block | `attempts_per_hour_are_limited`, `a_caller_has_one_call_at_a_time` in `push-gateway/tests/calls.rs`; `call_invites_are_counted_per_user_by_the_configured_hour`, `call_invites_default_to_30_an_hour` in `push-gateway/src/limits.rs` | 1 |
+| T3 | Call-state spoofing (accept/end another's call by `call_id`) | every frame checked against the record: sender user and device in their role; identical `CALL_NOT_FOUND`; call ids are unguessable UUIDv7 but never trusted | `wrong_role_is_not_found` in `push-domain/src/calls/tests/machine.rs`; `another_users_device_cannot_touch_the_call` in `push-gateway/tests/calls.rs` | 1 |
+| T4 | SDP / ICE injection, oversize or malformed | size caps (16 KiB SDP, 512 B candidate), line grammar, printable ASCII candidates, audio only, protobuf decode limits; never interpreted beyond that, relayed as opaque strings | proptests `sdp_check_never_panics`, `sdp_with_a_video_line_is_refused`, `sdp_padded_beyond_the_limit_is_refused`, `ice_check_never_panics` in `push-domain/src/calls/sdp.rs`; `decoding_never_panics`, `call_invites_round_trip` in `push-proto/src/codec.rs`; `oversize_and_video_offers_are_refused` in `push-gateway/tests/calls.rs` | 1 |
 | T5 | TURN used to reach internal addresses (SSRF, lateral movement) | coturn `denied-peer-ip` for RFC 1918, 100.64/10, link-local (incl. 169.254.169.254 metadata), loopback, the cluster pod and service CIDRs, IPv6 ULA/link-local/loopback, `no-multicast-peers`, `no-loopback-peers`; NetworkPolicy egress | chart tests render every range; integration test: a relay allocation to 10.x/127.x/169.254.169.254 is refused by the real coturn container | 3 |
 | T6 | TURN credential theft or replay | credentials expire (`ttlSeconds`, 600 s), scoped to the user (`<expiry>:<user_id>`), minted only for an access token, never logged, HTTPS only; `user-quota` limits damage | `credentials_expire_and_name_the_user`, `credentials_are_never_logged`, coturn refuses an expired credential | 3 |
-| T7 | Leaking IP addresses to non-contacts | SDP/ICE only after the contact policy; callee's IPs only after the callee accepts; pre-answer caller ICE only to the answering device; docs recommend trickle (offer without candidates) and `iceTransportPolicy: relay` for privacy; no IPs in logs/metrics/audit | `ringing_devices_never_get_caller_candidates`, `answer_and_ice_only_reach_the_party_device` (gateway); log-capture test | 1 (+ docs 5) |
-| T8 | DoS by exhausting call state | one call per user; bounded record (under 100 KiB per call: JSON escaping of the worst-case input); TTLs on every key; attempts/hour; ICE and renegotiation caps; due set bounded by live calls | `records_are_bounded` (domain), `keys_expire_without_message_svc` (message-svc redis test), limits tests | 1 |
-| T9 | Agents calling anyone but their owner | policy: an agent may only call its owner, only its owner may call it (`NOT_CONTACT` otherwise), checked for both directions | `agent_calls_only_its_owner`, `only_the_owner_calls_the_agent` (domain + gateway) | 1 (bridge use: 7, 8) |
-| T10 | Media or signalling content in logs, metrics, audit | no `Debug` of call frames in logs; audit fields fixed (ids, reason, duration); metrics labels are reasons/codes only | `no_sdp_or_candidate_in_logs_or_audit` (gateway calls test with a capturing subscriber) | 1 |
+| T7 | Leaking IP addresses to non-contacts | SDP/ICE only after the contact policy; callee's IPs only after the callee accepts; pre-answer caller ICE only to the answering device; docs recommend trickle (offer without candidates) and `iceTransportPolicy: relay` for privacy; no IPs in logs/metrics/audit | `ringing_devices_never_get_caller_candidates`, `answer_and_ice_only_reach_the_party_device`, `no_sdp_or_candidate_in_logs_or_audit` in `push-gateway/tests/calls.rs` | 1 (+ docs 5) |
+| T8 | DoS by exhausting call state | one call per user; bounded record (under 100 KiB per call: JSON escaping of the worst-case input); TTLs on every key; attempts/hour; ICE and renegotiation caps; due set bounded by live calls | `records_are_bounded`, `ice_cap_and_buffer_cap` in `push-domain/src/calls/tests/machine.rs`; `keys_expire_without_message_svc` in `push-message-svc/tests/calls_redis.rs`; `ice_frames_are_capped_per_side` in `push-gateway/tests/calls.rs` | 1 |
+| T9 | Agents calling anyone but their owner | policy: an agent may only call its owner, only its owner may call it (`NOT_CONTACT` otherwise), checked for both directions | `agent_calls_only_its_owner`, `only_the_owner_calls_the_agent` in `push-domain/src/calls/tests/policy.rs`; `agent_calls_only_its_owner` (both directions) in `push-gateway/tests/calls.rs` | 1 (bridge use: 7, 8) |
+| T10 | Media or signalling content in logs, metrics, audit | no `Debug` of call frames in logs; audit fields fixed (ids, reason, duration); metrics labels are reasons/codes only | `no_sdp_or_candidate_in_logs_or_audit` in `push-gateway/tests/calls.rs` (a capturing subscriber) | 1 |
 | T11 | Call history seen by others | rows per participant, read only by `user_id = caller`; delete hides only one's own row | `history_is_private_and_hides_per_side` | 2 |
 | T12 | Provider API secrets (cloudflare/twilio) leak | secrets only from the Secret (file), never values; never logged; cached credentials in memory | chart refuses inline secrets; `provider_secrets_never_logged` | 3 |
 
@@ -608,3 +611,25 @@ style).
   prefer a pure-Rust/ring backend) and record the MSRV of the feature.
 - Presence-lease-based liveness ties calls to the presence key layout
   (`push_proto::presence_conns_key`); a change there must update `calls::liveness`.
+
+## 15. Implementation notes (PR 1)
+
+Decisions taken while implementing, beyond or refining the sections above:
+
+- `Attach`/`Detach` events carry the user as well as the device.
+- An active call's due = min(`now + LIVENESS`, away + grace); a liveness `Tick` carries the
+  sides found live as well as the gone ones, and a live side's away time is cleared (the
+  tick-vs-attach race of §3.3).
+- An `Attach` of a party device always bumps the version, even when nothing else changes.
+- `RedisCalls::apply` re-reads the record after a lost reply and treats a stored record
+  equal to the one it wrote as applied.
+- A repeated `CallAccept` from the answering device re-publishes `CallAccepted`.
+- A repeated `CallInvite` (same caller device, call still ringing) is a no-op.
+- The registry attach refuses an older connection (UUIDv7 ids sort by time); the refused
+  attach gets an empty `CallSync`.
+- A ringing call whose ringing list is empty when it ends notifies only the caller.
+- The callee must send `CallAccept` before its `CallIce` (it has no role in the call yet).
+- The gateway caps `tungstenite` logging at debug, so frame contents never reach logs.
+- message-svc `/metrics` is empty when calls are disabled.
+- The gateway drops call frames from the hub on connections that are not calls-active.
+- The sweeper claims again while claims come back full and ticks 16 calls at a time (D5).
