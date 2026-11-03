@@ -39,7 +39,7 @@ const APPROVE_WORDS: &[&str] = &[
 /// Normalised: "don't" is "don t".
 const REJECT_WORDS: &[&str] = &[
     "reject", "rejected", "no", "nope", "deny", "denied", "decline", "declined", "cancel", "stop",
-    "don t", "do not", "not now",
+    "don t", "do not", "not now", "never",
 ];
 /// Words that negate (normalised: "can't" is "can t"); with one, nothing approves.
 const NEGATORS: &[&str] = &["not", "never", "cannot", "nor", "t"];
@@ -76,8 +76,8 @@ pub enum VoiceAnswer {
 /// without punctuation (an apostrophe splits a word: "can't" is "can t"); leading fillers
 /// ("um", "uh") are ignored. An approval is unclear when it is a question (it opens with
 /// "is", "are", "can", "do"…, other than "do it" or "do not"); a negation ("not", "never",
-/// "cannot", "nor", "n't") rejects when no approve word is heard and is unclear with one
-/// ("I can't approve that"); otherwise it needs exactly one of approve or reject. A
+/// "cannot", "nor", "n't") never approves ("I can't approve that" and "I can't hear you" are
+/// unclear); otherwise it needs exactly one of approve or reject. A
 /// question card takes the options named by number ("option two", "the second one", a bare
 /// "two") or by label, else the transcript as free text when the card allows it. The
 /// answer is the one the card's buttons give for the same values.
@@ -98,9 +98,11 @@ pub fn match_answer(kind: &CardKind, transcript: &str) -> VoiceAnswer {
             .is_some_and(|w| INTERROGATIVES.contains(&w.as_str()))
             && !starts(APPROVE_WORDS)
             && !starts(REJECT_WORDS);
-        return match (approve, reject || negated) {
+        return match (approve, reject) {
             _ if question => VoiceAnswer::Again(APPROVE_OR_REJECT),
-            (true, false) => answer(kind, vec![option_value(true)], "Approve".to_owned()),
+            (true, false) if !negated => {
+                answer(kind, vec![option_value(true)], "Approve".to_owned())
+            }
             (false, true) => answer(kind, vec![option_value(false)], "Reject".to_owned()),
             _ => VoiceAnswer::Again(APPROVE_OR_REJECT),
         };
@@ -336,6 +338,7 @@ mod tests {
             ("absolutely not okay", &again),
             ("I cannot accept", &again),
             ("no problem, go ahead", &again),
+            ("I can't hear you", &again),
             ("no", &reject),
             ("never", &reject),
             ("not now", &reject),
