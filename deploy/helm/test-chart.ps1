@@ -256,18 +256,20 @@ Check 'default: calls are off on the gateway and message-svc, with the default l
         $gateway -match 'name: PUSH_CALLS_ATTEMPTS_PER_HOUR\s+value: "30"' -and
         $messageSvc -match 'name: PUSH_CALLS_ENABLED\s+value: "0"' -and
         $messageSvc -match 'name: PUSH_CALLS_RING_SECONDS\s+value: "45"' -and
-        $messageSvc -match 'name: PUSH_CALLS_DISCONNECT_GRACE_SECONDS\s+value: "30"'
+        $messageSvc -match 'name: PUSH_CALLS_DISCONNECT_GRACE_SECONDS\s+value: "30"' -and
+        $messageSvc -match 'name: PUSH_CALLS_HISTORY_DAYS\s+value: "90"'
 }
 Check 'calls: one switch enables both services; the limits render as set' {
     $on = helm template push $chart --set calls.enabled=true --set calls.ringSeconds=120 `
-        --set calls.disconnectGraceSeconds=5 --set calls.attemptsPerHour=1000 | Out-String
+        --set calls.disconnectGraceSeconds=5 --set calls.attemptsPerHour=1000 --set calls.historyDays=3650 | Out-String
     $gateway = Doc $on 'Deployment' 'push-gateway'
     $messageSvc = Doc $on 'Deployment' 'push-message-svc'
     $gateway -match 'name: PUSH_CALLS_ENABLED\s+value: "1"' -and
         $gateway -match 'name: PUSH_CALLS_ATTEMPTS_PER_HOUR\s+value: "1000"' -and
         $messageSvc -match 'name: PUSH_CALLS_ENABLED\s+value: "1"' -and
         $messageSvc -match 'name: PUSH_CALLS_RING_SECONDS\s+value: "120"' -and
-        $messageSvc -match 'name: PUSH_CALLS_DISCONNECT_GRACE_SECONDS\s+value: "5"'
+        $messageSvc -match 'name: PUSH_CALLS_DISCONNECT_GRACE_SECONDS\s+value: "5"' -and
+        $messageSvc -match 'name: PUSH_CALLS_HISTORY_DAYS\s+value: "3650"'
 }
 foreach ($invalid in @(
     @('--set', 'calls.enabled=yes', 'calls.enabled must be true or false'),
@@ -280,7 +282,11 @@ foreach ($invalid in @(
     @('--set', 'calls.disconnectGraceSeconds=4.5', 'calls.disconnectGraceSeconds must be an integer from 5 to 120'),
     @('--set', 'calls.attemptsPerHour=0', 'calls.attemptsPerHour must be an integer from 1 to 1000'),
     @('--set', 'calls.attemptsPerHour=1001', 'calls.attemptsPerHour must be an integer from 1 to 1000'),
-    @('--set', 'calls.attemptsPerHour=4.5', 'calls.attemptsPerHour must be an integer from 1 to 1000')
+    @('--set', 'calls.attemptsPerHour=4.5', 'calls.attemptsPerHour must be an integer from 1 to 1000'),
+    @('--set', 'calls.historyDays=0', 'calls.historyDays must be an integer from 1 to 3650'),
+    @('--set', 'calls.historyDays=3651', 'calls.historyDays must be an integer from 1 to 3650'),
+    @('--set', 'calls.historyDays=89.5', 'calls.historyDays must be an integer from 1 to 3650'),
+    @('--set-string', 'calls.historyDays=90', 'calls.historyDays must be an integer from 1 to 3650')
 )) {
     Check "calls: $($invalid[0]) $($invalid[1]) is refused" {
         $errorText = helm template push $chart $invalid[0] $invalid[1] 2>&1 | Out-String
@@ -382,7 +388,7 @@ Check 'default: the ingress routes the auth API, not /dev, with Exact link route
     $ingress = Doc $default 'Ingress' 'push-auth'
     $links = Doc $default 'Ingress' 'push-auth-links'
     $ingress -match 'path: /v1/auth\s' -and $ingress -match 'path: /v1/devices\s' -and
-        $ingress -match 'path: /v1/users\s' -and $ingress -match 'path: /v1/agents\s' -and $ingress -match 'path: /v1/templates\s' -and $default -notmatch 'path: /dev' -and
+        $ingress -match 'path: /v1/users\s' -and $ingress -match 'path: /v1/agents\s' -and $ingress -match 'path: /v1/templates\s' -and $ingress -match 'path: /v1/calls\s' -and $default -notmatch 'path: /dev' -and
         $default -notmatch 'nginx\.ingress\.kubernetes\.io/' -and
         $links -match 'path: /v1/auth/verify\s+pathType: Exact' -and
         $links -match 'path: /v1/auth/password/reset\s+pathType: Exact'

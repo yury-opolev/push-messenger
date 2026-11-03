@@ -854,7 +854,7 @@ ranges the services accept at start (strings and fractions are refused).
 {{- if not (kindIs "bool" $calls.enabled) -}}
 {{- fail "calls.enabled must be true or false" -}}
 {{- end -}}
-{{- range $limit := list (list "ringSeconds" 10 120) (list "disconnectGraceSeconds" 5 120) (list "attemptsPerHour" 1 1000) -}}
+{{- range $limit := list (list "ringSeconds" 10 120) (list "disconnectGraceSeconds" 5 120) (list "attemptsPerHour" 1 1000) (list "historyDays" 1 3650) -}}
 {{- $name := index $limit 0 -}}
 {{- $value := index $calls $name -}}
 {{- $whole := int $value -}}

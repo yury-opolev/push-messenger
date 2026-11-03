@@ -207,6 +207,9 @@ calls:
   disconnectGraceSeconds: 30
   # Call attempts per user per hour, refused or not: 1 to 1000.
   attemptsPerHour: 30
+  # How many days call history is kept: 1 to 3650. Applies whether calls are enabled or not
+  # (message-svc purges older rows hourly).
+  historyDays: 90
 
 postgres:
   # true: the bundled PostgreSQL below. false: an external server (postgres.external);
