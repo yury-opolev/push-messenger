@@ -2,6 +2,7 @@
 //! (docs/superpowers/specs/2026-11-03-voice-calls-design.md).
 
 mod machine;
+mod policy;
 mod sdp;
 #[cfg(test)]
 mod tests;
