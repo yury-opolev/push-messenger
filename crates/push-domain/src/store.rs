@@ -426,6 +426,9 @@ pub trait Tx: Send {
     /// Whether `user` is an owned agent: [`Tx::record_agent_owner`] recorded it as the
     /// agent. Unknown users are not agents.
     async fn is_agent(&mut self, user: UserId) -> DomainResult<bool>;
+    /// The owner recorded for an owned agent ([`Tx::record_agent_owner`]); `None` for
+    /// anyone else, unknown users included.
+    async fn agent_owner(&mut self, user: UserId) -> DomainResult<Option<UserId>>;
     /// The stored version, or `None`.
     async fn template(&mut self, template: &TemplateRef) -> DomainResult<Option<StoredTemplate>>;
     /// The stored version, or `None`, read for a message that uses it. Holds a share lock

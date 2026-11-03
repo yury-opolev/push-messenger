@@ -1146,6 +1146,17 @@ impl Tx for PgTx {
         .map_err(store_error)
     }
 
+    async fn agent_owner(&mut self, user: UserId) -> DomainResult<Option<UserId>> {
+        let owner: Option<Uuid> = sqlx::query_scalar(
+            "SELECT owner_user_id FROM messaging.agent_owner WHERE agent_user_id = $1",
+        )
+        .bind(user.0)
+        .fetch_optional(self.conn())
+        .await
+        .map_err(store_error)?;
+        Ok(owner.map(UserId))
+    }
+
     async fn template(&mut self, template: &TemplateRef) -> DomainResult<Option<StoredTemplate>> {
         self.read_template(template, "").await
     }
