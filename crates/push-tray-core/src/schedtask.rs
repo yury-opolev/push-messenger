@@ -331,10 +331,7 @@ pub fn apply_switch(plan: &SwitchPlan, config: &mut TrayConfig) {
     for step in &plan.steps {
         if let Step::MarkAutostart(dir) = step {
             if !config.set_autostart(dir, true) {
-                config.instances.push(Instance {
-                    dir: dir.clone(),
-                    autostart: true,
-                });
+                config.instances.push(Instance::new(dir.clone()));
             }
         }
     }
@@ -804,8 +801,8 @@ mod tests {
             instances: dirs
                 .iter()
                 .map(|dir| Instance {
-                    dir: PathBuf::from(dir),
                     autostart: false,
+                    ..Instance::new(PathBuf::from(dir))
                 })
                 .collect(),
             ..TrayConfig::default()

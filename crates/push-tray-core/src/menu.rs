@@ -1,91 +1,108 @@
 //! The tray menu as data: the shell turns it into a native menu, and menu ids back into
-//! actions with [`parse_id`].
+//! commands with [`parse`]. The menu is slim: a line per agent (which opens it in the tray
+//! window), then the tray's own items. The agents' actions live in the window; whether
+//! one is available is [`enabled`].
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::schedtask::Offer;
 use crate::state::{AgentState, IconState, icon_for_view, label, tooltip as state_tooltip, worst};
 use crate::supervisor::InstanceView;
 
+/// An agent's item id is this followed by the instance id.
+pub const AGENT_PREFIX: &str = "agent:";
+/// "Open…": the tray window.
+pub const OPEN: &str = "open";
 /// "Add agent folder…".
 pub const ADD_FOLDER: &str = "add_folder";
 /// The "Start at logon" check item.
 pub const START_AT_LOGON: &str = "start_at_logon";
-/// "Switch from Scheduled Task to tray…".
+/// "Switch from Scheduled Task…".
 pub const SWITCH_OVER: &str = "switch_over";
 pub const QUIT: &str = "quit";
 
-/// An agent's menu action; its item id is `"<action>:<instance id>"`.
+/// An action on one agent (a button in the tray window).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum MenuAction {
+pub enum AgentAction {
     Start,
     Stop,
     RestartBackend,
     Reconnect,
     Pause,
     Resume,
-    OpenLog,
-    OpenFolder,
-    Details,
 }
 
-impl MenuAction {
-    pub const ALL: [MenuAction; 9] = [
-        MenuAction::Start,
-        MenuAction::Stop,
-        MenuAction::RestartBackend,
-        MenuAction::Reconnect,
-        MenuAction::Pause,
-        MenuAction::Resume,
-        MenuAction::OpenLog,
-        MenuAction::OpenFolder,
-        MenuAction::Details,
+impl AgentAction {
+    /// Every action, in the window's order.
+    pub const ALL: [AgentAction; 6] = [
+        AgentAction::Start,
+        AgentAction::Stop,
+        AgentAction::RestartBackend,
+        AgentAction::Reconnect,
+        AgentAction::Pause,
+        AgentAction::Resume,
     ];
 
     pub fn as_str(self) -> &'static str {
         match self {
-            MenuAction::Start => "start",
-            MenuAction::Stop => "stop",
-            MenuAction::RestartBackend => "restart_backend",
-            MenuAction::Reconnect => "reconnect",
-            MenuAction::Pause => "pause",
-            MenuAction::Resume => "resume",
-            MenuAction::OpenLog => "open_log",
-            MenuAction::OpenFolder => "open_folder",
-            MenuAction::Details => "details",
+            AgentAction::Start => "start",
+            AgentAction::Stop => "stop",
+            AgentAction::RestartBackend => "restart_backend",
+            AgentAction::Reconnect => "reconnect",
+            AgentAction::Pause => "pause",
+            AgentAction::Resume => "resume",
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
-            MenuAction::Start => "Start",
-            MenuAction::Stop => "Stop",
-            MenuAction::RestartBackend => "Restart Coda",
-            MenuAction::Reconnect => "Reconnect",
-            MenuAction::Pause => "Pause Coda for upgrade",
-            MenuAction::Resume => "Resume",
-            MenuAction::OpenLog => "Open log",
-            MenuAction::OpenFolder => "Open folder",
-            MenuAction::Details => "Details…",
+            AgentAction::Start => "Start",
+            AgentAction::Stop => "Stop",
+            AgentAction::RestartBackend => "Restart Coda",
+            AgentAction::Reconnect => "Reconnect",
+            AgentAction::Pause => "Pause for upgrade",
+            AgentAction::Resume => "Resume",
         }
     }
 
-    /// The item id for `instance`.
-    pub fn id(self, instance: &str) -> String {
-        format!("{}:{instance}", self.as_str())
+    /// The action [`AgentAction::as_str`] names.
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|action| action.as_str() == name)
     }
 }
 
-/// An agent item's action and instance id; `None` for the top-level ids and anything else.
-pub fn parse_id(id: &str) -> Option<(MenuAction, String)> {
-    let (action, instance) = id.split_once(':')?;
-    if instance.is_empty() {
-        return None;
+/// What a menu item asks for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MenuCommand {
+    /// Open the tray window on the agent with this instance id.
+    OpenAgent(String),
+    /// Open the tray window.
+    Open,
+    AddFolder,
+    StartAtLogon,
+    SwitchOver,
+    Quit,
+}
+
+/// The command a menu item id names; `None` for anything else.
+pub fn parse(id: &str) -> Option<MenuCommand> {
+    if let Some(instance) = id.strip_prefix(AGENT_PREFIX) {
+        return (!instance.is_empty()).then(|| MenuCommand::OpenAgent(instance.to_owned()));
     }
-    let action = MenuAction::ALL
-        .into_iter()
-        .find(|candidate| candidate.as_str() == action)?;
-    Some((action, instance.to_owned()))
+    match id {
+        OPEN => Some(MenuCommand::Open),
+        ADD_FOLDER => Some(MenuCommand::AddFolder),
+        START_AT_LOGON => Some(MenuCommand::StartAtLogon),
+        SWITCH_OVER => Some(MenuCommand::SwitchOver),
+        QUIT => Some(MenuCommand::Quit),
+        _ => None,
+    }
+}
+
+/// The item id of the agent with the instance id `instance`.
+pub fn agent_id(instance: &str) -> String {
+    format!("{AGENT_PREFIX}{instance}")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,8 +110,16 @@ pub struct Menu {
     pub items: Vec<Item>,
 }
 
+/// A menu item. Labels are ready for a native menu: `&` marks the mnemonic and a literal
+/// ampersand is `&&`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Item {
+    /// An agent's line, with its state's badge.
+    Agent {
+        id: String,
+        label: String,
+        icon: IconState,
+    },
     Action {
         id: String,
         label: String,
@@ -106,110 +131,71 @@ pub enum Item {
         checked: bool,
     },
     Separator,
-    Submenu {
-        label: String,
-        items: Vec<Item>,
-    },
     /// A disabled line of text.
     Info(String),
 }
 
-/// The tray menu: a submenu per agent, then "Add agent folder…", "Start at logon", the
-/// switch-over when offered, and "Quit". A `config_error` (tray.json unreadable) comes
-/// first.
+/// `text` with every `&` doubled, so that a native menu shows it as it is.
+pub fn escape(text: &str) -> String {
+    text.replace('&', "&&")
+}
+
+/// The tray menu: a line per agent ("<name>: <state>", or "<name>: <menu line>" when
+/// `menu_lines` has one for its instance id), then "Open…", "Add agent folder…",
+/// "Start at logon", the switch-over when offered, and "Quit". A `config_error` (tray.json
+/// unreadable) comes first.
 pub fn build(
     views: &[InstanceView],
     tray_autostart: bool,
     offer: &Offer,
     config_error: Option<&str>,
+    menu_lines: &HashMap<String, String>,
 ) -> Menu {
     let mut items = Vec::new();
     if let Some(error) = config_error {
-        items.push(Item::Info(format!("tray.json: {error}")));
+        items.push(Item::Info(escape(&format!("tray.json: {error}"))));
         items.push(Item::Separator);
     }
     if views.is_empty() {
         items.push(Item::Info("No agents".into()));
     }
-    items.extend(views.iter().map(agent_menu));
+    items.extend(views.iter().map(|view| {
+        let line = menu_lines
+            .get(&view.id)
+            .cloned()
+            .unwrap_or_else(|| label(&view.state));
+        Item::Agent {
+            id: agent_id(&view.id),
+            label: escape(&format!("{}: {line}", view.name)),
+            icon: icon_for_view(&view.state, view.connected),
+        }
+    }));
     items.push(Item::Separator);
-    items.push(Item::Action {
-        id: ADD_FOLDER.into(),
-        label: "Add agent folder…".into(),
+    let action = |id: &str, label: &str| Item::Action {
+        id: id.into(),
+        label: label.into(),
         enabled: true,
-    });
+    };
+    items.push(action(OPEN, "&Open…"));
+    items.push(action(ADD_FOLDER, "&Add agent folder…"));
     items.push(Item::Check {
         id: START_AT_LOGON.into(),
-        label: "Start at logon".into(),
+        label: "Start at &logon".into(),
         checked: tray_autostart,
     });
     if let Offer::SwitchOver(_) = offer {
-        items.push(Item::Action {
-            id: SWITCH_OVER.into(),
-            label: "Switch from Scheduled Task to tray…".into(),
-            enabled: true,
-        });
+        items.push(action(SWITCH_OVER, "&Switch from Scheduled Task…"));
     }
     items.push(Item::Separator);
-    items.push(Item::Action {
-        id: QUIT.into(),
-        label: "Quit".into(),
-        enabled: true,
-    });
+    items.push(action(QUIT, "&Quit"));
     Menu { items }
 }
 
-fn agent_menu(view: &InstanceView) -> Item {
-    let session = view
-        .status
-        .as_ref()
-        .and_then(|status| status.session.clone())
-        .unwrap_or_else(|| "none".into());
-    let mut items = vec![
-        Item::Info(label(&view.state)),
-        Item::Info(format!("Folder: {}", view.dir.display())),
-        Item::Info(format!("Session: {session}")),
-        Item::Separator,
-    ];
-    let action = |action: MenuAction| Item::Action {
-        id: action.id(&view.id),
-        label: action.label().into(),
-        enabled: enabled(view, action),
-    };
-    items.extend(
-        [
-            MenuAction::Start,
-            MenuAction::Stop,
-            MenuAction::RestartBackend,
-            MenuAction::Reconnect,
-            MenuAction::Pause,
-            MenuAction::Resume,
-        ]
-        .map(action),
-    );
-    items.push(Item::Separator);
-    items.extend(
-        [
-            MenuAction::OpenLog,
-            MenuAction::OpenFolder,
-            MenuAction::Details,
-        ]
-        .map(action),
-    );
-    Item::Submenu {
-        label: view.name.clone(),
-        items,
-    }
-}
-
 /// Whether `action` is available for the agent in `view`.
-pub fn enabled(view: &InstanceView, action: MenuAction) -> bool {
+pub fn enabled(view: &InstanceView, action: AgentAction) -> bool {
     let state = &view.state;
     if *state == AgentState::NotSetUp {
-        return matches!(
-            action,
-            MenuAction::Start | MenuAction::OpenFolder | MenuAction::Details
-        );
+        return action == AgentAction::Start;
     }
     let running = matches!(
         state,
@@ -224,15 +210,14 @@ pub fn enabled(view: &InstanceView, action: MenuAction) -> bool {
     );
     let live = view.connected && *state != AgentState::Stopping;
     match action {
-        MenuAction::Start => matches!(
+        AgentAction::Start => matches!(
             state,
             AgentState::Stopped | AgentState::GaveUp { .. } | AgentState::Failed { .. }
         ),
-        MenuAction::Stop => running || matches!(state, AgentState::Failed { .. }),
-        MenuAction::RestartBackend | MenuAction::Reconnect => live,
-        MenuAction::Pause => live && *state != AgentState::Paused,
-        MenuAction::Resume => live && *state == AgentState::Paused,
-        MenuAction::OpenLog | MenuAction::OpenFolder | MenuAction::Details => true,
+        AgentAction::Stop => running || matches!(state, AgentState::Failed { .. }),
+        AgentAction::RestartBackend | AgentAction::Reconnect => live,
+        AgentAction::Pause => live && *state != AgentState::Paused,
+        AgentAction::Resume => live && *state == AgentState::Paused,
     }
 }
 
@@ -260,14 +245,14 @@ pub fn icon(views: &[InstanceView]) -> Option<IconState> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::history::History;
     use crate::schedtask::TaskFor;
-    use push_bridge_control::Status;
     use std::time::Duration;
 
-    fn view(name: &str, state: AgentState, connected: bool) -> InstanceView {
+    /// An instance view for tests (also used by the window's tests).
+    pub(crate) fn view(name: &str, state: AgentState, connected: bool) -> InstanceView {
         InstanceView {
             dir: PathBuf::from(format!("bridges/{name}")),
             id: format!("{name}-id"),
@@ -281,250 +266,210 @@ mod tests {
             history: History::new(),
             last_exit: None,
             last_error: None,
+            peek_changes: 0,
+            control: None,
+            refusal: None,
         }
     }
 
-    fn submenu(item: &Item) -> (&str, &[Item]) {
-        match item {
-            Item::Submenu { label, items } => (label, items),
-            other => panic!("not a submenu: {other:?}"),
-        }
+    fn no_lines() -> HashMap<String, String> {
+        HashMap::new()
     }
 
-    fn enabled_ids(items: &[Item]) -> Vec<String> {
-        items
-            .iter()
-            .filter_map(|item| match item {
-                Item::Action {
-                    id, enabled: true, ..
-                } => Some(id.split(':').next().unwrap().to_owned()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    #[test]
-    fn ids_round_trip_and_top_level_ids_are_not_agent_actions() {
-        for action in MenuAction::ALL {
-            let id = action.id("00112233aabbccdd");
-            assert_eq!(parse_id(&id), Some((action, "00112233aabbccdd".to_owned())));
-        }
-        for id in [
-            ADD_FOLDER,
-            START_AT_LOGON,
-            SWITCH_OVER,
-            QUIT,
-            "",
-            "stop:",
-            "explode:x",
-            ":x",
-        ] {
-            assert_eq!(parse_id(id), None, "{id:?}");
-        }
-    }
-
-    #[test]
-    fn the_top_level_has_agents_then_the_tray_items() {
-        let views = [
-            view("a", AgentState::Idle, true),
-            view("b", AgentState::Stopped, false),
-        ];
-        let menu = build(&views, true, &Offer::None, None);
-        assert_eq!(submenu(&menu.items[0]).0, "a");
-        assert_eq!(submenu(&menu.items[1]).0, "b");
-        assert_eq!(
-            menu.items[2..],
-            [
-                Item::Separator,
-                Item::Action {
-                    id: ADD_FOLDER.into(),
-                    label: "Add agent folder…".into(),
-                    enabled: true,
-                },
-                Item::Check {
-                    id: START_AT_LOGON.into(),
-                    label: "Start at logon".into(),
-                    checked: true,
-                },
-                Item::Separator,
-                Item::Action {
-                    id: QUIT.into(),
-                    label: "Quit".into(),
-                    enabled: true,
-                },
-            ]
-        );
-        let offer = Offer::SwitchOver(vec![TaskFor {
-            task: "t".into(),
-            path: "\\".into(),
-            dir: PathBuf::from("bridges/a"),
-        }]);
-        let menu = build(&[], false, &offer, Some("bad JSON"));
-        assert_eq!(menu.items[0], Item::Info("tray.json: bad JSON".into()));
-        assert_eq!(menu.items[2], Item::Info("No agents".into()));
-        assert!(menu.items.contains(&Item::Action {
-            id: SWITCH_OVER.into(),
-            label: "Switch from Scheduled Task to tray…".into(),
-            enabled: true,
-        }));
-        assert!(menu.items.contains(&Item::Check {
-            id: START_AT_LOGON.into(),
-            label: "Start at logon".into(),
-            checked: false,
-        }));
-    }
-
-    #[test]
-    fn an_agent_submenu_shows_state_folder_and_session() {
-        let mut idle = view("a", AgentState::Waiting(Some("approval".into())), true);
-        idle.status = Some(Status {
-            session: Some("s-42".into()),
-            ..Status::default()
-        });
-        let menu = build(&[idle], false, &Offer::None, None);
-        let (_, items) = submenu(&menu.items[0]);
-        assert_eq!(items[0], Item::Info("waiting for you (approval)".into()));
-        assert_eq!(
-            items[1],
-            Item::Info(format!("Folder: {}", PathBuf::from("bridges/a").display()))
-        );
-        assert_eq!(items[2], Item::Info("Session: s-42".into()));
-        assert_eq!(items[3], Item::Separator);
-        let labels: Vec<&str> = items
-            .iter()
-            .filter_map(|item| match item {
-                Item::Action { label, .. } => Some(label.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            labels,
-            [
-                "Start",
-                "Stop",
-                "Restart Coda",
-                "Reconnect",
-                "Pause Coda for upgrade",
-                "Resume",
-                "Open log",
-                "Open folder",
-                "Details…"
-            ]
-        );
-        let stopped = build(
-            &[view("b", AgentState::Stopped, false)],
-            false,
-            &Offer::None,
-            None,
-        );
-        assert_eq!(
-            submenu(&stopped.items[0]).1[2],
-            Item::Info("Session: none".into())
-        );
-    }
-
-    #[test]
-    fn actions_are_enabled_by_state() {
-        let cases: [(AgentState, bool, &[&str]); 9] = [
+    /// The actions enabled for each state, as `AgentAction::as_str` names.
+    pub(crate) fn enabled_cases() -> [(AgentState, bool, &'static [&'static str]); 9] {
+        [
             (
                 AgentState::Idle,
                 true,
-                &[
-                    "stop",
-                    "restart_backend",
-                    "reconnect",
-                    "pause",
-                    "open_log",
-                    "open_folder",
-                    "details",
-                ],
+                &["stop", "restart_backend", "reconnect", "pause"],
             ),
             (
                 AgentState::Paused,
                 true,
-                &[
-                    "stop",
-                    "restart_backend",
-                    "reconnect",
-                    "resume",
-                    "open_log",
-                    "open_folder",
-                    "details",
-                ],
+                &["stop", "restart_backend", "reconnect", "resume"],
             ),
             (
                 AgentState::External { task: false },
                 true,
-                &[
-                    "stop",
-                    "restart_backend",
-                    "reconnect",
-                    "pause",
-                    "open_log",
-                    "open_folder",
-                    "details",
-                ],
+                &["stop", "restart_backend", "reconnect", "pause"],
             ),
-            (
-                AgentState::Starting,
-                false,
-                &["stop", "open_log", "open_folder", "details"],
-            ),
-            (
-                AgentState::Stopping,
-                true,
-                &["open_log", "open_folder", "details"],
-            ),
-            (
-                AgentState::Stopped,
-                false,
-                &["start", "open_log", "open_folder", "details"],
-            ),
+            (AgentState::Starting, false, &["stop"]),
+            (AgentState::Stopping, true, &[]),
+            (AgentState::Stopped, false, &["start"]),
             (
                 AgentState::Failed {
                     code: Some(1),
                     retry_in: Some(Duration::from_secs(4)),
                 },
                 false,
-                &["start", "stop", "open_log", "open_folder", "details"],
+                &["start", "stop"],
             ),
-            (
-                AgentState::GaveUp { code: Some(1) },
-                false,
-                &["start", "open_log", "open_folder", "details"],
-            ),
-            (
-                AgentState::NotSetUp,
-                false,
-                &["start", "open_folder", "details"],
-            ),
-        ];
-        for (state, connected, expected) in cases {
-            let menu = build(
-                &[view("a", state.clone(), connected)],
-                false,
-                &Offer::None,
-                None,
-            );
-            let (_, items) = submenu(&menu.items[0]);
-            assert_eq!(enabled_ids(items), expected, "{state:?}");
+            (AgentState::GaveUp { code: Some(1) }, false, &["start"]),
+            (AgentState::NotSetUp, false, &["start"]),
+        ]
+    }
+
+    #[test]
+    fn actions_round_trip_by_name() {
+        for action in AgentAction::ALL {
+            assert_eq!(AgentAction::parse(action.as_str()), Some(action));
+        }
+        assert_eq!(AgentAction::parse("open_log"), None);
+        assert_eq!(AgentAction::parse(""), None);
+        assert_eq!(AgentAction::Pause.label(), "Pause for upgrade");
+        assert_eq!(AgentAction::RestartBackend.label(), "Restart Coda");
+    }
+
+    #[test]
+    fn ids_round_trip() {
+        assert_eq!(
+            parse(&agent_id("00112233aabbccdd")),
+            Some(MenuCommand::OpenAgent("00112233aabbccdd".into()))
+        );
+        for (id, command) in [
+            (OPEN, MenuCommand::Open),
+            (ADD_FOLDER, MenuCommand::AddFolder),
+            (START_AT_LOGON, MenuCommand::StartAtLogon),
+            (SWITCH_OVER, MenuCommand::SwitchOver),
+            (QUIT, MenuCommand::Quit),
+        ] {
+            assert_eq!(parse(id), Some(command), "{id}");
+        }
+        for id in ["", "agent:", "stop:x", "details:x", "Quit", "explode"] {
+            assert_eq!(parse(id), None, "{id:?}");
         }
     }
 
     #[test]
-    fn a_not_set_up_agent_says_so() {
-        let menu = build(
-            &[view("a", AgentState::NotSetUp, false)],
-            false,
-            &Offer::None,
-            None,
-        );
-        let (_, items) = submenu(&menu.items[0]);
+    fn the_menu_has_a_line_per_agent_then_the_tray_items() {
+        let views = [
+            view("a", AgentState::Idle, true),
+            view("b", AgentState::Stopped, false),
+        ];
+        let menu = build(&views, true, &Offer::None, None, &no_lines());
         assert_eq!(
-            items[0],
-            Item::Info("Not set up: run keygen and enroll".into())
+            menu.items,
+            [
+                Item::Agent {
+                    id: "agent:a-id".into(),
+                    label: "a: connected, idle".into(),
+                    icon: IconState::Normal,
+                },
+                Item::Agent {
+                    id: "agent:b-id".into(),
+                    label: "b: stopped".into(),
+                    icon: IconState::Error,
+                },
+                Item::Separator,
+                Item::Action {
+                    id: OPEN.into(),
+                    label: "&Open…".into(),
+                    enabled: true,
+                },
+                Item::Action {
+                    id: ADD_FOLDER.into(),
+                    label: "&Add agent folder…".into(),
+                    enabled: true,
+                },
+                Item::Check {
+                    id: START_AT_LOGON.into(),
+                    label: "Start at &logon".into(),
+                    checked: true,
+                },
+                Item::Separator,
+                Item::Action {
+                    id: QUIT.into(),
+                    label: "&Quit".into(),
+                    enabled: true,
+                },
+            ]
         );
-        assert_eq!(enabled_ids(items), ["start", "open_folder", "details"]);
+        for item in &menu.items {
+            if let Item::Agent { id, .. } | Item::Action { id, .. } | Item::Check { id, .. } = item
+            {
+                assert!(parse(id).is_some(), "{id}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_config_error_no_agents_and_the_switch_over_show() {
+        let offer = Offer::SwitchOver(vec![TaskFor {
+            task: "t".into(),
+            path: "\\".into(),
+            dir: PathBuf::from("bridges/a"),
+        }]);
+        let menu = build(&[], false, &offer, Some("bad & JSON"), &no_lines());
+        assert_eq!(menu.items[0], Item::Info("tray.json: bad && JSON".into()));
+        assert_eq!(menu.items[1], Item::Separator);
+        assert_eq!(menu.items[2], Item::Info("No agents".into()));
+        assert!(menu.items.contains(&Item::Action {
+            id: SWITCH_OVER.into(),
+            label: "&Switch from Scheduled Task…".into(),
+            enabled: true,
+        }));
+        assert!(menu.items.contains(&Item::Check {
+            id: START_AT_LOGON.into(),
+            label: "Start at &logon".into(),
+            checked: false,
+        }));
+        assert_eq!(
+            menu.items.last(),
+            Some(&Item::Action {
+                id: QUIT.into(),
+                label: "&Quit".into(),
+                enabled: true,
+            })
+        );
+    }
+
+    #[test]
+    fn agent_lines_use_the_menu_line_and_escape_ampersands() {
+        let views = [
+            view("R&D", AgentState::Waiting(Some("approval".into())), true),
+            view("Ops", AgentState::Working, true),
+            view("Away", AgentState::Idle, false),
+        ];
+        let lines = HashMap::from([("Ops-id".to_owned(), "Done: tests & lint pass".to_owned())]);
+        let menu = build(&views, false, &Offer::None, None, &lines);
+        assert_eq!(
+            menu.items[..3],
+            [
+                Item::Agent {
+                    id: "agent:R&D-id".into(),
+                    label: "R&&D: waiting for you (approval)".into(),
+                    icon: IconState::Waiting,
+                },
+                Item::Agent {
+                    id: "agent:Ops-id".into(),
+                    label: "Ops: Done: tests && lint pass".into(),
+                    icon: IconState::Busy,
+                },
+                Item::Agent {
+                    id: "agent:Away-id".into(),
+                    label: "Away: connected, idle".into(),
+                    icon: IconState::Disconnected,
+                },
+            ]
+        );
+        assert_eq!(
+            parse("agent:R&D-id"),
+            Some(MenuCommand::OpenAgent("R&D-id".into()))
+        );
+    }
+
+    #[test]
+    fn actions_are_enabled_by_state() {
+        for (state, connected, expected) in enabled_cases() {
+            let view = view("a", state.clone(), connected);
+            let enabled: Vec<&str> = AgentAction::ALL
+                .into_iter()
+                .filter(|action| enabled(&view, *action))
+                .map(AgentAction::as_str)
+                .collect();
+            assert_eq!(enabled, expected, "{state:?}");
+        }
     }
 
     #[test]

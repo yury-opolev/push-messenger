@@ -21,7 +21,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use push_bridge_control::{
-    BridgeState, Call, ErrorBody, Event, EventLine, PauseParams, Status, instance_id, now_ms,
+    BridgeState, Call, ErrorBody, Event, EventLine, PauseParams, PeekEntry, Status, instance_id,
+    now_ms,
 };
 use serde_json::Value;
 use tokio::sync::{mpsc, watch};
@@ -29,6 +30,7 @@ use tokio::time::Instant;
 
 use crate::client::{self, ControlClient};
 use crate::history::History;
+use crate::menu::AgentAction;
 use crate::policy::{Decision, RestartPolicy};
 use crate::schedtask::{Scheduler, TaskFor, TaskId};
 use crate::state::{AgentState, from_bridge, label};
@@ -60,6 +62,8 @@ pub const CALL_TIMEOUT: Duration = Duration::from_secs(35);
 /// How long `pause_backend` (with the default drain) may take (the bridge's own limit is
 /// the drain plus 2 min: 12 min).
 pub const PAUSE_TIMEOUT: Duration = Duration::from_secs(15 * 60 + 30);
+/// How long a `peek` may take.
+pub const PEEK_TIMEOUT: Duration = Duration::from_secs(5);
 /// Notices waiting for the shell.
 const NOTICE_BUFFER: usize = 32;
 
@@ -204,6 +208,47 @@ pub struct InstanceView {
     pub history: History,
     pub last_exit: Option<i32>,
     pub last_error: Option<String>,
+    /// How many `peek_changed` events the bridge sent (the window peeks again when it
+    /// grows).
+    pub peek_changes: u64,
+    /// The open control channel, for the window's `peek`.
+    pub control: Option<ControlLink>,
+    /// The last action the tray forwarded that the bridge refused or that could not be
+    /// sent; cleared by the next action.
+    pub refusal: Option<Refusal>,
+}
+
+/// An action the bridge refused (or that could not be sent), shown next to its button.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refusal {
+    pub action: AgentAction,
+    /// "<message> (<code>)", or "not connected".
+    pub message: String,
+    /// Unix milliseconds.
+    pub at: i64,
+}
+
+/// A link to an instance's open control channel; equal when it is the same channel.
+#[derive(Clone)]
+pub struct ControlLink(Arc<ControlClient>);
+
+impl ControlLink {
+    /// The bridge's last `limit` peek entries, oldest first (at most [`PEEK_TIMEOUT`]).
+    pub async fn peek(&self, limit: usize) -> Result<Vec<PeekEntry>, ErrorBody> {
+        self.0.peek(limit, PEEK_TIMEOUT).await
+    }
+}
+
+impl PartialEq for ControlLink {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl std::fmt::Debug for ControlLink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ControlLink")
+    }
 }
 
 /// What the supervisor is asked to do. Instances are named by folder.
@@ -222,6 +267,21 @@ pub enum Command {
     Refresh,
     /// Stop the instances the tray started, leave the others, and return from `run`.
     Quit,
+}
+
+impl Command {
+    /// The folder of an agent action (Start, Stop, Restart Coda, Reconnect, Pause, Resume).
+    fn action_dir(&self) -> Option<&Path> {
+        match self {
+            Command::Start(dir)
+            | Command::Stop(dir)
+            | Command::RestartBackend(dir)
+            | Command::Reconnect(dir)
+            | Command::Pause(dir)
+            | Command::Resume(dir) => Some(dir),
+            Command::SetInstances(_) | Command::Refresh | Command::Quit => None,
+        }
+    }
 }
 
 /// Something worth a notification.
@@ -276,6 +336,8 @@ struct Instance {
     task_running: bool,
     last_exit: Option<i32>,
     last_error: Option<String>,
+    peek_changes: u64,
+    refusal: Option<Refusal>,
     removed: bool,
 }
 
@@ -306,6 +368,8 @@ impl Instance {
             task_running: false,
             last_exit: None,
             last_error: None,
+            peek_changes: 0,
+            refusal: None,
             removed: false,
         }
     }
@@ -370,6 +434,12 @@ impl Instance {
             history: self.history.clone(),
             last_exit: self.last_exit,
             last_error: self.last_error.clone(),
+            peek_changes: self.peek_changes,
+            control: self
+                .client
+                .as_ref()
+                .map(|client| ControlLink(Arc::clone(client))),
+            refusal: self.refusal.clone(),
         }
     }
 
@@ -405,6 +475,7 @@ enum Internal {
     Called {
         id: String,
         method: &'static str,
+        action: AgentAction,
         result: Result<Value, ErrorBody>,
     },
     ShutdownDone {
@@ -561,6 +632,11 @@ impl Supervisor {
             return;
         }
         let now = Instant::now();
+        if let Some(dir) = command.action_dir() {
+            if let Some(index) = self.index_of_dir(dir) {
+                self.instances[index].refusal = None;
+            }
+        }
         match command {
             Command::SetInstances(specs) => self.set_instances(specs),
             Command::Start(dir) => {
@@ -573,16 +649,19 @@ impl Supervisor {
                     self.stop(index, now);
                 }
             }
-            Command::RestartBackend(dir) => self.forward(&dir, Call::RestartBackend),
-            Command::Reconnect(dir) => self.forward(&dir, Call::Reconnect),
+            Command::RestartBackend(dir) => {
+                self.forward(&dir, AgentAction::RestartBackend, Call::RestartBackend);
+            }
+            Command::Reconnect(dir) => self.forward(&dir, AgentAction::Reconnect, Call::Reconnect),
             Command::Pause(dir) => self.forward(
                 &dir,
+                AgentAction::Pause,
                 Call::PauseBackend(PauseParams {
                     reason: Some("paused from the tray".into()),
                     drain_timeout_ms: None,
                 }),
             ),
-            Command::Resume(dir) => self.forward(&dir, Call::ResumeBackend),
+            Command::Resume(dir) => self.forward(&dir, AgentAction::Resume, Call::ResumeBackend),
             Command::Refresh => {
                 for instance in &mut self.instances {
                     if instance.client.is_some() {
@@ -741,7 +820,7 @@ impl Supervisor {
         });
     }
 
-    fn forward(&mut self, dir: &Path, call: Call) {
+    fn forward(&mut self, dir: &Path, action: AgentAction, call: Call) {
         let Some(index) = self.index_of_dir(dir) else {
             return;
         };
@@ -754,13 +833,23 @@ impl Supervisor {
         let instance = &mut self.instances[index];
         let Some(client) = instance.client.clone() else {
             instance.last_error = Some(format!("{method}: not connected"));
+            instance.refusal = Some(Refusal {
+                action,
+                message: "not connected".into(),
+                at: now_ms(),
+            });
             return;
         };
         let inbox = self.inbox.clone();
         let id = instance.id.clone();
         tokio::spawn(async move {
             let result = client.call(call, timeout).await;
-            let _ = inbox.send(Internal::Called { id, method, result });
+            let _ = inbox.send(Internal::Called {
+                id,
+                method,
+                action,
+                result,
+            });
         });
     }
 
@@ -829,16 +918,29 @@ impl Supervisor {
                     }
                 }
             }
-            Internal::Called { id, method, result } => {
+            Internal::Called {
+                id,
+                method,
+                action,
+                result,
+            } => {
                 let Some(index) = self.index(&id) else {
                     return;
                 };
                 let instance = &mut self.instances[index];
                 match result {
-                    Ok(_) => instance.next_status = Some(now),
+                    Ok(_) => {
+                        instance.next_status = Some(now);
+                        instance.refusal = None;
+                    }
                     Err(error) => {
-                        instance.last_error =
-                            Some(format!("{method}: {} ({})", error.message, error.code));
+                        let message = format!("{} ({})", error.message, error.code);
+                        instance.last_error = Some(format!("{method}: {message}"));
+                        instance.refusal = Some(Refusal {
+                            action,
+                            message,
+                            at: now_ms(),
+                        });
                     }
                 }
             }
@@ -957,6 +1059,7 @@ impl Supervisor {
                     None => code,
                 });
             }
+            Event::PeekChanged => instance.peek_changes += 1,
             _ => {}
         }
     }
