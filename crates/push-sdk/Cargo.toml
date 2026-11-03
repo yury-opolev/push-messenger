@@ -11,6 +11,8 @@ repository.workspace = true
 # The test doubles (`testing`) and the `push-sdk-fakes` binary, for the bindings' tests.
 # Never for an app.
 testing = ["dep:axum"]
+# MediaCall: a native WebRTC audio peer (str0m, Opus, TURN). Needs Rust 1.89.
+calls-media = ["dep:opus", "dep:str0m", "dep:turn-client-proto"]
 
 [[bin]]
 name = "push-sdk-fakes"
@@ -25,6 +27,7 @@ base64.workspace = true
 # RFC 3339 times of the calls API (ICE server expiry, call history).
 chrono.workspace = true
 futures-util.workspace = true
+opus = { version = "0.4", optional = true }
 push-domain.workspace = true
 push-proto.workspace = true
 rand.workspace = true
@@ -34,11 +37,13 @@ rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+str0m = { version = "0.25", default-features = false, features = ["aws-lc-rs"], optional = true }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
 # wss:// with rustls; ring is its provider through reqwest's rustls-tls.
 tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }
 tracing.workspace = true
+turn-client-proto = { version = "0.7", optional = true }
 uuid.workspace = true
 zeroize.workspace = true
 

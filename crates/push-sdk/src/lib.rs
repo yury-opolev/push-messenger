@@ -22,6 +22,8 @@ mod credentials;
 mod engine;
 mod error;
 mod key;
+#[cfg(feature = "calls-media")]
+pub mod media;
 mod model;
 mod policy;
 mod secrets;

@@ -690,6 +690,44 @@ and exchanging audio frames".
   clients, relay-only ICE, 2 s of a 440 Hz tone each way, assert energy at 440 Hz in the
   received PCM, hang up, both `on_ended`.
 
+## PR 6 refined (at implementation time)
+
+Crate facts found on 2026-11-03: str0m 0.25 needs Rust 1.89 and always builds aws-lc-rs
+(its `rust-crypto` backend still enables `dimpl/rcgen`, which pulls aws-lc-rs), so use
+`default-features = false, features = ["aws-lc-rs"]` (no `examples`/rouille). `audiopus`
+is unmaintained since 2021: use `opus` 0.4 (libopus 1.5 via `opusic-sys`, bundled with
+cmake, BSD-3). str0m has no TURN client: use `turn-client-proto` 0.7 (sans-IO, UDP and
+TCP, MIT/Apache). The E2E test lives in push-smoke (it owns the in-process stack), which
+enables the feature as a **dev-dependency**, so the `msrv` job (`cargo build`, no dev
+targets) never builds it.
+
+File map (all under `crates/push-sdk/src/media/`, `#[cfg(feature = "calls-media")]`):
+
+| File | Responsibility |
+|---|---|
+| `mod.rs` | public API: `MediaCall`, `Role`, `MediaOptions`, `PcmFrame`, `PcmStream`, `PcmSink`, `MediaEnded`, `MediaState`; command channel to the driver |
+| `resample.rs` | polyphase FIR 48 k → 16 k and 16 k → 48 k, stateful across frames |
+| `codec.rs` | Opus encoder/decoder (48 kHz mono, 20 ms) + resamplers: `Codec::encode(&PcmFrame)`, `decode(&[u8]) -> PcmFrame` |
+| `ice.rs` | parse `IceServers` URLs (`stun:`, `turn:` udp/tcp; `turns:` skipped), local address, STUN binding (srflx) |
+| `turn.rs` | TURN allocation over UDP or TCP with `turn-client-proto`: relay address, permissions, send/receive wrapping |
+| `driver.rs` | the task: str0m `Rtc` + sockets + TURN + codec, 20 ms send tick, events → state |
+
+- [ ] **6.1** feature + deps; `cargo deny check` (dev-dep in push-smoke puts them in the
+  graph); `cargo +1.85 build --workspace --locked` still passes.
+- [ ] **6.2** `resample.rs` with unit tests (length, 1 kHz tone kept, 12 kHz tone removed
+  on the way down, round trip correlation).
+- [ ] **6.3** `codec.rs` with a round-trip test (440 Hz tone survives Opus).
+- [ ] **6.4** `ice.rs` URL parsing tests; STUN binding request/response codec tests.
+- [ ] **6.5** `turn.rs` + `driver.rs` + `mod.rs`; an in-process unit test: two
+  `MediaCall` drivers wired with direct host candidates (no server) exchange a tone.
+- [ ] **6.6** `crates/push-smoke/tests/calls_media.rs` (`PUSH_CALLS_MEDIA=1`): the stack with
+  calls on, two SDK clients with `MediaCall`, stun-only (host candidates) and
+  `internal` TURN relay-only through the chart's coturn (shared helper moved to
+  `tests/common`), 440 Hz / 880 Hz tones, Goertzel energy check, hang up, both ended
+  `Completed`; CI job `calls-media`.
+- [ ] **6.7** docs/calls.md §19 media helper, CHANGELOG, spec §15 PR 6 notes, README of
+  the feature in the crate docs (MSRV 1.89, cmake).
+
 # PR 7 — Phase 2: bridge voice pipeline
 
 Spec §10.3, D22. Acceptance: "the bridge answers its owner's call, transcribes an
