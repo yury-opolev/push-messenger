@@ -8,6 +8,7 @@
 //! its changes to contacts, and keeps the template registry for auth-svc and seeds the
 //! built-in templates.
 
+pub mod calls;
 mod config;
 mod convert;
 mod grpc;
@@ -18,6 +19,7 @@ mod requests;
 mod server;
 mod templates;
 
+pub use calls::RedisCalls;
 pub use config::{Config, ConfigError, MigrateConfig};
 pub use grpc::{AccountsApi, DirectoryApi, InternalToken, MAX_VISIBLE_USERS, MessagingApi};
 pub use listeners::Listeners;
