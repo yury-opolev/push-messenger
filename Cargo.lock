@@ -2428,6 +2428,7 @@ dependencies = [
  "base64 0.22.1",
  "futures-util",
  "push-proto",
+ "redis",
  "reqwest",
  "serde",
  "serde_json",

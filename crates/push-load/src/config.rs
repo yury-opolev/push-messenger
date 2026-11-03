@@ -7,6 +7,8 @@ use std::time::Duration;
 use anyhow::{Context, bail};
 use reqwest::Url;
 
+use crate::commandstats::RedisUrl;
+
 /// Most connections one run opens and devices one preparation keeps.
 pub const MAX_CONNECTIONS: usize = 20_000;
 /// auth-svc's limit of active devices per account (`MAX_ACTIVE_DEVICES`).
@@ -250,6 +252,8 @@ pub struct CallsOptions {
     /// The run fails when the setup latency's p95 is above this.
     pub setup_p95: Duration,
     pub target_build: String,
+    /// The target's Redis, for `INFO commandstats` before and after the run.
+    pub redis: Option<RedisUrl>,
 }
 
 impl CallsOptions {
@@ -467,6 +471,7 @@ mod tests {
             attempts_per_hour: DEFAULT_CALL_ATTEMPTS_PER_HOUR,
             setup_p95: DEFAULT_SETUP_P95,
             target_build: "gateway@sha256:0123".to_owned(),
+            redis: None,
         }
     }
 

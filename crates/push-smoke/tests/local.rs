@@ -223,19 +223,39 @@ fn calls_options(calls: usize, duration_s: u64, hold_s: u64) -> CallsOptions {
         // deployment, not this test.
         setup_p95: Duration::from_secs(5),
         target_build: "local whole-stack test".to_owned(),
+        redis: None,
     }
+}
+
+/// A Redis user that may only run `INFO`, as an operator would give push-load: the URL
+/// of `redis_url` (no password) with that user and a password.
+async fn redis_stats_url(redis_url: &str) -> String {
+    let client = redis::Client::open(redis_url).unwrap();
+    let mut connection = client.get_multiplexed_async_connection().await.unwrap();
+    redis::cmd("ACL")
+        .arg(&["SETUSER", "push-load-stats", "on", ">stats-s3cret", "+info"])
+        .query_async::<()>(&mut connection)
+        .await
+        .unwrap();
+    redis_url.replace("redis://", "redis://push-load-stats:stats-s3cret@")
 }
 
 /// push-load's calls scenario against the whole stack with calls enabled: two pairs
 /// place, answer, hold and hang up calls for 20 s; the report passes, records setup
-/// latency and holds no credential.
+/// latency and the Redis commands the calls cost, and holds no credential.
 #[tokio::test]
 async fn push_load_calls_place_and_complete_calls_against_the_whole_stack() {
     let (datastores, _containers) = common::calls_datastores().await;
+    let redis_url = common::lookup(datastores.gateway.clone())("PUSH_REDIS_URL").unwrap();
+    let stats_url = redis_stats_url(&redis_url).await;
     let stack = Stack::start(datastores).await;
     let (target, state_path, accounts, dir) = prepare_pairs(&stack, 2).await;
 
-    let report = push_load::calls::run(&target, &state_path, &calls_options(2, 20, 2))
+    let options = CallsOptions {
+        redis: Some(push_load::commandstats::RedisUrl::new(&stats_url).unwrap()),
+        ..calls_options(2, 20, 2)
+    };
+    let report = push_load::calls::run(&target, &state_path, &options)
         .await
         .unwrap();
     assert_eq!(report.status, Status::Passed, "{:?}", report.failures);
@@ -262,8 +282,22 @@ async fn push_load_calls_place_and_complete_calls_against_the_whole_stack() {
     assert_eq!(calls.peak_active, 2, "both pairs were in a call at once");
     assert_eq!(report.latency.setup.count as u64, calls.accepted);
     assert!(report.latency.setup.p95_ms.is_some());
+    let redis = report.redis.as_ref().expect("Redis deltas");
+    assert!(redis.error.is_none() && !redis.reset, "{redis:?}");
+    assert!(
+        redis
+            .commands
+            .get("evalsha")
+            .is_some_and(|evalsha| evalsha.calls > 0),
+        "the call engine's scripts: {redis:?}"
+    );
+    assert!(redis.total_calls > 0 && redis.calls_per_call_placed.is_some());
 
     let json = serde_json::to_string(&report).unwrap();
+    assert!(
+        !json.contains("stats-s3cret") && !json.contains(&stats_url),
+        "the report holds the Redis URL"
+    );
     for account in &accounts {
         assert!(!json.contains(&account.email) && !json.contains(&account.password));
     }

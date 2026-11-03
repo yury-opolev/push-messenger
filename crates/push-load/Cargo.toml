@@ -13,6 +13,8 @@ anyhow.workspace = true
 base64.workspace = true
 futures-util.workspace = true
 push-proto.workspace = true
+# INFO commandstats of the target's Redis, when the operator passes its URL (calls).
+redis.workspace = true
 # HTTPS with rustls, ring and the webpki roots, as push-sdk.
 reqwest = { workspace = true, features = ["rustls-tls"] }
 serde.workspace = true

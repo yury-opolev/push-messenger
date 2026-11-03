@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use anyhow::{Context, bail};
 
+use crate::commandstats::RedisUrl;
 use crate::config::{
     CallsOptions, DEFAULT_CALL_ATTEMPTS_PER_HOUR, DEFAULT_SETUP_P95, PrepareOptions, RunOptions,
     Target,
@@ -28,6 +29,7 @@ usage:
                     --calls <n> --ramp-per-second <n> --duration-seconds <n>
                     --hold-seconds <n> --target-build <label> --report <new-file.json>
                     [--attempts-per-hour <n>] [--setup-p95-ms <n>] [--connect-to <ip>]
+                    [--redis-url-file <file>]
 
 Only test a deployment you own or are authorized to test (docs/consumer-verification.md).";
 
@@ -200,7 +202,7 @@ async fn run_command(args: &[String]) -> anyhow::Result<ExitCode> {
     Ok(exit_code(report.status))
 }
 
-const CALLS_FLAGS: [&str; 12] = [
+const CALLS_FLAGS: [&str; 13] = [
     "--target",
     "--authorized-target",
     "--state",
@@ -213,6 +215,7 @@ const CALLS_FLAGS: [&str; 12] = [
     "--target-build",
     "--report",
     "--connect-to",
+    "--redis-url-file",
 ];
 
 fn calls_options(flags: &Flags) -> anyhow::Result<CallsOptions> {
@@ -226,6 +229,10 @@ fn calls_options(flags: &Flags) -> anyhow::Result<CallsOptions> {
             .number("--attempts-per-hour", Some(DEFAULT_CALL_ATTEMPTS_PER_HOUR))?,
         setup_p95: Duration::from_millis(flags.number("--setup-p95-ms", Some(default_p95))?),
         target_build: flags.required("--target-build")?.to_owned(),
+        redis: flags
+            .optional("--redis-url-file")
+            .map(|path| RedisUrl::read(&PathBuf::from(path)))
+            .transpose()?,
     };
     options.validate()?;
     Ok(options)
@@ -395,6 +402,39 @@ mod tests {
         .to_string();
         assert!(error.contains("--attempts-per-hour 5"), "{error}");
         assert!(parse(&calls_args(&["--no-reconnect"]), &CALLS_FLAGS, &[]).is_err());
+        assert_eq!(options.redis, None);
+    }
+
+    #[test]
+    fn the_redis_url_comes_from_a_file_and_a_bad_one_is_not_echoed() {
+        let dir = std::env::temp_dir().join(format!("push-load-cli-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let good = dir.join("redis-url");
+        std::fs::write(&good, "redis://load:s3cret@127.0.0.1:6379\n").unwrap();
+        let bad = dir.join("bad-url");
+        std::fs::write(&bad, "http://load:s3cret@127.0.0.1:6379").unwrap();
+        let options = calls_options(
+            &parse(
+                &calls_args(&["--redis-url-file", good.to_str().unwrap()]),
+                &CALLS_FLAGS,
+                &[],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(options.redis.is_some());
+        assert!(!format!("{options:?}").contains("s3cret"));
+        let error = calls_options(
+            &parse(
+                &calls_args(&["--redis-url-file", bad.to_str().unwrap()]),
+                &CALLS_FLAGS,
+                &[],
+            )
+            .unwrap(),
+        )
+        .unwrap_err();
+        assert!(!format!("{error:#}").contains("s3cret"), "{error:#}");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]
