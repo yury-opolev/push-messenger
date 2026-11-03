@@ -633,3 +633,39 @@ Decisions taken while implementing, beyond or refining the sections above:
 - message-svc `/metrics` is empty when calls are disabled.
 - The gateway drops call frames from the hub on connections that are not calls-active.
 - The sweeper claims again while claims come back full and ticks 16 calls at a time (D5).
+
+### PR 2 (call history)
+
+Decisions taken while implementing §9, beyond or refining it:
+
+- Each history item carries its own opaque `cursor`; `next` is present only when the page is
+  full. `before` and `since` combine (strictly older than `before` and newer than `since`).
+  Cursors are base64url without padding of `<ended_at µs>:<call_id>` with one canonical
+  spelling (anything else is `400 invalid`).
+- `messaging.call_history` references `messaging.known_user` for both user columns; the
+  user index is `(user_id, ended_at DESC, call_id DESC)`, and a second index on `ended_at`
+  serves the purge. `outcome` and `direction` are `text` with CHECK constraints.
+- A hidden row stays hidden when the end is recorded again (`ON CONFLICT DO NOTHING`).
+- The rows are written after the Redis apply and the `CallEnded` publish, in a task of
+  their own (three attempts, 100 ms then 200 ms apart, then logged and counted in
+  `push_call_history_write_failures_total`, a metric beyond §9), so the ending frame's RPC
+  deadline cannot cancel the write and a slow database never stalls the sweeper. A write in
+  flight when the replica stops is lost. An ending apply whose reply is lost counts as
+  applied when the re-read finds the record gone (PR 1), so its rows are still written;
+  only a lost reply whose re-read fails too loses them.
+- `CallHistoryChanged` travels as `CallSignal.history_changed` (field 8) on the user's
+  `notify:` channel, addressed to the user's attached devices with a live presence lease
+  (the same "live" as ringing). It is also sent, without `latest_ended_at`, to the user's
+  own devices when they hide a call.
+- The retention purge runs in message-svc (push-worker has no access to the messaging
+  database), in every replica, hourly and once at start, whether calls are enabled or not
+  (history recorded while calls were on still expires); at most 1000 batches of 1000 per
+  run. The `Calls` gRPC service is likewise served with calls disabled.
+- `/metrics` now always serves the history families; the call families still only with
+  calls enabled (the body is no longer empty with calls disabled).
+- auth-svc rate limits both routes together (`call_history`: 120 per minute per user, 600
+  per IP). `Calls.History` treats `limit` 0 as 50 and clamps above 100; auth-svc accepts
+  only 1–100. `DELETE` accepts any UUID spelling for the id.
+- The gateway integration test `history_lists_both_sides_and_hiding_is_per_side` drives the
+  `Calls` API in process (the HTTP layer is covered by auth-svc's tests with a fake log and
+  its gRPC client by a stub server).

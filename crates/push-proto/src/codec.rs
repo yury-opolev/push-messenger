@@ -303,6 +303,9 @@ mod tests {
             }),
             Body::PeerCallIce(ice),
             Body::PeerCallRenegotiate(renegotiate),
+            Body::CallHistoryChanged(crate::v1::CallHistoryChanged {
+                latest_ended_at: Some(1_700_000_061_000_000),
+            }),
         ];
         for frame in frames {
             assert_eq!(decode_frame(&encode_frame(frame.clone())), Ok(frame));

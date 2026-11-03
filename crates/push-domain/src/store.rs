@@ -64,7 +64,9 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use uuid::Uuid;
 
+use crate::calls::{CallHistoryRow, HistoryCursor};
 use crate::error::DomainResult;
 use crate::ids::{ClientMsgId, ConversationId, DeviceId, MessageId, UserId};
 use crate::model::{
@@ -508,4 +510,38 @@ pub trait Tx: Send {
     /// The version's audit trail, oldest first. Empty for an unknown ref.
     async fn template_events(&mut self, template: &TemplateRef)
     -> DomainResult<Vec<TemplateEvent>>;
+
+    // --- Call history ------------------------------------------------------------------
+
+    /// Stores call history rows. A row whose `(user, call_id)` is stored already is
+    /// skipped, keeping the stored one (Postgres: `ON CONFLICT DO NOTHING`), so recording
+    /// an ended call again changes nothing and never shows a hidden row again. Fails with
+    /// `DomainError::Store` if a user or peer is not a known user.
+    async fn insert_call_history(&mut self, rows: &[CallHistoryRow]) -> DomainResult<()>;
+    /// `user`'s rows that are not hidden, newest first by `(ended_at, call_id)`: only
+    /// those strictly before `before` and strictly after `since` when given, at most
+    /// `limit`.
+    async fn call_history(
+        &mut self,
+        user: UserId,
+        before: Option<HistoryCursor>,
+        since: Option<HistoryCursor>,
+        limit: u32,
+    ) -> DomainResult<Vec<CallHistoryRow>>;
+    /// Hides `user`'s row of `call` as of `at`. Returns whether a visible row was hidden:
+    /// false when there is no such row of `user`'s or it is hidden already. Never touches
+    /// another user's row.
+    async fn hide_call(
+        &mut self,
+        user: UserId,
+        call: Uuid,
+        at: DateTime<Utc>,
+    ) -> DomainResult<bool>;
+    /// Deletes at most `batch` rows, of any user, that ended before `cutoff`, hidden or
+    /// not. Returns how many were deleted.
+    async fn delete_call_history_before(
+        &mut self,
+        cutoff: DateTime<Utc>,
+        batch: u32,
+    ) -> DomainResult<u64>;
 }

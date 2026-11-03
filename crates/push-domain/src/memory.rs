@@ -10,7 +10,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use tokio::sync::{Mutex, OwnedMutexGuard};
+use uuid::Uuid;
 
+use crate::calls::{CallHistoryRow, HistoryCursor};
 use crate::error::{DomainError, DomainResult};
 use crate::ids::{ClientMsgId, ConversationId, DeviceId, MessageId, UserId};
 use crate::model::{
@@ -51,6 +53,9 @@ fn check_template_status(template: &StoredTemplate) -> DomainResult<()> {
     Ok(())
 }
 
+/// A call history row and when its user hid it.
+type HistoryEntry = (CallHistoryRow, Option<DateTime<Utc>>);
+
 #[derive(Debug, Clone, Default)]
 struct State {
     users: HashSet<UserId>,
@@ -77,6 +82,8 @@ struct State {
     template_change: i64,
     /// Every template event, oldest first.
     template_events: Vec<TemplateEvent>,
+    /// Call history rows by `(user, call)`, with when the user hid them.
+    call_history: BTreeMap<(UserId, Uuid), HistoryEntry>,
 }
 
 impl State {
@@ -1147,5 +1154,76 @@ impl Tx for InMemoryTx {
             .filter(|event| event.template == *template)
             .cloned()
             .collect())
+    }
+
+    async fn insert_call_history(&mut self, rows: &[CallHistoryRow]) -> DomainResult<()> {
+        for row in rows {
+            if !self.work.users.contains(&row.user) || !self.work.users.contains(&row.peer) {
+                return Err(missing("user"));
+            }
+        }
+        for row in rows {
+            self.work
+                .call_history
+                .entry((row.user, row.call_id))
+                .or_insert_with(|| (row.clone(), None));
+        }
+        Ok(())
+    }
+
+    async fn call_history(
+        &mut self,
+        user: UserId,
+        before: Option<HistoryCursor>,
+        since: Option<HistoryCursor>,
+        limit: u32,
+    ) -> DomainResult<Vec<CallHistoryRow>> {
+        let mut rows: Vec<CallHistoryRow> = self
+            .work
+            .call_history
+            .values()
+            .filter(|(row, hidden)| row.user == user && hidden.is_none())
+            .map(|(row, _)| row)
+            .filter(|row| before.is_none_or(|before| row.cursor() < before))
+            .filter(|row| since.is_none_or(|since| row.cursor() > since))
+            .cloned()
+            .collect();
+        rows.sort_by_key(|row| std::cmp::Reverse(row.cursor()));
+        rows.truncate(limit as usize);
+        Ok(rows)
+    }
+
+    async fn hide_call(
+        &mut self,
+        user: UserId,
+        call: Uuid,
+        at: DateTime<Utc>,
+    ) -> DomainResult<bool> {
+        match self.work.call_history.get_mut(&(user, call)) {
+            Some((_, hidden @ None)) => {
+                *hidden = Some(at);
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    async fn delete_call_history_before(
+        &mut self,
+        cutoff: DateTime<Utc>,
+        batch: u32,
+    ) -> DomainResult<u64> {
+        let old: Vec<(UserId, Uuid)> = self
+            .work
+            .call_history
+            .iter()
+            .filter(|(_, (row, _))| row.ended_at < cutoff)
+            .map(|(key, _)| *key)
+            .take(batch as usize)
+            .collect();
+        for key in &old {
+            self.work.call_history.remove(key);
+        }
+        Ok(old.len() as u64)
     }
 }

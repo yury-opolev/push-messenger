@@ -99,6 +99,7 @@ async fn world() -> World {
         client_ip_header: Some(HeaderName::from_static("x-real-ip")),
         directory: Arc::clone(&directory) as Arc<dyn Directory>,
         templates: Arc::new(push_auth_core::NoTemplates),
+        call_history: Arc::new(push_auth_core::NoCalls),
     });
     World {
         _container: container,

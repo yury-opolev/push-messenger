@@ -84,6 +84,9 @@ spec:
               value: {{ int .Values.calls.ringSeconds | quote }}
             - name: PUSH_CALLS_DISCONNECT_GRACE_SECONDS
               value: {{ int .Values.calls.disconnectGraceSeconds | quote }}
+            # Call history retention, also with calls disabled.
+            - name: PUSH_CALLS_HISTORY_DAYS
+              value: {{ int .Values.calls.historyDays | quote }}
           ports:
             - name: messaging
               containerPort: 50051

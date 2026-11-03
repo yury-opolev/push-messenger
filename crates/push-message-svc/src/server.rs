@@ -13,6 +13,7 @@ use push_credentials::startup::{redis_permanent, retry};
 use push_credentials::{AuthMode, AzureConfig, RedisConnector};
 use push_domain::{DomainError, Messaging, SystemClock};
 use push_proto::internal::v1::accounts_server::AccountsServer;
+use push_proto::internal::v1::calls_server::CallsServer;
 use push_proto::internal::v1::directory_server::DirectoryServer;
 use push_proto::internal::v1::messaging_server::MessagingServer;
 use push_proto::internal::v1::templates_server::TemplatesServer;
@@ -22,7 +23,7 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tokio_util::sync::CancellationToken;
 
 use crate::Listeners;
-use crate::calls::{CallService, CallsApi, RedisCalls};
+use crate::calls::{CallHistory, CallHistoryApi, CallService, CallsApi, RedisCalls};
 use crate::config::{Config, MigrateConfig};
 use crate::grpc::{AccountsApi, DirectoryApi, InternalToken, MessagingApi};
 use crate::metrics::Metrics;
@@ -39,8 +40,9 @@ const RETRY_DELAY: Duration = Duration::from_secs(2);
 /// database is migrated and answers a ping, Redis has connected and the built-in templates
 /// are seeded, and never after shutdown began. Postgres, Redis and seeding are retried
 /// until they succeed, so the service may start before its datastores. `/metrics` serves
-/// the call metrics in the Prometheus text format (empty with calls disabled). With calls
-/// enabled the call sweeper runs beside the APIs until shutdown.
+/// the call history metrics, and the call metrics with calls enabled, in the Prometheus
+/// text format. The call history retention purge runs beside the APIs until shutdown, and
+/// with calls enabled the call sweeper too.
 pub async fn serve(
     config: Config,
     listeners: Listeners,
@@ -55,10 +57,8 @@ pub async fn serve(
     let ready = Health {
         store: Arc::new(OnceLock::new()),
         shutdown: shutdown.clone(),
-        calls: config.calls.enabled.then(|| CallsHealth {
-            metrics: Arc::new(Metrics::new()),
-            redis: Arc::new(OnceLock::new()),
-        }),
+        metrics: Arc::new(Metrics::new()),
+        calls: config.calls.enabled.then(|| Arc::new(OnceLock::new())),
     };
     let health_server = tokio::spawn(
         axum::serve(health, health_router(ready.clone()))
@@ -156,8 +156,13 @@ pub async fn serve(
         }
     }
     let _ = ready.store.set(store.clone());
-    let calls = ready.calls.as_ref().map(|health| {
-        let _ = health.redis.set(call_notifier.calls());
+    let history = Arc::new(CallHistory::new(
+        Arc::clone(&messaging),
+        call_notifier.clone(),
+        Arc::clone(&ready.metrics),
+    ));
+    let calls = ready.calls.as_ref().map(|redis| {
+        let _ = redis.set(call_notifier.calls());
         tracing::info!(
             ring_s = config.calls.ring.as_secs(),
             grace_s = config.calls.grace.as_secs(),
@@ -168,7 +173,7 @@ pub async fn serve(
             call_notifier.calls(),
             call_notifier.clone(),
             config.calls.timing(),
-            Arc::clone(&health.metrics),
+            Arc::clone(&ready.metrics),
         ))
     });
     let mut messaging_api = MessagingApi::with_presence(Arc::clone(&messaging), presence);
@@ -203,7 +208,7 @@ pub async fn serve(
                 shutdown.clone().cancelled_owned(),
             ),
     );
-    tracing::info!(addr = %config.directory_grpc_addr, "serving Directory and Templates gRPC");
+    tracing::info!(addr = %config.directory_grpc_addr, "serving Directory, Templates and Calls gRPC");
     let directory_token = InternalToken::directory(config.directory_token);
     servers.spawn(
         tonic::transport::Server::builder()
@@ -213,6 +218,10 @@ pub async fn serve(
             ))
             .add_service(TemplatesServer::with_interceptor(
                 TemplatesApi::new(messaging),
+                directory_token.clone(),
+            ))
+            .add_service(CallsServer::with_interceptor(
+                CallHistoryApi::new(Arc::clone(&history)),
                 directory_token,
             ))
             .serve_with_incoming_shutdown(
@@ -220,6 +229,14 @@ pub async fn serve(
                 shutdown.clone().cancelled_owned(),
             ),
     );
+    {
+        let shutdown = shutdown.clone();
+        let days = config.calls.history_days;
+        servers.spawn(async move {
+            history.run_retention(days, shutdown).await;
+            Ok(())
+        });
+    }
     if let Some(calls) = calls {
         let shutdown = shutdown.clone();
         servers.spawn(async move {
@@ -311,14 +328,10 @@ async fn finish(health_server: tokio::task::JoinHandle<std::io::Result<()>>) -> 
 struct Health {
     store: Arc<OnceLock<PgStore>>,
     shutdown: CancellationToken,
-    /// With calls enabled: the call metrics, and the call store once Redis connected.
-    calls: Option<CallsHealth>,
-}
-
-#[derive(Clone)]
-struct CallsHealth {
+    /// The call and call history metrics.
     metrics: Arc<Metrics>,
-    redis: Arc<OnceLock<RedisCalls>>,
+    /// With calls enabled: the call store once Redis connected.
+    calls: Option<Arc<OnceLock<RedisCalls>>>,
 }
 
 fn health_router(health: Health) -> Router {
@@ -329,25 +342,23 @@ fn health_router(health: Health) -> Router {
         .with_state(health)
 }
 
-/// Prometheus text: the call families with calls enabled (`push_calls_live` while Redis
-/// answers), else nothing.
+/// Prometheus text: the call history families, and the call families with calls enabled
+/// (`push_calls_live` while Redis answers).
 async fn metrics(State(health): State<Health>) -> impl IntoResponse {
-    let body = match &health.calls {
-        None => String::new(),
-        Some(calls) => {
-            let live = match calls.redis.get() {
-                Some(redis) => match redis.live_count().await {
-                    Ok(live) => Some(live),
-                    Err(error) => {
-                        tracing::debug!(%error, "push_calls_live could not be read");
-                        None
-                    }
-                },
-                None => None,
-            };
-            calls.metrics.render(live)
-        }
-    };
+    let mut body = health.metrics.render_history();
+    if let Some(redis) = &health.calls {
+        let live = match redis.get() {
+            Some(redis) => match redis.live_count().await {
+                Ok(live) => Some(live),
+                Err(error) => {
+                    tracing::debug!(%error, "push_calls_live could not be read");
+                    None
+                }
+            },
+            None => None,
+        };
+        body.push_str(&health.metrics.render(live));
+    }
     ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body)
 }
 

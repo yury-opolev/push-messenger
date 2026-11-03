@@ -295,7 +295,7 @@ ingress:
     secretName: messenger-tls # existing kubernetes.io/tls Secret; required for https
   annotations: {}             # on every public Ingress
   gatewayAnnotations: {}      # /v1/socket
-  authAnnotations: {}         # /v1/auth, /v1/devices, /v1/users, /v1/agents, /v1/templates
+  authAnnotations: {}         # /v1/auth, /v1/devices, /v1/users, /v1/agents, /v1/templates, /v1/calls
   authLinkAnnotations: {}     # /v1/auth/verify, /v1/auth/password/reset (token-bearing)
   webhookAnnotations: {}      # /v1/webhooks/resend
 ```
@@ -354,10 +354,11 @@ at start-up.
 | `calls.ringSeconds` | `45` | "calls.ringSeconds must be an integer from 10 to 120" | message-svc `PUSH_CALLS_RING_SECONDS` |
 | `calls.disconnectGraceSeconds` | `30` | "calls.disconnectGraceSeconds must be an integer from 5 to 120" | message-svc `PUSH_CALLS_DISCONNECT_GRACE_SECONDS` |
 | `calls.attemptsPerHour` | `30` | "calls.attemptsPerHour must be an integer from 1 to 1000" | gateway `PUSH_CALLS_ATTEMPTS_PER_HOUR` |
+| `calls.historyDays` | `90` | "calls.historyDays must be an integer from 1 to 3650" | message-svc `PUSH_CALLS_HISTORY_DAYS`: call history retention, applied hourly whether calls are enabled or not |
 
 Call state lives in the Redis the gateways and message-svc already share. message-svc
 serves the call metrics in the Prometheus text format at `GET /metrics` on its health port
-(8081, the `health` container port; empty while calls are disabled); the chart adds no
+(8081, the `health` container port; only the call history families while calls are disabled); the chart adds no
 scrape configuration or annotations, so point the consumer's own scraper at it. The
 chart's NetworkPolicies admit no scraper to that port; NetworkPolicies are additive, so
 add one of your own that admits it on 8081. Metric names: [calls.md](calls.md#11-metrics).

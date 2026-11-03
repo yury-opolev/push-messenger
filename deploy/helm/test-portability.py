@@ -360,7 +360,7 @@ def ingress():
         "portable-gateway": [("/v1/socket", "Exact", "portable-gateway")],
         "portable-auth": [(p, "Prefix", "portable-auth")
                           for p in ("/v1/auth", "/v1/devices", "/v1/users", "/v1/agents",
-                                   "/v1/templates")],
+                                   "/v1/templates", "/v1/calls")],
         "portable-auth-links": [(p, "Exact", "portable-auth")
                                 for p in ("/v1/auth/verify", "/v1/auth/password/reset")],
         "portable-worker": [("/v1/webhooks/resend", "Exact", "portable-worker")],

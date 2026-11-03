@@ -6,6 +6,25 @@ Notable changes for consumers of push-messenger. Newest first.
 
 ### Added
 
+- **Call history** (voice calls, PR 2): every participant of an ended call gets a row in
+  their own call history, kept apart from conversations (no "missed call" messages).
+  auth-svc serves `GET /v1/calls?before=<cursor>&since=<cursor>&limit=50` (the caller's
+  own calls, newest first: `call_id`, `peer_user_id`, `direction` `in`/`out`,
+  `started_at`, `answered_at?`, `ended_at`, `duration_s`, `outcome` as `CallEnded.reason`,
+  and an opaque `cursor`; `next` when the page is full) and `DELETE /v1/calls/{call_id}`
+  (hides the call from the caller's history only; always 204; audited as
+  `calls.history.hidden`), rate limited at 120 per minute per user. New server frame
+  `CallHistoryChanged` 52 (`latest_ended_at`) tells a user's calls-active devices to
+  refresh, for missed-call badges with `since`. message-svc writes the rows when a call
+  ends (busy and unreachable invites too; unreachable only for the caller), serves them
+  over the new internal `Calls` gRPC service on its Directory listener
+  (`Notification.call` gains `history_changed`), and deletes rows older than
+  `calls.historyDays` (default 90, 1 to 3650; `PUSH_CALLS_HISTORY_DAYS`) every hour, also
+  with calls disabled. Migration `0008_call_history.sql` adds the table
+  `messaging.call_history` (no existing data changes). New metrics
+  `push_call_history_rows_deleted_total` and `push_call_history_write_failures_total`
+  (served at `/metrics` even with calls disabled, so the body is no longer empty then).
+  The auth Ingress routes `/v1/calls`. Guide: [docs/calls.md](docs/calls.md#12-call-history).
 - **Voice calls (signalling)**: 1:1 WebRTC audio calls between accepted contacts (and
   between an owned agent and its owner) are signalled over the `push.v1` WebSocket; audio
   goes peer to peer and the server never sees it. New frames: client `CallInvite` 11,
@@ -26,7 +45,7 @@ Notable changes for consumers of push-messenger. Newest first.
   `PUSH_CALLS_DISCONNECT_GRACE_SECONDS` and `PUSH_CALLS_ATTEMPTS_PER_HOUR`. message-svc
   serves the call metrics in Prometheus text at `GET /metrics` on its health port.
   Rolling upgrade: enable `calls.enabled` only after every gateway and message-svc replica
-  runs this version. TURN credentials, call history and the SDK API are coming. Guide:
+  runs this version. TURN credentials and the SDK API are coming. Guide:
   [docs/calls.md](docs/calls.md).
 - **Agent tray v2**: the tray icon is the app's glyph (two linked chat bubbles, `#1b1b1b`
   on a light taskbar, `#ffffff` on a dark one) with a status badge for the most urgent

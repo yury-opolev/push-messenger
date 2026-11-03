@@ -162,6 +162,7 @@ fn public(world: &World, templates: Arc<dyn TemplateRegistry>) -> Router {
         client_ip_header: Some(HeaderName::from_static("x-real-ip")),
         directory: Arc::new(NoDirectory),
         templates,
+        call_history: Arc::new(crate::calls::NoCalls),
     })
 }
 
@@ -179,20 +180,20 @@ fn admin(templates: Arc<dyn TemplateRegistry>) -> Router {
     )
 }
 
-struct Answer {
-    status: StatusCode,
-    headers: HeaderMap,
-    body: Vec<u8>,
+pub(super) struct Answer {
+    pub(super) status: StatusCode,
+    pub(super) headers: HeaderMap,
+    pub(super) body: Vec<u8>,
 }
 
 impl Answer {
-    fn json(&self) -> Value {
+    pub(super) fn json(&self) -> Value {
         serde_json::from_slice(&self.body).unwrap_or(Value::Null)
     }
 }
 
 /// One request; `content_type` is sent with a body.
-async fn send(
+pub(super) async fn send(
     router: &Router,
     method: Method,
     uri: &str,

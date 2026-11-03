@@ -1282,3 +1282,120 @@ async fn no_sdp_or_candidate_in_logs_or_audit() {
         assert!(leaks.is_empty(), "{secret} logged: {leaks:#?}");
     }
 }
+
+/// The next `CallHistoryChanged`, skipping every other frame: its `latest_ended_at`.
+async fn next_history_changed(socket: &mut Socket) -> Option<i64> {
+    loop {
+        if let Body::CallHistoryChanged(changed) = next(socket).await {
+            return changed.latest_ended_at;
+        }
+    }
+}
+
+/// Asserts that no `CallHistoryChanged` reaches `socket` for a while.
+async fn no_history_changed(socket: &mut Socket) {
+    let deadline = Instant::now() + QUIET;
+    loop {
+        match tokio::time::timeout_at(deadline, socket.next()).await {
+            Err(_) => return,
+            Ok(Some(Ok(Message::Binary(bytes)))) => {
+                let frame = decode_frame(&bytes).expect("a valid frame");
+                assert!(
+                    !matches!(frame, Body::CallHistoryChanged(_)),
+                    "expected no CallHistoryChanged, got {frame:?}"
+                );
+            }
+            Ok(Some(Ok(Message::Ping(_) | Message::Pong(_)))) => {}
+            Ok(other) => panic!("expected an open connection, got {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn history_lists_both_sides_and_hiding_is_per_side() {
+    use push_message_svc::{CallHistory, CallHistoryApi};
+    use push_proto::internal::v1::calls_server::Calls as _;
+    use push_proto::internal::v1::{CallHistoryRequest, HideCallRequest};
+
+    let stack = stack().await;
+    let (alice, alice_device) = person(&stack).await;
+    let (bob, bob_device) = person(&stack).await;
+    contacts(&stack, alice, bob).await;
+    let mut alice_socket = calls_ready(&stack, A, alice, alice_device).await;
+    let mut bob_socket = calls_ready(&stack, B, bob, bob_device).await;
+    wait_online(&stack, alice, 1).await;
+    wait_online(&stack, bob, 1).await;
+
+    let call = invite(&mut alice_socket, bob).await;
+    expect_incoming(&mut bob_socket, &call, alice).await;
+    send(&mut bob_socket, accept(&call)).await;
+    expect_accepted(&mut alice_socket, &call, bob_device).await;
+    send(&mut alice_socket, hangup(&call)).await;
+    expect_ended(&mut alice_socket, &call, CallEndReason::Completed).await;
+    expect_ended(&mut bob_socket, &call, CallEndReason::Completed).await;
+    let alice_latest = next_history_changed(&mut alice_socket).await;
+    let bob_latest = next_history_changed(&mut bob_socket).await;
+    assert!(alice_latest.is_some());
+    assert_eq!(alice_latest, bob_latest);
+
+    let history = Arc::new(CallHistory::new(
+        Arc::clone(&stack.messaging),
+        RedisNotifier::connect(&stack.redis_url).await.unwrap(),
+        Arc::new(Metrics::new()),
+    ));
+    let api = CallHistoryApi::new(history);
+    let list = |user: Uuid| {
+        tonic::Request::new(CallHistoryRequest {
+            user_id: id_bytes(user),
+            before: None,
+            since: None,
+            limit: 0,
+        })
+    };
+    let mine = api.history(list(alice)).await.unwrap().into_inner().calls;
+    assert_eq!(mine.len(), 1);
+    assert_eq!(
+        (
+            mine[0].call_id.clone(),
+            mine[0].peer_user_id.clone(),
+            mine[0].direction(),
+            mine[0].outcome(),
+            Some(mine[0].ended_at),
+        ),
+        (
+            call.clone(),
+            id_bytes(bob),
+            CallDirection::Out,
+            CallEndReason::Completed,
+            alice_latest,
+        )
+    );
+    assert!(mine[0].answered_at.is_some());
+    let theirs = api.history(list(bob)).await.unwrap().into_inner().calls;
+    assert_eq!(theirs.len(), 1);
+    assert_eq!(
+        (theirs[0].peer_user_id.clone(), theirs[0].direction()),
+        (id_bytes(alice), CallDirection::In)
+    );
+
+    api.hide(tonic::Request::new(HideCallRequest {
+        user_id: id_bytes(alice),
+        call_id: call.clone(),
+    }))
+    .await
+    .unwrap();
+    assert_eq!(next_history_changed(&mut alice_socket).await, None);
+    no_history_changed(&mut bob_socket).await;
+    assert!(
+        api.history(list(alice))
+            .await
+            .unwrap()
+            .into_inner()
+            .calls
+            .is_empty()
+    );
+    assert_eq!(
+        api.history(list(bob)).await.unwrap().into_inner().calls,
+        theirs
+    );
+}

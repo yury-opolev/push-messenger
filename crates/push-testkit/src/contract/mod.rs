@@ -11,6 +11,7 @@ use push_domain::{
 
 use crate::{Backend, Case};
 
+mod call_history;
 mod contacts;
 mod conversations;
 mod entries;
@@ -30,6 +31,7 @@ pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
         ("contract::positions", positions::cases()),
         ("contract::overviews", overviews::cases()),
         ("contract::templates", templates::cases()),
+        ("contract::call_history", call_history::cases()),
     ];
     modules
         .into_iter()

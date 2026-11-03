@@ -144,6 +144,7 @@ fn is_call_body(body: &Body) -> bool {
             | Body::PeerCallIce(_)
             | Body::PeerCallRenegotiate(_)
             | Body::CallError(_)
+            | Body::CallHistoryChanged(_)
     )
 }
 
@@ -404,9 +405,9 @@ fn reply_error(code: ErrorCode, message: &str) -> Step {
 #[cfg(test)]
 mod tests {
     use push_proto::v1::{
-        ActivityState, AddMembers, CallAccepted, CallEnded, CallIncoming, CallSync, CallTaken,
-        CreateGroup, Identify, LeaveGroup, ListContacts, Ping, ReAuth, RemoveMember, RenameGroup,
-        SetRole,
+        ActivityState, AddMembers, CallAccepted, CallEnded, CallHistoryChanged, CallIncoming,
+        CallSync, CallTaken, CreateGroup, Identify, LeaveGroup, ListContacts, Ping, ReAuth,
+        RemoveMember, RenameGroup, SetRole,
     };
     use push_proto::{MAX_FRAME_BYTES, encode_frame};
 
@@ -760,6 +761,7 @@ mod tests {
             Body::CallSync(CallSync::default()),
             Body::PeerCallIce(CallIce::default()),
             Body::PeerCallRenegotiate(CallRenegotiate::default()),
+            Body::CallHistoryChanged(CallHistoryChanged::default()),
         ];
         let other = Body::Ready(Default::default());
         let (active, _) = calls_session(&[Capability::Calls], true);
@@ -836,6 +838,7 @@ mod tests {
             Body::CallSync(CallSync::default()),
             Body::PeerCallIce(CallIce::default()),
             Body::PeerCallRenegotiate(CallRenegotiate::default()),
+            Body::CallHistoryChanged(CallHistoryChanged::default()),
         ] {
             assert_eq!(
                 error_code(session.on_binary(&encode_frame(body))),

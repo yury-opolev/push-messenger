@@ -256,12 +256,35 @@ pub(crate) fn signal(record: &CallRecord, delivery: Delivery, now_ms: i64) -> (S
     (notify_channel(user.0), notification.encode_to_vec())
 }
 
-/// A call as `CallSync` lists it.
-pub(crate) fn call_state(view: &CallView) -> v1::CallState {
-    let direction = match view.direction {
+/// The `CallHistoryChanged` notification for `devices` of `user`: a call ended at
+/// `latest_ended_ms` (Redis-clock milliseconds), or `None` when a call was hidden.
+pub(crate) fn history_changed(
+    user: UserId,
+    devices: &[DeviceId],
+    latest_ended_ms: Option<i64>,
+) -> (String, Vec<u8>) {
+    let notification = Notification {
+        kind: Some(Kind::Call(CallSignal {
+            device_ids: devices.iter().map(|device| id_bytes(device.0)).collect(),
+            frame: Some(call_signal::Frame::HistoryChanged(v1::CallHistoryChanged {
+                latest_ended_at: latest_ended_ms.map(|at| at * 1000),
+            })),
+        })),
+    };
+    (notify_channel(user.0), notification.encode_to_vec())
+}
+
+/// A call direction on the wire.
+pub(crate) fn direction(direction: CallDirection) -> v1::CallDirection {
+    match direction {
         CallDirection::In => v1::CallDirection::In,
         CallDirection::Out => v1::CallDirection::Out,
-    };
+    }
+}
+
+/// A call as `CallSync` lists it.
+pub(crate) fn call_state(view: &CallView) -> v1::CallState {
+    let direction = direction(view.direction);
     let status = match view.status {
         CallState::Ringing => v1::CallStatus::Ringing,
         CallState::Active => v1::CallStatus::Active,

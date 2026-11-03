@@ -21,7 +21,7 @@ mod requests;
 mod server;
 mod templates;
 
-pub use calls::{CallService, CallsApi, RedisCalls};
+pub use calls::{CallHistory, CallHistoryApi, CallService, CallsApi, RedisCalls};
 pub use config::{CallsConfig, Config, ConfigError, MigrateConfig};
 pub use grpc::{AccountsApi, DirectoryApi, InternalToken, MAX_VISIBLE_USERS, MessagingApi};
 pub use listeners::Listeners;

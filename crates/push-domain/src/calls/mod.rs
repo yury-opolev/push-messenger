@@ -1,12 +1,16 @@
 //! 1:1 audio calls: input checks, the call state machine and who may call whom
 //! (docs/superpowers/specs/2026-11-03-voice-calls-design.md).
 
+mod history;
 mod machine;
 mod policy;
 mod sdp;
 #[cfg(test)]
 mod tests;
 
+pub use history::{
+    CallHistoryRow, DEFAULT_CALL_HISTORY_PAGE, HistoryCursor, MAX_CALL_HISTORY_PAGE, ended_rows,
+};
 pub use machine::{
     CallDirection, CallEvent, CallRecord, CallState, CallView, Candidate, Delivery, EndReason,
     MAX_ICE_PER_SIDE, MAX_PENDING_ICE, MAX_RENEGOTIATIONS, Outcome, RECORD_VERSION, Refusal, Side,

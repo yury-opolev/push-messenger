@@ -1,6 +1,6 @@
 //! Rate limits (spec §5.6): per account and per IP, on signup, login, verification resend,
-//! password reset, opening email links, handle lookup, template submission and the
-//! template catalog, and on sign-in by token (Entra ID
+//! password reset, opening email links, handle lookup, template submission, the
+//! template catalog and the call history, and on sign-in by token (Entra ID
 //! or an external provider). Accounts are never locked; a
 //! request over a limit is refused with `rate_limited` and a retry delay.
 //!
@@ -56,6 +56,8 @@ pub enum Action {
     TemplateSubmit,
     /// `GET /v1/templates`: per IP and per user.
     TemplateCatalog,
+    /// `GET /v1/calls` and `DELETE /v1/calls/{call_id}`: per IP and per user.
+    CallHistory,
 }
 
 /// Whom a limit counts.
@@ -109,6 +111,7 @@ impl Action {
             Self::AgentManagement => "agents",
             Self::TemplateSubmit => "template_submit",
             Self::TemplateCatalog => "template_catalog",
+            Self::CallHistory => "call_history",
         }
     }
 
@@ -149,6 +152,11 @@ impl Action {
             (Scope::Ip, per(600, MINUTE)),
             (Scope::Account, per(120, MINUTE)),
         ];
+        // Clients refresh the history on CallHistoryChanged; this only bounds a loop.
+        const CALL_HISTORY: &[(Scope, Limit)] = &[
+            (Scope::Ip, per(600, MINUTE)),
+            (Scope::Account, per(120, MINUTE)),
+        ];
         match self {
             Self::Signup => SIGNUP,
             Self::Login => LOGIN,
@@ -163,6 +171,7 @@ impl Action {
             Self::AgentManagement => AGENTS,
             Self::TemplateSubmit => TEMPLATE_SUBMIT,
             Self::TemplateCatalog => TEMPLATE_CATALOG,
+            Self::CallHistory => CALL_HISTORY,
         }
     }
 }

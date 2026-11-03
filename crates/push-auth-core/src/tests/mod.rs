@@ -6,6 +6,7 @@
 mod admin;
 mod agent_key;
 mod agents;
+mod calls;
 mod entra_accounts;
 mod entra_api;
 mod entra_server;
@@ -123,6 +124,7 @@ pub(crate) async fn world_with(
         client_ip_header: Some(HeaderName::from_static("x-real-ip")),
         directory: Arc::new(NoDirectory),
         templates: Arc::new(crate::templates::NoTemplates),
+        call_history: Arc::new(crate::calls::NoCalls),
     });
     World {
         _container: container,
