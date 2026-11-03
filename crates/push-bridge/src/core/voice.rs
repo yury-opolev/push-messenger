@@ -38,22 +38,24 @@ pub(super) struct ActiveCall {
     listening: bool,
     /// The agent speaks.
     speaking: bool,
-    /// The running reply's text, as spoken sentences.
+    /// The running reply's text, as spoken sentences. After a barge-in the session
+    /// mutes the reply ([`Session::say_reply`]) until the core unmutes it.
     speech: SpeechText,
-    /// The owner spoke over the agent: the rest of the reply is not spoken.
-    muted: bool,
 }
 
 impl ActiveCall {
-    fn say_all(&self, sentences: Vec<String>) {
+    /// Speaks sentences of the agent's reply, unless a barge-in muted it.
+    fn say_reply(&self, sentences: Vec<String>) {
         for sentence in sentences {
-            self.session.say(sentence);
+            self.session.say_reply(sentence);
         }
     }
 
-    /// Whether the agent's reply is spoken.
-    fn speaks_replies(&self) -> bool {
-        self.connected && !self.muted
+    /// The reply is spoken again; after a barge-in, from a new sentence.
+    fn unmute(&mut self) {
+        if self.session.unmute() {
+            self.speech = SpeechText::new();
+        }
     }
 }
 
@@ -173,7 +175,6 @@ impl<M: Messenger> Core<M> {
             listening: false,
             speaking: false,
             speech: SpeechText::new(),
-            muted: false,
         });
         self.update_activity(false).await;
     }
@@ -195,11 +196,8 @@ impl<M: Messenger> Core<M> {
             }
             SessionEvent::Listening(listening) => call.listening = listening,
             SessionEvent::Speaking(speaking) => call.speaking = speaking,
-            // The session logs the barge-in.
-            SessionEvent::BargedIn => {
-                call.muted = true;
-                call.speech = SpeechText::new();
-            }
+            // The session logs the barge-in and mutes the reply.
+            SessionEvent::BargedIn => call.speech = SpeechText::new(),
             SessionEvent::Transcript(text) => self.on_transcript(text).await,
             SessionEvent::SpeechFailed(_) => call.session.say(NOT_UNDERSTOOD),
             SessionEvent::Ended(end) => {
@@ -251,7 +249,7 @@ impl<M: Messenger> Core<M> {
             return;
         }
         if let Some(call) = &mut self.call {
-            call.muted = false;
+            call.session.unmute();
             call.speech = SpeechText::new();
         }
         self.send_to_agent(text).await;
@@ -309,7 +307,7 @@ impl<M: Messenger> Core<M> {
         };
         self.settle(request, answer).await;
         if let Some(call) = &mut self.call {
-            call.muted = false;
+            call.unmute();
             call.session.say(confirmation);
             if let Some(next) = self.open.first() {
                 call.session.say(next.spoken.clone());
@@ -328,17 +326,15 @@ impl<M: Messenger> Core<M> {
     pub(super) fn speech_turn_started(&mut self) {
         if let Some(call) = &mut self.call {
             call.speech = SpeechText::new();
-            call.muted = false;
+            call.session.unmute();
         }
     }
 
     /// Speaks the sentences `delta` completes in the running reply.
     pub(super) fn speak_delta(&mut self, delta: &str) {
-        if let Some(call) = &mut self.call {
-            if call.speaks_replies() {
-                let sentences = call.speech.push(delta);
-                call.say_all(sentences);
-            }
+        if let Some(call) = self.call.as_mut().filter(|call| call.connected) {
+            let sentences = call.speech.push(delta);
+            call.say_reply(sentences);
         }
     }
 
@@ -346,18 +342,18 @@ impl<M: Messenger> Core<M> {
     pub(super) fn speech_turn_ended(&mut self) {
         if let Some(call) = &mut self.call {
             let sentences = call.speech.finish();
-            if call.speaks_replies() {
-                call.say_all(sentences);
+            if call.connected {
+                call.say_reply(sentences);
             }
         }
     }
 
     /// Speaks a background message: "<label>." then its text.
     pub(super) fn speak_agent_message(&self, label: &str, text: &str) {
-        if let Some(call) = self.call.as_ref().filter(|call| call.speaks_replies()) {
+        if let Some(call) = self.call.as_ref().filter(|call| call.connected) {
             call.session
-                .say(format!("{}.", label.trim_end_matches('.')));
-            call.say_all(speech::sentences(text));
+                .say_reply(format!("{}.", label.trim_end_matches('.')));
+            call.say_reply(speech::sentences(text));
         }
     }
 
@@ -367,9 +363,7 @@ impl<M: Messenger> Core<M> {
             return;
         };
         let sentences = call.speech.finish();
-        if !call.muted {
-            call.say_all(sentences);
-        }
+        call.say_reply(sentences);
         call.session.say(spoken);
     }
 

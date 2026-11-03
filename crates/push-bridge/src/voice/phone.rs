@@ -206,7 +206,11 @@ struct CallShared {
     generation: AtomicU64,
     started: Instant,
     connect_delay: Option<Duration>,
+    /// Runs on the speaker's next `clear()`.
+    on_clear: Mutex<Option<ClearHook>>,
 }
+
+type ClearHook = Box<dyn FnOnce() + Send>;
 
 #[derive(Default)]
 struct CallInner {
@@ -276,6 +280,7 @@ impl FakeCall {
             generation: AtomicU64::new(0),
             started: Instant::now(),
             connect_delay,
+            on_clear: Mutex::new(None),
         });
         let (queue, played) = mpsc::channel(FAKE_QUEUE);
         tokio::spawn(play(shared.clone(), played));
@@ -335,6 +340,16 @@ impl FakeCall {
     /// How often the bridge cleared its speaker.
     pub fn clears(&self) -> usize {
         self.shared.inner().clears
+    }
+
+    /// Runs `hook` in the speaker's next `clear()`, in the bridge's task that clears it
+    /// (a barge-in's or a hush's), before that task goes on.
+    pub fn on_next_clear(&self, hook: impl FnOnce() + Send + 'static) {
+        *self
+            .shared
+            .on_clear
+            .lock()
+            .expect("the fake call is not poisoned") = Some(Box::new(hook));
     }
 
     /// The owner hangs up (or the server ends the call) with `reason`.
@@ -415,6 +430,15 @@ impl Speaker for FakeSpeaker {
             let mut inner = self.shared.inner();
             inner.clears += 1;
             inner.heard_since_clear.clear();
+        }
+        let hook = self
+            .shared
+            .on_clear
+            .lock()
+            .expect("the fake call is not poisoned")
+            .take();
+        if let Some(hook) = hook {
+            hook();
         }
         self.shared.changed.notify_waiters();
     }

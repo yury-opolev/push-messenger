@@ -355,6 +355,38 @@ async fn the_owner_barges_in_and_the_steer_s_answer_is_spoken() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn reply_text_handled_before_the_barge_in_event_is_not_spoken() {
+    let v = Voice::with_stt(Some(stt().with_delay(Duration::from_secs(2)))).await;
+    let call = v.call().await;
+    let greeting = call.heard().len();
+    v.h.backend.turn_started(TurnSource::Prompt);
+    for i in 1..=20 {
+        v.h.backend
+            .text(&format!("Sentence {i} of the long reply has some words.\n"));
+    }
+    call.wait_until("the reply plays", |call| {
+        call.heard().len() > greeting + 16 * 400
+    })
+    .await;
+    // The barge-in's clear queues this delta right after the session's `BargedIn`: the
+    // core, preferring backend events, handles the delta first.
+    let backend = v.h.backend.clone();
+    call.on_next_clear(move || backend.text("This part is cut.\n"));
+    call.say(&fixture("barge_in").audio()).await;
+    v.h.backend
+        .wait_for("steer stop, use the other file", 1)
+        .await;
+    v.h.backend.text("Then I switch files.\n");
+    v.h.backend.turn_ended(false);
+    v.until_said("Then I switch files.").await;
+    let spoken = v.tts.spoken();
+    assert!(
+        !spoken.iter().any(|said| said == "This part is cut."),
+        "{spoken:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn approve_by_voice_answers_the_card_and_closes_it() {
     let v = Voice::new().await;
     let call = v.call().await;

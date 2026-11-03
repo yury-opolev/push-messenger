@@ -8,6 +8,9 @@
 //!   agent speaks, that is a barge-in: the queued sentences and the queued audio are
 //!   dropped ([`SessionEvent::BargedIn`], then `Speaking(false)`); then
 //!   `Listening(true)`. An utterance (or a discarded noise) is `Listening(false)`.
+//!   A barge-in also mutes the agent's reply: [`Session::say_reply`] drops its sentences
+//!   until [`Session::unmute`], so the rest of the interrupted reply is not spoken even
+//!   when the core handles reply text before it handles the `BargedIn` event.
 //! - The STT worker transcribes one utterance at a time, in order: a non-empty text is a
 //!   [`SessionEvent::Transcript`], a failure a [`SessionEvent::SpeechFailed`] with the
 //!   provider's content-free code.
@@ -96,6 +99,9 @@ struct Speech {
     speaking: bool,
     /// When the audio queued so far will have played.
     playing_until: Option<Instant>,
+    /// A barge-in cut the reply: [`Session::say_reply`] drops sentences until
+    /// [`Session::unmute`].
+    muted: bool,
 }
 
 impl Speech {
@@ -129,8 +135,8 @@ impl Shared {
     }
 
     /// Stops speaking at once, reporting `Speaking(false)` if `Speaking(true)` was
-    /// reported. A barge-in only stops an agent that speaks and reports `BargedIn` first;
-    /// whether it did. Nothing happens once the call ended.
+    /// reported. A barge-in only stops an agent that speaks, mutes the reply and reports
+    /// `BargedIn` first; whether it did. Nothing happens once the call ended.
     ///
     /// The events are emitted under the speech lock, as the speaker worker's are: a
     /// `Speaking(true)` can never follow the `Speaking(false)` that ends it.
@@ -144,6 +150,7 @@ impl Shared {
             speech.queue.clear();
             speech.playing_until = None;
             if barge_in {
+                speech.muted = true;
                 self.emit(SessionEvent::BargedIn);
             }
             if std::mem::take(&mut speech.speaking) {
@@ -203,25 +210,44 @@ impl Session {
         self.call_id
     }
 
-    /// Queues one sentence to speak (ignored without TTS).
+    /// Queues one sentence to speak (ignored without TTS), muted or not: for what the
+    /// bridge itself says (the greeting, cards, confirmations).
     pub fn say(&self, text: impl Into<String>) {
+        self.queue(text.into(), false);
+    }
+
+    /// Queues one sentence of the agent's reply to speak, unless a barge-in muted the
+    /// reply (ignored without TTS).
+    pub fn say_reply(&self, text: impl Into<String>) {
+        self.queue(text.into(), true);
+    }
+
+    /// The owner is answered again: the next replies are spoken. Whether a barge-in had
+    /// muted them.
+    pub fn unmute(&self) -> bool {
+        std::mem::take(&mut self.shared.speech().muted)
+    }
+
+    fn queue(&self, text: String, reply: bool) {
         if !self.shared.speaks {
             return;
         }
         {
-            // Under the lock: the watcher resets the speech state under it once ended.
+            // Under the lock: the watcher resets the speech state under it once ended,
+            // and a barge-in mutes the reply under it.
             let mut speech = self.shared.speech();
-            if self.shared.ended() {
+            if self.shared.ended() || (reply && speech.muted) {
                 return;
             }
             let generation = self.shared.generation();
-            speech.queue.push_back((generation, text.into()));
+            speech.queue.push_back((generation, text));
         }
         self.shared.wake.notify_one();
     }
 
     /// Stops speaking: drops the queued sentences and the queued audio (nothing once the
-    /// call ended).
+    /// call ended). Unlike a barge-in it does not mute the reply: who hushes decides what
+    /// is said next.
     pub fn hush(&self) {
         self.shared.stop_speaking(false);
     }
@@ -630,6 +656,54 @@ mod tests {
         let after = call.owner.heard_since_clear();
         assert_eq!(after.len(), 200 * SAMPLES_PER_MS);
         assert!(amplitude(&after, TTS_HZ) > 5000.0);
+    }
+
+    #[tokio::test]
+    async fn a_barge_in_mutes_the_reply_until_unmuted() {
+        let mut call = call().await;
+        call.session.say(words(50));
+        call.until(&SessionEvent::Speaking(true)).await;
+        call.owner.say(&utterance(450.0)).await;
+        call.until(&SessionEvent::BargedIn).await;
+        call.until(&SessionEvent::Transcript("hello".into())).await;
+        // The core has not handled `BargedIn` yet: the reply's next sentence is dropped.
+        call.session.say_reply("the rest of the reply");
+        assert!(!call.session.speaking());
+        assert!(call.during(Duration::from_millis(300)).await.is_empty());
+        assert!(call.owner.heard_since_clear().is_empty());
+
+        call.session.say("one two");
+        call.until(&SessionEvent::Speaking(true)).await;
+        call.until(&SessionEvent::Speaking(false)).await;
+        call.owner
+            .wait_until("the prompt", |owner| {
+                owner.heard_since_clear().len() >= 200 * SAMPLES_PER_MS
+            })
+            .await;
+
+        assert!(call.session.unmute());
+        assert!(!call.session.unmute());
+        call.session.say_reply("one two three four five");
+        call.until(&SessionEvent::Speaking(true)).await;
+        call.until(&SessionEvent::Speaking(false)).await;
+        call.owner
+            .wait_until("the reply", |owner| {
+                owner.heard_since_clear().len() >= 500 * SAMPLES_PER_MS
+            })
+            .await;
+        assert_eq!(call.owner.heard_since_clear().len(), 500 * SAMPLES_PER_MS);
+    }
+
+    #[tokio::test]
+    async fn a_hush_does_not_mute_the_reply() {
+        let mut call = call().await;
+        call.session.say(words(50));
+        call.until(&SessionEvent::Speaking(true)).await;
+        call.session.hush();
+        call.until(&SessionEvent::Speaking(false)).await;
+        assert!(!call.session.unmute());
+        call.session.say_reply("one two");
+        call.until(&SessionEvent::Speaking(true)).await;
     }
 
     #[tokio::test]
