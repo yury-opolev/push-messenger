@@ -27,6 +27,8 @@ use push_credentials::{AzureConfig, ConfigProblem, RedisTarget, azure_for};
 /// | `PUSH_GROUPS` | `1` serves group requests; `0` refuses only the six group-management requests (create, add and remove members, leave, rename, set role) with `NOT_AVAILABLE`; groups that already exist still reach clients | `0` |
 /// | `PUSH_CLIENT_IP_HEADER` | header with the client's IP, set by the ingress (`x-real-ip`); its last line, then last entry is used | the peer address |
 /// | `PUSH_PRESENCE_GRACE_MS` | how long a closed connection still counts as online, so a reconnect within it is never shown offline; 0 to 120000 | `10000` |
+/// | `PUSH_CALLS_ENABLED` | `1` offers 1:1 audio calls (docs/calls.md) to clients that advertise them, when message-svc offers them too; `0` answers call frames `NOT_AVAILABLE` | `0` |
+/// | `PUSH_CALLS_ATTEMPTS_PER_HOUR` | `CallInvite` frames a user may send per hour, refused or not; 1 to 1000 | `30` |
 ///
 /// `PUSH_DEV_AUTH=1` (the DEV ONLY identities without a token, removed in Plan 8) is
 /// refused, so a deployment that still expects it fails at start-up.
@@ -49,6 +51,10 @@ pub struct Config {
     pub client_ip_header: Option<HeaderName>,
     /// How long a closed connection keeps its presence lease.
     pub presence_grace: Duration,
+    /// Whether calls are offered (when message-svc offers them too).
+    pub calls: bool,
+    /// `CallInvite` frames a user may send per hour.
+    pub call_attempts_per_hour: u32,
 }
 
 // The Redis URL carries a password and the token is a secret, so neither appears in debug
@@ -69,6 +75,8 @@ impl std::fmt::Debug for Config {
             .field("groups", &self.groups)
             .field("client_ip_header", &self.client_ip_header)
             .field("presence_grace", &self.presence_grace)
+            .field("calls", &self.calls)
+            .field("call_attempts_per_hour", &self.call_attempts_per_hour)
             .finish()
     }
 }
@@ -112,6 +120,14 @@ impl Config {
                 name: "PUSH_PRESENCE_GRACE_MS",
                 value: presence_grace_ms.to_string(),
                 reason: "use 0 to 120000 milliseconds".to_owned(),
+            });
+        }
+        let call_attempts_per_hour: u32 = parsed(&lookup, "PUSH_CALLS_ATTEMPTS_PER_HOUR", 30)?;
+        if !(1..=1_000).contains(&call_attempts_per_hour) {
+            return Err(ConfigError::Invalid {
+                name: "PUSH_CALLS_ATTEMPTS_PER_HOUR",
+                value: call_attempts_per_hour.to_string(),
+                reason: "use 1 to 1000 attempts".to_owned(),
             });
         }
         match lookup("PUSH_DEV_AUTH").as_deref() {
@@ -173,6 +189,8 @@ impl Config {
             groups: flag(&lookup, "PUSH_GROUPS")?,
             client_ip_header,
             presence_grace: Duration::from_millis(presence_grace_ms),
+            calls: flag(&lookup, "PUSH_CALLS_ENABLED")?,
+            call_attempts_per_hour,
         })
     }
 
@@ -290,6 +308,40 @@ mod tests {
         assert!(!config.groups, "groups are off unless switched on");
         assert_eq!(config.client_ip_header, None);
         assert_eq!(config.presence_grace, Duration::from_secs(10));
+        assert!(!config.calls, "calls are off unless switched on");
+        assert_eq!(config.call_attempts_per_hour, 30);
+    }
+
+    #[test]
+    fn calls_are_switched_on_with_1_and_attempts_stay_within_1_to_1000() {
+        let mut variables = REQUIRED.to_vec();
+        variables.push(("PUSH_CALLS_ENABLED", "1"));
+        variables.push(("PUSH_CALLS_ATTEMPTS_PER_HOUR", "1000"));
+        let on = config(&variables).unwrap();
+        assert!(on.calls);
+        assert_eq!(on.call_attempts_per_hour, 1000);
+        let output = format!("{on:?}");
+        assert!(output.contains("calls: true"), "{output}");
+        assert!(output.contains("call_attempts_per_hour: 1000"), "{output}");
+        for value in ["true", "2"] {
+            let mut variables = REQUIRED.to_vec();
+            variables.push(("PUSH_CALLS_ENABLED", value));
+            assert!(config(&variables).is_err(), "{value:?}");
+        }
+        for value in ["0", "1001", "-1", "many"] {
+            let mut variables = REQUIRED.to_vec();
+            variables.push(("PUSH_CALLS_ATTEMPTS_PER_HOUR", value));
+            assert!(
+                matches!(
+                    config(&variables),
+                    Err(ConfigError::Invalid {
+                        name: "PUSH_CALLS_ATTEMPTS_PER_HOUR",
+                        ..
+                    })
+                ),
+                "{value:?}"
+            );
+        }
     }
 
     #[test]

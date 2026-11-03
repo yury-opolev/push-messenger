@@ -222,6 +222,8 @@ async fn stack_with(sync_failures: u32, heartbeat: Duration) -> Stack {
         groups: false,
         client_ip_header: None,
         presence_grace: PRESENCE_GRACE,
+        calls: false,
+        call_attempts_per_hour: 30,
     };
     let shutdown = CancellationToken::new();
     let server = tokio::spawn(serve(config, listener, health, shutdown.clone()));
