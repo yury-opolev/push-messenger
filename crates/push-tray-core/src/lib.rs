@@ -1,6 +1,6 @@
 //! The agent tray's core, free of any UI toolkit: agent states and their icons and
-//! labels ([`state`], [`icon`]), the restart policy ([`policy`]), a state history
-//! ([`history`]), the tray's `tray.json` ([`tray_config`]) and folders ([`paths`]), the
+//! labels ([`state`], [`icon`], drawn from [`glyph`]), the restart policy ([`policy`]), a
+//! state history ([`history`]), the tray's `tray.json` ([`tray_config`]) and folders ([`paths`]), the
 //! tray's own start at logon ([`autostart`]), the switch-over from Scheduled Tasks
 //! ([`schedtask`]), opening a file or folder ([`open`]), the bridges' control channel
 //! ([`client`]), the bridges' supervision ([`supervisor`]), the tray menu ([`menu`]), and
@@ -9,6 +9,7 @@
 pub mod autostart;
 pub mod client;
 pub mod details;
+pub mod glyph;
 pub mod history;
 pub mod icon;
 pub mod menu;

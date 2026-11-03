@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::schedtask::Offer;
-use crate::state::{AgentState, IconState, icon_for, label, tooltip as state_tooltip, worst};
+use crate::state::{AgentState, IconState, icon_for_view, label, tooltip as state_tooltip, worst};
 use crate::supervisor::InstanceView;
 
 /// "Add agent folder…".
@@ -250,9 +250,13 @@ pub fn tooltip(views: &[InstanceView]) -> String {
     state_tooltip(&agents)
 }
 
-/// The tray icon for `views`: the most urgent agent's.
-pub fn icon(views: &[InstanceView]) -> IconState {
-    worst(views.iter().map(|view| icon_for(&view.state)))
+/// The tray icon's badge for `views`: the most urgent agent's; `None` without agents.
+pub fn icon(views: &[InstanceView]) -> Option<IconState> {
+    worst(
+        views
+            .iter()
+            .map(|view| icon_for_view(&view.state, view.connected)),
+    )
 }
 
 #[cfg(test)]
@@ -537,8 +541,10 @@ mod tests {
             tooltip(&views),
             "Coda (coda): waiting for you (approval)\nOther (other): working"
         );
-        assert_eq!(icon(&views), IconState::Waiting);
-        assert_eq!(icon(&[]), IconState::Normal);
+        assert_eq!(icon(&views), Some(IconState::Waiting));
+        assert_eq!(icon(&[]), None);
+        let offline = [view("Coda (coda)", AgentState::Idle, false)];
+        assert_eq!(icon(&offline), Some(IconState::Disconnected));
         assert_eq!(tooltip(&[]), "push-agent-tray\nNo agents");
     }
 
