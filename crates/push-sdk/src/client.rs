@@ -426,7 +426,7 @@ impl Client {
     /// is dropped (a binding that gives up on a call, or a `close` that cancels it), so
     /// it never outlives its caller holding a clone of the client. What must not be cut
     /// short runs through [`shielded`].
-    async fn run<T: Send + 'static>(
+    pub(crate) async fn run<T: Send + 'static>(
         &self,
         future: impl Future<Output = Result<T, SdkError>> + Send + 'static,
     ) -> Result<T, SdkError> {

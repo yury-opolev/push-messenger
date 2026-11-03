@@ -195,13 +195,19 @@ pub(crate) mod tests {
         let input = tone(700.0, 16_000.0, 3_200, 0);
         let whole = Upsampler::new().process(&input);
         let mut up = Upsampler::new();
-        let pieces: Vec<i16> = input.chunks(320).flat_map(|frame| up.process(frame)).collect();
+        let pieces: Vec<i16> = input
+            .chunks(320)
+            .flat_map(|frame| up.process(frame))
+            .collect();
         assert_eq!(whole.len(), 9_600);
         assert_eq!(whole, pieces);
         let input = tone(700.0, 48_000.0, 9_600, 0);
         let whole = Downsampler::new().process(&input);
         let mut down = Downsampler::new();
-        let pieces: Vec<i16> = input.chunks(960).flat_map(|frame| down.process(frame)).collect();
+        let pieces: Vec<i16> = input
+            .chunks(960)
+            .flat_map(|frame| down.process(frame))
+            .collect();
         assert_eq!(whole.len(), 3_200);
         assert_eq!(whole, pieces);
     }
