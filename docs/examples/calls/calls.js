@@ -14,6 +14,11 @@
 /* global protobuf */
 
 const CAPABILITY_CALLS = "CAPABILITY_CALLS";
+// Close codes after which reconnecting cannot help: 4001-4003 (the token is bad or
+// expired) and 4007 (this device connected elsewhere).
+const FINAL_CLOSE = (code) => (code >= 4001 && code <= 4003) || code === 4007;
+
+class CallGone extends Error {}
 const RECONNECT_FIRST_MS = 500;
 const RECONNECT_MAX_MS = 8000;
 
@@ -113,11 +118,13 @@ export class CallClient {
         clearInterval(this.pingTimer);
         this.connected = false;
         this.status(`disconnected (${event.code})`);
-        if (!ready) reject(new Error(`the socket closed before Ready (${event.code})`));
-        // 4001-4003: the token is bad or expired; 4007: this device connected elsewhere.
+        if (!ready) {
+          const error = new Error(`the socket closed before Ready (${event.code})`);
+          error.closeCode = event.code;
+          reject(error);
+        }
         // A connection that never got Ready is retried by reconnect() itself.
-        const final = this.closedByUser || (event.code >= 4001 && event.code <= 4003) || event.code === 4007;
-        if (ready && !final) this.reconnect();
+        if (ready && !this.closedByUser && !FINAL_CLOSE(event.code)) this.reconnect();
       };
     });
   }
@@ -130,7 +137,7 @@ export class CallClient {
       this.reconnects += 1;
     } catch (error) {
       this.log(`reconnect failed: ${error.message}`);
-      if (!this.closedByUser) this.reconnect(Math.min(delay * 2, RECONNECT_MAX_MS));
+      if (!this.closedByUser && !FINAL_CLOSE(error.closeCode)) this.reconnect(Math.min(delay * 2, RECONNECT_MAX_MS));
     }
   }
 
@@ -180,8 +187,18 @@ export class CallClient {
     return response.json(); // { ice_servers, expires_at, relay }
   }
 
+  // Throws CallGone when the call ended while this client awaited something (a CallEnded,
+  // a hang-up click), so no media or frame outlives it.
+  alive(call) {
+    if (call.status === "ended") {
+      this.release(call);
+      throw new CallGone();
+    }
+  }
+
   async peerConnection(call) {
     const servers = await this.iceServers();
+    this.alive(call);
     if (this.relayOnly && !servers.relay) throw new Error("relay-only asked for, but the server offers no TURN relay");
     const pc = new RTCPeerConnection({
       iceServers: servers.ice_servers,
@@ -189,7 +206,9 @@ export class CallClient {
       iceTransportPolicy: this.relayOnly ? "relay" : "all",
     });
     call.pc = pc;
+    // The permission prompt can take a while: the call may end meanwhile.
     call.stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+    this.alive(call);
     for (const track of call.stream.getTracks()) pc.addTrack(track, call.stream);
     pc.ontrack = (event) => {
       call.remoteStream = event.streams[0] ?? new MediaStream([event.track]);
@@ -210,7 +229,7 @@ export class CallClient {
       try {
         call.makingOffer = true;
         await pc.setLocalDescription();
-        this.send({ call_renegotiate: { call_id: call.idBytes, sdp: pc.localDescription.sdp, type: "CALL_SDP_TYPE_OFFER" } });
+        this.sendDescription(call);
       } catch (error) {
         this.log(`renegotiation failed: ${error.message}`);
       } finally {
@@ -218,6 +237,15 @@ export class CallClient {
       }
     };
     return pc;
+  }
+
+  // CallRenegotiate with the local description, typed by what it is: an implicit
+  // setLocalDescription() can make an answer when the peer's offer arrived first.
+  sendDescription(call) {
+    const { type, sdp } = call.pc.localDescription;
+    this.send({
+      call_renegotiate: { call_id: call.idBytes, sdp, type: type === "offer" ? "CALL_SDP_TYPE_OFFER" : "CALL_SDP_TYPE_ANSWER" },
+    });
   }
 
   // ---- trickle ICE -----------------------------------------------------------------
@@ -297,6 +325,7 @@ export class CallClient {
     try {
       const pc = await this.peerConnection(call);
       await pc.setLocalDescription(await pc.createOffer());
+      this.alive(call);
       this.send({
         call_invite: {
           call_id: call.idBytes,
@@ -309,6 +338,7 @@ export class CallClient {
       call.status = "ringing";
       this.changed(call);
     } catch (error) {
+      if (error instanceof CallGone) return id;
       this.log(`call failed: ${error.message}`);
       this.end(call, "FAILED (local)");
     }
@@ -325,6 +355,7 @@ export class CallClient {
       const pc = await this.peerConnection(call);
       await pc.setRemoteDescription({ type: "offer", sdp: call.offerSdp });
       await pc.setLocalDescription(await pc.createAnswer());
+      this.alive(call);
       this.send({ call_accept: { call_id: call.idBytes, answer_sdp: pc.localDescription.sdp } });
       // Only now may the callee send its candidates.
       this.flushLocalCandidates(call);
@@ -332,6 +363,7 @@ export class CallClient {
       this.changed(call);
       await this.flushPeerCandidates(call);
     } catch (error) {
+      if (error instanceof CallGone) return;
       this.log(`answer failed: ${error.message}`);
       this.send({ call_hangup: { call_id: call.idBytes, reason: "CALL_END_REASON_FAILED" } });
     }
@@ -347,22 +379,39 @@ export class CallClient {
   hangup(id) {
     const call = this.calls.get(id);
     if (!call) return;
-    if (call.role === "caller" && call.status !== "active") this.send({ call_cancel: { call_id: call.idBytes } });
+    // Not invited yet (still preparing media): the server knows nothing, end it here.
+    if (call.status === "calling") this.end(call, "CANCELLED (local)");
+    else if (call.role === "caller" && call.status !== "active") this.send({ call_cancel: { call_id: call.idBytes } });
     else this.send({ call_hangup: { call_id: call.idBytes } });
   }
 
+  // An offer with new ICE credentials, sent as CallRenegotiate. Made explicitly rather
+  // than through restartIce() and negotiationneeded, which does not fire outside the
+  // stable state: a caller that missed CallAccepted while disconnected still has its
+  // original offer pending, and this new offer replaces it.
   async restartIce(call) {
     if (!call.pc) return;
     try {
       // Fresh TURN credentials first: the old ones may have expired.
       const servers = await this.iceServers();
+      if (!call.pc) return;
       call.pc.setConfiguration({ ...call.pc.getConfiguration(), iceServers: servers.ice_servers });
     } catch (error) {
       this.log(`ice-servers before the restart: ${error.message}`);
     }
+    const pc = call.pc;
+    // An offer of the peer is being answered: that answer goes out first.
+    if (!pc || pc.signalingState === "have-remote-offer") return;
     this.log(`call ${call.id}: ICE restart`);
-    // Fires negotiationneeded: an offer with new ICE credentials, sent as CallRenegotiate.
-    call.pc.restartIce();
+    try {
+      call.makingOffer = true;
+      await pc.setLocalDescription(await pc.createOffer({ iceRestart: true }));
+      this.sendDescription(call);
+    } catch (error) {
+      this.log(`ICE restart failed: ${error.message}`);
+    } finally {
+      call.makingOffer = false;
+    }
   }
 
   release(call) {
@@ -399,7 +448,7 @@ export class CallClient {
         if (call) this.end(call, "TAKEN (answered on another device)");
         break;
       case "call_ended":
-        if (call) this.end(call, body.reason.replace("CALL_END_REASON_", ""), body.duration_s);
+        if (call) this.end(call, String(body.reason).replace("CALL_END_REASON_", ""), body.duration_s);
         break;
       case "call_error":
         this.callError(call, body);
@@ -466,10 +515,15 @@ export class CallClient {
       case "ERROR_CODE_CALL_LIMIT":
         // Retryable or a capped frame (ICE, renegotiation): the call goes on.
         break;
+      case "ERROR_CODE_INVALID":
+        // One refused CallIce or CallRenegotiate does not end an answered call.
+        if (call.status === "active") break;
+        this.end(call, "ERROR INVALID");
+        break;
       default:
         // CALL_NOT_FOUND, NOT_CONTACT, INVALID, IN_CALL, RATE_LIMITED, NOT_AVAILABLE:
         // the call does not exist (any more) for this device.
-        this.end(call, `ERROR ${body.code.replace("ERROR_CODE_", "")}`);
+        this.end(call, `ERROR ${String(body.code).replace("ERROR_CODE_", "")}`);
     }
   }
 
@@ -485,7 +539,7 @@ export class CallClient {
       await pc.setRemoteDescription(description); // a polite callee rolls back implicitly
       if (description.type === "offer") {
         await pc.setLocalDescription();
-        this.send({ call_renegotiate: { call_id: call.idBytes, sdp: pc.localDescription.sdp, type: "CALL_SDP_TYPE_ANSWER" } });
+        this.sendDescription(call);
       }
       await this.flushPeerCandidates(call);
     } catch (error) {
@@ -505,10 +559,20 @@ export class CallClient {
       const ringingIn = state.direction === "CALL_DIRECTION_IN" && state.status === "CALL_STATUS_RINGING";
       if (ringingIn && !call) {
         this.incoming(state, true);
+      } else if (state.status === "CALL_STATUS_ACTIVE" && !state.this_device) {
+        // Answered on another device while this one was away.
+        if (call) this.end(call, "TAKEN (answered on another device)");
       } else if (state.status === "CALL_STATUS_ACTIVE" && state.this_device) {
-        if (call && call.pc) this.restartIce(call);
-        // Active here but without media (the page was reloaded): end it.
-        else this.send({ call_hangup: { call_id: state.call_id, reason: "CALL_END_REASON_FAILED" } });
+        if (call && call.pc) {
+          // A caller that missed CallAccepted while away: the call is active now, and
+          // the restart's offer replaces the unanswered one.
+          call.status = "active";
+          this.changed(call);
+          this.restartIce(call);
+        } else {
+          // Active here but without media (the page was reloaded): end it.
+          this.send({ call_hangup: { call_id: state.call_id, reason: "CALL_END_REASON_FAILED" } });
+        }
       }
     }
     this.log(`CallSync: ${states.length} call(s)`);

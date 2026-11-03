@@ -276,15 +276,19 @@ sequenceDiagram
     participant B1 as Callee device
     A->>S: CallInvite
     S->>B1: CallIncoming
-    A->>S: CallCancel
-    S->>A: CallEnded (CANCELLED)
-    S->>B1: CallEnded (CANCELLED)
-    Note over A,B1: the race: B1 accepted first
-    A->>S: CallCancel
-    S->>A: CallError (ALREADY_ANSWERED)
-    A->>S: CallHangup
-    S->>A: CallEnded (COMPLETED)
-    S->>B1: CallEnded (COMPLETED)
+    alt the cancel wins
+        A->>S: CallCancel
+        S->>A: CallEnded (CANCELLED)
+        S->>B1: CallEnded (CANCELLED)
+    else B1 accepted first
+        B1->>S: CallAccept
+        S->>A: CallAccepted
+        A->>S: CallCancel
+        S->>A: CallError (ALREADY_ANSWERED)
+        A->>S: CallHangup
+        S->>A: CallEnded (COMPLETED)
+        S->>B1: CallEnded (COMPLETED)
+    end
 ```
 
 **Missed.** Nobody answers within `calls.ringSeconds` (45 s). An accept that arrives after
@@ -368,7 +372,10 @@ sequenceDiagram
 **Reconnect within the grace: CallSync and an ICE restart.** Media is peer to peer and
 usually survives a signalling drop. After reconnecting, the device reads `CallSync`; for
 its active call (`this_device`) it fetches fresh ICE servers, calls
-`setConfiguration()` and `restartIce()`, and sends the new offer as `CallRenegotiate`.
+`setConfiguration()`, creates an offer with `iceRestart: true` and sends it as
+`CallRenegotiate`. (Create the offer explicitly: `restartIce()` relies on
+`negotiationneeded`, which does not fire while an offer is pending, for example for a
+caller that missed `CallAccepted` while it was away; the new offer replaces that one.)
 Either side may restart; if both do at once, perfect negotiation resolves it
 ([§7](#7-client-rules)).
 
@@ -535,12 +542,13 @@ The chart refuses an invalid value naming it, for example `"calls.historyDays mu
 | `calls.turn.internal.tlsSecret` | `calls.turn.internal.tlsSecret must be empty or a Secret name` |
 | `calls.turn.internal.service.*` | `calls.turn.internal.service.type must be LoadBalancer or ClusterIP`; `calls.turn.internal.service.annotations must be a string-valued annotation map`; `calls.turn.internal.service.loadBalancerIP must be empty or an IP address` |
 | `calls.turn.internal.resources` | `calls.turn.internal.resources must be a map of Kubernetes container resources` |
-| `calls.turn.internal.deniedPeerCidrs` | `calls.turn.internal.deniedPeerCidrs must list the cluster's pod and service CIDRs (network addresses such as 10.244.0.0/16 or fd00:10:244::/56; at least /8 for IPv4, /16 for IPv6, not starting at ::), not <value>` |
+| `calls.turn.internal.deniedPeerCidrs` | empty: `calls.turn.internal.deniedPeerCidrs must list the cluster's pod and service CIDRs`; a bad entry: `calls.turn.internal.deniedPeerCidrs must list the cluster's pod and service CIDRs (network addresses such as 10.244.0.0/16 or fd00:10:244::/56; at least /8 for IPv4, /16 for IPv6, not starting at ::), not <value>`; a malformed range: `files/coturn/denied-peers.txt or calls.turn.internal.deniedPeerCidrs holds "<value>", which is not a CIDR` |
 | `calls.turn.internal.quotas.*` | `calls.turn.internal.quotas.<user\|total\|maxBps> must be an integer from <min> to <max>` |
 | `calls.turn.internal.image` | `calls.turn.internal.image must be <repository>:<tag>@sha256:<64 hex digits>` |
 | `calls.turn.internal.metricsPeers` | `calls.turn.internal.metricsPeers requires namespaceSelector and podSelector as non-empty label maps on every peer` |
 | `calls.turn.external.provider` | `calls.turn.external.provider must be generic, cloudflare or twilio` |
-| `calls.turn.external.*Secret`, `sharedSecret` | `<value> must name a key of the Secret, not hold the secret`; `external` without a consumer-managed Secret: `calls.turn.mode external needs the provider's secret in a consumer-managed Secret: set secrets.existingSecret or secrets.volume` |
+| `calls.turn.external.urls` | `calls.turn.external.urls must be a non-empty list of turn: or turns: URLs` |
+| `calls.turn.external.*Secret`, `sharedSecret` | `<value> must name a key of the Secret, not hold the secret`; with `secrets.volume`: `<value> must be empty with secrets.volume: the file comes from secrets.files.<key>`; `external` without a consumer-managed Secret: `calls.turn.mode external needs the provider's secret in a consumer-managed Secret: set secrets.existingSecret or secrets.volume` |
 | `calls.turn.external.cloudflare.keyId` | `calls.turn.external.cloudflare.keyId must be set to the TURN key id (1 to 64 letters and digits)` |
 | `calls.turn.external.twilio.accountSid` | `calls.turn.external.twilio.accountSid must be AC followed by 32 hexadecimal digits` |
 
@@ -814,7 +822,7 @@ field. Values under `calls.turn`:
 | `internal.ports` | `{udp: 3478, tcp: 3478, tls: 5349}` | the public Service ports, 1–65535 (coturn listens on 3478 and 5349; e.g. `tls: 443` for firewalls that only pass 443) |
 | `internal.relayPortRange` | `"49160-49200"` | `"<min>-<max>"`, 1024 ≤ min ≤ max ≤ 65535, at most 500 ports; each port is a UDP and a TCP Service port, so keep it small (one relay port per relayed call leg) |
 | `internal.tlsSecret` | `""` | a `kubernetes.io/tls` Secret: adds `turns:` on `ports.tls` |
-| `internal.service` | `{type: LoadBalancer, annotations: {}, loadBalancerIP: ""}` | `LoadBalancer` or `ClusterIP` (not `NodePort`: node ports cannot carry the relay ports at their numbers); string annotations; an IP; the public ports must differ from each other and lie outside the relay range |
+| `internal.service` | `{type: LoadBalancer, annotations: {}, loadBalancerIP: ""}` | `LoadBalancer` or `ClusterIP` (not `NodePort`: node ports cannot carry the relay ports at their numbers); string annotations; an IP; the public ports lie outside the relay range, and `ports.tls` differs from `ports.tcp` (with `tlsSecret`) |
 | `internal.resources` | `{}` | container resources |
 | `internal.externalIp` | `""` | the public IP coturn advertises as its relay address; empty: `service.loadBalancerIP`, else `publicHost` when it is an IP. One of them is required ("calls.turn.internal.externalIp must be set …") |
 | `internal.deniedPeerCidrs` | `[]` | required: the cluster's pod and service CIDRs (IPv4 and IPv6 network addresses, at least /8 and /16) ("calls.turn.internal.deniedPeerCidrs must list the cluster's pod and service CIDRs") |
@@ -993,8 +1001,8 @@ API sends no CORS headers). Browsers give microphone access only to secure conte
 | Trickle in: `peer_call_ice` → `addIceCandidate`, queued until the remote description is set | `peerCandidate()`, `flushPeerCandidates()` |
 | `CallAccepted` → `setRemoteDescription(answer)`; a repeated one is ignored | `accepted()` |
 | Renegotiation: `negotiationneeded` (only once active) → `CallRenegotiate` offer; `peer_call_renegotiate` → perfect negotiation, callee polite | `onnegotiationneeded`, `renegotiate()` |
-| `CallSync` after `Ready`: drop unlisted calls, add listed ringing incoming ones, ICE restart for the active one (or `CallHangup FAILED` if this page lost its media, e.g. after a reload) | `sync()`, `restartIce()` |
-| `connectionState` `failed` → ICE restart with fresh ICE servers (`setConfiguration`) | `peerConnection()` |
+| `CallSync` after `Ready`: drop unlisted calls, add listed ringing incoming ones, end ones answered on another device, ICE restart for the active one (or `CallHangup FAILED` if this page lost its media, e.g. after a reload) | `sync()`, `restartIce()` |
+| `connectionState` `failed` → ICE restart with fresh ICE servers (`setConfiguration`, then `createOffer({iceRestart: true})`) | `peerConnection()`, `restartIce()` |
 | `CallEnded`, `CallTaken`, `CALL_NOT_FOUND` and other final `CallError`s → stop tracks, close the peer connection | `end()`, `callError()` |
 | `ALREADY_ANSWERED` for a cancel → `CallHangup` | `callError()` |
 
@@ -1058,9 +1066,9 @@ results in the release notes.
 | 1 | Connect | status "ready"; no console errors; `Ready.capabilities` lists calls |
 | 2 | A calls B; B answers | both hear each other within 2 s of the answer |
 | 3 | Same with **Relay only** on both | audio flows; `chrome://webrtc-internals` / `about:webrtc` / Safari's WebRTC logging show a `relay` local candidate |
-| 4 | B has two tabs (two devices); answer in one | the other stops ringing (`TAKEN`) |
+| 4 | B signed in twice (two devices, two access tokens), each in its own browser profile; answer on one | the other stops ringing (`TAKEN`) |
 | 5 | Decline; cancel while ringing; let it ring 45 s | `DECLINED`; `CANCELLED`; `MISSED` on both sides |
-| 6 | B calls A while A is in a call | B gets `BUSY` at once |
+| 6 | B calls A while A is in a call with C | B gets `BUSY` at once |
 | 7 | Mid-call, switch B's network (Wi-Fi ↔ wired/cellular) or toggle airplane mode for < 30 s | B reconnects, `CallSync` lists the call, ICE restarts, audio resumes |
 | 8 | Mid-call, close B's tab | after 30 s A gets `FAILED` |
 | 9 | Hang up from either side | `COMPLETED` with a duration on both |

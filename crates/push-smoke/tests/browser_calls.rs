@@ -128,22 +128,21 @@ async fn playwright(page_url: String, a: (String, String), b: (String, String), 
         "run `npm ci` and `npx playwright install chromium` in {}",
         tests.display()
     );
-    let status = tokio::task::spawn_blocking(move || {
-        Command::new("node")
-            .arg(cli)
-            .arg("test")
-            .current_dir(&tests)
-            .env("CALLS_BASE_URL", page_url)
-            .env("CALLS_A_USER", a.0)
-            .env("CALLS_A_TOKEN", a.1)
-            .env("CALLS_B_USER", b.0)
-            .env("CALLS_B_TOKEN", b.1)
-            .env("CALLS_RELAY", if relay { "1" } else { "0" })
-            .status()
-            .expect("run Playwright")
-    })
-    .await
-    .unwrap();
+    // Killed when the caller's timeout drops this future.
+    let status = tokio::process::Command::new("node")
+        .arg(cli)
+        .arg("test")
+        .current_dir(&tests)
+        .env("CALLS_BASE_URL", page_url)
+        .env("CALLS_A_USER", a.0)
+        .env("CALLS_A_TOKEN", a.1)
+        .env("CALLS_B_USER", b.0)
+        .env("CALLS_B_TOKEN", b.1)
+        .env("CALLS_RELAY", if relay { "1" } else { "0" })
+        .kill_on_drop(true)
+        .status()
+        .await
+        .expect("run Playwright");
     assert!(status.success(), "the Playwright calls suite failed");
 }
 
