@@ -14,6 +14,7 @@
 
 mod agent_key;
 mod auth;
+mod calls;
 mod cards;
 mod client;
 mod connection;
@@ -34,8 +35,12 @@ pub use agent_key::{
     assemble_assertion,
 };
 pub use auth::{Device, Platform, Profile};
+pub use calls::{
+    CallDirection, CallEndReason, CallErrorCode, CallEvent, CallState, CallStatus, IceCandidate,
+    SdpKind,
+};
 pub use cards::{CardBook, CardCheck, CardRefusal, OpenCard};
-pub use client::{Account, Client, Config, EDIT_WINDOW, Events};
+pub use client::{Account, Calls, Client, Config, EDIT_WINDOW, Events};
 pub use error::SdkError;
 pub use key::DatabaseKey;
 pub use model::{
@@ -43,7 +48,7 @@ pub use model::{
     ConversationKind, Event, Invite, Message, MessageKind, MessageStatus, OutboxKind, Presence,
     PresenceState,
 };
-pub use push_domain::{ClientMsgId, ConversationId, DeviceId, MessageId, UserId};
+pub use push_domain::{CallId, ClientMsgId, ConversationId, DeviceId, MessageId, UserId};
 pub use secrets::{MemorySecretStore, SECRET_KEYS, SecretError, SecretStore};
 
 #[cfg(test)]

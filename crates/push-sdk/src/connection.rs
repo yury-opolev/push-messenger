@@ -28,7 +28,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
 use push_proto::v1::frame::Body;
-use push_proto::v1::{self, Identify, Ping, ReAuth, request, response};
+use push_proto::v1::{self, Capability, Identify, Ping, ReAuth, request, response};
 use push_proto::{decode_frame, encode_frame, id_bytes};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -133,6 +133,8 @@ pub(crate) struct Connection {
     shared: Arc<Shared>,
     credentials: Arc<Credentials>,
     endpoint: Endpoint,
+    /// [`crate::Config::calls`]: advertise calls in `Identify`.
+    calls: bool,
     state: Arc<watch::Sender<ConnectionState>>,
     commands: mpsc::UnboundedReceiver<Command>,
     engine: Engine,
@@ -146,6 +148,7 @@ impl Connection {
         shared: Arc<Shared>,
         credentials: Arc<Credentials>,
         endpoint: Endpoint,
+        calls: bool,
         state: Arc<watch::Sender<ConnectionState>>,
         commands: mpsc::UnboundedReceiver<Command>,
     ) -> Self {
@@ -154,6 +157,7 @@ impl Connection {
             shared,
             credentials,
             endpoint,
+            calls,
             state,
             commands,
             pong_timeout: PONG_TIMEOUT,
@@ -306,6 +310,7 @@ impl Connection {
             self.credentials.clone(),
             self.shared.clone(),
             self.endpoint.clone(),
+            self.calls,
         ));
         let shaken = loop {
             tokio::select! {
@@ -337,6 +342,7 @@ impl Connection {
         credentials: Arc<Credentials>,
         shared: Arc<Shared>,
         endpoint: Endpoint,
+        calls: bool,
     ) -> Result<(Socket, Session, v1::Ready), Ended> {
         let session = match credentials.fresh().await {
             Ok(session) => session,
@@ -392,7 +398,11 @@ impl Connection {
         };
         let identify = Body::Identify(Identify {
             token: token.clone(),
-            capabilities: Vec::new(),
+            capabilities: if calls {
+                vec![Capability::Calls.into()]
+            } else {
+                Vec::new()
+            },
         });
         if send_now(&mut socket, identify).await.is_err() {
             return Err(lost(AfterClose::Reconnect, None, token));
@@ -437,6 +447,8 @@ impl Connection {
             refresh_at: None,
             reauth_at: None,
         };
+        let calls = self.calls && ready.capabilities.contains(&Capability::Calls.into());
+        self.shared.set_calls_available(calls);
         self.set_state(ConnectionState::Connected);
         let mut out = Vec::new();
         self.engine.start(unix_ms(), &mut out);
@@ -612,6 +624,7 @@ impl Connection {
     /// finish: auth-svc may have rotated the token already, and the refresh saves the new
     /// one; aborting it could lose the only refresh token that still works.
     fn end(&mut self, live: &mut Live) {
+        self.shared.set_calls_available(false);
         self.engine.stop();
         for (_, reply) in live.pending.drain() {
             let _ = reply.send(Err(SdkError::Disconnected));
@@ -826,7 +839,8 @@ mod tests {
             socket_url: gateway.url.clone(),
             host: None,
         };
-        let mut connection = Connection::new(shared, credentials, endpoint, state_sender, receiver);
+        let mut connection =
+            Connection::new(shared, credentials, endpoint, false, state_sender, receiver);
         tune(&mut connection);
         tokio::spawn(connection.run());
         commands.send(Command::Connect).unwrap();

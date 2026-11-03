@@ -5,10 +5,11 @@
 //! (`connection.rs`) feeds the [`Engine`] the frames it receives and sends the frames the
 //! engine asks for.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use push_domain::{ClientMsgId, ConversationId, UserId};
+use push_domain::{CallId, ClientMsgId, ConversationId, DeviceId, UserId};
 use push_proto::v1::frame::Body;
 use push_proto::v1::{self, ListContacts, ListConversations, ReadUpTo, request, response};
 use tokio::sync::mpsc;
@@ -17,6 +18,8 @@ use tokio::time::Instant;
 use uuid::Uuid;
 
 use crate::SdkError;
+use crate::calls::{CallEndReason, CallErrorCode, CallEvent, CallState, IceCandidate, SdpKind};
+use crate::error::error_code_name;
 use crate::model::{Activity, ActivityState, Contact, ContactState, Event, OutboxKind, Presence};
 use crate::policy::{Acks, Backoff};
 use crate::store::{Applied, Store, bytes};
@@ -25,14 +28,18 @@ use crate::store::{Applied, Store, bytes};
 /// ones and is told so with [`Event::EventsLost`]; the store holds everything anyway.
 pub(crate) const EVENT_QUEUE: usize = 10_000;
 
-/// What the connection and the app's calls share: the store, the event stream, and the
-/// presence sharing setting this client last learned.
+/// What the connection and the app's calls share: the store, the event stream, the
+/// presence sharing setting this client last learned, and what it knows of calls.
 pub(crate) struct Shared {
     store: Mutex<Store>,
     events: Mutex<Queue>,
     /// The user and whether they share presence, as last answered to this client; `None`
     /// (unknown) counts as sharing.
     presence_sharing: Mutex<Option<(UserId, bool)>>,
+    /// The live connection offers calls and the client asked for them.
+    calls_available: AtomicBool,
+    /// The calls this client knows to be live, for [`CallEvent::Synced`]'s `gone`.
+    live_calls: Mutex<BTreeSet<CallId>>,
 }
 
 /// The sending end of the event queue.
@@ -52,7 +59,42 @@ impl Shared {
                 lost: false,
             }),
             presence_sharing: Mutex::new(None),
+            calls_available: AtomicBool::new(false),
+            live_calls: Mutex::new(BTreeSet::new()),
         }
+    }
+
+    /// Whether calls are available on the live connection.
+    pub fn calls_available(&self) -> bool {
+        self.calls_available.load(Ordering::SeqCst)
+    }
+
+    /// Set when a connection starts serving, cleared when it ends.
+    pub fn set_calls_available(&self, available: bool) {
+        self.calls_available.store(available, Ordering::SeqCst);
+    }
+
+    fn live_calls(&self) -> MutexGuard<'_, BTreeSet<CallId>> {
+        self.live_calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// A call this client invited to, accepted or heard of is live.
+    pub fn call_live(&self, call: CallId) {
+        self.live_calls().insert(call);
+    }
+
+    fn call_over(&self, call: CallId) {
+        self.live_calls().remove(&call);
+    }
+
+    /// The server listed the user's calls: they are the live ones now. The calls known
+    /// as live before that are not listed, in id order.
+    fn calls_synced(&self, listed: &[CallState]) -> Vec<CallId> {
+        let listed: BTreeSet<CallId> = listed.iter().map(|call| call.call_id).collect();
+        let previous = std::mem::replace(&mut *self.live_calls(), listed.clone());
+        previous.difference(&listed).copied().collect()
     }
 
     /// Records the presence sharing setting of `user` that the server answered.
@@ -331,6 +373,18 @@ impl Engine {
             Body::ContactEvent(event) => self.on_contact_event(&event, out),
             Body::ActivityEvent(event) => self.on_activity_event(&event, now_ms),
             Body::PresenceEvent(event) => self.on_presence_event(&event),
+            Body::CallIncoming(_)
+            | Body::CallAccepted(_)
+            | Body::CallTaken(_)
+            | Body::CallEnded(_)
+            | Body::CallError(_)
+            | Body::CallSync(_)
+            | Body::PeerCallIce(_)
+            | Body::PeerCallRenegotiate(_)
+            | Body::CallHistoryChanged(_) => match self.on_call_frame(body, now_ms) {
+                Some(event) => self.shared.emit(Event::Call(event)),
+                None => tracing::debug!("dropped a call frame with an unreadable id or kind"),
+            },
             other => return Some(other),
         }
         None
@@ -639,6 +693,82 @@ impl Engine {
             }
         }
     }
+
+    /// A call frame from the server, as the event for the app, keeping track of the live
+    /// calls; `None` when it names no call (or user, device, SDP kind) this client can
+    /// read. Server times are microseconds; ringing is timed on this device's clock.
+    fn on_call_frame(&mut self, body: Body, now_ms: i64) -> Option<CallEvent> {
+        let call = |id: &[u8]| Uuid::from_slice(id).ok().map(CallId);
+        let event = match body {
+            Body::CallIncoming(incoming) => CallEvent::Incoming {
+                call_id: call(&incoming.call_id)?,
+                caller_id: UserId(Uuid::from_slice(&incoming.caller_user_id).ok()?),
+                offer_sdp: incoming.offer_sdp,
+                expires_at_ms: now_ms.saturating_add(i64::from(incoming.expires_in_ms)),
+            },
+            Body::CallAccepted(accepted) => CallEvent::Accepted {
+                call_id: call(&accepted.call_id)?,
+                answer_sdp: accepted.answer_sdp,
+                answered_device_id: DeviceId(Uuid::from_slice(&accepted.answered_device_id).ok()?),
+            },
+            Body::CallTaken(taken) => CallEvent::Taken {
+                call_id: call(&taken.call_id)?,
+            },
+            Body::CallEnded(ended) => CallEvent::Ended {
+                call_id: call(&ended.call_id)?,
+                reason: CallEndReason::from_wire(ended.reason()),
+                duration_s: ended.duration_s,
+            },
+            Body::CallError(error) => CallEvent::Error {
+                call_id: call(&error.call_id)?,
+                code: CallErrorCode::from_wire(error.code()),
+                error: SdkError::Server {
+                    code: error_code_name(error.code()),
+                    message: error.message,
+                    retryable: error.retryable,
+                    retry_after_s: error.retry_after_s,
+                },
+            },
+            Body::CallSync(sync) => {
+                let calls: Vec<CallState> = sync
+                    .calls
+                    .into_iter()
+                    .filter_map(|state| CallState::from_wire(state, now_ms))
+                    .collect();
+                let gone = self.shared.calls_synced(&calls);
+                return Some(CallEvent::Synced { calls, gone });
+            }
+            Body::PeerCallIce(ice) => CallEvent::PeerIce {
+                call_id: call(&ice.call_id)?,
+                candidate: IceCandidate::from_wire(ice),
+            },
+            Body::PeerCallRenegotiate(renegotiate) => CallEvent::PeerRenegotiate {
+                call_id: call(&renegotiate.call_id)?,
+                kind: SdpKind::from_wire(renegotiate.r#type())?,
+                sdp: renegotiate.sdp,
+            },
+            Body::CallHistoryChanged(changed) => CallEvent::HistoryChanged {
+                latest_ended_at_ms: changed
+                    .latest_ended_at
+                    .map(|micros| micros.div_euclid(1_000)),
+            },
+            _ => return None,
+        };
+        match &event {
+            CallEvent::Incoming { call_id, .. } | CallEvent::Accepted { call_id, .. } => {
+                self.shared.call_live(*call_id);
+            }
+            CallEvent::Taken { call_id }
+            | CallEvent::Ended { call_id, .. }
+            | CallEvent::Error {
+                call_id,
+                code: CallErrorCode::CallNotFound,
+                ..
+            } => self.shared.call_over(*call_id),
+            _ => {}
+        }
+        Some(event)
+    }
 }
 
 #[cfg(test)]
@@ -647,6 +777,7 @@ mod tests {
     use push_proto::v1::{EntryKind, ErrorCode};
 
     use super::*;
+    use crate::calls::{CallDirection, CallStatus};
     use crate::model::{ConversationKind, MessageKind, MessageStatus, PresenceState};
     use crate::store::tests::{answer_entry, card_entry, entry};
 
@@ -1269,5 +1400,456 @@ mod tests {
         f.engine.start(0, &mut out);
         assert_eq!(sends(&out), [bytes(a.0)]);
         let _ = f.me;
+    }
+
+    fn call_frame(f: &mut Fixture, body: Body, now_ms: i64) {
+        let mut out = Vec::new();
+        let back = f.engine.on_frame(body, Instant::now(), now_ms, &mut out);
+        assert_eq!((back, out), (None, Vec::new()));
+    }
+
+    #[test]
+    fn call_frames_become_call_events() {
+        let mut f = fixture();
+        let (call, peer, device) = (CallId::new(), f.peer, DeviceId::new());
+        let id = bytes(call.0);
+        let frames = [
+            Body::CallIncoming(v1::CallIncoming {
+                call_id: id.clone(),
+                caller_user_id: bytes(peer.0),
+                offer_sdp: "v=0\nm=audio 9 UDP/TLS/RTP/SAVPF 111\n".to_owned(),
+                media: vec![v1::CallMedia::Audio.into()],
+                expires_at: 1_700_000_030_000_000,
+                expires_in_ms: 30_000,
+            }),
+            Body::CallAccepted(v1::CallAccepted {
+                call_id: id.clone(),
+                answer_sdp: "v=0\nm=audio 9\n".to_owned(),
+                answered_device_id: bytes(device.0),
+            }),
+            Body::CallTaken(v1::CallTaken {
+                call_id: id.clone(),
+            }),
+            Body::CallEnded(v1::CallEnded {
+                call_id: id.clone(),
+                reason: v1::CallEndReason::Completed.into(),
+                duration_s: Some(42),
+            }),
+            Body::CallEnded(v1::CallEnded {
+                call_id: id.clone(),
+                reason: 99,
+                duration_s: None,
+            }),
+            Body::PeerCallIce(v1::CallIce {
+                call_id: id.clone(),
+                candidate: "candidate:1 1 udp 2122260223 192.0.2.1 54321 typ host".to_owned(),
+                sdp_mid: Some("0".to_owned()),
+                sdp_mline_index: Some(0),
+                end_of_candidates: false,
+                username_fragment: Some("abcd".to_owned()),
+            }),
+            Body::PeerCallRenegotiate(v1::CallRenegotiate {
+                call_id: id.clone(),
+                sdp: "v=0\nm=audio 9\n".to_owned(),
+                r#type: v1::CallSdpType::Offer.into(),
+            }),
+            Body::CallHistoryChanged(v1::CallHistoryChanged {
+                latest_ended_at: Some(1_700_000_040_123_456),
+            }),
+            Body::CallHistoryChanged(v1::CallHistoryChanged {
+                latest_ended_at: None,
+            }),
+        ];
+        for body in frames {
+            call_frame(&mut f, body, 5_000);
+        }
+        let call_event = |event| Event::Call(event);
+        assert_eq!(
+            f.events(),
+            [
+                call_event(CallEvent::Incoming {
+                    call_id: call,
+                    caller_id: peer,
+                    offer_sdp: "v=0\nm=audio 9 UDP/TLS/RTP/SAVPF 111\n".to_owned(),
+                    expires_at_ms: 35_000,
+                }),
+                call_event(CallEvent::Accepted {
+                    call_id: call,
+                    answer_sdp: "v=0\nm=audio 9\n".to_owned(),
+                    answered_device_id: device,
+                }),
+                call_event(CallEvent::Taken { call_id: call }),
+                call_event(CallEvent::Ended {
+                    call_id: call,
+                    reason: CallEndReason::Completed,
+                    duration_s: Some(42),
+                }),
+                call_event(CallEvent::Ended {
+                    call_id: call,
+                    reason: CallEndReason::Failed,
+                    duration_s: None,
+                }),
+                call_event(CallEvent::PeerIce {
+                    call_id: call,
+                    candidate: IceCandidate {
+                        candidate: "candidate:1 1 udp 2122260223 192.0.2.1 54321 typ host"
+                            .to_owned(),
+                        sdp_mid: Some("0".to_owned()),
+                        sdp_mline_index: Some(0),
+                        username_fragment: Some("abcd".to_owned()),
+                        end_of_candidates: false,
+                    },
+                }),
+                call_event(CallEvent::PeerRenegotiate {
+                    call_id: call,
+                    sdp: "v=0\nm=audio 9\n".to_owned(),
+                    kind: SdpKind::Offer,
+                }),
+                call_event(CallEvent::HistoryChanged {
+                    latest_ended_at_ms: Some(1_700_000_040_123),
+                }),
+                call_event(CallEvent::HistoryChanged {
+                    latest_ended_at_ms: None,
+                }),
+            ]
+        );
+    }
+
+    #[test]
+    fn call_errors_carry_the_server_code() {
+        let mut f = fixture();
+        let call = CallId::new();
+        let cases = [
+            (
+                v1::ErrorCode::AlreadyAnswered,
+                CallErrorCode::AlreadyAnswered,
+                "already_answered",
+                None,
+            ),
+            (
+                v1::ErrorCode::CallNotFound,
+                CallErrorCode::CallNotFound,
+                "call_not_found",
+                None,
+            ),
+            (
+                v1::ErrorCode::InCall,
+                CallErrorCode::InCall,
+                "in_call",
+                None,
+            ),
+            (
+                v1::ErrorCode::CallLimit,
+                CallErrorCode::CallLimit,
+                "call_limit",
+                None,
+            ),
+            (
+                v1::ErrorCode::NotContact,
+                CallErrorCode::NotContact,
+                "not_contact",
+                None,
+            ),
+            (
+                v1::ErrorCode::Invalid,
+                CallErrorCode::Invalid,
+                "invalid",
+                None,
+            ),
+            (
+                v1::ErrorCode::RateLimited,
+                CallErrorCode::RateLimited,
+                "rate_limited",
+                Some(60),
+            ),
+            (
+                v1::ErrorCode::NotAvailable,
+                CallErrorCode::NotAvailable,
+                "not_available",
+                None,
+            ),
+            (
+                v1::ErrorCode::Unavailable,
+                CallErrorCode::Unavailable,
+                "unavailable",
+                None,
+            ),
+            (
+                v1::ErrorCode::NotMember,
+                CallErrorCode::Other,
+                "not_member",
+                None,
+            ),
+        ];
+        for (wire, _, _, retry_after_s) in cases {
+            call_frame(
+                &mut f,
+                Body::CallError(v1::CallError {
+                    call_id: bytes(call.0),
+                    code: wire.into(),
+                    message: "refused".to_owned(),
+                    retryable: retry_after_s.is_some(),
+                    retry_after_s,
+                }),
+                0,
+            );
+        }
+        let expected: Vec<Event> = cases
+            .iter()
+            .map(|(_, code, name, retry_after_s)| {
+                Event::Call(CallEvent::Error {
+                    call_id: call,
+                    code: *code,
+                    error: SdkError::Server {
+                        code: (*name).to_owned(),
+                        message: "refused".to_owned(),
+                        retryable: retry_after_s.is_some(),
+                        retry_after_s: *retry_after_s,
+                    },
+                })
+            })
+            .collect();
+        assert_eq!(f.events(), expected);
+    }
+
+    #[test]
+    fn call_frames_with_unreadable_ids_are_dropped() {
+        let mut f = fixture();
+        let call = bytes(CallId::new().0);
+        let frames = [
+            Body::CallIncoming(v1::CallIncoming {
+                call_id: vec![1, 2],
+                caller_user_id: bytes(f.peer.0),
+                offer_sdp: "v=0\n".to_owned(),
+                ..Default::default()
+            }),
+            Body::CallIncoming(v1::CallIncoming {
+                call_id: call.clone(),
+                caller_user_id: vec![3],
+                offer_sdp: "v=0\n".to_owned(),
+                ..Default::default()
+            }),
+            Body::CallAccepted(v1::CallAccepted {
+                call_id: call.clone(),
+                answer_sdp: "v=0\n".to_owned(),
+                answered_device_id: Vec::new(),
+            }),
+            Body::CallTaken(v1::CallTaken { call_id: vec![] }),
+            Body::CallEnded(v1::CallEnded {
+                call_id: vec![9],
+                ..Default::default()
+            }),
+            Body::CallError(v1::CallError {
+                call_id: vec![9],
+                ..Default::default()
+            }),
+            Body::PeerCallIce(v1::CallIce {
+                call_id: vec![9],
+                ..Default::default()
+            }),
+            Body::PeerCallRenegotiate(v1::CallRenegotiate {
+                call_id: vec![9],
+                sdp: "v=0\n".to_owned(),
+                r#type: v1::CallSdpType::Answer.into(),
+            }),
+            Body::PeerCallRenegotiate(v1::CallRenegotiate {
+                call_id: call,
+                sdp: "v=0\n".to_owned(),
+                r#type: v1::CallSdpType::Unspecified.into(),
+            }),
+        ];
+        for body in frames {
+            call_frame(&mut f, body, 0);
+        }
+        assert_eq!(f.events(), []);
+    }
+
+    #[test]
+    fn call_sync_reports_the_calls_it_does_not_list_as_gone() {
+        let mut f = fixture();
+        let (invited, ringing, accepted, ended, refused) = (
+            CallId::new(),
+            CallId::new(),
+            CallId::new(),
+            CallId::new(),
+            CallId::new(),
+        );
+        let peer = f.peer;
+        f.shared.call_live(invited);
+        f.shared.call_live(refused);
+        let incoming = |call: CallId| {
+            Body::CallIncoming(v1::CallIncoming {
+                call_id: bytes(call.0),
+                caller_user_id: bytes(peer.0),
+                offer_sdp: "v=0\n".to_owned(),
+                expires_in_ms: 1_000,
+                ..Default::default()
+            })
+        };
+        call_frame(&mut f, incoming(ringing), 0);
+        call_frame(&mut f, incoming(ended), 0);
+        call_frame(
+            &mut f,
+            Body::CallAccepted(v1::CallAccepted {
+                call_id: bytes(accepted.0),
+                answer_sdp: "v=0\n".to_owned(),
+                answered_device_id: bytes(DeviceId::new().0),
+            }),
+            0,
+        );
+        call_frame(
+            &mut f,
+            Body::CallEnded(v1::CallEnded {
+                call_id: bytes(ended.0),
+                reason: v1::CallEndReason::Missed.into(),
+                duration_s: None,
+            }),
+            0,
+        );
+        call_frame(
+            &mut f,
+            Body::CallError(v1::CallError {
+                call_id: bytes(refused.0),
+                code: v1::ErrorCode::CallNotFound.into(),
+                ..Default::default()
+            }),
+            0,
+        );
+        f.events();
+
+        let active = v1::CallState {
+            call_id: bytes(accepted.0),
+            peer_user_id: bytes(peer.0),
+            direction: v1::CallDirection::Out.into(),
+            status: v1::CallStatus::Active.into(),
+            media: vec![v1::CallMedia::Audio.into()],
+            offer_sdp: None,
+            expires_at: None,
+            expires_in_ms: None,
+            answered_at: Some(1_700_000_000_123_999),
+            this_device: true,
+        };
+        let listed_elsewhere = CallId::new();
+        let ringing_here = v1::CallState {
+            call_id: bytes(listed_elsewhere.0),
+            direction: v1::CallDirection::In.into(),
+            status: v1::CallStatus::Ringing.into(),
+            offer_sdp: Some("v=0\n".to_owned()),
+            expires_in_ms: Some(20_000),
+            answered_at: None,
+            this_device: false,
+            ..active.clone()
+        };
+        let unreadable = v1::CallState {
+            call_id: vec![1],
+            ..active.clone()
+        };
+        call_frame(
+            &mut f,
+            Body::CallSync(v1::CallSync {
+                calls: vec![active, ringing_here, unreadable],
+            }),
+            7_000,
+        );
+        let mut gone = vec![invited, ringing];
+        gone.sort();
+        let listed = vec![
+            CallState {
+                call_id: accepted,
+                peer_user_id: peer,
+                direction: CallDirection::Outgoing,
+                status: CallStatus::Active,
+                offer_sdp: None,
+                expires_at_ms: None,
+                answered_at_ms: Some(1_700_000_000_123),
+                this_device: true,
+            },
+            CallState {
+                call_id: listed_elsewhere,
+                peer_user_id: peer,
+                direction: CallDirection::Incoming,
+                status: CallStatus::Ringing,
+                offer_sdp: Some("v=0\n".to_owned()),
+                expires_at_ms: Some(27_000),
+                answered_at_ms: None,
+                this_device: false,
+            },
+        ];
+        assert!(listed[0].needs_ice_restart() && !listed[1].needs_ice_restart());
+        assert_eq!(
+            f.events(),
+            [Event::Call(CallEvent::Synced {
+                calls: listed,
+                gone,
+            })]
+        );
+
+        // The listed calls are the known ones now.
+        call_frame(
+            &mut f,
+            Body::CallSync(v1::CallSync { calls: Vec::new() }),
+            0,
+        );
+        let mut gone = vec![accepted, listed_elsewhere];
+        gone.sort();
+        assert_eq!(
+            f.events(),
+            [Event::Call(CallEvent::Synced {
+                calls: Vec::new(),
+                gone,
+            })]
+        );
+    }
+
+    #[test]
+    fn call_events_do_not_show_sdp_or_candidates_in_debug() {
+        let secret_sdp = "v=0\nc=IN IP4 198.51.100.7\nm=audio 9\n";
+        let secret_candidate = "candidate:1 1 udp 1 198.51.100.7 5000 typ host";
+        let call_id = CallId::new();
+        let events = [
+            CallEvent::Incoming {
+                call_id,
+                caller_id: UserId::new(),
+                offer_sdp: secret_sdp.to_owned(),
+                expires_at_ms: 0,
+            },
+            CallEvent::Accepted {
+                call_id,
+                answer_sdp: secret_sdp.to_owned(),
+                answered_device_id: DeviceId::new(),
+            },
+            CallEvent::PeerIce {
+                call_id,
+                candidate: IceCandidate {
+                    candidate: secret_candidate.to_owned(),
+                    username_fragment: Some("secret-ufrag".to_owned()),
+                    ..IceCandidate::default()
+                },
+            },
+            CallEvent::PeerRenegotiate {
+                call_id,
+                sdp: secret_sdp.to_owned(),
+                kind: SdpKind::Answer,
+            },
+            CallEvent::Synced {
+                calls: vec![CallState {
+                    call_id,
+                    peer_user_id: UserId::new(),
+                    direction: CallDirection::Incoming,
+                    status: CallStatus::Ringing,
+                    offer_sdp: Some(secret_sdp.to_owned()),
+                    expires_at_ms: None,
+                    answered_at_ms: None,
+                    this_device: true,
+                }],
+                gone: Vec::new(),
+            },
+        ];
+        for event in events {
+            let shown = format!("{:?}", Event::Call(event));
+            assert!(!shown.contains("198.51.100.7"), "{shown}");
+            assert!(!shown.contains("secret-ufrag"), "{shown}");
+            assert!(shown.contains(&call_id.to_string()), "{shown}");
+        }
     }
 }

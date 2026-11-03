@@ -11,6 +11,7 @@ use push_domain::{ClientMsgId, ConversationId, MessageId, UserId};
 use push_proto::v1;
 
 use crate::SdkError;
+use crate::calls::CallEvent;
 
 /// What kind of conversation it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -469,6 +470,9 @@ pub enum Event {
     /// ([`PresenceState::Unknown`]). Only while connected; not stored: read the current
     /// presence with `get_presence` after connecting.
     PresenceChanged(Presence),
+    /// Something happened to a call (docs/calls.md). Only while connected with calls
+    /// available; not stored.
+    Call(CallEvent),
     /// Sign in again (a password reset, or the credentials were refused). Also reported
     /// as [`ConnectionState::SignedOut`].
     SignedOut,

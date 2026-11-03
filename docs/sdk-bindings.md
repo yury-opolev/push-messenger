@@ -112,6 +112,7 @@ One ordered stream per client, each event an object with a `type`:
 | `contactChanged` | `contact` |
 | `activityChanged` | `activity`: another member's activity; a newer one from the same user and conversation replaces it |
 | `presenceChanged` | `presence`: a contact's presence changed |
+| `call` | `call`: something happened to a call ([below](#calls)); not emitted through the bindings yet |
 | `signedOut` | sign in again |
 | `deviceRemoved` | the device was revoked |
 | `openedElsewhere` | another copy took over |
@@ -164,6 +165,28 @@ The protocol, the rules and an agent recipe: [activity-presence.md](activity-pre
   (from either call; before either it counts as on), it drops `presenceChanged` about other
   users, so a change the server sent just before the switch is not shown; the user's own
   presence still arrives.
+
+### Calls
+
+push-sdk carries the signalling of 1:1 audio calls (the protocol: [calls.md](calls.md)).
+The bindings do not expose the calls functions or a `calls` config option yet, so these
+events do not occur through the bindings yet: they arrive with the bindings' calls API
+later. Their JSON form is fixed already: `{"type": "call", "call": {"type": …, …}}`, the
+inner `type` one of:
+
+| `call.type` | Fields |
+|---|---|
+| `call.incoming` | `callId`, `callerId`, `offerSdp`, `expiresAtMs` (when ringing stops, on this device's clock) |
+| `call.accepted` | `callId`, `answerSdp`, `answeredDeviceId`: the callee answered the user's call |
+| `call.taken` | `callId`: another device of the user answered; stop ringing |
+| `call.ended` | `callId`, `reason` (`completed`, `missed`, `declined`, `cancelled`, `busy`, `failed`, `unreachable`), `durationS` (answered calls, else `null`) |
+| `call.peerIce` | `callId`, `candidate`: `{candidate, sdpMid, sdpMLineIndex, usernameFragment, endOfCandidates}` |
+| `call.peerRenegotiate` | `callId`, `sdp`, `kind` (`offer` or `answer`) |
+| `call.error` | `callId`, `error`: a refused call frame; `error.code` is the server's (`already_answered`, `call_not_found`, `in_call`, `call_limit`, `not_contact`, `invalid`, `rate_limited`, `not_available`, `unavailable`) |
+| `call.synced` | `calls` (after every connect: `[{callId, peerUserId, direction, status, offerSdp, expiresAtMs, answeredAtMs, thisDevice}]`), `gone` (ids of calls the client knew as live that are not listed: drop them) |
+| `call.historyChanged` | `latestEndedAtMs` (`null` when a call was hidden): refresh the call history |
+
+SDP and candidate strings are in the JSON because the app needs them; never log them.
 
 ### The secret store and the database key
 
