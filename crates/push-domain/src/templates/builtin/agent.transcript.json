@@ -1,0 +1,17 @@
+{
+  "format": "tpl/1",
+  "publisher": "agent",
+  "name": "transcript",
+  "version": 1,
+  "title": "Voice transcript",
+  "senders": ["agent"],
+  "params": {
+    "speaker": {"type": "enum", "values": ["owner", "agent"]},
+    "text": {"type": "string", "max_len": 4000, "multiline": true}
+  },
+  "layout": [
+    {"type": "heading", "text": "🎤 voice"},
+    {"type": "status", "param": "speaker", "label": "Speaker"},
+    {"type": "text", "param": "text"}
+  ]
+}
