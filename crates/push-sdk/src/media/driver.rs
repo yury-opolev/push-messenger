@@ -32,6 +32,8 @@ const RTP_FRAME: u64 = 960;
 const MAX_HELD: usize = 64;
 /// How long a caller waits for the answer at most (the server rings for 45 s by default).
 const ANSWER_WAIT: Duration = Duration::from_secs(90);
+/// How far the frame clock may fall behind before it starts again instead of catching up.
+const MAX_CATCH_UP: Duration = Duration::from_millis(100);
 
 /// The driver's ends of the channels to its [`super::MediaCall`].
 pub(crate) struct Channels {
@@ -329,7 +331,9 @@ struct Driver<S> {
 impl<S: Signalling> Driver<S> {
     async fn run(mut self) {
         let mut tick = tokio::time::interval(FRAME_DURATION);
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Late ticks are caught up, so a frame goes out every 20 ms on average where the
+        // timer is coarse: Windows' ~15.6 ms made a delayed tick come every ~31 ms.
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
         let mut host_buffer = vec![0u8; 2_048];
         let mut relay_buffer = vec![0u8; 4_096];
         while self.ended.is_none() {
@@ -351,7 +355,14 @@ impl<S: Signalling> Driver<S> {
                         self.relay = None;
                     }
                 },
-                _ = tick.tick() => self.send_audio(),
+                scheduled = tick.tick() => {
+                    // After a stall the backlog is not sent in one burst: the clock
+                    // starts again.
+                    if scheduled.elapsed() > MAX_CATCH_UP {
+                        tick.reset();
+                    }
+                    self.send_audio();
+                }
                 () = tokio::time::sleep_until(deadline) => self.on_timeout().await,
             }
             if self.ended.is_none() {
@@ -987,6 +998,65 @@ mod tests {
             b_heard.recv().await.is_none(),
             "the stream ends with the call"
         );
+    }
+
+    /// One frame goes out every 20 ms, also where the timer is coarse (Windows: about
+    /// 15.6 ms, which made a delayed 20 ms tick come every 31 ms, ~32 frames a second).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_helper_sends_fifty_frames_a_second() {
+        let ((a_wire, a_events), (b_wire, mut b_events)) = wires();
+        let (servers, options) = direct();
+        let a = MediaCall::start_with(
+            a_wire,
+            servers.clone(),
+            Role::Caller {
+                peer: UserId::new(),
+            },
+            options.clone(),
+        )
+        .await
+        .expect("the caller starts");
+        let Some(CallEvent::Incoming {
+            call_id, offer_sdp, ..
+        }) = b_events.recv().await
+        else {
+            panic!("the callee rings");
+        };
+        let mut b = MediaCall::start_with(
+            b_wire,
+            servers,
+            Role::Callee { call_id, offer_sdp },
+            options,
+        )
+        .await
+        .expect("the callee answers");
+        let mut b_heard = b.incoming().unwrap();
+        let (a, b) = (Arc::new(a), Arc::new(b));
+        forward(a.clone(), a_events);
+        forward(b.clone(), b_events);
+        tokio::time::timeout(Duration::from_secs(15), async {
+            a.connected().await.expect("the caller connects");
+            b.connected().await.expect("the callee connects");
+        })
+        .await
+        .expect("the media connects in time");
+
+        // 2 s of audio, queued at once.
+        speak(&a, 440.0).await;
+        let mut first = None;
+        for _ in 0..100 {
+            tokio::time::timeout(Duration::from_secs(5), b_heard.recv())
+                .await
+                .expect("audio arrives")
+                .expect("the call is running");
+            first.get_or_insert_with(std::time::Instant::now);
+        }
+        let took = first.unwrap().elapsed();
+        assert!(
+            took > Duration::from_millis(1_600) && took < Duration::from_millis(2_500),
+            "100 frames (2 s) arrived over {took:?}"
+        );
+        a.hangup().await;
     }
 
     #[tokio::test]

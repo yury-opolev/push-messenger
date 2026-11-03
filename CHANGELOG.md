@@ -6,6 +6,34 @@ Notable changes for consumers of push-messenger. Newest first.
 
 ### Added
 
+- **Agent bridge voice calls** (phase 2's bridge voice pipeline): with the new feature
+  `voice` (`cargo build --release -p push-bridge --features voice`: push-sdk's media
+  helper, Rust 1.89 and CMake) and a `calls` section in `config.json`, push-agent-bridge
+  answers its owner's calls (`calls.answer` `auto`; anyone else is refused, a second call
+  is declined busy; without `calls`, with `calls.stt` `none` or without the feature, calls
+  are not advertised). An in-house energy voice activity detector (`calls.vad`:
+  `silence_ms` 700, `min_speech_ms` 300) cuts the owner's speech into utterances;
+  speech-to-text turns each into an `agent.transcript@1` message and a prompt, or a steer
+  while a turn runs (never a `/` command); the agent's Markdown replies are spoken
+  sentence by sentence as they stream (code blocks and tables are said to be in the chat),
+  with a greeting, spoken background messages and activity labels `speaking`,
+  `listening`, `thinking`, `on a call`. Speaking over the agent stops it at once
+  (barge-in) and steers the utterance in. Open cards are read out and can be answered by
+  voice (approve or reject, an option by number, ordinal or label, several for a
+  multi-select, free text; unclear answers are asked again); the card is then edited into
+  a closed "🎤 Answered by voice: …" reply. Providers: `azure-speech` (REST, a key from an
+  environment variable with `region`, or an Entra token from a command with `endpoint`),
+  `local` (a whisper.cpp server or command for speech-to-text, a command such as piper or
+  a URL for text-to-speech) and `none`; logs stay content-free. `status` prints a `Voice:`
+  line. Tone-based speech fakes and recorded fixtures test the core, and a new CI job
+  `bridge-voice` runs the bridge answering its owner's call over real media through the
+  stack; `calls-media-windows` also runs the bridge's voice tests with the feature;
+  `PUSH_BRIDGE_LIVE_SPEECH=1` tries real providers. Guide:
+  [docs/agent-bridge.md §18](docs/agent-bridge.md#18-voice-calls).
+- **Built-in `agent.transcript@1`** (`speaker`: `owner` or `agent`, `text` up to 4,000
+  characters; heading "🎤 voice"): a voice transcript, sent by agents. message-svc seeds
+  it as approved at its next start, like the other built-ins
+  ([docs/rich-messages.md](docs/rich-messages.md#agenttranscript1)).
 - **push-sdk media helper** (feature `calls-media`, off by default): `push_sdk::media::MediaCall`
   places or answers a call through `Calls` and runs its audio natively (str0m for ICE,
   DTLS-SRTP and RTP; Opus through libopus; TURN over UDP or TCP through
@@ -403,3 +431,11 @@ Notable changes for consumers of push-messenger. Newest first.
 - auth migration `0007_hyphenated_handles.sql` replaces the `auth.user_account` handle
   CHECK. It only widens the rule; no data changes. It runs with the usual auth
   migrations.
+
+### Fixed
+
+- **push-sdk media helper on coarse timers**: the helper now sends a frame every 20 ms on
+  average where the timer is coarse. On Windows (a ~15.6 ms timer) a late 20 ms tick came
+  every ~31 ms, about 32 frames a second, so the peer heard gaps and the audio fell
+  behind; late ticks are now caught up, and after a stall over 100 ms the clock starts
+  again ([docs/calls.md §19.4](docs/calls.md#194-audio)).

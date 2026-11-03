@@ -16,9 +16,13 @@ use push_bridge::folders;
 use push_bridge::messenger::{Call, TestMessenger, param, template};
 use push_bridge::state::StateFile;
 use push_bridge::test_backend::{TestBackend, error};
+use push_bridge::voice::VoiceSetup;
+use push_bridge::voice::fake::{FakeStt, FakeTts, Fixture};
+use push_bridge::voice::phone::FakePhone;
+use push_bridge::voice::vad::VadConfig;
 use push_bridge_control::transport::{Listener, connect};
 use push_bridge_control::{BridgeState, Event as ControlEvent, ServerLine, Status, endpoint_for};
-use push_sdk::{ActivityState, ClientMsgId, UserId};
+use push_sdk::{ActivityState, CallEvent, CallId, ClientMsgId, Event, UserId};
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot};
@@ -72,6 +76,16 @@ impl Harness {
         events: mpsc::UnboundedReceiver<BackendEvent>,
         hub: Option<&ControlHub>,
     ) -> Self {
+        Self::run_full(backend, events, hub, None)
+    }
+
+    /// [`Harness::run_with`], taking the owner's calls with `voice`.
+    fn run_full(
+        backend: Arc<dyn Backend>,
+        events: mpsc::UnboundedReceiver<BackendEvent>,
+        hub: Option<&ControlHub>,
+        voice: Option<VoiceSetup>,
+    ) -> Self {
         let scratch = Scratch::new();
         let (root, work, outside) = (
             scratch.real("root"),
@@ -94,6 +108,9 @@ impl Harness {
         );
         if let Some(hub) = hub {
             bridge = bridge.with_control(hub.handle(), hub.calls());
+        }
+        if let Some(voice) = voice {
+            bridge = bridge.with_voice(voice);
         }
         let (stop, stopped) = oneshot::channel::<()>();
         let run = tokio::spawn(bridge.run(async {
@@ -920,4 +937,112 @@ async fn a_bridge_without_the_peek_answers_peek_disabled() {
     );
     client.reading.abort();
     h.stop().await.unwrap();
+}
+
+/// The fixture `name` from `tests/fixtures/voice`.
+fn voice_fixture(name: &str) -> Fixture {
+    Fixture::load(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("tests/fixtures/voice/{name}.json")),
+    )
+    .unwrap()
+}
+
+/// A call through the public API: the owner's call is answered and greeted, an utterance
+/// is posted and prompted, the reply is spoken, "approve" answers a card by voice, and a
+/// stranger's call is declined.
+#[tokio::test(start_paused = true)]
+async fn a_voice_call_end_to_end() {
+    let prompt = voice_fixture("prompt");
+    let approve = voice_fixture("approve");
+    let words = prompt
+        .words
+        .iter()
+        .chain(&approve.words)
+        .map(|word| (word.hz, word.text.clone()))
+        .collect();
+    let phone = FakePhone::new();
+    let tts = Arc::new(FakeTts::new());
+    let (sender, events) = mpsc::unbounded_channel();
+    let backend = Arc::new(TestBackend::new("Coda", sender));
+    let h = Harness::run_full(
+        Arc::clone(&backend) as Arc<dyn Backend>,
+        events,
+        None,
+        Some(VoiceSetup {
+            phone: phone.clone(),
+            stt: Some(Arc::new(FakeStt::new(words))),
+            tts: Some(tts.clone()),
+            vad: VadConfig::default(),
+        }),
+    );
+    backend.wait_for("start", 1).await;
+    settle().await;
+    let spoken = |text: &str| tts.spoken().iter().any(|said| said == text);
+    let until_spoken = |text: &'static str| {
+        let spoken = &spoken;
+        async move {
+            within(async {
+                while !spoken(text) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+        }
+    };
+    let ring = |caller: UserId| {
+        let call_id = CallId::new();
+        h.messenger.inject(Event::Call(CallEvent::Incoming {
+            call_id,
+            caller_id: caller,
+            offer_sdp: "offer".into(),
+            expires_at_ms: i64::MAX,
+        }));
+        call_id
+    };
+
+    ring(h.messenger.owner_id());
+    let call = within(phone.wait_answered()).await;
+    until_spoken("Connected to Coda in work.").await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    call.say(&prompt.audio()).await;
+    within(backend.wait_for("prompt run the tests", 1)).await;
+    let transcript = h
+        .messenger
+        .sent_rich()
+        .into_iter()
+        .find(|(_, body)| template(body) == "agent.transcript@1")
+        .map(|(_, body)| param(&body, "text"))
+        .expect("a transcript");
+    assert_eq!(transcript.as_deref(), Some("run the tests"));
+
+    backend.turn_started(TurnSource::Prompt);
+    backend.text("All tests pass.\n");
+    let answer = backend.request(permission());
+    let (card, tpl) = h.card(2).await;
+    assert_eq!(tpl, "agent.approval@1");
+    until_spoken("All tests pass.").await;
+    until_spoken("Coda wants to use Bash. Approve or reject?").await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    call.say(&approve.audio()).await;
+    assert_eq!(within(answer).await, Ok(Answer::Permission(true)));
+    until_spoken("Approved.").await;
+    let (_, edit) = h
+        .messenger
+        .edits()
+        .into_iter()
+        .rfind(|(id, _)| *id == card)
+        .expect("the card was closed");
+    assert_eq!(template(&edit), "agent.reply@1");
+    assert_eq!(
+        param(&edit, "text").as_deref(),
+        Some("🎤 Answered by voice: Approve.")
+    );
+    backend.turn_ended(false);
+
+    let stranger = ring(UserId::new());
+    within(phone.wait_declined(1)).await;
+    assert_eq!(phone.declined(), [(stranger, false)]);
+    assert_eq!(phone.answered(), [call.call_id]);
 }

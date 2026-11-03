@@ -568,7 +568,7 @@ mod tests {
     #[tokio::test]
     async fn seeding_stores_the_builtins_once_and_the_catalog_lists_them() {
         let (api, messaging) = api();
-        assert_eq!(seed_builtins(&messaging).await, Ok(7));
+        assert_eq!(seed_builtins(&messaging).await, Ok(8));
         assert_eq!(seed_builtins(&messaging).await, Ok(0));
         let page = catalog(&api, 0).await;
         let mut refs: Vec<&str> = page
@@ -586,7 +586,8 @@ mod tests {
                 "agent.plan@1",
                 "agent.question@1",
                 "agent.reply@1",
-                "agent.reply@2"
+                "agent.reply@2",
+                "agent.transcript@1"
             ]
         );
         assert!(page.entries.iter().all(|entry| entry.definition.is_some()));

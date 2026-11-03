@@ -36,6 +36,11 @@ uuid.workspace = true
 # The media helper for calls_media.rs: its Rust 1.89 stays out of the msrv build, which
 # compiles no test target.
 push-sdk = { workspace = true, features = ["calls-media"] }
+# The agent bridge with voice for bridge_voice.rs (the media helper too: Rust 1.89, out of
+# the msrv build for the same reason).
+push-bridge = { workspace = true, features = ["voice"] }
+push-agent-key.workspace = true
+async-trait.workspace = true
 push-credentials = { workspace = true, features = ["testing"] }
 tokio = { workspace = true, features = ["io-util", "process"] }
 hmac.workspace = true

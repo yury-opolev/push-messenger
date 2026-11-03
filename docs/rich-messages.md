@@ -40,9 +40,9 @@ So rich content is filled from **templates**:
   edit.
 - A card with buttons or choices is answered with an ANSWER message. The server checks the
   answer against the card and closes the card with the first valid one.
-- Seven built-in templates (`agent.reply@1`, `agent.approval@1`, `agent.question@1`,
-  `agent.choose@1`, `agent.plan@1`, `agent.plan-approval@1`, `agent.reply@2`) are available
-  from the start, for owned agents only.
+- Eight built-in templates (`agent.reply@1`, `agent.approval@1`, `agent.question@1`,
+  `agent.choose@1`, `agent.plan@1`, `agent.plan-approval@1`, `agent.reply@2`,
+  `agent.transcript@1`) are available from the start, for owned agents only.
 
 ## 2. Enforcement model
 
@@ -480,17 +480,18 @@ RICH and ANSWER messages as text, their raw JSON body.
 
 ## 6. Built-in templates
 
-Seven `agent.*` templates ship in `push-domain` (`crates/push-domain/src/templates/builtin/`),
+Eight `agent.*` templates ship in `push-domain` (`crates/push-domain/src/templates/builtin/`),
 validated by the same code as any submission. message-svc **seeds them as approved at
 start-up**, before it reports ready, so the very first catalog lists them. They are owned
 by the server: the publisher `agent` is reserved and claimed by the server, so no account
 can publish under it. Seeding inserts missing versions only, so an admin may **revoke** a
 built-in and the revocation survives restarts. A changed built-in must get a new version;
 message-svc warns (`templates.builtin_mismatch`) when a stored built-in differs from the
-shipped one. All seven are for agents only. `agent.choose@1` and `agent.plan-approval@1`
+shipped one. All eight are for agents only. `agent.choose@1` and `agent.plan-approval@1`
 came later (with the [agent bridge](agent-bridge.md)); a message-svc of that release seeds
 them at its next start, next to the stored four. `agent.reply@2` came after them, and is
-seeded the same way.
+seeded the same way. `agent.transcript@1` came with voice calls (the agent bridge's voice
+transcripts), and is seeded the same way too.
 
 These were designed upstream: the consumer's own spec
 (`docs/specs/2026-10-26-rich-messages.md` in the consumer repository) was not available
@@ -684,6 +685,46 @@ for a decision rather than reporting progress.
       {"id": "reject", "label": "Reject", "style": "danger"}
     ]}
   ]
+}
+```
+
+### `agent.transcript@1`
+
+A spoken utterance from a voice call, as text (up to 4,000 characters): a fixed heading
+"🎤 voice", the label clients show, then who spoke and what was said. Not interactive. The
+[agent bridge](agent-bridge.md#18-voice-calls) posts each utterance of the owner during a
+voice call as this card (speaker `owner`), masked like any text it sends: it cannot send as
+the owner, so the transcript is an agent-sent card. `speaker: agent` is reserved for agents
+that want to post their own spoken words as transcripts; the bridge posts its replies as
+`agent.reply@2`.
+
+```json
+{
+  "format": "tpl/1",
+  "publisher": "agent",
+  "name": "transcript",
+  "version": 1,
+  "title": "Voice transcript",
+  "senders": ["agent"],
+  "params": {
+    "speaker": {"type": "enum", "values": ["owner", "agent"]},
+    "text": {"type": "string", "max_len": 4000, "multiline": true}
+  },
+  "layout": [
+    {"type": "heading", "text": "🎤 voice"},
+    {"type": "status", "param": "speaker", "label": "Speaker"},
+    {"type": "text", "param": "text"}
+  ]
+}
+```
+
+An example body:
+
+```json
+{
+  "tpl": "agent.transcript@1",
+  "params": {"speaker": "owner", "text": "Run the tests\nplease"},
+  "fallback": "🎤 voice: Run the tests please"
 }
 ```
 

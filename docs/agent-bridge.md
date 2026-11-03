@@ -26,6 +26,7 @@ and the plan differ, this guide describes what the code does.
 - [15. Upgrade mode](#15-upgrade-mode)
 - [16. Linux plan](#16-linux-plan)
 - [17. Manual smoke test on Windows](#17-manual-smoke-test-on-windows)
+- [18. Voice calls](#18-voice-calls)
 
 Design of the tray, the control channel and upgrade mode: the plan
 [2026-11-02-agent-tray-upgrade-mode](superpowers/plans/2026-11-02-agent-tray-upgrade-mode.md);
@@ -43,6 +44,7 @@ here too, this guide describes what the code does.
 | Replies | `agent.reply@2` cards (Coda writes Markdown; `agent.reply@1` for a plain-text backend): thinking, tool steps and text, edited as the turn runs |
 | Questions to the owner | `agent.approval@1`, `agent.question@1`, `agent.choose@1`, `agent.plan-approval@1` ([built-ins](rich-messages.md#6-built-in-templates)) |
 | Status | live activity: working, waiting, idle ([activity](activity-presence.md#7-agents)) |
+| Voice calls | the owner may call the agent from their app (build with `--features voice`, a `calls` section): what they say becomes prompts, posted as `agent.transcript@1`; the replies are spoken (Azure AI Speech or local engines); cards can be answered by voice ([voice calls](#18-voice-calls)) |
 | Stored on the machine | `config.json`, `state.json` (no secrets) and a JSON-lines log; tokens stay in memory |
 
 ## 2. Architecture
@@ -119,6 +121,14 @@ UI (states, icons, restart policy, `tray.json`, start at logon, Scheduled Tasks,
 supervisor and the menu model); **`apps/push-agent-tray`** is the Tauri v2 shell around
 it, a Cargo workspace of its own outside the root one.
 
+**Voice** (`voice` module, [voice calls](#18-voice-calls)): a `Phone` answers the owner's
+calls (`MediaPhone` over push-sdk's media helper, feature `voice`; `FakePhone` in tests),
+a `Session` per call runs the pipeline (voice activity detection, speech-to-text, the
+spoken sentences through text-to-speech, barge-in), and the speech providers (`Stt`,
+`Tts`: `azure`, `local`, tone-based `fake`) sit behind traits. The core's `core/voice.rs`
+answers or declines calls, posts transcripts, sends them to the backend like typed text,
+speaks replies and cards, and takes spoken answers; nothing in it knows Coda.
+
 ## 3. Requirements
 
 - Windows 10 or 11, or a Windows 365 Cloud PC (no managed identity needed). A TPM 2.0 is
@@ -132,7 +142,10 @@ it, a Cargo workspace of its own outside the root one.
   `agent.plan-approval@1`).
 - An owner account on that deployment, and an app that renders cards and sends answers.
 - To build: Rust 1.85 or later and the MSVC build tools (push-sdk compiles its bundled
-  SQLite).
+  SQLite); with `--features voice` (voice calls), Rust 1.89 and CMake.
+- For [voice calls](#18-voice-calls): calls enabled on the deployment
+  ([enabling calls](calls.md#2-enabling-calls)), a message-svc that seeds
+  `agent.transcript@1`, an owner's app that places calls, and a speech provider.
 
 ## 4. Setup on Windows
 
@@ -145,6 +158,11 @@ The steps use the default folder `%LOCALAPPDATA%\push-messenger\coda-bridge`. Ad
 cargo build --release -p push-bridge
 Copy-Item target\release\push-agent-bridge.exe C:\Tools\push-agent-bridge.exe
 ```
+
+For voice calls with the owner (the `calls` section), build with `--features voice`
+(push-sdk's media helper: Rust 1.89 and CMake). A build without it ignores `calls`, warns
+once, and does not advertise calls, so the owner's app shows the agent as unreachable.
+`status` prints a `Voice:` line saying which applies ([voice calls](#build-with-voice)).
 
 Keep the program somewhere stable: the logon task runs it from that path.
 
@@ -189,6 +207,7 @@ Create `%LOCALAPPDATA%\push-messenger\coda-bridge\config.json`. Every field:
 | `coda.args` | no | extra arguments after `serve`, as a list | `[]` |
 | `control` | no | serve the local [control channel](#14-control-channel-for-other-tools) (the tray's status and actions, `pause`, `resume`); `false` turns it off, and the bridge works as without it (the tray then cannot see or reach it) | `true` |
 | `peek` | no | keep the owner conversation's last 50 messages in memory, masked, for the tray's [chat peek](#chat-peek) (the control channel's `peek`); `false` keeps nothing and answers `peek_disabled` | `true` |
+| `calls` | no | voice calls with the owner: `answer` (`auto`), `language` (`en-US`), `stt` and `tts` (`{"provider": "azure-speech" \| "local" \| "none", …}`), `vad` (`silence_ms` 700, `min_speech_ms` 300); `stt` `none` means no calls (not advertised), `tts` `none` keeps replies in the chat ([every field](#the-calls-section)) | absent: no calls (not advertised) |
 
 Unknown fields are refused (a typo is an error, not ignored), and a UTF-8 byte order mark
 as Notepad writes it is fine. In JSON, double every backslash. `push-agent-bridge status`
@@ -296,7 +315,7 @@ push-agent-bridge [--dir <folder>] <command>
 | `thumbprint` | prints the thumbprint of the existing key |
 | `enroll --code <code>` | enrolls with the owner's one-time code and registers this device |
 | `run` | runs the bridge until Ctrl-C (what the logon task runs) |
-| `status` | prints the configuration path (and what is wrong with it), the key and its thumbprint, the agent user, the device, the folder, the sessions per folder and the log's path; no secrets |
+| `status` | prints the configuration path (and what is wrong with it), the key and its thumbprint, the agent user, the device, the folder, the sessions per folder, voice (`off (no calls section)`, `on: stt <provider>, tts <provider>`, `off (calls.stt is none)`, or configured in a build without voice; [details](#build-with-voice)) and the log's path; no secrets |
 | `pause [--reason <text>] [--drain-timeout <seconds>]` | asks the running bridge (through its [control channel](#14-control-channel-for-other-tools)) to [pause Coda for an upgrade](#15-upgrade-mode): Coda finishes its work (600 s at most by default), saves its state and is stopped; prints "Coda is paused; its program is released." once its program can be replaced. The bridge starts Coda again with its state once the program file changed, and holds the owner's texts meanwhile |
 | `resume` | asks the running bridge to start the paused Coda now (its program must be usable) and prints "Coda is resuming."; a pause that is still draining is cancelled instead: "The pause was cancelled; Coda keeps running." |
 | `help`, `--help`, `-h` | prints the usage |
@@ -529,6 +548,16 @@ restarts."
 | Logs | Names, codes, counts and durations only: never message bodies, previews, plans, typed answers, tokens or assertions |
 | Secrets at rest | Tokens stay in memory; the SDK's database is in memory; `state.json` holds ids only |
 | Another local user drives the bridge | The [control channel](#access-rules) is a local pipe whose DACL admits only the user and SYSTEM, and each side checks the other's user SID (Unix: a 0600 socket in a 0700 folder and a peer uid check); it carries states, counts, names and error codes only, except the [chat peek](#chat-peek) (the owner conversation's last messages, masked, in memory only; `"peek": false` turns it off); `"control": false` turns the channel off |
+| Someone else talks to the agent by voice | Only the owner's calls are answered (the server refuses non-contacts first), one at a time; a transcript is never a `/` command |
+
+**Voice calls.** The call's audio is encrypted end to end between the owner's app and the
+bridge. What the owner says and what the agent replies goes to the configured speech
+providers: with `azure-speech` each utterance's audio and each spoken sentence's text
+leave the machine for Azure AI Speech; with `local` they go to the configured command or
+URL; with `none`, nowhere. The bridge stores no audio; transcripts exist only as the masked
+`agent.transcript@1` messages it posts (stored on the server like every message). Speech
+keys come from environment variables only, Entra tokens stay in memory, and the logs carry
+no audio or text. Details: [privacy](#privacy-what-each-provider-receives).
 
 **Masking.** Previews, plans, step labels, thinking, text, command results, background
 messages and questions are masked before they leave the machine. Each match becomes
@@ -586,7 +615,8 @@ and upgrade mode add `control_listening` (`instance`), `control_unavailable` (`r
 `kind`), `control_request` and `control_action` (the method), `control_peer_refused`,
 `pause_started` (`drain_ms`), `backend_prepared`, `prepare_unsupported`, `pause_failed`,
 `backend_released`, `program_changed`, `backend_resuming` (`restore`),
-`pause_cancelled`, `backend_program_unusable` and `backend_restart_by_owner`.
+`pause_cancelled`, `backend_program_unusable` and `backend_restart_by_owner`. Voice calls
+add the events listed in [privacy](#privacy-what-each-provider-receives).
 
 The tray keeps `tray.json` outside the bridge folders
 ([location](#trayjson)).
@@ -640,6 +670,26 @@ owner's app. Use a scratch root folder.
 5. **Check that a stranger gets the fixed reply.** From another account, message the
    agent: it answers "This agent is private." once, and nothing reaches Coda (the log shows
    `stranger_refused`).
+
+**Speech providers.** `crates/push-bridge/tests/live_speech.rs` tries the configured
+providers ([the calls section](#the-calls-section)) against the real services (Azure AI
+Speech or local engines): text-to-speech
+says "Please run the unit tests now." and speech-to-text must hear "test" in it. With
+speech-to-text only, it transcribes a recording instead. It prints provider names and
+timings only:
+
+```powershell
+$env:PUSH_BRIDGE_LIVE_SPEECH = "1"
+$env:PUSH_BRIDGE_LIVE_SPEECH_CONFIG = "$env:LOCALAPPDATA\push-messenger\coda-bridge\config.json"  # or a file with just the calls section
+# $env:PUSH_BRIDGE_LIVE_SPEECH_WAV = "C:\scratch\run-the-tests.wav"  # speech-to-text only
+cargo test -p push-bridge --test live_speech -- --nocapture
+```
+
+The voice pipeline itself is tested end to end in CI (`bridge-voice`:
+`crates/push-smoke/tests/bridge_voice.rs`, opt in locally with `PUSH_BRIDGE_VOICE=1` and
+Docker): the owner's call over real media, a prompt, a spoken reply, barge-in, a voice
+approval and a stranger refused, with tone-based speech fakes
+([testing](#testing)).
 
 ## 13. The tray app (push-agent-tray)
 
@@ -1415,7 +1465,8 @@ switch-over).
    window. Expected in the chat: "(Coda is restarting: the owner asked)", then "Coda
    restarted by the owner." with what was lost; the badge pulses blue ("Coda restarting")
    for a moment (steady with "Reduce motion" checked), then green. The agent stays online,
-   the next message is answered, and `/status` shows the same session.4. **Reconnect signs in again.** Choose "Reconnect". Expected: "disconnected,
+   the next message is answered, and `/status` shows the same session.
+4. **Reconnect signs in again.** Choose "Reconnect". Expected: "disconnected,
    reconnecting" for a moment, then "connected, idle"; the log shows `messenger_reconnect`
    and no `backend_exited`; Coda was not restarted (no "Coda restarted" in the chat, the
    same session in `/status`).
@@ -1440,3 +1491,364 @@ switch-over).
 8. **The keyboard is enough.** With the window focused, Tab through the agent list (Up
    and Down select), the tabs (Left and Right switch) and the buttons; open the tray menu
    with Win+B and the arrow keys, the context-menu key (or Shift+F10), and the access keys.
+
+## 18. Voice calls
+
+The owner can call the agent from their app ([voice calls](calls.md)) and talk to it: the
+bridge answers, turns what the owner says into prompts, speaks the agent's replies, and
+takes spoken answers to its cards. Design: spec
+[2026-11-03-voice-calls-design](superpowers/specs/2026-11-03-voice-calls-design.md) §10.3
+and the plan's "PR 7 refined" section
+([2026-11-03-voice-calls](superpowers/plans/2026-11-03-voice-calls.md)); this guide
+describes what the code does.
+
+### Who gets through
+
+| Call | What happens |
+|---|---|
+| The owner calls, nothing else runs | answered at once (`calls.answer` `auto`); the bridge says "Connected to <name> in <folder>." (the backend's name and the last part of the current folder), then the oldest open card's question, if any |
+| Anyone else calls | refused by the server when they are not the agent's contact (`NOT_CONTACT`); a call from anyone but the owner that reaches the bridge is declined |
+| A second call while one runs (or is being answered, or the bridge is stopping) | declined busy |
+| No `calls` section, or `calls.stt` is `none` | calls are not advertised, so the owner's app sees the agent as unreachable (the server answers `UNREACHABLE`) |
+| A build without `--features voice` | calls are not advertised; a `calls` section only prints a warning at start (`voice_unavailable`) |
+
+One call at a time. The owner ends it by hanging up; stopping the bridge hangs it up. The
+agent cannot call its owner yet ([not yet](#not-yet)).
+
+### Build with voice
+
+```powershell
+cargo build --release -p push-bridge --features voice
+```
+
+The feature `voice` brings push-sdk's [media helper](calls.md#19-media-helper) (feature
+`calls-media`: ICE, DTLS-SRTP and Opus natively), which needs **Rust 1.89** and **CMake**
+with the MSVC build tools; the bridge without it keeps Rust 1.85. Everything else of the
+pipeline (speech providers, detector, spoken text, voice answers) builds and is tested
+without the feature.
+
+`push-agent-bridge status` prints a `Voice:` line with provider names only:
+
+| `Voice:` | Meaning |
+|---|---|
+| `off (no calls section)` | no `calls` in `config.json` |
+| `off (calls.stt is none)` | nobody listens: calls are not advertised |
+| `configured, but this build has no voice (build with --features voice)` | rebuild with the feature |
+| `on: stt <provider>, tts <provider>` | calls are answered; at start the log says `voice_enabled` with the two names |
+
+### The calls section
+
+The `calls` section of `config.json`. Unknown fields are refused here too; `calls` is
+validated (by `run`, `enroll` and `status`) whether or not the build has voice.
+
+| Field | Meaning | Default |
+|---|---|---|
+| `calls.answer` | `auto`: the owner's call is answered at once. `ask` is refused for now | `auto` |
+| `calls.language` | the language spoken, a BCP 47 tag; sent to the speech providers | `en-US` |
+| `calls.stt` | speech-to-text, required: `{"provider": "azure-speech", …}`, `{"provider": "local", …}` or `{"provider": "none"}` (calls are not advertised) | |
+| `calls.tts` | text-to-speech: the same three; `none` keeps every reply in the chat and the call silent (no greeting either) | `none` |
+| `calls.vad.silence_ms` | the silence that ends an utterance, 200 to 5000 | `700` |
+| `calls.vad.min_speech_ms` | the speech an utterance needs, 100 to 5000; shorter sounds (a cough, a click) are dropped | `300` |
+
+**`azure-speech`** ([Azure AI Speech](https://learn.microsoft.com/azure/ai-services/speech-service/),
+REST, no SDK):
+
+| Field | Meaning |
+|---|---|
+| `region` | the resource's region, such as `westeurope`: the regional endpoints `https://<region>.stt.speech.microsoft.com` and `https://<region>.tts.speech.microsoft.com`, with a key |
+| `endpoint` | instead of `region`: the resource's custom domain, `https://<name>.cognitiveservices.azure.com` (`/stt/…` and `/tts/…` below it), with a key or Entra |
+| `key_env` | the environment variable holding the key (sent as `Ocp-Apim-Subscription-Key`, read at each request, never in `config.json`); default `AZURE_SPEECH_KEY` |
+| `entra` | sign in with an Entra token instead of a key (needs `endpoint`): `resource_id` (the Speech resource's Azure resource ID; the token is then sent as `aad#<resource_id>#<token>`) and `token_command` (a program and its arguments, run without a shell, that prints an access token). Default command: `az account get-access-token --resource https://cognitiveservices.azure.com --query accessToken -o tsv` (`az.cmd` on Windows). A token is reused for 30 minutes; a 401 fetches a new one and tries once more |
+| `voice` | `calls.tts` only: the voice name | `en-US-JennyNeural` |
+
+```json
+"calls": {
+  "language": "en-US",
+  "stt": { "provider": "azure-speech", "region": "westeurope" },
+  "tts": { "provider": "azure-speech", "region": "westeurope", "voice": "en-US-JennyNeural" }
+}
+```
+
+With the key in the user's environment (`[Environment]::SetEnvironmentVariable("AZURE_SPEECH_KEY", "<key>", "User")`,
+then restart the bridge). With Entra, signed in with `az login` as a user who has the
+*Cognitive Services Speech User* (or *Cognitive Services User*) role on the resource:
+
+```json
+"calls": {
+  "stt": {
+    "provider": "azure-speech",
+    "endpoint": "https://my-speech.cognitiveservices.azure.com",
+    "entra": { "resource_id": "/subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.CognitiveServices/accounts/my-speech" }
+  },
+  "tts": {
+    "provider": "azure-speech",
+    "endpoint": "https://my-speech.cognitiveservices.azure.com",
+    "entra": { "resource_id": "/subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.CognitiveServices/accounts/my-speech" }
+  }
+}
+```
+
+Speech-to-text uses the REST API for short audio (`language`, `format=simple`; no match is
+an empty transcript); text-to-speech sends SSML with `language` and `voice` and asks for
+`raw-16khz-16bit-mono-pcm`.
+
+**`local`**: engines on this machine. Exactly one of `url` or `command`:
+
+| Field | Speech-to-text | Text-to-speech |
+|---|---|---|
+| `url` (`http://` or `https://`) | a whisper.cpp server's `/inference`: the WAV is POSTed as multipart form data (`file`, `response_format=json`, `temperature=0`, `language`) and `text` is the transcript | POSTs the text (`text/plain`) and reads a 16-bit PCM WAV back (any rate, mono or stereo) |
+| `command` (a program and its arguments, run without a shell) | `{wav}` in an argument (required) becomes a temporary WAV file of the utterance, `{language}` the language's primary subtag (`en`); stdout is the transcript | reads the text on stdin and writes raw 16-bit little-endian mono samples at `sample_rate` to stdout |
+| `sample_rate` | | required with `command`, 8000 to 48000; not allowed with `url` (the WAV header says) |
+
+Markers such as `[BLANK_AUDIO]`, `[Music]` or `(silence)` are removed from a transcript.
+Each request or command may take 30 s; a command that runs longer is killed. On Windows a
+program without an extension is looked up as an `.exe`: name a `.cmd` or `.bat` with its
+extension. Audio is converted to and from 16 kHz as needed.
+
+```json
+"calls": {
+  "language": "en-US",
+  "stt": { "provider": "local", "url": "http://127.0.0.1:8080/inference" },
+  "tts": { "provider": "local", "command": ["C:\\Tools\\piper\\piper.exe", "--model", "C:\\Tools\\piper\\en_US-lessac-medium.onnx", "--output_raw"], "sample_rate": 22050 }
+}
+```
+
+The server for that `url` is whisper.cpp's `whisper-server -m ggml-base.en.bin --host
+127.0.0.1 --port 8080`. Without a server, the command line tool loads its model for each
+utterance (slower to answer):
+
+```json
+"stt": { "provider": "local", "command": ["C:\\Tools\\whisper\\whisper-cli.exe", "-m", "C:\\Tools\\whisper\\ggml-base.en.bin", "-f", "{wav}", "-l", "{language}", "-nt", "-np"] }
+```
+
+(`-nt`: no timestamps, `-np`: no other output.) A TTS `url` suits any local server that
+answers text with a WAV.
+
+**`none`**: `{"provider": "none"}`, no other field.
+
+**Validation messages** (`status` prints them; `run` and `enroll` exit 1 with "invalid
+configuration: <message>"). `<at>` is `calls.stt` or `calls.tts`:
+
+| Message | Fix |
+|---|---|
+| `calls.answer "ask" is not supported yet: use "auto"` | use `auto` or leave it out |
+| `calls.language must be a language tag such as "en-US"` | a tag like `en-US`, `de-DE`, `en` |
+| `<at>: set exactly one of <at>.region or <at>.endpoint` | `azure-speech` needs one of them |
+| `<at>.region must be an Azure region such as "westeurope"` | lower-case letters and digits |
+| `<at>.endpoint must start with https://` | the custom domain's URL |
+| `<at>.entra: Entra sign-in needs <at>.endpoint, the resource's custom domain` | Entra works with `endpoint` only |
+| `<at>: set <at>.entra or <at>.key_env, not both` | choose one |
+| `<at>.entra.token_command must name a program` | a non-empty first item |
+| `<at>.key_env must be an environment variable's name` | letters, digits and `_`, not starting with a digit |
+| `calls.stt.voice is only for calls.tts` | remove `voice` from `stt` |
+| `calls.tts.voice must be a voice name such as "en-US-JennyNeural"` | letters, digits and `-` |
+| `<at>: set exactly one of <at>.url or <at>.command` | `local` needs one of them |
+| `<at>.url must start with http:// or https://` | |
+| `<at>.command must name a program` | a non-empty first item |
+| `calls.stt.command must pass the audio file as {wav} in an argument` | add `{wav}` to an argument |
+| `calls.tts.sample_rate is required with calls.tts.command` | the command's output rate (piper: the voice's, often 22050) |
+| `calls.tts.sample_rate must be 8000 to 48000` | |
+| `calls.tts.sample_rate is only for calls.tts.command: the WAV header says` | remove it with `url` |
+| `calls.vad.silence_ms must be 200 to 5000` | |
+| `calls.vad.min_speech_ms must be 100 to 5000` | |
+
+### The pipeline
+
+Call audio is 16 kHz mono in 20 ms frames (the [media helper](calls.md#194-audio)). Up to
+5 s of the owner's audio waits for the pipeline; when it falls further behind, newer frames
+are dropped.
+
+**Listening.** A voice activity detector cuts the owner's audio into utterances, by energy:
+
+- A frame's energy is its RMS in dBFS. The noise floor is the quietest frame of the last
+  1.5 s (75 frames), held between -70 and -30 dBFS. A frame is speech when it is more than
+  10 dB above the floor and above -55 dBFS, so a steady noise stops counting as speech
+  within 1.5 s.
+- Three speech frames in a row (60 ms) start an utterance, which keeps the 200 ms before
+  them.
+- It ends after `silence_ms` of frames that are not speech, keeping at most 200 ms after
+  the last speech frame. With less than `min_speech_ms` of speech it is dropped.
+- An utterance reaching 30 s is cut there and sent; the next speech starts a new one.
+
+**Transcribing.** The utterances go to the speech-to-text provider one at a time, in order.
+An empty transcript does nothing; a provider failure is logged (`stt_failed`) and the bridge
+says "Sorry, I couldn't make that out." Each transcript is then:
+
+1. posted to the owner's conversation as an
+   [`agent.transcript@1`](rich-messages.md#agenttranscript1) card (`speaker: owner`, the
+   text masked and cut at 4,000 characters; fallback "🎤 voice: <text>"; heading "🎤
+   voice"), and kept in the [chat peek](#chat-peek) as the owner's text "🎤 <text>";
+2. with a card open, an answer to the oldest one ([voice answers](#voice-answers-to-cards)),
+   but only when the utterance began (its onset) after that card was posted: words begun
+   before the card existed were not meant for it ("yes, go ahead" said as a steer never
+   approves a permission card that opened while it was transcribed);
+3. otherwise sent to the agent as typed text is ([the owner's text](#6-behaviour), steps
+   3 and 4): a prompt when the agent is idle, a steer while a turn runs (or waiting for it
+   to end), held while Coda is paused. A transcript is **never a `/` command**, whatever it
+   says.
+
+**Speaking.** The agent's replies are still posted as usual; with a `tts` provider they are
+also spoken, sentence by sentence as the text streams in, without waiting for the turn to
+end. The Markdown becomes plain sentences:
+
+| In the reply | Said |
+|---|---|
+| a fenced code block (```` ``` ```` or `~~~`) | "I've put the code in the chat." |
+| a table (a line starting with `\|`, or a header row followed by `--- \| ---`) | "I've put a table in the chat." (the same note is not said twice in a row) |
+| a heading, a list item (also a task list item) | a sentence of its own, ending with a period if it has none |
+| a link, an image | its text |
+| a bare URL, an autolink | "a link" |
+| a code span | its content (a stray backtick is not said) |
+| emphasis, strikethrough, quote markers, rules, HTML tags, backslash escapes | removed (`snake_case` and `2*3` stay) |
+
+Sentences end after `.`, `!`, `?` or `…` and a space, but not after abbreviations such as
+"e.g.", "i.e.", "etc.", "Dr."; a sentence over 300 characters is cut at a comma or space.
+Background messages (`notify_user`) are spoken too: "<label>." then their text. What is
+spoken is [masked](#9-security-model) like what is posted, before it reaches the text-to-speech
+provider: each complete line (and a background message's label) is masked before it is
+read, so a secret is never split across sentences and code spans are masked too; a
+masked secret is said as "hidden" ("api_key=hidden"). The sentences are synthesized one by one and played in real time; a sentence the provider
+fails on is skipped (`tts_failed`).
+
+**Barge-in.** When the owner starts speaking (an utterance's 60 ms onset) while the agent's
+voice is queued or playing, the agent stops at once: the sentences waiting and the audio
+already queued are dropped, and the rest of that reply is not spoken. The turn itself goes
+on. When the owner's utterance ends it is transcribed and steered into the running turn
+(or prompts, if the turn ended); from then on the reply is spoken again, from its next
+sentence (the rest of the line that was arriving is skipped too). A code block or table
+that was open stays one: its remaining lines stay silent and what follows its end is
+spoken. Speech while the agent is silent is simply an utterance and changes nothing in how
+the reply is spoken (a code block streaming silently stays silent).
+
+**Activity** during a call, when no card is open and Coda is not paused (cards and a pause
+keep their labels, [activity](#6-behaviour)):
+
+| State | Label | When |
+|---|---|---|
+| `working` | `speaking` | the agent's voice plays |
+| `working` | `listening` | the owner speaks |
+| `working` | `thinking` | a turn runs |
+| `working` | `on a call` | otherwise |
+
+### Voice answers to cards
+
+When a card opens during a call (and it is the only open one), the reply so far is spoken,
+then its question; at the greeting and after each voice answer, the oldest open card's
+question is spoken. A spoken transcript answers the **oldest** open card, if the utterance
+began after that card was posted; an utterance begun earlier goes to the agent (a prompt
+or steer) and the card stays open, its question spoken as usual.
+
+| Card | Said |
+|---|---|
+| permission (`agent.approval@1`) | "Coda wants to use <tool>. Approve or reject?" |
+| `/mode bypass`, `/yolo` | "Turn off approvals until you start a new session? Approve or reject?" |
+| plan (`agent.plan-approval@1`) | "The plan is in the chat. Approve or reject?" |
+| question, 1 to 10 options | "<question> Option one: <label>. Option two: <label>." then "Or say your own answer." when free text is allowed and "You can pick several." for a multi-select (the question at most 500 characters, masked) |
+| question, no options | "<question>" |
+| question, more than 10 options | "<question> The options are in the chat." |
+
+What is heard: words are compared whole, in lower case, without punctuation; leading "um",
+"uh", "er", "erm", "hmm", "hm" are ignored.
+
+- **Approvals** (permission, bypass, plan) need exactly one of approve ("approve",
+  "approved", "yes", "yeah", "yep", "yup", "sure", "ok", "okay", "allow", "accept",
+  "accepted", "confirm", "go ahead", "do it", "sounds good") or reject ("reject",
+  "rejected", "no", "nope", "deny", "denied", "decline", "declined", "cancel", "stop",
+  "don't", "do not", "not now", "never"). A negation ("not", "never", "cannot", "nor",
+  "n't") never approves: "I can't approve that" is asked again. A question (starting with
+  "is", "are", "can", "could", "should", "would", "will", "do", "does", "what", "why",
+  "how", "which", "who", other than "do it" or "do not") is asked again. Unclear: "Sorry,
+  I didn't catch that. Say approve or reject."
+- **Questions** take options by number ("option two", "number 2", "choice three", "the
+  second one", "second option", "2nd", a bare "two") or by their label as whole words. A
+  multi-select takes all it hears; a single choice that hears several asks "Sorry, which
+  one? Say the option's number." Nothing heard: the transcript is the answer when the card
+  allows free text (or has no options), else "Sorry, which option? Say its number, like
+  option one." A transcript with no words at all on a free-text question: "Sorry, I didn't
+  catch that. Say your answer again."
+
+Asked again, the card stays open. Answered, the bridge settles the request as a typed
+answer does (the agent gets the same answer the card's buttons would give), edits the card
+into a closed `agent.reply@1` titled with the card's title and saying "🎤 Answered by
+voice: <label>." (Approve, Reject, the chosen labels joined with ", ", or the free text;
+masked, at most 200 characters), and says "Approved.", "Rejected." or "Got it: <label>.",
+then the next open card's question. A question shown as text only (no options or more than
+10) has no card to edit.
+
+The card is **edited, not answered**: the bridge sent it, and the server refuses the
+sender's own answer (and tpl/1's ANSWER format has no place to say "by voice"). An
+unanswered card may be edited by its sender; the new body has no buttons, so the server
+refuses answers from the app to it afterwards. The owner can still answer on screen or
+type an answer during a call, as without one.
+
+### Privacy: what each provider receives
+
+The call's audio travels end to end encrypted (DTLS-SRTP) between the owner's app and the
+bridge; the server only relays the signalling ([calls privacy](calls.md#9-privacy)). From
+there:
+
+| Provider | Receives | Where it goes |
+|---|---|---|
+| `azure-speech` STT | each utterance's audio, a WAV (16 kHz, mono, 16-bit) | Azure AI Speech in the configured region or resource: it leaves the machine, and Microsoft's data handling for the Speech service applies |
+| `azure-speech` TTS | the text of each sentence spoken (the agent's reply, the bridge's own sentences such as card questions) | the same |
+| `local` STT, `url` | each utterance's WAV | the configured URL: it stays on the machine when the URL is local |
+| `local` STT, `command` | each utterance's WAV in a temporary file in the user's temp folder (only the user can read it), deleted after the utterance, also on failure | the command |
+| `local` TTS | each sentence's text, on stdin or in the request | the command or the URL |
+| `none` | nothing | |
+
+- The bridge persists nothing of a call: no audio, no transcripts beyond the
+  `agent.transcript@1` messages it posts (masked, and stored on the server like every
+  message: [security](#9-security-model)).
+- Logs are content-free: names, codes, counts and durations, never audio, transcripts or
+  spoken text. Events: `voice_enabled` (provider names), `voice_unavailable`,
+  `call_answering`, `call_answered` (`buffered`), `call_connected`, `call_refused`
+  (`reason`: `stranger`, `voice_off`, `busy`), `call_answer_failed` (`code`),
+  `voice_utterance` (`ms`), `voice_transcript` (`chars`), `voice_sentence` (`ms`),
+  `voice_barge_in`, `stt_failed` and `tts_failed` (`provider`, `code`),
+  `card_answered_by_voice` (`values`), `voice_call_ended` and `call_ended` (`reason`,
+  `duration_s`), `call_hung_up` (the bridge stopped); at `debug`, `call_ignored`,
+  `call_event_ignored`, `call_decline_failed` and `call_answer_dropped`.
+- Provider error codes are content-free too: `no_key`, `bad_credential`, `token_<code>`,
+  `no_token`, `http_<status>`, `timeout`, `connect_failed`, `request_failed`,
+  `bad_response`, `bad_audio`, `spawn_failed`, `exit_<code>`, `io`, or Azure's
+  recognition status.
+- Keys only come from environment variables; Entra tokens stay in memory (30 minutes).
+  `status` shows provider names, never their settings.
+
+### Testing
+
+- **Fakes.** Speech is tones: `voice::fake::FakeStt` hears a word per frequency (the
+  strongest tone of an utterance, by Goertzel), and `FakeTts` speaks a 600 Hz tone, 60 ms
+  per word (200 ms to 3 s), logging the texts. Both survive real Opus media.
+- **Fixtures** (`crates/push-bridge/tests/fixtures/voice/*.json`, see its README): the
+  owner's side as `words` (`{hz, text}`) and a `script` of `say` (`hz`, `ms`) and
+  `silence` (`ms`) steps at amplitude 8000. Frequencies lie between 350 and 2400 Hz, at
+  least 200 Hz apart across fixtures, and never within 150 Hz of 600 Hz (the agent's voice
+  must not be heard as the owner's words); each `say` is followed by at least 1 s of
+  silence. Fixtures: `prompt`, `barge_in`, `approve`, `option_two`, `ambiguous`.
+- **Unit and core tests** (`cargo test -p push-bridge`, no feature needed): the detector,
+  spoken text, voice answers, WAV and the providers against local test servers and
+  commands; the core with a `FakePhone`, `TestBackend` and `TestMessenger` in paused time
+  (`src/core/voice_tests.rs`): greeting, declines, spoken replies, barge-in, voice
+  answers, activity, masking and the peek. `tests/bridge.rs` runs a call through the
+  public API. CI's `calls-media-windows` job also runs the `voice::` tests with the feature
+  on Windows.
+- **End to end** (`crates/push-smoke/tests/bridge_voice.rs`, CI job `bridge-voice`): the
+  whole stack in one process, the owner calling with push-sdk's `MediaCall`, the bridge
+  enrolled with a software key and running with `SdkMessenger`, `MediaPhone`, a scripted
+  backend and the fakes, over real media: greeting, a prompt, a spoken reply, barge-in, a
+  voice approval, a stranger refused, the hang-up. Locally, with Docker:
+
+  ```powershell
+  $env:PUSH_BRIDGE_VOICE = "1"
+  cargo test -p push-smoke --test bridge_voice -- --nocapture --test-threads 1
+  ```
+
+- **Real providers**: the opt-in [live speech test](#12-live-smoke-test-opt-in).
+
+### Not yet
+
+Coming with the answering and calling policies (spec §10.4): `calls.answer: "ask"`
+(confirm on another device before answering), the agent calling its owner
+(`calls.notify_by_call`, after an unanswered card or for urgent news, with do-not-disturb
+hours and a rate limit), and the tray's call state with Mute and Hang up.

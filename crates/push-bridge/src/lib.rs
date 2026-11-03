@@ -19,6 +19,7 @@ pub mod peek;
 pub mod render;
 pub mod state;
 pub mod test_backend;
+pub mod voice;
 
 #[cfg(test)]
 pub(crate) mod test_dir;

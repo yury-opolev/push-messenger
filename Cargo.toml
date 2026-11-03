@@ -53,6 +53,7 @@ protoc-bin-vendored = "3"
 pulldown-cmark = { version = "0.13.5", default-features = false }
 push-agent-key = { path = "crates/push-agent-key" }
 push-auth-core = { path = "crates/push-auth-core" }
+push-bridge = { path = "crates/push-bridge" }
 push-bridge-control = { path = "crates/push-bridge-control" }
 push-credentials = { path = "crates/push-credentials" }
 push-domain = { path = "crates/push-domain" }

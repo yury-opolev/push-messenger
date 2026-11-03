@@ -38,7 +38,8 @@ and the spec differ, this guide describes what the code does.
 | push-load `calls` scenario: concurrent calls and setup latency ([§15.3](#153-load)) | available in this release |
 | push-sdk calls API ([§18](#18-push-sdk)) | available in this release (Rust; the C and Node bindings follow) |
 | push-sdk media helper `MediaCall` (feature `calls-media`: a native WebRTC audio peer, PCM in and out; [§19](#19-media-helper)) | available in this release (Rust) |
-| Agents in calls (push-agent-bridge voice) | coming |
+| Agents in calls: push-agent-bridge answers its owner's calls (phase 2's bridge voice pipeline, PR 7: speech-to-text, spoken replies, barge-in, voice answers to cards; [agent bridge §18](agent-bridge.md#18-voice-calls)) | available in this release (build with `--features voice`) |
+| Agents' answering and calling policies (`calls.answer: "ask"`, the agent calling its owner) | coming |
 
 This guide is meant to be enough to build a client without reading the server code. In
 short, a browser client:
@@ -1262,6 +1263,8 @@ the app plain PCM: **16 kHz, mono, signed 16-bit, 20 ms frames** (320 samples).
 push-sdk = { …, features = ["calls-media"] }
 ```
 
+push-agent-bridge uses it to take its owner's calls: [agent bridge §18](agent-bridge.md#18-voice-calls).
+
 ### 19.1 Requirements
 
 | | |
@@ -1349,7 +1352,9 @@ Between 48 kHz and 16 kHz the helper resamples by 3 with a 96-tap windowed-sinc
 (Blackman) low-pass FIR cut off at 7.2 kHz, as a polyphase decimator and interpolator
 (flat to about 5.5 kHz; images and aliases from above 8.6 kHz below -50 dB, the band
 just above 8 kHz folds back less attenuated). Incoming packets of any Opus frame size are decoded and
-cut into 20 ms frames. There is no jitter buffer, packet-loss concealment or echo
+cut into 20 ms frames. Outgoing frames go out on a 20 ms clock that catches up late ticks
+(after a stall over 100 ms it starts again instead), so a coarse timer (Windows' ~15.6 ms)
+still sends 50 frames a second. There is no jitter buffer, packet-loss concealment or echo
 cancellation: a speech recogniser or an agent's voice needs none of them; an app that
 plays audio to a person adds its own buffer.
 
@@ -1385,7 +1390,9 @@ both calls end `COMPLETED` (the callee's with a duration) and both PCM streams c
 | `media_helpers_talk_through_coturn_over_tcp` | the same | relay-only, TURN over TCP |
 
 CI runs them in the `calls-media` job; `calls-media-windows` builds the feature on
-Windows and runs its unit tests there. Locally (Docker running):
+Windows and runs its unit tests there, and the bridge's voice tests with it. The
+`bridge-voice` job runs push-agent-bridge answering its owner's call through the helper
+([agent bridge §18](agent-bridge.md#testing)). Locally (Docker running):
 
 ```
 PUSH_CALLS_MEDIA=1 cargo test -p push-smoke --test calls_media -- --nocapture

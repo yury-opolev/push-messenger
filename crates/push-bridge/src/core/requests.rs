@@ -79,10 +79,18 @@ impl<M: Messenger> Core<M> {
             responder,
             card,
             deadline: Instant::now() + CARD_TIMEOUT,
+            opened: Instant::now(),
             waiting_label: plan.waiting_label,
+            title: plan.title,
+            spoken: plan.spoken,
         });
         if let Some(request) = self.open.last() {
             self.request_opened(&request.kind);
+        }
+        // A call hears the oldest open card only: a voice answer goes to it.
+        if let [request] = self.open.as_slice() {
+            let spoken = request.spoken.clone();
+            self.speak_card(&spoken);
         }
         self.update_activity(false).await;
     }

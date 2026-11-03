@@ -12,6 +12,11 @@ repository.workspace = true
 name = "push-agent-bridge"
 path = "src/main.rs"
 
+[features]
+# Voice calls with the owner: the media helper (push-sdk `calls-media`: str0m, Opus; Rust 1.89 and CMake).
+# Without it the bridge does not advertise calls. Release builds: `cargo build --release -p push-bridge --features voice`.
+voice = ["push-sdk/calls-media"]
+
 [dependencies]
 async-trait.workspace = true
 push-agent-key.workspace = true
@@ -19,6 +24,7 @@ push-bridge-control.workspace = true
 push-domain.workspace = true
 push-sdk.workspace = true
 regex.workspace = true
+reqwest = { workspace = true, features = ["rustls-tls"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -41,4 +47,4 @@ all = { level = "warn", priority = -1 }
 undocumented_unsafe_blocks = "warn"
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
+tokio = { workspace = true, features = ["macros", "net", "rt", "test-util"] }

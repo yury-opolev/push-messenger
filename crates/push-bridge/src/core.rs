@@ -8,9 +8,12 @@ mod report;
 mod requests;
 mod turns;
 mod upgrade;
+mod voice;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod voice_tests;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
@@ -20,7 +23,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use push_bridge_control::{AgentInfo, BridgeState, CardState, PeekKind};
 use push_sdk::{
-    ActivityState, CardBook, ClientMsgId, ConnectionState, ConversationId, Event, SdkError, UserId,
+    ActivityState, CallEvent, CallId, CardBook, ClientMsgId, ConnectionState, ConversationId,
+    Event, SdkError, UserId,
 };
 use tokio::sync::mpsc;
 use tokio::time::{Instant, MissedTickBehavior};
@@ -35,6 +39,9 @@ use crate::control::{Calls, ControlCall, ControlHandle};
 use crate::messenger::Messenger;
 use crate::render::{TurnRenderer, reply_bodies};
 use crate::state::{State, StateFile};
+use crate::voice::VoiceSetup;
+use crate::voice::phone::Line;
+use crate::voice::session::SessionEvent;
 
 /// How often the core polls the reply, the cards' deadlines and the activity.
 const TICK: Duration = Duration::from_millis(500);
@@ -105,6 +112,8 @@ pub struct Bridge<M: Messenger> {
     calls: Calls,
     /// Keeps a bridge without a control channel's actions channel open.
     _calls: Option<mpsc::Sender<ControlCall>>,
+    /// Takes the owner's calls; `None` ignores call events.
+    voice: Option<VoiceSetup>,
 }
 
 impl<M: Messenger> Bridge<M> {
@@ -127,6 +136,15 @@ impl<M: Messenger> Bridge<M> {
             control: ControlHandle::detached(),
             calls: Arc::new(tokio::sync::Mutex::new(receiver)),
             _calls: Some(sender),
+            voice: None,
+        }
+    }
+
+    /// Takes the owner's calls with `voice` (see [`crate::voice`]).
+    pub fn with_voice(self, voice: VoiceSetup) -> Self {
+        Self {
+            voice: Some(voice),
+            ..self
         }
     }
 
@@ -154,6 +172,7 @@ impl<M: Messenger> Bridge<M> {
             control,
             calls,
             _calls,
+            voice,
         } = self;
         let mut calls = calls.lock().await;
         let owner = messenger.owner().await.map_err(BridgeError::Messenger)?;
@@ -180,6 +199,7 @@ impl<M: Messenger> Bridge<M> {
             conversation,
         );
         core.control = control;
+        core.voice = voice;
         tracing::info!(event = "bridge_started", backend = core.name.as_str());
         core.boot().await;
         core.publish();
@@ -244,6 +264,16 @@ enum Internal {
         pause: u64,
         result: Result<Prepared, BackendError>,
     },
+    /// The phone answered (or failed to answer) the owner's call.
+    Answered {
+        call_id: CallId,
+        result: Result<Line, SdkError>,
+    },
+    /// The pipeline of call `call_id` reported `event`.
+    Voice {
+        call_id: CallId,
+        event: SessionEvent,
+    },
 }
 
 /// The running turn's reply.
@@ -261,7 +291,13 @@ struct OpenRequest {
     /// The card; `None` for a question shown as text only.
     card: Option<ClientMsgId>,
     deadline: Instant,
+    /// When the card was posted: only an utterance begun after it answers it.
+    opened: Instant,
     waiting_label: &'static str,
+    /// The card's title as shown (a voice answer keeps it).
+    title: String,
+    /// What a call says about the request.
+    spoken: String,
 }
 
 /// Unix ms that follow tokio's clock (paused in tests).
@@ -353,6 +389,13 @@ struct Core<M: Messenger> {
     /// A start after a pause failed: the next successful start says how the backend
     /// came back and asks to confirm approvals again.
     pending_resume: Option<upgrade::ResumeCarry>,
+
+    /// Takes the owner's calls (see [`voice`]); `None` ignores call events.
+    voice: Option<VoiceSetup>,
+    /// The call running.
+    call: Option<voice::ActiveCall>,
+    /// The call being answered, with its call events that came meanwhile.
+    answering: Option<(CallId, Vec<CallEvent>)>,
 }
 
 impl<M: Messenger> Core<M> {
@@ -408,6 +451,9 @@ impl<M: Messenger> Core<M> {
             pauses: 0,
             restore_next: false,
             pending_resume: None,
+            voice: None,
+            call: None,
+            answering: None,
         }
     }
 
@@ -485,7 +531,8 @@ impl<M: Messenger> Core<M> {
         }
     }
 
-    /// Waiting while a card is open, working while paused or a turn runs, else idle.
+    /// Waiting while a card is open, working while paused, a call runs or a turn runs,
+    /// else idle.
     fn wanted_activity(&self) -> (ActivityState, Option<String>) {
         if let Some(request) = self.open.first() {
             (
@@ -494,6 +541,8 @@ impl<M: Messenger> Core<M> {
             )
         } else if self.pause.is_some() {
             (ActivityState::Working, Some(self.pause_label()))
+        } else if let Some(label) = self.call_label() {
+            (ActivityState::Working, Some(label.to_owned()))
         } else if let Some(turn) = &self.turn {
             (ActivityState::Working, Some(turn.renderer.current_label()))
         } else {
@@ -520,6 +569,8 @@ impl<M: Messenger> Core<M> {
                 self.release_when_idle().await;
             }
             Internal::Prepared { pause, result } => self.prepared(pause, result).await,
+            Internal::Answered { call_id, result } => self.answered(call_id, result).await,
+            Internal::Voice { call_id, event } => self.on_voice(call_id, event).await,
         }
     }
 
@@ -534,6 +585,7 @@ impl<M: Messenger> Core<M> {
     /// once), the activity and the backend.
     async fn close(&mut self) {
         self.stopping = true;
+        self.end_call_at_close();
         self.end_pause_at_close();
         self.publish();
         if let Some(mut turn) = self.turn.take() {

@@ -21,6 +21,8 @@ const LONG_TEXT: usize = 4_000;
 const QUESTION: usize = 1_000;
 /// Characters of an option label (push-domain's limit for options in a body).
 const OPTION_LABEL: usize = 80;
+/// Characters of a question said in a call.
+const SPOKEN_QUESTION: usize = 500;
 /// Options a card offers; more are shown as text.
 const MAX_OPTIONS: usize = 10;
 const APPROVE: &str = "approve";
@@ -78,22 +80,23 @@ pub struct CardPlan {
     pub kind: CardKind,
     /// The activity label while the card is open.
     pub waiting_label: &'static str,
+    /// The card's title as shown.
+    pub title: String,
+    /// What the bridge says when the card opens during a call.
+    pub spoken: String,
 }
 
 /// `agent.approval@1` asking to use `tool` in `folder`, with the masked preview.
 pub fn permission_card(backend: &str, tool: &str, preview: &str, folder: &Path) -> CardPlan {
     let title = shown_line(&format!("Allow {tool}?"), TITLE);
-    let details = format!(
-        "{backend} wants to use {tool} in {}.",
-        folder.display(),
-        tool = shown_line(tool, TITLE),
-    );
+    let tool = shown_line(tool, TITLE);
+    let details = format!("{backend} wants to use {tool} in {}.", folder.display());
     approval(
         title,
         &details,
         Some(preview),
         CardKind::Permission,
-        "approval needed",
+        format!("{backend} wants to use {tool}. Approve or reject?"),
     )
 }
 
@@ -107,7 +110,7 @@ pub fn bypass_card(backend: &str) -> CardPlan {
         &details,
         None,
         CardKind::Bypass,
-        "approval needed",
+        "Turn off approvals until you start a new session? Approve or reject?".to_owned(),
     )
 }
 
@@ -116,7 +119,7 @@ fn approval(
     details: &str,
     preview: Option<&str>,
     kind: CardKind,
-    waiting_label: &'static str,
+    spoken: String,
 ) -> CardPlan {
     let mut params = Map::new();
     params.insert("title".into(), json!(title));
@@ -134,7 +137,9 @@ fn approval(
         offered: vec![APPROVE.to_owned(), REJECT.to_owned()],
         max_values: 1,
         kind,
-        waiting_label,
+        waiting_label: "approval needed",
+        title,
+        spoken,
     }
 }
 
@@ -146,7 +151,13 @@ pub fn question_card(question: &str, options: &[String], multi: bool, free_text:
         multi,
         free_text,
     };
+    let said = shown_line(question, SPOKEN_QUESTION);
     if options.is_empty() || options.len() > MAX_OPTIONS {
+        let spoken = if options.is_empty() {
+            said
+        } else {
+            format!("{said} The options are in the chat.")
+        };
         return CardPlan {
             card: None,
             follow_ups: text_question(question, options, multi, free_text),
@@ -154,7 +165,21 @@ pub fn question_card(question: &str, options: &[String], multi: bool, free_text:
             max_values: 0,
             kind,
             waiting_label: "question",
+            title: "Question".to_owned(),
+            spoken,
         };
+    }
+    let mut spoken = said;
+    for (i, label) in options.iter().enumerate() {
+        let label = shown_line(label, OPTION_LABEL);
+        let label = label.trim().trim_end_matches('.');
+        spoken.push_str(&format!(" Option {}: {label}.", NUMBER_WORDS[i]));
+    }
+    if free_text {
+        spoken.push_str(" Or say your own answer.");
+    }
+    if multi {
+        spoken.push_str(" You can pick several.");
     }
     let shown_question = non_empty(shown(question, QUESTION));
     let items: Vec<_> = options
@@ -177,6 +202,8 @@ pub fn question_card(question: &str, options: &[String], multi: bool, free_text:
         max_values: if multi { options.len() } else { 1 },
         kind,
         waiting_label: "question",
+        title: shown_line(question, TITLE),
+        spoken: spoken.trim().to_owned(),
     }
 }
 
@@ -240,6 +267,8 @@ pub fn plan_card(plan: &str) -> CardPlan {
         max_values: 1,
         kind: CardKind::Plan,
         waiting_label: "plan approval",
+        title: "Approve the plan?".to_owned(),
+        spoken: "The plan is in the chat. Approve or reject?".to_owned(),
     }
 }
 
@@ -325,7 +354,13 @@ pub fn timeout_answer(kind: &CardKind) -> Option<Answer> {
     }
 }
 
-fn option_id(index: usize) -> String {
+/// Numbers one to ten as words, as options are said and heard.
+pub(crate) const NUMBER_WORDS: [&str; MAX_OPTIONS] = [
+    "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+];
+
+/// The value of the option at `index`: `o1`, `o2`, ….
+pub(crate) fn option_id(index: usize) -> String {
     format!("o{}", index + 1)
 }
 
@@ -418,6 +453,8 @@ mod tests {
         );
         assert_eq!(plan.kind, CardKind::Permission);
         assert!(plan.follow_ups.is_empty());
+        assert_eq!(plan.title, "Allow bash?");
+        assert_eq!(plan.spoken, "Coda wants to use bash. Approve or reject?");
     }
 
     #[test]
@@ -443,6 +480,11 @@ mod tests {
         assert!(param(&body, "details").unwrap().contains("until /new"));
         assert_eq!(plan.offered, offered(card, "agent.approval@1"));
         assert_eq!(plan.kind, CardKind::Bypass);
+        assert_eq!(plan.title, "Turn off approvals?");
+        assert_eq!(
+            plan.spoken,
+            "Turn off approvals until you start a new session? Approve or reject?"
+        );
     }
 
     #[test]
@@ -454,6 +496,13 @@ mod tests {
         assert_eq!(plan.offered, ["o1", "o2"]);
         assert_eq!(plan.offered, offered(card, "agent.question@1"));
         assert_eq!((plan.max_values, plan.waiting_label), (1, "question"));
+        assert_eq!(plan.title, "Which region?");
+        assert_eq!(plan.spoken, "Which region? Option one: EU. Option two: US.");
+        let free = question_card("Which region?", &strings(&["EU"]), false, true);
+        assert_eq!(
+            free.spoken,
+            "Which region? Option one: EU. Or say your own answer."
+        );
     }
 
     #[test]
@@ -465,6 +514,14 @@ mod tests {
         assert_eq!(plan.offered, offered(card, "agent.choose@1"));
         assert_eq!(plan.offered.last().map(String::as_str), Some("o10"));
         assert_eq!(plan.max_values, 10);
+        assert!(
+            plan.spoken
+                .starts_with("Which checks? Option one: Check 1. ")
+        );
+        assert!(
+            plan.spoken
+                .ends_with("Option ten: Check 10. You can pick several.")
+        );
     }
 
     #[test]
@@ -485,6 +542,11 @@ mod tests {
         assert_eq!(labels[0], "token=«masked»");
         assert_eq!(labels[1].chars().count(), OPTION_LABEL);
         assert_eq!(labels[2], "…");
+        assert!(plan.spoken.contains("Option one: token=«masked»."));
+        assert!(!plan.spoken.contains("s3cr3t"));
+        let secret = question_card("Use password=hunter2?", &options, false, false);
+        assert!(!secret.spoken.contains("hunter2"));
+        assert!(!secret.title.contains("hunter2"));
     }
 
     #[test]
@@ -506,6 +568,13 @@ mod tests {
                 .unwrap()
                 .ends_with("separated by commas.")
         );
+        assert_eq!(plan.title, "Question");
+        assert_eq!(plan.spoken, "Which one? The options are in the chat.");
+        let open = question_card("What name?\nAny.", &[], false, true);
+        assert_eq!(
+            (open.title.as_str(), open.spoken.as_str()),
+            ("Question", "What name? Any.")
+        );
     }
 
     #[test]
@@ -521,6 +590,8 @@ mod tests {
         assert_eq!(plan.offered, offered(card, "agent.plan-approval@1"));
         assert!(plan.follow_ups.is_empty());
         assert_eq!(plan.waiting_label, "plan approval");
+        assert_eq!(plan.title, "Approve the plan?");
+        assert_eq!(plan.spoken, "The plan is in the chat. Approve or reject?");
     }
 
     #[test]

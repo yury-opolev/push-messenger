@@ -746,6 +746,97 @@ card"; "a stranger's call is refused"; fake STT/TTS.
   (`PUSH_BRIDGE_LIVE_SPEECH=1`).
 - **Task 7.5** docs/agent-bridge.md voice section incl. what each provider receives.
 
+## PR 7 refined (at implementation time)
+
+Decisions taken on 2026-11-03 before coding:
+
+- **Build.** push-bridge gets an optional feature `voice = ["push-sdk/calls-media"]`
+  (Rust 1.89, CMake). Only the media adapter (`voice/media.rs`, `MediaPhone`) and its
+  wiring in `main.rs` need it: the pipeline, providers, VAD, confirmations and the core
+  integration always compile (Rust 1.85) and are tested by `cargo test -p push-bridge`
+  through a `FakePhone`. The `msrv` job builds default features, so it never compiles
+  the feature; push-smoke enables it as a **dev-dependency** for the E2E test (as PR 6
+  did for `calls-media`). The release build of the bridge is `cargo build --release -p
+  push-bridge --features voice`; without the feature the client does not advertise calls
+  (the owner's app sees the agent as unreachable).
+- **Answering in PR 7.** `calls.answer` accepts only `"auto"` (a call from the owner is
+  answered; `"ask"` is refused by validation until PR 8). Anyone else's call is declined
+  (the server refuses them first, `NOT_CONTACT`; the bridge declines as defence in depth),
+  as is a second call while one runs (busy) and every call when `calls` is absent or
+  `calls.stt.provider` is `none`.
+- **Transcripts** are the new built-in `agent.transcript@1` (`speaker`: `owner`|`agent`,
+  `text`; literal heading "🎤 voice"): the template always means a voice transcript, so
+  D22's `voice: true` is implied rather than a param (tpl/1 requires every param to be
+  shown). Masked like everything the bridge sends; in the peek as an owner text "🎤 …".
+- **Voice answers to cards.** The bridge cannot answer its own card (the server refuses
+  it), so a voice answer settles the request locally (as a typed answer does) and
+  **edits the card** into a closed `agent.reply@1` "<card title>" / "🎤 Answered by
+  voice: <label>." (an unanswered card may be edited by its sender; the new template has
+  no interactive block, so the server refuses later answers to it). This replaces the
+  spec's `via: "voice"` on an ANSWER body, which tpl/1's strict ANSWER format does not
+  allow.
+- **Providers** (no new crates: reqwest with rustls is already in the graph):
+  `azure-speech` REST (STT short-audio `…/speech/recognition/conversation/cognitiveservices/v1`,
+  TTS `…/cognitiveservices/v1` with `raw-16khz-16bit-mono-pcm`), a key from an
+  environment variable (`key_env`, default `AZURE_SPEECH_KEY`, never in config.json) with
+  `region`, or an Entra token from a command (default `az account get-access-token
+  --resource https://cognitiveservices.azure.com --query accessToken -o tsv`, cached 30
+  min) with the resource's custom-domain `endpoint` (and `resource_id` → `Bearer
+  aad#<id>#<token>`); `local` STT: a whisper.cpp server `url` (`/inference`, multipart
+  built by hand) or a `command` with `{wav}` (stdout is the transcript); `local` TTS: a
+  `command` (text on stdin, raw s16le mono at `sample_rate` on stdout, as `piper
+  --output_raw`) or a `url` (POST text, WAV back); `none`.
+- **VAD** in-house: 20 ms frames, energy (dBFS) over an adaptive noise floor (+10 dB,
+  above -55 dBFS), onset after 3 speech frames (60 ms) with 200 ms pre-roll; an utterance
+  ends after `silence_ms` (700) of non-speech, is kept when it has `min_speech_ms` (300)
+  of speech, and is cut at 30 s. Onset during TTS is the barge-in (sink `clear()`).
+- **Speech text**: incremental, line-based Markdown stripping (fences → "I've put the
+  code in the chat.", tables → "I've put a table in the chat.", headings/lists/quotes
+  unmarked, emphasis and code spans unwrapped, links → their text, bare URLs → "a link"),
+  split into sentences (max 300 characters) and spoken as they complete during a turn.
+  After a barge-in the rest of the reply is not spoken; text after the owner's steer is.
+- **Activity during a call** (no card open, not paused): working "speaking" > "listening"
+  > "thinking" (a turn runs) > "on a call".
+- **Tests**: fake STT recognises tone bursts by frequency (Goertzel) from a fixture
+  table; fake TTS speaks a tone whose length follows the text and logs the texts. Fixtures
+  in `crates/push-bridge/tests/fixtures/voice/*.json` (barge-in, approve, option two,
+  ambiguous). Core tests through `FakePhone`; E2E `crates/push-smoke/tests/bridge_voice.rs`
+  (`PUSH_BRIDGE_VOICE=1`, CI job `bridge-voice`): stack with calls and `agent-key`, the
+  owner creates an agent, the bridge enrolls with a software key and runs with
+  `SdkMessenger`, `TestBackend` and `MediaPhone`; the owner calls with `MediaCall`.
+  Live smoke `crates/push-bridge/tests/live_speech.rs` (`PUSH_BRIDGE_LIVE_SPEECH=1` +
+  provider variables), not in CI.
+
+File map (`crates/push-bridge/src/voice/`):
+
+| File | Responsibility |
+|---|---|
+| `mod.rs` | `SAMPLE_RATE`, `FRAME`, `Frame`, `VoiceSetup`, re-exports |
+| `wav.rs` | WAV encode/decode, resampling, framing |
+| `vad.rs` | `Vad`, `VadConfig`, `VadEvent` |
+| `speech.rs` | `SpeechText` (Markdown → spoken sentences, incremental) |
+| `confirm.rs` | `match_answer` (voice → card answer), `again` prompts |
+| `provider.rs` | `Stt`, `Tts`, `SpeechError`, `build` from config |
+| `azure.rs`, `local.rs`, `fake.rs` | providers |
+| `phone.rs` | `Phone`, `Line`, `Speaker`, `LineControl`, `LineEnded`, `FakePhone` |
+| `session.rs` | per-call pipeline task: VAD → STT, TTS queue → sink, barge-in |
+| `media.rs` (feature `voice`) | `MediaPhone` over `push_sdk::media::MediaCall` |
+
+Core: `core/voice.rs` (call events, session events, transcripts, voice answers, speech of
+replies and cards, activity labels); config `calls` section in `config.rs`.
+
+- [x] **7.1** `agent.transcript@1` + seeding counts + docs/rich-messages.md.
+- [x] **7.2** `wav.rs`, `vad.rs`, `speech.rs`, `confirm.rs` (+ `CardPlan::title`/`spoken`).
+- [x] **7.3** config `calls` + providers (`provider.rs`, `azure.rs`, `local.rs`, `fake.rs`).
+- [x] **7.4** `phone.rs`, `session.rs`, `media.rs`, feature `voice`.
+- [x] **7.5** `core/voice.rs` + core tests with fixtures.
+- [x] **7.6** `main.rs` wiring, push-smoke E2E, CI job, live smoke.
+- [x] **7.7** docs (agent-bridge.md voice, calls.md cross-ref, CHANGELOG, spec §15).
+
+PR 8 then adds: `calls.answer: "ask"`, `notify_by_call` (outgoing calls through
+`MediaPhone` as `Role::Caller`, spoken summary, missed → card stays, rate limit, DND), and
+the tray's call state with Mute agent / Hang up (control channel).
+
 # PR 8 — Phase 2: answering and calling policies
 
 Spec §10.4. Acceptance: "the agent calls the owner after the timeout, and a missed call

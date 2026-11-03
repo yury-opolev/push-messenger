@@ -674,6 +674,35 @@ mod tests {
     }
 
     #[test]
+    fn a_transcript_names_its_speaker_and_cannot_be_answered() {
+        let transcript = builtin("transcript");
+        let mut body = json!({
+            "tpl": "agent.transcript@1",
+            "params": {"speaker": "owner", "text": "Run the tests\nplease"},
+            "fallback": "🎤 voice: Run the tests please"
+        });
+        let card = checked(&body, &transcript).unwrap();
+        assert_eq!(
+            card.params.get("speaker"),
+            Some(&ParamValue::String("owner".into()))
+        );
+        assert!(transcript.interactive().is_none());
+        assert!(card.offered(&transcript).is_empty());
+        refused(
+            answer(CARD, &["approve"])
+                .unwrap()
+                .check(&card, &transcript),
+            "agent.transcript@1 has no interactive block",
+        );
+
+        body["params"]["speaker"] = json!("robot");
+        refused(
+            checked(&body, &transcript),
+            "params.speaker: \"robot\" is not one of owner, agent",
+        );
+    }
+
+    #[test]
     fn markdown_params_are_checked_as_markdown() {
         let definition = custom(
             json!({

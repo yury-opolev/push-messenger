@@ -1,0 +1,9 @@
+{
+  "description": "The owner approves the open card by voice: \"approve\".",
+  "words": [{ "hz": 1000, "text": "approve" }],
+  "script": [
+    { "silence": { "ms": 200 } },
+    { "say": { "hz": 1000, "ms": 900 } },
+    { "silence": { "ms": 1000 } }
+  ]
+}

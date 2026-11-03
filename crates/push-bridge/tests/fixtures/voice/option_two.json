@@ -1,0 +1,9 @@
+{
+  "description": "The owner picks the second option of the open question: \"option two\".",
+  "words": [{ "hz": 1300, "text": "option two" }],
+  "script": [
+    { "silence": { "ms": 200 } },
+    { "say": { "hz": 1300, "ms": 900 } },
+    { "silence": { "ms": 1000 } }
+  ]
+}
