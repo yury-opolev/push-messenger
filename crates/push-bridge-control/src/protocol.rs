@@ -779,6 +779,63 @@ mod tests {
     /// Only `peek` may carry message text. Both matches are exhaustive on purpose: a new
     /// call or event does not compile until someone decides whether it carries content.
     #[test]
+    fn status_fields_are_content_free() {
+        // Destructured without `..`: a new field does not compile until it is classified.
+        let Status {
+            protocol: _,       // a number
+            instance: _,       // the instance id (a hash of the folder)
+            pid: _,            // a number
+            bridge_version: _, // a version
+            state: _,          // a state
+            detail: _,         // a short fixed label ("approval", "offline", …)
+            agent: _,          // the agent's own display name and handle
+            connection: _,     // a connection state
+            folder: _,         // the backend's working folder
+            session: _,        // a session id
+            backend: _,        // see BackendInfo
+            open_requests: _,  // a count
+            held_texts: _,     // a count, never the texts
+            pause: _,          // see PauseInfo
+            last_error: _,     // see LastError
+            started_at: _,     // a time
+        } = Status::default();
+        let AgentInfo {
+            display_name: _,
+            handle: _,
+        } = AgentInfo {
+            display_name: String::new(),
+            handle: String::new(),
+        };
+        let BackendInfo {
+            name: _,          // the backend's name
+            version: _,       // its version
+            running: _,       // a flag
+            running_tasks: _, // a count
+        } = BackendInfo {
+            name: String::new(),
+            version: None,
+            running: false,
+            running_tasks: 0,
+        };
+        let PauseInfo {
+            phase: _,  // a fixed phase name
+            reason: _, // the caller's reason (the tray's or the CLI's), never a chat's
+            since: _,  // a time
+        } = PauseInfo {
+            phase: String::new(),
+            reason: None,
+            since: 0,
+        };
+        let LastError {
+            code: _, // an error code
+            at: _,   // a time
+        } = LastError {
+            code: String::new(),
+            at: 0,
+        };
+    }
+
+    #[test]
     fn only_peek_carries_message_text() {
         fn carries_text(call: &Call) -> bool {
             match call {
