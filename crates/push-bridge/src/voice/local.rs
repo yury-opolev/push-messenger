@@ -122,7 +122,8 @@ impl LocalStt {
         audio: Vec<u8>,
     ) -> Result<String, SpeechError> {
         let file = TempWav::new();
-        std::fs::write(&file.0, audio).map_err(|_| SpeechError::new(NAME, "io"))?;
+        file.write(&audio)
+            .map_err(|_| SpeechError::new(NAME, "io"))?;
         let path = file.0.display().to_string();
         let language = self.primary_language();
         let argv: Vec<String> = argv
@@ -147,6 +148,16 @@ struct TempWav(PathBuf);
 impl TempWav {
     fn new() -> Self {
         Self(std::env::temp_dir().join(format!("push-bridge-{}.wav", uuid::Uuid::new_v4())))
+    }
+
+    /// Writes `audio` to a new file only this user can read (`/tmp` is shared on Linux).
+    fn write(&self, audio: &[u8]) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        options.open(&self.0)?.write_all(audio)
     }
 }
 
