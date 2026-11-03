@@ -64,6 +64,8 @@ pub struct Shell {
     pub peek_wake: Notify,
     supervisor: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
     quitting: AtomicBool,
+    /// A window build is under way (later opens only record the selected agent).
+    pub building: AtomicBool,
     state: Mutex<TrayState>,
 }
 
@@ -218,6 +220,7 @@ fn setup(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
         peek_wake: Notify::new(),
         supervisor: Mutex::new(Some(handle)),
         quitting: AtomicBool::new(false),
+        building: AtomicBool::new(false),
         state: Mutex::new(state),
     });
     let theme = theme::current();

@@ -1,6 +1,8 @@
 //! The tray window (label [`LABEL`], the bundled `index.html`): opened from the tray icon,
 //! the menu or a second launch; closing it hides it and saves its place in tray.json.
 
+use std::sync::atomic::Ordering;
+
 use push_tray_core::tray_config::WindowPlace;
 use tauri::{
     AppHandle, Manager, PhysicalPosition, PhysicalSize, WebviewUrl, WebviewWindow,
@@ -24,10 +26,23 @@ pub fn open(app: &AppHandle, select: Option<String>) {
         show(&window);
         return;
     }
+    // One build at a time: a build under way shows the window on the agent just recorded.
+    if app
+        .state::<Shell>()
+        .building
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
     let app = app.clone();
     // Built off the main thread: building a WebView2 window there can deadlock.
     tauri::async_runtime::spawn(async move {
-        if let Err(error) = build(&app) {
+        let built = build(&app);
+        app.state::<Shell>()
+            .building
+            .store(false, Ordering::Release);
+        if let Err(error) = built {
             message(
                 &app,
                 format!("Could not open the window: {error}"),

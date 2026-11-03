@@ -217,8 +217,10 @@ async fn peek(
     seen: Option<u64>,
 ) -> Result<PeekView, String> {
     main_only(&window)?;
-    let visible = window.is_visible().unwrap_or(false) && !window.is_minimized().unwrap_or(true);
-    if !visible {
+    let visible = |window: &WebviewWindow| {
+        window.is_visible().unwrap_or(false) && !window.is_minimized().unwrap_or(true)
+    };
+    if !visible(&window) {
         return Err(HIDDEN.to_owned());
     }
     let shell = app.state::<Shell>();
@@ -264,6 +266,10 @@ async fn peek(
         reply.error = Some("not connected".to_owned());
         return Ok(reply);
     };
+    // The window may have been hidden or minimised while waiting.
+    if !visible(&window) {
+        return Err(HIDDEN.to_owned());
+    }
     match control.peek(limit as usize).await {
         Ok(entries) => reply.entries = peek::chat_entries(entries),
         Err(error) if error.code == "peek_disabled" => reply.disabled = true,

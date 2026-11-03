@@ -193,6 +193,10 @@ input {
   }
 }
 
+.reduce-motion .badge-blue-pulse {
+  animation: none;
+}
+
 /* Agent pane */
 h1 {
   font-size: 18px;

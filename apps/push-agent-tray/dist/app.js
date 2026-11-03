@@ -106,6 +106,7 @@ function renderWindow(view) {
   const global = view.global || {};
   $("startAtLogon").checked = Boolean(global.startAtLogon);
   $("reduceMotion").checked = Boolean(global.reduceMotion);
+  document.body.classList.toggle("reduce-motion", Boolean(global.reduceMotion));
   $("menuPeek").checked = Boolean(global.menuPeek);
   $("switchOver").hidden = !global.switchOffered;
   const notice = $("configError");
