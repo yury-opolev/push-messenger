@@ -31,6 +31,7 @@ use push_store::{DatabaseTarget, DatabaseVars, StoreOptions, postgres_auth};
 /// | `PUSH_CALLS_ENABLED` | `1` or `0`: run the call engine (docs/calls.md); enable once every gateway and message-svc replica has calls | `0` |
 /// | `PUSH_CALLS_RING_SECONDS` | how long a call rings, 10 to 120 | `45` |
 /// | `PUSH_CALLS_DISCONNECT_GRACE_SECONDS` | how long a party device may be gone before its call fails, 5 to 120 | `30` |
+/// | `PUSH_CALLS_HISTORY_DAYS` | how many days call history is kept, 1 to 3650; applies whether calls are enabled or not | `90` |
 #[derive(Clone, PartialEq, Eq)]
 pub struct Config {
     pub database: DatabaseTarget,
@@ -60,6 +61,8 @@ pub struct CallsConfig {
     /// How long a party device may be gone before its call fails
     /// (`PUSH_CALLS_DISCONNECT_GRACE_SECONDS`).
     pub grace: Duration,
+    /// How many days call history is kept (`PUSH_CALLS_HISTORY_DAYS`).
+    pub history_days: u32,
 }
 
 impl Default for CallsConfig {
@@ -68,6 +71,7 @@ impl Default for CallsConfig {
             enabled: false,
             ring: Duration::from_secs(45),
             grace: Duration::from_secs(30),
+            history_days: 90,
         }
     }
 }
@@ -89,6 +93,22 @@ impl CallsConfig {
             enabled,
             ring: seconds_in(lookup, "PUSH_CALLS_RING_SECONDS", 45, 10..=120)?,
             grace: seconds_in(lookup, "PUSH_CALLS_DISCONNECT_GRACE_SECONDS", 30, 5..=120)?,
+            history_days: history_days(lookup)?,
+        })
+    }
+}
+
+/// `PUSH_CALLS_HISTORY_DAYS`: 1 to 3650, 90 when unset or empty.
+fn history_days(lookup: &impl Fn(&str) -> Option<String>) -> Result<u32, ConfigError> {
+    const NAME: &str = "PUSH_CALLS_HISTORY_DAYS";
+    let days: u32 = parsed(lookup, NAME, 90)?;
+    if (1..=3650).contains(&days) {
+        Ok(days)
+    } else {
+        Err(ConfigError::Invalid {
+            name: NAME,
+            value: days.to_string(),
+            reason: "expected an integer from 1 to 3650".to_owned(),
         })
     }
 }
@@ -467,6 +487,7 @@ mod tests {
                 enabled: false,
                 ring: Duration::from_secs(45),
                 grace: Duration::from_secs(30),
+                history_days: 90,
             }
         );
         let mut variables = REQUIRED.to_vec();
@@ -474,11 +495,13 @@ mod tests {
             ("PUSH_CALLS_ENABLED", "1"),
             ("PUSH_CALLS_RING_SECONDS", "10"),
             ("PUSH_CALLS_DISCONNECT_GRACE_SECONDS", "120"),
+            ("PUSH_CALLS_HISTORY_DAYS", "3650"),
         ]);
         let calls = config(&variables).unwrap().calls;
         assert!(calls.enabled);
         assert_eq!(calls.ring, Duration::from_secs(10));
         assert_eq!(calls.grace, Duration::from_secs(120));
+        assert_eq!(calls.history_days, 3650);
         for off in ["0", ""] {
             let mut variables = REQUIRED.to_vec();
             variables.push(("PUSH_CALLS_ENABLED", off));
@@ -497,6 +520,9 @@ mod tests {
             ("PUSH_CALLS_DISCONNECT_GRACE_SECONDS", "4"),
             ("PUSH_CALLS_DISCONNECT_GRACE_SECONDS", "121"),
             ("PUSH_CALLS_DISCONNECT_GRACE_SECONDS", "-1"),
+            ("PUSH_CALLS_HISTORY_DAYS", "0"),
+            ("PUSH_CALLS_HISTORY_DAYS", "3651"),
+            ("PUSH_CALLS_HISTORY_DAYS", "ninety"),
         ];
         for (name, value) in cases {
             let mut variables = REQUIRED.to_vec();

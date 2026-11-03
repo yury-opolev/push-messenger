@@ -53,6 +53,9 @@ fn check_template_status(template: &StoredTemplate) -> DomainResult<()> {
     Ok(())
 }
 
+/// A call history row and when its user hid it.
+type HistoryEntry = (CallHistoryRow, Option<DateTime<Utc>>);
+
 #[derive(Debug, Clone, Default)]
 struct State {
     users: HashSet<UserId>,
@@ -80,7 +83,7 @@ struct State {
     /// Every template event, oldest first.
     template_events: Vec<TemplateEvent>,
     /// Call history rows by `(user, call)`, with when the user hid them.
-    call_history: BTreeMap<(UserId, Uuid), (CallHistoryRow, Option<DateTime<Utc>>)>,
+    call_history: BTreeMap<(UserId, Uuid), HistoryEntry>,
 }
 
 impl State {

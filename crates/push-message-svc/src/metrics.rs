@@ -121,7 +121,7 @@ impl Histogram {
     }
 }
 
-/// The call engine's counters and histograms.
+/// The call engine's counters and histograms, and the call history's counters.
 #[derive(Debug, Default)]
 pub struct Metrics {
     started: AtomicU64,
@@ -130,11 +130,49 @@ pub struct Metrics {
     refused: [AtomicU64; REFUSAL_CODES.len()],
     setup: Histogram,
     signal: [Histogram; SignalFrame::ALL.len()],
+    history_deleted: AtomicU64,
+    history_write_failures: AtomicU64,
 }
 
 impl Metrics {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The retention purge deleted `rows` call history rows.
+    pub fn history_deleted(&self, rows: u64) {
+        self.history_deleted.fetch_add(rows, Ordering::Relaxed);
+    }
+
+    /// The history rows of an ended call could not be stored (after retries).
+    pub fn history_write_failed(&self) {
+        self.history_write_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The call history families, served whether calls are enabled or not.
+    pub fn render_history(&self) -> String {
+        let mut out = String::new();
+        counter(
+            &mut out,
+            "push_call_history_rows_deleted_total",
+            "Call history rows deleted by the retention purge.",
+        );
+        let _ = writeln!(
+            out,
+            "push_call_history_rows_deleted_total {}",
+            self.history_deleted.load(Ordering::Relaxed)
+        );
+        counter(
+            &mut out,
+            "push_call_history_write_failures_total",
+            "Ended calls whose history rows could not be stored.",
+        );
+        let _ = writeln!(
+            out,
+            "push_call_history_write_failures_total {}",
+            self.history_write_failures.load(Ordering::Relaxed)
+        );
+        out
     }
 
     /// A call started ringing.
@@ -317,5 +355,18 @@ mod tests {
         assert!(text.contains("push_calls_ended_total{reason=\"missed\"} 1\n"));
         assert!(text.contains("push_call_frames_refused_total{code=\"call_limit\"} 1\n"));
         assert!(!text.contains("bad_frame"));
+    }
+
+    #[test]
+    fn history_families_count_purged_rows_and_failed_writes() {
+        let metrics = Metrics::new();
+        metrics.history_deleted(1000);
+        metrics.history_deleted(7);
+        metrics.history_write_failed();
+        let text = metrics.render_history();
+        assert!(text.contains("# TYPE push_call_history_rows_deleted_total counter\n"));
+        assert!(text.contains("push_call_history_rows_deleted_total 1007\n"));
+        assert!(text.contains("push_call_history_write_failures_total 1\n"));
+        assert!(!metrics.render(None).contains("push_call_history"));
     }
 }

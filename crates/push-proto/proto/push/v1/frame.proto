@@ -65,8 +65,10 @@ message Frame {
     CallIce peer_call_ice = 50;
     // A CallRenegotiate frame the other party's device sent for the call, relayed as is.
     CallRenegotiate peer_call_renegotiate = 51;
+    // The user's call history changed (docs/calls.md, "Call history").
+    CallHistoryChanged call_history_changed = 52;
   }
-  // 18-31 are free for later client frames, 52-63 for later server frames.
+  // 18-31 are free for later client frames, 53-63 for later server frames.
 }
 
 // Must be the first frame, within 5 seconds of connecting. The gateway learns the user
@@ -901,4 +903,17 @@ message CallState {
   // The call's device on this side is this device: the caller's device for an outgoing
   // call, the answering device for an active incoming one, or a ringing device.
   bool this_device = 10;
+}
+
+// The user's call history (GET /v1/calls on auth-svc) changed. Sent to every calls-active
+// device of the user when a call of theirs ended and its row was stored (also a call that
+// never rang: BUSY, and UNREACHABLE for the caller), and when one of their devices hid a
+// call (DELETE /v1/calls/{call_id}). Refresh the history, for example
+// GET /v1/calls?since=<the newest cursor you hold> for a missed-call badge. Never carries
+// the call itself; a lost one only delays the refresh (read the history after
+// reconnecting).
+message CallHistoryChanged {
+  // A call ended: its end (microseconds since the Unix epoch, server clock). Absent when
+  // a call was hidden.
+  optional int64 latest_ended_at = 1;
 }

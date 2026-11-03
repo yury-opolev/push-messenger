@@ -1,7 +1,7 @@
 //! Call history (spec §9): one row per participant of an ended call, kept apart from
 //! conversation history. Only the row's own user reads or hides it.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use uuid::Uuid;
 
 use super::machine::{CallDirection, EndReason};
@@ -134,9 +134,10 @@ where
         Ok(hidden)
     }
 
-    /// Deletes at most `batch` history rows of calls that ended before `cutoff`, hidden or
-    /// not. Returns how many were deleted.
-    pub async fn purge_call_history(&self, cutoff: DateTime<Utc>, batch: u32) -> DomainResult<u64> {
+    /// Deletes at most `batch` history rows of calls that ended more than `keep` ago, hidden
+    /// or not. Returns how many were deleted.
+    pub async fn purge_call_history(&self, keep: TimeDelta, batch: u32) -> DomainResult<u64> {
+        let cutoff = self.clock.now() - keep;
         let mut tx = self.store.begin().await?;
         let deleted = tx.delete_call_history_before(cutoff, batch).await?;
         tx.commit().await?;

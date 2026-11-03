@@ -531,8 +531,12 @@ pub trait Tx: Send {
     /// Hides `user`'s row of `call` as of `at`. Returns whether a visible row was hidden:
     /// false when there is no such row of `user`'s or it is hidden already. Never touches
     /// another user's row.
-    async fn hide_call(&mut self, user: UserId, call: Uuid, at: DateTime<Utc>)
-    -> DomainResult<bool>;
+    async fn hide_call(
+        &mut self,
+        user: UserId,
+        call: Uuid,
+        at: DateTime<Utc>,
+    ) -> DomainResult<bool>;
     /// Deletes at most `batch` rows, of any user, that ended before `cutoff`, hidden or
     /// not. Returns how many were deleted.
     async fn delete_call_history_before(

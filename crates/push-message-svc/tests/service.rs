@@ -271,8 +271,11 @@ async fn shutdown_is_honoured_while_the_database_is_unreachable() {
     ));
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(get(health_addr, "/readyz").await.0, 503);
-    // Calls are disabled: no call families.
-    assert_eq!(get(health_addr, "/metrics").await, (200, String::new()));
+    // Calls are disabled: only the call history families.
+    let (status, metrics) = get(health_addr, "/metrics").await;
+    assert_eq!(status, 200);
+    assert!(metrics.contains("push_call_history_rows_deleted_total 0\n"));
+    assert!(!metrics.contains("push_calls_started_total"));
 
     let started = std::time::Instant::now();
     shutdown.cancel();

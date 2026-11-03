@@ -4,13 +4,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use prost::Message;
-use push_domain::calls::Timing;
+use push_domain::calls::{CallDirection, CallHistoryRow, EndReason, Timing, ended_rows};
 use push_domain::{DeviceId, InMemoryStore, Messaging, RecordingNotifier, SystemClock, UserId};
-use push_message_svc::{CallService, CallsApi, MessagingApi, Metrics, RedisCalls, RedisNotifier};
+use push_message_svc::{
+    CallHistory, CallHistoryApi, CallService, CallsApi, MessagingApi, Metrics, RedisCalls,
+    RedisNotifier,
+};
+use push_proto::internal::v1::calls_server::Calls as _;
 use push_proto::internal::v1::messaging_server::Messaging as MessagingRpc;
 use push_proto::internal::v1::{
-    CallDeviceRequest, CallReply, CallRequest, CallSignal, IdentifyRequest, Notification,
-    call_request, call_signal, notification::Kind,
+    CallDeviceRequest, CallHistoryCursor, CallHistoryEntry, CallHistoryRequest, CallReply,
+    CallRequest, CallSignal, HideCallRequest, IdentifyRequest, Notification, call_request,
+    call_signal, notification::Kind,
 };
 use push_proto::v1::{self, CallEndReason, CallMedia, Capability, ErrorCode};
 use push_proto::{error_from_status, id_bytes, notify_channel, presence_conns_key};
@@ -713,4 +718,367 @@ async fn identify_offers_calls_only_with_the_engine() {
         .unwrap()
         .into_inner();
     assert!(sync.calls.is_empty());
+}
+
+/// The next signal must be `CallHistoryChanged`: its channel, sorted devices and
+/// `latest_ended_at`.
+async fn next_history_changed(subscriber: &mut PubSub) -> (String, Vec<Vec<u8>>, Option<i64>) {
+    let (channel, to, frame) = next_signal(subscriber).await;
+    let call_signal::Frame::HistoryChanged(changed) = frame else {
+        panic!("not CallHistoryChanged: {frame:?}");
+    };
+    (channel, to, changed.latest_ended_at)
+}
+
+async fn history_of(env: &Env, user: UserId) -> Vec<CallHistoryRow> {
+    env.messaging
+        .call_history(user, None, None, 0)
+        .await
+        .unwrap()
+}
+
+fn history_api(
+    env: &Env,
+    notifier: RedisNotifier,
+) -> (
+    Arc<History>,
+    CallHistoryApi<InMemoryStore, SystemClock, Arc<RecordingNotifier>>,
+) {
+    let history = Arc::new(CallHistory::new(
+        Arc::clone(&env.messaging),
+        notifier,
+        Arc::clone(&env.metrics),
+    ));
+    (Arc::clone(&history), CallHistoryApi::new(history))
+}
+
+type History = CallHistory<InMemoryStore, SystemClock, Arc<RecordingNotifier>>;
+
+#[tokio::test]
+async fn an_ended_call_is_in_both_histories_and_announced_to_their_devices() {
+    let mut env = env(Timing::default()).await;
+    let (alice, bob, carol) = (env.user().await, env.user().await, env.user().await);
+    let bob_laptop = DeviceId::new();
+    env.messaging
+        .device_registered(bob_laptop, bob.user)
+        .await
+        .unwrap();
+    // Alice's tablet is registered but not calls-active: it gets nothing.
+    env.messaging
+        .device_registered(DeviceId::new(), alice.user)
+        .await
+        .unwrap();
+    env.contacts(alice, bob).await;
+    env.online(alice.user, alice.device).await;
+    env.online(bob.user, bob.device).await;
+    env.online(bob.user, bob_laptop).await;
+    let mut signals = env.subscribe(&[alice.user, bob.user, carol.user]).await;
+
+    let call = Uuid::now_v7();
+    env.invite(alice, bob.user, call).await.unwrap();
+    assert!(matches!(
+        next_signal(&mut signals).await.2,
+        call_signal::Frame::Incoming(_)
+    ));
+    let accept = v1::CallAccept {
+        call_id: id_bytes(call),
+        answer_sdp: ANSWER.to_owned(),
+    };
+    env.send(bob, call_request::Frame::Accept(accept))
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        next_signal(&mut signals).await;
+    }
+    // Nothing is written while the call lives.
+    assert!(history_of(&env, alice.user).await.is_empty());
+    let hangup = v1::CallHangup {
+        call_id: id_bytes(call),
+        reason: None,
+    };
+    env.send(bob, call_request::Frame::Hangup(hangup))
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        assert!(matches!(
+            next_signal(&mut signals).await.2,
+            call_signal::Frame::Ended(_)
+        ));
+    }
+    let (channel, to, alice_latest) = next_history_changed(&mut signals).await;
+    assert_eq!(
+        (channel, to),
+        (notify_channel(alice.user.0), devices(&[alice.device]))
+    );
+    let (channel, to, bob_latest) = next_history_changed(&mut signals).await;
+    assert_eq!(
+        (channel, to),
+        (
+            notify_channel(bob.user.0),
+            devices(&[bob.device, bob_laptop])
+        )
+    );
+    nothing_more(&mut signals).await;
+
+    let mine = history_of(&env, alice.user).await;
+    assert_eq!(mine.len(), 1);
+    let row = &mine[0];
+    assert_eq!(row.call_id, call);
+    assert_eq!((row.user, row.peer), (alice.user, bob.user));
+    assert_eq!(row.direction, CallDirection::Out);
+    assert_eq!(row.outcome, EndReason::Completed);
+    assert!(row.started_at <= row.answered_at.unwrap());
+    assert!(row.answered_at.unwrap() <= row.ended_at);
+    assert_eq!(row.duration_s, 0);
+    assert_eq!(alice_latest, Some(row.ended_at.timestamp_micros()));
+    assert_eq!(bob_latest, alice_latest);
+    let theirs = history_of(&env, bob.user).await;
+    assert_eq!(theirs.len(), 1);
+    assert_eq!(
+        (theirs[0].peer, theirs[0].direction),
+        (alice.user, CallDirection::In)
+    );
+    assert_eq!(theirs[0].ended_at, row.ended_at);
+    assert!(history_of(&env, carol.user).await.is_empty());
+}
+
+#[tokio::test]
+async fn calls_that_never_rang_are_in_the_history() {
+    let mut env = env(Timing::default()).await;
+    let (alice, bob, carol) = (env.user().await, env.user().await, env.user().await);
+    env.contacts(alice, bob).await;
+    env.contacts(carol, bob).await;
+    env.online(alice.user, alice.device).await;
+    env.online(carol.user, carol.device).await;
+
+    // Unreachable: only the caller's row; the callee never saw the call.
+    let unreachable = Uuid::now_v7();
+    env.invite(alice, bob.user, unreachable).await.unwrap();
+    let mine = history_of(&env, alice.user).await;
+    assert_eq!(mine.len(), 1);
+    assert_eq!(
+        (mine[0].call_id, mine[0].outcome),
+        (unreachable, EndReason::Unreachable)
+    );
+    assert_eq!(mine[0].started_at, mine[0].ended_at);
+    assert!(history_of(&env, bob.user).await.is_empty());
+
+    env.online(bob.user, bob.device).await;
+    let mut signals = env.subscribe(&[bob.user, carol.user]).await;
+    let call = Uuid::now_v7();
+    env.invite(alice, bob.user, call).await.unwrap();
+    assert!(matches!(
+        next_signal(&mut signals).await.2,
+        call_signal::Frame::Incoming(_)
+    ));
+    // Busy: both rows, and both users' devices are told.
+    let busy = Uuid::now_v7();
+    env.invite(carol, bob.user, busy).await.unwrap();
+    let (channel, to, _) = next_history_changed(&mut signals).await;
+    assert_eq!(
+        (channel, to),
+        (notify_channel(carol.user.0), devices(&[carol.device]))
+    );
+    let (channel, to, _) = next_history_changed(&mut signals).await;
+    assert_eq!(
+        (channel, to),
+        (notify_channel(bob.user.0), devices(&[bob.device]))
+    );
+    let theirs = history_of(&env, bob.user).await;
+    assert_eq!(theirs.len(), 1);
+    assert_eq!(
+        (
+            theirs[0].call_id,
+            theirs[0].peer,
+            theirs[0].direction,
+            theirs[0].outcome
+        ),
+        (busy, carol.user, CallDirection::In, EndReason::Busy)
+    );
+    assert_eq!(
+        history_of(&env, carol.user).await[0].direction,
+        CallDirection::Out
+    );
+
+    // The ringing call is cancelled: newest first.
+    let cancel = v1::CallCancel {
+        call_id: id_bytes(call),
+    };
+    env.send(alice, call_request::Frame::Cancel(cancel))
+        .await
+        .unwrap();
+    let theirs = history_of(&env, bob.user).await;
+    assert_eq!(
+        theirs
+            .iter()
+            .map(|row| (row.call_id, row.outcome))
+            .collect::<Vec<_>>(),
+        [(call, EndReason::Cancelled), (busy, EndReason::Busy)]
+    );
+    let mine = history_of(&env, alice.user).await;
+    assert_eq!(mine.len(), 2);
+    assert_eq!(mine[0].outcome, EndReason::Cancelled);
+}
+
+#[tokio::test]
+async fn the_history_api_shows_own_calls_only_and_hides_per_side() {
+    let env = env(Timing::default()).await;
+    let (alice, bob, carol) = (env.user().await, env.user().await, env.user().await);
+    let (_, api) = history_api(&env, RedisNotifier::connect(&env.url).await.unwrap());
+    let ended_ms = chrono::Utc::now().timestamp_millis();
+    let mut calls = Vec::new();
+    for offset in [3_000, 2_000, 1_000] {
+        let call = Uuid::now_v7();
+        let rows = ended_rows(
+            call,
+            alice.user,
+            bob.user,
+            ended_ms - offset - 20_000,
+            Some(ended_ms - offset - 10_000),
+            ended_ms - offset,
+            EndReason::Completed,
+        );
+        env.messaging.record_call(&rows).await.unwrap();
+        calls.push(call);
+    }
+    calls.reverse();
+    let request = |user: UserId, before: Option<CallHistoryCursor>, since, limit| {
+        Request::new(CallHistoryRequest {
+            user_id: id_bytes(user.0),
+            before,
+            since,
+            limit,
+        })
+    };
+    let page = api
+        .history(request(alice.user, None, None, 0))
+        .await
+        .unwrap()
+        .into_inner();
+    let ids: Vec<Vec<u8>> = page
+        .calls
+        .iter()
+        .map(|entry| entry.call_id.clone())
+        .collect();
+    assert_eq!(
+        ids,
+        calls.iter().map(|call| id_bytes(*call)).collect::<Vec<_>>()
+    );
+    let newest = &page.calls[0];
+    assert_eq!(newest.peer_user_id, id_bytes(bob.user.0));
+    assert_eq!(newest.direction(), v1::CallDirection::Out);
+    assert_eq!(newest.outcome(), CallEndReason::Completed);
+    assert_eq!(newest.duration_s, 10);
+    assert_eq!(newest.ended_at, (ended_ms - 1_000) * 1000);
+    assert_eq!(newest.answered_at, Some((ended_ms - 11_000) * 1000));
+    assert_eq!(newest.started_at, (ended_ms - 21_000) * 1000);
+    let cursor = |entry: &CallHistoryEntry| CallHistoryCursor {
+        ended_at: entry.ended_at,
+        call_id: entry.call_id.clone(),
+    };
+    let older = api
+        .history(request(alice.user, Some(cursor(newest)), None, 1))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(older.calls, page.calls[1..2]);
+    let newer = api
+        .history(request(alice.user, None, Some(cursor(&page.calls[2])), 0))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(newer.calls, page.calls[..2]);
+    let status = api
+        .history(request(
+            alice.user,
+            Some(CallHistoryCursor {
+                ended_at: 0,
+                call_id: vec![1, 2, 3],
+            }),
+            None,
+            0,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), Code::InvalidArgument);
+    assert!(
+        api.history(request(carol.user, None, None, 0))
+            .await
+            .unwrap()
+            .into_inner()
+            .calls
+            .is_empty()
+    );
+
+    // Hiding: carol cannot hide alice's call; alice hides only her own row.
+    let mut env = env;
+    env.online(alice.user, alice.device).await;
+    env.online(bob.user, bob.device).await;
+    let mut signals = env.subscribe(&[alice.user, bob.user]).await;
+    let hide = |user: UserId, call: Uuid| {
+        Request::new(HideCallRequest {
+            user_id: id_bytes(user.0),
+            call_id: id_bytes(call),
+        })
+    };
+    api.hide(hide(carol.user, calls[0])).await.unwrap();
+    api.hide(hide(alice.user, Uuid::now_v7())).await.unwrap();
+    nothing_more(&mut signals).await;
+    assert_eq!(history_of(&env, alice.user).await.len(), 3);
+    api.hide(hide(alice.user, calls[0])).await.unwrap();
+    let (channel, to, latest) = next_history_changed(&mut signals).await;
+    assert_eq!(
+        (channel, to, latest),
+        (notify_channel(alice.user.0), devices(&[alice.device]), None)
+    );
+    // Hiding again changes nothing and tells nobody.
+    api.hide(hide(alice.user, calls[0])).await.unwrap();
+    nothing_more(&mut signals).await;
+    let mine: Vec<Uuid> = history_of(&env, alice.user)
+        .await
+        .iter()
+        .map(|row| row.call_id)
+        .collect();
+    assert_eq!(mine, calls[1..]);
+    assert_eq!(history_of(&env, bob.user).await.len(), 3);
+}
+
+#[tokio::test]
+async fn the_purge_deletes_only_rows_past_the_retention() {
+    let env = env(Timing::default()).await;
+    let (alice, bob) = (env.user().await, env.user().await);
+    let (history, _) = history_api(&env, RedisNotifier::connect(&env.url).await.unwrap());
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let day_ms = 24 * 60 * 60 * 1000;
+    let old = Uuid::now_v7();
+    let kept = Uuid::now_v7();
+    for (call, age_days) in [(old, 91), (kept, 89)] {
+        let ended = now_ms - age_days * day_ms;
+        let rows = ended_rows(
+            call,
+            alice.user,
+            bob.user,
+            ended,
+            None,
+            ended,
+            EndReason::Missed,
+        );
+        env.messaging.record_call(&rows).await.unwrap();
+    }
+    env.messaging.hide_call(bob.user, old).await.unwrap();
+
+    assert_eq!(history.purge(90).await.unwrap(), 2);
+    for user in [alice.user, bob.user] {
+        let rows = history_of(&env, user).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].call_id, kept);
+    }
+    assert_eq!(history.purge(90).await.unwrap(), 0);
+    assert!(
+        env.metrics
+            .render_history()
+            .contains("push_call_history_rows_deleted_total 2\n")
+    );
+    assert_eq!(history.purge(1).await.unwrap(), 2);
+    assert!(history_of(&env, alice.user).await.is_empty());
 }

@@ -117,7 +117,10 @@ async fn pages_are_newest_first_and_stable<B: Backend>(backend: &B) {
     assert_eq!(paged, all);
 
     let since = all[3].cursor();
-    assert_eq!(history(&store, alice, None, Some(since), 50).await, all[..3]);
+    assert_eq!(
+        history(&store, alice, None, Some(since), 50).await,
+        all[..3]
+    );
     assert_eq!(
         history(&store, alice, Some(all[0].cursor()), Some(since), 50).await,
         all[1..3]
@@ -161,8 +164,14 @@ async fn retention_deletes_only_old_rows<B: Backend>(backend: &B) {
         deleted += batch;
     }
     assert_eq!(deleted, 4);
-    assert_eq!(history(&store, alice, None, None, 50).await, vec![new[0].clone()]);
-    assert_eq!(history(&store, bob, None, None, 50).await, vec![new[1].clone()]);
+    assert_eq!(
+        history(&store, alice, None, None, 50).await,
+        vec![new[0].clone()]
+    );
+    assert_eq!(
+        history(&store, bob, None, None, 50).await,
+        vec![new[1].clone()]
+    );
 }
 
 async fn a_row_of_an_unknown_user_is_refused<B: Backend>(backend: &B) {
@@ -171,7 +180,8 @@ async fn a_row_of_an_unknown_user_is_refused<B: Backend>(backend: &B) {
     add_users(&store, &[alice]).await;
     let mut tx = store.begin().await.unwrap();
     assert!(matches!(
-        tx.insert_call_history(&missed(alice, UserId::new(), 1)).await,
+        tx.insert_call_history(&missed(alice, UserId::new(), 1))
+            .await,
         Err(DomainError::Store(_))
     ));
     drop(tx);

@@ -267,6 +267,7 @@ impl Hub {
             call_signal::Frame::Ended(ended) => Body::CallEnded(ended),
             call_signal::Frame::Ice(ice) => Body::PeerCallIce(ice),
             call_signal::Frame::Renegotiate(renegotiate) => Body::PeerCallRenegotiate(renegotiate),
+            call_signal::Frame::HistoryChanged(changed) => Body::CallHistoryChanged(changed),
         };
         self.forward_to(channel, &frame, |device| devices.contains(&device));
     }

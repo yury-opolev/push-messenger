@@ -2,6 +2,7 @@
 //! push-domain over compare-and-set Redis state, publishing, the sweeper, audit and
 //! metrics. Never logs SDP, candidates or addresses (spec D18, T10).
 
+mod history;
 mod redis;
 mod wire;
 
@@ -11,8 +12,8 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use push_domain::calls::{
-    CallEvent, CallRecord, CallState, Delivery, EndReason, Outcome, Refusal, Side, Timing, start,
-    sync_view, transition,
+    CallEvent, CallRecord, CallState, Delivery, EndReason, Outcome, Refusal, Side, Timing,
+    ended_rows, start, sync_view, transition,
 };
 use push_domain::{Clock, DeviceId, DomainError, Messaging, Notifier, Store, UserId};
 use push_proto::error_status;
@@ -22,6 +23,7 @@ use tokio_util::sync::CancellationToken;
 use tonic::{Code, Status};
 use uuid::Uuid;
 
+pub use self::history::{CallHistory, CallHistoryApi, PURGE_BATCH};
 pub use self::redis::{Applied, DUE_KEY, RedisCalls, Write, call_key, devices_key, user_key};
 use crate::config::CallsConfig;
 use crate::convert::{domain_error, invalid, parse_id};
@@ -80,6 +82,7 @@ pub struct CallService<S, C, N> {
     notifier: RedisNotifier,
     timing: Timing,
     metrics: Arc<Metrics>,
+    history: CallHistory<S, C, N>,
 }
 
 impl<S, C, N> CallService<S, C, N>
@@ -89,7 +92,8 @@ where
     N: Notifier,
 {
     /// `messaging` answers who may call whom; `redis` keeps the call state; `notifier`
-    /// publishes the frames; `timing` is usually [`CallsConfig::timing`].
+    /// publishes the frames and the history events; `timing` is usually
+    /// [`CallsConfig::timing`]. Ended calls are written to the call history.
     pub fn new(
         messaging: Arc<Messaging<S, C, N>>,
         redis: RedisCalls,
@@ -97,12 +101,18 @@ where
         timing: Timing,
         metrics: Arc<Metrics>,
     ) -> Self {
+        let history = CallHistory::new(
+            Arc::clone(&messaging),
+            notifier.clone(),
+            Arc::clone(&metrics),
+        );
         Self {
             messaging,
             redis,
             notifier,
             timing,
             metrics,
+            history,
         }
     }
 
@@ -225,7 +235,9 @@ where
             } else {
                 EndReason::Unreachable
             };
-            return Ok(self.not_ringing(invite.call_id, caller, callee, reason));
+            return Ok(self
+                .not_ringing(invite.call_id, caller, callee, reason, now)
+                .await);
         }
         let (record, deliveries) = start(
             invite.call_id,
@@ -251,7 +263,9 @@ where
             Applied::Ok => {}
             Applied::InCall => return Err(in_call()),
             Applied::Busy => {
-                return Ok(self.not_ringing(invite.call_id, caller, callee, EndReason::Busy));
+                return Ok(self
+                    .not_ringing(invite.call_id, caller, callee, EndReason::Busy, now)
+                    .await);
             }
             Applied::Exists => {
                 return if self.repeated_invite(record.call_id, caller, device).await? {
@@ -291,16 +305,20 @@ where
         }))
     }
 
-    /// An invite that cannot ring: answered `CallEnded` at once, audited as an end.
-    fn not_ringing(
+    /// An invite that cannot ring: answered `CallEnded` at once, audited as an end and
+    /// written to the call history (the callee's only for `Busy`).
+    async fn not_ringing(
         &self,
         call: Uuid,
         caller: UserId,
         callee: UserId,
         reason: EndReason,
+        now: i64,
     ) -> CallReply {
         audit_end(call, caller, callee, reason, 0, false);
         self.metrics.call_ended(reason);
+        let rows = ended_rows(call, caller, callee, now, None, now, reason);
+        self.history.record(call, &rows, now).await;
         CallReply {
             ended: Some(wire::ended(call, reason, None)),
         }
@@ -534,6 +552,16 @@ where
                 before.answered_ms.is_some(),
             );
             self.metrics.call_ended(reason);
+            let rows = ended_rows(
+                before.call_id,
+                before.caller,
+                before.callee,
+                before.created_ms,
+                before.answered_ms,
+                now,
+                reason,
+            );
+            self.history.record(before.call_id, &rows, now).await;
         }
         Ok(true)
     }

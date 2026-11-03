@@ -135,6 +135,22 @@ service Templates {
   rpc Review(ReviewTemplateRequest) returns (TemplateSummary);
 }
 
+// Call history (docs/calls.md, "Call history"), for auth-svc's GET /v1/calls and
+// DELETE /v1/calls/{call_id}. Served on the Directory listener with the same internal
+// token; without it the call is UNAUTHENTICATED. Served whether calls are enabled or not,
+// so history stays readable after calls are switched off. Malformed ids or cursors are
+// INVALID_ARGUMENT. message-svc writes the rows itself when a call ends: one per
+// participant, read and hidden only by that participant.
+service Calls {
+  // The user's calls they did not hide, newest first by (ended_at, call_id).
+  rpc History(CallHistoryRequest) returns (CallHistoryPage);
+  // Hides one call from the user's own history only; the other participant's row is
+  // untouched. Succeeds for an unknown call, another user's or one hidden already (no
+  // oracle). Publishes CallHistoryChanged to the user's calls-active devices when a row
+  // was hidden.
+  rpc Hide(HideCallRequest) returns (HideCallResponse);
+}
+
 message IdentifyRequest {
   bytes user_id = 1;
   bytes device_id = 2;
@@ -310,6 +326,8 @@ message CallSignal {
     push.v1.CallIce ice = 6;
     // Sent to the device as peer_call_renegotiate.
     push.v1.CallRenegotiate renegotiate = 7;
+    // The user's call history changed; sent to every calls-active device of the user.
+    push.v1.CallHistoryChanged history_changed = 8;
   }
 }
 
@@ -505,3 +523,48 @@ message ReviewTemplateRequest {
   string reviewer = 3;
   optional string note = 4;
 }
+
+// A position in a user's call history: rows are ordered by (ended_at, call_id).
+message CallHistoryCursor {
+  // Microseconds since the Unix epoch.
+  int64 ended_at = 1;
+  bytes call_id = 2;
+}
+
+message CallHistoryRequest {
+  bytes user_id = 1;
+  // Only calls strictly older than this.
+  optional CallHistoryCursor before = 2;
+  // Only calls strictly newer than this.
+  optional CallHistoryCursor since = 3;
+  // At most this many calls, up to 100; 0 means 50.
+  uint32 limit = 4;
+}
+
+// One call in the user's history. Times are microseconds since the Unix epoch (the
+// server's clock).
+message CallHistoryEntry {
+  bytes call_id = 1;
+  bytes peer_user_id = 2;
+  push.v1.CallDirection direction = 3;
+  // When the call was invited.
+  int64 started_at = 4;
+  // Calls that were answered only.
+  optional int64 answered_at = 5;
+  int64 ended_at = 6;
+  // Whole seconds from the answer to the end; 0 for calls never answered.
+  uint32 duration_s = 7;
+  push.v1.CallEndReason outcome = 8;
+}
+
+message CallHistoryPage {
+  // Newest first.
+  repeated CallHistoryEntry calls = 1;
+}
+
+message HideCallRequest {
+  bytes user_id = 1;
+  bytes call_id = 2;
+}
+
+message HideCallResponse {}
