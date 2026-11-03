@@ -1,0 +1,9 @@
+{
+  "description": "The owner talks over the agent while it reads a long reply: \"stop, use the other file\".",
+  "words": [{ "hz": 450, "text": "stop, use the other file" }],
+  "script": [
+    { "silence": { "ms": 200 } },
+    { "say": { "hz": 450, "ms": 900 } },
+    { "silence": { "ms": 1000 } }
+  ]
+}

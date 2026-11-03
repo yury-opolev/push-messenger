@@ -23,6 +23,19 @@ pub(crate) mod test_server;
 pub mod vad;
 pub mod wav;
 
+use std::sync::Arc;
+
+/// What the bridge needs to take calls: the phone, the speech providers and the
+/// detector's settings. Without `stt` every call is declined; without `tts` the agent's
+/// replies stay in the chat.
+#[derive(Clone)]
+pub struct VoiceSetup {
+    pub phone: Arc<dyn phone::Phone>,
+    pub stt: Option<Arc<dyn provider::Stt>>,
+    pub tts: Option<Arc<dyn provider::Tts>>,
+    pub vad: vad::VadConfig,
+}
+
 /// Samples per second of call audio (push-sdk's media helper).
 pub const SAMPLE_RATE: u32 = 16_000;
 /// Samples in one 20 ms frame.

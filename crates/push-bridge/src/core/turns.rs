@@ -25,9 +25,15 @@ impl<M: Messenger> Core<M> {
     pub(super) async fn on_backend(&mut self, event: BackendEvent) {
         let now = Instant::now();
         match event {
-            BackendEvent::TurnStarted { source } => self.begin_turn(source).await,
+            BackendEvent::TurnStarted { source } => {
+                self.begin_turn(source).await;
+                self.speech_turn_started();
+            }
             BackendEvent::ThinkingDelta(delta) => self.turn().renderer.thinking(&delta),
-            BackendEvent::TextDelta(delta) => self.turn().renderer.text(&delta),
+            BackendEvent::TextDelta(delta) => {
+                self.turn().renderer.text(&delta);
+                self.speak_delta(&delta);
+            }
             BackendEvent::ToolStarted {
                 id,
                 tool,
@@ -45,7 +51,11 @@ impl<M: Messenger> Core<M> {
                 cursor,
                 label,
                 text,
-            } => self.agent_message(cursor, &label, &text),
+            } => {
+                if self.agent_message(cursor, &label, &text) {
+                    self.speak_agent_message(&label, &text);
+                }
+            }
             BackendEvent::TaskStarted { id, background, .. } => {
                 tracing::debug!(event = "task_started", background);
                 self.running_tasks.insert(id);
@@ -66,7 +76,10 @@ impl<M: Messenger> Core<M> {
                 Some(turn) => turn.renderer.note(&message),
                 None => self.reply(&message),
             },
-            BackendEvent::TurnEnded { interrupted } => self.end_turn(interrupted).await,
+            BackendEvent::TurnEnded { interrupted } => {
+                self.speech_turn_ended();
+                self.end_turn(interrupted).await;
+            }
             BackendEvent::Exited { .. } => self.exited().await,
         }
     }
@@ -166,17 +179,19 @@ impl<M: Messenger> Core<M> {
         }
     }
 
-    /// A background message: its own reply titled with its label, shown once.
-    fn agent_message(&self, cursor: u64, label: &str, text: &str) {
+    /// A background message: its own reply titled with its label, shown once; whether
+    /// it was shown now.
+    fn agent_message(&self, cursor: u64, label: &str, text: &str) -> bool {
         let shown = self.state.get().agent_message_cursor;
         if shown.is_some_and(|shown| cursor <= shown) {
-            return;
+            return false;
         }
         tracing::info!(event = "agent_message", cursor);
         for body in formatted_bodies(Some(label), text, self.format) {
             self.send_rich(&body);
         }
         self.save(|state| state.agent_message_cursor = Some(cursor));
+        true
     }
 
     /// Background messages the bridge missed (after a reconnect or a restart against the

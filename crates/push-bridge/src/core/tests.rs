@@ -27,23 +27,30 @@ use crate::test_dir::TestDir;
 
 type Channels = (mpsc::UnboundedReceiver<BackendEvent>, mpsc::Receiver<Event>);
 
-struct Harness {
-    messenger: Arc<TestMessenger>,
-    backend: Arc<TestBackend>,
+pub(super) struct Harness {
+    pub(super) messenger: Arc<TestMessenger>,
+    pub(super) backend: Arc<TestBackend>,
     state: Arc<StateFile>,
     root: PathBuf,
-    work: PathBuf,
+    pub(super) work: PathBuf,
     other: PathBuf,
     channels: Option<Channels>,
     stop: Option<oneshot::Sender<()>>,
     run: Option<JoinHandle<Result<(), BridgeError>>>,
     hub: ControlHub,
     events: broadcast::Receiver<EventLine>,
+    /// Calls are taken with this (see `voice_tests`).
+    pub(super) voice: Option<crate::voice::VoiceSetup>,
     _dir: TestDir,
 }
 
 impl Harness {
     fn new() -> Self {
+        Self::named("Test")
+    }
+
+    /// With a backend named `name`.
+    pub(super) fn named(name: &str) -> Self {
         let dir = TestDir::new();
         dir.mkdir("root/work");
         dir.mkdir("root/other");
@@ -54,7 +61,8 @@ impl Harness {
         let (work, other, root) = (real("work"), real("other"), real("."));
         let state = Arc::new(StateFile::load(&dir.path().join("state.json")).unwrap());
         let (messenger, messenger_events) = TestMessenger::new();
-        let (backend, backend_events) = TestBackend::channel();
+        let (sender, backend_events) = mpsc::unbounded_channel();
+        let backend = Arc::new(TestBackend::new(name, sender));
         let hub = ControlHub::new("0011223344556677".into(), true);
         let events = hub.handle().subscribe();
         Self {
@@ -69,13 +77,14 @@ impl Harness {
             run: None,
             hub,
             events,
+            voice: None,
             _dir: dir,
         }
     }
 
-    fn start(&mut self) {
+    pub(super) fn start(&mut self) {
         let (backend_events, messenger_events) = self.channels.take().expect("not started");
-        let bridge = Bridge::new(
+        let mut bridge = Bridge::new(
             Arc::clone(&self.messenger),
             Arc::clone(&self.backend) as Arc<dyn Backend>,
             backend_events,
@@ -88,6 +97,9 @@ impl Harness {
             },
         )
         .with_control(self.hub.handle(), self.hub.calls());
+        if let Some(voice) = self.voice.take() {
+            bridge = bridge.with_voice(voice);
+        }
         let (stop, stopped) = oneshot::channel::<()>();
         self.stop = Some(stop);
         self.run = Some(tokio::spawn(bridge.run(async {
@@ -103,14 +115,14 @@ impl Harness {
         harness
     }
 
-    async fn stop(&mut self) -> Result<(), BridgeError> {
+    pub(super) async fn stop(&mut self) -> Result<(), BridgeError> {
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
         }
         self.run.take().expect("running").await.unwrap()
     }
 
-    fn replies(&self) -> Vec<String> {
+    pub(super) fn replies(&self) -> Vec<String> {
         self.messenger.reply_texts()
     }
 
@@ -140,7 +152,7 @@ impl Harness {
             .await;
     }
 
-    async fn idle(&self) {
+    pub(super) async fn idle(&self) {
         self.messenger
             .wait_until("idle", |_| {
                 self.messenger.activities().last() == Some(&(ActivityState::Idle, None))
@@ -148,7 +160,7 @@ impl Harness {
             .await;
     }
 
-    fn count(&self, prefix: &str) -> usize {
+    pub(super) fn count(&self, prefix: &str) -> usize {
         self.backend
             .calls()
             .iter()
@@ -226,11 +238,11 @@ impl Harness {
 
 /// Lets the core handle everything waiting: paused time moves on only when every task
 /// is idle.
-async fn settle() {
+pub(super) async fn settle() {
     tokio::time::sleep(Duration::from_millis(1)).await;
 }
 
-fn permission() -> RequestKind {
+pub(super) fn permission() -> RequestKind {
     RequestKind::Permission {
         tool: "Bash".into(),
         preview: "cargo test".into(),
@@ -2207,7 +2219,7 @@ async fn a_pause_s_events_and_status_carry_no_held_text() {
 }
 
 /// The peek's entries now.
-fn peeked(h: &Harness) -> Vec<push_bridge_control::PeekEntry> {
+pub(super) fn peeked(h: &Harness) -> Vec<push_bridge_control::PeekEntry> {
     h.hub
         .handle()
         .peek(push_bridge_control::PEEK_CAP)

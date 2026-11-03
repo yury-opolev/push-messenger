@@ -33,6 +33,7 @@ impl<M: Messenger> Core<M> {
             Event::DeviceRemoved => return Err(BridgeError::DeviceRemoved),
             Event::OpenedElsewhere => return Err(BridgeError::OpenedElsewhere),
             Event::EventsLost => tracing::warn!(event = "messenger_events_lost"),
+            Event::Call(event) => self.on_call(event).await,
             _ => {}
         }
         Ok(())

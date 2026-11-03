@@ -1,0 +1,14 @@
+{
+  "description": "An unclear answer to an approval (\"maybe later\"), asked again, then \"reject\".",
+  "words": [
+    { "hz": 1600, "text": "maybe later" },
+    { "hz": 1900, "text": "reject" }
+  ],
+  "script": [
+    { "silence": { "ms": 200 } },
+    { "say": { "hz": 1600, "ms": 900 } },
+    { "silence": { "ms": 1000 } },
+    { "say": { "hz": 1900, "ms": 900 } },
+    { "silence": { "ms": 1000 } }
+  ]
+}

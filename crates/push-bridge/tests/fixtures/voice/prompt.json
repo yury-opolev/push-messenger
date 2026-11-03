@@ -1,0 +1,9 @@
+{
+  "description": "The owner asks for the tests: one utterance, \"run the tests\".",
+  "words": [{ "hz": 800, "text": "run the tests" }],
+  "script": [
+    { "silence": { "ms": 200 } },
+    { "say": { "hz": 800, "ms": 900 } },
+    { "silence": { "ms": 1000 } }
+  ]
+}
