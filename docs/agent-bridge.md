@@ -1465,7 +1465,8 @@ switch-over).
    window. Expected in the chat: "(Coda is restarting: the owner asked)", then "Coda
    restarted by the owner." with what was lost; the badge pulses blue ("Coda restarting")
    for a moment (steady with "Reduce motion" checked), then green. The agent stays online,
-   the next message is answered, and `/status` shows the same session.4. **Reconnect signs in again.** Choose "Reconnect". Expected: "disconnected,
+   the next message is answered, and `/status` shows the same session.
+4. **Reconnect signs in again.** Choose "Reconnect". Expected: "disconnected,
    reconnecting" for a moment, then "connected, idle"; the log shows `messenger_reconnect`
    and no `backend_exited`; Coda was not restarted (no "Coda restarted" in the chat, the
    same session in `/status`).

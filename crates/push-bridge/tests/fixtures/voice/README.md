@@ -1,7 +1,7 @@
 # Voice fixtures
 
 Recorded owner speech for the bridge's voice tests (`src/core/voice_tests.rs`,
-`tests/bridge.rs`). Speech is tones: `voice::fake::FakeStt` hears a word per frequency
+`tests/bridge.rs`, and `crates/push-smoke/tests/bridge_voice.rs` through real media). Speech is tones: `voice::fake::FakeStt` hears a word per frequency
 and `voice::fake::FakeTts` speaks a 600 Hz tone, so the fixtures survive real Opus media
 in end-to-end tests too.
 
