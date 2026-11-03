@@ -6,6 +6,28 @@ Notable changes for consumers of push-messenger. Newest first.
 
 ### Added
 
+- **Voice calls (signalling)**: 1:1 WebRTC audio calls between accepted contacts (and
+  between an owned agent and its owner) are signalled over the `push.v1` WebSocket; audio
+  goes peer to peer and the server never sees it. New frames: client `CallInvite` 11,
+  `CallAccept` 12, `CallDecline` 13, `CallCancel` 14, `CallIce` 15, `CallHangup` 16,
+  `CallRenegotiate` 17; server `CallIncoming` 44, `CallAccepted` 45, `CallTaken` 46,
+  `CallEnded` 47, `CallError` 48, `CallSync` 49, `peer_call_ice` 50,
+  `peer_call_renegotiate` 51. Clients advertise `CAPABILITY_CALLS` in `Identify` and the
+  server offers it in `Ready`; only connections with both ring or may send call frames
+  (others get `CallError NOT_AVAILABLE`). New error codes `ALREADY_ANSWERED` 27,
+  `CALL_NOT_FOUND` 28, `IN_CALL` 29 and `CALL_LIMIT` 30. message-svc runs the call engine
+  (contact and agent policy, call state in Redis shared by every replica, ring and
+  disconnect timers, `call.started`/`call.ended` audit without SDP or candidates) behind
+  the new internal `Messaging.Call`, `Messaging.CallAttach` and `Messaging.CallDetach`
+  RPCs (`IdentifyResponse.capabilities`, `Notification.call`); the gateway relays the
+  frames to the right devices. Chart values `calls.enabled` (off by default),
+  `calls.ringSeconds` (45), `calls.disconnectGraceSeconds` (30) and
+  `calls.attemptsPerHour` (30) render `PUSH_CALLS_ENABLED`, `PUSH_CALLS_RING_SECONDS`,
+  `PUSH_CALLS_DISCONNECT_GRACE_SECONDS` and `PUSH_CALLS_ATTEMPTS_PER_HOUR`. message-svc
+  serves the call metrics in Prometheus text at `GET /metrics` on its health port.
+  Rolling upgrade: enable `calls.enabled` only after every gateway and message-svc replica
+  runs this version. TURN credentials, call history and the SDK API are coming. Guide:
+  [docs/calls.md](docs/calls.md).
 - **Agent tray v2**: the tray icon is the app's glyph (two linked chat bubbles, `#1b1b1b`
   on a light taskbar, `#ffffff` on a dark one) with a status badge for the most urgent
   agent: green idle, blue working, blue pulsing for starting/stopping/Coda
@@ -260,6 +282,10 @@ Notable changes for consumers of push-messenger. Newest first.
 
 ### Changed
 
+- **Gateway logging**: the gateway never logs WebSocket payloads, even with
+  `RUST_LOG=trace`: the WebSocket library (`tungstenite`) is capped at `debug`, since at
+  `trace` it logs every frame with its content (access tokens, messages, call SDP and ICE
+  candidates). `push_gateway::log_filter` applies the cap to any filter.
 - **Agent bridge**: a card ends the reply before it. When a request opens a card, the
   turn's reply gets its final state (a step still running shows as `pending`) and is not
   edited again; what the agent does after the owner's answer goes into a new reply below
