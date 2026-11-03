@@ -11,6 +11,9 @@
 //! The Node and C bindings (Plan 10) wrap this crate and add no logic. The public types
 //! are therefore plain data: identifiers, strings, numbers and enums, with no lifetimes
 //! or generics.
+//!
+//! The optional feature `calls-media` adds the `media` module: a native WebRTC audio peer for
+//! calls (Rust 1.89 and CMake; docs/calls.md, "Media helper").
 
 mod agent_key;
 mod auth;

@@ -6,6 +6,8 @@
 
 #![allow(dead_code)]
 
+pub mod coturn;
+
 use std::net::SocketAddr;
 use std::time::Duration;
 

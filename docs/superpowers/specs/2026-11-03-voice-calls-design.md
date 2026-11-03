@@ -762,3 +762,39 @@ Decisions taken while implementing §9, beyond or refining it:
   `CallSync` after a reconnect; `ice_servers` in stun-only and TURN REST modes (the HMAC
   checked). Missed calls, the disconnect grace and the frame caps stay covered by the
   gateway tests (PR 1). The media smoke through coturn is PR 6.
+
+### PR 6 (media helper): decisions and deviations
+
+- **Crates.** str0m 0.25 as D21 chose, with default features off and the `aws-lc-rs`
+  backend: its `rust-crypto` backend still builds AWS-LC (dimpl's `rcgen` feature), so a
+  pure-Rust backend saves nothing. Opus through `opus` 0.4 / `opusic-sys` (libopus 1.5,
+  bundled, CMake) instead of `audiopus`, unreleased since 2021. str0m has no TURN client:
+  `turn-client-proto` 0.7 (sans-IO, UDP and TCP). All pass cargo-deny; `ctutils` moved to
+  0.4.4 for RUSTSEC-2026-0385 (a dependency of dimpl).
+- **MSRV.** str0m needs Rust 1.89. The feature is off by default and only push-smoke's
+  tests enable it (a dev-dependency), so the `msrv` job (`cargo +1.85 build --workspace`,
+  no test targets) never compiles it; the crate docs and docs/calls.md §19.1 state 1.89
+  for the feature.
+- **API** (§10.1 refined): `MediaCall::start(&Calls, &IceServers, Role, MediaOptions)`
+  with `Role::Caller { peer }` / `Role::Callee { call_id, offer_sdp }`; the app forwards
+  call events to `MediaCall::handle` (the client has one event stream, owned by the app);
+  `incoming()` takes a `PcmStream` (a `Stream`), `outgoing()` a `PcmSink` that queues up
+  to 5 s and is paced by the helper (one frame per 20 ms) with `clear()` for barge-in;
+  `connected()`, `state()`, `on_ended() -> MediaEnded { reason, duration_s, cause }`
+  with `EndCause::{Server, Local, MediaFailed, Gone, Refused}`; `hangup()`, and drop
+  hangs up. A local hang-up resolves at once (`Local`, `Completed`) without waiting for
+  the server's confirmation.
+- **Gathering before signalling.** The helper gathers (host, server-reflexive, one TURN
+  allocation) before making the offer or answer, which carries every candidate, then
+  sends only an end-of-candidates marker: simpler than trickling and at most
+  `gather_timeout` (5 s) slower. IPv4 only; `turns:` URLs are skipped (no TLS to TURN).
+- **Media failure.** No connection within 30 s of both descriptions, or disconnected for
+  15 s, hangs up with `FAILED` (`EndCause::MediaFailed`).
+- **str0m quirk.** For an offer it answers, str0m 0.25 does not report `MediaAdded` in
+  the output drained right after `accept_offer`, so the helper reads the audio `mid`
+  from its answer.
+- **Test placement.** The E2E smoke is `crates/push-smoke/tests/calls_media.rs` (the
+  plan said push-sdk): push-smoke owns the in-process stack. Three variants (stun-only
+  host candidates; relay-only through coturn over UDP and over TCP), opt-in with
+  `PUSH_CALLS_MEDIA=1`, run by the new `calls-media` CI job. The coturn container helper
+  moved from `browser_calls.rs` to `tests/common/coturn.rs` and publishes UDP too.

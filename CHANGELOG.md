@@ -6,6 +6,17 @@ Notable changes for consumers of push-messenger. Newest first.
 
 ### Added
 
+- **push-sdk media helper** (feature `calls-media`, off by default): `push_sdk::media::MediaCall`
+  places or answers a call through `Calls` and runs its audio natively (str0m for ICE,
+  DTLS-SRTP and RTP; Opus through libopus; TURN over UDP or TCP through
+  `turn-client-proto`, relay-only when the ICE servers include a relay). Apps read and
+  write 16 kHz mono 16-bit PCM in 20 ms frames (`incoming() -> PcmStream`,
+  `outgoing() -> PcmSink` with `clear()` for barge-in), forward call events to
+  `handle()`, and learn the end from `on_ended()` (`MediaEnded` with an `EndCause`).
+  The feature needs Rust 1.89 and CMake; push-sdk without it keeps Rust 1.85. A new CI
+  job `calls-media` runs two SDK clients with the helper through the stack, once direct
+  and twice relay-only through the chart's coturn (UDP and TCP), exchanging tones.
+  Guide: [docs/calls.md §19](docs/calls.md#19-media-helper).
 - **push-sdk calls API**: `Config::calls` (opt-in; advertises `CAPABILITY_CALLS`) and
   `Client::calls() -> Calls` with `available()`, `invite` (the client picks the UUIDv7
   `CallId`), `accept`, `decline`, `cancel`, `hangup`, `send_ice` (with
