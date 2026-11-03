@@ -1,6 +1,6 @@
 {
   "identifier": "default",
-  "description": "The details windows get no permissions: no plugin or core command (tray, menu, image, event, window, ...). The app's own `details` command needs none, since app commands are only checked by the ACL when the app ships an ACL manifest (it does not) or the origin is remote (the page is bundled).",
-  "windows": ["details-*"],
+  "description": "The tray window (label main) gets no permissions: no plugin or core command (tray, menu, image, event, window, ...). The app's own commands need none, since app commands are only checked by the ACL when the app ships an ACL manifest (it does not) or the origin is remote (the page is bundled).",
+  "windows": ["main"],
   "permissions": []
 }

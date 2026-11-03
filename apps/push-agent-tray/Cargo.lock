@@ -2668,6 +2668,7 @@ dependencies = [
  "tauri-plugin-single-instance",
  "tokio",
  "tracing",
+ "winreg",
 ]
 
 [[package]]
