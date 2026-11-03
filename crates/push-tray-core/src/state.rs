@@ -47,19 +47,28 @@ pub enum AgentState {
 /// The tray icon's state, from the least to the most urgent (`Ord` follows this order).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum IconState {
+    /// Connected, idle.
     Normal,
+    /// Working.
     Busy,
+    /// On the way between states: starting, stopping, Coda restarting, reconnecting.
+    Transition,
+    /// Paused for an upgrade.
     Paused,
+    /// Waiting for the owner.
     Waiting,
+    /// Up, but the tray cannot reach it.
     Disconnected,
+    /// Stopped, failed, gave up or not set up.
     Error,
 }
 
 impl IconState {
     /// Every icon state, from the least to the most urgent.
-    pub const ALL: [IconState; 6] = [
+    pub const ALL: [IconState; 7] = [
         IconState::Normal,
         IconState::Busy,
+        IconState::Transition,
         IconState::Paused,
         IconState::Waiting,
         IconState::Disconnected,
@@ -77,7 +86,7 @@ pub fn icon_for(state: &AgentState) -> IconState {
         AgentState::Starting
         | AgentState::Reconnecting
         | AgentState::Restarting
-        | AgentState::Stopping => IconState::Disconnected,
+        | AgentState::Stopping => IconState::Transition,
         AgentState::Stopped
         | AgentState::Failed { .. }
         | AgentState::GaveUp { .. }
@@ -85,9 +94,27 @@ pub fn icon_for(state: &AgentState) -> IconState {
     }
 }
 
-/// The most urgent of `states`; [`IconState::Normal`] when there are none.
-pub fn worst(states: impl IntoIterator<Item = IconState>) -> IconState {
-    states.into_iter().max().unwrap_or(IconState::Normal)
+/// The icon for an agent in `state` whose control channel is `connected` or not: an agent
+/// that is up but unreachable is [`IconState::Disconnected`].
+pub fn icon_for_view(state: &AgentState, connected: bool) -> IconState {
+    let up = matches!(
+        state,
+        AgentState::Idle
+            | AgentState::Working
+            | AgentState::Waiting(_)
+            | AgentState::Paused
+            | AgentState::External { .. }
+    );
+    if up && !connected {
+        IconState::Disconnected
+    } else {
+        icon_for(state)
+    }
+}
+
+/// The most urgent of `states`; `None` when there are none (no agents, no badge).
+pub fn worst(states: impl IntoIterator<Item = IconState>) -> Option<IconState> {
+    states.into_iter().max()
 }
 
 /// The state for people, e.g. "waiting for you (approval)".
@@ -204,10 +231,10 @@ mod tests {
             (AgentState::Waiting(None), IconState::Waiting),
             (AgentState::Waiting(Some("plan".into())), IconState::Waiting),
             (AgentState::Paused, IconState::Paused),
-            (AgentState::Starting, IconState::Disconnected),
-            (AgentState::Reconnecting, IconState::Disconnected),
-            (AgentState::Restarting, IconState::Disconnected),
-            (AgentState::Stopping, IconState::Disconnected),
+            (AgentState::Starting, IconState::Transition),
+            (AgentState::Reconnecting, IconState::Transition),
+            (AgentState::Restarting, IconState::Transition),
+            (AgentState::Stopping, IconState::Transition),
             (AgentState::Stopped, IconState::Error),
             (failed(Some(1), Some(4)), IconState::Error),
             (AgentState::GaveUp { code: Some(1) }, IconState::Error),
@@ -215,6 +242,29 @@ mod tests {
         ];
         for (state, icon) in cases {
             assert_eq!(icon_for(&state), icon, "{state:?}");
+            assert_eq!(icon_for_view(&state, true), icon, "{state:?}");
+        }
+    }
+
+    #[test]
+    fn an_agent_that_is_up_but_not_connected_is_disconnected() {
+        let cases = [
+            (AgentState::Idle, IconState::Disconnected),
+            (AgentState::Working, IconState::Disconnected),
+            (AgentState::Waiting(None), IconState::Disconnected),
+            (AgentState::Paused, IconState::Disconnected),
+            (AgentState::External { task: true }, IconState::Disconnected),
+            (AgentState::Starting, IconState::Transition),
+            (AgentState::Reconnecting, IconState::Transition),
+            (AgentState::Restarting, IconState::Transition),
+            (AgentState::Stopping, IconState::Transition),
+            (AgentState::Stopped, IconState::Error),
+            (failed(Some(1), None), IconState::Error),
+            (AgentState::GaveUp { code: None }, IconState::Error),
+            (AgentState::NotSetUp, IconState::Error),
+        ];
+        for (state, icon) in cases {
+            assert_eq!(icon_for_view(&state, false), icon, "{state:?}");
         }
     }
 
@@ -223,29 +273,43 @@ mod tests {
         let mut sorted = IconState::ALL;
         sorted.sort();
         assert_eq!(sorted, IconState::ALL);
-        assert!(IconState::Paused < IconState::Waiting);
-        assert!(IconState::Waiting < IconState::Disconnected);
+        assert_eq!(
+            IconState::ALL,
+            [
+                IconState::Normal,
+                IconState::Busy,
+                IconState::Transition,
+                IconState::Paused,
+                IconState::Waiting,
+                IconState::Disconnected,
+                IconState::Error,
+            ]
+        );
     }
 
     #[test]
     fn the_worst_icon_wins() {
-        assert_eq!(worst([]), IconState::Normal);
-        assert_eq!(worst([IconState::Busy]), IconState::Busy);
+        assert_eq!(worst([]), None);
+        assert_eq!(worst([IconState::Busy]), Some(IconState::Busy));
         assert_eq!(
             worst([IconState::Normal, IconState::Waiting, IconState::Busy]),
-            IconState::Waiting
+            Some(IconState::Waiting)
         );
         assert_eq!(
             worst([IconState::Waiting, IconState::Paused]),
-            IconState::Waiting
+            Some(IconState::Waiting)
         );
         assert_eq!(
             worst([IconState::Error, IconState::Disconnected, IconState::Normal]),
-            IconState::Error
+            Some(IconState::Error)
         );
         assert_eq!(
             worst([IconState::Paused, IconState::Busy, IconState::Normal]),
-            IconState::Paused
+            Some(IconState::Paused)
+        );
+        assert_eq!(
+            worst([IconState::Busy, IconState::Transition]),
+            Some(IconState::Transition)
         );
     }
 

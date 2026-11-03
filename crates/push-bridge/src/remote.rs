@@ -128,7 +128,7 @@ mod tests {
 
     #[tokio::test]
     async fn asks_the_bridge_and_skips_its_events() {
-        let hub = ControlHub::new("0011223344556677".into());
+        let hub = ControlHub::new("0011223344556677".into(), true);
         let (client, server) = tokio::io::duplex(64 * 1024);
         let _served = hub.serve_stream(server);
         let calls = hub.calls();

@@ -1,6 +1,7 @@
 //! Messenger events: the owner gate, the owner's texts and card answers, sends the
 //! server refused, and the connection.
 
+use push_bridge_control::CardState;
 use push_sdk::{
     CardCheck, ClientMsgId, ConnectionState, ConversationId, Event, Message, MessageKind, SdkError,
     UserId,
@@ -73,6 +74,8 @@ impl<M: Messenger> Core<M> {
             }
             MessageKind::Text if message.conversation_id == self.conversation => {
                 if let Some(text) = message.body {
+                    let time = self.clock.now_ms();
+                    self.control.record(|ring| ring.owner_text(time, &text));
                     self.owner_text(text).await;
                 }
             }
@@ -123,6 +126,10 @@ impl<M: Messenger> Core<M> {
                 let request = self.open.remove(index);
                 let answer = cards::answer_from_values(&request.kind, &values);
                 tracing::info!(event = "card_answered", values = values.len());
+                let time = self.clock.now_ms();
+                let id = card.client_msg_id;
+                self.control
+                    .record(|ring| ring.owner_answer(time, id, &values));
                 self.settle(request, answer).await;
             }
             CardCheck::Refused(refusal) => {
@@ -284,6 +291,7 @@ impl<M: Messenger> Core<M> {
         };
         let request = self.open.remove(index);
         self.cards.close(id);
+        self.peek_card(Some(id), CardState::Declined);
         self.request_closed(&request.kind, "declined");
         if let Some(responder) = request.responder {
             responder.answer(Answer::Decline);

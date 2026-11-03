@@ -118,11 +118,16 @@ impl<M: Messenger> Core<M> {
             }
             match pages[update.page] {
                 Some(id) if !update.new => {
-                    if let Err(error) =
-                        self.messenger
-                            .edit_rich(self.conversation, id, &update.body)
+                    match self
+                        .messenger
+                        .edit_rich(self.conversation, id, &update.body)
                     {
-                        tracing::warn!(event = "edit_failed", code = error.code());
+                        Ok(()) => {
+                            let time = self.clock.now_ms();
+                            self.control
+                                .record(|ring| ring.edited(time, id, &update.body));
+                        }
+                        Err(error) => tracing::warn!(event = "edit_failed", code = error.code()),
                     }
                 }
                 _ => pages[update.page] = self.send_rich(&update.body),

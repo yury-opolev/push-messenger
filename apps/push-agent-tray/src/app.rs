@@ -1,11 +1,16 @@
-//! The shell around `push-tray-core`: the tray icon and its native menu, the details
-//! windows, notifications and dialogs. The supervisor does the work; this module turns its
-//! views into a menu, a tooltip and an icon, and menu clicks into supervisor commands.
+//! The shell around `push-tray-core`: the tray icon (the glyph with a status badge) and its
+//! slim native menu, notifications and the menu's dialogs. The supervisor does the work;
+//! this module turns its views into a menu, a tooltip and an icon, and menu clicks into
+//! supervisor commands or the tray window ([`crate::window`], whose page talks to the
+//! commands in [`crate::commands`]).
 //!
-//! Threading: menu events and synchronous commands run on the main thread, and Tauri's
-//! menu and tray calls from other threads wait for the main thread. So nothing holds
-//! [`Shell::state`] while calling into Tauri, and only the refresher task touches the tray.
+//! Threading: menu, tray and window events and synchronous commands run on the main thread,
+//! and Tauri's menu, tray and window calls from other threads wait for the main thread. So
+//! nothing holds [`Shell::state`] while calling into Tauri, only the refresher task touches
+//! the tray, the page's commands are all async (off the main thread), and windows are built
+//! off the main thread (building a WebView2 window there can deadlock).
 
+use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,102 +19,165 @@ use std::time::Duration;
 
 use push_bridge_control::instance_id;
 use push_tray_core::autostart::Autostart;
-use push_tray_core::details::{self, DetailsView};
-use push_tray_core::menu::{self, Item, MenuAction};
+use push_tray_core::icon::{self, Frame, Theme};
+use push_tray_core::menu::{self, Item, MenuCommand};
 use push_tray_core::schedtask::{self, Offer, PowerShellScheduler, TaskFor};
 use push_tray_core::state::IconState;
 use push_tray_core::supervisor::{
-    self, Command, EndpointConnector, InstanceSpec, InstanceView, Notice, ProcessSpawner,
-    Supervisor,
+    self, Command, ControlLink, EndpointConnector, InstanceSpec, InstanceView, Notice,
+    ProcessSpawner, Supervisor,
 };
 use push_tray_core::tray_config::TrayConfig;
-use push_tray_core::{icon, open::open_path, paths};
+use push_tray_core::{paths, peek};
 use tauri::image::Image;
-use tauri::menu::{
-    CheckMenuItem, IsMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu,
-};
-use tauri::tray::TrayIconBuilder;
-use tauri::{AppHandle, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder, Wry};
+use tauri::menu::{CheckMenuItem, IconMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
+use tauri::{AppHandle, Manager, RunEvent, Wry};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 use tauri_plugin_notification::NotificationExt;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Notify, mpsc, oneshot, watch};
+
+use crate::{commands, theme, window};
 
 const TRAY_ID: &str = "push-agent-tray";
-const TITLE: &str = "push-agent-tray";
+pub const TITLE: &str = "push-agent-tray";
 const ICON_SIZE: u32 = 32;
+const DOT_SIZE: u32 = 16;
 const COMMAND_BUFFER: usize = 64;
+/// How many peek entries the menu line is taken from.
+const MENU_PEEK_LIMIT: usize = 10;
 /// How long the switch-over waits for the supervisor to notice that a task's bridge (gone
 /// by then) closed its control channel before starting the instance under the tray.
 const SWITCH_WAIT: Duration = Duration::from_secs(5);
-const DETAILS_PAGE: &str = "details.html";
-const DETAILS_SIZE: (f64, f64) = (420.0, 520.0);
+pub const SWITCHING: &str = "A switch-over is running. Try again once it has finished.";
 
 /// The app's state (managed by Tauri).
-struct Shell {
-    config_path: PathBuf,
+pub struct Shell {
+    pub config_path: PathBuf,
     default_dir: PathBuf,
-    autostart: Box<dyn Autostart + Send + Sync>,
+    pub autostart: Box<dyn Autostart + Send + Sync>,
     commands: mpsc::Sender<Command>,
-    views: watch::Receiver<Vec<InstanceView>>,
-    refresh: mpsc::UnboundedSender<()>,
+    pub views: watch::Receiver<Vec<InstanceView>>,
+    /// Asks the refresher to redraw; `true` also rebuilds the menu.
+    refresh: mpsc::UnboundedSender<bool>,
+    /// Wakes the menu peek (its setting changed).
+    pub peek_wake: Notify,
     supervisor: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
     quitting: AtomicBool,
+    /// A window build is under way (later opens only record the selected agent).
+    pub building: AtomicBool,
     state: Mutex<TrayState>,
 }
 
-struct TrayState {
-    config: TrayConfig,
+pub struct TrayState {
+    pub config: TrayConfig,
     /// tray.json could not be read or written.
-    config_error: Option<String>,
+    pub config_error: Option<String>,
     /// tray.json was read: changes may be saved (a corrupt file is never overwritten).
-    config_writable: bool,
+    pub config_writable: bool,
     /// The Scheduled Tasks that run configured instances.
-    found: Vec<TaskFor>,
-    tray_autostart: bool,
-    switching: bool,
+    pub found: Vec<TaskFor>,
+    pub tray_autostart: bool,
+    pub switching: bool,
+    /// The agent the window should select next (asked for by the menu).
+    pub selected: Option<String>,
+    /// The page reported `prefers-reduced-motion: reduce`.
+    pub page_reduce_motion: bool,
+    /// The agents' last lines for the menu (with the menu peek on), by instance id.
+    pub menu_lines: HashMap<String, String>,
 }
 
 impl Shell {
-    fn state(&self) -> MutexGuard<'_, TrayState> {
+    pub fn state(&self) -> MutexGuard<'_, TrayState> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn send(&self, command: Command) {
-        if self.commands.try_send(command).is_err() {
+    pub fn send(&self, command: Command) -> Result<(), String> {
+        self.commands.try_send(command).map_err(|_| {
             eprintln!("push-agent-tray: the supervisor is busy or gone; command dropped");
-        }
+            "The tray is busy. Try again.".to_owned()
+        })
     }
 
-    fn request_refresh(&self) {
-        let _ = self.refresh.send(());
+    /// Redraws the tray and rebuilds its menu.
+    pub fn request_refresh(&self) {
+        let _ = self.refresh.send(true);
+    }
+
+    /// Redraws the tray (the icon and tooltip; the menu only when it changed).
+    pub fn nudge(&self) {
+        let _ = self.refresh.send(false);
     }
 
     /// Hands the configured instances (and the tasks that run them) to the supervisor.
-    fn set_instances(&self) {
+    pub fn set_instances(&self) {
         let specs: Vec<InstanceSpec> = {
             let state = self.state();
             supervisor::specs(&state.config, &state.found)
         };
-        self.send(Command::SetInstances(specs));
+        let _ = self.send(Command::SetInstances(specs));
         self.request_refresh();
     }
 
-    fn view(&self, id: &str) -> Option<InstanceView> {
+    pub fn view(&self, id: &str) -> Option<InstanceView> {
         self.views
             .borrow()
             .iter()
             .find(|view| view.id == id)
             .cloned()
     }
+
+    /// Why tray.json may not be changed now, if it may not.
+    pub fn refusal(&self) -> Option<String> {
+        let state = self.state();
+        if !state.config_writable {
+            return Some(self.unwritable());
+        }
+        state.switching.then(|| SWITCHING.to_owned())
+    }
+
+    fn unwritable(&self) -> String {
+        format!(
+            "{} could not be read, so the tray does not change it. Fix or delete it, then restart the tray.",
+            self.config_path.display()
+        )
+    }
+
+    /// Edits a copy of tray.json with `edit` and saves it when `edit` returns true; refused
+    /// when the file could not be read or a switch-over runs.
+    pub fn edit_config(
+        &self,
+        edit: impl FnOnce(&mut TrayConfig) -> Result<bool, String>,
+    ) -> Result<bool, String> {
+        let mut state = self.state();
+        if !state.config_writable {
+            return Err(self.unwritable());
+        }
+        if state.switching {
+            return Err(SWITCHING.to_owned());
+        }
+        let mut config = state.config.clone();
+        if !edit(&mut config)? {
+            return Ok(false);
+        }
+        config
+            .save(&self.config_path)
+            .map_err(|error| format!("tray.json could not be saved: {error}"))?;
+        state.config = config;
+        Ok(true)
+    }
 }
 
 pub fn run() {
     let app = tauri::Builder::default()
-        // First: a second launch hands over to this one and exits.
-        .plugin(tauri_plugin_single_instance::init(|_, _, _| {}))
+        // First: a second launch hands over to this one (which shows its window) and exits.
+        .plugin(tauri_plugin_single_instance::init(|app, _, _| {
+            window::open(app, None);
+        }))
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![details])
+        .invoke_handler(commands::handler())
+        .on_window_event(window::on_event)
         .setup(|app| {
             setup(app.handle())?;
             Ok(())
@@ -117,7 +185,7 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("push-agent-tray could not start");
     app.run(|_, event| {
-        // Closing the last details window does not quit the tray; Quit does (with a code).
+        // The hidden window does not quit the tray; Quit does (with a code).
         if let RunEvent::ExitRequested {
             code: None, api, ..
         } = event
@@ -149,17 +217,22 @@ fn setup(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
         commands,
         views: views.clone(),
         refresh,
+        peek_wake: Notify::new(),
         supervisor: Mutex::new(Some(handle)),
         quitting: AtomicBool::new(false),
+        building: AtomicBool::new(false),
         state: Mutex::new(state),
     });
+    let theme = theme::current();
     TrayIconBuilder::with_id(TRAY_ID)
-        .icon(tray_image(IconState::Normal))
+        .icon(tray_image(theme, None, Frame::Full))
         .tooltip(TITLE)
-        .show_menu_on_left_click(true)
+        .show_menu_on_left_click(false)
         .on_menu_event(on_menu_event)
+        .on_tray_icon_event(on_tray_event)
         .build(app)?;
-    tauri::async_runtime::spawn(refresher(app.clone(), views, refresh_receiver));
+    tauri::async_runtime::spawn(refresher(app.clone(), views.clone(), refresh_receiver));
+    tauri::async_runtime::spawn(menu_peek(app.clone(), views));
     tauri::async_runtime::spawn(notify(app.clone(), notices));
     tauri::async_runtime::spawn(begin(app.clone()));
     app.state::<Shell>().request_refresh();
@@ -192,6 +265,9 @@ fn load_config(path: &Path, default_dir: &Path) -> TrayState {
         found: Vec::new(),
         tray_autostart: false,
         switching: false,
+        selected: None,
+        page_reduce_motion: false,
+        menu_lines: HashMap::new(),
     }
 }
 
@@ -251,7 +327,7 @@ async fn begin(app: AppHandle) {
 }
 
 /// Looks for the Scheduled Tasks that run the configured instances again.
-async fn rescan(app: &AppHandle) {
+pub async fn rescan(app: &AppHandle) {
     let shell = app.state::<Shell>();
     let dirs = dirs(&shell.state().config);
     let default_dir = shell.default_dir.clone();
@@ -261,22 +337,39 @@ async fn rescan(app: &AppHandle) {
     shell.state().found = found;
 }
 
+/// The tray icon's look.
+#[derive(Clone, Copy, PartialEq)]
+struct Look {
+    theme: Theme,
+    badge: Option<IconState>,
+    frame: Frame,
+}
+
 /// What the tray shows.
 #[derive(PartialEq)]
 struct Shown {
     menu: menu::Menu,
     tooltip: String,
-    icon: IconState,
+    look: Look,
 }
 
-/// Rebuilds the tray from the views: on every change, and on request (always rebuilding
-/// the menu then, so that a check item clicked natively shows the real state again).
+/// Rebuilds the tray from the views: on every change, on request (rebuilding the menu
+/// then when asked, so that a check item clicked natively shows the real state again),
+/// when the taskbar theme changes (read every [`theme::POLL`]), and every
+/// [`icon::PULSE_FRAME`] while the badge pulses.
 async fn refresher(
     app: AppHandle,
     mut views: watch::Receiver<Vec<InstanceView>>,
-    mut requests: mpsc::UnboundedReceiver<()>,
+    mut requests: mpsc::UnboundedReceiver<bool>,
 ) {
     let mut shown: Option<Shown> = None;
+    let mut theme = theme::current();
+    let mut theme_poll = tokio::time::interval(theme::POLL);
+    theme_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut pulse = tokio::time::interval(icon::PULSE_FRAME);
+    pulse.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut animating = false;
+    let mut frame = Frame::Full;
     loop {
         let force = tokio::select! {
             changed = views.changed() => {
@@ -286,20 +379,47 @@ async fn refresher(
                 false
             }
             request = requests.recv() => {
-                if request.is_none() {
-                    return;
+                match request {
+                    Some(force) => force,
+                    None => return,
                 }
-                true
+            }
+            _ = theme_poll.tick() => {
+                theme = theme::current();
+                false
+            }
+            _ = pulse.tick(), if animating => {
+                frame = match frame {
+                    Frame::Full => Frame::Dim,
+                    Frame::Dim => Frame::Full,
+                };
+                false
             }
         };
         let current = views.borrow_and_update().clone();
+        let badge = menu::icon(&current);
         let next = {
             let shell = app.state::<Shell>();
             let state = shell.state();
+            let reduce_motion = state.config.reduce_motion || state.page_reduce_motion;
+            let pulsing = badge.is_some_and(|badge| icon::animated(badge, reduce_motion));
+            if pulsing && !animating {
+                pulse.reset();
+            }
+            animating = pulsing;
+            if !animating {
+                frame = Frame::Full;
+            }
             let offer = if state.switching {
                 Offer::None
             } else {
                 schedtask::offer(&state.found)
+            };
+            let no_lines = HashMap::new();
+            let lines = if state.config.menu_peek {
+                &state.menu_lines
+            } else {
+                &no_lines
             };
             Shown {
                 menu: menu::build(
@@ -307,9 +427,14 @@ async fn refresher(
                     state.tray_autostart,
                     &offer,
                     state.config_error.as_deref(),
+                    lines,
                 ),
                 tooltip: menu::tooltip(&current),
-                icon: menu::icon(&current),
+                look: Look {
+                    theme,
+                    badge,
+                    frame,
+                },
             }
         };
         if let Err(error) = apply(&app, shown.as_ref(), &next, force) {
@@ -329,51 +454,124 @@ fn apply(app: &AppHandle, shown: Option<&Shown>, next: &Shown, force: bool) -> t
     if shown.is_none_or(|shown| shown.tooltip != next.tooltip) {
         tray.set_tooltip(Some(&next.tooltip))?;
     }
-    if shown.is_none_or(|shown| shown.icon != next.icon) {
-        tray.set_icon(Some(tray_image(next.icon)))?;
+    if shown.is_none_or(|shown| shown.look != next.look) {
+        let look = next.look;
+        tray.set_icon(Some(tray_image(look.theme, look.badge, look.frame)))?;
     }
     Ok(())
 }
 
-fn tray_image(state: IconState) -> Image<'static> {
-    Image::new_owned(icon::rgba(state, ICON_SIZE), ICON_SIZE, ICON_SIZE)
+fn tray_image(theme: Theme, badge: Option<IconState>, frame: Frame) -> Image<'static> {
+    Image::new_owned(
+        icon::tray_rgba(theme, badge, frame, ICON_SIZE),
+        ICON_SIZE,
+        ICON_SIZE,
+    )
 }
 
 fn native_menu(app: &AppHandle, model: &menu::Menu) -> tauri::Result<Menu<Wry>> {
     let menu = Menu::new(app)?;
     for item in &model.items {
-        append(app, item, &|native| menu.append(native))?;
+        match item {
+            Item::Agent { id, label, icon } => {
+                let dot = Image::new_owned(icon::dot_rgba(*icon, DOT_SIZE), DOT_SIZE, DOT_SIZE);
+                menu.append(&IconMenuItem::with_id(
+                    app,
+                    id.as_str(),
+                    label,
+                    true,
+                    Some(dot),
+                    None::<&str>,
+                )?)?;
+            }
+            Item::Action { id, label, enabled } => menu.append(&MenuItem::with_id(
+                app,
+                id.as_str(),
+                label,
+                *enabled,
+                None::<&str>,
+            )?)?,
+            Item::Check { id, label, checked } => menu.append(&CheckMenuItem::with_id(
+                app,
+                id.as_str(),
+                label,
+                true,
+                *checked,
+                None::<&str>,
+            )?)?,
+            Item::Separator => menu.append(&PredefinedMenuItem::separator(app)?)?,
+            Item::Info(text) => menu.append(&MenuItem::new(app, text, false, None::<&str>)?)?,
+        }
     }
     Ok(menu)
 }
 
-type Append<'a> = &'a dyn Fn(&dyn IsMenuItem<Wry>) -> tauri::Result<()>;
-
-fn append(app: &AppHandle, item: &Item, to: Append<'_>) -> tauri::Result<()> {
-    match item {
-        Item::Action { id, label, enabled } => to(&MenuItem::with_id(
-            app,
-            id.as_str(),
-            label,
-            *enabled,
-            None::<&str>,
-        )?),
-        Item::Check { id, label, checked } => to(&CheckMenuItem::with_id(
-            app,
-            id.as_str(),
-            label,
-            true,
-            *checked,
-            None::<&str>,
-        )?),
-        Item::Separator => to(&PredefinedMenuItem::separator(app)?),
-        Item::Info(text) => to(&MenuItem::new(app, text, false, None::<&str>)?),
-        Item::Submenu { label, items } => {
-            let submenu = Submenu::new(app, label, true)?;
-            for child in items {
-                append(app, child, &|native| submenu.append(native))?;
+/// With the menu peek on: each connected agent's last line (for those whose chat peek is
+/// shown), fetched once on connect and again whenever its `peek_changes` grows. Never
+/// fetches with the menu peek off.
+async fn menu_peek(app: AppHandle, mut views: watch::Receiver<Vec<InstanceView>>) {
+    let shell = app.state::<Shell>();
+    let mut fetched: HashMap<String, (u64, ControlLink)> = HashMap::new();
+    loop {
+        let current = views.borrow_and_update().clone();
+        let targets: Vec<(String, u64, ControlLink)> = {
+            let state = shell.state();
+            if state.config.menu_peek {
+                current
+                    .iter()
+                    .filter(|view| {
+                        state
+                            .config
+                            .find(&view.dir)
+                            .is_none_or(|instance| instance.show_peek)
+                    })
+                    .filter_map(|view| {
+                        let control = view.control.clone()?;
+                        Some((view.id.clone(), view.peek_changes, control))
+                    })
+                    .collect()
+            } else {
+                Vec::new()
             }
-            to(&submenu)
+        };
+        fetched.retain(|id, _| targets.iter().any(|(target, _, _)| target == id));
+        let mut changed = false;
+        for (id, changes, control) in targets {
+            if fetched
+                .get(&id)
+                .is_some_and(|(seen, link)| *seen == changes && *link == control)
+            {
+                continue;
+            }
+            let line = control
+                .peek(MENU_PEEK_LIMIT)
+                .await
+                .ok()
+                .and_then(|entries| peek::menu_line(&entries));
+            fetched.insert(id.clone(), (changes, control));
+            let mut state = shell.state();
+            let old = match line {
+                Some(line) => state.menu_lines.insert(id.clone(), line.clone()) != Some(line),
+                None => state.menu_lines.remove(&id).is_some(),
+            };
+            changed |= old;
+        }
+        {
+            let mut state = shell.state();
+            let before = state.menu_lines.len();
+            state.menu_lines.retain(|id, _| fetched.contains_key(id));
+            changed |= state.menu_lines.len() != before;
+        }
+        if changed {
+            shell.nudge();
+        }
+        tokio::select! {
+            changed = views.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+            () = shell.peek_wake.notified() => {}
         }
     }
 }
@@ -384,7 +582,7 @@ async fn notify(app: AppHandle, mut notices: mpsc::Receiver<Notice>) {
             .notification()
             .builder()
             .title(TITLE)
-            .body(details::notice_text(&notice))
+            .body(push_tray_core::window::notice_text(&notice))
             .show();
         if let Err(error) = shown {
             eprintln!("push-agent-tray: notification failed: {error}");
@@ -393,7 +591,7 @@ async fn notify(app: AppHandle, mut notices: mpsc::Receiver<Notice>) {
 }
 
 /// An error or information box (does not block).
-fn message(app: &AppHandle, text: impl Into<String>, kind: MessageDialogKind) {
+pub fn message(app: &AppHandle, text: impl Into<String>, kind: MessageDialogKind) {
     app.dialog()
         .message(text)
         .title(TITLE)
@@ -402,214 +600,115 @@ fn message(app: &AppHandle, text: impl Into<String>, kind: MessageDialogKind) {
 }
 
 fn on_menu_event(app: &AppHandle, event: MenuEvent) {
-    let id: &str = event.id().as_ref();
-    match id {
-        menu::ADD_FOLDER => add_folder(app),
-        menu::START_AT_LOGON => toggle_tray_autostart(app),
-        menu::SWITCH_OVER => confirm_switch_over(app),
-        menu::QUIT => quit(app),
-        _ => {
-            if let Some((action, instance)) = menu::parse_id(id) {
-                agent_action(app, action, &instance);
-            }
+    match menu::parse(event.id().as_ref()) {
+        Some(MenuCommand::OpenAgent(id)) => window::open(app, Some(id)),
+        Some(MenuCommand::Open) => window::open(app, None),
+        Some(MenuCommand::AddFolder) => add_folder(app),
+        Some(MenuCommand::StartAtLogon) => toggle_tray_autostart(app),
+        Some(MenuCommand::SwitchOver) => confirm_switch_over(app),
+        Some(MenuCommand::Quit) => quit(app),
+        None => {}
+    }
+}
+
+/// A left click opens the window; a right click shows the menu.
+fn on_tray_event(tray: &TrayIcon, event: TrayIconEvent) {
+    if let TrayIconEvent::Click {
+        button: MouseButton::Left,
+        button_state: MouseButtonState::Up,
+        ..
+    } = event
+    {
+        window::open(tray.app_handle(), None);
+    }
+}
+
+/// Refuses (with a message box) to change tray.json when it could not be read or a
+/// switch-over runs.
+fn refuse_menu_edit(app: &AppHandle) -> bool {
+    let refusal = app.state::<Shell>().refusal();
+    match refusal {
+        Some(text) => {
+            message(app, text, MessageDialogKind::Error);
+            true
         }
+        None => false,
     }
 }
 
-fn agent_action(app: &AppHandle, action: MenuAction, instance: &str) {
-    let shell = app.state::<Shell>();
-    let Some(view) = shell.view(instance) else {
-        return;
-    };
-    let dir = view.dir.clone();
-    match action {
-        MenuAction::Start => shell.send(Command::Start(dir)),
-        MenuAction::Stop => shell.send(Command::Stop(dir)),
-        MenuAction::RestartBackend => shell.send(Command::RestartBackend(dir)),
-        MenuAction::Reconnect => shell.send(Command::Reconnect(dir)),
-        MenuAction::Pause => shell.send(Command::Pause(dir)),
-        MenuAction::Resume => shell.send(Command::Resume(dir)),
-        MenuAction::OpenLog => {
-            let log = menu::log_path(&dir);
-            if log.is_file() {
-                open(app, &log);
-            } else {
-                message(
-                    app,
-                    format!("{} has no log yet ({}).", view.name, log.display()),
-                    MessageDialogKind::Info,
-                );
-            }
-        }
-        MenuAction::OpenFolder => open(app, &dir),
-        MenuAction::Details => show_details(app, &view),
-    }
-}
-
-fn open(app: &AppHandle, path: &Path) {
-    if let Err(error) = open_path(path) {
-        message(
-            app,
-            format!("Could not open {}: {error}", path.display()),
-            MessageDialogKind::Error,
-        );
-    }
-}
-
-/// The agent's details window, focused when it is already open.
-fn show_details(app: &AppHandle, view: &InstanceView) {
-    let label = details::window_label(&view.id);
-    if let Some(window) = app.get_webview_window(&label) {
-        let _ = window.unminimize();
-        let _ = window.set_focus();
+fn add_folder(app: &AppHandle) {
+    if refuse_menu_edit(app) {
         return;
     }
-    let title = details::window_title(&view.name);
     let app = app.clone();
-    // Built off the main thread: building a WebView2 window there can deadlock.
     tauri::async_runtime::spawn(async move {
-        let built = WebviewWindowBuilder::new(&app, label, WebviewUrl::App(DETAILS_PAGE.into()))
-            .title(title)
-            .inner_size(DETAILS_SIZE.0, DETAILS_SIZE.1)
-            .build();
-        if let Err(error) = built {
-            message(
-                &app,
-                format!("Could not open the details: {error}"),
-                MessageDialogKind::Error,
-            );
+        let Some(dir) = pick_folder(&app).await else {
+            return;
+        };
+        if let Err(error) = add_dir(&app, &dir).await {
+            message(&app, error, MessageDialogKind::Error);
         }
     });
 }
 
-/// The `details` command: the details of the agent whose window asks. Content-free.
-#[tauri::command]
-fn details(
-    window: tauri::WebviewWindow,
-    shell: tauri::State<'_, Shell>,
-) -> Result<DetailsView, String> {
-    let id = details::instance_of_window(window.label())
-        .ok_or_else(|| "not a details window".to_owned())?;
-    shell
-        .view(id)
-        .map(|view| details::details_view(&view))
-        .ok_or_else(|| "this agent is no longer in the tray".to_owned())
-}
-
-/// Refuses to change tray.json when it could not be read (it is never overwritten).
-fn config_writable(app: &AppHandle) -> bool {
-    let shell = app.state::<Shell>();
-    let writable = shell.state().config_writable;
-    if !writable {
-        message(
-            app,
-            format!(
-                "{} could not be read, so the tray does not change it. Fix or delete it, then restart the tray.",
-                shell.config_path.display()
-            ),
-            MessageDialogKind::Error,
-        );
-    }
-    writable
-}
-
-fn add_folder(app: &AppHandle) {
-    if !config_writable(app) {
-        return;
-    }
-    if refuse_while_switching(app) {
-        return;
-    }
-    let handle = app.clone();
+/// The folder the user picks (none when cancelled).
+pub async fn pick_folder(app: &AppHandle) -> Option<PathBuf> {
+    let (sender, receiver) = oneshot::channel();
     app.dialog()
         .file()
         .set_title("Add agent folder")
         .pick_folder(move |folder| {
-            let Some(dir) = folder.and_then(|folder| folder.into_path().ok()) else {
-                return;
-            };
-            tauri::async_runtime::spawn(add_dir(handle, dir));
+            let _ = sender.send(folder.and_then(|folder| folder.into_path().ok()));
         });
+    receiver.await.ok().flatten()
 }
 
-const SWITCHING: &str = "A switch-over is running. Try again once it has finished.";
-
-/// Tells the user to try again when a switch-over is running (it rewrites tray.json).
-fn refuse_while_switching(app: &AppHandle) -> bool {
-    let switching = app.state::<Shell>().state().switching;
-    if switching {
-        message(app, SWITCHING, MessageDialogKind::Info);
+/// Adds the bridge folder `dir` to tray.json and the supervisor; its instance id.
+pub async fn add_dir(app: &AppHandle, dir: &Path) -> Result<String, String> {
+    let added = app.state::<Shell>().edit_config(|config| {
+        config
+            .add(dir)
+            .map_err(|error| format!("Could not add {}: {error}", dir.display()))
+    })?;
+    if !added {
+        return Err(format!("{} is already in the tray.", dir.display()));
     }
-    switching
-}
-
-async fn add_dir(app: AppHandle, dir: PathBuf) {
-    let added = {
-        let shell = app.state::<Shell>();
-        let mut state = shell.state();
-        if state.switching {
-            drop(state);
-            message(&app, SWITCHING, MessageDialogKind::Info);
-            return;
-        }
-        let mut config = state.config.clone();
-        match config.add(&dir) {
-            Ok(true) => config.save(&shell.config_path).map(|()| {
-                state.config = config;
-                true
-            }),
-            other => other,
-        }
-    };
-    match added {
-        Ok(true) => {
-            rescan(&app).await;
-            app.state::<Shell>().set_instances();
-        }
-        Ok(false) => message(
-            &app,
-            format!("{} is already in the tray.", dir.display()),
-            MessageDialogKind::Info,
-        ),
-        Err(error) => message(
-            &app,
-            format!("Could not add {}: {error}", dir.display()),
-            MessageDialogKind::Error,
-        ),
-    }
+    rescan(app).await;
+    app.state::<Shell>().set_instances();
+    Ok(instance_id(dir))
 }
 
 fn toggle_tray_autostart(app: &AppHandle) {
     let app = app.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let shell = app.state::<Shell>();
-        let on = !shell.state().tray_autostart;
-        let result = shell.autostart.set(on);
-        let enabled = shell.autostart.enabled().unwrap_or(on && result.is_ok());
-        shell.state().tray_autostart = enabled;
-        shell.request_refresh();
-        if let Err(error) = result {
-            message(
-                &app,
-                format!("Could not change the start at logon: {error}"),
-                MessageDialogKind::Error,
-            );
+    tauri::async_runtime::spawn(async move {
+        let on = !app.state::<Shell>().state().tray_autostart;
+        if let Err(error) = set_tray_autostart(&app, on).await {
+            message(&app, error, MessageDialogKind::Error);
         }
     });
 }
 
-fn confirm_switch_over(app: &AppHandle) {
-    if !config_writable(app) {
+/// Turns the tray's own start at logon on or off.
+pub async fn set_tray_autostart(app: &AppHandle, on: bool) -> Result<(), String> {
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let shell = app.state::<Shell>();
+        let result = shell.autostart.set(on);
+        let enabled = shell.autostart.enabled().unwrap_or(on && result.is_ok());
+        shell.state().tray_autostart = enabled;
+        shell.request_refresh();
+        result.map_err(|error| format!("Could not change the start at logon: {error}"))
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// Asks before switching from the Scheduled Tasks (a native dialog), then switches.
+pub fn confirm_switch_over(app: &AppHandle) {
+    if refuse_menu_edit(app) {
         return;
     }
-    let found = {
-        let shell = app.state::<Shell>();
-        let state = shell.state();
-        if state.switching {
-            return;
-        }
-        state.found.clone()
-    };
+    let found = app.state::<Shell>().state().found.clone();
     if found.is_empty() {
         return;
     }
@@ -707,7 +806,7 @@ async fn switch_over(app: AppHandle) {
         let gone =
             views.wait_for(|views| views.iter().any(|view| view.id == id && !view.connected));
         let _ = tokio::time::timeout(SWITCH_WAIT, gone).await;
-        shell.send(Command::Start(dir));
+        let _ = shell.send(Command::Start(dir));
     }
     if let Err(error) = saved {
         message(
@@ -729,7 +828,7 @@ async fn switch_over(app: AppHandle) {
 }
 
 /// Stops the bridges the tray started (the others keep running), then exits.
-fn quit(app: &AppHandle) {
+pub fn quit(app: &AppHandle) {
     let shell = app.state::<Shell>();
     if shell.quitting.swap(true, Ordering::SeqCst) {
         return;

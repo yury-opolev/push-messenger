@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use push_bridge_control::{AgentInfo, BridgeState};
+use push_bridge_control::{AgentInfo, BridgeState, CardState, PeekKind};
 use push_sdk::{
     ActivityState, CardBook, ClientMsgId, ConnectionState, ConversationId, Event, SdkError, UserId,
 };
@@ -418,17 +418,37 @@ impl<M: Messenger> Core<M> {
     /// Sends `text`, the bridge's own words, as `agent.reply@1` replies (masked, paged).
     fn reply(&self, text: &str) {
         for body in reply_bodies(None, text) {
-            self.send_rich(&body);
+            self.send_rich_as(&body, PeekKind::Note);
         }
     }
 
+    /// Sends `body` for the agent (its text is a reply in the peek).
     fn send_rich(&self, body: &str) -> Option<ClientMsgId> {
+        self.send_rich_as(body, PeekKind::Reply)
+    }
+
+    /// Sends `body` and records it in the peek, its text as `kind`.
+    fn send_rich_as(&self, body: &str, kind: PeekKind) -> Option<ClientMsgId> {
         match self.messenger.send_rich(self.conversation, body) {
-            Ok(id) => Some(id),
+            Ok(id) => {
+                let time = self.clock.now_ms();
+                self.control
+                    .record(|ring| ring.sent(time, Some(id), body, kind));
+                Some(id)
+            }
             Err(error) => {
                 tracing::warn!(event = "send_failed", code = error.code());
                 None
             }
+        }
+    }
+
+    /// Sets the peek's state of `card` (if any).
+    fn peek_card(&self, card: Option<ClientMsgId>, state: CardState) {
+        if let Some(card) = card {
+            self.control.record(|ring| {
+                ring.card_state(card, state);
+            });
         }
     }
 
@@ -527,6 +547,7 @@ impl<M: Messenger> Core<M> {
             if let Some(card) = request.card {
                 self.cards.close(card);
             }
+            self.peek_card(request.card, CardState::Declined);
             self.request_closed(&request.kind, "declined");
         }
         if !open.is_empty() {

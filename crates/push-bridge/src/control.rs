@@ -3,21 +3,25 @@
 //! core emits, and hands the actions to the bridge as [`ControlCall`]s.
 //!
 //! Everything that goes out here is content-free (see `push_bridge_control::protocol`):
-//! states, counts, names and error codes, never message text.
+//! states, counts, names and error codes, never message text. The one exception is the
+//! `peek` response: the owner conversation's last messages, masked, from the in-memory
+//! [`PeekRing`] (off with `"peek": false`); its `peek_changed` event carries nothing.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use push_bridge_control::transport::Listener;
 use push_bridge_control::{
-    BridgeState, Call, ErrorBody, Event, EventLine, MAX_LINE, PROTOCOL, PauseParams, Response,
-    Status, encode, now_ms, parse_request,
+    BridgeState, Call, ErrorBody, Event, EventLine, MAX_LINE, PEEK_DISABLED, PROTOCOL, PauseParams,
+    PeekEntry, PeekResult, Response, Status, encode, now_ms, parse_request, peek_limit,
 };
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
+
+use crate::peek::PeekRing;
 
 /// Connections served at once; more are closed at once.
 pub const MAX_CONNECTIONS: usize = 8;
@@ -76,25 +80,71 @@ pub fn error(code: &str, message: impl Into<String>) -> ErrorBody {
     }
 }
 
-/// The bridge's side of the hub: the status snapshot and the events.
+/// The chat peek shared by the handles: off, or the ring.
+struct PeekShared {
+    enabled: bool,
+    ring: StdMutex<PeekRing>,
+}
+
+/// The bridge's side of the hub: the status snapshot, the events and the chat peek.
 #[derive(Clone)]
 pub struct ControlHandle {
     status: Arc<watch::Sender<Status>>,
     events: broadcast::Sender<EventLine>,
+    peek: Arc<PeekShared>,
 }
 
 impl ControlHandle {
-    fn new(status: Status) -> Self {
+    fn new(status: Status, peek: bool) -> Self {
         let (events, _) = broadcast::channel(EVENT_BUFFER);
         Self {
             status: Arc::new(watch::Sender::new(status)),
             events,
+            peek: Arc::new(PeekShared {
+                enabled: peek,
+                ring: StdMutex::new(PeekRing::new()),
+            }),
         }
     }
 
-    /// A handle with no hub (for tests and `"control": false`): updates go nowhere.
+    /// A handle with no hub (for tests and `"control": false`): updates go nowhere and
+    /// the peek is off.
     pub fn detached() -> Self {
-        Self::new(Status::default())
+        Self::new(Status::default(), false)
+    }
+
+    /// Changes the peek's ring, then emits `peek_changed` when its entries changed;
+    /// nothing while the peek is off.
+    pub fn record(&self, change: impl FnOnce(&mut PeekRing)) {
+        if !self.peek.enabled {
+            return;
+        }
+        let changed = {
+            let mut ring = self
+                .peek
+                .ring
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let before = ring.revision();
+            change(&mut ring);
+            ring.revision() != before
+        };
+        if changed {
+            self.emit(Event::PeekChanged);
+        }
+    }
+
+    /// The peek's last `limit` entries, oldest first; `peek_disabled` while it is off.
+    pub fn peek(&self, limit: usize) -> Result<Vec<PeekEntry>, ErrorBody> {
+        if !self.peek.enabled {
+            return Err(error(PEEK_DISABLED, "the chat peek is off in config.json"));
+        }
+        let ring = self
+            .peek
+            .ring
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok(ring.last(limit))
     }
 
     /// Changes the status snapshot.
@@ -145,17 +195,20 @@ pub struct ControlHub {
 }
 
 impl ControlHub {
-    /// A hub for instance `instance`, starting.
-    pub fn new(instance: String) -> Self {
-        let handle = ControlHandle::new(Status {
-            protocol: PROTOCOL,
-            instance,
-            pid: std::process::id(),
-            bridge_version: env!("CARGO_PKG_VERSION").to_owned(),
-            state: Some(BridgeState::Starting),
-            started_at: now_ms(),
-            ..Status::default()
-        });
+    /// A hub for instance `instance`, starting; `peek` turns the chat peek on.
+    pub fn new(instance: String, peek: bool) -> Self {
+        let handle = ControlHandle::new(
+            Status {
+                protocol: PROTOCOL,
+                instance,
+                pid: std::process::id(),
+                bridge_version: env!("CARGO_PKG_VERSION").to_owned(),
+                state: Some(BridgeState::Starting),
+                started_at: now_ms(),
+                ..Status::default()
+            },
+            peek,
+        );
         let (sender, receiver) = mpsc::channel(CALL_BUFFER);
         Self {
             handle,
@@ -315,6 +368,13 @@ impl ControlHub {
                 (Action::Pause(params), limit)
             }
             Call::ResumeBackend => (Action::Resume, ACTION_TIMEOUT),
+            Call::Peek(params) => {
+                let entries = self.handle.peek(peek_limit(&params)).and_then(|entries| {
+                    serde_json::to_value(PeekResult { entries })
+                        .map_err(|_| error("internal", "the peek could not be encoded"))
+                });
+                return Some(response(id, entries));
+            }
         };
         tracing::info!(event = "control_request", method = action.name());
         let hub = self.clone();
@@ -479,7 +539,57 @@ mod tests {
     }
 
     fn hub() -> ControlHub {
-        ControlHub::new("0011223344556677".into())
+        ControlHub::new("0011223344556677".into(), true)
+    }
+
+    #[tokio::test]
+    async fn peek_returns_the_recorded_entries_and_record_emits_peek_changed() {
+        let hub = hub();
+        let mut events = hub.handle().subscribe();
+        for i in 0..5 {
+            hub.handle()
+                .record(|ring| ring.owner_text(i, &format!("m{i}")));
+        }
+        for _ in 0..5 {
+            assert_eq!(events.try_recv().unwrap().event, Event::PeekChanged);
+        }
+        hub.handle().record(|_| {});
+        assert!(events.try_recv().is_err(), "nothing changed");
+        let mut client = Client::greeted(&hub).await;
+        client
+            .send(r#"{"id":9,"method":"peek","params":{"limit":3}}"#)
+            .await;
+        let response = client.response().await;
+        assert_eq!((response.id, response.ok), (9, true));
+        let result: PeekResult = serde_json::from_value(response.result.unwrap()).unwrap();
+        let texts: Vec<_> = result.entries.iter().map(|e| e.text.as_str()).collect();
+        assert_eq!(texts, ["m2", "m3", "m4"]);
+        client.send(r#"{"id":10,"method":"peek"}"#).await;
+        let result: PeekResult =
+            serde_json::from_value(client.response().await.result.unwrap()).unwrap();
+        assert_eq!(result.entries.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn a_hub_without_the_peek_records_nothing_and_answers_peek_disabled() {
+        let hub = ControlHub::new("0011223344556677".into(), false);
+        let mut events = hub.handle().subscribe();
+        let mut called = false;
+        hub.handle().record(|ring| {
+            called = true;
+            ring.owner_text(1, "hi");
+        });
+        assert!(!called);
+        assert!(events.try_recv().is_err());
+        assert_eq!(hub.handle().peek(20).unwrap_err().code, PEEK_DISABLED);
+        let mut client = Client::greeted(&hub).await;
+        client.send(r#"{"id":4,"method":"peek"}"#).await;
+        let response = client.response().await;
+        assert_eq!(
+            (response.id, response.error.unwrap().code.as_str()),
+            (4, PEEK_DISABLED)
+        );
+        assert!(ControlHandle::detached().peek(20).is_err());
     }
 
     #[tokio::test]

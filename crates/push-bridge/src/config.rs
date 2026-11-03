@@ -52,6 +52,10 @@ pub struct Config {
     /// it off.
     #[serde(default = "yes")]
     pub control: bool,
+    /// The chat peek: the tray may read the owner conversation's last messages, masked,
+    /// over the control channel (kept in memory only); `false` turns it off.
+    #[serde(default = "yes")]
+    pub peek: bool,
 }
 
 fn yes() -> bool {
@@ -367,6 +371,15 @@ mod tests {
         assert_eq!(config.backend, BackendKind::Coda);
         assert!(!config.device_name().is_empty());
         assert!(config.control);
+        assert!(config.peek);
+    }
+
+    #[test]
+    fn the_chat_peek_can_be_turned_off() {
+        let fixture = fixture();
+        let mut config = minimal(&fixture);
+        config["peek"] = json!(false);
+        assert!(!load(&fixture, &config).unwrap().peek);
     }
 
     #[test]

@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>push-agent-tray</title>
+    <link rel="stylesheet" href="app.css">
+    <script src="chat.js" defer></script>
+    <script src="app.js" defer></script>
+  </head>
+  <body>
+    <nav aria-label="Agents">
+      <ul id="agents" role="listbox" aria-label="Agents"></ul>
+      <p id="noAgents" class="muted" hidden>No agents yet.</p>
+      <button id="addFolder" type="button">Add agent folder…</button>
+      <span id="addProblem" class="refused" role="status"></span>
+    </nav>
+
+    <main>
+      <p id="configError" class="notice" role="alert" hidden></p>
+      <p id="empty" class="muted">Select an agent.</p>
+      <section id="agent" hidden>
+        <h1><span id="agentBadge" class="badge"></span><span id="agentName"></span></h1>
+        <div role="tablist" aria-label="Agent" id="tabs">
+          <button type="button" role="tab" id="tab-overview" aria-controls="panel-overview" aria-selected="true">Overview</button>
+          <button type="button" role="tab" id="tab-chat" aria-controls="panel-chat" aria-selected="false" tabindex="-1">Chat</button>
+          <button type="button" role="tab" id="tab-logs" aria-controls="panel-logs" aria-selected="false" tabindex="-1">Logs</button>
+          <button type="button" role="tab" id="tab-settings" aria-controls="panel-settings" aria-selected="false" tabindex="-1">Settings</button>
+        </div>
+
+        <div role="tabpanel" id="panel-overview" aria-labelledby="tab-overview" tabindex="0">
+          <p class="state-line"><span id="ovBadge" class="badge"></span><span id="ovState"></span></p>
+          <div id="actions" class="actions"></div>
+          <dl>
+            <dt>Folder</dt><dd id="ovFolder"></dd>
+            <dt>Session</dt><dd id="ovSession"></dd>
+            <dt>Coda version</dt><dd id="ovCodaVersion"></dd>
+            <dt>Uptime</dt><dd id="ovUptime"></dd>
+            <dt>Running tasks</dt><dd id="ovRunningTasks"></dd>
+            <dt>Last error</dt><dd id="ovLastError"></dd>
+            <dt>Last exit code</dt><dd id="ovLastExit"></dd>
+          </dl>
+          <p class="row">
+            <button id="openFolder" type="button">Open folder</button>
+            <span id="openFolderProblem" class="refused" role="status"></span>
+          </p>
+          <h2>History</h2>
+          <ol id="history" class="history"></ol>
+        </div>
+
+        <div role="tabpanel" id="panel-chat" aria-labelledby="tab-chat" tabindex="0" hidden>
+          <p class="row">
+            <button id="openMessenger" type="button" hidden>Open in messenger</button>
+            <span id="chatProblem" class="refused" role="status"></span>
+          </p>
+          <p id="chatState" class="muted" role="status"></p>
+          <ol id="chat" class="chat" aria-label="Last messages"></ol>
+        </div>
+
+        <div role="tabpanel" id="panel-logs" aria-labelledby="tab-logs" tabindex="0" hidden>
+          <div class="row tools">
+            <label>Level
+              <select id="logLevel">
+                <option value="info">Info</option>
+                <option value="warn">Warn</option>
+                <option value="error">Error</option>
+              </select>
+            </label>
+            <input id="logSearch" type="search" placeholder="Search" aria-label="Search the log">
+            <label><input id="logRaw" type="checkbox"> Raw</label>
+            <button id="logCopy" type="button">Copy</button>
+            <button id="logOpen" type="button">Open in editor</button>
+            <span id="logProblem" class="refused" role="status"></span>
+          </div>
+          <div id="log" class="log" role="log" aria-label="Log" tabindex="0"></div>
+        </div>
+
+        <div role="tabpanel" id="panel-settings" aria-labelledby="tab-settings" tabindex="0" hidden>
+          <p><label><input id="setAutostart" type="checkbox"> Autostart (start this agent with the tray)</label></p>
+          <p><label><input id="setShowPeek" type="checkbox"> Show chat peek</label></p>
+          <p><label>Messages kept <input id="setPeekMessages" type="number" min="10" max="50" step="1"></label></p>
+          <p><span id="settingsProblem" class="refused" role="status"></span></p>
+          <p class="row">
+            <span>config.json: <span id="configPath" class="path"></span></span>
+            <button id="openConfig" type="button">Open config</button>
+            <span id="configProblem" class="refused" role="status"></span>
+          </p>
+          <p class="row">
+            <button id="remove" type="button">Remove agent from tray</button>
+            <span id="removeConfirm" hidden>
+              <span>Really remove? It stays enrolled and its folder is untouched. If the tray runs it, it is stopped.</span>
+              <button id="removeYes" type="button">Remove</button>
+              <button id="removeNo" type="button">Cancel</button>
+            </span>
+            <span id="removeProblem" class="refused" role="status"></span>
+          </p>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <label><input id="startAtLogon" type="checkbox"> Start at logon</label>
+      <label><input id="reduceMotion" type="checkbox"> Reduce motion</label>
+      <label><input id="menuPeek" type="checkbox"> Show last agent line in the menu</label>
+      <button id="switchOver" type="button" hidden>Switch from Scheduled Task…</button>
+      <button id="quit" type="button">Quit</button>
+      <span id="globalProblem" class="refused" role="status"></span>
+    </footer>
+  </body>
+</html>

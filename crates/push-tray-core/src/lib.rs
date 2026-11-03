@@ -1,24 +1,29 @@
 //! The agent tray's core, free of any UI toolkit: agent states and their icons and
-//! labels ([`state`], [`icon`]), the restart policy ([`policy`]), a state history
-//! ([`history`]), the tray's `tray.json` ([`tray_config`]) and folders ([`paths`]), the
+//! labels ([`state`], [`icon`], drawn from [`glyph`]), the restart policy ([`policy`]), a
+//! state history ([`history`]), the tray's `tray.json` ([`tray_config`]) and folders ([`paths`]), the
 //! tray's own start at logon ([`autostart`]), the switch-over from Scheduled Tasks
 //! ([`schedtask`]), opening a file or folder ([`open`]), the bridges' control channel
-//! ([`client`]), the bridges' supervision ([`supervisor`]), the tray menu ([`menu`]), and
-//! the details window and notifications ([`details`]).
+//! ([`client`]), the bridges' supervision ([`supervisor`]), the slim tray menu ([`menu`]),
+//! the tray window's view models and the notifications ([`window`]), the window's live log
+//! tail ([`logtail`]), and the chat peek's menu line, messenger link and Chat tab
+//! ([`peek`]).
 
 pub mod autostart;
 pub mod client;
-pub mod details;
+pub mod glyph;
 pub mod history;
 pub mod icon;
+pub mod logtail;
 pub mod menu;
 pub mod open;
 pub mod paths;
+pub mod peek;
 pub mod policy;
 pub mod schedtask;
 pub mod state;
 pub mod supervisor;
 pub mod tray_config;
+pub mod window;
 
 #[cfg(test)]
 pub(crate) mod test_dir;

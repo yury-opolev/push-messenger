@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use push_bridge_control::{
-    Call, ErrorBody, Event, EventLine, MAX_LINE, Request, Response, ServerLine, Status, encode,
-    endpoint, instance_id, transport,
+    Call, ErrorBody, Event, EventLine, MAX_LINE, PeekEntry, PeekParams, PeekResult, Request,
+    Response, ServerLine, Status, encode, endpoint, instance_id, transport,
 };
 use serde_json::Value;
 use tokio::io::{
@@ -150,6 +150,16 @@ impl ControlClient {
         let value = self.call(Call::Status, STATUS_TIMEOUT).await?;
         serde_json::from_value(value)
             .map_err(|_| local_error("bad_response", "the status could not be read"))
+    }
+
+    /// The bridge's last `limit` peek entries, oldest first.
+    pub async fn peek(&self, limit: usize, timeout: Duration) -> Result<Vec<PeekEntry>, ErrorBody> {
+        let value = self
+            .call(Call::Peek(PeekParams { limit: Some(limit) }), timeout)
+            .await?;
+        serde_json::from_value::<PeekResult>(value)
+            .map(|result| result.entries)
+            .map_err(|_| local_error("bad_response", "the peek could not be read"))
     }
 
     fn forget(&self, id: u64) {
@@ -441,6 +451,33 @@ mod tests {
             .await;
         assert_eq!(second.await.unwrap().unwrap(), status);
         assert_eq!(first.await.unwrap().unwrap_err().code, "busy");
+    }
+
+    #[tokio::test]
+    async fn peek_sends_its_limit_and_reads_the_entries() {
+        let (stream, mut bridge) = pair();
+        bridge.hello().await;
+        let (client, _events) = connect_stream(stream).await.unwrap();
+        let client = Arc::new(client);
+        let peek = |client: &Arc<ControlClient>| {
+            let client = Arc::clone(client);
+            tokio::spawn(async move { client.peek(7, Duration::from_secs(5)).await })
+        };
+        let first = peek(&client);
+        let request = bridge.request().await;
+        assert_eq!(request.call, Call::Peek(PeekParams { limit: Some(7) }));
+        let entries = json!({"entries": [
+            {"time": 1, "from": "agent", "kind": "reply", "text": "hi"}
+        ]});
+        bridge.respond(ok(request.id, entries)).await;
+        let entries = first.await.unwrap().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].text, "hi");
+
+        let second = peek(&client);
+        let request = bridge.request().await;
+        bridge.respond(ok(request.id, json!({"nope": 1}))).await;
+        assert_eq!(second.await.unwrap().unwrap_err().code, "bad_response");
     }
 
     #[tokio::test(start_paused = true)]

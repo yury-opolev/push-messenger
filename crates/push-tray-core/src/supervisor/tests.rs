@@ -5,7 +5,8 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use push_bridge_control::{
-    AgentInfo, BridgeState, MAX_LINE, Response, ServerLine, encode, parse_request,
+    AgentInfo, BridgeState, MAX_LINE, PeekEntry, PeekFrom, PeekKind, PeekResult, Response,
+    ServerLine, encode, parse_request,
 };
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -25,6 +26,8 @@ struct Bridge {
     refuse_connects: bool,
     /// Connecting never completes.
     hang_connects: bool,
+    /// Calls of this method fail with the error `busy`.
+    refuse: Option<&'static str>,
     /// The process the tray started for it.
     process: Option<Arc<Mutex<Option<Exit>>>>,
     /// Open connections: `Some(line)` to send, `None` to close.
@@ -40,6 +43,7 @@ impl Default for Bridge {
             ignore_shutdown: false,
             refuse_connects: false,
             hang_connects: false,
+            refuse: None,
             process: None,
             connections: Vec::new(),
             connects: 0,
@@ -233,7 +237,36 @@ async fn serve(
                 let Ok(Some(line)) = line else { return };
                 let request = parse_request(&line).unwrap();
                 world.with(|w| w.log.push(format!("{} {name}", request.call.method())));
-                let result = match request.call {
+                let refused = world.bridge(&name, |bridge| bridge.refuse)
+                    == Some(request.call.method());
+                if refused {
+                    let response = encode(&ServerLine::Response(Response {
+                        id: request.id,
+                        ok: false,
+                        result: None,
+                        error: Some(ErrorBody {
+                            code: "busy".into(),
+                            message: "Coda is busy".into(),
+                        }),
+                    }));
+                    if writer.write_all(response.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    continue;
+                }
+                let result = match &request.call {
+                    Call::Peek(params) => serde_json::to_value(PeekResult {
+                        entries: (0..params.limit.unwrap_or(1))
+                            .map(|n| PeekEntry {
+                                time: n as i64,
+                                from: PeekFrom::Agent,
+                                kind: PeekKind::Reply,
+                                text: format!("line {n}"),
+                                card_state: None,
+                            })
+                            .collect(),
+                    })
+                    .unwrap(),
                     Call::Status => serde_json::to_value(Status {
                         state: Some(world.bridge(&name, |bridge| bridge.state)),
                         agent: Some(AgentInfo {
@@ -795,6 +828,85 @@ async fn calls_are_forwarded_and_failures_kept() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn peek_changed_events_are_counted() {
+    let world = Shared::default();
+    let mut harness = start(&world, vec![spec("a", true)]);
+    let a = harness.state("a", AgentState::Idle).await;
+    assert_eq!(a.peek_changes, 0);
+    world.emit("a", Event::PeekChanged);
+    world.emit("a", Event::PeekChanged);
+    harness
+        .until("two peek changes", |views| views[0].peek_changes == 2)
+        .await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_control_link_peeks_while_connected() {
+    let world = Shared::default();
+    let mut harness = start(&world, vec![spec("a", true), spec("b", false)]);
+    let a = harness.state("a", AgentState::Idle).await;
+    let link = a.control.clone().expect("connected");
+    assert_eq!(a.control, Some(link.clone()));
+    let entries = link.peek(3).await.unwrap();
+    assert_eq!(
+        entries.iter().map(|e| e.text.as_str()).collect::<Vec<_>>(),
+        ["line 0", "line 1", "line 2"]
+    );
+    assert_eq!(world.count("peek a"), 1);
+    world.bridge("a", |bridge| bridge.refuse = Some("peek"));
+    let error = link.peek(3).await.unwrap_err();
+    assert_eq!(error.code, "busy");
+    let b = harness.state("b", AgentState::Stopped).await;
+    assert_eq!(b.control, None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_refused_action_is_kept_until_the_next_action() {
+    let world = Shared::default();
+    let mut harness = start(&world, vec![spec("a", true), spec("b", false)]);
+    harness.state("a", AgentState::Idle).await;
+    world.bridge("a", |bridge| bridge.refuse = Some("pause_backend"));
+    harness.send(Command::Pause(dir("a"))).await;
+    let views = harness
+        .until("a's refusal", |views| views[0].refusal.is_some())
+        .await;
+    let refusal = views[0].refusal.clone().unwrap();
+    assert_eq!(refusal.action, AgentAction::Pause);
+    assert_eq!(refusal.message, "Coda is busy (busy)");
+    assert!(refusal.at > 0);
+    assert_eq!(
+        views[0].last_error.as_deref(),
+        Some("pause_backend: Coda is busy (busy)")
+    );
+
+    // A new action clears it at once; its success keeps it clear.
+    harness.send(Command::Reconnect(dir("a"))).await;
+    harness
+        .until("a's refusal cleared", |views| views[0].refusal.is_none())
+        .await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(world.count("reconnect a"), 1);
+    assert_eq!(harness.views.borrow()[0].refusal, None);
+
+    // Not connected: refused at once.
+    harness.send(Command::Resume(dir("b"))).await;
+    let views = harness
+        .until("b's refusal", |views| views[1].refusal.is_some())
+        .await;
+    assert_eq!(
+        views[1]
+            .refusal
+            .as_ref()
+            .map(|r| (r.action, r.message.as_str())),
+        Some((AgentAction::Resume, "not connected"))
+    );
+    harness.send(Command::Stop(dir("b"))).await;
+    harness
+        .until("b's refusal cleared", |views| views[1].refusal.is_none())
+        .await;
+}
+
+#[tokio::test(start_paused = true)]
 async fn removed_instances_are_stopped_and_dropped() {
     let world = Shared::default();
     let mut harness = start(&world, vec![spec("a", true), spec("b", false)]);
@@ -814,13 +926,10 @@ async fn removed_instances_are_stopped_and_dropped() {
 fn specs_carry_the_task_of_each_instance() {
     let config = TrayConfig {
         instances: vec![
+            crate::tray_config::Instance::new(dir("a")),
             crate::tray_config::Instance {
-                dir: dir("a"),
-                autostart: true,
-            },
-            crate::tray_config::Instance {
-                dir: dir("b"),
                 autostart: false,
+                ..crate::tray_config::Instance::new(dir("b"))
             },
         ],
         ..TrayConfig::default()
