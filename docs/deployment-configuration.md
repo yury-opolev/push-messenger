@@ -75,6 +75,14 @@ Each workload receives only the keys it uses, as individual `secretKeyRef`s (nev
 | `resend-api-key` | worker when `worker.email.sender: resend` | Resend API key |
 | `resend-webhook-secret` | worker when `worker.email.webhook.enabled: true` | Svix signing secret `whsec_...` |
 | `auth-admin-token` | auth-svc when `auth.admin.enabled: true` | the admin API's bearer token, 32 to 256 visible ASCII characters |
+| `turn-shared-secret` | auth-svc and coturn when `calls.enabled` with `calls.turn.mode` `internal`; auth-svc with `external` `generic` | the TURN REST shared secret, at least 16 visible ASCII characters (letters and digits recommended); generated (48 characters) for a chart-managed Secret in `internal` mode |
+| `turn-cloudflare-token` | auth-svc with `external` `cloudflare` | the Cloudflare TURN key's API token |
+| `turn-twilio-token` | auth-svc with `external` `twilio` | the Twilio account's auth token |
+
+The three `turn-*` keys may be named otherwise in a consumer-managed Secret:
+`calls.turn.external.sharedSecret`, `.cloudflare.apiTokenSecret` and
+`.twilio.authTokenSecret` name the key (never hold the value). `external` modes need a
+consumer-managed Secret or `secrets.volume`: the chart never stores a provider's secret.
 
 Kubernetes `data` values carry an outer base64 encoding; the decoded auth keys are
 themselves standard base64. Do not double-encode values given as `stringData`.
@@ -124,6 +132,9 @@ secrets:
     auth-admin-token: auth-admin-token
     resend-api-key: resend-api-key
     resend-webhook-secret: resend-webhook-secret
+    turn-shared-secret: turn-shared-secret
+    turn-cloudflare-token: turn-cloudflare-token
+    turn-twilio-token: turn-twilio-token
 ```
 
 `mountPath` defaults as shown and must be an absolute, non-root path with no traversal
@@ -150,6 +161,9 @@ key values and `secrets.existingSecret` conflict with mounted mode and are refus
 | `auth-admin-token` | `PUSH_AUTH_ADMIN_TOKEN_FILE` | auth, when admin enabled |
 | `resend-api-key` | `PUSH_RESEND_API_KEY_FILE` | worker, when Resend selected |
 | `resend-webhook-secret` | `PUSH_RESEND_WEBHOOK_SECRET_FILE` | worker, when webhook enabled |
+| `turn-shared-secret` | `PUSH_TURN_SHARED_SECRET_FILE` | auth and coturn (its init container), when calls use `internal` or `external` `generic` TURN |
+| `turn-cloudflare-token` | `PUSH_TURN_CLOUDFLARE_TOKEN_FILE` | auth, with `external` `cloudflare` |
+| `turn-twilio-token` | `PUSH_TURN_TWILIO_TOKEN_FILE` | auth, with `external` `twilio` |
 
 The DEV password smoke hook also uses `auth-signing-key`, via
 `PUSH_SMOKE_SIGNING_KEY_FILE`. Operator Entra smoke receives **no application keys**.
@@ -363,6 +377,14 @@ scrape configuration or annotations, so point the consumer's own scraper at it. 
 chart's NetworkPolicies admit no scraper to that port; NetworkPolicies are additive, so
 add one of your own that admits it on 8081. Metric names: [calls.md](calls.md#11-metrics).
 
+With calls enabled, `calls.turn` decides what `GET /v1/calls/ice-servers` hands out:
+`internal` (the default) deploys coturn and needs at least `calls.turn.internal.publicHost`,
+a public IP (`externalIp`, `service.loadBalancerIP` or an IP `publicHost`) and
+`calls.turn.internal.deniedPeerCidrs` (the cluster's pod and service CIDRs); `external`
+uses a provider; `stun-only` needs `calls.turn.stunUrls`. Every value, its validation
+message and the AKS notes: [calls.md, TURN](calls.md#13-turn). auth-svc serves its TURN
+credential counters at `GET /metrics` on its health port (8081) too.
+
 ## In-cluster transport
 
 Public traffic is TLS at the controller. Traffic between the services inside the
@@ -393,7 +415,9 @@ rendered as `repository@digest`. Use the digest your own publication returned fo
 **each** image; they differ. For example (synthetic, non-deployable):
 `digest: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`.
 `postgres.image` and `redis.image` are complete references and accept
-`repository@sha256:...` directly; by default they are `postgres:17-alpine` and
+`repository@sha256:...` directly, as does `calls.turn.internal.image` (coturn, pinned
+to the digest of its multi-arch index and scanned by CI; see
+[calls.md](calls.md#137-upgrading-coturn)); by default they are `postgres:17-alpine` and
 `redis:7-alpine` pinned to the digest of their multi-arch index, as are the
 Dockerfile's base images. Upgrading from a chart that named them by tag alone restarts
 the bundled PostgreSQL and Redis once (their pod spec changes). Valid syntax does not prove a digest exists or is
