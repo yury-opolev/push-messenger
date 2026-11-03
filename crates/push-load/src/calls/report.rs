@@ -7,6 +7,7 @@ use std::fmt::Write as _;
 
 use serde::Serialize;
 
+use crate::commandstats::RedisDeltas;
 use crate::metrics::{Summary, nearest_rank};
 use crate::report::{Connections, Generator, Status};
 
@@ -33,6 +34,9 @@ pub struct CallsReport {
     pub calls: CallCounts,
     pub latency: CallLatency,
     pub generator: Generator,
+    /// Redis `INFO commandstats` deltas over the run, with `--redis-url-file`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub redis: Option<RedisDeltas>,
     pub percentiles: String,
 }
 
@@ -238,6 +242,11 @@ pub fn judge(report: &CallsReport, interrupted: bool) -> (Status, Vec<String>) {
             ));
         }
     }
+    if let Some(error) = report.redis.as_ref().and_then(|redis| redis.error.as_ref()) {
+        failures.push(format!(
+            "Redis INFO commandstats could not be read after the run: {error}"
+        ));
+    }
     if report.generator.saturated {
         failures.push(format!(
             "the load generator was saturated (p99 scheduling lag {} ms > {} ms): the results do not describe the target",
@@ -300,6 +309,32 @@ pub fn summary_text(report: &CallsReport) -> String {
         millis(setup.p99_ms),
         millis(setup.max_ms)
     );
+    if let Some(redis) = &report.redis {
+        let busiest = redis
+            .busiest(5)
+            .into_iter()
+            .map(|(name, delta)| format!("{name} x{}", delta.calls))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = writeln!(
+            text,
+            "  redis: {} commands ({} per call placed){}{}",
+            redis.total_calls,
+            redis
+                .calls_per_call_placed
+                .map_or_else(|| "-".to_owned(), |per| per.to_string()),
+            if busiest.is_empty() {
+                String::new()
+            } else {
+                format!(", most: {busiest}")
+            },
+            if redis.reset {
+                " (statistics were reset during the run)"
+            } else {
+                ""
+            }
+        );
+    }
     let _ = writeln!(
         text,
         "  generator: scheduling lag p99 {} ms (limit {} ms)",
@@ -368,6 +403,7 @@ mod tests {
                 lag_limit_ms: 250,
                 saturated: false,
             },
+            redis: None,
             percentiles: String::new(),
         }
     }
@@ -489,6 +525,45 @@ mod tests {
         assert!(
             text.contains("PASSED") && text.contains("p95 110 (limit 300)"),
             "{text}"
+        );
+        assert!(!text.contains("redis"), "{text}");
+    }
+
+    #[test]
+    fn redis_deltas_are_summarised_and_an_unread_after_snapshot_fails_the_run() {
+        use crate::commandstats::parse;
+        let mut report = passing();
+        report.redis = Some(RedisDeltas::between(
+            &parse("cmdstat_evalsha:calls=1,usec=1\r\ncmdstat_get:calls=1,usec=1"),
+            &parse(
+                "cmdstat_evalsha:calls=41,usec=801\r\ncmdstat_get:calls=11,usec=11\r\ncmdstat_hget:calls=10,usec=9",
+            ),
+            10,
+        ));
+        assert_eq!(judge(&report, false), (Status::Passed, Vec::new()));
+        let text = summary_text(&report);
+        assert!(
+            text.contains(
+                "redis: 60 commands (6 per call placed), most: evalsha x40, get x10, hget x10"
+            ),
+            "{text}"
+        );
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["redis"]["commands"]["evalsha"]["usec_per_call"], 20.0);
+        assert!(
+            serde_json::to_value(passing())
+                .unwrap()
+                .get("redis")
+                .is_none()
+        );
+
+        report.redis = Some(RedisDeltas::failed("IoError".to_owned()));
+        let (status, failures) = judge(&report, false);
+        assert_eq!(status, Status::Failed);
+        assert!(
+            failures.iter().any(|failure| failure
+                .contains("Redis INFO commandstats could not be read after the run: IoError")),
+            "{failures:?}"
         );
     }
 }

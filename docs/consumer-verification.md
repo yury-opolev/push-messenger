@@ -189,7 +189,8 @@ candidate each side trickles names a documentation address (192.0.2.1).
 push-load calls --target https://api.example.com --authorized-target api.example.com \
   --state /private/state.json --calls 1000 --ramp-per-second 100 \
   --duration-seconds 1200 --hold-seconds 60 \
-  --target-build "gateway@sha256:..., chart 1.2.3" --report /private/calls-1.json
+  --target-build "gateway@sha256:..., chart 1.2.3" --report /private/calls-1.json \
+  [--attempts-per-hour 30] [--setup-p95-ms 300] [--redis-url-file /private/redis-url]
 ```
 
 - **Sizing.** Each concurrent call needs one sample pair: two accounts that are
@@ -220,9 +221,17 @@ push-load calls --target https://api.example.com --authorized-target api.example
 - **The server side.** During the run, watch message-svc's `/metrics` (health port
   8081): `push_call_signal_seconds` (time to handle each call frame),
   `push_call_setup_seconds`, `push_calls_live` (it should follow the run's ringing and
-  active calls) and `push_call_frames_refused_total`. Watch Redis load, which push-load
-  does not measure, with Redis `INFO` (`instantaneous_ops_per_sec`, `used_memory`) or
-  the deployment's Redis metrics.
+  active calls) and `push_call_frames_refused_total`. Watch Redis memory and latency
+  with the deployment's Redis metrics or `INFO` (`instantaneous_ops_per_sec`,
+  `used_memory`).
+- **Redis commands.** With `--redis-url-file <file>`, push-load reads the target Redis's
+  `INFO commandstats` before the first connection and after the last one closes, and
+  reports what the run cost it command by command. The file holds only a `redis://` or
+  `rediss://` URL (with its credential); push-load never prints it, and its errors name
+  only the kind of failure. Give it a user that may run `INFO` alone, for example
+  `ACL SETUSER push-load-stats on >... +info` (password Redis, not Entra ID tokens). A
+  Redis that cannot be read stops the run before any token refresh. The statistics
+  cover every client of that Redis: use a deployment no one else uses during the run.
 
 The report has the run's `connections`, `close_codes`, `generator` and `workload`
 (with `hold_s`, `attempts_per_hour` and `attempts_per_pair_max`), and:
@@ -236,14 +245,21 @@ The report has the run's `connections`, `close_codes`, `generator` and `workload
   holds it), `peak_active` and `peak_ringing_or_active`.
 - `latency.setup`: count, p50, p95, p99 and max in milliseconds; also `connect` and
   `ping_rtt`.
+- `redis` (with `--redis-url-file` only): `commands`, each command called during the
+  run (`evalsha`, `zscore`, `script|load`, ...) with its `calls`, `usec`,
+  `usec_per_call`, `rejected_calls` and `failed_calls` deltas; `total_calls`,
+  `total_usec`; `calls_per_call_placed` (every command of the run, including connects,
+  presence and Pings, per call placed); `reset` (the statistics were reset during the
+  run, so the deltas cover part of it); and `error` (the statistics after the run could
+  not be read). The call engine's scripts show as `evalsha`.
 
 `passed` requires every connection to have reached Ready, all open at once, each with
 its `CallSync`; no connection dropped, failed or rate limited; calls placed and no
 `CallError` (a refused hangup of a leftover call is not one); every call accepted within
 10 s and ended `COMPLETED` for both parties (no other reason in `ended` or
 `callee_ended`); every pair in a call at once (`peak_active` equal to `--calls`); no
-unexpected call frame; a setup p95 at most `--setup-p95-ms` (default 300); and an
-unsaturated generator. Exit codes are those of `run`. Each call leaves a call history
+unexpected call frame; a setup p95 at most `--setup-p95-ms` (default 300); with
+`--redis-url-file`, Redis statistics read after the run; and an unsaturated generator. Exit codes are those of `run`. Each call leaves a call history
 row per participant, kept for `calls.historyDays`.
 
 ### Local functional check

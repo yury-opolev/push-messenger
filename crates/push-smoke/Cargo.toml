@@ -35,10 +35,12 @@ uuid.workspace = true
 [dev-dependencies]
 push-credentials = { workspace = true, features = ["testing"] }
 tokio = { workspace = true, features = ["io-util", "process"] }
+hmac.workspace = true
 push-gateway.workspace = true
 push-message-svc.workspace = true
 push-store.workspace = true
 push-worker.workspace = true
+sha1.workspace = true
 testcontainers-modules.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true

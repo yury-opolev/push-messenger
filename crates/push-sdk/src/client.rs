@@ -6,9 +6,12 @@
 //! and can be awaited from any executor; its plain methods read or change the local store
 //! at once. It is cheap to clone, and every clone is the same client.
 
+mod calls;
 mod presence;
 mod requests;
 mod sending;
+
+pub use calls::Calls;
 
 use std::future::Future;
 use std::sync::Arc;
@@ -56,6 +59,9 @@ pub struct Config {
     /// tokens and messages — anyone on the path can read. Off by default: only for
     /// development clusters reached over a private network.
     pub allow_insecure_transport: bool,
+    /// Advertises that this app can take calls (it has call UI or a media helper):
+    /// only such connections ring and may use [`Client::calls`]. Off by default.
+    pub calls: bool,
 }
 
 impl Config {
@@ -68,6 +74,7 @@ impl Config {
             database_key: None,
             request_timeout: Duration::from_secs(15),
             allow_insecure_transport: false,
+            calls: false,
         }
     }
 
@@ -391,6 +398,7 @@ impl Client {
             shared.clone(),
             credentials.clone(),
             endpoint,
+            config.calls,
             state_sender.clone(),
             command_receiver,
         );
@@ -640,7 +648,9 @@ impl Client {
             let tail = inner.clone();
             shielded(async move {
                 stop_connection(&tail).await?;
-                blocking(&tail.shared, move |store| store.bind_owner(user)).await?;
+                if blocking(&tail.shared, move |store| store.bind_owner(user)).await? {
+                    tail.shared.forget_calls();
+                }
                 Ok(())
             })
             .await?;
@@ -686,6 +696,7 @@ impl Client {
                 let (session, forgotten) = local.credentials.sign_out_for_good().await;
                 let stopped = stop_connection(&local).await.err();
                 let erased = if stopped.is_none() {
+                    local.shared.forget_calls();
                     blocking(&local.shared, |store| store.erase_all())
                         .await
                         .err()
@@ -936,10 +947,23 @@ mod tests {
     impl Fixture {
         /// A client signed in to fake services, not connected, on its own database.
         pub async fn new() -> Self {
+            Self::start(false).await
+        }
+
+        /// Like [`Fixture::new`], with [`Config::calls`] set.
+        pub async fn with_calls() -> Self {
+            Self::start(true).await
+        }
+
+        async fn start(calls: bool) -> Self {
             let database = format!("file:client-{}?mode=memory&cache=shared", Uuid::now_v7());
             let (auth, gateway) = (FakeAuth::start().await, FakeGateway::start().await);
             let secrets = Arc::new(MemorySecretStore::new());
-            let (client, events) = open(&auth, &gateway, &database, &secrets);
+            let config = Config {
+                calls,
+                ..test_config(&auth, &gateway, &database)
+            };
+            let (client, events) = Client::open(config, secrets.clone()).unwrap();
             client
                 .sign_in("a@example.com", "password", "phone", Platform::Ios)
                 .await
@@ -976,18 +1000,27 @@ mod tests {
 
         /// Accepts the connection and answers `Identify` with `Ready`.
         pub async fn ready(&mut self) -> crate::testing::Server {
+            self.ready_with(Vec::new()).await.0
+        }
+
+        /// Accepts the connection and answers `Identify` with `Ready` offering
+        /// `capabilities`; the socket and the `Identify` read.
+        pub async fn ready_with(
+            &mut self,
+            capabilities: Vec<i32>,
+        ) -> (crate::testing::Server, push_proto::v1::Identify) {
             let mut socket = self.gateway.next().await;
-            let Body::Identify(_) = recv(&mut socket).await else {
+            let Body::Identify(identify) = recv(&mut socket).await else {
                 panic!("Identify first");
             };
             let ready = Ready {
                 user_id: bytes(self.auth.user.0),
                 device_id: bytes(self.auth.device.0),
                 heartbeat_ms: 30_000,
-                capabilities: Vec::new(),
+                capabilities,
             };
             send(&mut socket, Body::Ready(ready)).await;
-            socket
+            (socket, identify)
         }
     }
 
@@ -1007,11 +1040,14 @@ mod tests {
         database: &str,
         secrets: &Arc<MemorySecretStore>,
     ) -> (Client, Events) {
-        let config = Config {
+        Client::open(test_config(auth, gateway, database), secrets.clone()).unwrap()
+    }
+
+    fn test_config(auth: &FakeAuth, gateway: &FakeGateway, database: &str) -> Config {
+        Config {
             request_timeout: Duration::from_secs(3),
             ..Config::new(&auth.url, &gateway.url, database)
-        };
-        Client::open(config, secrets.clone()).unwrap()
+        }
     }
 
     #[tokio::test]

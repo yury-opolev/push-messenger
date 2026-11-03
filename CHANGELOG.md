@@ -6,6 +6,17 @@ Notable changes for consumers of push-messenger. Newest first.
 
 ### Added
 
+- **push-sdk calls API**: `Config::calls` (opt-in; advertises `CAPABILITY_CALLS`) and
+  `Client::calls() -> Calls` with `available()`, `invite` (the client picks the UUIDv7
+  `CallId`), `accept`, `decline`, `cancel`, `hangup`, `send_ice` (with
+  `IceCandidate::end_of_candidates()`), `renegotiate`, `ice_servers()`,
+  `history(before, since, limit)` and `hide`; every call frame arrives as
+  `Event::Call(CallEvent)` (`Incoming`, `Accepted`, `Taken`, `Ended`, `PeerIce`,
+  `PeerRenegotiate`, `Error` with a typed `CallErrorCode`, `Synced` with the calls gone
+  since the last connection, `HistoryChanged`). `CallId` joins push-domain's ids. The
+  bindings carry the events in JSON (`{"type": "call", …}`); their calls methods follow.
+  push-load's calls scenario can report Redis `INFO commandstats` deltas
+  (`--redis-url-file`). Guide: [docs/calls.md §18](docs/calls.md#18-push-sdk).
 - **Voice calls: client guide, browser recipe and tests** (PR 5):
   [docs/calls.md](docs/calls.md) is now a complete client guide: a field reference for
   every call frame, sequence diagrams for every ending (declined, cancelled, missed, busy,

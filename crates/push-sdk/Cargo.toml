@@ -22,6 +22,8 @@ argon2 = { workspace = true, features = ["zeroize"] }
 axum = { workspace = true, optional = true }
 # base64url and SHA-256 for agent-key assertions and key thumbprints.
 base64.workspace = true
+# RFC 3339 times of the calls API (ICE server expiry, call history).
+chrono.workspace = true
 futures-util.workspace = true
 push-domain.workspace = true
 push-proto.workspace = true

@@ -723,3 +723,42 @@ Decisions taken while implementing §9, beyond or refining it:
 - Local clusters: denied private ranges mean the chart's coturn cannot relay between
   private addresses; docs recommend `stun-only` locally. PR 5's browser smoke test "through
   internal TURN" will need either public addressing or a test-only allow list.
+
+### PR 4 (push-sdk calls API): decisions and deviations
+
+- `Config::calls` is a plain field (`false` by default), not a builder method; `Calls` is
+  a handle that clones the client (like every clone it must be dropped before
+  `Client::close` can finish).
+- `history(before, since, limit)` takes `since` too (§9 and PR 2 added it); `limit` is
+  checked locally (1–100) and `None` leaves the server's default of 50.
+- Errors are typed twice: `CallEvent::Error` carries a `CallErrorCode` enum and an
+  `SdkError::Server` whose code is the wire name in snake case (`already_answered`, …), so
+  bindings pass it on unchanged. A frame method returns `offline` while the connection is
+  down or reconnecting and `not_available` when `Ready` did not offer calls (the server's
+  code, decided locally).
+- `CallEvent::Synced` carries `gone`: the calls this client knew live (its invites and
+  accepts, `Incoming`, `Accepted`) that the `CallSync` does not list. Calls invited or
+  accepted on the new connection before its first `CallSync` (the gateway sends it before
+  reading client frames) are kept, as are calls whose `CallState` has an unknown direction
+  or status. An invite refused with `IN_CALL`, `NOT_CONTACT` or `RATE_LIMITED` never
+  existed and is dropped from the set; other refusals keep it. The set is cleared on
+  sign-out and when another user signs in.
+- `CallEndReason` and `CallErrorCode` are `#[non_exhaustive]`; an unknown wire reason (or
+  history outcome) reads as `Failed`. `CallId` is a new push-domain id type.
+- Times are milliseconds: `Incoming.expires_at_ms` and `CallState.expires_at_ms` are on
+  this device's clock (receipt + `expires_in_ms`), server times (`answered_at`, history,
+  `expires_at` of ICE servers) are converted from microseconds or RFC 3339 (chrono).
+- The bindings (C, Node) carry the call events in JSON (`{"type": "call", "call": {…}}`)
+  but get neither the methods nor the `calls` option in this PR (the request's "and,
+  later, the bindings"); without the option they never advertise calls, so no call event
+  reaches them yet.
+- push-load: the `calls` scenario landed with PR 5 (#58); PR 4 adds the Redis
+  `INFO commandstats` deltas (`--redis-url-file`, URLs only from files as push-load's
+  other credentials).
+- Tests: `crates/push-smoke/tests/calls_sdk.rs` runs two (and three) SDK clients against
+  the whole stack in process: a complete call with two callee devices, buffered and
+  trickled ICE both ways, renegotiation, history, `HistoryChanged` and hide; decline, busy
+  decline, cancel, busy, unreachable, `NOT_CONTACT`, `IN_CALL`, `not_available`;
+  `CallSync` after a reconnect; `ice_servers` in stun-only and TURN REST modes (the HMAC
+  checked). Missed calls, the disconnect grace and the frame caps stay covered by the
+  gateway tests (PR 1). The media smoke through coturn is PR 6.

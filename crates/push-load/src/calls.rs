@@ -28,6 +28,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::commandstats::RedisDeltas;
 use crate::config::{CALL_MARGIN, CALL_PAUSE, CallsOptions, Target};
 use crate::metrics::{self, CloseCodes, Counters, LAG_LIMIT, Samples, bump, read};
 use crate::report::{Connections, Generator, Status};
@@ -600,6 +601,12 @@ pub async fn run(
         );
     }
     let pairs = &pairs[..options.calls];
+    // A Redis that cannot be read stops the run before any token is refreshed.
+    if let Some(redis) = &options.redis {
+        if let Err(error) = redis.read_commandstats().await {
+            bail!("the Redis of --redis-url-file could not be read: {error}");
+        }
+    }
     let selected: Vec<DeviceRef> = pairs
         .iter()
         .flat_map(|(caller, callee)| [*caller, *callee])
@@ -616,6 +623,13 @@ pub async fn run(
         target, &mut state, state_path, &selected, &counters, &interrupt,
     )
     .await?;
+
+    let redis_before = match &options.redis {
+        Some(redis) => Some(redis.read_commandstats().await.map_err(|error| {
+            anyhow::anyhow!("the Redis of --redis-url-file could not be read: {error}")
+        })?),
+        None => None,
+    };
 
     let lag = Arc::new(Samples::default());
     let lag_cancel = CancellationToken::new();
@@ -688,6 +702,13 @@ pub async fn run(
     }
     lag_cancel.cancel();
     let _ = lag_watch.await;
+    let redis = match (&options.redis, &redis_before) {
+        (Some(redis), Some(before)) => Some(match redis.read_commandstats().await {
+            Ok(after) => RedisDeltas::between(before, &after, read(&shared.calls.placed)),
+            Err(error) => RedisDeltas::failed(error),
+        }),
+        _ => None,
+    };
 
     let c = &shared.counters;
     let lag = lag.summary();
@@ -748,6 +769,7 @@ pub async fn run(
             scheduling_lag: lag,
             lag_limit_ms: u64::try_from(LAG_LIMIT.as_millis()).unwrap_or(u64::MAX),
         },
+        redis,
         percentiles: CALL_PERCENTILES.to_owned(),
     };
     let (status, failures) = report::judge(&report, interrupt.is_cancelled());
@@ -1005,6 +1027,7 @@ mod tests {
             attempts_per_hour: 30,
             setup_p95: Duration::from_millis(300),
             target_build: "test".to_owned(),
+            redis: None,
         }
     }
 

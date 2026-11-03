@@ -72,6 +72,10 @@ id_type!(
     /// A log entry's idempotency key, chosen by the client before the first attempt.
     ClientMsgId
 );
+id_type!(
+    /// A 1:1 call; the caller chooses its id (UUIDv7: `CallId::new()`).
+    CallId
+);
 
 #[cfg(test)]
 mod tests {

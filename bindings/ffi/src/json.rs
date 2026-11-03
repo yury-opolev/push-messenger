@@ -6,8 +6,8 @@
 //! Field names and enum values are camelCase (`clientMsgId`, `"requestedOut"`); error
 //! codes keep the SDK's snake_case (`"wrong_key"`). Ids are UUID strings; times are
 //! microseconds since the Unix epoch, as in the SDK (they stay below 2^53, so JavaScript
-//! numbers hold them exactly), except fields named `…Ms` (activity and presence), which
-//! are milliseconds. The schema is documented in `docs/sdk-bindings.md`.
+//! numbers hold them exactly), except fields named `…Ms` (activity, presence and calls),
+//! which are milliseconds. The schema is documented in `docs/sdk-bindings.md`.
 //!
 //! Nothing here logs. The database key never passes through JSON: the bindings take it as
 //! bytes ([`config`]).
@@ -16,9 +16,10 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use push_sdk::{
-    Account, Activity, ActivityState, ConnectionState, Contact, ContactState, Conversation,
-    ConversationKind, DatabaseKey, Device, Event, Invite, Message, MessageKind, MessageStatus,
-    OutboxKind, Platform, Presence, PresenceState, Profile, SdkError,
+    Account, Activity, ActivityState, CallDirection, CallEvent, CallState, CallStatus,
+    ConnectionState, Contact, ContactState, Conversation, ConversationKind, DatabaseKey, Device,
+    Event, IceCandidate, Invite, Message, MessageKind, MessageStatus, OutboxKind, Platform,
+    Presence, PresenceState, Profile, SdkError, SdpKind,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -196,6 +197,117 @@ pub fn presence(presence: &Presence) -> Value {
     })
 }
 
+/// `{candidate, sdpMid, sdpMLineIndex, usernameFragment, endOfCandidates}`, as an
+/// `RTCIceCandidateInit` plus the end-of-candidates flag.
+pub fn ice_candidate(candidate: &IceCandidate) -> Value {
+    json!({
+        "candidate": candidate.candidate,
+        "sdpMid": candidate.sdp_mid,
+        "sdpMLineIndex": candidate.sdp_mline_index,
+        "usernameFragment": candidate.username_fragment,
+        "endOfCandidates": candidate.end_of_candidates,
+    })
+}
+
+/// `{callId, peerUserId, direction, status, offerSdp, expiresAtMs, answeredAtMs,
+/// thisDevice}`: `direction` is `incoming` or `outgoing`, `status` `ringing` or `active`.
+pub fn call_state(state: &CallState) -> Value {
+    let direction = match state.direction {
+        CallDirection::Incoming => "incoming",
+        CallDirection::Outgoing => "outgoing",
+    };
+    let status = match state.status {
+        CallStatus::Ringing => "ringing",
+        CallStatus::Active => "active",
+    };
+    json!({
+        "callId": state.call_id.to_string(),
+        "peerUserId": state.peer_user_id.to_string(),
+        "direction": direction,
+        "status": status,
+        "offerSdp": state.offer_sdp,
+        "expiresAtMs": state.expires_at_ms,
+        "answeredAtMs": state.answered_at_ms,
+        "thisDevice": state.this_device,
+    })
+}
+
+/// A call event: `{"type": "incoming" | "accepted" | "taken" | "ended" | "peerIce" |
+/// "peerRenegotiate" | "error" | "synced" | "historyChanged", …}` (see
+/// `docs/sdk-bindings.md`). The SDP and candidates are included: the app needs them.
+pub fn call_event(event: &CallEvent) -> Value {
+    let sdp_kind = |kind: &SdpKind| match kind {
+        SdpKind::Offer => "offer",
+        SdpKind::Answer => "answer",
+    };
+    match event {
+        CallEvent::Incoming {
+            call_id,
+            caller_id,
+            offer_sdp,
+            expires_at_ms,
+        } => json!({
+            "type": "incoming",
+            "callId": call_id.to_string(),
+            "callerId": caller_id.to_string(),
+            "offerSdp": offer_sdp,
+            "expiresAtMs": expires_at_ms,
+        }),
+        CallEvent::Accepted {
+            call_id,
+            answer_sdp,
+            answered_device_id,
+        } => json!({
+            "type": "accepted",
+            "callId": call_id.to_string(),
+            "answerSdp": answer_sdp,
+            "answeredDeviceId": answered_device_id.to_string(),
+        }),
+        CallEvent::Taken { call_id } => {
+            json!({"type": "taken", "callId": call_id.to_string()})
+        }
+        CallEvent::Ended {
+            call_id,
+            reason,
+            duration_s,
+        } => json!({
+            "type": "ended",
+            "callId": call_id.to_string(),
+            "reason": reason.as_str(),
+            "durationS": duration_s,
+        }),
+        CallEvent::PeerIce { call_id, candidate } => json!({
+            "type": "peerIce",
+            "callId": call_id.to_string(),
+            "candidate": ice_candidate(candidate),
+        }),
+        CallEvent::PeerRenegotiate { call_id, sdp, kind } => json!({
+            "type": "peerRenegotiate",
+            "callId": call_id.to_string(),
+            "sdp": sdp,
+            "kind": sdp_kind(kind),
+        }),
+        CallEvent::Error {
+            call_id,
+            error: failure,
+            ..
+        } => json!({
+            "type": "error",
+            "callId": call_id.to_string(),
+            "error": error(failure),
+        }),
+        CallEvent::Synced { calls, gone } => json!({
+            "type": "synced",
+            "calls": list(calls, call_state),
+            "gone": gone.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        }),
+        CallEvent::HistoryChanged { latest_ended_at_ms } => json!({
+            "type": "historyChanged",
+            "latestEndedAtMs": latest_ended_at_ms,
+        }),
+    }
+}
+
 /// Each of `items` with `shape`, as an array.
 pub fn list<T>(items: &[T], shape: impl Fn(&T) -> Value) -> Value {
     Value::Array(items.iter().map(shape).collect())
@@ -262,6 +374,7 @@ pub fn event(event: &Event) -> Value {
         Event::PresenceChanged(changed) => {
             json!({"type": "presenceChanged", "presence": presence(changed)})
         }
+        Event::Call(call) => json!({"type": "call", "call": call_event(call)}),
     }
 }
 
@@ -517,6 +630,88 @@ mod tests {
     }
 
     #[test]
+    fn call_events_are_nested_under_call() {
+        let (call_id, peer) = (push_sdk::CallId::new(), UserId::new());
+        assert_eq!(
+            event(&Event::Call(CallEvent::Incoming {
+                call_id,
+                caller_id: peer,
+                offer_sdp: "v=0".to_owned(),
+                expires_at_ms: 1_760_000_030_000,
+            })),
+            json!({"type": "call", "call": {
+                "type": "incoming",
+                "callId": call_id.to_string(),
+                "callerId": peer.to_string(),
+                "offerSdp": "v=0",
+                "expiresAtMs": 1_760_000_030_000_i64,
+            }})
+        );
+        let ice = event(&Event::Call(CallEvent::PeerIce {
+            call_id,
+            candidate: IceCandidate::end_of_candidates(),
+        }));
+        assert_eq!(
+            ice["call"],
+            json!({"type": "peerIce", "callId": call_id.to_string(), "candidate": {
+                "candidate": "",
+                "sdpMid": null,
+                "sdpMLineIndex": null,
+                "usernameFragment": null,
+                "endOfCandidates": true,
+            }})
+        );
+        let refused = call_event(&CallEvent::Error {
+            call_id,
+            code: push_sdk::CallErrorCode::AlreadyAnswered,
+            error: SdkError::Server {
+                code: "already_answered".to_owned(),
+                message: "answered".to_owned(),
+                retryable: false,
+                retry_after_s: None,
+            },
+        });
+        assert_eq!(refused["type"], "error");
+        assert_eq!(refused["error"]["code"], "already_answered");
+        let gone = push_sdk::CallId::new();
+        let synced = call_event(&CallEvent::Synced {
+            calls: vec![CallState {
+                call_id,
+                peer_user_id: peer,
+                direction: CallDirection::Outgoing,
+                status: CallStatus::Active,
+                offer_sdp: None,
+                expires_at_ms: None,
+                answered_at_ms: Some(1_760_000_000_000),
+                this_device: true,
+            }],
+            gone: vec![gone],
+        });
+        assert_eq!(
+            synced,
+            json!({"type": "synced", "calls": [{
+                "callId": call_id.to_string(),
+                "peerUserId": peer.to_string(),
+                "direction": "outgoing",
+                "status": "active",
+                "offerSdp": null,
+                "expiresAtMs": null,
+                "answeredAtMs": 1_760_000_000_000_i64,
+                "thisDevice": true,
+            }], "gone": [gone.to_string()]})
+        );
+        let ended = call_event(&CallEvent::Ended {
+            call_id,
+            reason: push_sdk::CallEndReason::Missed,
+            duration_s: None,
+        });
+        assert_eq!(
+            (&ended["reason"], &ended["durationS"]),
+            (&json!("missed"), &Value::Null)
+        );
+    }
+
+    #[test]
     fn a_config_takes_known_fields_and_the_key_as_bytes() {
         let value = json!({
             "authUrl": "http://127.0.0.1:1",
@@ -645,6 +840,52 @@ mod tests {
         ];
         for shown in events.iter().map(event) {
             let row = format!("| `{}` |", shown["type"].as_str().unwrap());
+            assert!(guide.contains(&row), "{row}");
+        }
+        let call_id = push_sdk::CallId::new();
+        let calls = [
+            CallEvent::Incoming {
+                call_id,
+                caller_id: user,
+                offer_sdp: text(),
+                expires_at_ms: 0,
+            },
+            CallEvent::Accepted {
+                call_id,
+                answer_sdp: text(),
+                answered_device_id: DeviceId::new(),
+            },
+            CallEvent::Taken { call_id },
+            CallEvent::Ended {
+                call_id,
+                reason: push_sdk::CallEndReason::Completed,
+                duration_s: None,
+            },
+            CallEvent::PeerIce {
+                call_id,
+                candidate: IceCandidate::end_of_candidates(),
+            },
+            CallEvent::PeerRenegotiate {
+                call_id,
+                sdp: text(),
+                kind: SdpKind::Offer,
+            },
+            CallEvent::Error {
+                call_id,
+                code: push_sdk::CallErrorCode::InCall,
+                error: SdkError::Offline,
+            },
+            CallEvent::Synced {
+                calls: Vec::new(),
+                gone: Vec::new(),
+            },
+            CallEvent::HistoryChanged {
+                latest_ended_at_ms: None,
+            },
+        ];
+        for shown in calls.into_iter().map(|call| event(&Event::Call(call))) {
+            assert!(guide.contains(&format!("| `{}` |", shown["type"].as_str().unwrap())));
+            let row = format!("| `call.{}` |", shown["call"]["type"].as_str().unwrap());
             assert!(guide.contains(&row), "{row}");
         }
     }
