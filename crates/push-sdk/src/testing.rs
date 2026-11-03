@@ -517,6 +517,7 @@ async fn serve(mut socket: Server, identity: &Mutex<(UserId, DeviceId)>, log: &M
                     user_id: id_bytes(user.0),
                     device_id: id_bytes(device.0),
                     heartbeat_ms: 30_000,
+                    capabilities: Vec::new(),
                 })]
             }
             Body::Ping(_) => vec![Body::Pong(Pong {})],

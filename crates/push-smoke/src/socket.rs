@@ -66,6 +66,7 @@ pub(crate) async fn identify(
     };
     let identify = Body::Identify(Identify {
         token: token.to_owned(),
+        capabilities: Vec::new(),
     });
     socket
         .send(Message::Binary(encode_frame(identify).into()))

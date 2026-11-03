@@ -66,6 +66,7 @@ pub async fn open(target: &Target, access_token: &str) -> anyhow::Result<Opened>
     let mut socket = connect(target).await?;
     let identify = Body::Identify(Identify {
         token: access_token.to_owned(),
+        capabilities: Vec::new(),
     });
     send(&mut socket, identify).await?;
     let deadline = Instant::now() + ANSWER_TIMEOUT;

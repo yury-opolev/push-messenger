@@ -366,6 +366,8 @@ fn server_frame(kind: Kind) -> Option<Body> {
         Kind::PresenceChanged(presence) => Body::PresenceEvent(PresenceEvent {
             presence: Some(presence),
         }),
+        // Call frames target devices, not every connection of the user.
+        Kind::Call(_) => return None,
     })
 }
 

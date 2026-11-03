@@ -158,6 +158,7 @@ async fn ready(url: &str, token: &str) -> Socket {
                 &mut socket,
                 Body::Identify(Identify {
                     token: token.to_owned(),
+                    capabilities: Vec::new(),
                 }),
             )
             .await;

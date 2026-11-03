@@ -166,6 +166,7 @@ impl Session {
             user_id: id_bytes(claims.user),
             device_id: id_bytes(claims.device),
             heartbeat_ms: u32::try_from(heartbeat.as_millis()).unwrap_or(u32::MAX),
+            capabilities: Vec::new(),
         }))
     }
 
@@ -275,6 +276,7 @@ mod tests {
     fn identify(token: &str) -> Vec<u8> {
         encode_frame(Body::Identify(Identify {
             token: token.to_owned(),
+            capabilities: Vec::new(),
         }))
     }
 
@@ -331,6 +333,7 @@ mod tests {
                 user_id: id_bytes(claims.user),
                 device_id: id_bytes(claims.device),
                 heartbeat_ms: 30_000,
+                capabilities: Vec::new(),
             }))
         );
         assert_eq!(session.device(), Some(claims.device));

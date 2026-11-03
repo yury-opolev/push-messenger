@@ -392,6 +392,7 @@ impl Connection {
         };
         let identify = Body::Identify(Identify {
             token: token.clone(),
+            capabilities: Vec::new(),
         });
         if send_now(&mut socket, identify).await.is_err() {
             return Err(lost(AfterClose::Reconnect, None, token));
@@ -852,6 +853,7 @@ mod tests {
                 user_id: id_bytes(client.session.user_id.0),
                 device_id: id_bytes(client.session.device_id.0),
                 heartbeat_ms,
+                capabilities: Vec::new(),
             }),
         )
         .await;

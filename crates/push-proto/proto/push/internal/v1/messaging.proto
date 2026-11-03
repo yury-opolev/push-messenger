@@ -51,6 +51,22 @@ service Messaging {
   // of the last one): reads the shared state and publishes it to the contacts allowed to
   // see it. Idempotent.
   rpc AnnouncePresence(AnnouncePresenceRequest) returns (AnnouncePresenceResponse);
+  // One call frame of a calls-active device (docs/calls.md): runs the call engine and
+  // publishes the resulting frames (CallSignal on `notify:{user}`) before answering, so
+  // two frames of one device reach the peer in order. Errors are statuses carrying a
+  // push.v1.Error, as for every Messaging RPC; the gateway sends them to the device as a
+  // CallError with the frame's call_id. With calls disabled: FAILED_PRECONDITION
+  // (NOT_AVAILABLE).
+  rpc Call(CallRequest) returns (CallReply);
+  // A calls-active connection identified (after Ready): registers device → connection,
+  // resumes the device's call (clears its away time, or adds it to a ringing call's
+  // devices) and returns the device's CallSync, which the gateway sends to it. With calls
+  // disabled: FAILED_PRECONDITION (NOT_AVAILABLE).
+  rpc CallAttach(CallDeviceRequest) returns (push.v1.CallSync);
+  // A calls-active connection closed: removes its registration if it still names this
+  // connection, and starts the disconnect grace if the device was a party device of a
+  // call (or drops it from a ringing call's devices). Idempotent.
+  rpc CallDetach(CallDeviceRequest) returns (CallDetachResponse);
 }
 
 // auth-svc's user and device events, relayed by the worker from auth-svc's outbox
@@ -126,7 +142,12 @@ message IdentifyRequest {
   int64 issued_at = 3;
 }
 
-message IdentifyResponse {}
+message IdentifyResponse {
+  // The features message-svc serves (CAPABILITY_CALLS when calls are enabled); empty from
+  // versions before calls. The gateway offers a feature in Ready only when it serves it
+  // too.
+  repeated push.v1.Capability capabilities = 1;
+}
 
 message SendRequest {
   bytes user_id = 1;
@@ -197,6 +218,56 @@ message AnnouncePresenceRequest {
 
 message AnnouncePresenceResponse {}
 
+// One call frame of a device (Messaging.Call).
+message CallRequest {
+  bytes user_id = 1;
+  bytes device_id = 2;
+  oneof frame {
+    push.v1.CallInvite invite = 3;
+    push.v1.CallAccept accept = 4;
+    push.v1.CallDecline decline = 5;
+    push.v1.CallCancel cancel = 6;
+    push.v1.CallIce ice = 7;
+    push.v1.CallHangup hangup = 8;
+    push.v1.CallRenegotiate renegotiate = 9;
+  }
+}
+
+message CallReply {
+  // A CallInvite that could not ring (BUSY, UNREACHABLE): the gateway sends it to the
+  // caller's device at once.
+  optional push.v1.CallEnded ended = 1;
+}
+
+// A calls-active connection of a device (CallAttach, CallDetach).
+message CallDeviceRequest {
+  bytes user_id = 1;
+  bytes device_id = 2;
+  // The id the gateway gave the connection (a UUIDv7): the one its presence lease names.
+  bytes connection_id = 3;
+}
+
+message CallDetachResponse {}
+
+// Call state in Redis (docs/calls.md), written and read by message-svc only. Every key
+// carries the hash tag `{calls}`, so a call's record, both users' busy locks and the due
+// set share one cluster slot and the Lua scripts stay cluster-safe. Times are Redis `TIME`
+// in milliseconds.
+// - `calls:{calls}:call:<call uuid>`: a hash, `ver` (the compare-and-set counter) and
+//   `rec` (the JSON call record, `"v": 1`). Expires at the ring deadline + 60 s while
+//   ringing, now + 120 s while active (refreshed by every write and liveness tick);
+//   deleted when the call ends.
+// - `calls:{calls}:user:<user uuid>`: a string, the user's call id (the busy lock: one
+//   call per user across devices). Same expiry as the record; deleted at the end if it
+//   still names the call.
+// - `calls:{calls}:devices:<user uuid>`: a hash, device id → connection id of each
+//   attached (calls-active) connection. 24 h TTL, refreshed on attach; a field is removed
+//   on the detach of that connection. An attached device is live while its connection
+//   holds a lease in `presence:{<user uuid>}:conns`.
+// - `calls:{calls}:due`: a sorted set, member = call id, score = its next deadline (ring
+//   timeout, grace end or liveness check). One entry per live call; a sweeper claim
+//   pushes it 5 s ahead (a lease); removed when the call ends.
+
 // Presence state in Redis (docs/activity-presence.md), written by the gateways and read
 // by message-svc. The braces are a hash tag, so both keys of a user share a cluster slot.
 // Every script uses Redis `TIME`, never a replica's clock.
@@ -220,6 +291,25 @@ message Notification {
     // client (activity is refreshed, presence is read again).
     push.v1.ActivityEvent activity_changed = 5;
     push.v1.Presence presence_changed = 6;
+    // Call frames for some of the user's devices (only calls-active connections of
+    // those devices get them). Never logged: it carries SDP and ICE candidates.
+    CallSignal call = 7;
+  }
+}
+
+// A call frame for the named devices of the user the channel belongs to.
+message CallSignal {
+  // The target devices (16-byte ids).
+  repeated bytes device_ids = 1;
+  oneof frame {
+    push.v1.CallIncoming incoming = 2;
+    push.v1.CallAccepted accepted = 3;
+    push.v1.CallTaken taken = 4;
+    push.v1.CallEnded ended = 5;
+    // Sent to the device as peer_call_ice.
+    push.v1.CallIce ice = 6;
+    // Sent to the device as peer_call_renegotiate.
+    push.v1.CallRenegotiate renegotiate = 7;
   }
 }
 

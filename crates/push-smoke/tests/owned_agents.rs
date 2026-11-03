@@ -77,6 +77,7 @@ async fn ready(url: &str, token: &str) -> Socket {
                 &mut socket,
                 Body::Identify(Identify {
                     token: token.to_owned(),
+                    capabilities: Vec::new(),
                 }),
             )
             .await;
@@ -443,6 +444,7 @@ async fn owner_and_agent_chat_as_distinct_users_and_deletion_kicks_the_live_agen
         &mut revived,
         Body::Identify(Identify {
             token: agent_token.to_owned(),
+            capabilities: Vec::new(),
         }),
     )
     .await;
