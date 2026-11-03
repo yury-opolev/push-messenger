@@ -2932,12 +2932,15 @@ name = "push-smoke"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "base64 0.22.1",
  "futures-util",
  "hmac",
  "jsonwebtoken",
+ "push-agent-key",
  "push-auth-core",
+ "push-bridge",
  "push-credentials",
  "push-gateway",
  "push-load",
