@@ -24,6 +24,7 @@ and the spec differ, this guide describes what the code does.
 - [15. Testing: browser smoke, interoperability, load](#15-testing-browser-smoke-interoperability-load)
 - [16. Troubleshooting](#16-troubleshooting)
 - [17. Release notes and upgrade guide](#17-release-notes-and-upgrade-guide)
+- [18. push-sdk](#18-push-sdk)
 
 ## 1. Status
 
@@ -34,7 +35,7 @@ and the spec differ, this guide describes what the code does.
 | Call history (`GET /v1/calls`, `DELETE /v1/calls/{call_id}`, `CallHistoryChanged`, retention) | available in this release ([§12](#12-call-history)) |
 | Browser recipe: a reference page ([`docs/examples/calls`](examples/calls)), its Playwright smoke test and the interoperability checklist ([§14](#14-browser-recipe), [§15](#15-testing-browser-smoke-interoperability-load)) | available in this release |
 | push-load `calls` scenario: concurrent calls and setup latency ([§15.3](#153-load)) | available in this release |
-| push-sdk calls API and bindings | coming |
+| push-sdk calls API ([§18](#18-push-sdk)) | available in this release (Rust; the C and Node bindings follow) |
 | Agents in calls (push-agent-bridge voice) | coming |
 
 This guide is meant to be enough to build a client without reading the server code. In
@@ -767,8 +768,7 @@ Errors use the API's format (`{"error": {"code", "message", "retryable"}}`):
 | 429 | `rate_limited` (`Retry-After`) | more than 60 requests per user per hour (600 per IP) |
 | 503 | `turn_unavailable` (`Retry-After: 30`, retryable) | no TURN configured (`calls.enabled` false), or the provider failed or answered with nothing usable. The API never returns servers that could not work |
 
-Client SDKs: push-sdk's `Calls::ice_servers()` (and `Calls::history()` / `Calls::hide()`
-for [§12](#12-call-history)).
+Client SDKs: push-sdk's `Calls::ice_servers()` ([§18](#18-push-sdk)).
 
 ### 13.2 Security
 
@@ -1102,7 +1102,8 @@ received; the load callee answers at once, so the callee's human response is exc
 
 A run needs two accounts per concurrent call (`prepare --sample-pairs N`) and a deployment
 whose `calls.attemptsPerHour` covers the run. Watch Redis while it runs (CPU, ops/s,
-memory; each call is one hash of under 100 KiB plus a lock) and message-svc's
+memory; each call is one hash of under 100 KiB plus a lock; `--redis-url-file` adds
+Redis `INFO commandstats` deltas per command to the report) and message-svc's
 `push_call_signal_seconds`, `push_call_setup_seconds` and `push_calls_live`. CI runs a
 small calls scenario against the in-process stack (`cargo test -p push-smoke --test
 local`); full-scale runs are for a deployment you own.
@@ -1173,3 +1174,76 @@ keeps messaging working:
 expires within two minutes; clients hide call UI on their next `Ready`), then roll back
 the images. Call history rows stay until retention removes them; an older message-svc
 ignores the table.
+
+## 18. push-sdk
+
+The Rust client core ([`crates/push-sdk`](../crates/push-sdk)) wraps everything above:
+the frames of [§4](#4-wire-frames), the error codes of [§5](#5-error-codes), the history
+of [§12](#12-call-history) and the ICE servers of [§13.1](#131-the-api). Media stays the
+app's job (a WebRTC stack of its own); an optional media helper follows.
+
+**Opting in.** Set `Config::calls = true` (default `false`) only in an app that can take
+calls: the client then lists `CAPABILITY_CALLS` in `Identify` and its connections ring.
+`client.calls()` returns a `Calls` handle (a clone of the client: drop it before
+`Client::close`). `Calls::available()` is true while the connection is up and its `Ready`
+offered calls; hide call UI otherwise.
+
+```rust
+let calls = client.calls();
+let servers = calls.ice_servers().await?;               // GET /v1/calls/ice-servers
+let call = calls.invite(peer, &offer_sdp).await?;       // a new UUIDv7 CallId
+calls.send_ice(call, candidate).await?;                 // trickle, then:
+calls.send_ice(call, IceCandidate::end_of_candidates()).await?;
+// on the callee: calls.accept(call, &answer_sdp), or decline(call, busy)
+// later: renegotiate(call, &sdp, SdpKind::Offer), hangup(call, failed), cancel(call)
+let page = calls.history(None, None, Some(50)).await?;  // GET /v1/calls
+calls.hide(call).await?;                                 // DELETE /v1/calls/{call_id}
+```
+
+| Method | Frame or route | Notes |
+|---|---|---|
+| `invite(peer, offer_sdp) -> CallId` | `CallInvite` (audio) | the client chooses the UUIDv7 id; calling oneself is `invalid` |
+| `accept(call, answer_sdp)` | `CallAccept` | |
+| `decline(call, busy)` | `CallDecline` | reason `BUSY` when `busy`, else `DECLINED` |
+| `cancel(call)` | `CallCancel` | `ALREADY_ANSWERED` back means it connected: `hangup` |
+| `hangup(call, failed)` | `CallHangup` | reason `FAILED` when `failed`, else `COMPLETED` |
+| `send_ice(call, IceCandidate)` | `CallIce` | `IceCandidate::end_of_candidates()` ends the trickle |
+| `renegotiate(call, sdp, SdpKind)` | `CallRenegotiate` | active calls only |
+| `ice_servers() -> IceServers` | `GET /v1/calls/ice-servers` | `servers` (`urls`, `username`, `credential`), `expires_at_ms`, `relay` |
+| `history(before, since, limit) -> CallPage` | `GET /v1/calls` | cursors as given; `limit` 1–100 (`None`: 50) |
+| `hide(call)` | `DELETE /v1/calls/{call_id}` | |
+
+The frame methods are fire and forget, like activity: they check the input as the server
+does ([§8](#8-limits): SDP and candidate rules, `invalid`), then need a live calls-active
+connection (`offline` while connecting or reconnecting, `not_available` when `Ready` did
+not offer calls) and return once the frame is queued. A refusal arrives later as
+`CallEvent::Error`. The HTTP methods need only a signed-in client.
+
+**Events.** Every server frame of a call becomes `Event::Call(CallEvent)`:
+
+| `CallEvent` | Frame | Fields |
+|---|---|---|
+| `Incoming` | `CallIncoming` | `call_id`, `caller_id`, `offer_sdp`, `expires_at_ms` (this device's clock: receipt + `expires_in_ms`) |
+| `Accepted` | `CallAccepted` | `call_id`, `answer_sdp`, `answered_device_id` |
+| `Taken` | `CallTaken` | `call_id` |
+| `Ended` | `CallEnded` | `call_id`, `reason` (`CallEndReason`), `duration_s` |
+| `PeerIce` | `peer_call_ice` | `call_id`, `candidate` (`IceCandidate`) |
+| `PeerRenegotiate` | `peer_call_renegotiate` | `call_id`, `sdp`, `kind` (`SdpKind`) |
+| `Error` | `CallError` | `call_id`, `code` (`CallErrorCode`: `AlreadyAnswered`, `CallNotFound`, `InCall`, `CallLimit`, `NotContact`, `Invalid`, `RateLimited`, `NotAvailable`, `Unavailable`, `Other`), `error` (`SdkError::Server` with the code in snake case, `retryable` and `retry_after_s`) |
+| `Synced` | `CallSync` | `calls` (`CallState`: id, peer, direction, status, offer, expiry, `answered_at_ms`, `this_device`), `gone` |
+| `HistoryChanged` | `CallHistoryChanged` | `latest_ended_at_ms` |
+
+**After a reconnect** ([§7](#7-client-rules)) the client reports `Synced` with the calls
+the server holds and, in `gone`, the calls this client knew live (invited, accepted,
+incoming) that the server no longer lists: release their media. For a listed call with
+`CallState::needs_ice_restart()` (active on this device) make an ICE restart offer and
+send it with `renegotiate`. Calls invited or accepted on the new connection before its
+`CallSync` arrived are never reported gone.
+
+**Privacy.** The SDK never logs SDP, candidates or TURN credentials, and their `Debug`
+output shows only lengths.
+
+**Bindings.** The C and Node bindings carry the call events in their JSON form
+([sdk-bindings.md](sdk-bindings.md)), but do not yet expose the methods or the `calls`
+option, so they never advertise calls and receive no call frames; the bindings' calls API
+follows.
