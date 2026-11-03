@@ -1,0 +1,18 @@
+//! Voice calls with the owner: call audio (16 kHz mono, 20 ms frames) is cut into
+//! utterances by voice activity detection, transcribed and sent to the agent as a prompt;
+//! the agent's Markdown reply becomes short plain sentences that are synthesized and played
+//! back; open approval and question cards can be answered by voice. These are the pure
+//! building blocks: WAV files and resampling, the detector, the spoken text and voice
+//! answers.
+
+pub mod confirm;
+pub mod speech;
+pub mod vad;
+pub mod wav;
+
+/// Samples per second of call audio (push-sdk's media helper).
+pub const SAMPLE_RATE: u32 = 16_000;
+/// Samples in one 20 ms frame.
+pub const FRAME: usize = 320;
+/// One 20 ms frame of 16 kHz mono audio.
+pub type Frame = [i16; FRAME];
