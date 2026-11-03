@@ -77,6 +77,13 @@ spec:
             {{- include "push.applicationEnv" (dict "root" . "name" "PUSH_DIRECTORY_TOKEN" "key" "directory-token") | nindent 12 }}
             # Only the gateway has this one: the Messaging API refuses calls without it.
             {{- include "push.applicationEnv" (dict "root" . "name" "PUSH_MESSAGING_TOKEN" "key" "messaging-token") | nindent 12 }}
+            # The call engine (docs/calls.md); the gateway is switched by the same value.
+            - name: PUSH_CALLS_ENABLED
+              value: {{ ternary "1" "0" (eq (toString .Values.calls.enabled) "true") | quote }}
+            - name: PUSH_CALLS_RING_SECONDS
+              value: {{ int .Values.calls.ringSeconds | quote }}
+            - name: PUSH_CALLS_DISCONNECT_GRACE_SECONDS
+              value: {{ int .Values.calls.disconnectGraceSeconds | quote }}
           ports:
             - name: messaging
               containerPort: 50051

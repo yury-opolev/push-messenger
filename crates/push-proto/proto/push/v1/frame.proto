@@ -29,6 +29,16 @@ message Frame {
     ReadUpTo read_up_to = 8;
     Request request = 9;
     Activity activity = 10;
+    // Calls, client to server (docs/calls.md). Only on a connection whose Ready listed
+    // CAPABILITY_CALLS and whose Identify did too; otherwise answered CallError
+    // NOT_AVAILABLE.
+    CallInvite call_invite = 11;
+    CallAccept call_accept = 12;
+    CallDecline call_decline = 13;
+    CallCancel call_cancel = 14;
+    CallIce call_ice = 15;
+    CallHangup call_hangup = 16;
+    CallRenegotiate call_renegotiate = 17;
 
     // Server to client (spec §7.2).
     Ready ready = 32;
@@ -43,8 +53,20 @@ message Frame {
     AuthExpiring auth_expiring = 41;
     ActivityEvent activity_event = 42;
     PresenceEvent presence_event = 43;
+    // Calls, server to client (docs/calls.md). Only calls-active connections receive
+    // them.
+    CallIncoming call_incoming = 44;
+    CallAccepted call_accepted = 45;
+    CallTaken call_taken = 46;
+    CallEnded call_ended = 47;
+    CallError call_error = 48;
+    CallSync call_sync = 49;
+    // A CallIce frame the other party's device sent for the call, relayed as is.
+    CallIce peer_call_ice = 50;
+    // A CallRenegotiate frame the other party's device sent for the call, relayed as is.
+    CallRenegotiate peer_call_renegotiate = 51;
   }
-  // 11-31 are free for later client frames, 44-63 for later server frames.
+  // 18-31 are free for later client frames, 52-63 for later server frames.
 }
 
 // Must be the first frame, within 5 seconds of connecting. The gateway learns the user
@@ -52,6 +74,9 @@ message Frame {
 message Identify {
   // The access token auth-svc issued for this device (a JWT, spec §5.1).
   string token = 1;
+  // What this client can do. List CAPABILITY_CALLS only if the client can take calls (it
+  // has call UI or a media helper): only such connections ring and may send call frames.
+  repeated Capability capabilities = 2;
   // 14 and 15 held the DEV ONLY ids that let a local gateway skip the token (Plans 4 to
   // 7); 16 is private_reads: the device does not reveal reads to others.
   reserved 14, 15, 16;
@@ -63,6 +88,17 @@ message Ready {
   bytes device_id = 2;
   // How often the client should send Ping.
   uint32 heartbeat_ms = 3;
+  // What this server offers on this connection. CAPABILITY_CALLS: calls are available;
+  // the connection is calls-active when Identify listed it too. Hide call UI without it
+  // (servers from before calls never list anything).
+  repeated Capability capabilities = 4;
+}
+
+// A feature a client advertises in Identify and a server offers in Ready.
+enum Capability {
+  CAPABILITY_UNSPECIFIED = 0;
+  // 1:1 audio calls (docs/calls.md).
+  CAPABILITY_CALLS = 1;
 }
 
 // A fresh access token for an identified connection (spec §7.3), sent after
@@ -604,6 +640,18 @@ enum ErrorCode {
   ERROR_CODE_PASSWORD_CHANGED = 25;
   // The device was registered moments ago and is not ready yet: retry shortly.
   ERROR_CODE_DEVICE_NOT_READY = 26;
+  // Calls: CallAccept or CallCancel after a device of the callee answered. A caller that
+  // gets it for CallCancel has a connected call and should send CallHangup.
+  ERROR_CODE_ALREADY_ANSWERED = 27;
+  // Calls: no such call for this device in this role: unknown, ended, another user's, or
+  // a frame the device may not send for it (for example CallRenegotiate while ringing).
+  // One answer for all, so it reveals nothing. Drop the call locally.
+  ERROR_CODE_CALL_NOT_FOUND = 28;
+  // Calls: the caller already has a call, ringing or active, on any of their devices.
+  ERROR_CODE_IN_CALL = 29;
+  // Calls: the call's cap of CallIce (200 per side, 32 before the answer) or
+  // CallRenegotiate (20 per side) frames is reached.
+  ERROR_CODE_CALL_LIMIT = 30;
 }
 
 message Error {
@@ -617,4 +665,240 @@ message Error {
   optional uint64 request_id = 5;
   // RATE_LIMITED: when the same frame may succeed again.
   optional uint32 retry_after_s = 6;
+}
+
+// Calls (docs/calls.md: the guide for client developers, with a browser recipe).
+//
+// 1:1 WebRTC audio calls between accepted contacts (and between an agent and its owner).
+// The server carries signalling only: SDP and ICE candidates travel through it, media
+// goes peer to peer and the server never sees it. Calls are available on a connection
+// only when its Identify and its Ready both list CAPABILITY_CALLS (a calls-active
+// connection); call frames on any other connection are answered CallError NOT_AVAILABLE.
+//
+// - call_id: a UUIDv7 (version 7 is enforced) chosen by the caller for CallInvite;
+//   every later frame of the call names it.
+// - Times (expires_at, answered_at) are microseconds since the Unix epoch on the server's
+//   clock (Redis). Use expires_in_ms, which is relative, for local timers: a skewed
+//   device clock then never shortens or lengthens ringing.
+// - A user has at most one call (ringing or active) across all their devices.
+// - Every refused call frame is answered by a CallError with its call_id, never by Error.
+// - Old clients never receive call frames: they do not advertise CAPABILITY_CALLS.
+
+enum CallMedia {
+  CALL_MEDIA_UNSPECIFIED = 0;
+  // Audio (Opus). The only media of this release.
+  CALL_MEDIA_AUDIO = 1;
+  // Not available in this release: an invite listing it is refused with INVALID.
+  CALL_MEDIA_VIDEO = 2;
+}
+
+// Why a call ended.
+enum CallEndReason {
+  CALL_END_REASON_UNSPECIFIED = 0;
+  // A party hung up after the call was answered.
+  CALL_END_REASON_COMPLETED = 1;
+  // Nobody answered before ringing timed out.
+  CALL_END_REASON_MISSED = 2;
+  // A ringing callee device declined.
+  CALL_END_REASON_DECLINED = 3;
+  // The caller cancelled before anyone answered.
+  CALL_END_REASON_CANCELLED = 4;
+  // The callee is in another call, or a ringing callee device declined as busy.
+  CALL_END_REASON_BUSY = 5;
+  // The call broke: a party hung up reporting a failure, or a party's device stayed
+  // disconnected longer than the grace period (30 s by default).
+  CALL_END_REASON_FAILED = 6;
+  // The callee has no calls-capable device online.
+  CALL_END_REASON_UNREACHABLE = 7;
+}
+
+enum CallSdpType {
+  CALL_SDP_TYPE_UNSPECIFIED = 0;
+  CALL_SDP_TYPE_OFFER = 1;
+  CALL_SDP_TYPE_ANSWER = 2;
+}
+
+// The call as seen by the user receiving CallState.
+enum CallDirection {
+  CALL_DIRECTION_UNSPECIFIED = 0;
+  // The user is the callee.
+  CALL_DIRECTION_IN = 1;
+  // The user is the caller.
+  CALL_DIRECTION_OUT = 2;
+}
+
+enum CallStatus {
+  CALL_STATUS_UNSPECIFIED = 0;
+  // Invited, not answered yet.
+  CALL_STATUS_RINGING = 1;
+  // Answered by a callee device.
+  CALL_STATUS_ACTIVE = 2;
+}
+
+// Calls a contact: their calls-capable online devices ring. Answered by nothing when it
+// rings (the callee's CallAccepted, or a CallEnded, follows), by CallEnded BUSY or
+// UNREACHABLE when it cannot ring, or by CallError: NOT_CONTACT (not an accepted contact,
+// a block either way, an agent rule, or no such user, indistinguishable), INVALID,
+// IN_CALL, RATE_LIMITED (too many invites per hour, with retry_after_s) or UNAVAILABLE.
+message CallInvite {
+  // A new UUIDv7 chosen by the caller (16 bytes).
+  bytes call_id = 1;
+  // The user to call; not the caller.
+  bytes callee_user_id = 2;
+  // The caller's SDP offer: at most 16384 bytes of UTF-8, audio only (at least one
+  // m=audio line and no other m= line kind).
+  string offer_sdp = 3;
+  // Exactly [CALL_MEDIA_AUDIO] in this release; CALL_MEDIA_VIDEO is refused with INVALID.
+  repeated CallMedia media = 4;
+}
+
+// Answers a ringing call, from one of the callee's devices that received CallIncoming
+// (or saw it ringing in CallSync). The first accept wins: the caller's device gets
+// CallAccepted, the callee's other ringing devices CallTaken. A later accept is
+// ALREADY_ANSWERED; one after ringing timed out ends the call MISSED.
+message CallAccept {
+  bytes call_id = 1;
+  // The callee's SDP answer: at most 16384 bytes of UTF-8, audio only.
+  string answer_sdp = 2;
+}
+
+// Refuses a ringing call from one of the callee's ringing devices: the call ends for
+// every device involved.
+message CallDecline {
+  bytes call_id = 1;
+  // CALL_END_REASON_DECLINED (the default when absent) or CALL_END_REASON_BUSY (the user
+  // is busy, for example in a call on another app); anything else is INVALID.
+  optional CallEndReason reason = 2;
+}
+
+// Withdraws a ringing call, from the caller's device. ALREADY_ANSWERED when a callee
+// device answered first: the call is connected, send CallHangup to end it.
+message CallCancel {
+  bytes call_id = 1;
+}
+
+// One trickled ICE candidate of the sender's side (RTCIceCandidate), relayed to the
+// other party's device as peer_call_ice. While ringing, the caller's candidates are
+// buffered (at most 32) and relayed to the answering device right after its accept;
+// ringing devices never receive them. At most 200 per side per call (CALL_LIMIT after).
+// After the last candidate, send one with end_of_candidates.
+message CallIce {
+  bytes call_id = 1;
+  // The candidate line: at most 512 bytes of printable ASCII starting with "candidate:",
+  // or empty together with end_of_candidates.
+  string candidate = 2;
+  // The media stream identification tag; at most 32 bytes.
+  optional string sdp_mid = 3;
+  // The index of the m= line the candidate belongs to.
+  optional uint32 sdp_mline_index = 4;
+  // No further candidates of this side for this generation (candidate empty).
+  bool end_of_candidates = 5;
+  // The ICE username fragment the candidate belongs to; at most 256 bytes.
+  optional string username_fragment = 6;
+}
+
+// Ends the call, from a party device. While active it ends the call for both party
+// devices. While ringing it is accepted too: from the caller it cancels the call
+// (CANCELLED), from a ringing callee device it declines it (DECLINED).
+message CallHangup {
+  bytes call_id = 1;
+  // CALL_END_REASON_COMPLETED (the default when absent) or CALL_END_REASON_FAILED (the
+  // media could not be established or broke); anything else is INVALID.
+  optional CallEndReason reason = 2;
+}
+
+// A new offer or answer for an active call (ICE restart, later media changes), relayed to
+// the other party's device as peer_call_renegotiate. Either side may send it; resolve
+// glare with "perfect negotiation", the callee being the polite peer. At most 20 per side
+// per call (CALL_LIMIT after); while ringing it is CALL_NOT_FOUND.
+message CallRenegotiate {
+  bytes call_id = 1;
+  // At most 16384 bytes of UTF-8, audio only.
+  string sdp = 2;
+  // CALL_SDP_TYPE_OFFER or CALL_SDP_TYPE_ANSWER.
+  CallSdpType type = 3;
+}
+
+// A call rings. Sent to every calls-capable online device of the callee. Ring for
+// expires_in_ms from receipt; stop on CallTaken or CallEnded.
+message CallIncoming {
+  bytes call_id = 1;
+  bytes caller_user_id = 2;
+  // The caller's SDP offer (audio only).
+  string offer_sdp = 3;
+  // [CALL_MEDIA_AUDIO] in this release.
+  repeated CallMedia media = 4;
+  // When ringing times out: microseconds since the Unix epoch, server clock.
+  int64 expires_at = 5;
+  // How long ringing lasts from now, in milliseconds: use it for the local ringing timer.
+  uint32 expires_in_ms = 6;
+}
+
+// A callee device answered the call. Sent to the caller's device.
+message CallAccepted {
+  bytes call_id = 1;
+  // The callee's SDP answer.
+  string answer_sdp = 2;
+  // The callee device that answered.
+  bytes answered_device_id = 3;
+}
+
+// Another device of the user answered the call. Sent to the callee's other ringing
+// devices: stop ringing, the call goes on elsewhere.
+message CallTaken {
+  bytes call_id = 1;
+}
+
+// The call is over. Sent to every device involved: the caller's device, and the callee's
+// ringing devices (while ringing) or answering device (once active), including the device
+// whose frame ended the call (as a confirmation). Also the immediate answer to a
+// CallInvite that cannot ring (BUSY, UNREACHABLE). Release the call's media.
+message CallEnded {
+  bytes call_id = 1;
+  CallEndReason reason = 2;
+  // Calls that were answered: whole seconds from the answer to the end.
+  optional uint32 duration_s = 3;
+}
+
+// A call frame was refused. Sent to the device that sent it, with its call_id.
+message CallError {
+  bytes call_id = 1;
+  // ALREADY_ANSWERED, CALL_NOT_FOUND, IN_CALL, CALL_LIMIT, NOT_CONTACT, INVALID,
+  // RATE_LIMITED, NOT_AVAILABLE or UNAVAILABLE.
+  ErrorCode code = 2;
+  // A human-readable explanation, never shown verbatim as the only information.
+  string message = 3;
+  // Whether the same frame may succeed if sent again unchanged (UNAVAILABLE and
+  // RATE_LIMITED only).
+  bool retryable = 4;
+  // RATE_LIMITED: when another CallInvite may succeed.
+  optional uint32 retry_after_s = 5;
+}
+
+// The user's calls as this device sees them. Sent once after Ready to every calls-active
+// connection (and so after every reconnect). Drop any local call it does not list; for a
+// listed active call with this_device, restart ICE through CallRenegotiate (an offer with
+// iceRestart).
+message CallSync {
+  repeated CallState calls = 1;
+}
+
+message CallState {
+  bytes call_id = 1;
+  // The other party.
+  bytes peer_user_id = 2;
+  CallDirection direction = 3;
+  CallStatus status = 4;
+  repeated CallMedia media = 5;
+  // An incoming ringing call only: the caller's SDP offer, to answer it.
+  optional string offer_sdp = 6;
+  // Ringing only: when ringing times out (microseconds since the Unix epoch, server clock).
+  optional int64 expires_at = 7;
+  // Ringing only: how long ringing lasts from now, in milliseconds.
+  optional uint32 expires_in_ms = 8;
+  // Active only: when the call was answered (microseconds since the Unix epoch).
+  optional int64 answered_at = 9;
+  // The call's device on this side is this device: the caller's device for an outgoing
+  // call, the answering device for an active incoming one, or a ringing device.
+  bool this_device = 10;
 }

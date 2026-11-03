@@ -11,14 +11,16 @@ use push_proto::id_bytes;
 use push_proto::internal::v1::{
     AccountAgent, AccountDevice, AccountUser, AccountsResponse, AckRequest, AckResponse,
     ActivityRequest, ActivityResponse, AnnouncePresenceRequest, AnnouncePresenceResponse,
-    DeleteRequest, EditRequest, IdentifyRequest, IdentifyResponse, ReadUpToRequest,
-    ReadUpToResponse, RequestCall, SendRequest, SyncRequest, SyncResponse, VisibleUsersRequest,
-    VisibleUsersResponse, accounts_server, directory_server, messaging_server,
+    CallDetachResponse, CallDeviceRequest, CallReply, CallRequest, DeleteRequest, EditRequest,
+    IdentifyRequest, IdentifyResponse, ReadUpToRequest, ReadUpToResponse, RequestCall, SendRequest,
+    SyncRequest, SyncResponse, VisibleUsersRequest, VisibleUsersResponse, accounts_server,
+    directory_server, messaging_server,
 };
-use push_proto::v1::{ContentType, SendAck};
+use push_proto::v1::{CallSync, Capability, ContentType, ErrorCode, SendAck};
 use tonic::service::Interceptor;
 use tonic::{Request, Response, Status};
 
+use crate::calls::CallsApi;
 use crate::convert::{
     activity_state_from_wire, deliver, domain_error, from_micros, invalid, parse_id, send_ack,
 };
@@ -30,6 +32,7 @@ use crate::requests;
 pub struct MessagingApi<S, C, N> {
     messaging: Arc<Messaging<S, C, N>>,
     presence: Arc<dyn PresenceStates>,
+    calls: Option<Arc<dyn CallsApi>>,
 }
 
 impl<S, C, N> MessagingApi<S, C, N> {
@@ -47,7 +50,19 @@ impl<S, C, N> MessagingApi<S, C, N> {
         Self {
             messaging,
             presence,
+            calls: None,
         }
+    }
+
+    /// With the call engine: `Identify` offers `CAPABILITY_CALLS` and the call RPCs run
+    /// on `calls`. Without it they answer `FAILED_PRECONDITION` `NOT_AVAILABLE`.
+    pub fn with_calls(mut self, calls: Arc<dyn CallsApi>) -> Self {
+        self.calls = Some(calls);
+        self
+    }
+
+    fn calls(&self) -> Result<&dyn CallsApi, Status> {
+        self.calls.as_deref().ok_or_else(calls_not_available)
     }
 }
 
@@ -71,7 +86,13 @@ where
             .identify(device, user, issued_at)
             .await
             .map_err(domain_error)?;
-        Ok(Response::new(IdentifyResponse {}))
+        Ok(Response::new(IdentifyResponse {
+            capabilities: if self.calls.is_some() {
+                vec![Capability::Calls.into()]
+            } else {
+                Vec::new()
+            },
+        }))
     }
 
     async fn send(&self, request: Request<SendRequest>) -> Result<Response<SendAck>, Status> {
@@ -199,6 +220,44 @@ where
             .map_err(domain_error)?;
         Ok(Response::new(AnnouncePresenceResponse {}))
     }
+
+    async fn call(&self, request: Request<CallRequest>) -> Result<Response<CallReply>, Status> {
+        self.calls()?
+            .call(request.into_inner())
+            .await
+            .map(Response::new)
+    }
+
+    async fn call_attach(
+        &self,
+        request: Request<CallDeviceRequest>,
+    ) -> Result<Response<CallSync>, Status> {
+        self.calls()?
+            .attach(request.into_inner())
+            .await
+            .map(Response::new)
+    }
+
+    async fn call_detach(
+        &self,
+        request: Request<CallDeviceRequest>,
+    ) -> Result<Response<CallDetachResponse>, Status> {
+        self.calls()?.detach(request.into_inner()).await?;
+        Ok(Response::new(CallDetachResponse {}))
+    }
+}
+
+/// The answer of the call RPCs while calls are disabled (the default).
+fn calls_not_available() -> Status {
+    push_proto::error_status(
+        tonic::Code::FailedPrecondition,
+        push_proto::v1::Error {
+            code: ErrorCode::NotAvailable.into(),
+            message: "calls are not available".to_owned(),
+            retryable: false,
+            ..push_proto::v1::Error::default()
+        },
+    )
 }
 
 /// The `Accounts` service: auth-svc's user and device events, relayed by the worker. Every

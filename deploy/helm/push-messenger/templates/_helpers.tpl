@@ -846,6 +846,25 @@ every identity that reaches it; password mode needs a consumer-managed Secret wi
 {{- end -}}
 
 {{/*
+Checks the voice call settings (docs/calls.md): a boolean switch and whole numbers in the
+ranges the services accept at start (strings and fractions are refused).
+*/}}
+{{- define "push.checkCalls" -}}
+{{- $calls := .Values.calls -}}
+{{- if not (kindIs "bool" $calls.enabled) -}}
+{{- fail "calls.enabled must be true or false" -}}
+{{- end -}}
+{{- range $limit := list (list "ringSeconds" 10 120) (list "disconnectGraceSeconds" 5 120) (list "attemptsPerHour" 1 1000) -}}
+{{- $name := index $limit 0 -}}
+{{- $value := index $calls $name -}}
+{{- $whole := int $value -}}
+{{- if or (not (or (kindIs "float64" $value) (kindIs "int64" $value) (kindIs "int" $value))) (ne (toString $whole) (toString $value)) (lt $whole (index $limit 1)) (gt $whole (index $limit 2)) -}}
+{{- fail (printf "calls.%s must be an integer from %d to %d" $name (index $limit 1) (index $limit 2)) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
 A service's PostgreSQL variables: the URL from the Secret (bundled, or external password
 mode), or the Entra ID variables of Plan 12A. Arguments: root, secretKey, database, user.
 */}}

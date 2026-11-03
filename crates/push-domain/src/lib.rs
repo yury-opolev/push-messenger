@@ -5,6 +5,7 @@
 //! the `Store` and `Tx` traits.
 
 mod activity;
+pub mod calls;
 pub mod clock;
 mod contacts;
 mod conversations;

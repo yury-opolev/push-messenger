@@ -251,6 +251,8 @@ Rich messages (cards from reviewed templates, answers, publishing, admin review 
 client catalog): [docs/rich-messages.md](docs/rich-messages.md).
 Live activity (typing, working, waiting) and presence (online, last seen):
 [docs/activity-presence.md](docs/activity-presence.md).
+Voice calls (1:1 WebRTC audio signalling, off by default, chart: `calls`):
+[docs/calls.md](docs/calls.md).
 auth-svc is a
 library, `push-auth-core`, and a thin binary, `push-auth`: a binary of your own can replace
 or restrict the sign-in check
@@ -274,11 +276,14 @@ at start-up.
 | `PUSH_GRPC_ADDR` | address of the gateway-only Messaging API | `0.0.0.0:50051` |
 | `PUSH_ACCOUNTS_GRPC_ADDR` | address of the worker-only Accounts API | `0.0.0.0:50052` |
 | `PUSH_DIRECTORY_GRPC_ADDR` | address of the auth-only Directory API | `0.0.0.0:50053` |
-| `PUSH_HEALTH_ADDR` | address of `/healthz` and `/readyz` | `0.0.0.0:8081` |
+| `PUSH_HEALTH_ADDR` | address of `/healthz`, `/readyz` and `/metrics` (the call metrics, Prometheus text) | `0.0.0.0:8081` |
 | `PUSH_DB_MAX_CONNECTIONS` | pool size, at least 1 | `10` |
 | `PUSH_ACCOUNTS_TOKEN` | the worker's token for the `Accounts` API, 32 to 256 visible ASCII characters; without it `Accounts` refuses every call | none |
 | `PUSH_DIRECTORY_TOKEN` | auth-svc's token for the `Directory` API, 32 to 256 visible ASCII characters and different from `PUSH_ACCOUNTS_TOKEN`; without it `Directory` refuses every call | none |
 | `PUSH_MESSAGING_TOKEN` | the gateway's token for the `Messaging` API, 32 to 256 visible ASCII characters and different from the other two; without it `Messaging` refuses every call | none |
+| `PUSH_CALLS_ENABLED` | `1` or `0`: run the call engine and offer calls ([docs/calls.md](docs/calls.md)); enable once every gateway and message-svc replica has calls | `0` |
+| `PUSH_CALLS_RING_SECONDS` | how long a call rings before it ends as missed, 10 to 120 | `45` |
+| `PUSH_CALLS_DISCONNECT_GRACE_SECONDS` | how long a party device may be gone before its call fails, 5 to 120 | `30` |
 
 `push-gateway`:
 
@@ -295,6 +300,8 @@ at start-up.
 | `PUSH_GROUPS` | `1` serves group requests; `0` refuses only the six group-management requests (create, add and remove members, leave, rename, set role) with `NOT_AVAILABLE`; groups that already exist (made while it was `1`, or directly through message-svc) still reach clients, and message-svc keeps serving them | `0` |
 | `PUSH_CLIENT_IP_HEADER` | header with the client's IP, set by the ingress (`x-real-ip`), for the per-IP limits on redeeming invites and contact requests; same trust assumption as auth-svc's | the peer address |
 | `PUSH_PRESENCE_GRACE_MS` | how long a closed connection still counts as online, so a reconnect within it (a network blip, a gateway rollout) is never shown offline; 0 to 120000 | `10000` |
+| `PUSH_CALLS_ENABLED` | `1` offers 1:1 audio calls ([docs/calls.md](docs/calls.md)) to clients that advertise them, when message-svc offers them too; `0` answers call frames `NOT_AVAILABLE` | `0` |
+| `PUSH_CALLS_ATTEMPTS_PER_HOUR` | `CallInvite` frames a user may send per hour, refused or not; 1 to 1000 | `30` |
 
 `push-auth`:
 

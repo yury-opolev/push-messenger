@@ -183,6 +183,24 @@ async fn the_presence_setting_round_trips<B: Backend>(backend: &B) {
     ));
 }
 
+/// An enrolled agent names its owner; the owner, another user and an unknown user name
+/// none.
+async fn agent_owner_names_the_owner<B: Backend>(backend: &B) {
+    let store = backend.store().await;
+    let (agent, owner, other) = (UserId::new(), UserId::new(), UserId::new());
+    add_users(&store, &[agent, owner, other]).await;
+    let mut tx = store.begin().await.unwrap();
+    assert_eq!(tx.agent_owner(agent).await, Ok(None));
+    tx.record_agent_owner(agent, owner).await.unwrap();
+    tx.commit().await.unwrap();
+
+    let mut tx = store.begin().await.unwrap();
+    assert_eq!(tx.agent_owner(agent).await, Ok(Some(owner)));
+    assert_eq!(tx.agent_owner(owner).await, Ok(None));
+    assert_eq!(tx.agent_owner(other).await, Ok(None));
+    assert_eq!(tx.agent_owner(UserId::new()).await, Ok(None));
+}
+
 pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
     case_list![
         inserting_a_user_twice_is_harmless,
@@ -194,5 +212,6 @@ pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
         device_state_reads_owner_activity_and_reset_together,
         a_password_reset_keeps_the_latest_time_and_needs_the_user,
         the_presence_setting_round_trips,
+        agent_owner_names_the_owner,
     ]
 }

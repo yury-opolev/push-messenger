@@ -1,12 +1,14 @@
 //! Rate limits of the gateway: the requests that let someone guess or probe (redeeming
 //! invites, contact requests, creating invites, presence reads), `Identify` per device
-//! (spec §7.3), writes (`Send`, `Edit`, `Delete`) per user, and frames per connection.
+//! (spec §7.3), writes (`Send`, `Edit`, `Delete`) per user, `CallInvite` per user, and
+//! frames per connection.
 //!
 //! Request limits are fixed windows in Redis (`INCR`, then `EXPIRE … NX`), keyed by a
 //! hash of the subject, so no user id or IP is stored in Redis; they count across every
 //! gateway. When Redis does not answer within 500 ms the request is refused with a
 //! retryable `UNAVAILABLE` and a warning (fail closed, like auth-svc): without counters
-//! nothing would stop someone guessing invite codes. `Identify` and writes fail open
+//! nothing would stop someone guessing invite codes; `CallInvite` fails closed too (calls
+//! need Redis anyway). `Identify` and writes fail open
 //! instead: signed-in devices must keep connecting and messaging while Redis is down
 //! (spec §12, test 4); meanwhile writes are bounded only by the frame budget.
 //!
@@ -41,6 +43,9 @@ pub enum Action {
     Write,
     /// `GetPresence`, per user: probing who is online, or loading Redis with batch reads.
     Presence,
+    /// `CallInvite`, per user, refused or not: ringing people over and over. The limit is
+    /// configured (`PUSH_CALLS_ATTEMPTS_PER_HOUR`, [`Limits::with_call_attempts`]).
+    CallInvite,
 }
 
 /// Whom a limit counts.
@@ -67,6 +72,8 @@ const fn per(max: u32, seconds: u64) -> Limit {
 }
 
 const HOUR: u64 = 3600;
+/// `CallInvite` frames a user may send per hour unless configured otherwise.
+const DEFAULT_CALL_ATTEMPTS: u32 = 30;
 const MINUTE: u64 = 60;
 
 impl Action {
@@ -89,11 +96,13 @@ impl Action {
             Self::Identify => "identify",
             Self::Write => "write",
             Self::Presence => "presence",
+            Self::CallInvite => "call",
         }
     }
 
     /// The limits of the action, in the order they are counted. A request refused by one
-    /// is not counted by the later ones.
+    /// is not counted by the later ones. For `CallInvite` this is the default; [`Limits`]
+    /// counts the configured one.
     pub fn limits(self) -> &'static [(Scope, Limit)] {
         // 50-bit codes: 20 guesses an hour per user and 60 per address. The user is
         // counted first, so a user over their own limit does not use up the quota of an
@@ -113,6 +122,7 @@ impl Action {
         // Two batch reads a second: a client reads its contact list on start and on
         // reconnects, then hears changes pushed.
         const PRESENCE: &[(Scope, Limit)] = &[(Scope::User, per(120, MINUTE))];
+        const CALL: &[(Scope, Limit)] = &[(Scope::User, per(DEFAULT_CALL_ATTEMPTS, HOUR))];
         match self {
             Self::RedeemInvite => REDEEM,
             Self::ContactRequest => CONTACT,
@@ -120,6 +130,7 @@ impl Action {
             Self::Identify => IDENTIFY,
             Self::Write => WRITE,
             Self::Presence => PRESENCE,
+            Self::CallInvite => CALL,
         }
     }
 }
@@ -161,6 +172,8 @@ pub enum Refused {
 #[derive(Clone)]
 pub struct Limits {
     counter: Arc<dyn Counter>,
+    /// The `CallInvite` limit: per user, per hour.
+    call_attempts: [(Scope, Limit); 1],
 }
 
 impl std::fmt::Debug for Limits {
@@ -179,13 +192,29 @@ pub struct Subject {
 
 impl Limits {
     pub fn new(counter: Arc<dyn Counter>) -> Self {
-        Self { counter }
+        Self {
+            counter,
+            call_attempts: [(Scope::User, per(DEFAULT_CALL_ATTEMPTS, HOUR))],
+        }
+    }
+
+    /// Counts at most `max` `CallInvite` frames per user per hour.
+    pub fn with_call_attempts(mut self, max: u32) -> Self {
+        self.call_attempts = [(Scope::User, per(max, HOUR))];
+        self
+    }
+
+    fn limits_of(&self, action: Action) -> &[(Scope, Limit)] {
+        match action {
+            Action::CallInvite => &self.call_attempts,
+            other => other.limits(),
+        }
     }
 
     /// Counts `action` by `subject`. A failing counter is `Unavailable`; the caller
     /// decides whether that refuses.
     pub async fn check(&self, action: Action, subject: Subject) -> Result<(), Refused> {
-        for &(scope, limit) in action.limits() {
+        for &(scope, limit) in self.limits_of(action) {
             let id = match scope {
                 Scope::Ip => subject.ip.map(ip_subject),
                 Scope::User => subject.user.map(|user| user.to_string()),
@@ -562,6 +591,42 @@ mod tests {
             limits.check(Action::Write, writer).await,
             Err(Refused::Limited { retry_after_s }) if retry_after_s > 60
         ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn call_invites_are_counted_per_user_by_the_configured_hour() {
+        let limits = memory().with_call_attempts(3);
+        let caller = Subject {
+            user: Some(Uuid::now_v7()),
+            ..Subject::default()
+        };
+        for _ in 0..3 {
+            limits.check(Action::CallInvite, caller).await.unwrap();
+        }
+        assert!(matches!(
+            limits.check(Action::CallInvite, caller).await,
+            Err(Refused::Limited { retry_after_s }) if retry_after_s > 3000
+        ));
+        let other = Subject {
+            user: Some(Uuid::now_v7()),
+            ..Subject::default()
+        };
+        limits.check(Action::CallInvite, other).await.unwrap();
+        tokio::time::advance(Duration::from_secs(3600)).await;
+        limits.check(Action::CallInvite, caller).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn call_invites_default_to_30_an_hour() {
+        let limits = memory();
+        let caller = Subject {
+            user: Some(Uuid::now_v7()),
+            ..Subject::default()
+        };
+        for _ in 0..30 {
+            limits.check(Action::CallInvite, caller).await.unwrap();
+        }
+        assert!(limits.check(Action::CallInvite, caller).await.is_err());
     }
 
     #[tokio::test]

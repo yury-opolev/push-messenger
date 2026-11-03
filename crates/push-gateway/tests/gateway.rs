@@ -16,8 +16,9 @@ use push_proto::internal::v1::messaging_client::MessagingClient;
 use push_proto::internal::v1::messaging_server::{self, MessagingServer};
 use push_proto::internal::v1::{
     AckRequest, AckResponse, ActivityRequest, ActivityResponse, AnnouncePresenceRequest,
-    AnnouncePresenceResponse, DeleteRequest, EditRequest, IdentifyRequest, IdentifyResponse,
-    ReadUpToRequest, ReadUpToResponse, RequestCall, SendRequest, SyncRequest, SyncResponse,
+    AnnouncePresenceResponse, CallDetachResponse, CallDeviceRequest, CallReply, CallRequest,
+    DeleteRequest, EditRequest, IdentifyRequest, IdentifyResponse, ReadUpToRequest,
+    ReadUpToResponse, RequestCall, SendRequest, SyncRequest, SyncResponse,
 };
 use push_proto::v1;
 use push_proto::v1::frame::Body;
@@ -115,6 +116,24 @@ impl messaging_server::Messaging for FlakySync {
     ) -> Result<Response<AnnouncePresenceResponse>, Status> {
         self.api.announce_presence(request).await
     }
+
+    async fn call(&self, request: Request<CallRequest>) -> Result<Response<CallReply>, Status> {
+        self.api.call(request).await
+    }
+
+    async fn call_attach(
+        &self,
+        request: Request<CallDeviceRequest>,
+    ) -> Result<Response<v1::CallSync>, Status> {
+        self.api.call_attach(request).await
+    }
+
+    async fn call_detach(
+        &self,
+        request: Request<CallDeviceRequest>,
+    ) -> Result<Response<CallDetachResponse>, Status> {
+        self.api.call_detach(request).await
+    }
 }
 
 struct Stack {
@@ -203,6 +222,8 @@ async fn stack_with(sync_failures: u32, heartbeat: Duration) -> Stack {
         groups: false,
         client_ip_header: None,
         presence_grace: PRESENCE_GRACE,
+        calls: false,
+        call_attempts_per_hour: 30,
     };
     let shutdown = CancellationToken::new();
     let server = tokio::spawn(serve(config, listener, health, shutdown.clone()));
@@ -267,7 +288,10 @@ fn identify(stack: &Stack, user: Uuid, device: Uuid) -> Body {
 /// minutes later.
 fn identify_issued(stack: &Stack, user: Uuid, device: Uuid, issued_at: i64) -> Body {
     let (token, _) = stack.issuer.issue(user, device, issued_at);
-    Body::Identify(Identify { token })
+    Body::Identify(Identify {
+        token,
+        capabilities: Vec::new(),
+    })
 }
 
 /// Connects and identifies with a token issued now; returns once `Ready` arrived.
@@ -383,14 +407,28 @@ async fn an_invalid_token_is_closed_with_4001_and_an_expired_one_with_4002() {
         elsewhere.issue(user, device, now()).0,
     ] {
         let mut socket = connect(&stack).await;
-        send(&mut socket, Body::Identify(Identify { token })).await;
+        send(
+            &mut socket,
+            Body::Identify(Identify {
+                token,
+                capabilities: Vec::new(),
+            }),
+        )
+        .await;
         assert_eq!(close_code(&mut socket).await, 4001);
     }
     // A key the gateway does not hold even after fetching the set again, such as one
     // retired before it started: refresh, never a sign-out.
     let mut socket = connect(&stack).await;
     let token = stranger.issue(user, device, now()).0;
-    send(&mut socket, Body::Identify(Identify { token })).await;
+    send(
+        &mut socket,
+        Body::Identify(Identify {
+            token,
+            capabilities: Vec::new(),
+        }),
+    )
+    .await;
     assert_eq!(close_code(&mut socket).await, 4002);
     // Expired 90 s ago: past the 60 s leeway. The client refreshes, then reconnects.
     // Expired 45 s ago: inside the leeway, but past the 30 s a connection has to send

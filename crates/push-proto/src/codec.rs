@@ -212,6 +212,127 @@ mod tests {
     }
 
     #[test]
+    fn call_frames_survive_encoding() {
+        use crate::v1::{
+            CallAccept, CallAccepted, CallCancel, CallDecline, CallDirection, CallEndReason,
+            CallEnded, CallError, CallHangup, CallIce, CallIncoming, CallInvite, CallMedia,
+            CallRenegotiate, CallSdpType, CallState, CallStatus, CallSync, CallTaken,
+        };
+        let call = id_bytes(Uuid::now_v7());
+        let sdp =
+            "v=0\r\no=- 1 1 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n";
+        let ice = CallIce {
+            call_id: call.clone(),
+            candidate: "candidate:1 1 udp 2122260223 192.0.2.1 54321 typ host".to_owned(),
+            sdp_mid: Some("0".to_owned()),
+            sdp_mline_index: Some(0),
+            end_of_candidates: true,
+            username_fragment: Some("abcd".to_owned()),
+        };
+        let renegotiate = CallRenegotiate {
+            call_id: call.clone(),
+            sdp: sdp.to_owned(),
+            r#type: CallSdpType::Offer.into(),
+        };
+        let audio = vec![CallMedia::Audio.into()];
+        let frames = [
+            Body::CallInvite(CallInvite {
+                call_id: call.clone(),
+                callee_user_id: id_bytes(Uuid::now_v7()),
+                offer_sdp: sdp.to_owned(),
+                media: audio.clone(),
+            }),
+            Body::CallAccept(CallAccept {
+                call_id: call.clone(),
+                answer_sdp: sdp.to_owned(),
+            }),
+            Body::CallDecline(CallDecline {
+                call_id: call.clone(),
+                reason: Some(CallEndReason::Busy.into()),
+            }),
+            Body::CallCancel(CallCancel {
+                call_id: call.clone(),
+            }),
+            Body::CallIce(ice.clone()),
+            Body::CallHangup(CallHangup {
+                call_id: call.clone(),
+                reason: Some(CallEndReason::Failed.into()),
+            }),
+            Body::CallRenegotiate(renegotiate.clone()),
+            Body::CallIncoming(CallIncoming {
+                call_id: call.clone(),
+                caller_user_id: id_bytes(Uuid::now_v7()),
+                offer_sdp: sdp.to_owned(),
+                media: audio.clone(),
+                expires_at: 1_700_000_045_000_000,
+                expires_in_ms: 45_000,
+            }),
+            Body::CallAccepted(CallAccepted {
+                call_id: call.clone(),
+                answer_sdp: sdp.to_owned(),
+                answered_device_id: id_bytes(Uuid::now_v7()),
+            }),
+            Body::CallTaken(CallTaken {
+                call_id: call.clone(),
+            }),
+            Body::CallEnded(CallEnded {
+                call_id: call.clone(),
+                reason: CallEndReason::Completed.into(),
+                duration_s: Some(61),
+            }),
+            Body::CallError(CallError {
+                call_id: call.clone(),
+                code: ErrorCode::RateLimited.into(),
+                message: "too many calls".to_owned(),
+                retryable: true,
+                retry_after_s: Some(120),
+            }),
+            Body::CallSync(CallSync {
+                calls: vec![CallState {
+                    call_id: call.clone(),
+                    peer_user_id: id_bytes(Uuid::now_v7()),
+                    direction: CallDirection::In.into(),
+                    status: CallStatus::Ringing.into(),
+                    media: audio,
+                    offer_sdp: Some(sdp.to_owned()),
+                    expires_at: Some(1_700_000_045_000_000),
+                    expires_in_ms: Some(30_000),
+                    answered_at: Some(1_700_000_001_000_000),
+                    this_device: true,
+                }],
+            }),
+            Body::PeerCallIce(ice),
+            Body::PeerCallRenegotiate(renegotiate),
+        ];
+        for frame in frames {
+            assert_eq!(decode_frame(&encode_frame(frame.clone())), Ok(frame));
+        }
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn decoding_never_panics(bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..4096)) {
+            let _ = decode_frame(&bytes);
+        }
+
+        #[test]
+        fn call_invites_round_trip(
+            sdp in "[ -~]{0,2000}",
+            call in proptest::prelude::any::<[u8; 16]>(),
+            callee in proptest::prelude::any::<[u8; 16]>(),
+        ) {
+            use crate::v1::{CallInvite, CallMedia};
+            let invite = Body::CallInvite(CallInvite {
+                call_id: call.to_vec(),
+                callee_user_id: callee.to_vec(),
+                offer_sdp: sdp,
+                media: vec![CallMedia::Audio.into()],
+            });
+            proptest::prop_assert_eq!(decode_frame(&encode_frame(invite.clone())), Ok(invite));
+        }
+    }
+
+    #[test]
     fn a_frame_without_a_body_is_empty() {
         assert_eq!(decode_frame(&[]), Err(FrameError::Empty));
     }

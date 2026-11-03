@@ -341,6 +341,27 @@ blip, a gateway rollout) is never shown offline; 0 to 120000 milliseconds, anyth
 stops the gateway at start-up. Presence state lives in the Redis the gateways and
 message-svc already share; see [activity-presence.md](activity-presence.md).
 
+### Voice calls
+
+1:1 audio call signalling ([calls.md](calls.md)) is off by default. Enable it only once
+every gateway and message-svc replica runs a version with calls; the one switch sets both
+services. Out-of-range values fail the render with the message shown and stop the service
+at start-up.
+
+| Value | Default | Validation | Renders |
+|---|---|---|---|
+| `calls.enabled` | `false` | "calls.enabled must be true or false" | `PUSH_CALLS_ENABLED` (`1`/`0`) on the gateway and message-svc |
+| `calls.ringSeconds` | `45` | "calls.ringSeconds must be an integer from 10 to 120" | message-svc `PUSH_CALLS_RING_SECONDS` |
+| `calls.disconnectGraceSeconds` | `30` | "calls.disconnectGraceSeconds must be an integer from 5 to 120" | message-svc `PUSH_CALLS_DISCONNECT_GRACE_SECONDS` |
+| `calls.attemptsPerHour` | `30` | "calls.attemptsPerHour must be an integer from 1 to 1000" | gateway `PUSH_CALLS_ATTEMPTS_PER_HOUR` |
+
+Call state lives in the Redis the gateways and message-svc already share. message-svc
+serves the call metrics in the Prometheus text format at `GET /metrics` on its health port
+(8081, the `health` container port; empty while calls are disabled); the chart adds no
+scrape configuration or annotations, so point the consumer's own scraper at it. The
+chart's NetworkPolicies admit no scraper to that port; NetworkPolicies are additive, so
+add one of your own that admits it on 8081. Metric names: [calls.md](calls.md#11-metrics).
+
 ## In-cluster transport
 
 Public traffic is TLS at the controller. Traffic between the services inside the

@@ -18,6 +18,6 @@ pub use hub::{Hub, Membership, Signal};
 pub use limits::{
     Action, Counter, FrameBudget, Limit, Limits, Outcome, RedisCounter, Refused, Scope, Subject,
 };
-pub use server::{init_logging, serve, terminated};
+pub use server::{init_logging, log_filter, serve, terminated};
 pub use session::{RetryDelay, Session, Step};
 pub use tokens::{Claims, LEEWAY, REFETCH_INTERVAL, TokenError, Verifier};

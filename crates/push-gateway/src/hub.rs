@@ -12,8 +12,9 @@
 //! On `notify:{user_id}`, `EntriesAvailable` rings every connection of the user (rings
 //! coalesce: a busy connection syncs once more afterwards, not once per ring), and receipts,
 //! read positions, contact changes, activity and presence are forwarded to each as server
-//! frames. On `kick:{device_id}`, the connections of the device are told to close, with two
-//! exceptions:
+//! frames. Call signals (`Notification.call`) name the devices they are for: each frame
+//! goes only to the user's connections of those devices. On `kick:{device_id}`, the
+//! connections of the device are told to close, with two exceptions:
 //!
 //! - a takeover closes only connections older than the newcomer it names. Connection ids
 //!   are UUIDv7s taken when a connection starts watching its device, so they sort by time:
@@ -38,8 +39,8 @@ use std::time::Duration;
 use prost::Message;
 use push_credentials::{AccessToken, RedisConnector};
 use push_proto::internal::v1::{
-    ContactChanged, Kick, KickReason, Notification, ReadPositionChanged, ReceiptChanged,
-    notification::Kind, receipt_changed,
+    CallSignal, ContactChanged, Kick, KickReason, Notification, ReadPositionChanged,
+    ReceiptChanged, call_signal, notification::Kind, receipt_changed,
 };
 use push_proto::v1::frame::Body;
 use push_proto::v1::{
@@ -96,6 +97,8 @@ struct Channel {
 struct Member {
     /// Connection id: a takeover names the newcomer by it.
     connection: Uuid,
+    /// The connection's device: call signals name the devices they are for.
+    device: Uuid,
     /// The `iat` of the connection's current token, in seconds since the Unix epoch.
     issued_at: i64,
     doorbell: mpsc::Sender<()>,
@@ -163,6 +166,7 @@ impl Hub {
         let (kicks, kicked) = mpsc::channel(1);
         let member = Member {
             connection,
+            device,
             issued_at,
             doorbell,
             events,
@@ -229,12 +233,42 @@ impl Hub {
 
     /// Hands a server frame to every connection on `channel`.
     fn forward(&self, channel: &str, frame: &Body) {
+        self.forward_to(channel, frame, |_| true);
+    }
+
+    /// Hands a server frame to the connections on `channel` whose device `wanted`.
+    fn forward_to(&self, channel: &str, frame: &Body, wanted: impl Fn(Uuid) -> bool) {
         let members = lock(&self.members);
         for member in Self::members_of(&members, channel) {
-            if member.events.try_send(frame.clone()).is_err() {
+            if wanted(member.device) && member.events.try_send(frame.clone()).is_err() {
                 tracing::warn!("a connection is not keeping up; a server frame was dropped");
             }
         }
+    }
+
+    /// Hands a call frame to the connections on `channel` of the devices the signal names.
+    /// A signal without a frame or without a valid device reaches nobody.
+    fn forward_call(&self, channel: &str, signal: CallSignal) {
+        let devices: Vec<Uuid> = signal
+            .device_ids
+            .iter()
+            .filter_map(|device| id(device).ok())
+            .collect();
+        let Some(frame) = signal.frame else {
+            return;
+        };
+        if devices.is_empty() {
+            return;
+        }
+        let frame = match frame {
+            call_signal::Frame::Incoming(incoming) => Body::CallIncoming(incoming),
+            call_signal::Frame::Accepted(accepted) => Body::CallAccepted(accepted),
+            call_signal::Frame::Taken(taken) => Body::CallTaken(taken),
+            call_signal::Frame::Ended(ended) => Body::CallEnded(ended),
+            call_signal::Frame::Ice(ice) => Body::PeerCallIce(ice),
+            call_signal::Frame::Renegotiate(renegotiate) => Body::PeerCallRenegotiate(renegotiate),
+        };
+        self.forward_to(channel, &frame, |device| devices.contains(&device));
     }
 
     /// Tells the connections on `channel` to close: for a takeover only those older than
@@ -297,6 +331,9 @@ impl Hub {
                 Ok(Notification {
                     kind: Some(Kind::EntriesAvailable(_)),
                 }) => self.ring(channel),
+                Ok(Notification {
+                    kind: Some(Kind::Call(signal)),
+                }) => self.forward_call(channel, signal),
                 Ok(Notification { kind: Some(kind) }) => {
                     if let Some(frame) = server_frame(kind) {
                         self.forward(channel, &frame);
@@ -366,6 +403,8 @@ fn server_frame(kind: Kind) -> Option<Body> {
         Kind::PresenceChanged(presence) => Body::PresenceEvent(PresenceEvent {
             presence: Some(presence),
         }),
+        // Call frames target devices, not every connection of the user: `forward_call`.
+        Kind::Call(_) => return None,
     })
 }
 
@@ -1092,6 +1131,69 @@ mod tests {
         assert_eq!(signal, Signal::Ring);
         shutdown.cancel();
         subscriber.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_call_signal_reaches_only_the_named_devices() {
+        let (hub, _commands) = hub();
+        let (alice, bob) = (Uuid::now_v7(), Uuid::now_v7());
+        let (mut phone, phone_device, _) = connection(&hub, alice).await;
+        let (mut laptop, _, _) = connection(&hub, alice).await;
+        let (mut other, other_device, _) = connection(&hub, bob).await;
+        let ended = v1::CallEnded {
+            call_id: id_bytes(Uuid::now_v7()),
+            reason: v1::CallEndReason::Completed.into(),
+            duration_s: Some(4),
+        };
+        let signal = |device_ids: Vec<Vec<u8>>, frame| {
+            Notification {
+                kind: Some(Kind::Call(CallSignal { device_ids, frame })),
+            }
+            .encode_to_vec()
+        };
+        // Bob's device is named too, but this is Alice's channel; a malformed id is skipped.
+        let payload = signal(
+            vec![
+                id_bytes(phone_device),
+                vec![1, 2, 3],
+                id_bytes(other_device),
+            ],
+            Some(call_signal::Frame::Ended(ended.clone())),
+        );
+        hub.dispatch(&notify_channel(alice), &payload);
+        assert_eq!(
+            pending(&mut phone),
+            Some(Signal::Frame(Box::new(Body::CallEnded(ended.clone()))))
+        );
+        assert_eq!(pending(&mut laptop), None);
+        assert_eq!(pending(&mut other), None);
+
+        let ice = v1::CallIce {
+            call_id: ended.call_id.clone(),
+            ..v1::CallIce::default()
+        };
+        hub.dispatch(
+            &notify_channel(alice),
+            &signal(
+                vec![id_bytes(phone_device)],
+                Some(call_signal::Frame::Ice(ice.clone())),
+            ),
+        );
+        assert_eq!(
+            pending(&mut phone),
+            Some(Signal::Frame(Box::new(Body::PeerCallIce(ice))))
+        );
+        // Without a frame, or without devices: nothing.
+        hub.dispatch(
+            &notify_channel(alice),
+            &signal(vec![id_bytes(phone_device)], None),
+        );
+        hub.dispatch(
+            &notify_channel(alice),
+            &signal(Vec::new(), Some(call_signal::Frame::Ended(ended))),
+        );
+        assert_eq!(pending(&mut phone), None);
+        assert_eq!(pending(&mut laptop), None);
     }
 
     #[tokio::test(start_paused = true)]

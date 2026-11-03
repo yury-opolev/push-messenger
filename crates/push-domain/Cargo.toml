@@ -19,6 +19,7 @@ unicode-normalization.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+proptest.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "time"] }
 
 [lints]

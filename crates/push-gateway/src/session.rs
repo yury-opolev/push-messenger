@@ -1,15 +1,17 @@
 //! The protocol state of one WebSocket connection, without any I/O: which frames are
 //! allowed when, what each one asks the gateway to do, which entries the client has
-//! already been sent, and when to sync again.
+//! already been sent, whether calls are active, and when to sync again.
 
 use std::collections::HashMap;
 use std::time::Duration;
 
 use push_proto::close;
+use push_proto::internal::v1::call_request;
 use push_proto::v1::frame::Body;
 use push_proto::v1::{
-    Ack, Activity, Delete, Deliver, Edit, Error, ErrorCode, Pong, ReadUpTo, Ready, Request, Send,
-    request,
+    Ack, Activity, CallAccept, CallCancel, CallDecline, CallError, CallHangup, CallIce, CallInvite,
+    CallRenegotiate, Capability, Delete, Deliver, Edit, Error, ErrorCode, Pong, ReadUpTo, Ready,
+    Request, Send, request,
 };
 use push_proto::{FrameError, decode_frame, id_bytes};
 use uuid::Uuid;
@@ -22,8 +24,12 @@ pub enum Step {
     /// Send this frame to the client.
     Reply(Body),
     /// Check this access token, ask message-svc whether the device it names may connect,
-    /// then call [`Session::identified`] or close.
-    Identify(String),
+    /// then call [`Session::identified`] or close. `capabilities`: what the client
+    /// advertised (`Capability` values, unknown ones included).
+    Identify {
+        token: String,
+        capabilities: Vec<i32>,
+    },
     /// Check this access token, which must name the connection's user and device, and
     /// ask message-svc again: the connection continues on the new token.
     ReAuth(String),
@@ -45,8 +51,100 @@ pub enum Step {
     /// Pace an activity through the connection's [`crate::ActivityLimiter`], then forward
     /// it to message-svc; answer only if it fails, with an error that is never retryable.
     Activity(Activity),
+    /// Forward a call frame of a calls-active connection to message-svc (`Messaging.Call`);
+    /// answer a refusal with `CallError`. Its `Debug` never shows the frame.
+    Call(CallFrame),
     /// Close the connection with this code and reason.
     Close(u16, &'static str),
+}
+
+/// A call frame a client sent (docs/calls.md). SDP and candidates are never logged, so
+/// `Debug` shows only which frame it is.
+#[derive(Clone, PartialEq)]
+pub enum CallFrame {
+    Invite(CallInvite),
+    Accept(CallAccept),
+    Decline(CallDecline),
+    Cancel(CallCancel),
+    Ice(CallIce),
+    Hangup(CallHangup),
+    Renegotiate(CallRenegotiate),
+}
+
+impl CallFrame {
+    /// The call the frame is about.
+    pub fn call_id(&self) -> &[u8] {
+        match self {
+            Self::Invite(frame) => &frame.call_id,
+            Self::Accept(frame) => &frame.call_id,
+            Self::Decline(frame) => &frame.call_id,
+            Self::Cancel(frame) => &frame.call_id,
+            Self::Ice(frame) => &frame.call_id,
+            Self::Hangup(frame) => &frame.call_id,
+            Self::Renegotiate(frame) => &frame.call_id,
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Invite(_) => "Invite",
+            Self::Accept(_) => "Accept",
+            Self::Decline(_) => "Decline",
+            Self::Cancel(_) => "Cancel",
+            Self::Ice(_) => "Ice",
+            Self::Hangup(_) => "Hangup",
+            Self::Renegotiate(_) => "Renegotiate",
+        }
+    }
+}
+
+impl std::fmt::Debug for CallFrame {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "CallFrame::{}(..)", self.name())
+    }
+}
+
+impl From<CallFrame> for call_request::Frame {
+    fn from(frame: CallFrame) -> Self {
+        match frame {
+            CallFrame::Invite(frame) => Self::Invite(frame),
+            CallFrame::Accept(frame) => Self::Accept(frame),
+            CallFrame::Decline(frame) => Self::Decline(frame),
+            CallFrame::Cancel(frame) => Self::Cancel(frame),
+            CallFrame::Ice(frame) => Self::Ice(frame),
+            CallFrame::Hangup(frame) => Self::Hangup(frame),
+            CallFrame::Renegotiate(frame) => Self::Renegotiate(frame),
+        }
+    }
+}
+
+/// The client frame as a call frame, if it is one.
+fn call_frame(body: Body) -> Option<CallFrame> {
+    match body {
+        Body::CallInvite(frame) => Some(CallFrame::Invite(frame)),
+        Body::CallAccept(frame) => Some(CallFrame::Accept(frame)),
+        Body::CallDecline(frame) => Some(CallFrame::Decline(frame)),
+        Body::CallCancel(frame) => Some(CallFrame::Cancel(frame)),
+        Body::CallIce(frame) => Some(CallFrame::Ice(frame)),
+        Body::CallHangup(frame) => Some(CallFrame::Hangup(frame)),
+        Body::CallRenegotiate(frame) => Some(CallFrame::Renegotiate(frame)),
+        _ => None,
+    }
+}
+
+/// Whether `body` is a server call frame.
+fn is_call_body(body: &Body) -> bool {
+    matches!(
+        body,
+        Body::CallIncoming(_)
+            | Body::CallAccepted(_)
+            | Body::CallTaken(_)
+            | Body::CallEnded(_)
+            | Body::CallSync(_)
+            | Body::PeerCallIce(_)
+            | Body::PeerCallRenegotiate(_)
+            | Body::CallError(_)
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,6 +163,9 @@ pub struct Session {
     /// Whether group requests are served (`PUSH_GROUPS`); refused with `NOT_AVAILABLE`
     /// otherwise.
     groups: bool,
+    /// Whether the connection is calls-active: the server offered calls in `Ready` and
+    /// the client advertised them in `Identify`. Call frames are refused otherwise.
+    calls_active: bool,
     state: State,
     /// The highest `seq` sent to the client per conversation, so a sync that repeats
     /// entries the client has not acked yet does not send them twice.
@@ -79,6 +180,7 @@ impl Session {
     pub fn new(groups: bool) -> Self {
         Self {
             groups,
+            calls_active: false,
             state: State::New,
             sent: HashMap::new(),
             more_waiting: false,
@@ -91,6 +193,17 @@ impl Session {
             State::Ready { device } => Some(device),
             State::New | State::Identifying => None,
         }
+    }
+
+    /// Whether the connection is calls-active.
+    pub fn calls_active(&self) -> bool {
+        self.calls_active
+    }
+
+    /// Whether a frame from the hub goes out on this connection: call frames only reach
+    /// calls-active connections.
+    pub fn forwards(&self, body: &Body) -> bool {
+        self.calls_active || !is_call_body(body)
     }
 
     /// What to do with a binary message from the client.
@@ -110,7 +223,10 @@ impl Session {
         match (body, self.state) {
             (Body::Identify(identify), State::New) => {
                 self.state = State::Identifying;
-                Step::Identify(identify.token)
+                Step::Identify {
+                    token: identify.token,
+                    capabilities: identify.capabilities,
+                }
             }
             (_, State::New | State::Identifying) => {
                 Step::Close(close::PROTOCOL_ERROR, "the first frame must be Identify")
@@ -139,7 +255,17 @@ impl Session {
             }
             (Body::Activity(activity), State::Ready { .. }) => Step::Activity(activity),
             (Body::Ping(_), State::Ready { .. }) => Step::Reply(Body::Pong(Pong {})),
-            (_, State::Ready { .. }) => reply_error(ErrorCode::BadFrame, "not a client frame"),
+            (body, State::Ready { .. }) => match call_frame(body) {
+                Some(frame) if self.calls_active => Step::Call(frame),
+                Some(frame) => Step::Reply(Body::CallError(CallError {
+                    call_id: frame.call_id().to_vec(),
+                    code: ErrorCode::NotAvailable.into(),
+                    message: "calls are not available on this connection".to_owned(),
+                    retryable: false,
+                    retry_after_s: None,
+                })),
+                None => reply_error(ErrorCode::BadFrame, "not a client frame"),
+            },
         }
     }
 
@@ -154,18 +280,31 @@ impl Session {
     }
 
     /// The token of [`Step::Identify`] passed and message-svc accepted the device it
-    /// names: the `Ready` frame to send. `None` if no identity is being checked.
-    pub fn identified(&mut self, claims: &Claims, heartbeat: Duration) -> Option<Body> {
+    /// names: the `Ready` frame to send, listing what the server `offered` on this
+    /// connection. `calls_active`: whether call frames are served. `None` if no identity
+    /// is being checked.
+    pub fn identified(
+        &mut self,
+        claims: &Claims,
+        heartbeat: Duration,
+        offered: &[Capability],
+        calls_active: bool,
+    ) -> Option<Body> {
         if self.state != State::Identifying {
             return None;
         }
         self.state = State::Ready {
             device: claims.device,
         };
+        self.calls_active = calls_active;
         Some(Body::Ready(Ready {
             user_id: id_bytes(claims.user),
             device_id: id_bytes(claims.device),
             heartbeat_ms: u32::try_from(heartbeat.as_millis()).unwrap_or(u32::MAX),
+            capabilities: offered
+                .iter()
+                .map(|&capability| capability.into())
+                .collect(),
         }))
     }
 
@@ -265,8 +404,9 @@ fn reply_error(code: ErrorCode, message: &str) -> Step {
 #[cfg(test)]
 mod tests {
     use push_proto::v1::{
-        ActivityState, AddMembers, CreateGroup, Identify, LeaveGroup, ListContacts, Ping, ReAuth,
-        RemoveMember, RenameGroup, SetRole,
+        ActivityState, AddMembers, CallAccepted, CallEnded, CallIncoming, CallSync, CallTaken,
+        CreateGroup, Identify, LeaveGroup, ListContacts, Ping, ReAuth, RemoveMember, RenameGroup,
+        SetRole,
     };
     use push_proto::{MAX_FRAME_BYTES, encode_frame};
 
@@ -275,7 +415,15 @@ mod tests {
     fn identify(token: &str) -> Vec<u8> {
         encode_frame(Body::Identify(Identify {
             token: token.to_owned(),
+            capabilities: Vec::new(),
         }))
+    }
+
+    fn identify_step(token: &str) -> Step {
+        Step::Identify {
+            token: token.to_owned(),
+            capabilities: Vec::new(),
+        }
     }
 
     fn claims() -> Claims {
@@ -291,11 +439,11 @@ mod tests {
         let mut session = Session::new(false);
         assert_eq!(
             session.on_binary(&identify("token")),
-            Step::Identify("token".to_owned())
+            identify_step("token")
         );
         let claims = claims();
         session
-            .identified(&claims, Duration::from_secs(30))
+            .identified(&claims, Duration::from_secs(30), &[], false)
             .unwrap();
         (session, claims.device)
     }
@@ -320,27 +468,34 @@ mod tests {
         let mut session = Session::new(false);
         assert_eq!(
             session.on_binary(&identify("a.b.c")),
-            Step::Identify("a.b.c".to_owned())
+            identify_step("a.b.c")
         );
         assert_eq!(session.device(), None);
         let claims = claims();
-        let ready = session.identified(&claims, Duration::from_secs(30));
+        let ready = session.identified(&claims, Duration::from_secs(30), &[], false);
         assert_eq!(
             ready,
             Some(Body::Ready(Ready {
                 user_id: id_bytes(claims.user),
                 device_id: id_bytes(claims.device),
                 heartbeat_ms: 30_000,
+                capabilities: Vec::new(),
             }))
         );
         assert_eq!(session.device(), Some(claims.device));
-        assert_eq!(session.identified(&claims, Duration::from_secs(30)), None);
+        assert_eq!(
+            session.identified(&claims, Duration::from_secs(30), &[], false),
+            None
+        );
     }
 
     #[test]
     fn identified_without_a_pending_identity_does_nothing() {
         let mut session = Session::new(false);
-        assert_eq!(session.identified(&claims(), Duration::from_secs(30)), None);
+        assert_eq!(
+            session.identified(&claims(), Duration::from_secs(30), &[], false),
+            None
+        );
         assert_eq!(session.device(), None);
     }
 
@@ -369,7 +524,7 @@ mod tests {
             let mut session = Session::new(false);
             assert_eq!(
                 session.on_binary(&identify("token")),
-                Step::Identify("token".to_owned())
+                identify_step("token")
             );
             assert_eq!(
                 session.on_binary(bytes),
@@ -531,7 +686,7 @@ mod tests {
 
         let mut session = Session::new(true);
         session.on_binary(&identify("token"));
-        session.identified(&claims(), Duration::from_secs(30));
+        session.identified(&claims(), Duration::from_secs(30), &[], false);
         for body in group_requests() {
             let request = Request {
                 request_id: 1,
@@ -542,6 +697,171 @@ mod tests {
                 Step::Request(request)
             );
         }
+    }
+
+    fn call_frames() -> Vec<Body> {
+        let call_id = id_bytes(Uuid::now_v7());
+        vec![
+            Body::CallInvite(CallInvite {
+                call_id: call_id.clone(),
+                ..CallInvite::default()
+            }),
+            Body::CallAccept(CallAccept {
+                call_id: call_id.clone(),
+                ..CallAccept::default()
+            }),
+            Body::CallDecline(CallDecline {
+                call_id: call_id.clone(),
+                reason: None,
+            }),
+            Body::CallCancel(CallCancel {
+                call_id: call_id.clone(),
+            }),
+            Body::CallIce(CallIce {
+                call_id: call_id.clone(),
+                ..CallIce::default()
+            }),
+            Body::CallHangup(CallHangup {
+                call_id: call_id.clone(),
+                reason: None,
+            }),
+            Body::CallRenegotiate(CallRenegotiate {
+                call_id,
+                ..CallRenegotiate::default()
+            }),
+        ]
+    }
+
+    fn calls_session(offered: &[Capability], calls_active: bool) -> (Session, Option<Body>) {
+        let mut session = Session::new(false);
+        let hello = encode_frame(Body::Identify(Identify {
+            token: "token".to_owned(),
+            capabilities: vec![Capability::Calls.into()],
+        }));
+        assert_eq!(
+            session.on_binary(&hello),
+            Step::Identify {
+                token: "token".to_owned(),
+                capabilities: vec![Capability::Calls.into()],
+            }
+        );
+        let ready = session.identified(&claims(), Duration::from_secs(30), offered, calls_active);
+        (session, ready)
+    }
+
+    #[test]
+    fn call_frames_from_the_hub_only_reach_calls_active_connections() {
+        let call_bodies = [
+            Body::CallIncoming(CallIncoming::default()),
+            Body::CallAccepted(CallAccepted::default()),
+            Body::CallTaken(CallTaken::default()),
+            Body::CallEnded(CallEnded::default()),
+            Body::CallError(CallError::default()),
+            Body::CallSync(CallSync::default()),
+            Body::PeerCallIce(CallIce::default()),
+            Body::PeerCallRenegotiate(CallRenegotiate::default()),
+        ];
+        let other = Body::Ready(Default::default());
+        let (active, _) = calls_session(&[Capability::Calls], true);
+        let (inactive, _) = calls_session(&[], false);
+        for body in &call_bodies {
+            assert!(active.forwards(body), "{body:?}");
+            assert!(!inactive.forwards(body), "{body:?}");
+        }
+        assert!(active.forwards(&other));
+        assert!(inactive.forwards(&other));
+    }
+
+    #[test]
+    fn ready_lists_what_the_server_offered() {
+        let (session, ready) = calls_session(&[Capability::Calls], true);
+        let Some(Body::Ready(ready)) = ready else {
+            panic!("no Ready");
+        };
+        assert_eq!(ready.capabilities, vec![i32::from(Capability::Calls)]);
+        assert!(session.calls_active());
+        let (session, ready) = calls_session(&[], false);
+        let Some(Body::Ready(ready)) = ready else {
+            panic!("no Ready");
+        };
+        assert!(ready.capabilities.is_empty());
+        assert!(!session.calls_active());
+    }
+
+    #[test]
+    fn call_frames_become_steps_on_a_calls_active_connection() {
+        let (mut session, _) = calls_session(&[Capability::Calls], true);
+        for body in call_frames() {
+            let expected = call_frame(body.clone()).unwrap();
+            let step = session.on_binary(&encode_frame(body));
+            assert_eq!(step, Step::Call(expected.clone()));
+            let Step::Call(frame) = step else {
+                unreachable!();
+            };
+            assert_eq!(frame.call_id(), expected.call_id());
+            assert!(!format!("{frame:?}").contains("call_id"));
+        }
+    }
+
+    #[test]
+    fn call_frames_are_not_available_on_other_connections() {
+        // Offered but not advertised by the client, or not offered at all.
+        for offered in [&[Capability::Calls][..], &[]] {
+            let (mut session, _) = calls_session(offered, false);
+            for body in call_frames() {
+                let call_id = call_frame(body.clone()).unwrap().call_id().to_vec();
+                assert_eq!(
+                    session.on_binary(&encode_frame(body)),
+                    Step::Reply(Body::CallError(CallError {
+                        call_id,
+                        code: ErrorCode::NotAvailable.into(),
+                        message: "calls are not available on this connection".to_owned(),
+                        retryable: false,
+                        retry_after_s: None,
+                    }))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn server_call_frames_from_a_client_are_bad_frames() {
+        let (mut session, _) = calls_session(&[Capability::Calls], true);
+        for body in [
+            Body::CallIncoming(CallIncoming::default()),
+            Body::CallAccepted(CallAccepted::default()),
+            Body::CallTaken(CallTaken::default()),
+            Body::CallEnded(CallEnded::default()),
+            Body::CallError(CallError::default()),
+            Body::CallSync(CallSync::default()),
+            Body::PeerCallIce(CallIce::default()),
+            Body::PeerCallRenegotiate(CallRenegotiate::default()),
+        ] {
+            assert_eq!(
+                error_code(session.on_binary(&encode_frame(body))),
+                ErrorCode::BadFrame
+            );
+        }
+    }
+
+    #[test]
+    fn a_call_frame_becomes_the_internal_frame() {
+        let invite = CallInvite {
+            call_id: id_bytes(Uuid::now_v7()),
+            ..CallInvite::default()
+        };
+        assert_eq!(
+            call_request::Frame::from(CallFrame::Invite(invite.clone())),
+            call_request::Frame::Invite(invite)
+        );
+        let hangup = CallHangup {
+            call_id: id_bytes(Uuid::now_v7()),
+            reason: None,
+        };
+        assert_eq!(
+            call_request::Frame::from(CallFrame::Hangup(hangup.clone())),
+            call_request::Frame::Hangup(hangup)
+        );
     }
 
     #[test]

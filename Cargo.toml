@@ -48,6 +48,7 @@ hyper-util = "0.1"
 jsonwebtoken = { version = "9", default-features = false }
 libtest-mimic = "0.8"
 prost = "0.14"
+proptest = "1"
 protoc-bin-vendored = "3"
 pulldown-cmark = { version = "0.13.5", default-features = false }
 push-agent-key = { path = "crates/push-agent-key" }

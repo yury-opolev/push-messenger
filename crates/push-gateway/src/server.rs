@@ -17,11 +17,14 @@ use push_credentials::startup::{redis_permanent, retry};
 use push_credentials::{AuthMode, AzureConfig, RedisConnector};
 use push_proto::internal::v1::messaging_client::MessagingClient;
 use push_proto::internal::v1::{
-    AckRequest, ActivityRequest, DeleteRequest, EditRequest, IdentifyRequest, Kick, KickReason,
-    ReadUpToRequest, RequestCall, SendRequest, SyncRequest,
+    AckRequest, ActivityRequest, CallDeviceRequest, CallRequest, DeleteRequest, EditRequest,
+    IdentifyRequest, IdentifyResponse, Kick, KickReason, ReadUpToRequest, RequestCall, SendRequest,
+    SyncRequest,
 };
 use push_proto::v1::frame::Body;
-use push_proto::v1::{Activity, ActivityState, AuthExpiring, Error, ErrorCode, SendAck};
+use push_proto::v1::{
+    Activity, ActivityState, AuthExpiring, CallError, Capability, Error, ErrorCode, SendAck,
+};
 use push_proto::{MAX_FRAME_BYTES, close, encode_frame, error_from_status, id_bytes, kick_channel};
 use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 use tokio::net::TcpListener;
@@ -40,7 +43,7 @@ use crate::drain::Drain;
 use crate::hub::{Hub, Membership, Signal};
 use crate::limits::{Action, FrameBudget, Limits, RedisCounter, Refused, Subject};
 use crate::presence::{self, PresenceContext};
-use crate::session::{RetryDelay, Session, Step, error_frame};
+use crate::session::{CallFrame, RetryDelay, Session, Step, error_frame};
 use crate::tokens::{Claims, TokenError, Verifier};
 
 /// The first frame must be `Identify`, within this time (spec §7.1).
@@ -68,6 +71,8 @@ const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 const SWEEP_INTERVAL: Duration = Duration::from_secs(300);
 /// How long each idle announcement of a closed connection may take.
 const IDLE_ON_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long telling message-svc that a calls-active connection closed may take.
+const DETACH_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// message-svc's `Messaging` API, every call carrying the gateway's internal token.
 pub(crate) type MessagingApi = MessagingClient<InterceptedService<Channel, BearerToken>>;
@@ -184,6 +189,7 @@ pub async fn serve(
         sessions.clone(),
     );
     let listen_addr = config.listen_addr;
+    let call_attempts = config.call_attempts_per_hour;
     let app = App {
         config: Arc::new(config),
         messaging,
@@ -192,7 +198,8 @@ pub async fn serve(
         limits: Limits::new(Arc::new(RedisCounter::new(
             publisher.clone(),
             shutdown.clone(),
-        ))),
+        )))
+        .with_call_attempts(call_attempts),
         redis: publisher,
         presence,
         sessions: sessions.clone(),
@@ -319,11 +326,18 @@ fn client_ip(
 /// One client connection, from `Identify` to close.
 async fn connection(mut socket: WebSocket, app: App, ip: IpAddr) {
     let mut session = Session::new(app.config.groups);
-    let Some((claims, mut membership)) = identify(&mut socket, &mut session, &app, ip).await else {
+    let Some(admitted) = identify(&mut socket, &mut session, &app, ip).await else {
         return;
     };
+    let Admitted {
+        claims,
+        mut membership,
+        offered,
+        calls_active,
+    } = admitted;
     membership.join_user(claims.user).await;
-    let Some(ready) = session.identified(&claims, app.config.heartbeat) else {
+    let Some(ready) = session.identified(&claims, app.config.heartbeat, &offered, calls_active)
+    else {
         return;
     };
     take_over(&app, claims.device, membership.connection()).await;
@@ -343,6 +357,10 @@ async fn connection(mut socket: WebSocket, app: App, ip: IpAddr) {
         retry: RetryDelay::default(),
         retry_at: None,
         activity: ActivityLimiter::new(Instant::now()),
+        connection: membership.connection(),
+        attached: false,
+        attach_retry: RetryDelay::default(),
+        attach_retry_at: None,
     };
     let kicked = converse(&mut connected, &mut membership, &app, ready).await;
     // A newer connection of the device took over: it is live and keeps its own activity
@@ -350,6 +368,11 @@ async fn connection(mut socket: WebSocket, app: App, ip: IpAddr) {
     if kicked != Some(KickReason::TakenOver) {
         connected.idle_on_close(&app);
     }
+    // Also after a takeover: the registry only ever holds the device's newest connection
+    // (an older connection's attach, even one landing after the newer one's, never replaces
+    // it) and the detach only removes the entry if it names this connection, so the newer
+    // connection stays registered whichever order the calls land in.
+    connected.detach_on_close(&app);
     drop(presence);
 }
 
@@ -364,12 +387,16 @@ async fn converse(
     if send(&mut connected.socket, ready).await.is_err() || connected.deliver().await.is_err() {
         return None;
     }
+    if connected.session.calls_active() && connected.attach().await.is_err() {
+        return None;
+    }
     // Clients ping every heartbeat; one silent for two and a half is gone.
     let idle = app.config.heartbeat * 5 / 2;
     let mut idle_at = Instant::now() + idle;
     let mut sweep_at = Instant::now() + first_sweep(membership.connection());
     loop {
         let retry_at = connected.retry_at;
+        let attach_retry_at = connected.attach_retry_at;
         let activity_due = connected.activity.next_due();
         let (warn_at, warned, deadline) = (
             connected.expiry.warn_at,
@@ -395,7 +422,11 @@ async fn converse(
             signal = membership.next() => {
                 let done = match signal {
                     Signal::Ring => connected.deliver().await,
-                    Signal::Frame(frame) => send(&mut connected.socket, *frame).await,
+                    Signal::Frame(frame) if connected.session.forwards(&frame) => {
+                        send(&mut connected.socket, *frame).await
+                    }
+                    // A call frame for a connection that does not serve calls.
+                    Signal::Frame(_) => Ok(()),
                     Signal::Kick(reason) => {
                         let (code, why) = kick_close(reason);
                         tracing::info!(device = %connected.device, ?reason, "connection kicked");
@@ -410,6 +441,14 @@ async fn converse(
             // The precondition disables the branch; the far-away instant is never awaited.
             () = tokio::time::sleep_until(retry_at.unwrap_or_else(far_future)), if retry_at.is_some() => {
                 if connected.deliver().await.is_err() {
+                    return None;
+                }
+            }
+            // The kick branch returns as soon as a kick is observed, so no retry starts
+            // after one; an attach still racing the takeover is refused by message-svc's
+            // registry, which keeps the newer connection.
+            () = tokio::time::sleep_until(attach_retry_at.unwrap_or_else(far_future)), if attach_retry_at.is_some() => {
+                if connected.attach().await.is_err() {
                     return None;
                 }
             }
@@ -482,6 +521,34 @@ fn far_future() -> Instant {
     Instant::now() + Duration::from_secs(24 * 60 * 60)
 }
 
+/// A connection message-svc admitted.
+struct Admitted {
+    claims: Claims,
+    membership: Membership,
+    /// What the server offers on the connection (`Ready.capabilities`).
+    offered: Vec<Capability>,
+    /// Whether calls are offered and the client advertised them.
+    calls_active: bool,
+}
+
+/// What the server offers a connection: calls when the gateway has them enabled and
+/// message-svc offered them; and whether the connection is calls-active, the client
+/// having `advertised` calls too.
+fn offer(
+    calls_enabled: bool,
+    response: &IdentifyResponse,
+    advertised: &[i32],
+) -> (Vec<Capability>, bool) {
+    let calls = i32::from(Capability::Calls);
+    let offered = if calls_enabled && response.capabilities.contains(&calls) {
+        vec![Capability::Calls]
+    } else {
+        Vec::new()
+    };
+    let calls_active = !offered.is_empty() && advertised.contains(&calls);
+    (offered, calls_active)
+}
+
 /// Waits for the first frame, checks its token and asks message-svc whether the device it
 /// names may connect. The connection watches the device's kicks before message-svc
 /// answers, so a revocation or password reset committed after the answer still reaches
@@ -491,7 +558,7 @@ async fn identify(
     session: &mut Session,
     app: &App,
     ip: IpAddr,
-) -> Option<(Claims, Membership)> {
+) -> Option<Admitted> {
     let deadline = tokio::time::sleep(IDENTIFY_TIMEOUT);
     tokio::pin!(deadline);
     let step = loop {
@@ -516,8 +583,11 @@ async fn identify(
             },
         }
     };
-    let token = match step {
-        Step::Identify(token) => token,
+    let (token, advertised) = match step {
+        Step::Identify {
+            token,
+            capabilities,
+        } => (token, capabilities),
         Step::Close(code, reason) => {
             close_with(socket, code, reason).await;
             return None;
@@ -581,9 +651,15 @@ async fn identify(
         .watch_device(claims.device, connection_id, claims.issued_at)
         .await;
     match admit(&mut app.messaging.clone(), &claims).await {
-        Ok(()) => {
-            tracing::info!(user = %claims.user, device = %claims.device, "device connected");
-            Some((claims, membership))
+        Ok(response) => {
+            let (offered, calls_active) = offer(app.config.calls, &response, &advertised);
+            tracing::info!(user = %claims.user, device = %claims.device, calls_active, "device connected");
+            Some(Admitted {
+                claims,
+                membership,
+                offered,
+                calls_active,
+            })
         }
         Err(refusal) => {
             let (code, reason) = refusal.close();
@@ -730,15 +806,17 @@ fn session_ended(status: &tonic::Status) -> Option<(u16, &'static str)> {
 }
 
 /// Asks message-svc whether the device of a valid token may connect: it is active and the
-/// user's, and the token is newer than the user's last password reset.
-async fn admit(messaging: &mut MessagingApi, claims: &Claims) -> Result<(), Refusal> {
+/// user's, and the token is newer than the user's last password reset. Its answer lists
+/// the features message-svc serves.
+async fn admit(messaging: &mut MessagingApi, claims: &Claims) -> Result<IdentifyResponse, Refusal> {
     let request = IdentifyRequest {
         user_id: id_bytes(claims.user),
         device_id: id_bytes(claims.device),
         issued_at: claims.issued_at,
     };
-    let Err(status) = messaging.identify(request).await else {
-        return Ok(());
+    let status = match messaging.identify(request).await {
+        Ok(response) => return Ok(response.into_inner()),
+        Err(status) => status,
     };
     if let Some((code, reason)) = session_ended(&status) {
         return Err(Refusal::Close(code, reason));
@@ -816,6 +894,14 @@ struct Connected {
     retry_at: Option<Instant>,
     /// Paces the connection's activities and remembers the live ones.
     activity: ActivityLimiter,
+    /// The connection's id: message-svc's call registry names it.
+    connection: Uuid,
+    /// Whether message-svc was asked to attach the connection (calls-active only), so it
+    /// must be told when the connection closes.
+    attached: bool,
+    attach_retry: RetryDelay,
+    /// When to retry a failed attach; `None` unless the last one failed.
+    attach_retry_at: Option<Instant>,
 }
 
 impl Connected {
@@ -940,11 +1026,127 @@ impl Connected {
                 close_with(&mut self.socket, code, reason).await;
                 Err(Closed)
             }
-            Step::Identify(_) => {
+            Step::Identify { .. } => {
                 let error = error_frame(ErrorCode::BadFrame, "already identified");
                 send(&mut self.socket, error).await
             }
+            Step::Call(frame) => self.call(frame).await,
         }
+    }
+
+    /// Forwards a call frame to message-svc. A `CallInvite` is counted against the user's
+    /// attempts first (fails closed). Refusals are answered with `CallError` naming the
+    /// frame's call; an invite that cannot ring is answered with its `CallEnded`. The
+    /// frame and its fields (SDP, candidates) are never logged.
+    async fn call(&mut self, frame: CallFrame) -> Result<(), Closed> {
+        let call_id = frame.call_id().to_vec();
+        if matches!(frame, CallFrame::Invite(_)) {
+            let who = Subject {
+                user: Some(self.user),
+                ..Subject::default()
+            };
+            if let Err(refused) = self.limits.check(Action::CallInvite, who).await {
+                let (code, message, retry_after_s) = match refused {
+                    Refused::Limited { retry_after_s } => {
+                        tracing::warn!(
+                            target: "security",
+                            event = "gateway.call.rate_limited",
+                            user_id = %self.user,
+                            device_id = %self.device,
+                            "a user calls too often"
+                        );
+                        (
+                            ErrorCode::RateLimited,
+                            "too many calls; retry later",
+                            retry_after_s,
+                        )
+                    }
+                    Refused::Unavailable => (
+                        ErrorCode::Unavailable,
+                        "calls cannot be placed now; retry",
+                        1,
+                    ),
+                };
+                let error = CallError {
+                    call_id,
+                    code: code.into(),
+                    message: message.to_owned(),
+                    retryable: true,
+                    retry_after_s: Some(retry_after_s),
+                };
+                return send(&mut self.socket, Body::CallError(error)).await;
+            }
+        }
+        let request = CallRequest {
+            user_id: id_bytes(self.user),
+            device_id: id_bytes(self.device),
+            frame: Some(frame.into()),
+        };
+        let body = match self.messaging.call(request).await {
+            Ok(reply) => match reply.into_inner().ended {
+                Some(ended) => Body::CallEnded(ended),
+                None => return Ok(()),
+            },
+            Err(status) => {
+                self.end_if_over(&status).await?;
+                Body::CallError(call_error(call_id, &status))
+            }
+        };
+        send(&mut self.socket, body).await
+    }
+
+    /// The connection's entry in message-svc's call registry.
+    fn call_device(&self) -> CallDeviceRequest {
+        CallDeviceRequest {
+            user_id: id_bytes(self.user),
+            device_id: id_bytes(self.device),
+            connection_id: id_bytes(self.connection),
+        }
+    }
+
+    /// Attaches a calls-active connection to message-svc's call registry and sends the
+    /// device's `CallSync`. A failed attach is retried after [`RetryDelay`], from the
+    /// connection's loop.
+    async fn attach(&mut self) -> Result<(), Closed> {
+        // Detaching is idempotent: the connection detaches when it closes even if this
+        // attempt's answer is lost.
+        self.attached = true;
+        match self.messaging.call_attach(self.call_device()).await {
+            Ok(sync) => {
+                self.attach_retry.succeeded();
+                self.attach_retry_at = None;
+                send(&mut self.socket, Body::CallSync(sync.into_inner())).await
+            }
+            Err(status) => {
+                self.end_if_over(&status).await?;
+                let delay = self.attach_retry.failed();
+                self.attach_retry_at = Some(Instant::now() + delay);
+                tracing::warn!(
+                    device = %self.device,
+                    code = ?status.code(),
+                    retry_in = ?delay,
+                    "call attach failed"
+                );
+                Ok(())
+            }
+        }
+    }
+
+    /// The connection ended: if it was attached for calls, tells message-svc (the call's
+    /// grace starts). In a task of its own, which shutdown waits for.
+    fn detach_on_close(&self, app: &App) {
+        if !(self.session.calls_active() && self.attached) {
+            return;
+        }
+        let request = self.call_device();
+        let mut messaging = self.messaging.clone();
+        let device = self.device;
+        app.sessions.spawn(async move {
+            let call = messaging.call_detach(request);
+            if !matches!(tokio::time::timeout(DETACH_TIMEOUT, call).await, Ok(Ok(_))) {
+                tracing::warn!(%device, "could not detach a closed connection from calls");
+            }
+        });
     }
 
     /// Counts a write (`Send`, `Edit`, `Delete`) against the user's quota. Over it, the
@@ -1102,8 +1304,9 @@ impl Connected {
             .await;
             return Err(Closed);
         }
+        // The connection's capabilities were settled at Identify.
         match admit(&mut self.messaging, &claims).await {
-            Ok(()) => {
+            Ok(_) => {
                 self.expiry = Expiry::new(claims.expires_at);
                 self.issued_at = claims.issued_at;
                 Ok(())
@@ -1168,6 +1371,31 @@ impl Connected {
     }
 }
 
+/// The `CallError` for a call frame message-svc refused. A message-svc from before calls
+/// (`UNIMPLEMENTED`, during a rollout) or one that cannot be reached is `UNAVAILABLE`,
+/// retryable.
+fn call_error(call_id: Vec<u8>, status: &tonic::Status) -> CallError {
+    let error = if status.code() == tonic::Code::Unimplemented {
+        Error {
+            code: ErrorCode::Unavailable.into(),
+            message: "calls are not available now; retry".to_owned(),
+            retryable: true,
+            client_msg_id: None,
+            request_id: None,
+            retry_after_s: Some(1),
+        }
+    } else {
+        error_from_status(status)
+    };
+    CallError {
+        call_id,
+        code: error.code,
+        message: error.message,
+        retryable: error.retryable,
+        retry_after_s: error.retry_after_s,
+    }
+}
+
 /// Sends one frame. A client that does not take it within 10 s is cut off.
 async fn send(socket: &mut WebSocket, body: Body) -> Result<(), Closed> {
     let message = Message::Binary(encode_frame(body).into());
@@ -1199,15 +1427,27 @@ async fn close_with(socket: &mut WebSocket, code: u16, reason: &'static str) {
     let _ = tokio::time::timeout(CLOSE_TIMEOUT, handshake).await;
 }
 
-/// Structured JSON logs on stdout. The level comes from `RUST_LOG` (default `info`).
+/// Structured JSON logs on stdout. The level comes from `RUST_LOG` (default `info`),
+/// through [`log_filter`].
 pub fn init_logging() {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     tracing_subscriber::fmt()
         .json()
-        .with_env_filter(filter)
+        .with_env_filter(log_filter(filter))
         .with_current_span(false)
         .init();
+}
+
+/// `filter` with the WebSocket library capped at `debug`, whatever it asks for: at
+/// `trace` tungstenite logs every frame with its payload (access tokens, messages, call
+/// SDP and ICE candidates).
+pub fn log_filter(filter: tracing_subscriber::EnvFilter) -> tracing_subscriber::EnvFilter {
+    filter.add_directive(
+        "tungstenite=debug"
+            .parse()
+            .expect("a valid filter directive"),
+    )
 }
 
 /// Resolves on Ctrl-C, or on SIGTERM where there is one (Kubernetes sends it).
@@ -1260,6 +1500,31 @@ mod tests {
 
     fn forwarded() -> HeaderName {
         HeaderName::from_static("x-forwarded-for")
+    }
+
+    #[test]
+    fn calls_are_offered_only_when_both_services_serve_them_and_active_when_advertised() {
+        let calls = i32::from(Capability::Calls);
+        let serving = IdentifyResponse {
+            capabilities: vec![calls],
+        };
+        let old = IdentifyResponse::default();
+        assert_eq!(
+            offer(true, &serving, &[calls]),
+            (vec![Capability::Calls], true)
+        );
+        assert_eq!(offer(true, &serving, &[]), (vec![Capability::Calls], false));
+        assert_eq!(offer(false, &serving, &[calls]), (Vec::new(), false));
+        assert_eq!(offer(true, &old, &[calls]), (Vec::new(), false));
+    }
+
+    #[test]
+    fn an_old_message_svc_makes_call_errors_retryable() {
+        let call_id = id_bytes(Uuid::now_v7());
+        let error = call_error(call_id.clone(), &tonic::Status::unimplemented("no Call"));
+        assert_eq!(error.call_id, call_id);
+        assert_eq!(error.code(), ErrorCode::Unavailable);
+        assert!(error.retryable);
     }
 
     #[test]

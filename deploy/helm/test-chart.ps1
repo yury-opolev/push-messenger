@@ -249,6 +249,44 @@ Check 'default: the presence grace is 10 s and configurable' {
     (Doc $default 'Deployment' 'push-gateway') -match 'name: PUSH_PRESENCE_GRACE_MS\s+value: "10000"' -and
         (Doc $short 'Deployment' 'push-gateway') -match 'name: PUSH_PRESENCE_GRACE_MS\s+value: "2000"'
 }
+Check 'default: calls are off on the gateway and message-svc, with the default limits' {
+    $gateway = Doc $default 'Deployment' 'push-gateway'
+    $messageSvc = Doc $default 'Deployment' 'push-message-svc'
+    $gateway -match 'name: PUSH_CALLS_ENABLED\s+value: "0"' -and
+        $gateway -match 'name: PUSH_CALLS_ATTEMPTS_PER_HOUR\s+value: "30"' -and
+        $messageSvc -match 'name: PUSH_CALLS_ENABLED\s+value: "0"' -and
+        $messageSvc -match 'name: PUSH_CALLS_RING_SECONDS\s+value: "45"' -and
+        $messageSvc -match 'name: PUSH_CALLS_DISCONNECT_GRACE_SECONDS\s+value: "30"'
+}
+Check 'calls: one switch enables both services; the limits render as set' {
+    $on = helm template push $chart --set calls.enabled=true --set calls.ringSeconds=120 `
+        --set calls.disconnectGraceSeconds=5 --set calls.attemptsPerHour=1000 | Out-String
+    $gateway = Doc $on 'Deployment' 'push-gateway'
+    $messageSvc = Doc $on 'Deployment' 'push-message-svc'
+    $gateway -match 'name: PUSH_CALLS_ENABLED\s+value: "1"' -and
+        $gateway -match 'name: PUSH_CALLS_ATTEMPTS_PER_HOUR\s+value: "1000"' -and
+        $messageSvc -match 'name: PUSH_CALLS_ENABLED\s+value: "1"' -and
+        $messageSvc -match 'name: PUSH_CALLS_RING_SECONDS\s+value: "120"' -and
+        $messageSvc -match 'name: PUSH_CALLS_DISCONNECT_GRACE_SECONDS\s+value: "5"'
+}
+foreach ($invalid in @(
+    @('--set', 'calls.enabled=yes', 'calls.enabled must be true or false'),
+    @('--set', 'calls.ringSeconds=9', 'calls.ringSeconds must be an integer from 10 to 120'),
+    @('--set', 'calls.ringSeconds=121', 'calls.ringSeconds must be an integer from 10 to 120'),
+    @('--set', 'calls.ringSeconds=45.5', 'calls.ringSeconds must be an integer from 10 to 120'),
+    @('--set-string', 'calls.ringSeconds=45', 'calls.ringSeconds must be an integer from 10 to 120'),
+    @('--set', 'calls.disconnectGraceSeconds=4', 'calls.disconnectGraceSeconds must be an integer from 5 to 120'),
+    @('--set', 'calls.disconnectGraceSeconds=121', 'calls.disconnectGraceSeconds must be an integer from 5 to 120'),
+    @('--set', 'calls.disconnectGraceSeconds=4.5', 'calls.disconnectGraceSeconds must be an integer from 5 to 120'),
+    @('--set', 'calls.attemptsPerHour=0', 'calls.attemptsPerHour must be an integer from 1 to 1000'),
+    @('--set', 'calls.attemptsPerHour=1001', 'calls.attemptsPerHour must be an integer from 1 to 1000'),
+    @('--set', 'calls.attemptsPerHour=4.5', 'calls.attemptsPerHour must be an integer from 1 to 1000')
+)) {
+    Check "calls: $($invalid[0]) $($invalid[1]) is refused" {
+        $errorText = helm template push $chart $invalid[0] $invalid[1] 2>&1 | Out-String
+        $LASTEXITCODE -ne 0 -and $errorText.Contains($invalid[2])
+    }
+}
 Check 'default: the DevSetup switch is gone' { $default -notmatch 'PUSH_DEV_SETUP' }
 Check 'default: no smoke test' { $default -notmatch 'helm.sh/hook: test' -and $default -notmatch 'PUSH_SMOKE_SIGNING_KEY' }
 Check 'operator smoke: consumer Secret enables helm test without DEV credentials' {

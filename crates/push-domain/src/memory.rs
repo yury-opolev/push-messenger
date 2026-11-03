@@ -964,6 +964,10 @@ impl Tx for InMemoryTx {
         Ok(self.work.agent_owners.contains_key(&user))
     }
 
+    async fn agent_owner(&mut self, user: UserId) -> DomainResult<Option<UserId>> {
+        Ok(self.work.agent_owners.get(&user).copied())
+    }
+
     async fn template(&mut self, template: &TemplateRef) -> DomainResult<Option<StoredTemplate>> {
         Ok(self.work.templates.get(template).cloned())
     }

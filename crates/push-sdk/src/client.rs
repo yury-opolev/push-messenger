@@ -984,6 +984,7 @@ mod tests {
                 user_id: bytes(self.auth.user.0),
                 device_id: bytes(self.auth.device.0),
                 heartbeat_ms: 30_000,
+                capabilities: Vec::new(),
             };
             send(&mut socket, Body::Ready(ready)).await;
             socket
