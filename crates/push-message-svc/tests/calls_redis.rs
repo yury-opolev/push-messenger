@@ -266,17 +266,41 @@ async fn keys_expire_without_message_svc() {
 async fn detach_only_removes_the_matching_connection() {
     let (_container, calls, _admin) = redis().await;
     let (user, device) = (UserId::new(), DeviceId::new());
-    let (old, new) = (Uuid::new_v4(), Uuid::new_v4());
-    calls.attach(user, device, old).await.unwrap();
+    let (old, new) = (Uuid::now_v7(), Uuid::now_v7());
+    assert!(calls.attach(user, device, old).await.unwrap());
     assert_eq!(calls.connection_of(user, device).await.unwrap(), Some(old));
     // A takeover: the new connection replaces the old one.
-    calls.attach(user, device, new).await.unwrap();
+    assert!(calls.attach(user, device, new).await.unwrap());
     assert_eq!(calls.connection_of(user, device).await.unwrap(), Some(new));
     assert!(!calls.detach(user, device, old).await.unwrap());
     assert_eq!(calls.connection_of(user, device).await.unwrap(), Some(new));
     assert!(calls.detach(user, device, new).await.unwrap());
     assert_eq!(calls.connection_of(user, device).await.unwrap(), None);
     assert!(!calls.detach(user, device, new).await.unwrap());
+}
+
+#[tokio::test]
+async fn an_older_connection_never_replaces_a_newer_one() {
+    let (_container, calls, _admin) = redis().await;
+    let (user, device) = (UserId::new(), DeviceId::new());
+    let (older, newer) = (Uuid::now_v7(), Uuid::now_v7());
+    assert!(older.to_string() < newer.to_string());
+    assert!(calls.attach(user, device, newer).await.unwrap());
+    // The older connection's attach lands late, e.g. retried across the takeover.
+    assert!(!calls.attach(user, device, older).await.unwrap());
+    assert_eq!(
+        calls.connection_of(user, device).await.unwrap(),
+        Some(newer)
+    );
+    // Re-attaching the registered connection is fine.
+    assert!(calls.attach(user, device, newer).await.unwrap());
+    assert!(!calls.detach(user, device, older).await.unwrap());
+    assert_eq!(
+        calls.connection_of(user, device).await.unwrap(),
+        Some(newer)
+    );
+    assert!(calls.detach(user, device, newer).await.unwrap());
+    assert_eq!(calls.connection_of(user, device).await.unwrap(), None);
 }
 
 #[tokio::test]

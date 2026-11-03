@@ -110,7 +110,7 @@ impl Env {
 
     /// Attaches `device` of `user` on a new connection with a live presence lease.
     async fn online(&mut self, user: UserId, device: DeviceId) -> (Uuid, v1::CallSync) {
-        let connection = Uuid::new_v4();
+        let connection = Uuid::now_v7();
         let now = self.service.redis().now().await.unwrap();
         let _: () = redis::cmd("ZADD")
             .arg(presence_conns_key(user.0))

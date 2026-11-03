@@ -90,8 +90,14 @@ table.insert(ids, 1, now); return ids
 ";
 
 /// Registers a device's connection (`ARGV[1]` device, `ARGV[2]` connection, `ARGV[3]` the
-/// registry's TTL in ms).
+/// registry's TTL in ms) unless a newer connection is registered: 1 if it stored it.
+/// Connection ids are UUIDv7 as lowercase hyphenated strings, so comparing the strings
+/// orders them by creation time. A late attach of an older connection (an attach in flight
+/// or retried across a takeover) thus never replaces the newer one, whose registration the
+/// older one's detach would then remove.
 const ATTACH: &str = r"
+local current = redis.call('HGET', KEYS[1], ARGV[1])
+if current and ARGV[2] < current then return 0 end
 redis.call('HSET', KEYS[1], ARGV[1], ARGV[2])
 redis.call('PEXPIRE', KEYS[1], ARGV[3])
 return 1
@@ -369,16 +375,18 @@ impl RedisCalls {
         Ok((now, ids))
     }
 
-    /// Registers `conn` as `device`'s calls-active connection (replacing an earlier one).
-    pub async fn attach(&self, user: UserId, device: DeviceId, conn: Uuid) -> RedisResult<()> {
+    /// Registers `conn` (a UUIDv7) as `device`'s calls-active connection, replacing an
+    /// older one; whether it did: `false` when a newer connection is registered.
+    pub async fn attach(&self, user: UserId, device: DeviceId, conn: Uuid) -> RedisResult<bool> {
         let keys = [devices_key(user)];
         let args = [
             device.0.to_string(),
             conn.to_string(),
             DEVICES_TTL_MS.to_string(),
         ];
-        let _: (i64, bool) = bounded(self.attach.run(&self.connection, &keys, &args)).await?;
-        Ok(())
+        let (stored, _): (i64, bool) =
+            bounded(self.attach.run(&self.connection, &keys, &args)).await?;
+        Ok(stored == 1)
     }
 
     /// Removes `device`'s registration if it still names `conn`; whether it did.

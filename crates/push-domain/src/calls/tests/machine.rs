@@ -1410,7 +1410,31 @@ fn ice_cap_and_buffer_cap() {
 
 #[test]
 fn records_are_bounded() {
-    let offer = "a".repeat(MAX_SDP_BYTES);
+    // Worst case for the JSON: inputs the validators accept made of characters JSON escapes
+    // to two bytes (`\` and `"`).
+    let head = "v=0\nm=audio 9 UDP/TLS/RTP/SAVPF 111\na=";
+    let offer = format!("{head}{}", "\\".repeat(MAX_SDP_BYTES - head.len()));
+    assert_eq!(offer.len(), MAX_SDP_BYTES);
+    assert_eq!(check_sdp(&offer), Ok(()));
+    let candidate = Candidate {
+        candidate: format!(
+            "candidate:{}",
+            "\"".repeat(MAX_CANDIDATE_BYTES - "candidate:".len())
+        ),
+        sdp_mid: Some("\\".repeat(MAX_SDP_MID_BYTES)),
+        sdp_mline_index: Some(u32::MAX),
+        end_of_candidates: true,
+        username_fragment: Some("\"".repeat(MAX_UFRAG_BYTES)),
+    };
+    assert_eq!(
+        check_candidate(&CandidateInput {
+            candidate: &candidate.candidate,
+            sdp_mid: candidate.sdp_mid.as_deref(),
+            username_fragment: candidate.username_fragment.as_deref(),
+            end_of_candidates: candidate.end_of_candidates,
+        }),
+        Ok(())
+    );
     let mut record = start(
         call_id(),
         caller(),
@@ -1422,18 +1446,10 @@ fn records_are_bounded() {
         &timing(),
     )
     .0;
-    record.pending_ice = (0..MAX_PENDING_ICE)
-        .map(|_| Candidate {
-            candidate: "c".repeat(MAX_CANDIDATE_BYTES),
-            sdp_mid: Some("m".repeat(MAX_SDP_MID_BYTES)),
-            sdp_mline_index: Some(u32::MAX),
-            end_of_candidates: true,
-            username_fragment: Some("u".repeat(MAX_UFRAG_BYTES)),
-        })
-        .collect();
+    record.pending_ice = (0..MAX_PENDING_ICE).map(|_| candidate.clone()).collect();
     record.ice_caller = MAX_PENDING_ICE as u32;
     let json = serde_json::to_vec(&record).unwrap();
-    assert!(json.len() < 50 * 1024, "{} bytes", json.len());
+    assert!(json.len() < 100 * 1024, "{} bytes", json.len());
 }
 
 #[test]

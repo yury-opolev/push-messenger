@@ -368,8 +368,10 @@ async fn connection(mut socket: WebSocket, app: App, ip: IpAddr) {
     if kicked != Some(KickReason::TakenOver) {
         connected.idle_on_close(&app);
     }
-    // Also after a takeover: the newer connection's attach replaced this one's, so the
-    // detach changes nothing then.
+    // Also after a takeover: the registry only ever holds the device's newest connection
+    // (an older connection's attach, even one landing after the newer one's, never replaces
+    // it) and the detach only removes the entry if it names this connection, so the newer
+    // connection stays registered whichever order the calls land in.
     connected.detach_on_close(&app);
     drop(presence);
 }
@@ -438,6 +440,9 @@ async fn converse(
                     return None;
                 }
             }
+            // The kick branch returns as soon as a kick is observed, so no retry starts
+            // after one; an attach still racing the takeover is refused by message-svc's
+            // registry, which keeps the newer connection.
             () = tokio::time::sleep_until(attach_retry_at.unwrap_or_else(far_future)), if attach_retry_at.is_some() => {
                 if connected.attach().await.is_err() {
                     return None;

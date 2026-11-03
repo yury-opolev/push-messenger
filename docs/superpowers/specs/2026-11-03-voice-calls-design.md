@@ -386,7 +386,7 @@ calls in progress lose their state: the next frame of either side gets `CALL_NOT
 media continues peer to peer until a side hangs up locally.
 
 The record is bounded: offer ≤ 16 KiB (dropped when answered), ≤ 32 buffered candidates
-(≤ 1 KiB each with metadata) — under 50 KiB per call, one call per user.
+(≤ 2 KiB each with metadata) — under 100 KiB per call (JSON escaping of the worst-case input), one call per user.
 
 ## 6. Failure matrix
 
@@ -418,7 +418,7 @@ The record is bounded: offer ≤ 16 KiB (dropped when answered), ≤ 32 buffered
 | T5 | TURN used to reach internal addresses (SSRF, lateral movement) | coturn `denied-peer-ip` for RFC 1918, 100.64/10, link-local (incl. 169.254.169.254 metadata), loopback, the cluster pod and service CIDRs, IPv6 ULA/link-local/loopback, `no-multicast-peers`, `no-loopback-peers`; NetworkPolicy egress | chart tests render every range; integration test: a relay allocation to 10.x/127.x/169.254.169.254 is refused by the real coturn container | 3 |
 | T6 | TURN credential theft or replay | credentials expire (`ttlSeconds`, 600 s), scoped to the user (`<expiry>:<user_id>`), minted only for an access token, never logged, HTTPS only; `user-quota` limits damage | `credentials_expire_and_name_the_user`, `credentials_are_never_logged`, coturn refuses an expired credential | 3 |
 | T7 | Leaking IP addresses to non-contacts | SDP/ICE only after the contact policy; callee's IPs only after the callee accepts; pre-answer caller ICE only to the answering device; docs recommend trickle (offer without candidates) and `iceTransportPolicy: relay` for privacy; no IPs in logs/metrics/audit | `ringing_devices_never_get_caller_candidates`, `answer_and_ice_only_reach_the_party_device` (gateway); log-capture test | 1 (+ docs 5) |
-| T8 | DoS by exhausting call state | one call per user; bounded record (< 50 KiB); TTLs on every key; attempts/hour; ICE and renegotiation caps; due set bounded by live calls | `records_are_bounded` (domain), `keys_expire_without_message_svc` (message-svc redis test), limits tests | 1 |
+| T8 | DoS by exhausting call state | one call per user; bounded record (under 100 KiB per call: JSON escaping of the worst-case input); TTLs on every key; attempts/hour; ICE and renegotiation caps; due set bounded by live calls | `records_are_bounded` (domain), `keys_expire_without_message_svc` (message-svc redis test), limits tests | 1 |
 | T9 | Agents calling anyone but their owner | policy: an agent may only call its owner, only its owner may call it (`NOT_CONTACT` otherwise), checked for both directions | `agent_calls_only_its_owner`, `only_the_owner_calls_the_agent` (domain + gateway) | 1 (bridge use: 7, 8) |
 | T10 | Media or signalling content in logs, metrics, audit | no `Debug` of call frames in logs; audit fields fixed (ids, reason, duration); metrics labels are reasons/codes only | `no_sdp_or_candidate_in_logs_or_audit` (gateway calls test with a capturing subscriber) | 1 |
 | T11 | Call history seen by others | rows per participant, read only by `user_id = caller`; delete hides only one's own row | `history_is_private_and_hides_per_side` | 2 |

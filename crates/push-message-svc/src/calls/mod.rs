@@ -320,10 +320,15 @@ where
         device: DeviceId,
         conn: Uuid,
     ) -> Result<CallSync, Status> {
-        self.redis
+        let stored = self
+            .redis
             .attach(user, device, conn)
             .await
             .map_err(redis_failed)?;
+        if !stored {
+            // A newer connection of the device is registered: it owns the device's calls.
+            return Ok(CallSync::default());
+        }
         let Some(call) = self.redis.user_call(user).await.map_err(redis_failed)? else {
             return Ok(CallSync::default());
         };
