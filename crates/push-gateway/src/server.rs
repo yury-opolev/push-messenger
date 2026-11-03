@@ -1418,15 +1418,27 @@ async fn close_with(socket: &mut WebSocket, code: u16, reason: &'static str) {
     let _ = tokio::time::timeout(CLOSE_TIMEOUT, handshake).await;
 }
 
-/// Structured JSON logs on stdout. The level comes from `RUST_LOG` (default `info`).
+/// Structured JSON logs on stdout. The level comes from `RUST_LOG` (default `info`),
+/// through [`log_filter`].
 pub fn init_logging() {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     tracing_subscriber::fmt()
         .json()
-        .with_env_filter(filter)
+        .with_env_filter(log_filter(filter))
         .with_current_span(false)
         .init();
+}
+
+/// `filter` with the WebSocket library capped at `debug`, whatever it asks for: at
+/// `trace` tungstenite logs every frame with its payload (access tokens, messages, call
+/// SDP and ICE candidates).
+pub fn log_filter(filter: tracing_subscriber::EnvFilter) -> tracing_subscriber::EnvFilter {
+    filter.add_directive(
+        "tungstenite=debug"
+            .parse()
+            .expect("a valid filter directive"),
+    )
 }
 
 /// Resolves on Ctrl-C, or on SIGTERM where there is one (Kubernetes sends it).
