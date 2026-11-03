@@ -197,6 +197,17 @@ messageSvc:
       cpu: 500m
       memory: 256Mi
 
+# Voice calls (docs/calls.md). Off by default; enable once every gateway and message-svc
+# replica runs a version with calls.
+calls:
+  enabled: false
+  # How long a call rings before it ends as missed: 10 to 120 seconds.
+  ringSeconds: 45
+  # How long a call survives a dropped connection of either side: 5 to 120 seconds.
+  disconnectGraceSeconds: 30
+  # Call attempts per user per hour, refused or not: 1 to 1000.
+  attemptsPerHour: 30
+
 postgres:
   # true: the bundled PostgreSQL below. false: an external server (postgres.external);
   # the bundled settings below are then unused.
