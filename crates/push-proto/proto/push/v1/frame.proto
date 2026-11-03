@@ -714,9 +714,12 @@ enum CallEndReason {
   CALL_END_REASON_UNREACHABLE = 7;
 }
 
+// The kind of SDP in CallRenegotiate (RTCSessionDescription.type).
 enum CallSdpType {
   CALL_SDP_TYPE_UNSPECIFIED = 0;
+  // A new offer (for example an ICE restart): answer it with CALL_SDP_TYPE_ANSWER.
   CALL_SDP_TYPE_OFFER = 1;
+  // The answer to the other side's offer.
   CALL_SDP_TYPE_ANSWER = 2;
 }
 
@@ -786,16 +789,17 @@ message CallCancel {
 // After the last candidate, send one with end_of_candidates.
 message CallIce {
   bytes call_id = 1;
-  // The candidate line: at most 512 bytes of printable ASCII starting with "candidate:",
-  // or empty together with end_of_candidates.
+  // The candidate line (RTCIceCandidate.candidate): at most 512 bytes of printable ASCII
+  // starting with "candidate:", or empty together with end_of_candidates.
   string candidate = 2;
-  // The media stream identification tag; at most 32 bytes.
+  // The media stream identification tag (RTCIceCandidate.sdpMid); at most 32 bytes.
   optional string sdp_mid = 3;
-  // The index of the m= line the candidate belongs to.
+  // The index of the m= line the candidate belongs to (RTCIceCandidate.sdpMLineIndex).
   optional uint32 sdp_mline_index = 4;
   // No further candidates of this side for this generation (candidate empty).
   bool end_of_candidates = 5;
-  // The ICE username fragment the candidate belongs to; at most 256 bytes.
+  // The ICE username fragment the candidate belongs to (RTCIceCandidate.usernameFragment);
+  // at most 256 bytes. It tells candidates of an ICE restart from older ones.
   optional string username_fragment = 6;
 }
 
@@ -836,7 +840,9 @@ message CallIncoming {
   uint32 expires_in_ms = 6;
 }
 
-// A callee device answered the call. Sent to the caller's device.
+// A callee device answered the call. Sent to the caller's device: apply answer_sdp as the
+// remote description, then add the queued peer candidates. A repeated CallAccepted for
+// the same call (the callee resent its accept) can be ignored.
 message CallAccepted {
   bytes call_id = 1;
   // The callee's SDP answer.
@@ -885,12 +891,16 @@ message CallSync {
   repeated CallState calls = 1;
 }
 
+// One call of the user in CallSync.
 message CallState {
   bytes call_id = 1;
   // The other party.
   bytes peer_user_id = 2;
+  // IN: the user is the callee; OUT: the user is the caller.
   CallDirection direction = 3;
+  // RINGING (not answered yet) or ACTIVE (answered).
   CallStatus status = 4;
+  // [CALL_MEDIA_AUDIO] in this release.
   repeated CallMedia media = 5;
   // An incoming ringing call only: the caller's SDP offer, to answer it.
   optional string offer_sdp = 6;

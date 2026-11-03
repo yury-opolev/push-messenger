@@ -104,6 +104,34 @@ jobs:
           node-version: 20
       - run: node --test apps/push-agent-tray/tests/chat.test.js
 
+  # The browser smoke test of voice calls (docs/calls.md, "Browser smoke test"): the
+  # whole stack in process with calls on, the example page docs/examples/calls, and
+  # Playwright with two Chromium contexts and fake media devices calling each other,
+  # once through stun-only and once relay-only through the chart's pinned coturn.
+  browser-calls:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: docs/examples/calls/tests/package-lock.json
+      - run: npm ci
+        working-directory: docs/examples/calls/tests
+      - run: npx playwright install --with-deps chromium
+        working-directory: docs/examples/calls/tests
+      - run: docker pull postgres:17-alpine
+      - run: docker pull redis:7-alpine
+      - run: cargo test -p push-smoke --test browser_calls --locked -- --nocapture
+        env:
+          PUSH_BROWSER_CALLS: "1"
+
   # The container images build (nothing is pushed). Deploying them is verified on
   # minikube before merge: deploy/minikube/up.ps1 -Smoke.
   images:

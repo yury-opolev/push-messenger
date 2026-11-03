@@ -450,7 +450,7 @@ async fn connect_device(
         .await?;
     let deadline = Instant::now() + READY_WAIT;
     loop {
-        match socket::open(target, &access_token).await? {
+        match socket::open(target, &access_token, &[]).await? {
             Opened::Ready(socket, ready) => return Ok((*socket, ready)),
             Opened::Closed(4006) if Instant::now() < deadline => {
                 tokio::time::sleep(Duration::from_secs(1)).await

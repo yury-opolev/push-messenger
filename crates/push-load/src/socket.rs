@@ -6,7 +6,7 @@ use std::time::Duration;
 use anyhow::{Context, bail};
 use futures_util::{SinkExt, StreamExt};
 use push_proto::v1::frame::Body;
-use push_proto::v1::{self, Identify, request, response};
+use push_proto::v1::{self, Capability, Identify, request, response};
 use push_proto::{decode_frame, encode_frame, id};
 use tokio::net::TcpStream;
 use tokio::time::Instant;
@@ -31,6 +31,8 @@ pub const NO_STATUS: u16 = 1005;
 pub struct Ready {
     pub user: Uuid,
     pub heartbeat: Duration,
+    /// `Ready.capabilities` lists `CAPABILITY_CALLS`.
+    pub calls: bool,
 }
 
 /// What became of an Identify.
@@ -61,12 +63,16 @@ async fn connect(target: &Target) -> anyhow::Result<Socket> {
     Ok(socket)
 }
 
-/// Connects and identifies with `access_token`.
-pub async fn open(target: &Target, access_token: &str) -> anyhow::Result<Opened> {
+/// Connects and identifies with `access_token`, advertising `capabilities`.
+pub async fn open(
+    target: &Target,
+    access_token: &str,
+    capabilities: &[Capability],
+) -> anyhow::Result<Opened> {
     let mut socket = connect(target).await?;
     let identify = Body::Identify(Identify {
         token: access_token.to_owned(),
-        capabilities: Vec::new(),
+        capabilities: capabilities.iter().copied().map(i32::from).collect(),
     });
     send(&mut socket, identify).await?;
     let deadline = Instant::now() + ANSWER_TIMEOUT;
@@ -84,7 +90,15 @@ pub async fn open(target: &Target, access_token: &str) -> anyhow::Result<Opened>
                         let user = id(&ready.user_id)
                             .map_err(|_| anyhow::anyhow!("Ready names no valid user"))?;
                         let heartbeat = Duration::from_millis(u64::from(ready.heartbeat_ms));
-                        return Ok(Opened::Ready(Box::new(socket), Ready { user, heartbeat }));
+                        let calls = ready.capabilities.contains(&i32::from(Capability::Calls));
+                        return Ok(Opened::Ready(
+                            Box::new(socket),
+                            Ready {
+                                user,
+                                heartbeat,
+                                calls,
+                            },
+                        ));
                     }
                     _ => bail!("the gateway answered Identify with another frame"),
                 }

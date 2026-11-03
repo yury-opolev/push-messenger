@@ -6,6 +6,23 @@ Notable changes for consumers of push-messenger. Newest first.
 
 ### Added
 
+- **Voice calls: client guide, browser recipe and tests** (PR 5):
+  [docs/calls.md](docs/calls.md) is now a complete client guide: a field reference for
+  every call frame, sequence diagrams for every ending (declined, cancelled, missed, busy,
+  unreachable, taken on another device, failed after the disconnect grace, reconnect with
+  `CallSync` and an ICE restart, renegotiation glare), offer and perfect-negotiation rules,
+  every chart validation message, troubleshooting (no audio, one-way audio, symmetric NAT,
+  firewalls and `turns:` on 443), an interoperability checklist (Chromium, Edge, Firefox,
+  Safari), and release notes with an upgrade and rollback guide. A reference browser
+  client in [docs/examples/calls](docs/examples/calls) (`RTCPeerConnection` with the
+  ice-servers API, trickle ICE, `CallSync` handling) with a Playwright smoke test: two
+  Chromium contexts with fake media call each other through `stun-only` and, relay-only,
+  through the chart's pinned coturn; CI job `browser-calls`. `push-load calls` places
+  concurrent calls between prepared pairs and reports setup latency (invite →
+  `CallAccepted`) against the targets (< 300 ms p95; 1,000 concurrent calls per gateway
+  replica); `prepare --sample-pairs` now goes up to 2000 (`run` still sends sample
+  messages on at most 50 pairs). `frame.proto` call comments clarified (no wire change).
+
 - **Voice call relays (TURN)**: `GET /v1/calls/ice-servers` on auth-svc (access token)
   answers the browser-ready ICE servers with short-lived credentials,
   `{"ice_servers": [{urls, username?, credential?}], "expires_at", "relay"}`, or

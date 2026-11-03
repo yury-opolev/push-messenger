@@ -1,0 +1,13 @@
+{
+  "name": "push-calls-browser-smoke",
+  "private": true,
+  "description": "Playwright smoke test of the browser calls example (docs/calls.md, 'Browser smoke test').",
+  "type": "module",
+  "scripts": {
+    "test": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.64.1",
+    "protobufjs": "8.8.1"
+  }
+}

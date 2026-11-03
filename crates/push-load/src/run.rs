@@ -23,7 +23,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::config::{RunOptions, Target};
+use crate::config::{RUN_SAMPLE_PAIRS_MAX, RunOptions, Target};
 use crate::http::{ApiError, AuthApi};
 use crate::metrics::{
     self, CloseCodes, Counters, LAG_LIMIT, Messages, PERCENTILES, Samples, bump, read,
@@ -37,16 +37,16 @@ const REFRESH_CONCURRENCY: usize = 32;
 const REFRESH_PHASE_LIMIT: Duration = Duration::from_secs(180);
 const SAVE_EVERY: usize = 256;
 /// A connection must reach Ready within this long of its first attempt or of losing it.
-const READY_DEADLINE: Duration = Duration::from_secs(60);
-const PONG_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const READY_DEADLINE: Duration = Duration::from_secs(60);
+pub(crate) const PONG_TIMEOUT: Duration = Duration::from_secs(10);
 /// No sample message is sent in the last seconds of the run, so all can arrive.
 const DRAIN: Duration = Duration::from_secs(10);
-const STOP_GRACE: Duration = Duration::from_secs(15);
+pub(crate) const STOP_GRACE: Duration = Duration::from_secs(15);
 /// Acks are coalesced (the highest seq per conversation) and sent this often, inside the
 /// gateway's frame budget even for a large backlog.
 const ACK_EVERY: Duration = Duration::from_millis(250);
-const FIRST_BACKOFF: Duration = Duration::from_millis(500);
-const MAX_BACKOFF: Duration = Duration::from_secs(8);
+pub(crate) const FIRST_BACKOFF: Duration = Duration::from_millis(500);
+pub(crate) const MAX_BACKOFF: Duration = Duration::from_secs(8);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CloseAction {
@@ -67,7 +67,7 @@ pub fn close_action(code: u16) -> CloseAction {
 }
 
 /// `base` scaled by a random factor from 0.5 to 1.5.
-fn jitter(base: Duration) -> Duration {
+pub(crate) fn jitter(base: Duration) -> Duration {
     let random = Uuid::new_v4().as_bytes()[0];
     base.mul_f64(0.5 + f64::from(random) / 255.0)
 }
@@ -102,6 +102,22 @@ struct Plan {
     sends_to: Option<Vec<u8>>,
 }
 
+/// The senders of the ready pairs whose both devices are chosen, at most
+/// [`RUN_SAMPLE_PAIRS_MAX`], and the conversation each sends sample messages to.
+fn sample_senders(state: &State, chosen: &HashSet<DeviceRef>) -> HashMap<DeviceRef, Vec<u8>> {
+    state
+        .pairs
+        .iter()
+        .filter(|pair| {
+            state.pair_is_ready(pair)
+                && chosen.contains(&pair.sender)
+                && chosen.contains(&pair.receiver)
+        })
+        .take(RUN_SAMPLE_PAIRS_MAX)
+        .map(|pair| (pair.sender, id_bytes(pair.conversation_id)))
+        .collect()
+}
+
 pub async fn run(
     target: &Target,
     state_path: &Path,
@@ -129,16 +145,7 @@ pub async fn run(
     }
     let selected: Vec<DeviceRef> = ready[..options.connections].to_vec();
     let chosen: HashSet<DeviceRef> = selected.iter().copied().collect();
-    let sends_to: HashMap<DeviceRef, Vec<u8>> = state
-        .pairs
-        .iter()
-        .filter(|pair| {
-            state.pair_is_ready(pair)
-                && chosen.contains(&pair.sender)
-                && chosen.contains(&pair.receiver)
-        })
-        .map(|pair| (pair.sender, id_bytes(pair.conversation_id)))
-        .collect();
+    let sends_to = sample_senders(&state, &chosen);
     let started_unix_s = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |since| since.as_secs());
@@ -163,7 +170,12 @@ pub async fn run(
     tokio::spawn(watch_interrupt(interrupt.clone()));
 
     let tokens = refresh_all(
-        target, &mut state, state_path, &selected, &shared, &interrupt,
+        target,
+        &mut state,
+        state_path,
+        &selected,
+        &shared.counters,
+        &interrupt,
     )
     .await?;
 
@@ -293,7 +305,7 @@ pub async fn run(
 }
 
 /// Cancels `interrupt` on Ctrl-C, and on SIGTERM (`docker stop`) on Unix.
-async fn watch_interrupt(interrupt: CancellationToken) {
+pub(crate) async fn watch_interrupt(interrupt: CancellationToken) {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
@@ -317,12 +329,12 @@ async fn watch_interrupt(interrupt: CancellationToken) {
 /// timed-out request: auth-svc may have rotated it), is marked for `prepare` to sign in
 /// again rather than reusing a token auth-svc would treat as stolen. An interruption
 /// lets the refreshes in flight finish, saves, and stops before connecting.
-async fn refresh_all(
+pub(crate) async fn refresh_all(
     target: &Target,
     state: &mut State,
     path: &Path,
     selected: &[DeviceRef],
-    shared: &Shared,
+    counters: &Counters,
     interrupt: &CancellationToken,
 ) -> anyhow::Result<Vec<Option<String>>> {
     let api = AuthApi::new(target)?;
@@ -393,11 +405,11 @@ async fn refresh_all(
             }
             Some(Err(ApiError::Rejected { status: 401, .. })) => {
                 state.device_mut(device).needs_sign_in = true;
-                bump(&shared.counters.auth_failures);
+                bump(&counters.auth_failures);
             }
             Some(Err(_)) => {
                 state.device_mut(device).needs_sign_in = true;
-                bump(&shared.counters.connect_failures);
+                bump(&counters.connect_failures);
             }
         }
         unsaved += 1;
@@ -426,7 +438,7 @@ async fn connection(shared: Arc<Shared>, plan: Plan) {
     loop {
         let opened = tokio::select! {
             () = shared.cancel.cancelled() => return,
-            opened = socket::open(&shared.target, &plan.access_token) => opened,
+            opened = socket::open(&shared.target, &plan.access_token, &[]) => opened,
         };
         match opened {
             Ok(Opened::Ready(socket, ready)) => {
@@ -450,7 +462,7 @@ async fn connection(shared: Arc<Shared>, plan: Plan) {
                     Ended::Closed(code) => {
                         shared.closes.record(code);
                         bump(&shared.counters.disconnects);
-                        if stop_for(&shared, code) {
+                        if stop_for(&shared.counters, code) {
                             return;
                         }
                     }
@@ -472,7 +484,7 @@ async fn connection(shared: Arc<Shared>, plan: Plan) {
             }
             Ok(Opened::Closed(code)) => {
                 shared.refusals.record(code);
-                if stop_for(&shared, code) {
+                if stop_for(&shared.counters, code) {
                     return;
                 }
             }
@@ -495,12 +507,12 @@ async fn connection(shared: Arc<Shared>, plan: Plan) {
 }
 
 /// Counts a close that must not be retried; whether the connection stops.
-fn stop_for(shared: &Shared, code: u16) -> bool {
+pub(crate) fn stop_for(counters: &Counters, code: u16) -> bool {
     let counter = match close_action(code) {
         CloseAction::Reconnect => return false,
-        CloseAction::AuthFailure => &shared.counters.auth_failures,
-        CloseAction::Takeover => &shared.counters.takeovers,
-        CloseAction::RateLimited => &shared.counters.rate_limited,
+        CloseAction::AuthFailure => &counters.auth_failures,
+        CloseAction::Takeover => &counters.takeovers,
+        CloseAction::RateLimited => &counters.rate_limited,
     };
     bump(counter);
     true
@@ -624,6 +636,36 @@ mod tests {
         for code in [1000, 1001, 1002, 1006, 1008, 1011, 4005, 4006] {
             assert_eq!(close_action(code), CloseAction::Reconnect, "{code}");
         }
+    }
+
+    #[test]
+    fn a_run_sends_sample_messages_on_at_most_fifty_pairs() {
+        use crate::state::{AccountState, DeviceState, Pair};
+        let mut state = State::new("push.test");
+        for account in 0..2 * (RUN_SAMPLE_PAIRS_MAX + 10) {
+            let mut prepared = AccountState::new(&format!("{account}@x.test"));
+            prepared.devices.push(DeviceState {
+                device_id: Some(Uuid::now_v7()),
+                refresh_token: Some("refresh".to_owned()),
+                ..DeviceState::new()
+            });
+            state.accounts.push(prepared);
+        }
+        let device = |account| DeviceRef { account, device: 0 };
+        for pair in 0..RUN_SAMPLE_PAIRS_MAX + 10 {
+            state.pairs.push(Pair {
+                sender: device(2 * pair),
+                receiver: device(2 * pair + 1),
+                conversation_id: Uuid::now_v7(),
+            });
+        }
+        let chosen: HashSet<DeviceRef> = state.ready_devices().into_iter().collect();
+        let senders = sample_senders(&state, &chosen);
+        assert_eq!(senders.len(), RUN_SAMPLE_PAIRS_MAX);
+        assert!(senders.contains_key(&device(0)));
+        // A pair only partly chosen sends nothing.
+        let chosen: HashSet<DeviceRef> = [device(0), device(1), device(2)].into();
+        assert_eq!(sample_senders(&state, &chosen).len(), 1);
     }
 
     #[test]

@@ -20,6 +20,10 @@ and the spec differ, this guide describes what the code does.
 - [11. Metrics](#11-metrics)
 - [12. Call history](#12-call-history)
 - [13. TURN](#13-turn)
+- [14. Browser recipe](#14-browser-recipe)
+- [15. Testing: browser smoke, interoperability, load](#15-testing-browser-smoke-interoperability-load)
+- [16. Troubleshooting](#16-troubleshooting)
+- [17. Release notes and upgrade guide](#17-release-notes-and-upgrade-guide)
 
 ## 1. Status
 
@@ -28,8 +32,26 @@ and the spec differ, this guide describes what the code does.
 | Signalling (the frames below, the call engine in message-svc, the gateway relay) | available in this release, **off by default** |
 | TURN credentials API (`GET /v1/calls/ice-servers`), the chart's coturn and `calls.turn` ([§13](#13-turn)) | available in this release, with calls |
 | Call history (`GET /v1/calls`, `DELETE /v1/calls/{call_id}`, `CallHistoryChanged`, retention) | available in this release ([§12](#12-call-history)) |
-| push-sdk calls API, bindings and a complete browser recipe | coming |
+| Browser recipe: a reference page ([`docs/examples/calls`](examples/calls)), its Playwright smoke test and the interoperability checklist ([§14](#14-browser-recipe), [§15](#15-testing-browser-smoke-interoperability-load)) | available in this release |
+| push-load `calls` scenario: concurrent calls and setup latency ([§15.3](#153-load)) | available in this release |
+| push-sdk calls API and bindings | coming |
 | Agents in calls (push-agent-bridge voice) | coming |
+
+This guide is meant to be enough to build a client without reading the server code. In
+short, a browser client:
+
+1. connects the WebSocket and lists `CAPABILITY_CALLS` in `Identify` ([§3](#3-capability-advertisement));
+2. fetches `GET /v1/calls/ice-servers` for each call and builds an `RTCPeerConnection` with
+   it ([§13.1](#131-the-api));
+3. as the caller, puts its offer in `CallInvite`; as the callee, its answer in
+   `CallAccept` ([§6](#6-call-flow));
+4. trickles candidates with `CallIce`, queueing the peer's until the remote description is
+   set ([§7](#7-client-rules));
+5. reads `CallSync` after every reconnect and restarts ICE for its active call;
+6. releases media on `CallEnded`, `CallTaken` or `CALL_NOT_FOUND`.
+
+[`docs/examples/calls/calls.js`](examples/calls/calls.js) does all of this in about 500
+lines ([§14](#14-browser-recipe)).
 
 Clients get their ICE servers (STUN and TURN, with short-lived credentials) from
 `GET /v1/calls/ice-servers` ([§13.1](#131-the-api)). Video, group calls,
@@ -103,6 +125,54 @@ only), `expires_at`/`expires_in_ms` (ringing only), `answered_at` (active only) 
 `this_device` (the call's device on this side is this device: the caller's device for an
 outgoing call, the answering device for an active incoming one, or a ringing device).
 
+### 4.1 Field reference
+
+Field names are as in `frame.proto` (protobuf.js with `keepCase: true` keeps them; most
+generators turn them into camelCase). `bytes` ids are 16-byte UUIDs; proto3 `optional`
+fields can be absent, which is not the same as zero.
+
+| Message | Field (#) | Type | Meaning |
+|---|---|---|---|
+| `Identify` | `capabilities` (2) | `repeated Capability` | list `CAPABILITY_CALLS` to take calls |
+| `Ready` | `capabilities` (4) | `repeated Capability` | `CAPABILITY_CALLS` when the server offers calls on this connection |
+| `CallInvite` | `call_id` (1) | bytes | a new UUIDv7 chosen by the caller |
+| | `callee_user_id` (2) | bytes | the user to call (not yourself) |
+| | `offer_sdp` (3) | string | the SDP offer, audio only, ≤ 16384 bytes |
+| | `media` (4) | `repeated CallMedia` | exactly `[CALL_MEDIA_AUDIO]` |
+| `CallAccept` | `call_id` (1), `answer_sdp` (2) | bytes, string | the SDP answer, audio only, ≤ 16384 bytes |
+| `CallDecline` | `call_id` (1), `reason` (2, optional) | bytes, `CallEndReason` | `DECLINED` (default) or `BUSY` |
+| `CallCancel` | `call_id` (1) | bytes | |
+| `CallIce` (also `peer_call_ice`) | `call_id` (1) | bytes | |
+| | `candidate` (2) | string | `RTCIceCandidate.candidate` (`candidate:…`, ≤ 512 bytes); empty with `end_of_candidates` |
+| | `sdp_mid` (3, optional) | string | `RTCIceCandidate.sdpMid`, ≤ 32 bytes |
+| | `sdp_mline_index` (4, optional) | uint32 | `RTCIceCandidate.sdpMLineIndex` |
+| | `end_of_candidates` (5) | bool | no more candidates of this side for this ICE generation |
+| | `username_fragment` (6, optional) | string | `RTCIceCandidate.usernameFragment`, ≤ 256 bytes; tells candidates of an ICE restart apart |
+| `CallHangup` | `call_id` (1), `reason` (2, optional) | bytes, `CallEndReason` | `COMPLETED` (default) or `FAILED` |
+| `CallRenegotiate` (also `peer_call_renegotiate`) | `call_id` (1), `sdp` (2), `type` (3) | bytes, string, `CallSdpType` | `CALL_SDP_TYPE_OFFER` or `CALL_SDP_TYPE_ANSWER` |
+| `CallIncoming` | `call_id` (1), `caller_user_id` (2) | bytes | |
+| | `offer_sdp` (3), `media` (4) | string, `repeated CallMedia` | the caller's offer |
+| | `expires_at` (5) | int64 | ringing ends (µs since the epoch, server clock): display only |
+| | `expires_in_ms` (6) | uint32 | ringing lasts this long from receipt: use it for the timer |
+| `CallAccepted` | `call_id` (1), `answer_sdp` (2), `answered_device_id` (3) | bytes, string, bytes | the callee's answer and the device that gave it |
+| `CallTaken` | `call_id` (1) | bytes | another device of yours answered |
+| `CallEnded` | `call_id` (1), `reason` (2), `duration_s` (3, optional) | bytes, `CallEndReason`, uint32 | `duration_s` only for answered calls |
+| `CallError` | `call_id` (1), `code` (2), `message` (3), `retryable` (4), `retry_after_s` (5, optional) | bytes, `ErrorCode`, string, bool, uint32 | [§5](#5-error-codes) |
+| `CallSync` | `calls` (1) | `repeated CallState` | the user's calls as this device sees them |
+| `CallState` | `call_id` (1), `peer_user_id` (2), `direction` (3), `status` (4), `media` (5) | | `CALL_DIRECTION_IN`/`OUT`, `CALL_STATUS_RINGING`/`ACTIVE` |
+| | `offer_sdp` (6, optional) | string | incoming ringing calls only |
+| | `expires_at` (7), `expires_in_ms` (8) (optional) | int64, uint32 | ringing only |
+| | `answered_at` (9, optional) | int64 | active only |
+| | `this_device` (10) | bool | this device is the call's device on this side |
+| `CallHistoryChanged` | `latest_ended_at` (1, optional) | int64 | [§12](#12-call-history) |
+
+Enums: `Capability` (`CAPABILITY_CALLS` = 1), `CallMedia` (`AUDIO` = 1; `VIDEO` = 2 is
+refused in this release), `CallEndReason` (`COMPLETED` 1, `MISSED` 2, `DECLINED` 3,
+`CANCELLED` 4, `BUSY` 5, `FAILED` 6, `UNREACHABLE` 7), `CallSdpType` (`OFFER` 1, `ANSWER`
+2), `CallDirection` (`IN` 1, `OUT` 2), `CallStatus` (`RINGING` 1, `ACTIVE` 2). Treat
+unknown enum values and unknown frames as "ignore": later releases add values (video,
+group calls) without breaking older clients.
+
 ## 5. Error codes
 
 `CallError.code` is one of:
@@ -171,6 +241,185 @@ A user has at most one call, ringing or active, across all their devices. Resend
 retry; resending `CallAccept` from the answering device sends `CallAccepted` to the caller
 again.
 
+### 6.1 Every ending, step by step
+
+In the diagrams `A` is the caller's device, `S` the server, `B1`/`B2` the callee's
+devices. Frames the server sends to several devices are sent to each of them.
+
+**Declined.** A ringing device refuses (`CallDecline`, or `CallHangup` while ringing). A
+decline with `reason: BUSY` (the user is busy elsewhere, for example in a call in another
+app) ends the call `BUSY` instead.
+
+```mermaid
+sequenceDiagram
+    participant A as Caller
+    participant S as Server
+    participant B1 as Callee device 1
+    participant B2 as Callee device 2
+    A->>S: CallInvite
+    S->>B1: CallIncoming
+    S->>B2: CallIncoming
+    B1->>S: CallDecline (DECLINED)
+    S->>A: CallEnded (DECLINED)
+    S->>B1: CallEnded (DECLINED)
+    S->>B2: CallEnded (DECLINED)
+```
+
+**Cancelled.** The caller gives up while it rings (`CallCancel`, or `CallHangup`). If an
+accept won the race, the cancel is answered `CallError ALREADY_ANSWERED`: the call is
+connected, hang it up.
+
+```mermaid
+sequenceDiagram
+    participant A as Caller
+    participant S as Server
+    participant B1 as Callee device
+    A->>S: CallInvite
+    S->>B1: CallIncoming
+    alt the cancel wins
+        A->>S: CallCancel
+        S->>A: CallEnded (CANCELLED)
+        S->>B1: CallEnded (CANCELLED)
+    else B1 accepted first
+        B1->>S: CallAccept
+        S->>A: CallAccepted
+        A->>S: CallCancel
+        S->>A: CallError (ALREADY_ANSWERED)
+        A->>S: CallHangup
+        S->>A: CallEnded (COMPLETED)
+        S->>B1: CallEnded (COMPLETED)
+    end
+```
+
+**Missed.** Nobody answers within `calls.ringSeconds` (45 s). An accept that arrives after
+the deadline ends the call `MISSED` too, for the late accepter as well. Clients also stop
+ringing locally after `expires_in_ms`, in case the `CallEnded` is lost.
+
+```mermaid
+sequenceDiagram
+    participant A as Caller
+    participant S as Server
+    participant B1 as Callee device
+    A->>S: CallInvite
+    S->>B1: CallIncoming (expires_in_ms 45000)
+    Note over S: 45 s pass
+    S->>A: CallEnded (MISSED)
+    S->>B1: CallEnded (MISSED)
+```
+
+**Busy.** The callee is in a call or ringing for one, on any device: the invite is
+answered at once and nothing rings. A caller that already has a call gets `CallError
+IN_CALL` instead.
+
+```mermaid
+sequenceDiagram
+    participant A as Caller
+    participant S as Server
+    participant B1 as Callee device (in another call)
+    A->>S: CallInvite
+    S->>A: CallEnded (BUSY)
+    Note over B1: nothing is sent to the callee
+```
+
+**Unreachable.** No device of the callee is calls-active (offline, or only clients without
+call support): the invite is answered at once. The callee gets no history row for it.
+
+```mermaid
+sequenceDiagram
+    participant A as Caller
+    participant S as Server
+    A->>S: CallInvite
+    S->>A: CallEnded (UNREACHABLE)
+```
+
+**Taken on another device.** The first accept wins; the other ringing devices stop.
+A second accept is refused.
+
+```mermaid
+sequenceDiagram
+    participant A as Caller
+    participant S as Server
+    participant B1 as Callee device 1
+    participant B2 as Callee device 2
+    A->>S: CallInvite
+    S->>B1: CallIncoming
+    S->>B2: CallIncoming
+    B1->>S: CallAccept
+    S->>A: CallAccepted (answered_device_id = B1)
+    S->>B2: CallTaken
+    B2->>S: CallAccept (too late)
+    S->>B2: CallError (ALREADY_ANSWERED)
+```
+
+**Failed: a disconnect longer than the grace.** A party device's connection drops (the
+gateway sees the close, or the heartbeat times out after 2.5 heartbeats) and it does not
+come back within `calls.disconnectGraceSeconds` (30 s). The same applies to the caller
+while it rings. A party can also end a call `FAILED` itself (`CallHangup` with
+`reason: FAILED`, for example when ICE never connects).
+
+```mermaid
+sequenceDiagram
+    participant A as Caller
+    participant S as Server
+    participant B1 as Callee device
+    Note over A,B1: active call, audio peer to peer
+    B1--xS: connection lost
+    Note over S: grace (30 s) runs
+    S->>A: CallEnded (FAILED, duration_s)
+    Note over B1: on reconnect: CallSync without the call, so drop it
+```
+
+**Reconnect within the grace: CallSync and an ICE restart.** Media is peer to peer and
+usually survives a signalling drop. After reconnecting, the device reads `CallSync`; for
+its active call (`this_device`) it fetches fresh ICE servers, calls
+`setConfiguration()`, creates an offer with `iceRestart: true` and sends it as
+`CallRenegotiate`. (Create the offer explicitly: `restartIce()` relies on
+`negotiationneeded`, which does not fire while an offer is pending, for example for a
+caller that missed `CallAccepted` while it was away; the new offer replaces that one.)
+Either side may restart; if both do at once, perfect negotiation resolves it
+([§7](#7-client-rules)).
+
+```mermaid
+sequenceDiagram
+    participant A as Caller
+    participant S as Server
+    participant B1 as Callee device
+    Note over A,B1: active call
+    B1--xS: connection lost (network change)
+    B1->>S: reconnect, Identify (CAPABILITY_CALLS)
+    S->>B1: Ready
+    S->>B1: CallSync (the call: ACTIVE, this_device)
+    B1->>S: GET /v1/calls/ice-servers (fresh TURN credentials)
+    B1->>S: CallRenegotiate (offer, ICE restart)
+    S->>A: peer_call_renegotiate (offer)
+    A->>S: CallRenegotiate (answer)
+    S->>B1: peer_call_renegotiate (answer)
+    B1->>S: CallIce ...
+    S->>A: peer_call_ice ...
+    A->>S: CallIce ...
+    S->>B1: peer_call_ice ...
+    Note over A,B1: audio continues on the new path
+```
+
+**Renegotiation glare.** Both sides send an offer at once. The impolite caller ignores
+the callee's offer and keeps its own; the polite callee rolls its own back, answers the
+caller's offer, and renegotiates again later if it still needs to.
+
+```mermaid
+sequenceDiagram
+    participant A as Caller (impolite)
+    participant S as Server
+    participant B1 as Callee (polite)
+    A->>S: CallRenegotiate (offer a)
+    B1->>S: CallRenegotiate (offer b)
+    S->>B1: peer_call_renegotiate (offer a)
+    S->>A: peer_call_renegotiate (offer b)
+    Note over A: collision, impolite: ignore offer b
+    Note over B1: collision, polite: roll back b, apply a
+    B1->>S: CallRenegotiate (answer to a)
+    S->>A: peer_call_renegotiate (answer)
+```
+
 ## 7. Client rules
 
 - **Only the caller makes the initial offer**, in `CallInvite`. The callee answers in
@@ -198,6 +447,29 @@ again.
   `CallHangup` to end it.
 - **`CALL_NOT_FOUND`**: the call is gone for this device; release its media.
 - On `CallEnded`, release the call's media and close the peer connection.
+- **Offer/answer roles in short**: the initial offer is the caller's (`CallInvite`), the
+  initial answer the callee's (`CallAccept`); never send `CallRenegotiate` before the call
+  is active (it is `CALL_NOT_FOUND` while ringing). Ignore `negotiationneeded` until the
+  call is active: browsers fire it for the first `addTrack`, which the invite already
+  covers.
+- **Perfect negotiation in code** (what [`calls.js`](examples/calls/calls.js) does): keep
+  `makingOffer` while creating a renegotiation offer; on `peer_call_renegotiate` with an
+  offer, `collision = makingOffer || pc.signalingState !== "stable"`; the caller
+  (impolite) drops a colliding offer, the callee (polite) applies it with
+  `setRemoteDescription` (which rolls back its own) and answers with
+  `setLocalDescription()` sent as `CallRenegotiate` type `ANSWER`. Ignore
+  `addIceCandidate` errors for candidates of an offer you ignored.
+- **ICE restarts** make new ICE credentials: send `username_fragment` with each candidate
+  so the peer can match candidates to the right generation, and send `end_of_candidates`
+  once per generation. Fetch new ICE servers first: TURN credentials expire after
+  `calls.turn.ttlSeconds`.
+- **Restart ICE also when the path breaks**: on `connectionState` `failed` (or
+  `disconnected` for longer than a few seconds) during an active call, restart ICE.
+- **One call per user**: your own other devices cannot place or take a second call while
+  you are in one (`IN_CALL`, `BUSY`); show that instead of an error.
+- **Token refresh**: answer `AuthExpiring` with `ReAuth` as for messaging; a closed
+  connection (4002) only starts the disconnect grace, so reconnect with a fresh token
+  quickly.
 
 ## 8. Limits
 
@@ -248,6 +520,43 @@ Chart values (validated by the chart and by the services at start):
 | `calls.turn.*` | `mode: internal` | see [§13.3](#133-chart-values) | `PUSH_TURN_*` (auth-svc), the coturn objects |
 
 The chart refuses an invalid value naming it, for example `"calls.historyDays must be an integer from 1 to 3650"`; the services refuse it at start naming the variable.
+
+### 10.1 Validation messages
+
+`helm install`/`upgrade` stops with one of these (`calls.turn.*` is validated when
+`calls.enabled` is true, `calls.turn.mode` always):
+
+| Value | Message |
+|---|---|
+| `calls.enabled` | `calls.enabled must be true or false` |
+| `calls.ringSeconds`, `disconnectGraceSeconds`, `attemptsPerHour`, `historyDays` | `calls.<name> must be an integer from <min> to <max>` |
+| `calls.turn.mode` | `calls.turn.mode must be internal, external or stun-only` |
+| `calls.turn.ttlSeconds` | `calls.turn.ttlSeconds must be an integer from 60 to 86400` |
+| `calls.turn.stunUrls` | `calls.turn.stunUrls must be a list of stun: or stuns: URLs`; with `stun-only`: `calls.turn.stunUrls must not be empty with calls.turn.mode stun-only` |
+| `calls.turn.internal.enabled` | `calls.turn.internal.enabled must be true or false` |
+| `calls.turn.internal.publicHost` | `calls.turn.internal.publicHost must be the DNS name or IP address clients reach coturn at` |
+| `calls.turn.internal.realm` | `calls.turn.internal.realm must be empty or a DNS-like name` |
+| `calls.turn.internal.externalIp` | `calls.turn.internal.externalIp must be empty or an IP address`; missing: `calls.turn.internal.externalIp must be set (or calls.turn.internal.service.loadBalancerIP, or an IP address as publicHost): coturn advertises it as its relay address` |
+| `calls.turn.internal.ports.*` | `calls.turn.internal.ports.<udp\|tcp\|tls> must be an integer from 1 to 65535`; `calls.turn.internal.ports.tls must differ from calls.turn.internal.ports.tcp`; `calls.turn.internal.ports.<name> must not be within calls.turn.internal.relayPortRange` |
+| `calls.turn.internal.relayPortRange` | `calls.turn.internal.relayPortRange must be "<min>-<max>" with 1024 <= min <= max <= 65535 and at most 500 ports` |
+| `calls.turn.internal.tlsSecret` | `calls.turn.internal.tlsSecret must be empty or a Secret name` |
+| `calls.turn.internal.service.*` | `calls.turn.internal.service.type must be LoadBalancer or ClusterIP`; `calls.turn.internal.service.annotations must be a string-valued annotation map`; `calls.turn.internal.service.loadBalancerIP must be empty or an IP address` |
+| `calls.turn.internal.resources` | `calls.turn.internal.resources must be a map of Kubernetes container resources` |
+| `calls.turn.internal.deniedPeerCidrs` | empty: `calls.turn.internal.deniedPeerCidrs must list the cluster's pod and service CIDRs`; a bad entry: `calls.turn.internal.deniedPeerCidrs must list the cluster's pod and service CIDRs (network addresses such as 10.244.0.0/16 or fd00:10:244::/56; at least /8 for IPv4, /16 for IPv6, not starting at ::), not <value>`; a malformed range: `files/coturn/denied-peers.txt or calls.turn.internal.deniedPeerCidrs holds "<value>", which is not a CIDR` |
+| `calls.turn.internal.quotas.*` | `calls.turn.internal.quotas.<user\|total\|maxBps> must be an integer from <min> to <max>` |
+| `calls.turn.internal.image` | `calls.turn.internal.image must be <repository>:<tag>@sha256:<64 hex digits>` |
+| `calls.turn.internal.metricsPeers` | `calls.turn.internal.metricsPeers requires namespaceSelector and podSelector as non-empty label maps on every peer` |
+| `calls.turn.external.provider` | `calls.turn.external.provider must be generic, cloudflare or twilio` |
+| `calls.turn.external.urls` | `calls.turn.external.urls must be a non-empty list of turn: or turns: URLs` |
+| `calls.turn.external.*Secret`, `sharedSecret` | `<value> must name a key of the Secret, not hold the secret`; with `secrets.volume`: `<value> must be empty with secrets.volume: the file comes from secrets.files.<key>`; `external` without a consumer-managed Secret: `calls.turn.mode external needs the provider's secret in a consumer-managed Secret: set secrets.existingSecret or secrets.volume` |
+| `calls.turn.external.cloudflare.keyId` | `calls.turn.external.cloudflare.keyId must be set to the TURN key id (1 to 64 letters and digits)` |
+| `calls.turn.external.twilio.accountSid` | `calls.turn.external.twilio.accountSid must be AC followed by 32 hexadecimal digits` |
+
+The services check their variables again at start and stop with an error that names the
+variable and the rule, for example `PUSH_CALLS_RING_SECONDS` (10 to 120),
+`PUSH_CALLS_DISCONNECT_GRACE_SECONDS` (5 to 120), `PUSH_CALLS_ATTEMPTS_PER_HOUR` (1 to
+1000), `PUSH_CALLS_HISTORY_DAYS` (1 to 3650), `PUSH_CALLS_ENABLED` (`1` or `0`),
+`PUSH_TURN_*` ([§13.3](#133-chart-values)); secret values are never echoed.
 
 ## 11. Metrics
 
@@ -513,7 +822,7 @@ field. Values under `calls.turn`:
 | `internal.ports` | `{udp: 3478, tcp: 3478, tls: 5349}` | the public Service ports, 1–65535 (coturn listens on 3478 and 5349; e.g. `tls: 443` for firewalls that only pass 443) |
 | `internal.relayPortRange` | `"49160-49200"` | `"<min>-<max>"`, 1024 ≤ min ≤ max ≤ 65535, at most 500 ports; each port is a UDP and a TCP Service port, so keep it small (one relay port per relayed call leg) |
 | `internal.tlsSecret` | `""` | a `kubernetes.io/tls` Secret: adds `turns:` on `ports.tls` |
-| `internal.service` | `{type: LoadBalancer, annotations: {}, loadBalancerIP: ""}` | `LoadBalancer` or `ClusterIP` (not `NodePort`: node ports cannot carry the relay ports at their numbers); string annotations; an IP; the public ports must differ from each other and lie outside the relay range |
+| `internal.service` | `{type: LoadBalancer, annotations: {}, loadBalancerIP: ""}` | `LoadBalancer` or `ClusterIP` (not `NodePort`: node ports cannot carry the relay ports at their numbers); string annotations; an IP; the public ports lie outside the relay range, and `ports.tls` differs from `ports.tcp` (with `tlsSecret`) |
 | `internal.resources` | `{}` | container resources |
 | `internal.externalIp` | `""` | the public IP coturn advertises as its relay address; empty: `service.loadBalancerIP`, else `publicHost` when it is an IP. One of them is required ("calls.turn.internal.externalIp must be set …") |
 | `internal.deniedPeerCidrs` | `[]` | required: the cluster's pod and service CIDRs (IPv4 and IPv6 network addresses, at least /8 and /16) ("calls.turn.internal.deniedPeerCidrs must list the cluster's pod and service CIDRs") |
@@ -602,6 +911,22 @@ addresses. To exercise coturn itself, run `minikube tunnel`, use the `EXTERNAL-I
 `10.244.0.0/16` and `10.96.0.0/12` in `deniedPeerCidrs`; the push-auth-core integration
 test (`cargo test -p push-auth-core --test turn`) runs the same coturn in Docker.
 
+The browser smoke test ([§15.1](#151-browser-smoke-test)) relays between two local
+browsers through the pinned coturn by adding one **test-only** line to the chart's
+configuration, `allowed-peer-ip=172.16.0.0-172.31.255.255` (Docker's bridge range, where
+the relay addresses are). Never add it to a deployment: it re-opens the private range
+that `denied-peer-ip` closes. The chart has no value for it on purpose.
+
+A minikube walk-through with the reference page:
+
+1. `pwsh deploy/minikube/up.ps1` (or `up.sh`), then upgrade the release with
+   `--set calls.enabled=true --set calls.turn.mode=stun-only --set
+   calls.turn.stunUrls[0]=stun:stun.l.google.com:19302`.
+2. Create two accounts that are contacts (the app, or `push-dev-accounts`), sign each in
+   on its own browser profile and copy its access token.
+3. `node docs/examples/calls/serve.mjs --api http://<the ingress host>` and open
+   `http://127.0.0.1:8080/` in both profiles ([§14](#14-browser-recipe)).
+
 ### 13.7 Upgrading coturn
 
 The image is pinned by digest, and CI (`coturn-image` in `.github/workflows/ci.yml`)
@@ -635,3 +960,215 @@ them with a reason and an expiry. To move:
 
 Rotate `turn-shared-secret` by changing it in the Secret and restarting auth-svc and
 coturn together; credentials minted with the old secret stop working.
+
+## 14. Browser recipe
+
+[`docs/examples/calls`](examples/calls) is a reference client in plain JavaScript, with no
+build step: [`index.html`](examples/calls/index.html) (the page),
+[`calls.js`](examples/calls/calls.js) (the `CallClient` class, the part to copy) and
+[`serve.mjs`](examples/calls/serve.mjs) (a dependency-free Node server for trying it). It
+uses [protobuf.js](https://github.com/protobufjs/protobuf.js) 8.8.1, pinned on jsDelivr
+with a Subresource Integrity hash, and parses the repository's `frame.proto` at run time
+(`keepCase: true`, so fields keep their proto names). An app with generated TypeScript
+bindings uses those instead; the frames and the logic are the same.
+
+### 14.1 Try it
+
+```
+node docs/examples/calls/serve.mjs --api https://push.example.com   # or http://127.0.0.1:<port>
+```
+
+Open `http://127.0.0.1:8080/` in two browser profiles, paste each user's access token
+(from your app's sign-in), press **Connect**, and call the other user's id. The two
+users must be accepted contacts and the deployment must have calls enabled (the status
+says "calls not offered by this server" otherwise). `serve.mjs` serves the page, the
+script and `frame.proto`, and forwards `/v1/*` (HTTP and the WebSocket) to the
+deployment, because `GET /v1/calls/ice-servers` needs the page on the API's origin (the
+API sends no CORS headers). Browsers give microphone access only to secure contexts:
+`127.0.0.1` and `localhost` qualify, other hosts need HTTPS. Tick **Relay only** to force
+`iceTransportPolicy: "relay"`.
+
+### 14.2 What the client does
+
+| Step | Code (`calls.js`) |
+|---|---|
+| Connect: `Identify{token, capabilities: [CAPABILITY_CALLS]}`; on `Ready` check `capabilities` and start a `Ping` every `heartbeat_ms` | `open()`, `onReady()` |
+| Reconnect with backoff (0.5 s doubling to 8 s), except after 4001–4003 (token) and 4007 (takeover) | `reconnect()` |
+| ICE servers for each call: `GET /v1/calls/ice-servers` → `new RTCPeerConnection({iceServers: body.ice_servers, iceTransportPolicy})` | `iceServers()`, `peerConnection()` |
+| Call: a UUIDv7 `call_id`, `getUserMedia({audio: true})`, `createOffer` → `setLocalDescription` → `CallInvite` | `call()` |
+| Incoming: `CallIncoming` → ring for `expires_in_ms`; Answer: `setRemoteDescription(offer)` → `createAnswer` → `setLocalDescription` → `CallAccept` | `incoming()`, `answer()` |
+| Trickle out: each `icecandidate` → `CallIce`; `null` or an empty candidate → `end_of_candidates`; the callee holds its candidates until after `CallAccept` | `localCandidate()`, `flushLocalCandidates()` |
+| Trickle in: `peer_call_ice` → `addIceCandidate`, queued until the remote description is set | `peerCandidate()`, `flushPeerCandidates()` |
+| `CallAccepted` → `setRemoteDescription(answer)`; a repeated one is ignored | `accepted()` |
+| Renegotiation: `negotiationneeded` (only once active) → `CallRenegotiate` offer; `peer_call_renegotiate` → perfect negotiation, callee polite | `onnegotiationneeded`, `renegotiate()` |
+| `CallSync` after `Ready`: drop unlisted calls, add listed ringing incoming ones, end ones answered on another device, ICE restart for the active one (or `CallHangup FAILED` if this page lost its media, e.g. after a reload) | `sync()`, `restartIce()` |
+| `connectionState` `failed` → ICE restart with fresh ICE servers (`setConfiguration`, then `createOffer({iceRestart: true})`) | `peerConnection()`, `restartIce()` |
+| `CallEnded`, `CallTaken`, `CALL_NOT_FOUND` and other final `CallError`s → stop tracks, close the peer connection | `end()`, `callError()` |
+| `ALREADY_ANSWERED` for a cancel → `CallHangup` | `callError()` |
+
+Left to the app on purpose: sign-in and token refresh (`AuthExpiring` → `ReAuth`), the
+contact list and user names, call history ([§12](#12-call-history)), ringtones and
+notifications, device selection (`getUserMedia` constraints, `setSinkId`), and showing
+`relay: false` ("calls may fail on some networks").
+
+## 15. Testing: browser smoke, interoperability, load
+
+### 15.1 Browser smoke test
+
+[`crates/push-smoke/tests/browser_calls.rs`](../crates/push-smoke/tests/browser_calls.rs)
+starts the whole stack in one process (auth-svc, message-svc, the gateway and the worker,
+on Postgres and Redis containers, with calls enabled), makes two verified accounts
+contacts, serves the example page with `serve.mjs`, and runs
+[Playwright](examples/calls/tests/calls.spec.mjs) with two Chromium contexts and fake
+media devices (`--use-fake-device-for-media-stream --use-fake-ui-for-media-stream`). The
+suite checks, for each TURN mode:
+
+- a call rings, is answered, carries audio both ways (inbound RTP bytes grow on both
+  pages) and ends `COMPLETED` on both;
+- the callee's WebSocket drops mid-call: it reconnects, reads `CallSync` (the call is
+  listed), restarts ICE through `CallRenegotiate`, audio keeps flowing, and the call ends
+  `COMPLETED`;
+- a declined call ends `DECLINED` on both sides.
+
+| Test | TURN mode | ICE |
+|---|---|---|
+| `browsers_call_each_other_with_stun_only` | `stun-only` (`PUSH_TURN_MODE=stun-only`) | all candidates; host candidates connect the two local browsers |
+| `browsers_call_each_other_through_the_internal_turn_relay` | `internal`: the chart's pinned coturn in Docker with the chart's `turnserver.conf` and every denied range, credentials minted by auth-svc | `iceTransportPolicy: "relay"`; the test asserts the selected pair's local candidate is `relay` |
+
+The relay test adds the test-only `allowed-peer-ip` line described in
+[§13.6](#136-local-clusters); without it the relay is refused (the chart's denial of
+private peers works) and the test fails.
+
+CI runs both in the `browser-calls` job (`.github/workflows/ci.yml`). Locally (Docker,
+Node.js 20+ and Rust):
+
+```
+cd docs/examples/calls/tests
+npm ci
+npx playwright install chromium        # Linux: --with-deps chromium
+cd ../../../..
+PUSH_BROWSER_CALLS=1 cargo test -p push-smoke --test browser_calls -- --nocapture
+```
+
+(PowerShell: `$env:PUSH_BROWSER_CALLS = "1"`.) Without `PUSH_BROWSER_CALLS=1` the two
+tests pass without running, so `cargo test --workspace` needs neither Node nor a browser.
+
+### 15.2 Interoperability checklist
+
+Automated coverage is Chromium (above). Before a release that changes the call frames or
+the recipe, run this by hand with the example page on a deployment with TURN, for each
+pair of browsers you support (at least each browser with itself and with Chromium):
+**Chromium/Chrome, Edge, Firefox, Safari (macOS and iOS)**. Record browser versions and
+results in the release notes.
+
+| # | Check | Expect |
+|---|---|---|
+| 1 | Connect | status "ready"; no console errors; `Ready.capabilities` lists calls |
+| 2 | A calls B; B answers | both hear each other within 2 s of the answer |
+| 3 | Same with **Relay only** on both | audio flows; `chrome://webrtc-internals` / `about:webrtc` / Safari's WebRTC logging show a `relay` local candidate |
+| 4 | B signed in twice (two devices, two access tokens), each in its own browser profile; answer on one | the other stops ringing (`TAKEN`) |
+| 5 | Decline; cancel while ringing; let it ring 45 s | `DECLINED`; `CANCELLED`; `MISSED` on both sides |
+| 6 | B calls A while A is in a call with C | B gets `BUSY` at once |
+| 7 | Mid-call, switch B's network (Wi-Fi ↔ wired/cellular) or toggle airplane mode for < 30 s | B reconnects, `CallSync` lists the call, ICE restarts, audio resumes |
+| 8 | Mid-call, close B's tab | after 30 s A gets `FAILED` |
+| 9 | Hang up from either side | `COMPLETED` with a duration on both |
+| 10 | Mute/unmute (`track.enabled = false`) | the peer hears silence, no renegotiation |
+| 11 | Echo: both on speakers in one room | echo cancellation keeps it usable |
+
+Known differences to watch:
+
+- **Safari** asks for the microphone per page load and only after a user gesture; audio
+  playback also needs a gesture (call `audio.play()` from the Answer/Call click). iOS
+  pauses background tabs: expect a reconnect and an ICE restart when the tab comes back.
+  Safari before 15.4 lacks parameterless `setLocalDescription()`/implicit rollback; the
+  recipe needs a current Safari.
+- **Firefox** sends end-of-candidates as an empty candidate string (handled) and shows
+  ICE details in `about:webrtc`.
+- **Edge** behaves as Chromium; check its tracking prevention does not block the page's
+  CDN script (serve protobuf.js yourself if it does).
+- Chromium hides host addresses behind mDNS `.local` names until microphone permission
+  is granted; the recipe asks for the microphone before creating the offer.
+
+### 15.3 Load
+
+`push-load calls` places concurrent calls between prepared pairs of contacts over the
+public API and measures signalling setup latency (`CallInvite` sent → `CallAccepted`
+received; the load callee answers at once, so the callee's human response is excluded):
+[load verification](consumer-verification.md#voice-calls). Targets:
+
+- call setup relayed in **under 300 ms p95** within a region;
+- **1,000 concurrent ringing or active calls per gateway replica** without errors.
+
+A run needs two accounts per concurrent call (`prepare --sample-pairs N`) and a deployment
+whose `calls.attemptsPerHour` covers the run. Watch Redis while it runs (CPU, ops/s,
+memory; each call is one hash of under 100 KiB plus a lock) and message-svc's
+`push_call_signal_seconds`, `push_call_setup_seconds` and `push_calls_live`. CI runs a
+small calls scenario against the in-process stack (`cargo test -p push-smoke --test
+local`); full-scale runs are for a deployment you own.
+
+## 16. Troubleshooting
+
+Start with the browser's WebRTC page: `chrome://webrtc-internals` (Chromium, Edge),
+`about:webrtc` (Firefox), Develop → WebRTC logging (Safari). It shows the candidates
+gathered, the pair selected, and bytes sent and received per direction.
+
+| Symptom | Likely cause | Check / fix |
+|---|---|---|
+| No call button / `NOT_AVAILABLE` | the connection is not calls-active | `Identify` lists `CAPABILITY_CALLS`? `Ready` lists it? `calls.enabled` on, every gateway and message-svc replica upgraded ([§2](#2-enabling-calls)) |
+| Invite answered `UNREACHABLE` at once | the callee has no calls-active device online | the callee's app must advertise the capability and be connected |
+| Invite refused `NOT_CONTACT` | not accepted contacts, a block, or an agent rule | accept the contact request first |
+| Rings, answered, **no audio either way** | ICE never connected | look for `failed` in `iceConnectionState`. With `relay: false` (stun-only), two symmetric NATs or a firewall cannot connect: configure TURN. With TURN: no `relay` candidates means coturn's ports are unreachable or the credentials are refused ([§13.8](#138-troubleshooting-turn)) |
+| **One-way audio** | one direction blocked or not sending | inbound bytes stay at 0 on one side: a firewall drops one direction (UDP to the relay range), a muted or ended local track (`track.enabled`, `track.readyState`), the microphone denied on that side, or `autoplay` blocked playback (bytes arrive but nothing plays: call `audio.play()` from a click) |
+| Works on the same Wi-Fi, fails across networks | no relay | **symmetric NAT** (mobile carriers, many corporate NATs) gives a different public port per destination, so the peer cannot reach the address STUN learned. Only a relay that both sides reach can connect them: TURN is needed, not just STUN |
+| Fails only in offices or hotels | UDP blocked, or only 80/443 allowed | offer `turns:` on TCP **443** (`calls.turn.internal.ports.tls: 443` with `tlsSecret`, or a provider with TLS on 443) and `turn:…?transport=tcp`; TLS on 443 passes most proxies and deep packet inspection |
+| Audio stops after a network change | ICE did not restart | the client must restart ICE on `CallSync` and on `connectionState` `failed`; fetch fresh ICE servers first (expired TURN credentials make the restart fail with 401) |
+| Call ends `FAILED` after ~30 s while audio was fine | the signalling connection dropped and did not come back | the app must reconnect the WebSocket while in a call (and refresh its token); half-open sockets count from detection (up to 2.5 heartbeats) |
+| `CALL_LIMIT` | more than 200 ICE frames or 20 renegotiations per side | stop restarting in a loop; restarts need backoff |
+| `RATE_LIMITED` on invite | `calls.attemptsPerHour` reached | wait `retry_after_s` |
+| `INVALID` on invite or accept | SDP over 16 KiB, a video line, or a non-UUIDv7 id | audio-only tracks; trickle ICE keeps candidates out of the SDP |
+
+## 17. Release notes and upgrade guide
+
+**This release** adds 1:1 voice calls, off by default:
+
+- signalling frames on `push.v1` (client frames 11–17, server frames 44–52), the call
+  engine in message-svc with state in Redis, the gateway relay and `CallSync`;
+- call history (`GET /v1/calls`, `DELETE /v1/calls/{call_id}`, `CallHistoryChanged`,
+  retention `calls.historyDays`) in message-svc's database (migration
+  `0008_call_history.sql`);
+- TURN credentials (`GET /v1/calls/ice-servers`) and `calls.turn` with an `internal`
+  coturn, `external` providers (generic, Cloudflare, Twilio) or `stun-only`;
+- this guide, the browser recipe, its Playwright smoke test in CI, the interoperability
+  checklist and the `push-load calls` scenario.
+
+The protocol change is additive: no field or frame was renumbered or reused, old clients
+never receive call frames, and every mix of old and new gateway, message-svc and client
+keeps messaging working:
+
+| Combination | Result |
+|---|---|
+| old client, any server | never advertises calls; callers see it as `UNREACHABLE`; messaging unchanged |
+| new client, old gateway | `Ready` without capabilities: hide call UI |
+| new gateway, old message-svc | calls not offered (`NOT_AVAILABLE`) |
+| mixed message-svc replicas with calls on | a call frame on an old replica answers `UNAVAILABLE` (retryable) |
+| mixed gateway replicas | devices on old gateways are unreachable for calls |
+
+**Upgrading:**
+
+1. Upgrade as usual with `calls.enabled: false` (the default)
+   ([deployment-upgrade.md](deployment-upgrade.md)). message-svc applies the history
+   migration; nothing else changes.
+2. Wait until every gateway and message-svc replica runs this version.
+3. Choose TURN ([§13](#13-turn)): for production `internal` (public IP, DNS, NSG ports,
+   `deniedPeerCidrs`, [§13.5](#135-aks)) or an `external` provider (its secret in your
+   Secret); `stun-only` only for development.
+4. Set `calls.enabled: true` with the `calls.turn` values and upgrade. Check
+   `GET /v1/calls/ice-servers` answers 200 with `relay: true`, coturn's pod is ready, and
+   a test call between two networks connects (the example page, [§14](#14-browser-recipe)).
+5. Optionally verify capacity with `push-load calls` ([§15.3](#153-load)) and alert on
+   `push_calls_ended_total{reason="failed"}` and `push_turn_credentials_failures_total`.
+
+**Rolling back:** set `calls.enabled: false` first (calls in progress end as their state
+expires within two minutes; clients hide call UI on their next `Ready`), then roll back
+the images. Call history rows stay until retention removes them; an older message-svc
+ignores the table.
