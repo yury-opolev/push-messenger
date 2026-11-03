@@ -517,6 +517,36 @@ async fn the_sweeper_ends_a_missed_call() {
 }
 
 #[tokio::test]
+async fn one_sweep_ticks_every_due_call() {
+    const CALLS: usize = 200;
+    let timing = Timing {
+        ring_ms: 1_000,
+        ..Timing::default()
+    };
+    let mut env = env(timing).await;
+    for _ in 0..CALLS {
+        let (alice, bob) = (env.user().await, env.user().await);
+        env.contacts(alice, bob).await;
+        env.online(bob.user, bob.device).await;
+        env.invite(alice, bob.user, Uuid::now_v7()).await.unwrap();
+    }
+    assert_eq!(
+        env.service.redis().live_count().await.unwrap(),
+        CALLS as u64
+    );
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+
+    // Far more than one claim's worth: the sweep claims again while claims come back full.
+    let started = std::time::Instant::now();
+    assert_eq!(env.service.sweep_once().await.unwrap(), CALLS);
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert_eq!(env.service.redis().live_count().await.unwrap(), 0);
+    assert!(env.metrics.render(Some(0)).contains(&format!(
+        "push_calls_ended_total{{reason=\"missed\"}} {CALLS}\n"
+    )));
+}
+
+#[tokio::test]
 async fn a_party_device_gone_past_the_grace_fails_the_call_and_a_reattach_resumes() {
     let timing = Timing {
         ring_ms: 45_000,

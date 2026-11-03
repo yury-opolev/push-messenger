@@ -249,7 +249,7 @@ Labels are reasons, codes and frame kinds only, never call content.
 | `push_calls_started_total` | counter | — |
 | `push_calls_answered_total` | counter | — |
 | `push_calls_ended_total` | counter | `reason`: completed, missed, declined, cancelled, busy, failed, unreachable |
-| `push_call_frames_refused_total` | counter | `code`: not_contact, call_not_found, invalid, already_answered, in_call, call_limit, unavailable, not_available |
+| `push_call_frames_refused_total` | counter | `code`: not_contact, call_not_found, invalid, already_answered, in_call, call_limit, unavailable |
 | `push_call_setup_seconds` | histogram | — (an accept received → `CallAccepted` published) |
 | `push_call_signal_seconds` | histogram | `frame`: invite, accept, decline, cancel, ice, hangup, renegotiate (time to handle and publish a call frame) |
 | `push_calls_live` | gauge | — (calls ringing or active; absent while Redis does not answer) |

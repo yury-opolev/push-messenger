@@ -23,7 +23,7 @@ const END_REASONS: [EndReason; 7] = [
 ];
 
 /// The refusal codes counted, with their label.
-const REFUSAL_CODES: [(ErrorCode, &str); 8] = [
+const REFUSAL_CODES: [(ErrorCode, &str); 7] = [
     (ErrorCode::NotContact, "not_contact"),
     (ErrorCode::CallNotFound, "call_not_found"),
     (ErrorCode::Invalid, "invalid"),
@@ -31,7 +31,6 @@ const REFUSAL_CODES: [(ErrorCode, &str); 8] = [
     (ErrorCode::InCall, "in_call"),
     (ErrorCode::CallLimit, "call_limit"),
     (ErrorCode::Unavailable, "unavailable"),
-    (ErrorCode::NotAvailable, "not_available"),
 ];
 
 /// A client call frame, the `frame` label of `push_call_signal_seconds`.

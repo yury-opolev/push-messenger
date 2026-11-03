@@ -323,13 +323,24 @@ async fn live_devices_need_a_presence_lease() {
             .unwrap();
     }
     assert_eq!(calls.live_devices(user, now).await.unwrap(), [live]);
-    assert!(calls.connection_live(user, live_conn, now).await.unwrap());
-    assert!(
-        !calls
-            .connection_live(user, expired_conn, now)
+    let unknown = (UserId::new(), DeviceId::new());
+    assert_eq!(
+        calls
+            .devices_live(
+                &[
+                    (user, live),
+                    (user, expired),
+                    unknown,
+                    (user, unleased),
+                    (user, live)
+                ],
+                now
+            )
             .await
-            .unwrap()
+            .unwrap(),
+        [true, false, false, false, true]
     );
+    assert!(calls.devices_live(&[], now).await.unwrap().is_empty());
     assert!(
         calls
             .live_devices(UserId::new(), now)

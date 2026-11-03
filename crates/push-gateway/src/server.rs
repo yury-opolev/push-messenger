@@ -422,7 +422,11 @@ async fn converse(
             signal = membership.next() => {
                 let done = match signal {
                     Signal::Ring => connected.deliver().await,
-                    Signal::Frame(frame) => send(&mut connected.socket, *frame).await,
+                    Signal::Frame(frame) if connected.session.forwards(&frame) => {
+                        send(&mut connected.socket, *frame).await
+                    }
+                    // A call frame for a connection that does not serve calls.
+                    Signal::Frame(_) => Ok(()),
                     Signal::Kick(reason) => {
                         let (code, why) = kick_close(reason);
                         tracing::info!(device = %connected.device, ?reason, "connection kicked");

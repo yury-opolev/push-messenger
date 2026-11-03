@@ -132,6 +132,21 @@ fn call_frame(body: Body) -> Option<CallFrame> {
     }
 }
 
+/// Whether `body` is a server call frame.
+fn is_call_body(body: &Body) -> bool {
+    matches!(
+        body,
+        Body::CallIncoming(_)
+            | Body::CallAccepted(_)
+            | Body::CallTaken(_)
+            | Body::CallEnded(_)
+            | Body::CallSync(_)
+            | Body::PeerCallIce(_)
+            | Body::PeerCallRenegotiate(_)
+            | Body::CallError(_)
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
     /// Connected; the first frame must be `Identify`.
@@ -183,6 +198,12 @@ impl Session {
     /// Whether the connection is calls-active.
     pub fn calls_active(&self) -> bool {
         self.calls_active
+    }
+
+    /// Whether a frame from the hub goes out on this connection: call frames only reach
+    /// calls-active connections.
+    pub fn forwards(&self, body: &Body) -> bool {
+        self.calls_active || !is_call_body(body)
     }
 
     /// What to do with a binary message from the client.
@@ -726,6 +747,29 @@ mod tests {
         );
         let ready = session.identified(&claims(), Duration::from_secs(30), offered, calls_active);
         (session, ready)
+    }
+
+    #[test]
+    fn call_frames_from_the_hub_only_reach_calls_active_connections() {
+        let call_bodies = [
+            Body::CallIncoming(CallIncoming::default()),
+            Body::CallAccepted(CallAccepted::default()),
+            Body::CallTaken(CallTaken::default()),
+            Body::CallEnded(CallEnded::default()),
+            Body::CallError(CallError::default()),
+            Body::CallSync(CallSync::default()),
+            Body::PeerCallIce(CallIce::default()),
+            Body::PeerCallRenegotiate(CallRenegotiate::default()),
+        ];
+        let other = Body::Ready(Default::default());
+        let (active, _) = calls_session(&[Capability::Calls], true);
+        let (inactive, _) = calls_session(&[], false);
+        for body in &call_bodies {
+            assert!(active.forwards(body), "{body:?}");
+            assert!(!inactive.forwards(body), "{body:?}");
+        }
+        assert!(active.forwards(&other));
+        assert!(inactive.forwards(&other));
     }
 
     #[test]

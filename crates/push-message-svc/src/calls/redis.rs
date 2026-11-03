@@ -406,17 +406,51 @@ impl RedisCalls {
         conn.map(|conn| parse_uuid(&conn)).transpose()
     }
 
-    /// Whether `conn` of `user` holds a presence lease that ends after `now_ms`.
-    pub async fn connection_live(
+    /// For each `(user, device)`, in order: whether the device has a registered connection
+    /// holding a presence lease that ends after `now_ms`. Two round trips at most.
+    pub async fn devices_live(
         &self,
-        user: UserId,
-        conn: Uuid,
+        devices: &[(UserId, DeviceId)],
         now_ms: i64,
-    ) -> RedisResult<bool> {
-        let mut score = redis::cmd("ZSCORE");
-        score.arg(presence_conns_key(user.0)).arg(conn.to_string());
-        let lease: Option<f64> = self.query(&score).await?;
-        Ok(lease.is_some_and(|end| end > now_ms as f64))
+    ) -> RedisResult<Vec<bool>> {
+        if devices.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut gets = redis::pipe();
+        for (user, device) in devices {
+            gets.cmd("HGET")
+                .arg(devices_key(*user))
+                .arg(device.0.to_string());
+        }
+        let conns: Vec<Option<String>> = self.query_pipeline(&gets).await?;
+        let mut scores = redis::pipe();
+        let mut registered = Vec::with_capacity(devices.len());
+        for ((user, _), conn) in devices.iter().zip(&conns) {
+            let conn = conn.as_deref().map(parse_uuid).transpose()?;
+            if let Some(conn) = conn {
+                scores
+                    .cmd("ZSCORE")
+                    .arg(presence_conns_key(user.0))
+                    .arg(conn.to_string());
+            }
+            registered.push(conn.is_some());
+        }
+        let leases: Vec<Option<f64>> = if registered.contains(&true) {
+            self.query_pipeline(&scores).await?
+        } else {
+            Vec::new()
+        };
+        let mut leases = leases.into_iter();
+        Ok(registered
+            .into_iter()
+            .map(|registered| {
+                registered
+                    && leases
+                        .next()
+                        .flatten()
+                        .is_some_and(|end| end > now_ms as f64)
+            })
+            .collect())
     }
 
     /// `user`'s attached devices whose connection holds a live presence lease, in id
@@ -435,11 +469,7 @@ impl RedisCalls {
                 .arg(presence_conns_key(user.0))
                 .arg(conn);
         }
-        let pipeline = &pipeline;
-        let leases: Vec<Option<f64>> = bounded(push_credentials::retry_if_dropped(|| async move {
-            pipeline.query_async(&mut self.connection.clone()).await
-        }))
-        .await?;
+        let leases: Vec<Option<f64>> = self.query_pipeline(&pipeline).await?;
         let mut live = Vec::new();
         for ((device, _), lease) in registered.iter().zip(leases) {
             if lease.is_some_and(|end| end > now_ms as f64) {
@@ -469,6 +499,17 @@ impl RedisCalls {
     async fn query<T: FromRedisValue>(&self, command: &redis::Cmd) -> RedisResult<T> {
         bounded(push_credentials::retry_if_dropped(|| async move {
             command.query_async(&mut self.connection.clone()).await
+        }))
+        .await
+    }
+
+    /// Runs a pipeline of reads, once more on a dropped connection.
+    async fn query_pipeline<T: FromRedisValue>(
+        &self,
+        pipeline: &redis::Pipeline,
+    ) -> RedisResult<T> {
+        bounded(push_credentials::retry_if_dropped(|| async move {
+            pipeline.query_async(&mut self.connection.clone()).await
         }))
         .await
     }

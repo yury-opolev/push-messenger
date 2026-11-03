@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use push_domain::calls::{
     CallEvent, CallRecord, CallState, Delivery, EndReason, Outcome, Refusal, Side, Timing, start,
     sync_view, transition,
@@ -29,8 +30,12 @@ use crate::notify::RedisNotifier;
 
 /// How often a frame retries after losing a compare-and-set race (spec §6).
 const MAX_ATTEMPTS: usize = 5;
-/// How many due calls one sweep claims.
+/// How many due calls one claim takes.
 const CLAIM_MAX: u32 = 32;
+/// How many full claims in a row one sweep makes before it yields to the next interval.
+const MAX_FULL_CLAIMS: usize = 50;
+/// How many claimed calls are ticked at a time.
+const TICK_CONCURRENCY: usize = 16;
 /// How long a claimed due call is leased to the claiming replica (spec D5).
 const CLAIM_LEASE_MS: i64 = 5_000;
 /// How often the sweeper claims due calls.
@@ -106,25 +111,40 @@ where
         &self.redis
     }
 
-    /// Ticks the due calls once: ring timeouts, grace ends and liveness checks. Returns
-    /// how many calls were claimed. A call that fails is logged and ticked again after
-    /// its lease.
+    /// Ticks the due calls: ring timeouts, grace ends and liveness checks. Claims again at
+    /// once while a claim comes back full (at most [`MAX_FULL_CLAIMS`] times) and ticks
+    /// [`TICK_CONCURRENCY`] calls at a time. Returns how many calls were claimed. A call
+    /// that fails is logged and ticked again after its lease.
     pub async fn sweep_once(&self) -> Result<usize, Status> {
-        let (_, due) = self
-            .redis
-            .claim(CLAIM_MAX, CLAIM_LEASE_MS)
-            .await
-            .map_err(redis_failed)?;
-        for call in &due {
-            if let Err(status) = self.tick(*call).await {
-                tracing::warn!(
-                    call_id = %call,
-                    error = status.message(),
-                    "a due call could not be ticked; it is tried again after its lease"
-                );
+        self.sweep(&CancellationToken::new()).await
+    }
+
+    async fn sweep(&self, shutdown: &CancellationToken) -> Result<usize, Status> {
+        let mut claimed = 0;
+        for _ in 0..MAX_FULL_CLAIMS {
+            let (_, due) = self
+                .redis
+                .claim(CLAIM_MAX, CLAIM_LEASE_MS)
+                .await
+                .map_err(redis_failed)?;
+            claimed += due.len();
+            let full = due.len() >= CLAIM_MAX as usize;
+            futures_util::stream::iter(due)
+                .for_each_concurrent(TICK_CONCURRENCY, |call| async move {
+                    if let Err(status) = self.tick(call).await {
+                        tracing::warn!(
+                            call_id = %call,
+                            error = status.message(),
+                            "a due call could not be ticked; it is tried again after its lease"
+                        );
+                    }
+                })
+                .await;
+            if !full || shutdown.is_cancelled() {
+                break;
             }
         }
-        Ok(due.len())
+        Ok(claimed)
     }
 
     /// Sweeps every 500 ms until `shutdown`.
@@ -137,7 +157,7 @@ where
                 _ = interval.tick() => {}
             }
             // A failure is logged; the next sweep tries again.
-            let _ = self.sweep_once().await;
+            let _ = self.sweep(&shutdown).await;
         }
     }
 
@@ -422,27 +442,25 @@ where
         record: &CallRecord,
         now: i64,
     ) -> Result<(Vec<Side>, Vec<Side>), Status> {
-        let parties = [
+        let parties: Vec<(Side, UserId, DeviceId)> = [
             (Side::Caller, record.caller, Some(record.caller_device)),
             (Side::Callee, record.callee, record.callee_device),
-        ];
+        ]
+        .into_iter()
+        .filter_map(|(side, user, device)| device.map(|device| (side, user, device)))
+        .collect();
+        let devices: Vec<(UserId, DeviceId)> = parties
+            .iter()
+            .map(|&(_, user, device)| (user, device))
+            .collect();
+        let live = self
+            .redis
+            .devices_live(&devices, now)
+            .await
+            .map_err(redis_failed)?;
         let mut gone = Vec::new();
         let mut connected = Vec::new();
-        for (side, user, device) in parties {
-            let Some(device) = device else { continue };
-            let conn = self
-                .redis
-                .connection_of(user, device)
-                .await
-                .map_err(redis_failed)?;
-            let live = match conn {
-                None => false,
-                Some(conn) => self
-                    .redis
-                    .connection_live(user, conn, now)
-                    .await
-                    .map_err(redis_failed)?,
-            };
+        for ((side, _, _), live) in parties.into_iter().zip(live) {
             if live {
                 connected.push(side);
             } else {
