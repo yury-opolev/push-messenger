@@ -347,8 +347,6 @@ function hideRemoveConfirm() {
 
 // ---- Chat -------------------------------------------------------------------------------
 
-const KIND_LABELS = { step: "step", card: "card", answer: "answer", note: "note" };
-
 function renderChat(reply) {
   $("openMessenger").hidden = !reply.messengerUrl;
   let status = "";
@@ -361,19 +359,8 @@ function renderChat(reply) {
   const list = $("chat");
   const scroller = $("panel-chat").closest("main");
   const atBottom = scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 4;
-  const items = (reply.off || reply.disabled ? [] : reply.entries || []).map((entry) => {
-    const item = el("li", entry.from === "owner" ? "from-owner" : "from-agent");
-    const meta = el("div", "meta");
-    meta.append(el("time", null, clockTime(entry.time)));
-    const kind = KIND_LABELS[entry.kind];
-    if (kind) {
-      const label = entry.kind === "card" && entry.cardState ? kind + " · " + entry.cardState : kind;
-      meta.append(el("span", "kind", label));
-    }
-    item.append(meta, el("div", "text", String(entry.text || "")));
-    return item;
-  });
-  list.replaceChildren(...items);
+  const entries = reply.off || reply.disabled ? [] : reply.entries || [];
+  list.replaceChildren(...window.PushTrayChat.chatItems(document, entries));
   if (atBottom) scroller.scrollTop = scroller.scrollHeight;
 }
 

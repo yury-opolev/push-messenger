@@ -34,6 +34,9 @@ The exe is `apps/push-agent-tray/target/release/push-agent-tray.exe`. Put it nex
 `push-agent-bridge.exe`: the tray starts the bridge found in its own folder. It needs the
 WebView2 runtime (part of Windows 10 and 11) for the window only.
 
+The page's chat rendering has Node tests (text only, never HTML):
+`node --test apps/push-agent-tray/tests/chat.test.js`.
+
 ## Install
 
 Per user, no admin rights: copy `push-agent-tray.exe` next to `push-agent-bridge.exe`
