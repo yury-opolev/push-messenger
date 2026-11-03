@@ -115,7 +115,7 @@ values would be silently ignored, so they are refused by name, never by value.
 {{- if not (kindIs "map" $secrets.files) -}}
 {{- fail "secrets.files must be a map of application key names to filenames" -}}
 {{- end -}}
-{{- $keys := list "auth-signing-key" "auth-link-key" "accounts-token" "directory-token" "messaging-token" "auth-admin-token" "resend-api-key" "resend-webhook-secret" -}}
+{{- $keys := list "auth-signing-key" "auth-link-key" "accounts-token" "directory-token" "messaging-token" "auth-admin-token" "resend-api-key" "resend-webhook-secret" "turn-shared-secret" "turn-cloudflare-token" "turn-twilio-token" -}}
 {{- $filenames := dict -}}
 {{- range $key, $filename := $secrets.files -}}
 {{- if or (not (has $key $keys)) (not (kindIs "string" $filename)) -}}
@@ -141,6 +141,7 @@ values would be silently ignored, so they are refused by name, never by value.
 {{- if .Values.auth.admin.enabled -}}{{- $required = append $required "auth-admin-token" -}}{{- end -}}
 {{- if eq .Values.worker.email.sender "resend" -}}{{- $required = append $required "resend-api-key" -}}{{- end -}}
 {{- if include "push.hasWebhook" . -}}{{- $required = append $required "resend-webhook-secret" -}}{{- end -}}
+{{- with include "push.turnSecretKey" . -}}{{- $required = append $required . -}}{{- end -}}
 {{- range $required -}}
 {{- if not (index $secrets.files .) -}}
 {{- fail (printf "secrets.files.%s needs a filename" .) -}}
@@ -174,9 +175,13 @@ values would be silently ignored, so they are refused by name, never by value.
   "message-svc" (list "accounts-token" "directory-token" "messaging-token")
   "gateway" (list "messaging-token")
   "worker" (list "accounts-token")
-  "smoke" (list "auth-signing-key")) .component -}}
+  "smoke" (list "auth-signing-key")
+  "coturn" (list "turn-shared-secret")) .component -}}
 {{- if and (eq .component "auth") $root.Values.auth.admin.enabled -}}
 {{- $keys = append $keys "auth-admin-token" -}}
+{{- end -}}
+{{- if eq .component "auth" -}}
+{{- with include "push.turnSecretKey" $root -}}{{- $keys = append $keys . -}}{{- end -}}
 {{- end -}}
 {{- if eq .component "worker" -}}
 {{- if eq $root.Values.worker.email.sender "resend" -}}
@@ -862,6 +867,7 @@ ranges the services accept at start (strings and fractions are refused).
 {{- fail (printf "calls.%s must be an integer from %d to %d" $name (index $limit 1) (index $limit 2)) -}}
 {{- end -}}
 {{- end -}}
+{{- include "push.checkTurn" . -}}
 {{- end -}}
 
 {{/*

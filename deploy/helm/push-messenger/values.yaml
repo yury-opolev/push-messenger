@@ -210,6 +210,79 @@ calls:
   # How many days call history is kept: 1 to 3650. Applies whether calls are enabled or not
   # (message-svc purges older rows hourly).
   historyDays: 90
+  # TURN: the ICE servers GET /v1/calls/ice-servers hands out (docs/calls.md, "TURN").
+  turn:
+    # internal: the chart's coturn (or one run elsewhere with the same secret). external: a
+    # provider's TURN service. stun-only: no relay (calls fail behind symmetric NATs).
+    mode: internal
+    # Lifetime of the TURN credentials handed out: 60 to 86400 seconds.
+    ttlSeconds: 600
+    # Extra stun: or stuns: URLs; internal mode adds its own first.
+    stunUrls: []
+    # The coturn deployed by the chart.
+    internal:
+      # false: no coturn here; auth-svc hands out credentials for one run elsewhere with the
+      # same secret (the Secret's turn-shared-secret) at publicHost and the ports below.
+      enabled: true
+      # DNS name or IP address clients reach coturn at (over UDP too). Required.
+      publicHost: ""
+      # Empty: publicHost.
+      realm: ""
+      # The public Service ports (1 to 65535); coturn itself listens on 3478 and 5349.
+      ports:
+        udp: 3478
+        tcp: 3478
+        tls: 5349
+      # Relay ports, "<min>-<max>" within 1024 to 65535, at most 500 ports: each is a
+      # Service port (UDP and TCP), so keep the range small.
+      relayPortRange: "49160-49200"
+      # A kubernetes.io/tls Secret for turns: (TURN over TLS on ports.tls). Empty: turn: only.
+      tlsSecret: ""
+      service:
+        # LoadBalancer or ClusterIP (with your own route for UDP to every port, at its number).
+        type: LoadBalancer
+        annotations: {}
+        # Empty: assigned by the cloud.
+        loadBalancerIP: ""
+      resources: {}
+      # The public IP coturn advertises as its relay address; empty: service.loadBalancerIP,
+      # else publicHost when it is an IP address.
+      externalIp: ""
+      # Required: the cluster's pod and service CIDRs (IPv4/IPv6), denied as peers on top of
+      # files/coturn/denied-peers.txt.
+      deniedPeerCidrs: []
+      quotas:
+        # Relayed sessions per user (1 to 1000) and in total (1 to 100000).
+        user: 12
+        total: 1200
+        # Bytes per second per session: 8000 to 1000000000.
+        maxBps: 512000
+      # Pinned by digest (coturn/coturn 4.18.0-alpine multi-arch index); CI scans it (Trivy).
+      image: coturn/coturn:4.18.0-alpine@sha256:c29135c08565810d37053f384584392b7c24b69570fc81a721b878d6fe63e04e
+      # Peers allowed to scrape coturn's Prometheus port 9641, each with both non-empty
+      # label maps, like networkPolicy.adminPeers. Empty: nobody.
+      metricsPeers: []
+    # A provider such as Cloudflare Calls TURN, Twilio or Xirsys. Needs a consumer-managed
+    # Secret (secrets.existingSecret or secrets.volume) holding the provider's secret.
+    external:
+      # generic (TURN REST shared secret), cloudflare or twilio.
+      provider: generic
+      # generic: the turn: and turns: URLs.
+      urls: []
+      # Names of keys in the app Secret (never secret values); empty: the default key. With
+      # secrets.volume leave them empty and set secrets.files.<default key> instead.
+      # generic: the TURN REST shared secret (default turn-shared-secret).
+      sharedSecret: ""
+      cloudflare:
+        # The TURN key id.
+        keyId: ""
+        # The key with its API token (default turn-cloudflare-token).
+        apiTokenSecret: ""
+      twilio:
+        # AC followed by 32 hexadecimal digits.
+        accountSid: ""
+        # The key with its auth token (default turn-twilio-token).
+        authTokenSecret: ""
 
 postgres:
   # true: the bundled PostgreSQL below. false: an external server (postgres.external);
@@ -345,6 +418,9 @@ secrets:
     auth-admin-token: auth-admin-token
     resend-api-key: resend-api-key
     resend-webhook-secret: resend-webhook-secret
+    turn-shared-secret: turn-shared-secret
+    turn-cloudflare-token: turn-cloudflare-token
+    turn-twilio-token: turn-twilio-token
 
 # Ingress isolation for the application components (the bundled datastores' policies
 # only when they are enabled); egress is unrestricted unless egress.enabled.

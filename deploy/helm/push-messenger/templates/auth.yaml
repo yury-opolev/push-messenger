@@ -92,6 +92,10 @@ spec:
             - name: PUSH_MESSAGE_SVC_URL
               value: {{ printf "http://%s:50053" (include "push.name" (dict "root" . "component" "message-svc")) | quote }}
             {{- include "push.applicationEnv" (dict "root" . "name" "PUSH_DIRECTORY_TOKEN" "key" "directory-token") | nindent 12 }}
+            {{- with (include "push.turnEnv" . | trim) }}
+            # The ICE servers of GET /v1/calls/ice-servers (calls.turn, docs/calls.md).
+            {{- . | nindent 12 }}
+            {{- end }}
             {{- with (include "push.signInEnv" . | trim) }}
             # Sign-in beyond email and password (auth.signIn, docs/entra-sign-in.md).
             {{- . | nindent 12 }}

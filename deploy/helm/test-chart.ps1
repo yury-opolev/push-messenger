@@ -259,8 +259,11 @@ Check 'default: calls are off on the gateway and message-svc, with the default l
         $messageSvc -match 'name: PUSH_CALLS_DISCONNECT_GRACE_SECONDS\s+value: "30"' -and
         $messageSvc -match 'name: PUSH_CALLS_HISTORY_DAYS\s+value: "90"'
 }
+$turnArgs = @('--set', 'calls.enabled=true', '--set', 'calls.turn.internal.publicHost=turn.example.com',
+    '--set', 'calls.turn.internal.externalIp=203.0.113.10',
+    '--set', 'calls.turn.internal.deniedPeerCidrs={10.244.0.0/14,fd12:3456:789a::/52}')
 Check 'calls: one switch enables both services; the limits render as set' {
-    $on = helm template push $chart --set calls.enabled=true --set calls.ringSeconds=120 `
+    $on = helm template push $chart @turnArgs --set calls.ringSeconds=120 `
         --set calls.disconnectGraceSeconds=5 --set calls.attemptsPerHour=1000 --set calls.historyDays=3650 | Out-String
     $gateway = Doc $on 'Deployment' 'push-gateway'
     $messageSvc = Doc $on 'Deployment' 'push-message-svc'
@@ -291,6 +294,377 @@ foreach ($invalid in @(
     Check "calls: $($invalid[0]) $($invalid[1]) is refused" {
         $errorText = helm template push $chart $invalid[0] $invalid[1] 2>&1 | Out-String
         $LASTEXITCODE -ne 0 -and $errorText.Contains($invalid[2])
+    }
+}
+
+# auth-svc's PUSH_TURN_* variables equal $expected: a value, secret:<Secret>/<key> or, for
+# *_FILE variables, the file path.
+function TurnEnv([string] $rendered, [hashtable] $expected) {
+    $validator = @'
+import json, sys, yaml
+case = json.load(sys.stdin)
+docs = [d for d in yaml.safe_load_all(case["rendered"]) if d]
+auth = next(d for d in docs if d["kind"] == "Deployment" and d["metadata"]["name"] == "push-auth")
+env = {}
+for entry in auth["spec"]["template"]["spec"]["containers"][0]["env"]:
+    if entry["name"].startswith("PUSH_TURN_"):
+        ref = entry.get("valueFrom", {}).get("secretKeyRef")
+        env[entry["name"]] = f"secret:{ref['name']}/{ref['key']}" if ref else entry["value"]
+assert env == case["expected"], (env, case["expected"])
+'@
+    $result = @{ rendered = $rendered; expected = $expected } | ConvertTo-Json -Depth 5 -Compress |
+        & $python.Source -c $validator 2>&1
+    $passed = $LASTEXITCODE -eq 0
+    if (-not $passed) { $result | ForEach-Object { Write-Host $_ } }
+    return $passed
+}
+
+# The complete coturn objects for $case (see the defaults below), parsed with PyYAML; the
+# denied-peer-ip ranges are recomputed from the CIDRs with Python's ipaddress module.
+function CoturnMatrix([string] $rendered, [hashtable] $case) {
+    $validator = @'
+import hashlib, ipaddress, json, sys, yaml
+case = json.load(sys.stdin)
+docs = [d for d in yaml.safe_load_all(case["rendered"]) if d]
+tls = case["tls"]
+def doc(kind, name):
+    found = [d for d in docs if d["kind"] == kind and d["metadata"]["name"] == name]
+    assert len(found) == 1, (kind, name, len(found))
+    return found[0]
+with open(case["conf"], encoding="utf-8", newline="") as f:
+    static = f.read()
+with open(case["denied"], encoding="utf-8", newline="") as f:
+    lines = [line.strip() for line in f.read().split("\n")]
+assert "\r" not in static
+cidrs = [line for line in lines if line and not line.startswith("#")] + case["cidrs"]
+
+config = doc("ConfigMap", "push-coturn")["data"]["turnserver.conf"]
+assert config.startswith(static), "the static options come first, unchanged"
+added = config[len(static):].splitlines()
+expected = ["# Set by the chart from calls.turn.internal.", "realm=" + case["realm"],
+            "external-ip=" + case["externalIp"], f"min-port={case['min']}", f"max-port={case['max']}",
+            "user-quota=12", "total-quota=1200", "max-bps=512000"]
+expected += (["tls-listening-port=5349", "cert=/etc/coturn/tls/tls.crt", "pkey=/etc/coturn/tls/tls.key"]
+             if tls else ["no-tls"])
+denied = added[len(expected):]
+assert added[:len(expected)] == expected, added[:len(expected)]
+assert all(line.startswith("denied-peer-ip=") and "/" not in line for line in denied), denied
+ranges = [tuple(ipaddress.ip_address(a) for a in line.removeprefix("denied-peer-ip=").split("-")) for line in denied]
+networks = [ipaddress.ip_network(c) for c in cidrs]
+assert ranges == [(n.network_address, n.broadcast_address) for n in networks], ranges
+assert "static-auth-secret" not in config
+
+secrets = [d for d in docs if d["kind"] == "Secret"]
+if secrets and "turn-shared-secret" in secrets[0].get("stringData", {}):
+    secret = secrets[0]["stringData"]["turn-shared-secret"]
+    assert len(secret) == 48 and secret not in json.dumps([d for d in docs if d["kind"] != "Secret"])
+
+deployment = doc("Deployment", "push-coturn")["spec"]
+assert deployment["replicas"] == 1 and deployment["strategy"] == {"type": "Recreate"}
+pod = deployment["template"]["spec"]
+assert deployment["template"]["metadata"]["annotations"]["checksum/config"] == hashlib.sha256(
+    config.removesuffix("\n").encode()).hexdigest()
+assert pod["automountServiceAccountToken"] is False
+security = {"runAsNonRoot": True, "runAsUser": 65534, "runAsGroup": 65534, "allowPrivilegeEscalation": False,
+            "readOnlyRootFilesystem": True, "capabilities": {"drop": ["ALL"]},
+            "seccompProfile": {"type": "RuntimeDefault"}}
+[init] = pod["initContainers"]
+[main] = pod["containers"]
+image = "coturn/coturn:4.18.0-alpine@sha256:c29135c08565810d37053f384584392b7c24b69570fc81a721b878d6fe63e04e"
+assert init["name"] == "config" and init["image"] == image and main["image"] == image
+assert init["command"][:2] == ["sh", "-c"] and len(init["command"]) == 3
+assert "umask 077" in init["command"][2] and "static-auth-secret=" in init["command"][2]
+assert "> /run/coturn/turnserver.conf" in init["command"][2]
+assert init["securityContext"] == security and main["securityContext"] == security
+assert init["env"] == [{"name": "TURN_SECRET_FILE", "value": case["secretFile"]}]
+volumes = {v["name"]: v for v in pod["volumes"]}
+init_mounts = {m["mountPath"]: m for m in init["volumeMounts"]}
+assert init_mounts["/run/coturn"] == {"name": "run", "mountPath": "/run/coturn"}
+assert init_mounts["/etc/coturn/config"] == {"name": "config", "mountPath": "/etc/coturn/config", "readOnly": True}
+assert volumes["config"] == {"name": "config", "configMap": {"name": "push-coturn"}}
+if case["volume"]:
+    filename = case["secretFile"].rsplit("/", 1)[1]
+    assert init_mounts[case["secretFile"]] == {"name": "application-keys", "mountPath": case["secretFile"],
+                                               "subPath": filename, "readOnly": True}
+    assert "turn-secret" not in volumes and volumes["application-keys"] == {"name": "application-keys", **case["volume"]}
+    assert len(init["volumeMounts"]) == 3
+else:
+    assert init_mounts["/etc/coturn/secret"] == {"name": "turn-secret", "mountPath": "/etc/coturn/secret", "readOnly": True}
+    assert volumes["turn-secret"]["secret"] == {"secretName": case["secretName"], "defaultMode": 0o440,
+        "items": [{"key": "turn-shared-secret", "path": "turn-shared-secret"}]}
+assert main["command"] == ["turnserver", "-c", "/run/coturn/turnserver.conf"]
+assert [(p["name"], p["containerPort"], p["protocol"]) for p in main["ports"]] == (
+    [("turn-udp", 3478, "UDP"), ("turn-tcp", 3478, "TCP")] + ([("turns", 5349, "TCP")] if tls else [])
+    + [("metrics", 9641, "TCP")])
+assert main["readinessProbe"] == {"tcpSocket": {"port": 3478}, "periodSeconds": 5}
+assert main["livenessProbe"] == {"tcpSocket": {"port": 3478}, "initialDelaySeconds": 10, "periodSeconds": 10}
+assert main.get("resources", {}) == case["resources"]
+mounts = {m["mountPath"]: m for m in main["volumeMounts"]}
+assert mounts["/run/coturn"] == {"name": "run", "mountPath": "/run/coturn", "readOnly": True}
+assert volumes["run"]["emptyDir"]["medium"] == "Memory"
+assert mounts["/var/tmp"]["name"] == "var-tmp" and "emptyDir" in volumes["var-tmp"]
+assert mounts["/var/lib/coturn"]["name"] == "var-lib" and "emptyDir" in volumes["var-lib"]
+assert not {"turn-secret", "application-keys", "config"} & {m["name"] for m in main["volumeMounts"]}
+assert ("/etc/coturn/tls" in mounts) == tls and ("tls" in volumes) == tls
+if tls:
+    assert mounts["/etc/coturn/tls"] == {"name": "tls", "mountPath": "/etc/coturn/tls", "readOnly": True}
+    assert volumes["tls"]["secret"] == {"secretName": "turn-tls", "defaultMode": 0o440}
+
+selector = {"app.kubernetes.io/name": "coturn", "app.kubernetes.io/instance": "push"}
+service = doc("Service", "push-coturn")
+spec = service["spec"]
+ports = [("turn-udp", case["ports"]["udp"], 3478, "UDP"), ("turn-tcp", case["ports"]["tcp"], 3478, "TCP")]
+if tls:
+    ports.append(("turns", case["ports"]["tls"], 5349, "TCP"))
+for port in range(case["min"], case["max"] + 1):
+    ports += [(f"ru-{port}", port, port, "UDP"), (f"rt-{port}", port, port, "TCP")]
+assert [(p["name"], p["port"], p["targetPort"], p["protocol"]) for p in spec["ports"]] == ports
+assert spec["selector"] == selector and spec["type"] == case["serviceType"]
+assert spec.get("externalTrafficPolicy") == (None if case["serviceType"] == "ClusterIP" else "Local")
+assert spec.get("loadBalancerIP") == case["loadBalancerIP"]
+assert service["metadata"].get("annotations") == case["annotations"]
+metrics = doc("Service", "push-coturn-metrics")["spec"]
+assert metrics == {"type": "ClusterIP", "selector": selector,
+                   "ports": [{"name": "metrics", "port": 9641, "targetPort": "metrics", "protocol": "TCP"}]}
+
+policy = doc("NetworkPolicy", "push-coturn")["spec"]
+assert policy["podSelector"] == {"matchLabels": selector} and policy["policyTypes"] == ["Ingress", "Egress"]
+public = [{"protocol": "UDP", "port": 3478}, {"protocol": "TCP", "port": 3478}]
+public += [{"protocol": "TCP", "port": 5349}] if tls else []
+public += [{"protocol": p, "port": case["min"], "endPort": case["max"]} for p in ["UDP", "TCP"]]
+rules = [{"ports": public}]
+if case["metricsPeers"]:
+    rules.append({"ports": [{"protocol": "TCP", "port": 9641}], "from": [
+        {"namespaceSelector": {"matchLabels": p["namespaceSelector"]}, "podSelector": {"matchLabels": p["podSelector"]}}
+        for p in case["metricsPeers"]]})
+assert policy["ingress"] == rules, policy["ingress"]
+v4 = [c for c in cidrs if ":" not in c]
+v6 = [c for c in cidrs if ":" in c]
+assert policy["egress"] == [{"to": [{"ipBlock": {"cidr": "0.0.0.0/0", "except": v4}},
+                                    {"ipBlock": {"cidr": "::/0", "except": v6}}]}], policy["egress"]
+assert sum(d["kind"] == "NetworkPolicy" for d in docs) == 7
+'@
+    $values = @{
+        rendered = $rendered; tls = $false; cidrs = @('10.244.0.0/14', 'fd12:3456:789a::/52')
+        conf = (Join-Path $chart 'files/coturn/turnserver.conf'); denied = (Join-Path $chart 'files/coturn/denied-peers.txt')
+        realm = 'turn.example.com'; externalIp = '203.0.113.10'; min = 49160; max = 49200
+        ports = @{ udp = 3478; tcp = 3478; tls = 5349 }; serviceType = 'LoadBalancer'; loadBalancerIP = $null
+        annotations = $null; resources = @{}; metricsPeers = @(); volume = $null
+        secretFile = '/etc/coturn/secret/turn-shared-secret'; secretName = 'push-secrets'
+    }
+    foreach ($key in $case.Keys) { $values[$key] = $case[$key] }
+    $result = $values | ConvertTo-Json -Depth 10 -Compress | & $python.Source -c $validator 2>&1
+    $passed = $LASTEXITCODE -eq 0
+    if (-not $passed) { $result | ForEach-Object { Write-Host $_ } }
+    return $passed
+}
+
+$turnInternal = helm template push $chart @turnArgs | Out-String
+Check 'turn: off by default: no TURN variables, no coturn, no TURN secret; the auth route serves /v1/calls' {
+    $default -notmatch 'PUSH_TURN_|push-coturn|turn-shared-secret' -and
+        (Doc $default 'Ingress' 'push-auth') -match '(?s)- path: /v1/calls\s+pathType: Prefix\s+backend:\s+service:\s+name: push-auth'
+}
+Check 'turn: internal renders the TURN variables, a generated secret and coturn' {
+    (TurnEnv $turnInternal @{
+        PUSH_TURN_MODE = 'internal'; PUSH_TURN_TTL_SECONDS = '600'
+        PUSH_TURN_STUN_URLS = 'stun:turn.example.com:3478'
+        PUSH_TURN_URLS = 'turn:turn.example.com:3478?transport=udp,turn:turn.example.com:3478?transport=tcp'
+        PUSH_TURN_SHARED_SECRET = 'secret:push-secrets/turn-shared-secret'
+    }) -and
+        (Doc $turnInternal 'Secret' 'push-secrets') -match '(?m)^  turn-shared-secret: "[A-Za-z0-9]{48}"\s*$' -and
+        (CoturnMatrix $turnInternal @{})
+}
+$coturnPeers = '[{"namespaceSelector":{"kubernetes.io/metadata.name":"monitoring"},"podSelector":{"app":"prometheus"}}]'
+$turnTls = helm template push $chart @turnArgs --set calls.turn.internal.externalIp= `
+    --set calls.turn.internal.tlsSecret=turn-tls --set calls.turn.internal.ports.udp=3479 `
+    --set calls.turn.internal.ports.tcp=443 --set calls.turn.internal.ports.tls=5350 `
+    --set calls.turn.internal.relayPortRange=50000-50002 --set calls.turn.internal.realm=example.com `
+    --set calls.turn.internal.service.loadBalancerIP=198.51.100.7 `
+    --set calls.turn.internal.service.annotations.example\.com/pool=turn `
+    --set calls.turn.internal.resources.limits.memory=256Mi --set calls.turn.ttlSeconds=3600 `
+    --set 'calls.turn.stunUrls={stun:stun.example.org:19302}' `
+    --set-json "calls.turn.internal.metricsPeers=$coturnPeers" | Out-String
+Check 'turn: internal with TLS, custom ports, realm, Service settings and metrics peers' {
+    (TurnEnv $turnTls @{
+        PUSH_TURN_MODE = 'internal'; PUSH_TURN_TTL_SECONDS = '3600'
+        PUSH_TURN_STUN_URLS = 'stun:turn.example.com:3479,stun:stun.example.org:19302'
+        PUSH_TURN_URLS = 'turn:turn.example.com:3479?transport=udp,turn:turn.example.com:443?transport=tcp,turns:turn.example.com:5350?transport=tcp'
+        PUSH_TURN_SHARED_SECRET = 'secret:push-secrets/turn-shared-secret'
+    }) -and (CoturnMatrix $turnTls @{
+        tls = $true; realm = 'example.com'; externalIp = '198.51.100.7'; min = 50000; max = 50002
+        ports = @{ udp = 3479; tcp = 443; tls = 5350 }; loadBalancerIP = '198.51.100.7'
+        annotations = @{ 'example.com/pool' = 'turn' }; resources = @{ limits = @{ memory = '256Mi' } }
+        metricsPeers = @(ConvertFrom-Json $coturnPeers)
+    })
+}
+$csiVolume = '{"csi":{"driver":"secrets-store.csi.k8s.io","readOnly":true,"volumeAttributes":{"secretProviderClass":"push-keys"}}}'
+$turnIpv6 = helm template push $chart --set calls.enabled=true --set calls.turn.internal.publicHost=2001:db8::10 `
+    --set 'calls.turn.internal.deniedPeerCidrs={fd00:10:244::/56}' --set calls.turn.internal.service.type=ClusterIP `
+    --set-json "secrets.volume=$csiVolume" --set secrets.files.turn-shared-secret=turn-key | Out-String
+Check 'turn: an IPv6 publicHost is bracketed and advertised; secrets.volume delivers the secret file' {
+    $auth = Doc $turnIpv6 'Deployment' 'push-auth'
+    (TurnEnv $turnIpv6 @{
+        PUSH_TURN_MODE = 'internal'; PUSH_TURN_TTL_SECONDS = '600'
+        PUSH_TURN_STUN_URLS = 'stun:[2001:db8::10]:3478'
+        PUSH_TURN_URLS = 'turn:[2001:db8::10]:3478?transport=udp,turn:[2001:db8::10]:3478?transport=tcp'
+        PUSH_TURN_SHARED_SECRET_FILE = '/etc/push/application-keys/turn-key'
+    }) -and
+        $auth -match '(?s)- name: application-keys\s+mountPath: "/etc/push/application-keys/turn-key"\s+subPath: "turn-key"\s+readOnly: true' -and
+        $turnIpv6 -notmatch 'turn-shared-secret:' -and
+        (CoturnMatrix $turnIpv6 @{
+            cidrs = @('fd00:10:244::/56'); realm = '2001:db8::10'; externalIp = '2001:db8::10'; serviceType = 'ClusterIP'
+            volume = (ConvertFrom-Json $csiVolume); secretFile = '/etc/push/application-keys/turn-key'
+        })
+}
+Check 'turn: internal.enabled false hands out credentials for a coturn run elsewhere, without deploying one' {
+    $rendered = helm template push $chart --set calls.enabled=true --set calls.turn.internal.enabled=false `
+        --set calls.turn.internal.publicHost=turn.example.net | Out-String
+    $LASTEXITCODE -eq 0 -and $rendered -notmatch 'push-coturn' -and
+        (Doc $rendered 'Secret' 'push-secrets') -match 'turn-shared-secret: "[A-Za-z0-9]{48}"' -and
+        (TurnEnv $rendered @{
+            PUSH_TURN_MODE = 'internal'; PUSH_TURN_TTL_SECONDS = '600'
+            PUSH_TURN_STUN_URLS = 'stun:turn.example.net:3478'
+            PUSH_TURN_URLS = 'turn:turn.example.net:3478?transport=udp,turn:turn.example.net:3478?transport=tcp'
+            PUSH_TURN_SHARED_SECRET = 'secret:push-secrets/turn-shared-secret'
+        })
+}
+Check 'turn: an existing Secret is referenced for coturn and auth-svc, never generated' {
+    $rendered = helm template push $chart @turnArgs --set secrets.existingSecret=push-creds | Out-String
+    $rendered -notmatch '(?m)^kind: Secret' -and
+        (TurnEnv $rendered @{
+            PUSH_TURN_MODE = 'internal'; PUSH_TURN_TTL_SECONDS = '600'
+            PUSH_TURN_STUN_URLS = 'stun:turn.example.com:3478'
+            PUSH_TURN_URLS = 'turn:turn.example.com:3478?transport=udp,turn:turn.example.com:3478?transport=tcp'
+            PUSH_TURN_SHARED_SECRET = 'secret:push-creds/turn-shared-secret'
+        }) -and (CoturnMatrix $rendered @{ secretName = 'push-creds' })
+}
+Check 'turn: stun-only hands out STUN URLs only; no relay, no TURN secret' {
+    $rendered = helm template push $chart --set calls.enabled=true --set calls.turn.mode=stun-only `
+        --set 'calls.turn.stunUrls={stun:stun.example.org:3478,stuns:stun.example.org:5349}' | Out-String
+    $rendered -notmatch 'push-coturn|turn-shared-secret' -and
+        (TurnEnv $rendered @{
+            PUSH_TURN_MODE = 'stun-only'; PUSH_TURN_TTL_SECONDS = '600'
+            PUSH_TURN_STUN_URLS = 'stun:stun.example.org:3478,stuns:stun.example.org:5349'
+        })
+}
+$external = @('--set', 'calls.enabled=true', '--set', 'calls.turn.mode=external', '--set', 'secrets.existingSecret=push-creds')
+Check 'turn: external generic reads the shared secret from the named key' {
+    $rendered = helm template push $chart @external --set calls.turn.external.sharedSecret=provider-turn `
+        --set 'calls.turn.external.urls={turn:turn.example.net:3478?transport=udp,turns:turn.example.net:443?transport=tcp}' | Out-String
+    $rendered -notmatch 'push-coturn' -and
+        (TurnEnv $rendered @{
+            PUSH_TURN_MODE = 'external'; PUSH_TURN_TTL_SECONDS = '600'; PUSH_TURN_PROVIDER = 'generic'
+            PUSH_TURN_URLS = 'turn:turn.example.net:3478?transport=udp,turns:turn.example.net:443?transport=tcp'
+            PUSH_TURN_SHARED_SECRET = 'secret:push-creds/provider-turn'
+        })
+}
+Check 'turn: external cloudflare with the default and a named token key' {
+    $plain = helm template push $chart @external --set calls.turn.external.provider=cloudflare `
+        --set calls.turn.external.cloudflare.keyId=a1b2c3 | Out-String
+    $named = helm template push $chart @external --set calls.turn.external.provider=cloudflare `
+        --set calls.turn.external.cloudflare.keyId=a1b2c3 --set calls.turn.external.cloudflare.apiTokenSecret=cf.token | Out-String
+    (TurnEnv $plain @{
+        PUSH_TURN_MODE = 'external'; PUSH_TURN_TTL_SECONDS = '600'; PUSH_TURN_PROVIDER = 'cloudflare'
+        PUSH_TURN_CLOUDFLARE_KEY_ID = 'a1b2c3'; PUSH_TURN_CLOUDFLARE_TOKEN = 'secret:push-creds/turn-cloudflare-token'
+    }) -and (TurnEnv $named @{
+            PUSH_TURN_MODE = 'external'; PUSH_TURN_TTL_SECONDS = '600'; PUSH_TURN_PROVIDER = 'cloudflare'
+            PUSH_TURN_CLOUDFLARE_KEY_ID = 'a1b2c3'; PUSH_TURN_CLOUDFLARE_TOKEN = 'secret:push-creds/cf.token'
+        })
+}
+# Built from parts: a whole SID-shaped literal trips secret scanning.
+$twilioSid = 'AC' + '0123456789abcdef' + '0123456789ABCDEF'
+Check 'turn: external twilio, also from a mounted file' {
+    $rendered = helm template push $chart @external --set calls.turn.external.provider=twilio `
+        --set calls.turn.external.twilio.accountSid=$twilioSid --set calls.turn.external.twilio.authTokenSecret=twilio-auth | Out-String
+    $mounted = helm template push $chart --set calls.enabled=true --set calls.turn.mode=external `
+        --set calls.turn.external.provider=twilio --set calls.turn.external.twilio.accountSid=$twilioSid `
+        --set-json "secrets.volume=$csiVolume" --set secrets.files.turn-twilio-token=twilio | Out-String
+    (TurnEnv $rendered @{
+        PUSH_TURN_MODE = 'external'; PUSH_TURN_TTL_SECONDS = '600'; PUSH_TURN_PROVIDER = 'twilio'
+        PUSH_TURN_TWILIO_ACCOUNT_SID = $twilioSid; PUSH_TURN_TWILIO_TOKEN = 'secret:push-creds/twilio-auth'
+    }) -and (TurnEnv $mounted @{
+        PUSH_TURN_MODE = 'external'; PUSH_TURN_TTL_SECONDS = '600'; PUSH_TURN_PROVIDER = 'twilio'
+        PUSH_TURN_TWILIO_ACCOUNT_SID = $twilioSid; PUSH_TURN_TWILIO_TOKEN_FILE = '/etc/push/application-keys/twilio'
+    }) -and
+        (Doc $mounted 'Deployment' 'push-auth') -match 'subPath: "twilio"' -and
+        (Doc $mounted 'Deployment' 'push-auth') -notmatch 'subPath: "turn-shared-secret"' -and
+        $mounted -notmatch 'push-coturn|turn-shared-secret:'
+}
+Check 'turn: lint --strict with a full internal configuration' {
+    helm lint $chart --strict @turnArgs --set calls.turn.internal.tlsSecret=turn-tls `
+        --set-json "calls.turn.internal.metricsPeers=$coturnPeers" | Out-Null
+    $LASTEXITCODE -eq 0
+}
+$externalUrls = @('--set', 'calls.turn.external.urls={turn:turn.example.net:3478}')
+$noExternalIp = @('--set', 'calls.enabled=true', '--set', 'calls.turn.internal.publicHost=turn.example.com',
+    '--set', 'calls.turn.internal.deniedPeerCidrs={10.244.0.0/16}')
+$noCidrs = @('--set', 'calls.enabled=true', '--set', 'calls.turn.internal.publicHost=203.0.113.10')
+foreach ($invalid in @(
+    @{ args = @('--set', 'calls.turn.mode=relay'); message = 'calls.turn.mode must be internal, external or stun-only' },
+    @{ args = @('--set', 'calls.ringSeconds=45', '--set-string', 'calls.turn.mode=1'); message = 'calls.turn.mode must be internal, external or stun-only' },
+    @{ args = $turnArgs + @('--set', 'calls.turn.ttlSeconds=59'); message = 'calls.turn.ttlSeconds must be an integer from 60 to 86400' },
+    @{ args = $turnArgs + @('--set', 'calls.turn.ttlSeconds=86401'); message = 'calls.turn.ttlSeconds must be an integer from 60 to 86400' },
+    @{ args = $turnArgs + @('--set', 'calls.turn.ttlSeconds=600.5'); message = 'calls.turn.ttlSeconds must be an integer from 60 to 86400' },
+    @{ args = $turnArgs + @('--set-string', 'calls.turn.ttlSeconds=600'); message = 'calls.turn.ttlSeconds must be an integer from 60 to 86400' },
+    @{ args = $turnArgs + @('--set', 'calls.turn.stunUrls={https://stun.example.org}'); message = 'calls.turn.stunUrls must be a list of stun: or stuns: URLs' },
+    @{ args = $turnArgs + @('--set', 'calls.turn.stunUrls=stun:stun.example.org'); message = 'calls.turn.stunUrls must be a list of stun: or stuns: URLs' },
+    @{ args = @('--set', 'calls.enabled=true', '--set', 'calls.turn.mode=stun-only'); message = 'calls.turn.stunUrls must not be empty with calls.turn.mode stun-only' },
+    @{ args = $turnArgs + @('--set', 'calls.turn.internal.enabled=yes'); message = 'calls.turn.internal.enabled must be true or false' },
+    @{ args = @('--set', 'calls.enabled=true'); message = 'calls.turn.internal.publicHost must be the DNS name or IP address clients reach coturn at' },
+    @{ args = $turnArgs + @('--set', 'calls.turn.internal.publicHost=turn_example.com'); message = 'calls.turn.internal.publicHost must be the DNS name or IP address clients reach coturn at' },
+    @{ args = $turnArgs + @('--set', 'calls.turn.internal.publicHost=203.0.113.256'); message = 'calls.turn.internal.publicHost must be the DNS name or IP address clients reach coturn at' },
+    @{ args = $turnArgs + @('--set', 'calls.turn.internal.realm=bad realm'); message = 'calls.turn.internal.realm must be empty or a DNS-like name' },
+    @{ args = $turnArgs + @('--set', 'calls.turn.internal.ports.udp=0'); message = 'calls.turn.internal.ports.udp must be an integer from 1 to 65535' },
+    @{ args = $turnArgs + @('--set', 'calls.turn.internal.ports.tcp=65536'); message = 'calls.turn.internal.ports.tcp must be an integer from 1 to 65535' },
+    @{ args = $turnArgs + @('--set-string', 'calls.turn.internal.ports.tls=5349'); message = 'calls.turn.internal.ports.tls must be an integer from 1 to 65535' },
+    @{ args = $turnArgs + @('--set', 'calls.turn.internal.relayPortRange=1023-1100'); message = 'calls.turn.internal.relayPortRange must be "<min>-<max>" with 1024 <= min <= max <= 65535 and at most 500 ports' },
+    @{ args = $turnArgs + @('--set', 'calls.turn.internal.relayPortRange=49200-49160'); message = 'calls.turn.internal.relayPortRange must be "<min>-<max>" with 1024 <= min <= max <= 65535 and at most 500 ports' },
+    @{ args = $turnArgs + @('--set', 'calls.turn.internal.relayPortRange=49160-49660'); message = 'calls.turn.internal.relayPortRange must be "<min>-<max>" with 1024 <= min <= max <= 65535 and at most 500 ports' },
+    @{ args = $turnArgs + @('--set', 'calls.turn.internal.relayPortRange=65000-65536'); message = 'calls.turn.internal.relayPortRange must be "<min>-<max>" with 1024 <= min <= max <= 65535 and at most 500 ports' },
+    @{ args = $turnArgs + @('--set', 'calls.turn.internal.relayPortRange=49160'); message = 'calls.turn.internal.relayPortRange must be "<min>-<max>" with 1024 <= min <= max <= 65535 and at most 500 ports' },
+    @{ args = $turnArgs + @('--set', 'calls.turn.internal.tlsSecret=Turn_TLS'); message = 'calls.turn.internal.tlsSecret must be empty or a Secret name' },
+    @{ args = $turnArgs + @('--set', 'calls.turn.internal.service.type=ExternalName'); message = 'calls.turn.internal.service.type must be LoadBalancer or ClusterIP' },
+    @{ args = $turnArgs + @('--set', 'calls.turn.internal.service.type=NodePort'); message = 'calls.turn.internal.service.type must be LoadBalancer or ClusterIP' },
+    @{ args = $turnArgs + @('--set', 'calls.turn.internal.ports.udp=49160'); message = 'calls.turn.internal.ports.udp must not be within calls.turn.internal.relayPortRange' },
+    @{ args = $turnArgs + @('--set', 'calls.turn.internal.tlsSecret=turn-tls', '--set', 'calls.turn.internal.ports.tls=49200'); message = 'calls.turn.internal.ports.tls must not be within calls.turn.internal.relayPortRange' },
+    @{ args = $turnArgs + @('--set', 'calls.turn.internal.tlsSecret=turn-tls', '--set', 'calls.turn.internal.ports.tcp=443', '--set', 'calls.turn.internal.ports.tls=443'); message = 'calls.turn.internal.ports.tls must differ from calls.turn.internal.ports.tcp' },
+    @{ args = $turnArgs + @('--set-json', 'calls.turn.internal.service.annotations={"a":1}'); message = 'calls.turn.internal.service.annotations must be a string-valued annotation map' },
+    @{ args = $turnArgs + @('--set', 'calls.turn.internal.service.loadBalancerIP=lb.example.com'); message = 'calls.turn.internal.service.loadBalancerIP must be empty or an IP address' },
+    @{ args = $turnArgs + @('--set', 'calls.turn.internal.externalIp=203.0.113'); message = 'calls.turn.internal.externalIp must be empty or an IP address' },
+    @{ args = $turnArgs + @('--set', 'calls.turn.internal.resources=1'); message = 'calls.turn.internal.resources must be a map of Kubernetes container resources' },
+    @{ args = $noExternalIp; message = 'calls.turn.internal.externalIp must be set (or calls.turn.internal.service.loadBalancerIP, or an IP address as publicHost): coturn advertises it as its relay address' },
+    @{ args = $noCidrs; message = "calls.turn.internal.deniedPeerCidrs must list the cluster's pod and service CIDRs" },
+    @{ args = $noCidrs + @('--set', 'calls.turn.internal.deniedPeerCidrs={10.244.0.1/16}'); message = "calls.turn.internal.deniedPeerCidrs must list the cluster's pod and service CIDRs" },
+    @{ args = $noCidrs + @('--set', 'calls.turn.internal.deniedPeerCidrs={fd00::1::/64}'); message = "calls.turn.internal.deniedPeerCidrs must list the cluster's pod and service CIDRs" },
+    @{ args = $noCidrs + @('--set', 'calls.turn.internal.deniedPeerCidrs={10.96.0.0/33}'); message = "calls.turn.internal.deniedPeerCidrs must list the cluster's pod and service CIDRs" },
+    @{ args = $noCidrs + @('--set', 'calls.turn.internal.deniedPeerCidrs={0.0.0.0/0}'); message = "calls.turn.internal.deniedPeerCidrs must list the cluster's pod and service CIDRs" },
+    @{ args = $noCidrs + @('--set', 'calls.turn.internal.deniedPeerCidrs={10.0.0.0/7}'); message = "calls.turn.internal.deniedPeerCidrs must list the cluster's pod and service CIDRs" },
+    @{ args = $noCidrs + @('--set', 'calls.turn.internal.deniedPeerCidrs={::/0}'); message = "calls.turn.internal.deniedPeerCidrs must list the cluster's pod and service CIDRs" },
+    @{ args = $noCidrs + @('--set', 'calls.turn.internal.deniedPeerCidrs={::/128}'); message = "calls.turn.internal.deniedPeerCidrs must list the cluster's pod and service CIDRs" },
+    @{ args = $noCidrs + @('--set', 'calls.turn.internal.deniedPeerCidrs={2001::/15}'); message = "calls.turn.internal.deniedPeerCidrs must list the cluster's pod and service CIDRs" },
+    @{ args = $turnArgs + @('--set', 'calls.turn.internal.quotas.user=0'); message = 'calls.turn.internal.quotas.user must be an integer from 1 to 1000' },
+    @{ args = $turnArgs + @('--set', 'calls.turn.internal.quotas.total=100001'); message = 'calls.turn.internal.quotas.total must be an integer from 1 to 100000' },
+    @{ args = $turnArgs + @('--set', 'calls.turn.internal.quotas.maxBps=7999'); message = 'calls.turn.internal.quotas.maxBps must be an integer from 8000 to 1000000000' },
+    @{ args = $turnArgs + @('--set', 'calls.turn.internal.image=coturn/coturn:4.18.0-alpine'); message = 'calls.turn.internal.image must be <repository>:<tag>@sha256:<64 hex digits>' },
+    @{ args = $turnArgs + @('--set-json', 'calls.turn.internal.metricsPeers=[{"podSelector":{"app":"prometheus"}}]'); message = 'calls.turn.internal.metricsPeers requires namespaceSelector and podSelector as non-empty label maps on every peer' },
+    @{ args = $external + @('--set', 'calls.turn.external.provider=xirsys'); message = 'calls.turn.external.provider must be generic, cloudflare or twilio' },
+    @{ args = $external; message = 'calls.turn.external.urls must be a non-empty list of turn: or turns: URLs' },
+    @{ args = $external + @('--set', 'calls.turn.external.urls={stun:turn.example.net:3478}'); message = 'calls.turn.external.urls must be a non-empty list of turn: or turns: URLs' },
+    @{ args = $external + @('--set', 'calls.turn.external.provider=cloudflare'); message = 'calls.turn.external.cloudflare.keyId must be set' },
+    @{ args = $external + @('--set', 'calls.turn.external.provider=twilio', '--set', 'calls.turn.external.twilio.accountSid=AC123'); message = 'calls.turn.external.twilio.accountSid must be AC followed by 32 hexadecimal digits' },
+    @{ args = $external + $externalUrls + @('--set', 'calls.turn.external.sharedSecret=c2VjcmV0/dmFsdWU='); message = 'calls.turn.external.sharedSecret must name a key of the Secret, not hold the secret' },
+    @{ args = $external + $externalUrls + @('--set', "calls.turn.external.sharedSecret=$('k' * 64)"); message = 'calls.turn.external.sharedSecret must name a key of the Secret, not hold the secret' },
+    @{ args = $external + $externalUrls + @('--set', 'calls.turn.external.cloudflare.apiTokenSecret=a token'); message = 'calls.turn.external.cloudflare.apiTokenSecret must name a key of the Secret, not hold the secret' },
+    @{ args = $external + $externalUrls + @('--set', 'calls.turn.external.twilio.authTokenSecret=a:b'); message = 'calls.turn.external.twilio.authTokenSecret must name a key of the Secret, not hold the secret' },
+    @{ args = @('--set', 'calls.enabled=true', '--set', 'calls.turn.mode=external', '--set-json', "secrets.volume=$csiVolume") + $externalUrls + @('--set', 'calls.turn.external.sharedSecret=provider-turn'); message = 'calls.turn.external.sharedSecret must be empty with secrets.volume: the file comes from secrets.files.turn-shared-secret' },
+    @{ args = @('--set', 'calls.enabled=true', '--set', 'calls.turn.mode=external') + $externalUrls; message = "calls.turn.mode external needs the provider's secret in a consumer-managed Secret: set secrets.existingSecret or secrets.volume" },
+    @{ args = $turnArgs + @('--set-json', "secrets.volume=$csiVolume", '--set', 'secrets.files.turn-shared-secret='); message = 'secrets.files.turn-shared-secret needs a filename' }
+)) {
+    Check "turn: $($invalid.args[-1]) is refused ($($invalid.message.Split(' ')[0]))" {
+        $errorText = helm template push $chart @($invalid.args) 2>&1 | Out-String
+        $passed = $LASTEXITCODE -ne 0 -and $errorText.Contains($invalid.message)
+        if (-not $passed) { Write-Host $errorText }
+        $passed
     }
 }
 Check 'default: the DevSetup switch is gone' { $default -notmatch 'PUSH_DEV_SETUP' }

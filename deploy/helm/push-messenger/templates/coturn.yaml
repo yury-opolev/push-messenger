@@ -1,0 +1,306 @@
+{{- /*
+The chart's TURN relay (calls.turn.mode internal, docs/calls.md "TURN"): coturn with TURN
+REST credentials that auth-svc hands out. Its shared secret never enters the ConfigMap: an
+init container appends it to a copy of the configuration in memory. One replica: a relay
+allocation lives in one process, and the relay ports cannot be shared across pods.
+*/ -}}
+{{- if include "push.coturnEnabled" . -}}
+{{- include "push.checkTurn" . -}}
+{{- $context := dict "root" . "component" "coturn" -}}
+{{- $name := include "push.name" $context -}}
+{{- $internal := .Values.calls.turn.internal -}}
+{{- $tls := $internal.tlsSecret -}}
+{{- $relay := splitList "-" $internal.relayPortRange -}}
+{{- $minPort := int (index $relay 0) -}}
+{{- $maxPort := int (index $relay 1) -}}
+{{- $config := include "push.coturnConfig" . -}}
+{{- $secretFile := "/etc/coturn/secret/turn-shared-secret" -}}
+{{- if .Values.secrets.volume -}}
+{{- $secretFile = printf "%s/%s" .Values.secrets.mountPath (index .Values.secrets.files "turn-shared-secret") -}}
+{{- end -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "push.labels" $context | nindent 4 }}
+data:
+  turnserver.conf: |
+    {{- $config | nindent 4 }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "push.labels" $context | nindent 4 }}
+spec:
+  # One relay: allocations and relay ports belong to one process.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "push.selector" $context | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "push.labels" $context | nindent 8 }}
+      annotations:
+        checksum/config: {{ sha256sum $config }}
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        # Secret files are group-readable by coturn's user only.
+        fsGroup: 65534
+      initContainers:
+        # Writes the configuration with static-auth-secret to the in-memory /run/coturn.
+        - name: config
+          image: {{ $internal.image }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              umask 077
+              secret="$(tr -d '\r\n' < "$TURN_SECRET_FILE")"
+              if [ -z "$secret" ]; then
+                echo "the TURN shared secret (turn-shared-secret) is empty" >&2
+                exit 1
+              fi
+              { cat /etc/coturn/config/turnserver.conf; printf 'static-auth-secret=%s\n' "$secret"; } > /run/coturn/turnserver.conf
+          env:
+            - name: TURN_SECRET_FILE
+              value: {{ $secretFile | quote }}
+          {{- include "push.coturnSecurity" . | nindent 10 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/coturn/config
+              readOnly: true
+            - name: run
+              mountPath: /run/coturn
+            {{- if .Values.secrets.volume }}
+            {{- include "push.applicationMounts" $context | nindent 12 }}
+            {{- else }}
+            - name: turn-secret
+              mountPath: /etc/coturn/secret
+              readOnly: true
+            {{- end }}
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 32Mi
+      containers:
+        - name: coturn
+          image: {{ $internal.image }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          command: ["turnserver", "-c", "/run/coturn/turnserver.conf"]
+          {{- include "push.coturnSecurity" . | nindent 10 }}
+          ports:
+            - name: turn-udp
+              containerPort: 3478
+              protocol: UDP
+            - name: turn-tcp
+              containerPort: 3478
+              protocol: TCP
+            {{- if $tls }}
+            - name: turns
+              containerPort: 5349
+              protocol: TCP
+            {{- end }}
+            - name: metrics
+              containerPort: 9641
+              protocol: TCP
+          readinessProbe:
+            tcpSocket:
+              port: 3478
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: 3478
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          {{- with $internal.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: run
+              mountPath: /run/coturn
+              readOnly: true
+            - name: var-tmp
+              mountPath: /var/tmp
+            - name: var-lib
+              mountPath: /var/lib/coturn
+            {{- if $tls }}
+            - name: tls
+              mountPath: /etc/coturn/tls
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ $name }}
+        - name: run
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Mi
+        - name: var-tmp
+          emptyDir: {}
+        - name: var-lib
+          emptyDir: {}
+        {{- if .Values.secrets.volume }}
+        {{- include "push.applicationVolumes" . | nindent 8 }}
+        {{- else }}
+        - name: turn-secret
+          secret:
+            secretName: {{ include "push.secretName" . }}
+            defaultMode: 0440
+            items:
+              - key: turn-shared-secret
+                path: turn-shared-secret
+        {{- end }}
+        {{- if $tls }}
+        - name: tls
+          secret:
+            secretName: {{ $tls }}
+            defaultMode: 0440
+        {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "push.labels" $context | nindent 4 }}
+  {{- with $internal.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ $internal.service.type }}
+  {{- if eq $internal.service.type "LoadBalancer" }}
+  # Keeps the clients' addresses: TURN permissions and quotas work per client.
+  externalTrafficPolicy: Local
+  {{- end }}
+  {{- with $internal.service.loadBalancerIP }}
+  loadBalancerIP: {{ . | quote }}
+  {{- end }}
+  selector:
+    {{- include "push.selector" $context | nindent 4 }}
+  ports:
+    - name: turn-udp
+      port: {{ int64 $internal.ports.udp }}
+      targetPort: 3478
+      protocol: UDP
+    - name: turn-tcp
+      port: {{ int64 $internal.ports.tcp }}
+      targetPort: 3478
+      protocol: TCP
+    {{- if $tls }}
+    - name: turns
+      port: {{ int64 $internal.ports.tls }}
+      targetPort: 5349
+      protocol: TCP
+    {{- end }}
+    {{- range $port := untilStep $minPort (int (add $maxPort 1)) 1 }}
+    - name: ru-{{ $port }}
+      port: {{ $port }}
+      targetPort: {{ $port }}
+      protocol: UDP
+    - name: rt-{{ $port }}
+      port: {{ $port }}
+      targetPort: {{ $port }}
+      protocol: TCP
+    {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}-metrics
+  labels:
+    {{- include "push.labels" $context | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "push.selector" $context | nindent 4 }}
+  ports:
+    - name: metrics
+      port: 9641
+      targetPort: metrics
+      protocol: TCP
+{{- if .Values.networkPolicy.enabled }}
+{{- $v4 := list -}}
+{{- $v6 := list -}}
+{{- range splitList "\n" (include "push.turnDeniedCidrs" .) -}}
+{{- if not (hasSuffix "/0" .) -}}
+{{- if contains ":" . -}}
+{{- $v6 = append $v6 . -}}
+{{- else -}}
+{{- $v4 = append $v4 . -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+---
+# TURN from anywhere; the relay reaches public addresses only (the denied peers, as in
+# coturn's denied-peer-ip). Prometheus only from calls.turn.internal.metricsPeers.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "push.labels" $context | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "push.selector" $context | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - ports:
+        - protocol: UDP
+          port: 3478
+        - protocol: TCP
+          port: 3478
+        {{- if $tls }}
+        - protocol: TCP
+          port: 5349
+        {{- end }}
+        - protocol: UDP
+          port: {{ $minPort }}
+          endPort: {{ $maxPort }}
+        - protocol: TCP
+          port: {{ $minPort }}
+          endPort: {{ $maxPort }}
+    {{- with $internal.metricsPeers }}
+    - ports:
+        - protocol: TCP
+          port: 9641
+      from:
+        {{- range . }}
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .namespaceSelector | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .podSelector | nindent 14 }}
+        {{- end }}
+    {{- end }}
+  egress:
+    - to:
+        - ipBlock:
+            cidr: "0.0.0.0/0"
+            except:
+              {{- toYaml $v4 | nindent 14 }}
+        - ipBlock:
+            cidr: "::/0"
+            except:
+              {{- toYaml $v6 | nindent 14 }}
+{{- end }}
+{{- end }}
