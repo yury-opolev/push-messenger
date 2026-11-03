@@ -35,7 +35,7 @@ pub(crate) struct Relay {
     /// The zero of the TURN client's clock.
     epoch: Instant,
     waiting: HashMap<IpAddr, Vec<(SocketAddr, Vec<u8>)>>,
-    /// The allocation's outcome once known: its address, or None when refused.
+    /// The allocation's outcome once known: its address, or `None` when refused.
     allocation: Option<Option<SocketAddr>>,
 }
 
@@ -141,7 +141,17 @@ impl Relay {
     /// Fails when the stream closed.
     pub(crate) async fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         match &mut self.link {
-            Link::Udp(socket) => socket.recv(buffer).await,
+            Link::Udp(socket) => loop {
+                match socket.recv(buffer).await {
+                    // An ICMP error for an earlier datagram: the link itself stays up.
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::ConnectionRefused | io::ErrorKind::ConnectionReset
+                        ) => {}
+                    read => return read,
+                }
+            },
             Link::Tcp(stream) => match stream.read(buffer).await? {
                 0 => Err(io::ErrorKind::UnexpectedEof.into()),
                 length => Ok(length),

@@ -1295,11 +1295,11 @@ let ended = call.hangup().await;                            // or: call.on_ended
 | API | |
 |---|---|
 | `MediaCall::start(&Calls, &IceServers, Role, MediaOptions) -> Result<MediaCall, SdkError>` | gathers candidates, then as `Role::Caller { peer }` invites with its offer (returns while it rings), as `Role::Callee { call_id, offer_sdp }` applies the offer and accepts |
-| `handle(&CallEvent) -> bool` | the app forwards every call event; `true` when it was about this call. Events that arrive while `start` runs wait in the client's event stream |
+| `handle(&CallEvent) -> bool` | the app forwards every call event; `true` when it was about this call. Include the events that arrived while `start` ran (the answer may): read the client's events on the task that awaits `start`, or keep the call's events for it. A caller whose answer never reaches the helper hangs up as failed after 90 s plus `connect_timeout` |
 | `incoming() -> Option<PcmStream>` | the peer's audio (the first call takes it); `recv()`, `try_recv()`, `futures::Stream`; ends with the call. A reader more than 1 s behind loses the newest frames |
 | `outgoing() -> PcmSink` | `send(frame).await` (waits while 5 s are queued), `try_send(frame)`, `clear()` drops what is queued (barge-in). One frame goes out every 20 ms once connected; nothing while the queue is empty, so queue faster than real time freely |
 | `state() -> MediaState`, `connected()`, `on_ended() -> MediaEnded` | `Connecting`, `Connected`, `Ended(MediaEnded { reason, duration_s, cause })` |
-| `hangup() -> MediaEnded` | hangs up (`COMPLETED`) and stops; dropping the `MediaCall` does the same |
+| `hangup() -> MediaEnded` | hangs up (`COMPLETED`) and stops; dropping the `MediaCall` does the same, as does dropping `start`'s future once it invited or accepted |
 | `call_id()` | |
 
 `MediaOptions` (`Default` suits most calls): `relay_only` (`None`: relay-only exactly when
@@ -1312,7 +1312,9 @@ busy, unreachable, with the server's reason and duration), `Local` (`hangup` or 
 `disconnect_timeout`: the helper hung up with `FAILED`), `Gone` (a `CallSync` after a
 reconnect no longer lists the call) and `Refused(CallErrorCode)` (the server refused the
 invite or the answer for good: `NOT_CONTACT`, `IN_CALL`, `RATE_LIMITED`,
-`NOT_AVAILABLE`, `ALREADY_ANSWERED`, `CALL_NOT_FOUND`).
+`NOT_AVAILABLE`, `ALREADY_ANSWERED`, `CALL_NOT_FOUND` while the call is being set up; a refused
+candidate or renegotiation later leaves the call running, and `CALL_NOT_FOUND` for an
+established call ends it as `Gone`).
 
 The helper's task holds a clone of the client until the call ends: end calls before
 `Client::close`.
@@ -1344,8 +1346,9 @@ It follows the client rules of [§7](#7-client-rules) and the browser recipe:
 
 Opus at 48 kHz mono, 20 ms packets, 32 kbit/s, in-band FEC on, the `VOIP` application.
 Between 48 kHz and 16 kHz the helper resamples by 3 with a 96-tap windowed-sinc
-(Blackman) low-pass FIR, as a polyphase decimator and interpolator (flat to about 5.5 kHz,
-images and aliases below -50 dB). Incoming packets of any Opus frame size are decoded and
+(Blackman) low-pass FIR cut off at 7.2 kHz, as a polyphase decimator and interpolator
+(flat to about 5.5 kHz; images and aliases from above 8.6 kHz below -50 dB, the band
+just above 8 kHz folds back less attenuated). Incoming packets of any Opus frame size are decoded and
 cut into 20 ms frames. There is no jitter buffer, packet-loss concealment or echo
 cancellation: a speech recogniser or an agent's voice needs none of them; an app that
 plays audio to a person adds its own buffer.

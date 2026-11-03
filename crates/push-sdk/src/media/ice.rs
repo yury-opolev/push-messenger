@@ -51,10 +51,16 @@ pub(crate) fn usable(servers: &IceServers) -> (Vec<Endpoint>, Vec<TurnServer>) {
                 }
             } else if let Some(rest) = url.strip_prefix("turn:") {
                 let (address, query) = rest.split_once('?').unwrap_or((rest, ""));
-                let transport = match query {
-                    "" | "transport=udp" => Transport::Udp,
-                    "transport=tcp" => Transport::Tcp,
-                    _ => continue,
+                let transport = query
+                    .split('&')
+                    .filter_map(|parameter| parameter.split_once('='))
+                    .find(|(name, _)| name.eq_ignore_ascii_case("transport"))
+                    .map(|(_, value)| value);
+                let transport = match transport {
+                    None => Transport::Udp,
+                    Some(value) if value.eq_ignore_ascii_case("udp") => Transport::Udp,
+                    Some(value) if value.eq_ignore_ascii_case("tcp") => Transport::Tcp,
+                    Some(_) => continue,
                 };
                 let (Some(endpoint), Some(username), Some(credential)) = (
                     endpoint_of(address),
@@ -238,6 +244,26 @@ mod tests {
         );
         assert_eq!(turn[0].username, "1700000000:user");
         assert_eq!(turn[0].credential, "secret");
+    }
+
+    #[test]
+    fn the_transport_parameter_is_case_insensitive_among_others() {
+        let (_, turn) = usable(&servers(&[(
+            &[
+                "turn:a.example?transport=TCP",
+                "turn:b.example?foo=1&transport=udp",
+                "turn:c.example?transport=sctp",
+            ],
+            Some("secret"),
+        )]));
+        let found: Vec<_> = turn
+            .iter()
+            .map(|server| (server.endpoint.host.as_str(), server.transport))
+            .collect();
+        assert_eq!(
+            found,
+            [("b.example", Transport::Udp), ("a.example", Transport::Tcp)]
+        );
     }
 
     #[test]

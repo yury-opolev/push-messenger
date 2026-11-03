@@ -798,3 +798,9 @@ Decisions taken while implementing §9, beyond or refining it:
   host candidates; relay-only through coturn over UDP and over TCP), opt-in with
   `PUSH_CALLS_MEDIA=1`, run by the new `calls-media` CI job. The coturn container helper
   moved from `browser_calls.rs` to `tests/common/coturn.rs` and publishes UDP too.
+- **Robustness.** `MediaCall::start` runs detached on the client's runtime, so a caller
+  that gives up after the invite or accept drops a `MediaCall` that hangs up. A caller
+  whose answer never reaches the helper (the app did not forward it) hangs up as failed
+  after 90 s plus `connect_timeout`. A server refusal (`NOT_CONTACT`, `IN_CALL`, …) ends
+  the helper's call only while it is being set up; later refusals of ICE or
+  renegotiation frames leave it running.

@@ -30,6 +30,8 @@ use crate::calls::{CallEndReason, CallErrorCode, CallEvent, IceCandidate, IceSer
 const RTP_FRAME: u64 = 960;
 /// Remote candidates held until the remote description is set.
 const MAX_HELD: usize = 64;
+/// How long a caller waits for the answer at most (the server rings for 45 s by default).
+const ANSWER_WAIT: Duration = Duration::from_secs(90);
 
 /// The driver's ends of the channels to its [`super::MediaCall`].
 pub(crate) struct Channels {
@@ -92,6 +94,23 @@ pub(crate) async fn start<S: Signalling>(
         broken_since: None,
         ended: None,
     };
+    match negotiate(&mut driver, role).await {
+        Ok(()) => {
+            let call_id = driver.call_id;
+            tokio::spawn(driver.run());
+            Ok(call_id)
+        }
+        Err(error) => {
+            if let Some(relay) = &mut driver.relay {
+                relay.release().await;
+            }
+            Err(error)
+        }
+    }
+}
+
+/// Invites with this side's offer, or accepts the caller's offer with an answer.
+async fn negotiate<S: Signalling>(driver: &mut Driver<S>, role: Role) -> Result<(), SdkError> {
     match role {
         Role::Caller { peer } => {
             let mut api = driver.rtc.sdp_api();
@@ -106,6 +125,9 @@ pub(crate) async fn start<S: Signalling>(
                 .signalling
                 .invite(peer, offer.to_sdp_string())
                 .await?;
+            // The ring ends the call (missed) well before this; it guards against an
+            // answer the app never forwarded.
+            driver.connect_deadline = later(ANSWER_WAIT + driver.options.connect_timeout);
         }
         Role::Callee { call_id, offer_sdp } => {
             driver.call_id = call_id;
@@ -134,9 +156,12 @@ pub(crate) async fn start<S: Signalling>(
         .signalling
         .send_ice(driver.call_id, end_of_candidates(driver.mid))
         .await;
-    let call_id = driver.call_id;
-    tokio::spawn(driver.run());
-    Ok(call_id)
+    Ok(())
+}
+
+/// `now + wait`; `None` (never) when that is past the clock's range.
+fn later(wait: Duration) -> Option<Instant> {
+    Instant::now().checked_add(wait)
 }
 
 fn add_local(rtc: &mut Rtc, candidate: Result<Candidate, str0m::error::IceError>) {
@@ -148,7 +173,7 @@ fn add_local(rtc: &mut Rtc, candidate: Result<Candidate, str0m::error::IceError>
     }
 }
 
-/// The =mid of the first m=audio section of sdp.
+/// The `a=mid` of the first `m=audio` section of `sdp`.
 fn audio_mid(sdp: &str) -> Option<Mid> {
     let mut audio = false;
     for line in sdp.lines() {
@@ -164,7 +189,6 @@ fn audio_mid(sdp: &str) -> Option<Mid> {
 fn end_of_candidates(mid: Option<Mid>) -> IceCandidate {
     IceCandidate {
         sdp_mid: mid.map(|mid| mid.to_string()),
-        sdp_mline_index: Some(0),
         ..IceCandidate::end_of_candidates()
     }
 }
@@ -254,12 +278,18 @@ async fn mapped_address(socket: &UdpSocket, stun: &[Endpoint]) -> Option<SocketA
             let _ = socket.send_to(&request, server).await;
         }
         let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
-        while let Ok(Ok((length, source))) =
-            tokio::time::timeout_at(deadline, socket.recv_from(&mut buffer)).await
-        {
-            if servers.contains(&source) {
-                if let Some(mapped) = ice::binding_response(&buffer[..length], transaction) {
-                    return Some(mapped);
+        loop {
+            match tokio::time::timeout_at(deadline, socket.recv_from(&mut buffer)).await {
+                Err(_) => break,
+                // An ICMP error from an unreachable server: keep waiting for the others.
+                Ok(Err(_)) => {}
+                Ok(Ok((length, source))) => {
+                    if servers.contains(&source) {
+                        if let Some(mapped) = ice::binding_response(&buffer[..length], transaction)
+                        {
+                            return Some(mapped);
+                        }
+                    }
                 }
             }
         }
@@ -347,7 +377,9 @@ impl<S: Signalling> Driver<S> {
             deadline = deadline.min(at);
         }
         if let Some(since) = self.broken_since {
-            deadline = deadline.min(since + self.options.disconnect_timeout);
+            if let Some(at) = since.checked_add(self.options.disconnect_timeout) {
+                deadline = deadline.min(at);
+            }
         }
         deadline
     }
@@ -375,7 +407,7 @@ impl<S: Signalling> Driver<S> {
             if let Err(error) = relay.send(destination, data).await {
                 tracing::debug!(%error, "calls media: sending through TURN failed");
             }
-        } else if let Some((_, socket)) = &self.host {
+        } else if let Some((_, socket)) = self.host.as_ref().filter(|(host, _)| *host == source) {
             let _ = socket.send_to(data, destination).await;
         }
     }
@@ -396,6 +428,8 @@ impl<S: Signalling> Driver<S> {
             Event::MediaAdded(added) if added.kind == MediaKind::Audio => {
                 self.mid.get_or_insert(added.mid);
             }
+            // An empty payload would make Opus conceal 120 ms of loss.
+            Event::MediaData(data) if data.data.is_empty() => {}
             Event::MediaData(data) => match self.decoder.decode(&data.data) {
                 Ok(samples) => {
                     self.partial.extend(samples);
@@ -435,7 +469,8 @@ impl<S: Signalling> Driver<S> {
         let generation = self.channels.generation.load(Ordering::Acquire);
         let frame = loop {
             match self.channels.outgoing.try_recv() {
-                Ok((queued, frame)) if queued == generation => break Some(frame),
+                // Frames queued before the last clear() are dropped.
+                Ok((queued, frame)) if queued >= generation => break Some(frame),
                 Ok(_) => {}
                 Err(_) => break None,
             }
@@ -511,7 +546,8 @@ impl<S: Signalling> Driver<S> {
         let never_connected = self.connect_deadline.is_some_and(|at| at <= now);
         let broken = self
             .broken_since
-            .is_some_and(|since| since + self.options.disconnect_timeout <= now);
+            .and_then(|since| since.checked_add(self.options.disconnect_timeout))
+            .is_some_and(|at| at <= now);
         if never_connected || broken {
             self.fail().await;
         }
@@ -549,17 +585,28 @@ impl<S: Signalling> Driver<S> {
                     self.restart_ice().await;
                 }
             }
-            CallEvent::Error { code, .. } => match code {
-                CallErrorCode::AlreadyAnswered
-                | CallErrorCode::CallNotFound
-                | CallErrorCode::NotContact
-                | CallErrorCode::InCall
-                | CallErrorCode::RateLimited
-                | CallErrorCode::NotAvailable => {
-                    self.end(CallEndReason::Failed, None, EndCause::Refused(code));
+            CallEvent::Error { code, .. } => {
+                // The invite or the answer was refused while the call was being set up:
+                // the call is not this side's. Later, a refused ICE or renegotiation
+                // frame leaves the call running.
+                let established = self.connected || (!self.polite && self.remote);
+                match code {
+                    CallErrorCode::CallNotFound if established => {
+                        self.end(CallEndReason::Failed, None, EndCause::Gone);
+                    }
+                    CallErrorCode::AlreadyAnswered
+                    | CallErrorCode::CallNotFound
+                    | CallErrorCode::NotContact
+                    | CallErrorCode::InCall
+                    | CallErrorCode::RateLimited
+                    | CallErrorCode::NotAvailable
+                        if !established =>
+                    {
+                        self.end(CallEndReason::Failed, None, EndCause::Refused(code));
+                    }
+                    _ => tracing::debug!(?code, "calls media: a call frame was refused"),
                 }
-                _ => tracing::debug!(?code, "calls media: a call frame was refused"),
-            },
+            }
             CallEvent::Incoming { .. }
             | CallEvent::Taken { .. }
             | CallEvent::HistoryChanged { .. } => {}
@@ -640,10 +687,14 @@ impl<S: Signalling> Driver<S> {
         if self.drain().await.is_err() {
             return self.fail().await;
         }
-        let _ = self
+        let sent = self
             .signalling
             .renegotiate(self.call_id, offer.to_sdp_string(), SdpKind::Offer)
             .await;
+        if sent.is_err() {
+            // No answer will come: the next restart may offer again.
+            self.pending = None;
+        }
     }
 
     async fn add_remote(&mut self, candidate: &IceCandidate) {
@@ -666,7 +717,7 @@ impl<S: Signalling> Driver<S> {
     fn remote_set(&mut self) {
         self.remote = true;
         if !self.connected {
-            self.connect_deadline = Some(Instant::now() + self.options.connect_timeout);
+            self.connect_deadline = later(self.options.connect_timeout);
         }
     }
 

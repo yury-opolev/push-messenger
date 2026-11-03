@@ -293,8 +293,11 @@ impl MediaCall {
     /// Starts a call's media with `servers` (fetch them per call:
     /// [`Calls::ice_servers`]). As [`Role::Caller`] it gathers candidates, invites with
     /// its offer and returns (the call rings); as [`Role::Callee`] it applies the offer and
-    /// accepts. From then on forward every [`CallEvent`] to [`MediaCall::handle`]: events
-    /// that arrive before this returns wait in the client's event stream.
+    /// accepts. From then on forward every [`CallEvent`] to [`MediaCall::handle`],
+    /// including those that arrived while this ran (the answer may): read the client's
+    /// events on the task that awaits this, or keep the call's events for it. A caller
+    /// whose answer never reaches the helper hangs up as failed after 90 s plus
+    /// [`MediaOptions::connect_timeout`].
     ///
     /// Errors: the input checks and refusals of [`Calls::invite`] and [`Calls::accept`]
     /// (`offline`, `not_available`, `invalid`); [`SdkError::Invalid`] for an offer it
@@ -308,10 +311,14 @@ impl MediaCall {
     ) -> Result<Self, SdkError> {
         let signalling = calls.clone();
         let servers = servers.clone();
-        calls
-            .client()
-            .run(async move { Self::start_with(signalling, servers, role, options).await })
-            .await
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        // Not cut short by a caller that gives up: once invited or accepted, the call
+        // must be hung up, which the dropped `MediaCall` then does.
+        calls.client().spawn(async move {
+            let started = Self::start_with(signalling, servers, role, options).await;
+            let _ = sender.send(started);
+        })?;
+        receiver.await.unwrap_or(Err(SdkError::Closed))
     }
 
     /// [`MediaCall::start`] over any signalling, on the current runtime.
@@ -418,7 +425,8 @@ impl MediaCall {
         }
     }
 
-    /// Hangs up (completed) and stops the media; returns once it stopped.
+    /// Hangs up (completed) and stops the media; returns once the call ended (the TURN
+    /// allocation is released right after).
     pub async fn hangup(&self) -> MediaEnded {
         let _ = self.commands.send(Command::Hangup);
         self.on_ended().await

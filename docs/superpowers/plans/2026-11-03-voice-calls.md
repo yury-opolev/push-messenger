@@ -712,20 +712,20 @@ File map (all under `crates/push-sdk/src/media/`, `#[cfg(feature = "calls-media"
 | `turn.rs` | TURN allocation over UDP or TCP with `turn-client-proto`: relay address, permissions, send/receive wrapping |
 | `driver.rs` | the task: str0m `Rtc` + sockets + TURN + codec, 20 ms send tick, events → state |
 
-- [ ] **6.1** feature + deps; `cargo deny check` (dev-dep in push-smoke puts them in the
+- [x] **6.1** feature + deps; `cargo deny check` (dev-dep in push-smoke puts them in the
   graph); `cargo +1.85 build --workspace --locked` still passes.
-- [ ] **6.2** `resample.rs` with unit tests (length, 1 kHz tone kept, 12 kHz tone removed
+- [x] **6.2** `resample.rs` with unit tests (length, 1 kHz tone kept, 12 kHz tone removed
   on the way down, round trip correlation).
-- [ ] **6.3** `codec.rs` with a round-trip test (440 Hz tone survives Opus).
-- [ ] **6.4** `ice.rs` URL parsing tests; STUN binding request/response codec tests.
-- [ ] **6.5** `turn.rs` + `driver.rs` + `mod.rs`; an in-process unit test: two
+- [x] **6.3** `codec.rs` with a round-trip test (440 Hz tone survives Opus).
+- [x] **6.4** `ice.rs` URL parsing tests; STUN binding request/response codec tests.
+- [x] **6.5** `turn.rs` + `driver.rs` + `mod.rs`; an in-process unit test: two
   `MediaCall` drivers wired with direct host candidates (no server) exchange a tone.
-- [ ] **6.6** `crates/push-smoke/tests/calls_media.rs` (`PUSH_CALLS_MEDIA=1`): the stack with
+- [x] **6.6** `crates/push-smoke/tests/calls_media.rs` (`PUSH_CALLS_MEDIA=1`): the stack with
   calls on, two SDK clients with `MediaCall`, stun-only (host candidates) and
   `internal` TURN relay-only through the chart's coturn (shared helper moved to
   `tests/common`), 440 Hz / 880 Hz tones, Goertzel energy check, hang up, both ended
   `Completed`; CI job `calls-media`.
-- [ ] **6.7** docs/calls.md §19 media helper, CHANGELOG, spec §15 PR 6 notes, README of
+- [x] **6.7** docs/calls.md §19 media helper, CHANGELOG, spec §15 PR 6 notes, README of
   the feature in the crate docs (MSRV 1.89, cmake).
 
 # PR 7 — Phase 2: bridge voice pipeline
