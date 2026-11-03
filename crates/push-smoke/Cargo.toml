@@ -33,6 +33,9 @@ tokio-tungstenite.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+# The media helper for calls_media.rs: its Rust 1.89 stays out of the msrv build, which
+# compiles no test target.
+push-sdk = { workspace = true, features = ["calls-media"] }
 push-credentials = { workspace = true, features = ["testing"] }
 tokio = { workspace = true, features = ["io-util", "process"] }
 hmac.workspace = true

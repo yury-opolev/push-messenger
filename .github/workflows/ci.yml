@@ -132,6 +132,39 @@ jobs:
         env:
           PUSH_BROWSER_CALLS: "1"
 
+  # The media helper's smoke test (docs/calls.md, "Media helper"): the whole stack in
+  # process with calls on and two push-sdk clients with MediaCall (feature calls-media)
+  # exchanging tones, once over host candidates (stun-only) and twice relay-only through
+  # the chart's pinned coturn (TURN over UDP and over TCP).
+  calls-media:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: docker pull postgres:17-alpine
+      - run: docker pull redis:7-alpine
+      - run: cargo test -p push-smoke --test calls_media --locked -- --nocapture --test-threads 1
+        env:
+          PUSH_CALLS_MEDIA: "1"
+
+  # The media helper builds on Windows (libopus and AWS-LC from source with MSVC and
+  # CMake) and its unit tests pass there, two helpers talking over host candidates
+  # included.
+  calls-media-windows:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: "cargo test -p push-sdk --features calls-media --locked --lib -- media::"
+
   # The container images build (nothing is pushed). Deploying them is verified on
   # minikube before merge: deploy/minikube/up.ps1 -Smoke.
   images:

@@ -12,7 +12,6 @@
 mod common;
 
 use std::io::{BufRead, BufReader};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -21,9 +20,6 @@ use common::{Containers, Datastores, Stack};
 use push_load::config::{PrepareOptions, Target as LoadTarget};
 use push_load::http::AuthApi;
 use push_load::state::State;
-use testcontainers_modules::testcontainers::core::{ContainerPort, WaitFor};
-use testcontainers_modules::testcontainers::runners::AsyncRunner;
-use testcontainers_modules::testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
 const TURN_SECRET: &str = "the-coturn-shared-secret-of-the-browser-test";
 
@@ -170,8 +166,8 @@ async fn browsers_call_each_other_through_the_internal_turn_relay() {
     if !enabled() {
         return;
     }
-    let (_coturn, port) = coturn().await;
-    let urls = format!("turn:127.0.0.1:{port}?transport=tcp");
+    let coturn = common::coturn::start(TURN_SECRET).await;
+    let urls = format!("turn:127.0.0.1:{}?transport=tcp", coturn.tcp_port);
     let (stack, _containers) = stack(&[
         ("PUSH_TURN_MODE", "internal"),
         ("PUSH_TURN_URLS", &urls),
@@ -184,83 +180,4 @@ async fn browsers_call_each_other_through_the_internal_turn_relay() {
         .await
         .expect("the browser suite finishes within 300 s");
     stack.stop().await;
-}
-
-fn chart_file(name: &str) -> String {
-    let path = repo().join("deploy/helm/push-messenger").join(name);
-    std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()))
-}
-
-/// `first-last` of a CIDR, as coturn's denied-peer-ip wants it.
-fn range(cidr: &str) -> String {
-    let (address, prefix) = cidr.split_once('/').expect("a CIDR");
-    let prefix: u32 = prefix.parse().unwrap();
-    match address.parse::<IpAddr>().unwrap() {
-        IpAddr::V4(address) => {
-            let mask = u32::MAX.checked_shl(32 - prefix).unwrap_or(0);
-            let first = u32::from(address) & mask;
-            format!(
-                "{}-{}",
-                Ipv4Addr::from(first),
-                Ipv4Addr::from(first | !mask)
-            )
-        }
-        IpAddr::V6(address) => {
-            let mask = u128::MAX.checked_shl(128 - prefix).unwrap_or(0);
-            let first = u128::from(address) & mask;
-            format!(
-                "{}-{}",
-                Ipv6Addr::from(first),
-                Ipv6Addr::from(first | !mask)
-            )
-        }
-    }
-}
-
-/// The chart's coturn configuration with every denied range, plus one TEST-ONLY
-/// exception: Docker's bridge range (172.16.0.0/12) is allowed as a peer. Both browsers
-/// reach coturn through a published TCP port on the loopback, so each one's relay
-/// address is coturn's own address on the Docker bridge, which the chart denies
-/// (RFC 1918). A deployment never sets allowed-peer-ip.
-fn coturn_config() -> String {
-    let mut config = chart_file("files/coturn/turnserver.conf");
-    config.push_str(&format!(
-        "realm=push.test\nmin-port=49160\nmax-port=49200\nuser-quota=12\ntotal-quota=1200\n\
-         max-bps=512000\nno-tls\nstatic-auth-secret={TURN_SECRET}\n"
-    ));
-    let denied = chart_file("files/coturn/denied-peers.txt");
-    for cidr in denied
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-    {
-        config.push_str(&format!("denied-peer-ip={}\n", range(cidr)));
-    }
-    config.push_str("allowed-peer-ip=172.16.0.0-172.31.255.255\n");
-    config
-}
-
-/// The chart's pinned coturn image in Docker; its published TCP port on the loopback.
-async fn coturn() -> (ContainerAsync<GenericImage>, u16) {
-    let values = chart_file("values.yaml");
-    let tag = values
-        .lines()
-        .map(str::trim)
-        .find_map(|line| line.strip_prefix("image: coturn/coturn:"))
-        .expect("calls.turn.internal.image in values.yaml")
-        .trim()
-        .to_owned();
-    let container = GenericImage::new("coturn/coturn".to_owned(), tag)
-        .with_exposed_port(ContainerPort::Tcp(3478))
-        .with_wait_for(WaitFor::Nothing)
-        .with_copy_to("/etc/coturn/push-test.conf", coturn_config().into_bytes())
-        .with_cmd(["-c", "/etc/coturn/push-test.conf"])
-        .start()
-        .await
-        .expect("start a coturn container (is Docker running?)");
-    let port = container
-        .get_host_port_ipv4(ContainerPort::Tcp(3478))
-        .await
-        .unwrap();
-    (container, port)
 }

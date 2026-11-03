@@ -47,6 +47,12 @@ impl Calls {
         self.client.inner.shared.calls_available()
     }
 
+    /// The client of these calls (the media helper runs on its runtime).
+    #[cfg(feature = "calls-media")]
+    pub(crate) fn client(&self) -> &Client {
+        &self.client
+    }
+
     /// Calls `peer` (an accepted contact, or the user's agent or owner) with the app's
     /// SDP offer: their calls-capable devices ring. Returns the new call's id. The callee's
     /// answer arrives as [`CallEvent::Accepted`]; a call that cannot ring ends at once

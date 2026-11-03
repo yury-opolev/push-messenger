@@ -25,6 +25,7 @@ and the spec differ, this guide describes what the code does.
 - [16. Troubleshooting](#16-troubleshooting)
 - [17. Release notes and upgrade guide](#17-release-notes-and-upgrade-guide)
 - [18. push-sdk](#18-push-sdk)
+- [19. Media helper](#19-media-helper)
 
 ## 1. Status
 
@@ -36,6 +37,7 @@ and the spec differ, this guide describes what the code does.
 | Browser recipe: a reference page ([`docs/examples/calls`](examples/calls)), its Playwright smoke test and the interoperability checklist ([§14](#14-browser-recipe), [§15](#15-testing-browser-smoke-interoperability-load)) | available in this release |
 | push-load `calls` scenario: concurrent calls and setup latency ([§15.3](#153-load)) | available in this release |
 | push-sdk calls API ([§18](#18-push-sdk)) | available in this release (Rust; the C and Node bindings follow) |
+| push-sdk media helper `MediaCall` (feature `calls-media`: a native WebRTC audio peer, PCM in and out; [§19](#19-media-helper)) | available in this release (Rust) |
 | Agents in calls (push-agent-bridge voice) | coming |
 
 This guide is meant to be enough to build a client without reading the server code. In
@@ -912,11 +914,12 @@ addresses. To exercise coturn itself, run `minikube tunnel`, use the `EXTERNAL-I
 `10.244.0.0/16` and `10.96.0.0/12` in `deniedPeerCidrs`; the push-auth-core integration
 test (`cargo test -p push-auth-core --test turn`) runs the same coturn in Docker.
 
-The browser smoke test ([§15.1](#151-browser-smoke-test)) relays between two local
-browsers through the pinned coturn by adding one **test-only** line to the chart's
-configuration, `allowed-peer-ip=172.16.0.0-172.31.255.255` (Docker's bridge range, where
-the relay addresses are). Never add it to a deployment: it re-opens the private range
-that `denied-peer-ip` closes. The chart has no value for it on purpose.
+The browser smoke test ([§15.1](#151-browser-smoke-test)) and the media helper's smoke
+test ([§19.6](#196-smoke-test)) relay between two local peers through the pinned coturn
+(`crates/push-smoke/tests/common/coturn.rs`) by adding one **test-only** line to the
+chart's configuration, `allowed-peer-ip=172.16.0.0-172.31.255.255` (Docker's bridge
+range, where the relay addresses are). Never add it to a deployment: it re-opens the
+private range that `denied-peer-ip` closes. The chart has no value for it on purpose.
 
 A minikube walk-through with the reference page:
 
@@ -1180,7 +1183,7 @@ ignores the table.
 The Rust client core ([`crates/push-sdk`](../crates/push-sdk)) wraps everything above:
 the frames of [§4](#4-wire-frames), the error codes of [§5](#5-error-codes), the history
 of [§12](#12-call-history) and the ICE servers of [§13.1](#131-the-api). Media stays the
-app's job (a WebRTC stack of its own); an optional media helper follows.
+app's job (a WebRTC stack of its own), or the optional media helper's ([§19](#19-media-helper)).
 
 **Opting in.** Set `Config::calls = true` (default `false`) only in an app that can take
 calls: the client then lists `CAPABILITY_CALLS` in `Identify` and its connections ring.
@@ -1247,3 +1250,148 @@ output shows only lengths.
 ([sdk-bindings.md](sdk-bindings.md)), but do not yet expose the methods or the `calls`
 option, so they never advertise calls and receive no call frames; the bindings' calls API
 follows.
+
+## 19. Media helper
+
+For apps without a WebRTC stack (agents, bots, push-agent-bridge, command-line tools),
+push-sdk's optional feature `calls-media` runs a call's audio natively: `MediaCall` places
+or answers a call through [`Calls`](#18-push-sdk), runs ICE, DTLS-SRTP and Opus, and hands
+the app plain PCM: **16 kHz, mono, signed 16-bit, 20 ms frames** (320 samples).
+
+```toml
+push-sdk = { …, features = ["calls-media"] }
+```
+
+### 19.1 Requirements
+
+| | |
+|---|---|
+| Rust | **1.89** with the feature (str0m's MSRV); push-sdk without it keeps the workspace's 1.85 |
+| Build tools | a C compiler and CMake (libopus through `opusic-sys`; AWS-LC through `aws-lc-sys`, NASM is bundled for Windows x64) |
+| Platforms | Windows and Linux are built and tested in CI; macOS should build (untested) |
+| Network | UDP to the peer or the TURN server, or TCP to the TURN server; IPv4 |
+
+### 19.2 Placing and answering a call
+
+```rust
+use push_sdk::media::{MediaCall, MediaOptions, PcmFrame, Role};
+
+let calls = client.calls();
+let servers = calls.ice_servers().await?;                   // per call
+let mut call = MediaCall::start(&calls, &servers, Role::Caller { peer }, MediaOptions::default()).await?;
+// callee instead: Role::Callee { call_id, offer_sdp } from CallEvent::Incoming
+
+// forward EVERY call event of the client to the helper:
+//   Event::Call(event) => { call.handle(&event); }
+
+let mut heard = call.incoming().expect("first take");      // PcmStream (also a Stream)
+let say = call.outgoing();                                  // PcmSink, cheap to clone
+call.connected().await?;                                    // audio flows
+say.send(PcmFrame::from_slice(&samples).unwrap()).await;    // 320 samples
+while let Some(frame) = heard.recv().await { /* frame.samples(): &[i16; 320] */ }
+let ended = call.hangup().await;                            // or: call.on_ended().await
+```
+
+| API | |
+|---|---|
+| `MediaCall::start(&Calls, &IceServers, Role, MediaOptions) -> Result<MediaCall, SdkError>` | gathers candidates, then as `Role::Caller { peer }` invites with its offer (returns while it rings), as `Role::Callee { call_id, offer_sdp }` applies the offer and accepts |
+| `handle(&CallEvent) -> bool` | the app forwards every call event; `true` when it was about this call. Include the events that arrived while `start` ran (the answer may): read the client's events on the task that awaits `start`, or keep the call's events for it. A caller whose answer never reaches the helper hangs up as failed after 90 s plus `connect_timeout` |
+| `incoming() -> Option<PcmStream>` | the peer's audio (the first call takes it); `recv()`, `try_recv()`, `futures::Stream`; ends with the call. A reader more than 1 s behind loses the newest frames |
+| `outgoing() -> PcmSink` | `send(frame).await` (waits while 5 s are queued), `try_send(frame)`, `clear()` drops what is queued (barge-in). One frame goes out every 20 ms once connected; nothing while the queue is empty, so queue faster than real time freely |
+| `state() -> MediaState`, `connected()`, `on_ended() -> MediaEnded` | `Connecting`, `Connected`, `Ended(MediaEnded { reason, duration_s, cause })` |
+| `hangup() -> MediaEnded` | hangs up (`COMPLETED`) and stops; dropping the `MediaCall` does the same, as does dropping `start`'s future once it invited or accepted |
+| `call_id()` | |
+
+`MediaOptions` (`Default` suits most calls): `relay_only` (`None`: relay-only exactly when
+`IceServers::relay`), `gather_timeout` (5 s), `connect_timeout` (30 s from the answer),
+`disconnect_timeout` (15 s).
+
+`EndCause` says why it ended: `Server` (a `CallEnded`: hang-up, decline, cancel, missed,
+busy, unreachable, with the server's reason and duration), `Local` (`hangup` or drop),
+`MediaFailed` (no media within `connect_timeout`, or disconnected for longer than
+`disconnect_timeout`: the helper hung up with `FAILED`), `Gone` (a `CallSync` after a
+reconnect no longer lists the call) and `Refused(CallErrorCode)` (the server refused the
+invite or the answer for good: `NOT_CONTACT`, `IN_CALL`, `RATE_LIMITED`,
+`NOT_AVAILABLE`, `ALREADY_ANSWERED`, `CALL_NOT_FOUND` while the call is being set up; a refused
+candidate or renegotiation later leaves the call running, and `CALL_NOT_FOUND` for an
+established call ends it as `Gone`).
+
+The helper's task holds a clone of the client until the call ends: end calls before
+`Client::close`.
+
+### 19.3 What it does on the wire
+
+It follows the client rules of [§7](#7-client-rules) and the browser recipe:
+
+- **Candidates.** Without relay-only: a host candidate (one UDP socket on the address of
+  the default route) and, when a STUN server answers, a server-reflexive one. With a TURN
+  URL: one allocation (UDP URLs tried first, then TCP; `turns:` is skipped) and its relay
+  candidate. Relay-only uses the relay candidate alone, so the peer never learns this
+  host's addresses; without an allocation `start` fails (`network`). Gathering finishes
+  before the offer or answer, which carries every candidate; the helper then sends only
+  `IceCandidate::end_of_candidates()`.
+- **The peer's candidates** (`PeerIce`) are held until the remote description is set, then
+  applied; ones it cannot use (mDNS `.local` names, TCP) are skipped.
+- **Reconnects.** On `Synced`, a call in `gone` ends (`Gone`); a listed call with
+  `needs_ice_restart()` gets an ICE-restart offer through `renegotiate`. The helper's own
+  sockets do not depend on the WebSocket, so audio usually keeps flowing meanwhile.
+- **Renegotiation** (`PeerRenegotiate`): an offer is answered with `renegotiate(…,
+  Answer)`; when both sides offer at once the callee is polite (it drops its own offer and
+  answers), the caller ignores the callee's.
+- **TURN.** Permissions are created for each peer address on first use (the data waits up
+  to 64 packets); the allocation is refreshed while the call lasts and released at its
+  end. Over TCP the stream carries the framed TURN messages.
+
+### 19.4 Audio
+
+Opus at 48 kHz mono, 20 ms packets, 32 kbit/s, in-band FEC on, the `VOIP` application.
+Between 48 kHz and 16 kHz the helper resamples by 3 with a 96-tap windowed-sinc
+(Blackman) low-pass FIR cut off at 7.2 kHz, as a polyphase decimator and interpolator
+(flat to about 5.5 kHz; images and aliases from above 8.6 kHz below -50 dB, the band
+just above 8 kHz folds back less attenuated). Incoming packets of any Opus frame size are decoded and
+cut into 20 ms frames. There is no jitter buffer, packet-loss concealment or echo
+cancellation: a speech recogniser or an agent's voice needs none of them; an app that
+plays audio to a person adds its own buffer.
+
+Audio, SDP and candidates never reach a log line, and `PcmFrame`'s `Debug` shows no
+samples.
+
+### 19.5 Libraries
+
+| Need | Crate | Why |
+|---|---|---|
+| WebRTC (ICE, DTLS, SRTP, RTP) | `str0m` 0.25 (MIT/Apache-2.0), default features off, `aws-lc-rs` backend | sans-IO and runtime-agnostic, small tree (spec D21). Its `rust-crypto` backend also builds AWS-LC (its DTLS certificate generation does), so `aws-lc-rs` is used as is. Rust 1.89 |
+| Opus | `opus` 0.4 over `opusic-sys` (libopus 1.5, BSD-3-Clause, built with CMake) | maintained (the spec's `audiopus` has had no release since 2021) |
+| TURN client | `turn-client-proto` 0.7 (MIT/Apache-2.0) | sans-IO RFC 8656 client over UDP and TCP; str0m has none |
+
+All pass `cargo deny check` (`deny.toml`); `ctutils` is pinned at 0.4.4 or later for
+RUSTSEC-2026-0385. The `msrv` CI job builds the workspace's default features with Rust
+1.85, which never compiles the feature: only push-smoke's tests enable it (a
+dev-dependency).
+
+### 19.6 Smoke test
+
+[`crates/push-smoke/tests/calls_media.rs`](../crates/push-smoke/tests/calls_media.rs)
+starts the whole stack in one process with calls on, signs in two SDK clients with calls
+enabled, makes them contacts and calls one from the other with `MediaCall` on both
+sides. The caller sends 3 s of a 440 Hz tone and the callee 3 s of 880 Hz; each checks
+(Goertzel) that it hears the other's tone and not its own, then the caller hangs up and
+both calls end `COMPLETED` (the callee's with a duration) and both PCM streams close.
+
+| Test | TURN mode | ICE |
+|---|---|---|
+| `media_helpers_talk_with_stun_only` | `stun-only` | host candidates connect the two local clients |
+| `media_helpers_talk_through_coturn_over_udp` | `internal`: the chart's pinned coturn in Docker, TURN REST credentials from auth-svc | relay-only, TURN over UDP |
+| `media_helpers_talk_through_coturn_over_tcp` | the same | relay-only, TURN over TCP |
+
+CI runs them in the `calls-media` job; `calls-media-windows` builds the feature on
+Windows and runs its unit tests there. Locally (Docker running):
+
+```
+PUSH_CALLS_MEDIA=1 cargo test -p push-smoke --test calls_media -- --nocapture
+```
+
+(PowerShell: `$env:PUSH_CALLS_MEDIA = "1"`.) Without `PUSH_CALLS_MEDIA=1` they pass
+without running. push-sdk's own unit tests (run by `cargo test --workspace`) cover the
+resampler, Opus, the ICE server URLs, the STUN binding and two helpers talking over host
+candidates with an in-memory signalling wire.
