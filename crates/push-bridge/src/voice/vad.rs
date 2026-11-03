@@ -1,17 +1,20 @@
 //! Voice activity detection over 20 ms frames, by energy.
 //!
-//! A frame's energy is its RMS in dBFS (`20·log10(rms / 32768)`, -100 for silence). A noise
-//! floor follows the quiet frames: it starts at the first frame's energy (at most -30
-//! dBFS); on a frame that is not speech it drops to the frame's energy when that is lower,
-//! else moves 5% of the way toward it, never above -30 dBFS. It does not adapt during
-//! speech. A frame is speech when its energy is above both `floor + 10 dB` and -55 dBFS.
+//! A frame's energy is its RMS in dBFS (`20·log10(rms / 32768)`, -100 for silence). The
+//! noise floor is the lowest energy of the last 1.5 s of frames (75, the current one
+//! included), speech or not, held between -70 dBFS (so digital silence does not pull it
+//! down to -100) and -30 dBFS; before 1.5 s have been heard it is the lowest so far. A
+//! frame is speech when its energy is above both `floor + 10 dB` and -55 dBFS. So a steady
+//! sound stops being speech at most 1.5 s after it starts, and the utterance it opened
+//! ends `silence_ms` later: noise that follows silence or steps up cannot hold the detector
+//! in speech.
 //!
 //! Three speech frames in a row (60 ms) are an onset: [`VadEvent::SpeechStarted`], and the
 //! utterance starts with the last 10 frames (200 ms, the onset frames included). It ends
 //! after `silence_ms` of frames that are not speech: an [`VadEvent::Utterance`] (at most
 //! 200 ms kept after its last speech frame) when it held at least `min_speech_ms` of speech
 //! frames, else [`VadEvent::Discarded`]. An utterance reaching [`MAX_UTTERANCE`] samples is
-//! cut there; a new onset starts the next one.
+//! cut there and is an [`VadEvent::Utterance`]; a new onset starts the next one.
 
 use std::collections::VecDeque;
 
@@ -58,8 +61,10 @@ const MAX_FLOOR: f64 = -30.0;
 const ABOVE_FLOOR: f64 = 10.0;
 /// Quietest speech, dBFS.
 const MIN_SPEECH_DB: f64 = -55.0;
-/// Share of a quiet frame's energy the floor moves by.
-const FLOOR_RATE: f64 = 0.05;
+/// Lowest noise floor, dBFS.
+const MIN_FLOOR: f64 = -70.0;
+/// Frames the noise floor is the quietest of (1.5 s).
+const FLOOR_FRAMES: usize = 75;
 /// Speech frames in a row that start an utterance.
 const ONSET_FRAMES: usize = 3;
 /// Frames kept before the onset and after the last speech frame (200 ms).
@@ -70,8 +75,8 @@ const FRAME_MS: u32 = 20;
 /// The detector for one call's incoming audio.
 pub struct Vad {
     config: VadConfig,
-    /// The noise floor, dBFS; `None` before the first frame.
-    floor: Option<f64>,
+    /// The energies of the latest frames (at most [`FLOOR_FRAMES`]), for the noise floor.
+    energies: VecDeque<f64>,
     /// The latest frames while no utterance is in progress, for the pre-roll.
     recent: VecDeque<Frame>,
     /// Speech frames in a row while no utterance is in progress.
@@ -93,7 +98,7 @@ impl Vad {
     pub fn new(config: VadConfig) -> Self {
         Self {
             config,
-            floor: None,
+            energies: VecDeque::with_capacity(FLOOR_FRAMES),
             recent: VecDeque::with_capacity(PAD_FRAMES),
             onset: 0,
             utterance: None,
@@ -103,7 +108,16 @@ impl Vad {
     /// Feeds one frame; at most one event per frame.
     pub fn push(&mut self, frame: &Frame) -> Option<VadEvent> {
         let energy = energy(frame);
-        let floor = *self.floor.get_or_insert(energy.min(MAX_FLOOR));
+        if self.energies.len() == FLOOR_FRAMES {
+            self.energies.pop_front();
+        }
+        self.energies.push_back(energy);
+        let floor = self
+            .energies
+            .iter()
+            .copied()
+            .fold(f64::INFINITY, f64::min)
+            .clamp(MIN_FLOOR, MAX_FLOOR);
         let speech = energy > (floor + ABOVE_FLOOR).max(MIN_SPEECH_DB);
         match self.utterance.as_mut() {
             Some(utterance) => {
@@ -132,7 +146,6 @@ impl Vad {
                 self.recent.push_back(*frame);
                 if !speech {
                     self.onset = 0;
-                    self.floor = Some(adapt(floor, energy));
                     return None;
                 }
                 self.onset += 1;
@@ -180,15 +193,6 @@ fn energy(frame: &Frame) -> f64 {
         return SILENCE_DB;
     }
     (20.0 * (rms / 32_768.0).log10()).max(SILENCE_DB)
-}
-
-/// The floor after a frame that is not speech.
-fn adapt(floor: f64, energy: f64) -> f64 {
-    if energy < floor {
-        energy
-    } else {
-        (floor + FLOOR_RATE * (energy - floor)).min(MAX_FLOOR)
-    }
 }
 
 #[cfg(test)]
@@ -380,6 +384,37 @@ mod tests {
             summary(&signal.run(config)),
             [(12, "started", 0), (29, "utterance", 22)]
         );
+    }
+
+    /// Feeds `signal` and checks that nothing happens after the first `settle_ms` from
+    /// frame `step` on and that no utterance is in progress at the end.
+    fn settles(signal: &Signal, step: usize, settle_ms: usize) {
+        let mut vad = Vad::new(VadConfig::default());
+        let mut events = Vec::new();
+        for (i, frame) in signal.frames.iter().enumerate() {
+            if let Some(event) = vad.push(frame) {
+                events.push((i, event));
+            }
+        }
+        let summary = summary(&events);
+        assert!(summary.len() <= 2, "{summary:?}");
+        let last = step + settle_ms / FRAME_MS as usize;
+        assert!(summary.iter().all(|(i, _, _)| *i < last), "{summary:?}");
+        assert!(!vad.in_speech());
+    }
+
+    #[test]
+    fn steady_noise_after_digital_silence_is_not_speech_for_long() {
+        let signal = Signal::new().silence(500).add(60_000, 0.0, 318.0);
+        // The 1.5 s window forgets the silence; 700 ms more of non-speech end it.
+        settles(&signal, 25, 2_500);
+    }
+
+    #[test]
+    fn a_noise_step_up_is_not_speech_for_long() {
+        // Uniform noise at amplitude 57 is about -60 dBFS, at 568 about -40 dBFS.
+        let signal = Signal::new().add(3_000, 0.0, 57.0).add(30_000, 0.0, 568.0);
+        settles(&signal, 150, 2_500);
     }
 
     #[test]

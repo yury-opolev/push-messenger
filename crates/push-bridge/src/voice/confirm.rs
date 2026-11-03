@@ -41,6 +41,13 @@ const REJECT_WORDS: &[&str] = &[
     "reject", "rejected", "no", "nope", "deny", "denied", "decline", "declined", "cancel", "stop",
     "don t", "do not", "not now",
 ];
+/// Words that negate (normalised: "can't" is "can t"); with one, nothing approves.
+const NEGATORS: &[&str] = &["not", "never", "cannot", "nor", "t"];
+/// Words that start a question.
+const INTERROGATIVES: &[&str] = &[
+    "are", "is", "can", "could", "should", "would", "will", "do", "does", "what", "why", "how",
+    "which", "who",
+];
 const ORDINALS: [&str; 10] = [
     "first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth", "tenth",
 ];
@@ -66,10 +73,14 @@ pub enum VoiceAnswer {
 }
 
 /// What `transcript` answers to a card of `kind`. Words are compared whole, lowercase and
-/// without punctuation; leading fillers ("um", "uh") are ignored. An approval needs exactly
-/// one of approve or reject; a question takes the options named by number ("option two",
-/// "the second one", a bare "two") or by label, else the transcript as free text when the
-/// card allows it. The answer is the one the card's buttons give for the same values.
+/// without punctuation (an apostrophe splits a word: "can't" is "can t"); leading fillers
+/// ("um", "uh") are ignored. An approval is unclear when it is a question (it opens with
+/// "is", "are", "can", "do"…, other than "do it" or "do not"); a negation ("not", "never",
+/// "cannot", "nor", "n't") rejects when no approve word is heard and is unclear with one
+/// ("I can't approve that"); otherwise it needs exactly one of approve or reject. A
+/// question card takes the options named by number ("option two", "the second one", a bare
+/// "two") or by label, else the transcript as free text when the card allows it. The
+/// answer is the one the card's buttons give for the same values.
 pub fn match_answer(kind: &CardKind, transcript: &str) -> VoiceAnswer {
     let words = words(transcript);
     let CardKind::Question {
@@ -80,7 +91,15 @@ pub fn match_answer(kind: &CardKind, transcript: &str) -> VoiceAnswer {
     else {
         let approve = APPROVE_WORDS.iter().any(|p| has_phrase(&words, p));
         let reject = REJECT_WORDS.iter().any(|p| has_phrase(&words, p));
-        return match (approve, reject) {
+        let negated = words.iter().any(|w| NEGATORS.contains(&w.as_str()));
+        let starts = |phrases: &[&str]| phrases.iter().any(|p| words.starts_with(&plain_words(p)));
+        let question = words
+            .first()
+            .is_some_and(|w| INTERROGATIVES.contains(&w.as_str()))
+            && !starts(APPROVE_WORDS)
+            && !starts(REJECT_WORDS);
+        return match (approve, reject || negated) {
+            _ if question => VoiceAnswer::Again(APPROVE_OR_REJECT),
             (true, false) => answer(kind, vec![option_value(true)], "Approve".to_owned()),
             (false, true) => answer(kind, vec![option_value(false)], "Reject".to_owned()),
             _ => VoiceAnswer::Again(APPROVE_OR_REJECT),
@@ -296,6 +315,44 @@ mod tests {
                 label: "Approve".to_owned(),
             }
         );
+    }
+
+    #[test]
+    fn negations_and_questions_never_approve() {
+        let approve = chose(&["approve"], "Approve");
+        let reject = chose(&["reject"], "Reject");
+        let again = Err(APPROVE_OR_REJECT);
+        let cases = [
+            ("I can't approve that", &again),
+            ("I won't allow it", &again),
+            ("never allow that", &again),
+            ("I wouldn't do it", &again),
+            ("not sure", &again),
+            ("I'm not sure", &again),
+            ("are you sure", &again),
+            ("is that okay", &again),
+            ("Is that okay?", &again),
+            ("not okay", &again),
+            ("absolutely not okay", &again),
+            ("I cannot accept", &again),
+            ("no problem, go ahead", &again),
+            ("no", &reject),
+            ("never", &reject),
+            ("not now", &reject),
+            ("do not", &reject),
+            ("yes", &approve),
+            ("go ahead", &approve),
+            ("do it", &approve),
+        ];
+        for kind in [CardKind::Permission, CardKind::Plan, CardKind::Bypass] {
+            for (transcript, expected) in &cases {
+                assert_eq!(
+                    &heard(&kind, transcript),
+                    *expected,
+                    "{kind:?} {transcript}"
+                );
+            }
+        }
     }
 
     #[test]

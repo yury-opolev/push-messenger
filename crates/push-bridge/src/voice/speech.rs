@@ -3,7 +3,10 @@
 //!
 //! Complete lines are read as Markdown: a fenced code block is said as [`CODE_NOTE`] and
 //! a table as [`TABLE_NOTE`]; headings and list items are sentences of their own; quote
-//! markers, rules, links, URLs, code spans, emphasis and HTML tags go. A paragraph's text is
+//! markers, rules, links, URLs, code spans, emphasis and HTML tags go. A table starts at a
+//! line opening with `|` or at a delimiter row (`--- | ---`), and goes on while lines hold a
+//! `|`; a paragraph line with a `|` waits for the next line, so a header before a delimiter
+//! row is never said (and a line that is not one is said as usual). A paragraph's text is
 //! cut into sentences after `.`, `!`, `?` or `…` and whitespace (not after abbreviations
 //! such as "e.g."), and sentences over 300 characters at a comma or space.
 
@@ -56,6 +59,9 @@ pub struct SpeechText {
     fence: Option<(char, usize)>,
     /// Whether the last line was a table row.
     table: bool,
+    /// A paragraph line with a `|`, held until the next line shows whether it is a table's
+    /// header.
+    held: Option<String>,
     /// The note said last, with nothing said since.
     last_note: Option<&'static str>,
     out: Vec<String>,
@@ -84,6 +90,9 @@ impl SpeechText {
         if !line.is_empty() {
             self.read_line(line.trim_end_matches('\r'));
         }
+        if let Some(held) = self.held.take() {
+            self.read(&held, false);
+        }
         self.flush(false);
         let out = mem::take(&mut self.out);
         *self = Self::default();
@@ -92,6 +101,18 @@ impl SpeechText {
 
     fn read_line(&mut self, raw: &str) {
         let line = raw.trim();
+        if let Some(held) = self.held.take() {
+            if TABLE_DELIMITER.is_match(line) {
+                self.start_table();
+                return;
+            }
+            self.read(&held, false);
+        }
+        self.read(line, true);
+    }
+
+    /// Reads a trimmed line; with `hold`, a paragraph line with a `|` waits for the next.
+    fn read(&mut self, line: &str, hold: bool) {
         if let Some((fence, len)) = self.fence {
             if fence_of(line).is_some_and(|(c, n)| c == fence && n >= len && closing(line, n)) {
                 self.fence = None;
@@ -105,12 +126,11 @@ impl SpeechText {
             self.table = false;
             return;
         }
-        if line.starts_with('|') || TABLE_DELIMITER.is_match(line) {
-            if !self.table {
-                self.flush(false);
-                self.note(TABLE_NOTE);
-                self.table = true;
-            }
+        if line.starts_with('|')
+            || TABLE_DELIMITER.is_match(line)
+            || (self.table && line.contains('|'))
+        {
+            self.start_table();
             return;
         }
         self.table = false;
@@ -125,12 +145,23 @@ impl SpeechText {
         } else if let Some(item) = LIST_ITEM.captures(line) {
             let item = item.get(1).map_or("", |m| m.as_str());
             self.alone(item);
+        } else if hold && line.contains('|') {
+            self.held = Some(line.to_owned());
         } else {
             let text = inline(line);
             if !text.is_empty() {
                 self.paragraph.push_str(&text);
                 self.paragraph.push(' ');
             }
+        }
+    }
+
+    /// A table row: the note, unless the table was already noted.
+    fn start_table(&mut self) {
+        if !self.table {
+            self.flush(false);
+            self.note(TABLE_NOTE);
+            self.table = true;
         }
     }
 
@@ -405,7 +436,8 @@ mod tests {
     const SAMPLE: &str = "# Plan\n\nI looked at the **build** script. It fails on Windows, e.g. when \
 paths have spaces! The fix costs 3.5 hours.\nSee [the docs](https://example.com/a) or \
 https://example.com/b for more.\n\n```rust\nfn main() {}\n```\n\n- Run `cargo test`.\n\
-2. Check the snake_case_name\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\nDone… Shall I go on?";
+2. Check the snake_case_name\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\nAlso:\nName | Age\n--- | ---\n\
+Bob | 3\nAmy | 4\n\nUse a | b to pipe.\nDone… Shall I go on?";
 
     fn all(markdown: &str) -> Vec<String> {
         sentences(markdown)
@@ -425,6 +457,9 @@ https://example.com/b for more.\n\n```rust\nfn main() {}\n```\n\n- Run `cargo te
                 "Run cargo test.",
                 "Check the snake_case_name.",
                 TABLE_NOTE,
+                "Also:",
+                TABLE_NOTE,
+                "Use a | b to pipe.",
                 "Done…",
                 "Shall I go on?",
             ]
@@ -495,6 +530,19 @@ https://example.com/b for more.\n\n```rust\nfn main() {}\n```\n\n- Run `cargo te
             all("Results:\n|a|b|\n|:-|-:|\n|1|2|\n|3|4|\nThat is all."),
             ["Results:", TABLE_NOTE, "That is all."]
         );
+        assert_eq!(
+            all("Results:\nName | Age\n:--- | ---:\nBob | 3\nAmy|4\nThat is all."),
+            ["Results:", TABLE_NOTE, "That is all."]
+        );
+    }
+
+    #[test]
+    fn a_line_with_a_pipe_but_no_delimiter_row_is_spoken() {
+        assert_eq!(all("Run a | b"), ["Run a | b"]);
+        assert_eq!(all("Run a | b.\nThen c."), ["Run a | b.", "Then c."]);
+        let mut text = SpeechText::new();
+        assert!(text.push("Run a | b.\n").is_empty());
+        assert_eq!(text.finish(), ["Run a | b."]);
     }
 
     #[test]
