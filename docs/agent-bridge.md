@@ -702,8 +702,9 @@ From the top: a line "tray.json: <error>" when [`tray.json`](#trayjson) could no
 one line per agent, "`<name>: <state label>`" with a small dot in its badge colour ("No
 agents" when there are none), which opens the window on that agent; "Open…" (the window);
 "Add agent folder…"; the check item "Start at logon"; "Switch from Scheduled Task…" when
-[offered](#scheduled-tasks-and-the-switch-over); "Quit". Every item has an access key
-(`&` mnemonics), so the menu works without a mouse.
+[offered](#scheduled-tasks-and-the-switch-over); "Quit". The tray's own items have access
+keys (`&` mnemonics) and the agent lines are reached with the arrow keys, so the menu
+works without a mouse.
 
 With "Show last agent line in the menu" on (the window's setting, off by default), an
 agent's line shows the last line the agent wrote in its conversation instead of its
