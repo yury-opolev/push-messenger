@@ -646,10 +646,13 @@ Decisions taken while implementing §9, beyond or refining it:
   user index is `(user_id, ended_at DESC, call_id DESC)`, and a second index on `ended_at`
   serves the purge. `outcome` and `direction` are `text` with CHECK constraints.
 - A hidden row stays hidden when the end is recorded again (`ON CONFLICT DO NOTHING`).
-- The rows are written inline after the Redis apply and the `CallEnded` publish (three
-  attempts, 100 ms then 200 ms apart), then logged and counted
-  (`push_call_history_write_failures_total`, a metric beyond §9). The ending frame's RPC or
-  sweeper tick waits for the write.
+- The rows are written after the Redis apply and the `CallEnded` publish, in a task of
+  their own (three attempts, 100 ms then 200 ms apart, then logged and counted in
+  `push_call_history_write_failures_total`, a metric beyond §9), so the ending frame's RPC
+  deadline cannot cancel the write and a slow database never stalls the sweeper. A write in
+  flight when the replica stops is lost. An ending apply whose reply is lost counts as
+  applied when the re-read finds the record gone (PR 1), so its rows are still written;
+  only a lost reply whose re-read fails too loses them.
 - `CallHistoryChanged` travels as `CallSignal.history_changed` (field 8) on the user's
   `notify:` channel, addressed to the user's attached devices with a live presence lease
   (the same "live" as ringing). It is also sent, without `latest_ended_at`, to the user's

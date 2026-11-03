@@ -146,6 +146,25 @@ where
     }
 }
 
+impl<S, C, N> CallHistory<S, C, N>
+where
+    S: Store + 'static,
+    C: Clock + 'static,
+    N: Notifier + 'static,
+{
+    /// [`Self::record`] in a task of its own, so neither the ending frame's RPC deadline nor
+    /// a sweep waits for the database or can cancel the write.
+    pub(crate) fn record_in_background(
+        self: &Arc<Self>,
+        call: Uuid,
+        rows: Vec<CallHistoryRow>,
+        ended_ms: i64,
+    ) {
+        let history = Arc::clone(self);
+        tokio::spawn(async move { history.record(call, &rows, ended_ms).await });
+    }
+}
+
 /// The `Calls` service: auth-svc's call history calls. Guarded by auth-svc's internal
 /// token, as `Directory` is.
 pub struct CallHistoryApi<S, C, N> {

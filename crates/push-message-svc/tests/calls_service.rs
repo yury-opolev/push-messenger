@@ -737,6 +737,18 @@ async fn history_of(env: &Env, user: UserId) -> Vec<CallHistoryRow> {
         .unwrap()
 }
 
+/// `user`'s history once it holds `len` calls: rows are written in the background.
+async fn history_with(env: &Env, user: UserId, len: usize) -> Vec<CallHistoryRow> {
+    for _ in 0..100 {
+        let rows = history_of(env, user).await;
+        if rows.len() == len {
+            return rows;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("no {len} calls in the history within 5 s");
+}
+
 fn history_api(
     env: &Env,
     notifier: RedisNotifier,
@@ -854,7 +866,7 @@ async fn calls_that_never_rang_are_in_the_history() {
     // Unreachable: only the caller's row; the callee never saw the call.
     let unreachable = Uuid::now_v7();
     env.invite(alice, bob.user, unreachable).await.unwrap();
-    let mine = history_of(&env, alice.user).await;
+    let mine = history_with(&env, alice.user, 1).await;
     assert_eq!(mine.len(), 1);
     assert_eq!(
         (mine[0].call_id, mine[0].outcome),
@@ -907,7 +919,7 @@ async fn calls_that_never_rang_are_in_the_history() {
     env.send(alice, call_request::Frame::Cancel(cancel))
         .await
         .unwrap();
-    let theirs = history_of(&env, bob.user).await;
+    let theirs = history_with(&env, bob.user, 2).await;
     assert_eq!(
         theirs
             .iter()
@@ -915,8 +927,7 @@ async fn calls_that_never_rang_are_in_the_history() {
             .collect::<Vec<_>>(),
         [(call, EndReason::Cancelled), (busy, EndReason::Busy)]
     );
-    let mine = history_of(&env, alice.user).await;
-    assert_eq!(mine.len(), 2);
+    let mine = history_with(&env, alice.user, 2).await;
     assert_eq!(mine[0].outcome, EndReason::Cancelled);
 }
 

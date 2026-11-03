@@ -82,14 +82,14 @@ pub struct CallService<S, C, N> {
     notifier: RedisNotifier,
     timing: Timing,
     metrics: Arc<Metrics>,
-    history: CallHistory<S, C, N>,
+    history: Arc<CallHistory<S, C, N>>,
 }
 
 impl<S, C, N> CallService<S, C, N>
 where
-    S: Store,
-    C: Clock,
-    N: Notifier,
+    S: Store + 'static,
+    C: Clock + 'static,
+    N: Notifier + 'static,
 {
     /// `messaging` answers who may call whom; `redis` keeps the call state; `notifier`
     /// publishes the frames and the history events; `timing` is usually
@@ -101,11 +101,11 @@ where
         timing: Timing,
         metrics: Arc<Metrics>,
     ) -> Self {
-        let history = CallHistory::new(
+        let history = Arc::new(CallHistory::new(
             Arc::clone(&messaging),
             notifier.clone(),
             Arc::clone(&metrics),
-        );
+        ));
         Self {
             messaging,
             redis,
@@ -235,9 +235,7 @@ where
             } else {
                 EndReason::Unreachable
             };
-            return Ok(self
-                .not_ringing(invite.call_id, caller, callee, reason, now)
-                .await);
+            return Ok(self.not_ringing(invite.call_id, caller, callee, reason, now));
         }
         let (record, deliveries) = start(
             invite.call_id,
@@ -263,9 +261,7 @@ where
             Applied::Ok => {}
             Applied::InCall => return Err(in_call()),
             Applied::Busy => {
-                return Ok(self
-                    .not_ringing(invite.call_id, caller, callee, EndReason::Busy, now)
-                    .await);
+                return Ok(self.not_ringing(invite.call_id, caller, callee, EndReason::Busy, now));
             }
             Applied::Exists => {
                 return if self.repeated_invite(record.call_id, caller, device).await? {
@@ -307,7 +303,7 @@ where
 
     /// An invite that cannot ring: answered `CallEnded` at once, audited as an end and
     /// written to the call history (the callee's only for `Busy`).
-    async fn not_ringing(
+    fn not_ringing(
         &self,
         call: Uuid,
         caller: UserId,
@@ -318,7 +314,7 @@ where
         audit_end(call, caller, callee, reason, 0, false);
         self.metrics.call_ended(reason);
         let rows = ended_rows(call, caller, callee, now, None, now, reason);
-        self.history.record(call, &rows, now).await;
+        self.history.record_in_background(call, rows, now);
         CallReply {
             ended: Some(wire::ended(call, reason, None)),
         }
@@ -561,7 +557,7 @@ where
                 now,
                 reason,
             );
-            self.history.record(before.call_id, &rows, now).await;
+            self.history.record_in_background(before.call_id, rows, now);
         }
         Ok(true)
     }
