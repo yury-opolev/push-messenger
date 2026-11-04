@@ -824,10 +824,10 @@ mod tests {
         assert_eq!(load(&fixture, &minimal(&fixture)).unwrap().calls, None);
     }
 
-    const ADAPTER: &str = "push-voice-me";
+    const ADAPTER: &str = "voice-adapter";
 
     fn adapter() -> serde_json::Value {
-        json!({ "connect": { "pipe": ADAPTER } })
+        json!({ "spawn": { "command": [ADAPTER] } })
     }
 
     fn removed(field: &str) -> String {
