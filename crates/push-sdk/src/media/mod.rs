@@ -10,6 +10,11 @@
 //! [`MediaCall::outgoing`]. It forwards the client's call events to
 //! [`MediaCall::handle`] and learns the end from [`MediaCall::on_ended`].
 //!
+//! This PCM (16 kHz, mono, s16le, 20 ms frames of [`FRAME_SAMPLES`] samples) is exactly
+//! the audio format of the voice adapter protocol `push-voice-adapter/1`
+//! (docs/voice-adapter-protocol.md, "Audio"): push-agent-bridge passes it to and from its
+//! voice adapter as is, so an adapter never handles Opus or WebRTC.
+//!
 //! The feature needs Rust 1.89 (str0m) and a C toolchain with CMake (libopus, AWS-LC);
 //! the rest of push-sdk keeps the workspace's Rust 1.85.
 

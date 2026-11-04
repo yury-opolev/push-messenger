@@ -13,10 +13,13 @@ adapter without reading the bridge's source.
 - Rust implementation (framing, messages, limits, version negotiation):
   `crates/push-voice-adapter-proto`.
 
-**Status.** The bridge's adapter client ships in this release: `calls.adapter` in the
+**Status.** A voice adapter is the only way the bridge does speech: `calls.adapter` in the
 bridge's config, spawn and connect modes ([agent bridge §18, voice
-adapter](agent-bridge.md#voice-adapter)). The bridge's built-in speech providers
-(`calls.stt`, `calls.tts`, `calls.vad`) are deprecated and removed in the next release.
+adapter](agent-bridge.md#voice-adapter)). The bridge's former built-in speech providers
+(`calls.stt`, `calls.tts`, `calls.vad`) are removed; a config that still sets them does
+not start ([migrating](agent-bridge.md#migrating-from-callsstt-and-callstts)).
+[§14](#14-writing-an-adapter) shows how to write an adapter, [§15](#15-troubleshooting)
+what to check when it does not work.
 
 A reference adapter for tests is `crates/push-voice-adapter-testkit` (a library,
 `ScriptedAdapter`, and a binary): it hears tones as words and speaks a 600 Hz tone, and
@@ -38,7 +41,8 @@ Contents: [1 Overview](#1-overview) · [2 Transport](#2-transport) ·
 [6 Handshake and versions](#6-handshake-and-versions) · [7 A call](#7-a-call) ·
 [8 Speaking](#8-speaking) · [9 Liveness](#9-liveness) ·
 [10 Limits and backpressure](#10-limits-and-backpressure) · [11 Errors](#11-errors) ·
-[12 Compatibility](#12-compatibility) · [13 Privacy and security](#13-privacy-and-security)
+[12 Compatibility](#12-compatibility) · [13 Privacy and security](#13-privacy-and-security) ·
+[14 Writing an adapter](#14-writing-an-adapter) · [15 Troubleshooting](#15-troubleshooting)
 
 ## 1. Overview
 
@@ -460,3 +464,148 @@ and ignored — except a malformed `hello`, which ends the connection.
   [§2](#2-transport) and check the connecting process's user.
 - Cap what you accept from the bridge as the bridge caps what it accepts from you
   ([§10](#10-limits-and-backpressure)).
+
+## 14. Writing an adapter
+
+An adapter is a loop over frames. Each frame is a `u32` big-endian length of the payload,
+a kind byte (1 JSON, 2 audio) and the payload, at most 64 KiB ([§3](#3-framing)); an audio
+payload is the 9-byte header (`stream`, `seq`, `timestamp_ms`) and the samples
+([§4](#4-audio)). In Rust, `crates/push-voice-adapter-proto` does the framing, the
+messages, the limits and the version check. In another language, the JSON Schemas in
+[`docs/schemas/voice-adapter/v1/`](schemas/voice-adapter/v1/) describe each message.
+
+The main loop, in pseudo-code:
+
+```text
+main:
+    send logs to stderr or a file of your own: stdout carries frames only
+    hello = read_frame()                                  # the bridge speaks first
+    if hello is not a control frame of type "hello": close
+    version = the highest of hello.protocols (or hello.protocol) you speak
+    if there is none:
+        send error {code: "unsupported_protocol", message: "this adapter speaks push-voice-adapter/1"}
+        close
+    if hello.audio is not {rate: 16000, channels: 1, format: "s16le", frame_ms: 20}:
+        send error {code: "unsupported_format", message: "…"}
+        close
+    send hello {protocol: version, name, version,
+                capabilities: {stt: true, tts: true, vad: true}, voices}
+    call = none
+    every 10 s: send ping {id: next_ping_id()}
+    loop:
+        frame = read_frame()            # end of stream: exit; nothing for 30 s: the bridge is gone, close
+        if frame is audio:
+            if call is none or frame.stream != 0: drop it
+            elif frame has not 320 samples: drop it; send error unsupported_format once per call
+            else:
+                vad.push(frame.samples)
+                if vad.speech_started():
+                    utterance_id = new_id()
+                    send speech_started {call_id: call, utterance_id}
+                if vad.speech_ended():
+                    text = stt(vad.utterance(), language)
+                    if text is empty: send error {code: "recognition_failed", call_id: call, utterance_id}
+                    else: send transcript {call_id: call, utterance_id, text, final: true}
+            continue
+        message = parse the JSON           # malformed: send error invalid_message, continue
+        switch message.type:
+            "call_started":  if call is not none: send error busy; continue
+                             call = message.call_id; language = message.language; reset the VAD,
+                             the speak queue and stream 1's seq
+            "speak":         speaker.queue(message)            # start synthesising it now
+            "stop_speaking": speaker.stop(message.speak_id)    # absent: every speak not done;
+                                                               # each gets speak_done interrupted: true
+            "call_ended":    speaker.stop(all); call = none; reset the VAD and the queue
+            "ping":          send pong {id: message.id}
+            "pong", "error": nothing (log an error's code)
+            anything else:   ignore it
+```
+
+The speaker runs beside the loop, so reading never waits for synthesis:
+
+```text
+speaker (while a call is active):
+    tick = a clock firing every 20 ms
+    for each speak, oldest first:
+        i = 0
+        for each 320-sample frame of tts(speak.text, speak.voice):
+            if speak was stopped: break
+            if i >= 5: wait for tick                      # the first 100 ms go out at once
+            send audio {stream: 1, seq: next_seq(), timestamp_ms: 20 * i, samples}
+            i = i + 1
+        send speak_done {call_id, speak_id, interrupted: speak was stopped or failed}
+```
+
+Rules that matter in practice:
+
+- **Answer the hello at once**, within 10 s ([§6](#6-handshake-and-versions)). An adapter
+  that loads a model should load it after its hello and answer `engine_unavailable` while
+  it cannot listen yet.
+- **Read all the time.** One task reads, one writes; control messages go before queued
+  audio. A reader blocked behind synthesis stalls the bridge's writes and, after 30 s, the
+  link ([§9](#9-liveness)).
+- **Pace stream 1 with a clock**, 20 ms per frame, not as fast as the engine produces it:
+  the bridge buffers at most 2 s and drops the rest ([§4](#4-audio)). `seq` counts on per
+  call; `timestamp_ms` starts at 0 for each speak.
+- **One `speak_done` per `speak`** ([§8](#8-speaking)), `interrupted: true` when it was
+  cut, dropped or failed. `stop_speaking` without `speak_id` stops every speak not done.
+- **Reset on `call_started` and `call_ended`**: VAD state, queued speaks, ids. A
+  `call_started` with the same `call_id` after a reconnect is a fresh start.
+- **Ignore what you do not know**: unknown `type`s, fields, codes and reasons
+  ([§12](#12-compatibility)).
+- **Never write anything but frames to stdout** (spawn mode). A library that prints
+  corrupts the stream: in Python, keep `sys.stdout.buffer` for frames, point `sys.stdout`
+  at stderr before importing anything, and flush after each frame.
+- **Do not log content**: no transcripts, speech text or audio; ids, codes, lengths and
+  durations are fine ([§13](#13-privacy-and-security)).
+
+**Spawn mode** ([§2](#2-transport)): the bridge starts the program in
+`calls.adapter.spawn.command` (a list, no shell) and talks over its stdin and stdout; its
+stderr goes to the bridge's `logs\voice-adapter.log` or nowhere. The environment is the
+bridge's without its secrets: your own keys come from your own config file, or from a
+variable named in `calls.adapter.spawn.env_allow`. Exit when stdin ends; the bridge kills
+you 2 s after closing it. When you exit or fail, the bridge starts you again with a
+backoff (1 s, doubling to 60 s).
+
+**Connect mode** ([§2](#2-transport)): you run on your own and listen on a named pipe
+(Windows) or a Unix socket, private to the user (the table in §2:
+`FILE_FLAG_FIRST_PIPE_INSTANCE`, the DACL, the peer check). Serve one bridge at a time,
+answer a second one `error busy`, and wait for the next connection when the bridge's
+closes. The bridge reconnects with the same backoff.
+
+**Reference.** `crates/push-voice-adapter-testkit` implements all of this for tests (its
+`ScriptedAdapter` in `src/adapter.rs`, spawn and connect modes in `src/main.rs`): tones
+stand for words, so it shows the protocol, not a speech engine. Real engines live in
+adapters of their own, for example
+[yuopolev/voice-adapter](https://github.com/yuopolev/voice-adapter).
+
+## 15. Troubleshooting
+
+Start with `push-agent-bridge status`. Its `Voice:` line says whether calls can work
+(`off (no calls.adapter)`, `adapter starting`, `adapter ready (<name> <version>; stt, tts,
+vad, barge-in)`, `adapter backing off <n> s (<reason>)`, …) and the `Voice adapter:`
+line counts frames each way, dropped frames and restarts. The bridge's log
+(`logs\bridge.log`) has one `voice_adapter_failed` warning per failure with the same
+reason, and `adapter_ready`, `adapter_handshake_failed`, `adapter_link_closed` and
+`adapter_error` (`code`, for an error the adapter reports during a call); a spawned
+adapter's own output is in `logs\voice-adapter.log`. `PUSH_BRIDGE_LOG=debug` adds the
+adapter's other errors, `adapter_audio_format` and `adapter_unknown_type`. Every line of
+the [agent bridge's list](agent-bridge.md#voice-adapter) applies too.
+
+| Symptom | Cause and fix |
+|---|---|
+| The owner hears nothing | The hello has no `tts` (the `Voice:` line lists the capabilities): the bridge sends no `speak`. Stream-1 frames that are not 320 samples are dropped and answered `unsupported_format` (once per call; `adapter_audio_format` at debug). Audio outside a call, or for a speak that was stopped, is dropped. Frames sent much faster than real time overflow the bridge's 2 s buffer: "dropped from adapter" grows on the `Voice adapter:` line; pace them with a 20 ms clock ([§14](#14-writing-an-adapter)) |
+| The agent's voice stutters | Frames come late or in bursts: send each speak's first 100–200 ms at once, then one frame per 20 ms tick, and synthesise the next speak while the current one plays ([§8](#8-speaking)) |
+| `adapter ready (…), but calls are not advertised: the adapter cannot listen (no stt)` | The hello has no `stt`: the bridge does not advertise calls without it |
+| `adapter backing off <n> s (voice adapter program <file> was not found)` | Spawn mode: `command[0]` does not exist, or a bare name is not on the bridge's `PATH` (a Scheduled Task's `PATH` may differ from a console's). Use an absolute path. The command is a list (program, then each argument), run without a shell: no quoting, no `&&`, no `.cmd` or `.bat` (a config error) |
+| `adapter backing off <n> s (no voice adapter is listening on \\.\pipe\<name>)` | Connect mode: the adapter is not running, or listens on another name. Start it; the bridge retries up to every 60 s |
+| `adapter backing off <n> s (\\.\pipe\<name> belongs to another user)` | The process that owns the endpoint runs as another user (its user SID is not the bridge's or SYSTEM): run the adapter as the bridge's user, or pick another name |
+| The adapter cannot create its pipe ("access denied" on the first instance) | The name is in use: with `FILE_FLAG_FIRST_PIPE_INSTANCE` creating it fails instead of sharing it. An old instance of the adapter still runs, or another process took the name: stop it, or choose another name (and the same in `calls.adapter.connect.pipe`) |
+| `… (voice adapter refused the hello (busy))` | The adapter serves another bridge: two bridges (two `--dir`s) point at the same pipe or socket. One adapter per bridge |
+| `… (voice adapter speaks push-voice-adapter/2; this bridge speaks push-voice-adapter/1)` or `… (voice adapter does not speak push-voice-adapter/1 (unsupported_protocol))` | A version mismatch: update the adapter or the bridge ([§6](#6-handshake-and-versions)). Calls stay unadvertised meanwhile |
+| `… (voice adapter cannot take the bridge's audio (16000 Hz, 1 channel(s), s16le, 20 ms frames) (unsupported_format))` | The adapter refused the v1 format in its hello |
+| `… (the voice adapter sent a bad frame: …)`, often right after the start | stdout carries something that is not a frame: a banner, a progress bar, a `print`, a library's warning. The bridge answers `invalid_frame` and drops the link. Send all of it to stderr (it lands in `voice-adapter.log`) |
+| `… (the voice adapter sent no hello within 10 s)` | Answer the hello first, then load models |
+| `… (the voice adapter stopped responding)` | Nothing came for 30 s: answer every `ping`, send your own, and keep reading while you synthesise |
+| `… (the voice adapter sent too many messages)` | More than 100 control messages in a second ([§10](#10-limits-and-backpressure)) |
+| `… (the voice adapter closed the connection)` | The adapter exited or closed the stream; see its own log |

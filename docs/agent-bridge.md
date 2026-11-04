@@ -44,7 +44,7 @@ here too, this guide describes what the code does.
 | Replies | `agent.reply@2` cards (Coda writes Markdown; `agent.reply@1` for a plain-text backend): thinking, tool steps and text, edited as the turn runs |
 | Questions to the owner | `agent.approval@1`, `agent.question@1`, `agent.choose@1`, `agent.plan-approval@1` ([built-ins](rich-messages.md#6-built-in-templates)) |
 | Status | live activity: working, waiting, idle ([activity](activity-presence.md#7-agents)) |
-| Voice calls | the owner may call the agent from their app (build with `--features voice`, a `calls` section): what they say becomes prompts, posted as `agent.transcript@1`; the replies are spoken (Azure AI Speech or local engines); cards can be answered by voice ([voice calls](#18-voice-calls)) |
+| Voice calls | the owner may call the agent from their app (build with `--features voice`, a `calls` section): what they say becomes prompts, posted as `agent.transcript@1`; the replies are spoken; the speech runs in a separate voice adapter process (any engine, local or cloud); cards can be answered by voice ([voice calls](#18-voice-calls)) |
 | Stored on the machine | `config.json`, `state.json` (no secrets) and a JSON-lines log; tokens stay in memory |
 
 ## 2. Architecture
@@ -123,9 +123,10 @@ it, a Cargo workspace of its own outside the root one.
 
 **Voice** (`voice` module, [voice calls](#18-voice-calls)): a `Phone` answers the owner's
 calls (`MediaPhone` over push-sdk's media helper, feature `voice`; `FakePhone` in tests),
-a `Session` per call runs the pipeline (voice activity detection, speech-to-text, the
-spoken sentences through text-to-speech, barge-in), and the speech providers (`Stt`,
-`Tts`: `azure`, `local`, tone-based `fake`) sit behind traits. The core's `core/voice.rs`
+a `Session` per call runs the pipeline (the owner's audio out, transcripts in, the
+sentences to speak, barge-in) with its speech in a `SpeechEngine`: the voice adapter's
+(`voice::adapter`: spawn or connect, the link, the supervisor and the call router; the
+bridge has no speech engine of its own). The core's `core/voice.rs`
 answers or declines calls, posts transcripts, sends them to the backend like typed text,
 speaks replies and cards, and takes spoken answers; nothing in it knows Coda.
 
@@ -145,7 +146,8 @@ speaks replies and cards, and takes spoken answers; nothing in it knows Coda.
   SQLite); with `--features voice` (voice calls), Rust 1.89 and CMake.
 - For [voice calls](#18-voice-calls): calls enabled on the deployment
   ([enabling calls](calls.md#2-enabling-calls)), a message-svc that seeds
-  `agent.transcript@1`, an owner's app that places calls, and a speech provider.
+  `agent.transcript@1`, an owner's app that places calls, and a
+  [voice adapter](#voice-adapter) program.
 
 ## 4. Setup on Windows
 
@@ -207,7 +209,7 @@ Create `%LOCALAPPDATA%\push-messenger\coda-bridge\config.json`. Every field:
 | `coda.args` | no | extra arguments after `serve`, as a list | `[]` |
 | `control` | no | serve the local [control channel](#14-control-channel-for-other-tools) (the tray's status and actions, `pause`, `resume`); `false` turns it off, and the bridge works as without it (the tray then cannot see or reach it) | `true` |
 | `peek` | no | keep the owner conversation's last 50 messages in memory, masked, for the tray's [chat peek](#chat-peek) (the control channel's `peek`); `false` keeps nothing and answers `peek_disabled` | `true` |
-| `calls` | no | voice calls with the owner: `answer` (`auto`), `language` (`en-US`), `stt` and `tts` (`{"provider": "azure-speech" \| "local" \| "none", …}`), `vad` (`silence_ms` 700, `min_speech_ms` 300); `stt` `none` means no calls (not advertised), `tts` `none` keeps replies in the chat ([every field](#the-calls-section)) | absent: no calls (not advertised) |
+| `calls` | no | voice calls with the owner: `answer` (`auto`), `language` (`en-US`), `adapter` (the [voice adapter](#voice-adapter) doing the speech: `{"spawn": {…}}` or `{"connect": {…}}`; without it no calls are advertised), `notify_by_call` ([every field](#the-calls-section)). `stt`, `tts` and `vad` are no longer accepted ([migrating](#migrating-from-callsstt-and-callstts)) | absent: no calls (not advertised) |
 
 Unknown fields are refused (a typo is an error, not ignored), and a UTF-8 byte order mark
 as Notepad writes it is fine. In JSON, double every backslash. `push-agent-bridge status`
@@ -315,7 +317,7 @@ push-agent-bridge [--dir <folder>] <command>
 | `thumbprint` | prints the thumbprint of the existing key |
 | `enroll --code <code>` | enrolls with the owner's one-time code and registers this device |
 | `run` | runs the bridge until Ctrl-C (what the logon task runs) |
-| `status` | prints the configuration path (and what is wrong with it), the key and its thumbprint, the agent user, the device, the folder, the sessions per folder, voice (`off (no calls section)`, `on: stt <provider>, tts <provider>`, `off (calls.stt is none)`, or configured in a build without voice; [details](#build-with-voice)) and the log's path; no secrets |
+| `status` | prints the configuration path (and what is wrong with it), the key and its thumbprint, the agent user, the device, the folder, the sessions per folder, voice (`off (no calls section)`, `off (no calls.adapter)`, the voice adapter's state such as `adapter ready (…)`, or configured in a build without voice; [details](#build-with-voice)) and the log's path; no secrets |
 | `pause [--reason <text>] [--drain-timeout <seconds>]` | asks the running bridge (through its [control channel](#14-control-channel-for-other-tools)) to [pause Coda for an upgrade](#15-upgrade-mode): Coda finishes its work (600 s at most by default), saves its state and is stopped; prints "Coda is paused; its program is released." once its program can be replaced. The bridge starts Coda again with its state once the program file changed, and holds the owner's texts meanwhile |
 | `resume` | asks the running bridge to start the paused Coda now (its program must be usable) and prints "Coda is resuming."; a pause that is still draining is cancelled instead: "The pause was cancelled; Coda keeps running." |
 | `help`, `--help`, `-h` | prints the usage |
@@ -551,13 +553,13 @@ restarts."
 | Someone else talks to the agent by voice | Only the owner's calls are answered (the server refuses non-contacts first), one at a time; a transcript is never a `/` command |
 
 **Voice calls.** The call's audio is encrypted end to end between the owner's app and the
-bridge. What the owner says and what the agent replies goes to the configured speech
-providers: with `azure-speech` each utterance's audio and each spoken sentence's text
-leave the machine for Azure AI Speech; with `local` they go to the configured command or
-URL; with `none`, nowhere. The bridge stores no audio; transcripts exist only as the masked
-`agent.transcript@1` messages it posts (stored on the server like every message). Speech
-keys come from environment variables only, Entra tokens stay in memory, and the logs carry
-no audio or text. Details: [privacy](#privacy-what-each-provider-receives).
+bridge. The call's audio and the text of each spoken sentence (masked) go to the
+configured voice adapter, a local process of the same user; where it sends them (a local
+engine, a cloud speech service) is up to the adapter. The adapter gets no credentials,
+tokens or history, and a spawned adapter's environment has none of the bridge's secrets.
+The bridge stores no audio; transcripts exist only as the masked `agent.transcript@1`
+messages it posts (stored on the server like every message), and the logs carry no audio
+or text. Details: [privacy](#privacy-what-the-adapter-receives).
 
 **Masking.** Previews, plans, step labels, thinking, text, command results, background
 messages and questions are masked before they leave the machine. Each match becomes
@@ -617,7 +619,7 @@ and upgrade mode add `control_listening` (`instance`), `control_unavailable` (`r
 `pause_started` (`drain_ms`), `backend_prepared`, `prepare_unsupported`, `pause_failed`,
 `backend_released`, `program_changed`, `backend_resuming` (`restore`),
 `pause_cancelled`, `backend_program_unusable` and `backend_restart_by_owner`. Voice calls
-add the events listed in [privacy](#privacy-what-each-provider-receives).
+add the events listed in [privacy](#privacy-what-the-adapter-receives).
 
 The tray keeps `tray.json` outside the bridge folders
 ([location](#trayjson)).
@@ -673,25 +675,13 @@ owner's app. Use a scratch root folder.
    agent: it answers "This agent is private." once, and nothing reaches Coda (the log shows
    `stranger_refused`).
 
-**Speech providers.** `crates/push-bridge/tests/live_speech.rs` tries the configured
-providers ([the calls section](#the-calls-section)) against the real services (Azure AI
-Speech or local engines): text-to-speech
-says "Please run the unit tests now." and speech-to-text must hear "test" in it. With
-speech-to-text only, it transcribes a recording instead. It prints provider names and
-timings only:
-
-```powershell
-$env:PUSH_BRIDGE_LIVE_SPEECH = "1"
-$env:PUSH_BRIDGE_LIVE_SPEECH_CONFIG = "$env:LOCALAPPDATA\push-messenger\coda-bridge\config.json"  # or a file with just the calls section
-# $env:PUSH_BRIDGE_LIVE_SPEECH_WAV = "C:\scratch\run-the-tests.wav"  # speech-to-text only
-cargo test -p push-bridge --test live_speech -- --nocapture
-```
-
-The voice pipeline itself is tested end to end in CI (`bridge-voice`:
-`crates/push-smoke/tests/bridge_voice.rs`, opt in locally with `PUSH_BRIDGE_VOICE=1` and
-Docker): the owner's call over real media, a prompt, a spoken reply, barge-in, a voice
-approval and a stranger refused, with tone-based speech fakes
-([testing](#testing)).
+**Voice.** The voice pipeline is tested end to end in CI (`bridge-voice`:
+`crates/push-smoke/tests/bridge_voice.rs` and `bridge_voice_adapter.rs`, opt in locally
+with `PUSH_BRIDGE_VOICE=1` and Docker): the owner's call over real media, a prompt, a
+spoken reply, barge-in, a voice approval and a stranger refused, with the testkit's
+tone-based voice adapter ([testing](#testing)). Real speech engines are tested in their
+own adapters; to try one with the bridge, configure it in `calls.adapter` and call the
+agent from the owner's app.
 
 ## 13. The tray app (push-agent-tray)
 
@@ -1528,11 +1518,14 @@ switch-over).
 
 The owner can call the agent from their app ([voice calls](calls.md)) and talk to it: the
 bridge answers, turns what the owner says into prompts, speaks the agent's replies, and
-takes spoken answers to its cards. Design: spec
-[2026-11-03-voice-calls-design](superpowers/specs/2026-11-03-voice-calls-design.md) §10.3
-and the plan's "PR 7 refined" section
-([2026-11-03-voice-calls](superpowers/plans/2026-11-03-voice-calls.md)); this guide
-describes what the code does.
+takes spoken answers to its cards. The speech itself (hearing when the owner speaks,
+recognising it, synthesising the replies) runs in a separate **voice adapter** process
+that the bridge starts or connects to ([voice adapter](#voice-adapter),
+[protocol](voice-adapter-protocol.md)); the bridge carries the audio and keeps the
+conversation. Design: the
+[voice calls spec](superpowers/specs/2026-11-03-voice-calls-design.md) and its addendum
+[2026-11-04-voice-adapter-design](superpowers/specs/2026-11-04-voice-adapter-design.md);
+this guide describes what the code does.
 
 ### Who gets through
 
@@ -1542,7 +1535,7 @@ describes what the code does.
 | The owner calls, `calls.answer` `ask` | a card asks first ([asking before answering](#asking-before-answering)); answered only when the owner picks "Answer" before the ring ends, then greeted as above |
 | Anyone else calls | refused by the server when they are not the agent's contact (`NOT_CONTACT`); a call from anyone but the owner that reaches the bridge is declined |
 | A second call while one runs (or is being answered, asked about or placed, or the bridge is stopping) | declined busy |
-| No `calls` section, or `calls.stt` is `none` without `calls.adapter` | calls are not advertised, so the owner's app sees the agent as unreachable (the server answers `UNREACHABLE`) |
+| No `calls` section, or no `calls.adapter` | calls are not advertised, so the owner's app sees the agent as unreachable (the server answers `UNREACHABLE`) |
 | `calls.adapter`, and the [voice adapter](#voice-adapter) is not ready (or cannot listen) | the same: calls are advertised only while the adapter is ready with `stt` |
 | A build without `--features voice` | calls are not advertised; a `calls` section only prints a warning at start (`voice_unavailable`) |
 
@@ -1557,28 +1550,29 @@ cargo build --release -p push-bridge --features voice
 ```
 
 The feature `voice` brings push-sdk's [media helper](calls.md#19-media-helper) (feature
-`calls-media`: ICE, DTLS-SRTP and Opus natively), which needs **Rust 1.89** and **CMake**
-with the MSVC build tools; the bridge without it keeps Rust 1.85. Everything else of the
-pipeline (speech providers, detector, spoken text, voice answers, the
-[voice adapter](#voice-adapter) client) builds and is tested without the feature; without
-it no adapter is started and calls are not advertised.
+`calls-media`: ICE, DTLS-SRTP and Opus natively) and nothing else; it needs **Rust 1.89**
+and **CMake** with the MSVC build tools; the bridge without it keeps Rust 1.85. The bridge
+has no speech engine of its own. Everything else of the pipeline (the
+[voice adapter](#voice-adapter) client, spoken text, voice answers, the policies) builds
+and is tested without the feature; without it no adapter is started and calls are not
+advertised.
 
-`push-agent-bridge status` prints a `Voice:` line with provider names only:
+`push-agent-bridge status` prints a `Voice:` line:
 
 | `Voice:` | Meaning |
 |---|---|
 | `off (no calls section)` | no `calls` in `config.json` |
-| `off (calls.stt is none)` | nobody listens: calls are not advertised |
+| `off (no calls.adapter)` | a `calls` section without `adapter`: nothing does the speech, calls are not advertised |
 | `configured, but this build has no voice (build with --features voice)` | rebuild with the feature |
-| `on: stt <provider>, tts <provider>` | calls are answered; at start the log says `voice_enabled` with the two names |
-| `adapter ready (<name> <version>; stt, tts, vad, barge-in)` | `calls.adapter`: the running bridge's adapter is ready; calls are advertised (after 2 s ready, never during a call) |
+| `adapter ready (<name> <version>; stt, tts, vad, barge-in)` | the running bridge's adapter is ready with these capabilities; calls are advertised (after 2 s ready, never during a call) |
 | `adapter ready (…), but calls are not advertised: the adapter cannot listen (no stt)` | the adapter has no `stt` |
 | `adapter starting`, `adapter starting (handshake)` | the bridge is starting or connecting to the adapter, or waits for its hello |
 | `adapter backing off <n> s (<reason>)` | the adapter ended or could not be started or reached; the bridge tries again in `n` seconds |
 | `adapter configured (the bridge is not running)` | `status` asks the running bridge; none runs |
 
 With a running adapter a `Voice adapter:` line follows with its counters
-([metrics](#voice-adapter)).
+([metrics](#voice-adapter)). A `config.json` that still has `calls.stt`, `calls.tts` or
+`calls.vad` shows the error under `Configuration:` ([migrating](#migrating-from-callsstt-and-callstts)).
 
 ### The calls section
 
@@ -1588,146 +1582,92 @@ validated (by `run`, `enroll` and `status`) whether or not the build has voice.
 | Field | Meaning | Default |
 |---|---|---|
 | `calls.answer` | `auto`: the owner's call is answered at once. `ask`: a card asks the owner first ([asking before answering](#asking-before-answering)) | `auto` |
-| `calls.language` | the language spoken, a BCP 47 tag; sent to the speech providers | `en-US` |
-| `calls.adapter` | the [voice adapter](#voice-adapter) doing the speech: `{"spawn": {…}}` or `{"connect": {…}}`. With it, `calls.stt`, `calls.tts` and `calls.vad` stay unset (or `none`) | |
-| `calls.stt` | speech-to-text, **deprecated**: `{"provider": "azure-speech", …}`, `{"provider": "local", …}` or `{"provider": "none"}` (calls are not advertised unless `calls.adapter` is set) | `none` |
-| `calls.tts` | text-to-speech, **deprecated**: the same three; `none` keeps every reply in the chat and the call silent (no greeting either) | `none` |
-| `calls.vad.silence_ms` | **deprecated**: the silence that ends an utterance, 200 to 5000 | `700` |
-| `calls.vad.min_speech_ms` | **deprecated**: the speech an utterance needs, 100 to 5000; shorter sounds (a cough, a click) are dropped | `300` |
+| `calls.language` | the language spoken, a BCP 47 tag; sent to the voice adapter in its hello and each `call_started` | `en-US` |
+| `calls.adapter` | the [voice adapter](#voice-adapter) doing the speech: `{"spawn": {…}}` or `{"connect": {…}}`. Without it the bridge takes no calls and places none | |
 | `calls.notify_by_call` | when the agent calls its owner ([the agent calls you](#the-agent-calls-you)); absent: never | |
-
-**The built-in providers are deprecated.** `azure-speech`, `local` and the detector
-(`calls.stt`, `calls.tts`, `calls.vad`) still work in this release when `calls.adapter` is
-absent, exactly as before; the next release removes them (a config that still sets them
-then fails to start, naming the field). Move the speech into a
-[voice adapter](#voice-adapter).
-
-**`azure-speech`** ([Azure AI Speech](https://learn.microsoft.com/azure/ai-services/speech-service/),
-REST, no SDK):
-
-| Field | Meaning |
-|---|---|
-| `region` | the resource's region, such as `westeurope`: the regional endpoints `https://<region>.stt.speech.microsoft.com` and `https://<region>.tts.speech.microsoft.com`, with a key |
-| `endpoint` | instead of `region`: the resource's custom domain, `https://<name>.cognitiveservices.azure.com` (`/stt/…` and `/tts/…` below it), with a key or Entra |
-| `key_env` | the environment variable holding the key (sent as `Ocp-Apim-Subscription-Key`, read at each request, never in `config.json`); default `AZURE_SPEECH_KEY` |
-| `entra` | sign in with an Entra token instead of a key (needs `endpoint`): `resource_id` (the Speech resource's Azure resource ID; the token is then sent as `aad#<resource_id>#<token>`) and `token_command` (a program and its arguments, run without a shell, that prints an access token). Default command: `az account get-access-token --resource https://cognitiveservices.azure.com --query accessToken -o tsv` (`az.cmd` on Windows). A token is reused for 30 minutes; a 401 fetches a new one and tries once more |
-| `voice` | `calls.tts` only: the voice name | `en-US-JennyNeural` |
 
 ```json
 "calls": {
   "language": "en-US",
-  "stt": { "provider": "azure-speech", "region": "westeurope" },
-  "tts": { "provider": "azure-speech", "region": "westeurope", "voice": "en-US-JennyNeural" }
+  "adapter": { "spawn": { "command": ["C:\\Tools\\voice\\voice-adapter.exe"] } }
 }
 ```
 
-With the key in the user's environment (`[Environment]::SetEnvironmentVariable("AZURE_SPEECH_KEY", "<key>", "User")`,
-then restart the bridge). With Entra, signed in with `az login` as a user who has the
-*Cognitive Services Speech User* (or *Cognitive Services User*) role on the resource:
+**Validation messages** (`status` prints them; `run` and `enroll` exit 1 with "invalid
+configuration: <message>"):
 
-```json
-"calls": {
-  "stt": {
-    "provider": "azure-speech",
-    "endpoint": "https://my-speech.cognitiveservices.azure.com",
-    "entra": { "resource_id": "/subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.CognitiveServices/accounts/my-speech" }
-  },
-  "tts": {
-    "provider": "azure-speech",
-    "endpoint": "https://my-speech.cognitiveservices.azure.com",
-    "entra": { "resource_id": "/subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.CognitiveServices/accounts/my-speech" }
-  }
-}
+| Message | Fix |
+|---|---|
+| `calls.stt is no longer supported: speech runs in a voice adapter. Configure calls.adapter (docs/agent-bridge.md §18, docs/voice-adapter-protocol.md).` (also `calls.tts`, `calls.vad`) | remove the field and configure `calls.adapter` ([migrating](#migrating-from-callsstt-and-callstts)) |
+| `calls.language must be a language tag such as "en-US"` | a tag like `en-US`, `de-DE`, `en` |
+| `calls.notify_by_call.after_minutes must be 0 (off) to 8: a card expires after 10 minutes` | the call must ring and talk before the card's 10 minutes are over |
+| `calls.notify_by_call.min_interval_minutes must be 10 to 1440` | at most one call per 10 minutes, or less often |
+| `calls.notify_by_call.do_not_disturb[<i>] <why>: write "22:00-07:00", "mon-fri 22:00-07:00" or "sat,sun 00:00-24:00"` | `<why>` is `needs a time range`, `has a bad time "…"` (`HH:MM`, two digits each; `24:00` only as an end), `has an unknown day "…"` (`mon` … `sun`) or `is empty (its start and end are the same)` |
+| `calls.notify_by_call needs calls.adapter: without it the bridge takes no calls and places none` | add `calls.adapter`, or set `after_minutes` 0 and `urgent` false |
+
+The `calls.adapter` messages are in [voice adapter](#voice-adapter).
+
+### Migrating from `calls.stt` and `calls.tts`
+
+Earlier builds had speech providers of their own (`azure-speech`, `local`) and a voice
+activity detector, set with `calls.stt`, `calls.tts` and `calls.vad`. They are gone: a
+`config.json` that still has any of the three (whatever its value, `none` and `null`
+included) does not start. `run` and `enroll` exit 1 and `status` shows, for the first of
+`stt`, `tts`, `vad` it finds:
+
+```text
+invalid configuration: calls.stt is no longer supported: speech runs in a voice adapter. Configure calls.adapter (docs/agent-bridge.md §18, docs/voice-adapter-protocol.md).
 ```
 
-Speech-to-text uses the REST API for short audio (`language`, `format=simple`; no match is
-an empty transcript); text-to-speech sends SSML with `language` and `voice` and asks for
-`raw-16khz-16bit-mono-pcm`.
-
-**`local`**: engines on this machine. Exactly one of `url` or `command`:
-
-| Field | Speech-to-text | Text-to-speech |
-|---|---|---|
-| `url` (`http://` or `https://`) | a whisper.cpp server's `/inference`: the WAV is POSTed as multipart form data (`file`, `response_format=json`, `temperature=0`, `language`) and `text` is the transcript | POSTs the text (`text/plain`) and reads a 16-bit PCM WAV back (any rate, mono or stereo) |
-| `command` (a program and its arguments, run without a shell) | `{wav}` in an argument (required) becomes a temporary WAV file of the utterance, `{language}` the language's primary subtag (`en`); stdout is the transcript | reads the text on stdin and writes raw 16-bit little-endian mono samples at `sample_rate` to stdout |
-| `sample_rate` | | required with `command`, 8000 to 48000; not allowed with `url` (the WAV header says) |
-
-Markers such as `[BLANK_AUDIO]`, `[Music]` or `(silence)` are removed from a transcript.
-Each request or command may take 30 s; a command that runs longer is killed. On Windows a
-program without an extension is looked up as an `.exe`: name a `.cmd` or `.bat` with its
-extension. Audio is converted to and from 16 kHz as needed.
+Nothing changes silently. To migrate, remove the three fields and set `calls.adapter` to
+a voice adapter that does the same job: one wrapping your whisper.cpp and piper, one
+calling Azure AI Speech, or a realtime speech model. The adapter detects speech itself,
+so `calls.vad` has no replacement in the bridge. Before:
 
 ```json
 "calls": {
   "language": "en-US",
   "stt": { "provider": "local", "url": "http://127.0.0.1:8080/inference" },
-  "tts": { "provider": "local", "command": ["C:\\Tools\\piper\\piper.exe", "--model", "C:\\Tools\\piper\\en_US-lessac-medium.onnx", "--output_raw"], "sample_rate": 22050 }
+  "tts": { "provider": "local", "command": ["C:\\Tools\\piper\\piper.exe", "--model", "C:\\Tools\\piper\\en_US-lessac-medium.onnx", "--output_raw"], "sample_rate": 22050 },
+  "vad": { "silence_ms": 700 },
+  "notify_by_call": { "after_minutes": 5 }
 }
 ```
 
-The server for that `url` is whisper.cpp's `whisper-server -m ggml-base.en.bin --host
-127.0.0.1 --port 8080`. Without a server, the command line tool loads its model for each
-utterance (slower to answer):
+After:
 
 ```json
-"stt": { "provider": "local", "command": ["C:\\Tools\\whisper\\whisper-cli.exe", "-m", "C:\\Tools\\whisper\\ggml-base.en.bin", "-f", "{wav}", "-l", "{language}", "-nt", "-np"] }
+"calls": {
+  "language": "en-US",
+  "adapter": {
+    "spawn": { "command": ["C:\\Tools\\voice\\voice-adapter.exe", "--config", "C:\\Tools\\voice\\adapter.json"] }
+  },
+  "notify_by_call": { "after_minutes": 5 }
+}
 ```
 
-(`-nt`: no timestamps, `-np`: no other output.) A TTS `url` suits any local server that
-answers text with a WAV.
-
-**`none`**: `{"provider": "none"}`, no other field.
-
-**Validation messages** (`status` prints them; `run` and `enroll` exit 1 with "invalid
-configuration: <message>"). `<at>` is `calls.stt` or `calls.tts`:
-
-| Message | Fix |
-|---|---|
-| `calls.language must be a language tag such as "en-US"` | a tag like `en-US`, `de-DE`, `en` |
-| `<at>: set exactly one of <at>.region or <at>.endpoint` | `azure-speech` needs one of them |
-| `<at>.region must be an Azure region such as "westeurope"` | lower-case letters and digits |
-| `<at>.endpoint must start with https://` | the custom domain's URL |
-| `<at>.entra: Entra sign-in needs <at>.endpoint, the resource's custom domain` | Entra works with `endpoint` only |
-| `<at>: set <at>.entra or <at>.key_env, not both` | choose one |
-| `<at>.entra.token_command must name a program` | a non-empty first item |
-| `<at>.key_env must be an environment variable's name` | letters, digits and `_`, not starting with a digit |
-| `calls.stt.voice is only for calls.tts` | remove `voice` from `stt` |
-| `calls.tts.voice must be a voice name such as "en-US-JennyNeural"` | letters, digits and `-` |
-| `<at>: set exactly one of <at>.url or <at>.command` | `local` needs one of them |
-| `<at>.url must start with http:// or https://` | |
-| `<at>.command must name a program` | a non-empty first item |
-| `calls.stt.command must pass the audio file as {wav} in an argument` | add `{wav}` to an argument |
-| `calls.tts.sample_rate is required with calls.tts.command` | the command's output rate (piper: the voice's, often 22050) |
-| `calls.tts.sample_rate must be 8000 to 48000` | |
-| `calls.tts.sample_rate is only for calls.tts.command: the WAV header says` | remove it with `url` |
-| `calls.vad.silence_ms must be 200 to 5000` | |
-| `calls.vad.min_speech_ms must be 100 to 5000` | |
-| `calls.notify_by_call.after_minutes must be 0 (off) to 8: a card expires after 10 minutes` | the call must ring and talk before the card's 10 minutes are over |
-| `calls.notify_by_call.min_interval_minutes must be 10 to 1440` | at most one call per 10 minutes, or less often |
-| `calls.notify_by_call.do_not_disturb[<i>] <why>: write "22:00-07:00", "mon-fri 22:00-07:00" or "sat,sun 00:00-24:00"` | `<why>` is `needs a time range`, `has a bad time "…"` (`HH:MM`, two digits each; `24:00` only as an end), `has an unknown day "…"` (`mon` … `sun`) or `is empty (its start and end are the same)` |
-| `calls.notify_by_call needs calls.stt: without it the bridge takes no calls and places none` | without `calls.adapter`: a speech-to-text provider, or `after_minutes` 0 and `urgent` false |
-| `calls.notify_by_call needs calls.tts: the call says what it is about` | without `calls.adapter`: a text-to-speech provider |
-
-The `calls.adapter` messages are in [voice adapter](#voice-adapter).
+A spawned adapter never gets `AZURE_SPEECH_KEY` (nor any variable named like a secret,
+unless `env_allow` names it): give it its key in its own configuration, or under another
+name listed in `calls.adapter.spawn.env_allow`. Without `calls.adapter` the bridge still
+starts, but takes no calls (`Voice: off (no calls.adapter)`), and `calls.notify_by_call`
+with `after_minutes` above 0 or `urgent` is an error.
 
 ### Voice adapter
 
-With `calls.adapter` the speech runs in a separate process, the **voice adapter**: it hears
-the call's audio and says what was said, and it speaks the sentences the bridge sends it.
+The voice adapter does the speech, a separate process: it hears the call's audio and
+says what was said, and it speaks the sentences the bridge sends it.
 Any engine fits behind it (local models, a cloud service, a realtime speech model); the
-wire is [`push-voice-adapter/1`](voice-adapter-protocol.md). Everything else stays in the
+wire is [`push-voice-adapter/1`](voice-adapter-protocol.md), which also shows how to
+[write one](voice-adapter-protocol.md#14-writing-an-adapter). Everything else stays in the
 bridge: answering and the policies, transcripts in the chat, prompts and steers, voice
 answers to cards, spoken text and masking, barge-in, mute, activity and the tray. The
 client is plain tokio and needs no feature, but only a build with `--features voice` takes
 calls: without it no adapter is started and calls are not advertised.
 
-**With the built-in providers.** `calls.adapter` replaces them: with it, `calls.stt` and
-`calls.tts` stay absent or `{"provider": "none"}` and `calls.vad` absent (or at its
-defaults). `calls.stt` defaults to `none`, so `"calls": {"adapter": …}` alone is a calls
-section, and `calls.notify_by_call` needs no `stt` or `tts` with an adapter (the bridge
-then calls its owner only while the adapter is ready with `stt` and `tts` and calls are
-advertised; without `tts` it logs `call_held` `no_tts`). The built-in
-providers are deprecated and go in the next release.
+**Required for calls.** `"calls": {"adapter": …}` alone is a calls section; without
+`adapter` the bridge takes no calls and places none. `calls.notify_by_call` calls the
+owner only while the adapter is ready with `stt` and `tts` and calls are advertised
+(without `tts` it logs `call_held` `no_tts`).
 
 **Spawn**: the bridge starts the adapter and speaks the protocol on its stdin (bridge →
 adapter) and stdout (adapter → bridge).
@@ -1792,7 +1732,6 @@ endpoint is refused ("… belongs to another user") and backed off from; the
 
 | Message | Fix |
 |---|---|
-| `calls.adapter and calls.stt cannot both be set; speech runs in the adapter` (also `tts`, `vad`) | remove the field, or set it to `none` |
 | `calls.adapter.spawn.command is empty`, `calls.adapter.spawn.command[<i>] is empty` | the program, then its arguments |
 | `calls.adapter.spawn.command[0] is a batch file; …` | an `.exe`, or the interpreter with the script as an argument |
 | `calls.adapter.spawn.env_allow[<i>] must be an environment variable's name` | letters, digits and `_`, not starting with a digit |
@@ -1898,47 +1837,48 @@ Other events: `adapter_ready` (`name`, `version`, `stt`, `tts`, `vad`),
   within 10 s ([handshake](voice-adapter-protocol.md#6-handshake-and-versions)); one
   that loads a model first should answer at once and load afterwards (answering a call's
   speech it cannot handle yet with `engine_unavailable`).
+- More cases, from the adapter's side: the protocol's
+  [troubleshooting](voice-adapter-protocol.md#15-troubleshooting).
 - Its own output: `logs\voice-adapter.log` (spawn with `stderr` `log`); more detail from
   the bridge with `PUSH_BRIDGE_LOG=debug`.
 
 ### The pipeline
 
-Call audio is 16 kHz mono in 20 ms frames (the [media helper](calls.md#194-audio)). Up to
-5 s of the owner's audio waits for the pipeline; when it falls further behind, newer frames
-are dropped.
+The bridge carries the call's audio between the owner's app and the voice adapter and
+keeps the conversation; the adapter does the speech. Call audio is 16 kHz mono in 20 ms
+frames (the [media helper](calls.md#194-audio)), exactly the adapter's format, so neither
+side converts it again. Up to 5 s of the owner's audio waits for the pipeline (newer
+frames are dropped when it falls further behind), and a 1 s queue to the adapter drops
+the oldest.
 
-**Listening.** A voice activity detector cuts the owner's audio into utterances, by energy:
+| In the bridge | In the voice adapter |
+|---|---|
+| answering and the [policies](#asking-before-answering), owner-only calls, busy and stranger declines | detecting speech (`speech_started`) |
+| transcripts in the chat, prompts and steers, [voice answers](#voice-answers-to-cards) to cards | speech-to-text (final `transcript`s) |
+| the replies turned into plain sentences, [masking](#9-security-model), mute and barge-in | text-to-speech (stream-1 audio for each `speak`) |
+| activity labels, the tray's call controls, the [fallback](#voice-adapter) when the adapter goes away | its own engines, keys and logs |
 
-- A frame's energy is its RMS in dBFS. The noise floor is the quietest frame of the last
-  1.5 s (75 frames), held between -70 and -30 dBFS. A frame is speech when it is more than
-  10 dB above the floor and above -55 dBFS, so a steady noise stops counting as speech
-  within 1.5 s.
-- Three speech frames in a row (60 ms) start an utterance, which keeps the 200 ms before
-  them.
-- It ends after `silence_ms` of frames that are not speech, keeping at most 200 ms after
-  the last speech frame. With less than `min_speech_ms` of speech it is dropped.
-- An utterance reaching 30 s is cut there and sent; the next speech starts a new one.
-
-**Transcribing.** The utterances go to the speech-to-text provider one at a time, in order.
-An empty transcript does nothing; a provider failure is logged (`stt_failed`) and the bridge
-says "Sorry, I couldn't make that out." Each transcript is then:
+**Listening.** The adapter says when the owner starts speaking (`speech_started`, with
+`vad`) and what was said (a final `transcript`). A `recognition_failed` from it makes the
+bridge say "Sorry, I couldn't make that out." Each final transcript is then:
 
 1. posted to the owner's conversation as an
    [`agent.transcript@1`](rich-messages.md#agenttranscript1) card (`speaker: owner`, the
    text masked and cut at 4,000 characters; fallback "🎤 voice: <text>"; heading "🎤
    voice"), and kept in the [chat peek](#chat-peek) as the owner's text "🎤 <text>";
 2. with a card open, an answer to the oldest one ([voice answers](#voice-answers-to-cards)),
-   but only when the utterance began (its onset) after that card was posted: words begun
-   before the card existed were not meant for it ("yes, go ahead" said as a steer never
-   approves a permission card that opened while it was transcribed);
+   but only when the utterance began (its `speech_started`, or the final transcript's
+   arrival without one) after that card was posted:
+   words begun before the card existed were not meant for it ("yes, go ahead" said as a
+   steer never approves a permission card that opened while it was transcribed);
 3. otherwise sent to the agent as typed text is ([the owner's text](#6-behaviour), steps
    3 and 4): a prompt when the agent is idle, a steer while a turn runs (or waiting for it
    to end), held while Coda is paused. A transcript is **never a `/` command**, whatever it
    says.
 
-**Speaking.** The agent's replies are still posted as usual; with a `tts` provider they are
-also spoken, sentence by sentence as the text streams in, without waiting for the turn to
-end. The Markdown becomes plain sentences:
+**Speaking.** The agent's replies are still posted as usual; when the adapter has `tts`
+they are also spoken, sentence by sentence as the text streams in, without waiting for the
+turn to end. The Markdown becomes plain sentences:
 
 | In the reply | Said |
 |---|---|
@@ -1953,15 +1893,18 @@ end. The Markdown becomes plain sentences:
 Sentences end after `.`, `!`, `?` or `…` and a space, but not after abbreviations such as
 "e.g.", "i.e.", "etc.", "Dr."; a sentence over 300 characters is cut at a comma or space.
 Background messages (`notify_user`) are spoken too: "<label>." then their text. What is
-spoken is [masked](#9-security-model) like what is posted, before it reaches the text-to-speech
-provider: each complete line (and a background message's label) is masked before it is
+spoken is [masked](#9-security-model) like what is posted, before it reaches the voice
+adapter: each complete line (and a background message's label) is masked before it is
 read, so a secret is never split across sentences and code spans are masked too; a
-masked secret is said as "hidden" ("api_key=hidden"). The sentences are synthesized one by one and played in real time; a sentence the provider
-fails on is skipped (`tts_failed`).
+masked secret is said as "hidden" ("api_key=hidden"). Each sentence becomes a `speak`
+(the agent's replies interruptible, the bridge's own lines not), and the adapter's audio
+is played in real time; a sentence the adapter fails on (`synthesis_failed`) is skipped.
 
-**Barge-in.** When the owner starts speaking (an utterance's 60 ms onset) while the agent's
+**Barge-in.** When the owner starts speaking (the adapter's `speech_started`; without
+`vad`, its final transcript) while the agent's
 voice is queued or playing, the agent stops at once: the sentences waiting and the audio
-already queued are dropped, and the rest of that reply is not spoken. The turn itself goes
+already queued are dropped (the adapter gets `stop_speaking`), and the rest of that reply
+is not spoken. The turn itself goes
 on. When the owner's utterance ends it is transcribed and steered into the running turn
 (or prompts, if the turn ended); from then on the reply is spoken again, from its next
 sentence (the rest of the line that was arriving is skipped too). A code block or table
@@ -2061,8 +2004,7 @@ the caller) instead of only waiting for a card to be answered:
 
 ```json
 "calls": {
-  "stt": { "provider": "local", "url": "http://127.0.0.1:8080/inference" },
-  "tts": { "provider": "local", "command": ["C:\\Tools\\piper\\piper.exe", "--model", "C:\\Tools\\piper\\en_US-lessac-medium.onnx", "--output_raw"], "sample_rate": 22050 },
+  "adapter": { "spawn": { "command": ["C:\\Tools\\voice\\voice-adapter.exe"] } },
   "notify_by_call": {
     "after_minutes": 5,
     "urgent": true,
@@ -2079,12 +2021,12 @@ the caller) instead of only waiting for a card to be answered:
 | `min_interval_minutes` | at most one call per this many minutes, whatever it is about (counted from when each call was placed, answered or not); 10 to 1440 | `10` |
 | `do_not_disturb` | local time ranges without calls, a string or a list: `"HH:MM-HH:MM"` every day, or with days first, `"mon-fri 22:00-07:00"`, `"sat,sun 00:00-24:00"`, `"mon,wed-fri 12:00-13:00"` (`mon` … `sun`, ranges may wrap, `fri-mon`). A range whose end is not after its start runs past midnight into the next day; its days are the days it starts on (`"fri 22:00-07:00"` covers Friday 22:00 to Saturday 07:00). Times are the computer's local time zone, with its daylight saving | none |
 
-`notify_by_call` needs `calls.stt` and `calls.tts` (validation says so): a call nobody
-hears or that cannot say why it rings is pointless. With a [voice adapter](#voice-adapter)
-the same holds at run time: the bridge calls only while the adapter is ready with `stt`
-**and** `tts` and calls are advertised; a ready adapter without `tts` holds the call back
-(`call_held` `no_tts`, logged once). With both `after_minutes` 0 and `urgent` false the
-section does nothing.
+`notify_by_call` needs `calls.adapter` (validation says so), and at run time an adapter
+that can listen and speak: a call nobody hears or that cannot say why it rings is
+pointless. The bridge calls only while the [voice adapter](#voice-adapter) is ready with
+`stt` **and** `tts` and calls are advertised; a ready adapter without `tts` holds the call
+back (`call_held` `no_tts`, logged once). With both `after_minutes` 0 and `urgent` false
+the section does nothing.
 
 **When it calls.** Every half second the bridge checks the open requests. When one has
 waited `after_minutes`, no call runs, rings or is being answered, the messenger is
@@ -2141,33 +2083,36 @@ in a call, speaking or listening, muted) and offers two actions ([§13](#13-the-
 
 Both answer `no_call` when there is no call.
 
-### Privacy: what each provider receives
+### Privacy: what the adapter receives
 
 The call's audio travels end to end encrypted (DTLS-SRTP) between the owner's app and the
 bridge; the server only relays the signalling ([calls privacy](calls.md#9-privacy)). From
-there:
+there the bridge gives the voice adapter only what speech needs:
 
-| Provider | Receives | Where it goes |
-|---|---|---|
-| `azure-speech` STT | each utterance's audio, a WAV (16 kHz, mono, 16-bit) | Azure AI Speech in the configured region or resource: it leaves the machine, and Microsoft's data handling for the Speech service applies |
-| `azure-speech` TTS | the text of each sentence spoken (the agent's reply, the bridge's own sentences such as card questions) | the same |
-| `local` STT, `url` | each utterance's WAV | the configured URL: it stays on the machine when the URL is local |
-| `local` STT, `command` | each utterance's WAV in a temporary file in the user's temp folder (only the user can read it), deleted after the utterance, also on failure | the command |
-| `local` TTS | each sentence's text, on stdin or in the request | the command or the URL |
-| `none` | nothing | |
-| `calls.adapter` | the call's audio (16 kHz mono, as it arrives) and the text of each sentence spoken, masked; the `call_id` and `calls.language`, never the owner's name, keys or file paths | the adapter process, as the same user; where it sends them is up to the adapter |
+| The adapter receives | Never |
+|---|---|
+| the call's audio (16 kHz mono, as it arrives, from the call's connection to its end) | message history, files, the agent's tools or anything else of Coda's |
+| the text of each sentence to speak (the agent's reply, the bridge's own sentences such as card questions), masked | credentials, tokens, keys, or ids that link to the messaging server |
+| `calls.language`, a random `call_id` per call, and the caller's display name field, which the bridge sends empty | the owner's name, handle or file paths |
 
+- The adapter runs as the same user: started by the bridge without a shell and with an
+  environment stripped of the bridge's secrets ([spawn](#voice-adapter)), or reached on a
+  pipe or socket private to the user ([connect](#voice-adapter)). Where it sends the audio
+  and the text (a local engine, a cloud speech service) is up to the adapter: check its
+  own documentation.
+- The bridge holds no speech credentials; the adapter keeps its own.
 - The bridge persists nothing of a call: no audio, no transcripts beyond the
   `agent.transcript@1` messages it posts (masked, and stored on the server like every
   message: [security](#9-security-model)).
 - Logs are content-free: names, codes, counts and durations, never audio, transcripts or
-  spoken text. Events: `voice_enabled` (provider names), `voice_unavailable`,
+  spoken text. Events: `voice_enabled` (`adapter`: `spawn` or `connect`, `answer`,
+  `notify_by_call`), `voice_off` (`reason` `no_adapter`), `voice_unavailable`,
   `call_answering`, `call_answered` (`buffered`), `call_connected`, `call_refused`
   (`reason`: `stranger`, `voice_off`, `busy`), `call_answer_failed` (`code`),
-  `voice_utterance` (`ms`), `voice_transcript` (`chars`), `voice_sentence` (`ms`),
-  `voice_barge_in`, `stt_failed` and `tts_failed` (`provider`, `code`),
-  `card_answered_by_voice` (`values`), `voice_call_ended` and `call_ended` (`reason`,
-  `duration_s`), `call_hung_up` (the bridge stopped); for the
+  `voice_transcript` (`chars`), `voice_barge_in`, `call_chat_only` (`reason`:
+  `adapter_lost`, `adapter_unavailable`), `card_answered_by_voice` (`values`),
+  `voice_call_ended` and `call_ended` (`reason`, `duration_s`), `call_hung_up` (the bridge
+  stopped); the [voice adapter](#voice-adapter)'s events; for the
   [policies](#the-agent-calls-you): `call_asking` (`card`), `call_ask_answered`
   (`answer`), `call_ask_ended` (`reason`), `call_ask_expired`, `call_ask_failed`,
   `call_dialing` (`reason`: `request` or `urgent`), `call_ringing` (`buffered`),
@@ -2175,29 +2120,29 @@ there:
   `call_unanswered` (`reason`), `call_withdrawn`, `urgent_call_skipped`, `call_muted`
   (`muted`), `call_hangup_requested`; at `debug`, `call_ignored`,
   `call_event_ignored`, `call_decline_failed` and `call_answer_dropped`.
-- Provider error codes are content-free too: `no_key`, `bad_credential`, `token_<code>`,
-  `no_token`, `http_<status>`, `timeout`, `connect_failed`, `request_failed`,
-  `bad_response`, `bad_audio`, `spawn_failed`, `exit_<code>`, `io`, or Azure's
-  recognition status.
-- Keys only come from environment variables; Entra tokens stay in memory (30 minutes).
-  `status` shows provider names, never their settings.
 
 ### Testing
 
-- **Fakes.** Speech is tones: `voice::fake::FakeStt` hears a word per frequency (the
-  strongest tone of an utterance, by Goertzel), and `FakeTts` speaks a 600 Hz tone, 60 ms
-  per word (200 ms to 3 s), logging the texts. Both survive real Opus media.
-- **Fixtures** (`crates/push-bridge/tests/fixtures/voice/*.json`, see its README): the
-  owner's side as `words` (`{hz, text}`) and a `script` of `say` (`hz`, `ms`) and
-  `silence` (`ms`) steps at amplitude 8000. Frequencies lie between 350 and 2400 Hz, at
-  least 200 Hz apart across fixtures, and never within 150 Hz of 600 Hz (the agent's voice
-  must not be heard as the owner's words); each `say` is followed by at least 1 s of
-  silence. Fixtures: `prompt`, `barge_in`, `approve`, `option_two`, `ambiguous`.
-- **Unit and core tests** (`cargo test -p push-bridge`, no feature needed): the detector,
-  spoken text, voice answers, WAV and the providers against local test servers and
-  commands; the core with a `FakePhone`, `TestBackend` and `TestMessenger` in paused time
-  (`src/core/voice_tests.rs`): greeting, declines, spoken replies, barge-in, voice
-  answers, activity, masking and the peek; the policies: ask mode (answer, decline, a
+- **The test adapter.** Speech is tones: `crates/push-voice-adapter-testkit` is a
+  scripted voice adapter that hears a word per frequency (by Goertzel) and speaks a 600 Hz
+  tone, both surviving real Opus media. Its library (`ScriptedAdapter`) runs in process
+  over in-memory pipes; its binary is spawned or connected to like a real adapter, and
+  plays faults on demand (a crash, a refused format, another protocol version, a stall, a
+  flood, no hello). What it heard and did is in its `Log` (content-free; the texts it
+  spoke stay in memory, `Log::spoken()`, for in-process assertions only).
+- **Fixtures** (`crates/push-voice-adapter-testkit/fixtures/*.json`, its `fixture`
+  module, see the folder's README): the owner's side as `words` (`{hz, text}`) and a
+  `script` of `say` (`hz`, `ms`) and `silence` (`ms`) steps at amplitude 8000.
+  Frequencies lie between 350 and 2400 Hz, at least 200 Hz apart across fixtures, and
+  never within 150 Hz of 600 Hz (the agent's voice must not be heard as the owner's
+  words); each `say` is followed by at least 1 s of silence. Fixtures: `prompt`,
+  `barge_in`, `approve`, `option_two`, `ambiguous`.
+- **Unit and core tests** (`cargo test -p push-bridge`, no feature needed): spoken text,
+  voice answers, the adapter client (spawn, connect, the link, the supervisor and the call
+  router, against the testkit); the core with a `FakePhone`, the testkit's adapter,
+  `TestBackend` and `TestMessenger` in paused time (`src/core/voice_tests.rs`): greeting,
+  declines, spoken replies, barge-in, voice answers, activity, masking and the peek; the
+  policies: ask mode (answer, decline, a
   busy second call, the ring ending, the bridge's own deadline), a request unanswered
   calling the owner who approves by voice, missed, declined and unreachable calls leaving
   the card open (and never calling twice for it), the rate limit, do-not-disturb hours,
@@ -2209,14 +2154,15 @@ there:
 - **End to end** (`crates/push-smoke/tests/bridge_voice.rs`, CI job `bridge-voice`): the
   whole stack in one process, the owner calling with push-sdk's `MediaCall`, the bridge
   enrolled with a software key and running with `SdkMessenger`, `MediaPhone`, a scripted
-  backend and the fakes, over real media: greeting, a prompt, a spoken reply, barge-in, a
-  voice approval, a stranger refused, the hang-up. A second test runs the policies with a
+  backend and the testkit's adapter (spawned), over real media: greeting, a prompt, a
+  spoken reply, barge-in, a voice approval, a stranger refused, the hang-up. A second test
+  runs the policies with a
   10 s ring: `ask` (the call waits for the card's "Answer"), a card unanswered for 3 s
   making the bridge call the owner, who answers, hears the summary and approves by voice,
   and a call the owner lets ring out, after which the card is still open and takes the
-  answer. `crates/push-smoke/tests/bridge_voice_adapter.rs` (same job) runs speech in a
-  voice adapter, `push-voice-adapter-testkit` (the test builds its binary): spawned and
-  connected, a crash mid-call (the owner is told, the restarted adapter takes the call
+  answer. `crates/push-smoke/tests/bridge_voice_adapter.rs` (same job) tests the adapter
+  link itself with the testkit's binary (the tests build it): spawned and connected, a
+  crash mid-call (the owner is told, the restarted adapter takes the call
   again), no adapter and a refused audio format (calls not advertised, one warning), a
   final transcript becoming a `speak` within 100 ms, the agent's voice without gaps over
   40 ms, and a log free of what was said. Locally, with Docker:
@@ -2226,7 +2172,9 @@ there:
   cargo test -p push-smoke --test bridge_voice --test bridge_voice_adapter -- --nocapture --test-threads 1
   ```
 
-- **Real providers**: the opt-in [live speech test](#12-live-smoke-test-opt-in).
+- **Real speech engines** are tested in their own adapters (for example
+  [yuopolev/voice-adapter](https://github.com/yuopolev/voice-adapter)), against the
+  [protocol](voice-adapter-protocol.md); the bridge's tests need none.
 
 ### Limitations
 

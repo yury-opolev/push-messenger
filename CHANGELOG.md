@@ -65,7 +65,7 @@ Notable changes for consumers of push-messenger. Newest first.
   `voice-adapter-fuzz`. Reference: [docs/voice-adapter-protocol.md](docs/voice-adapter-protocol.md);
   design: `docs/superpowers/specs/2026-11-04-voice-adapter-design.md`. The bridge's
   adapter client and the test adapter follow; the built-in speech providers are then
-  removed.
+  removed (both done: see the entries above and Removed).
 
 - **Agent bridge answering and calling policies** (phase 2, the voice feature's last
   part): `calls.answer: "ask"` makes push-agent-bridge post a card "📞 Owner is calling
@@ -113,7 +113,9 @@ Notable changes for consumers of push-messenger. Newest first.
   `bridge-voice` runs the bridge answering its owner's call over real media through the
   stack; `calls-media-windows` also runs the bridge's voice tests with the feature;
   `PUSH_BRIDGE_LIVE_SPEECH=1` tries real providers. Guide:
-  [docs/agent-bridge.md §18](docs/agent-bridge.md#18-voice-calls).
+  [docs/agent-bridge.md §18](docs/agent-bridge.md#18-voice-calls). (The providers, the
+  detector, `calls.stt`/`calls.tts`/`calls.vad`, the fakes and the live speech test were
+  replaced by the voice adapter before a release: see Changed and Removed.)
 - **Built-in `agent.transcript@1`** (`speaker`: `owner` or `agent`, `text` up to 4,000
   characters; heading "🎤 voice"): a voice transcript, sent by agents. message-svc seeds
   it as approved at its next start, like the other built-ins
@@ -474,15 +476,30 @@ Notable changes for consumers of push-messenger. Newest first.
 
 ### Changed
 
-- **Agent bridge `calls.stt` defaults to `none`**, so `"calls": {"adapter": …}` alone is
-  a valid calls section; with `calls.adapter`, `calls.stt` and `calls.tts` must be absent
-  or `none` and `calls.vad` absent or default (a config error names the field). A
-  `calls` section without `calls.stt` and without `calls.adapter` is now accepted and
-  advertises no calls, as `none` did.
-- **Agent bridge built-in speech providers deprecated**: `calls.stt`, `calls.tts` and
-  `calls.vad` (`azure-speech`, `local`, the energy detector) work as before without
-  `calls.adapter`, and are removed in the next release in favour of a voice adapter
-  ([guide](docs/agent-bridge.md#voice-adapter)).
+- **Agent bridge: speech runs only in a voice adapter** (third of three steps that move
+  speech out of push-agent-bridge). A `config.json` whose `calls` has `stt`, `tts` or
+  `vad` (whatever the value, `none` and `null` included) no longer starts: `run` and
+  `enroll` exit 1 and `status` shows, for the first of them, `calls.stt is no longer
+  supported: speech runs in a voice adapter. Configure calls.adapter (docs/agent-bridge.md
+  §18, docs/voice-adapter-protocol.md).` (`calls.tts`, `calls.vad` alike). Calls need
+  `calls.adapter`: without it calls are not advertised and `status` prints `Voice: off
+  (no calls.adapter)`; `calls.notify_by_call` with `after_minutes` above 0 or `urgent`
+  without it is a config error (`calls.notify_by_call needs calls.adapter: without it the
+  bridge takes no calls and places none`). The feature `voice` now builds only the media
+  helper. The voice tests' recorded fixtures moved from
+  `crates/push-bridge/tests/fixtures/voice` to `crates/push-voice-adapter-testkit/fixtures`
+  (the testkit's `fixture` module owns their rules), and the `bridge_voice` end-to-end
+  test runs through the testkit's adapter. Migration: [agent bridge
+  §18](docs/agent-bridge.md#migrating-from-callsstt-and-callstts); writing an adapter:
+  [docs/voice-adapter-protocol.md §14](docs/voice-adapter-protocol.md#14-writing-an-adapter).
+- **Agent bridge `calls.stt` defaults to `none`** (step two; superseded by the entry
+  above before any release: `calls.stt` is now refused), so `"calls": {"adapter": …}`
+  alone is a valid calls section; with `calls.adapter`, `calls.stt` and `calls.tts` had to
+  be absent or `none` and `calls.vad` absent or default. A `calls` section without
+  `calls.adapter` is accepted and advertises no calls.
+- **Agent bridge built-in speech providers deprecated** (step two): `calls.stt`,
+  `calls.tts` and `calls.vad` (`azure-speech`, `local`, the energy detector) worked as
+  before without `calls.adapter`. Step three removed them (see Removed below).
 
 - **Gateway logging**: the gateway never logs WebSocket payloads, even with
   `RUST_LOG=trace`: the WebSocket library (`tungstenite`) is capped at `debug`, since at
@@ -525,6 +542,17 @@ Notable changes for consumers of push-messenger. Newest first.
 - auth migration `0007_hyphenated_handles.sql` replaces the `auth.user_account` handle
   CHECK. It only widens the rule; no data changes. It runs with the usual auth
   migrations.
+
+### Removed
+
+- **Agent bridge built-in speech providers**: `azure-speech` and `local`, the energy voice
+  activity detector, and their settings `calls.stt`, `calls.tts` and `calls.vad` (now a
+  startup error, see Changed). Speech runs only in a voice adapter (`calls.adapter`,
+  [`push-voice-adapter/1`](docs/voice-adapter-protocol.md)): wrap the engines you used
+  (whisper.cpp, piper, Azure AI Speech) in one. Also removed: the opt-in live speech test
+  (`crates/push-bridge/tests/live_speech.rs`, `PUSH_BRIDGE_LIVE_SPEECH`; real engines are
+  tested in their own adapters), the bridge's tone fakes (replaced by the testkit adapter)
+  and push-bridge's `reqwest` dependency (push-sdk still uses it for its HTTP client).
 
 ### Fixed
 

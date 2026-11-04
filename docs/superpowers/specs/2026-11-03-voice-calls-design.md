@@ -529,6 +529,10 @@ Chromium fake media devices between two contexts (stun-only and internal TURN).
 
 ### 10.3 Bridge voice pipeline (PR 7)
 
+> **Superseded** by the [voice adapter design addendum](2026-11-04-voice-adapter-design.md):
+> speech (VAD, STT, TTS) runs in a separate voice adapter process; the providers and the
+> `stt`/`tts`/`vad` settings below were removed.
+
 `push-agent-bridge` config `calls` block:
 `{ "answer": "auto"|"ask", "stt": {"provider": "azure-speech"|"local"|"none", …},
 "tts": {…}, "vad": {"silence_ms": 700, "min_speech_ms": 300}, "language": "en-US" }`.
