@@ -2687,6 +2687,7 @@ dependencies = [
  "push-domain",
  "push-sdk",
  "push-voice-adapter-proto",
+ "push-voice-adapter-testkit",
  "regex",
  "reqwest",
  "serde",

@@ -50,4 +50,5 @@ all = { level = "warn", priority = -1 }
 undocumented_unsafe_blocks = "warn"
 
 [dev-dependencies]
+push-voice-adapter-testkit.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt", "test-util"] }

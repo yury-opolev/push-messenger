@@ -7,3 +7,4 @@ pub mod connect;
 mod job;
 pub mod link;
 pub mod spawn;
+pub mod supervisor;
