@@ -76,7 +76,13 @@ pub struct CallsConfig {
     /// The language spoken, a BCP 47 tag: `en-US` by default.
     #[serde(default = "default_language")]
     pub language: String,
-    /// Speech-to-text; `{"provider": "none"}` declines calls (there is nobody to listen).
+    /// The voice adapter, a separate process doing the speech; absent, the built-in
+    /// `stt`/`tts`/`vad` below are used. With it, those must be absent (or `none`).
+    #[serde(default)]
+    pub adapter: Option<AdapterConfig>,
+    /// Speech-to-text; `{"provider": "none"}` (the default) declines calls unless
+    /// `adapter` is set (there is nobody to listen).
+    #[serde(default)]
     pub stt: SttConfig,
     /// Text-to-speech; `none` (the default) keeps the replies in the chat.
     #[serde(default)]
@@ -179,8 +185,108 @@ pub enum AnswerMode {
     Ask,
 }
 
-/// The speech-to-text provider.
+/// Where speech runs (docs/voice-adapter-protocol.md §2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum AdapterConfig {
+    /// The bridge starts the adapter and talks to it over its stdin/stdout.
+    Spawn(SpawnConfig),
+    /// The bridge connects to an adapter already running.
+    Connect(ConnectConfig),
+}
+
+/// A voice adapter the bridge starts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpawnConfig {
+    /// argv: program then arguments; never run through a shell.
+    pub command: Vec<String>,
+    /// `log` (default: <state dir>/logs/voice-adapter.log) or `discard`.
+    #[serde(default)]
+    pub stderr: StderrMode,
+    /// Extra variables to pass even though they look secret (rarely needed).
+    #[serde(default)]
+    pub env_allow: Vec<String>,
+}
+
+/// Where a spawned adapter's stderr goes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StderrMode {
+    /// To `<state dir>/logs/voice-adapter.log`.
+    #[default]
+    Log,
+    /// Nowhere.
+    Discard,
+}
+
+/// A voice adapter already running, listening on a local endpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum ConnectConfig {
+    /// Windows: `\\.\pipe\<name>`; the name only, 1–200 chars of [A-Za-z0-9._-].
+    Pipe(String),
+    /// Unix: an absolute path after `$XDG_RUNTIME_DIR` expansion.
+    Socket(String),
+}
+
+/// The longest pipe name in `calls.adapter.connect.pipe`.
+pub const PIPE_NAME_MAX: usize = 200;
+
+/// Checks `calls.adapter`; the error names the field.
+pub fn validate_adapter(adapter: &AdapterConfig) -> Result<(), String> {
+    match adapter {
+        AdapterConfig::Spawn(spawn) => {
+            let at = "calls.adapter.spawn";
+            if spawn.command.is_empty() {
+                return Err(format!("{at}.command is empty"));
+            }
+            if let Some(index) = spawn.command.iter().position(|arg| arg.is_empty()) {
+                return Err(format!("{at}.command[{index}] is empty"));
+            }
+            if let Some(index) = spawn
+                .env_allow
+                .iter()
+                .position(|name| !matches(r"^[A-Za-z_][A-Za-z0-9_]*$", name))
+            {
+                return Err(format!(
+                    "{at}.env_allow[{index}] must be an environment variable's name"
+                ));
+            }
+        }
+        AdapterConfig::Connect(ConnectConfig::Pipe(name)) => {
+            let at = "calls.adapter.connect.pipe";
+            if !cfg!(windows) {
+                return Err(format!("{at} is only available on Windows"));
+            }
+            if name.is_empty()
+                || name.len() > PIPE_NAME_MAX
+                || !name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+            {
+                return Err(format!(
+                    "{at} must be the pipe's name only: 1 to {PIPE_NAME_MAX} of A-Z a-z 0-9 . _ -"
+                ));
+            }
+        }
+        AdapterConfig::Connect(ConnectConfig::Socket(path)) => {
+            let at = "calls.adapter.connect.socket";
+            if !cfg!(unix) {
+                return Err(format!("{at} is only available on Unix"));
+            }
+            if !(path.starts_with('/') || path.starts_with("$XDG_RUNTIME_DIR/")) {
+                return Err(format!(
+                    "{at} must be an absolute path (it may start with $XDG_RUNTIME_DIR/)"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The speech-to-text provider.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
     from = "ProviderWire<AzureSpeechConfig, LocalSttConfig>",
     into = "ProviderWire<AzureSpeechConfig, LocalSttConfig>"
@@ -191,6 +297,7 @@ pub enum SttConfig {
     /// A whisper.cpp-compatible server or command on this machine.
     Local(LocalSttConfig),
     /// No speech-to-text: calls are declined.
+    #[default]
     None,
 }
 
@@ -398,6 +505,20 @@ impl CallsConfig {
         if !matches(r"^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*$", &self.language) {
             return Err("calls.language must be a language tag such as \"en-US\"".to_owned());
         }
+        if let Some(adapter) = &self.adapter {
+            validate_adapter(adapter)?;
+            for (field, set) in [
+                ("stt", self.stt != SttConfig::None),
+                ("tts", self.tts != TtsConfig::None),
+                ("vad", self.vad != VadSettings::default()),
+            ] {
+                if set {
+                    return Err(format!(
+                        "calls.adapter and calls.{field} cannot both be set; speech runs in the adapter"
+                    ));
+                }
+            }
+        }
         match &self.stt {
             SttConfig::AzureSpeech(azure) => validate_azure(azure, "calls.stt", false)?,
             SttConfig::Local(local) => validate_local_stt(local)?,
@@ -427,13 +548,13 @@ impl CallsConfig {
                 ));
             }
             notify.policy()?;
-            let calls = notify.after_minutes > 0 || notify.urgent;
-            if calls && self.stt == SttConfig::None {
+            let builtin = self.adapter.is_none() && (notify.after_minutes > 0 || notify.urgent);
+            if builtin && self.stt == SttConfig::None {
                 return Err(format!(
                     "{at} needs calls.stt: without it the bridge takes no calls and places none"
                 ));
             }
-            if calls && self.tts == TtsConfig::None {
+            if builtin && self.tts == TtsConfig::None {
                 return Err(format!(
                     "{at} needs calls.tts: the call says what it is about"
                 ));
@@ -1385,6 +1506,153 @@ mod tests {
             assert!(
                 matches!(&error, ConfigError::Parse { message, .. } if message.contains(field)),
                 "{calls}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_adapter_alone_is_a_calls_section() {
+        let fixture = fixture();
+        let config = with_calls(
+            &fixture,
+            json!({ "adapter": { "spawn": { "command": ["C:\\a.exe", "--x"] } } }),
+        )
+        .unwrap();
+        let calls = config.calls.clone().unwrap();
+        assert_eq!(
+            calls.adapter,
+            Some(AdapterConfig::Spawn(SpawnConfig {
+                command: vec!["C:\\a.exe".into(), "--x".into()],
+                stderr: StderrMode::Log,
+                env_allow: Vec::new(),
+            }))
+        );
+        assert_eq!(calls.stt, SttConfig::None);
+        config.validate().unwrap();
+
+        let relative = with_calls(
+            &fixture,
+            json!({ "adapter": { "spawn": { "command": ["adapter"], "stderr": "discard", "env_allow": ["HF_TOKEN"] } }, "stt": { "provider": "none" }, "tts": { "provider": "none" }, "notify_by_call": { "urgent": true } }),
+        )
+        .unwrap();
+        relative.validate().unwrap();
+
+        let pipe = with_calls(
+            &fixture,
+            json!({ "adapter": { "connect": { "pipe": "push-voice-me" } } }),
+        )
+        .unwrap();
+        assert_eq!(
+            pipe.calls.clone().unwrap().adapter,
+            Some(AdapterConfig::Connect(ConnectConfig::Pipe(
+                "push-voice-me".into()
+            )))
+        );
+        #[cfg(windows)]
+        pipe.validate().unwrap();
+
+        #[cfg(unix)]
+        for socket in ["/run/push/voice.sock", "$XDG_RUNTIME_DIR/push-voice.sock"] {
+            with_calls(
+                &fixture,
+                json!({ "adapter": { "connect": { "socket": socket } } }),
+            )
+            .unwrap()
+            .validate()
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn adapter_mistakes_are_refused_by_field() {
+        let fixture = fixture();
+        let spawn = json!({ "spawn": { "command": ["adapter"] } });
+        let long = "a".repeat(201);
+        let mut cases = vec![
+            (
+                json!({ "adapter": { "spawn": { "command": [] } } }),
+                "calls.adapter.spawn.command is empty".to_owned(),
+            ),
+            (
+                json!({ "adapter": { "spawn": { "command": ["adapter", ""] } } }),
+                "calls.adapter.spawn.command[1] is empty".to_owned(),
+            ),
+            (
+                json!({ "adapter": { "spawn": { "command": ["adapter"], "env_allow": ["A B"] } } }),
+                "calls.adapter.spawn.env_allow[0]".to_owned(),
+            ),
+            (
+                json!({ "adapter": spawn, "stt": { "provider": "local", "url": "http://a" } }),
+                "calls.adapter and calls.stt cannot both be set; speech runs in the adapter"
+                    .to_owned(),
+            ),
+            (
+                json!({ "adapter": spawn, "tts": { "provider": "local", "url": "http://a" } }),
+                "calls.adapter and calls.tts cannot both be set; speech runs in the adapter"
+                    .to_owned(),
+            ),
+            (
+                json!({ "adapter": spawn, "vad": { "silence_ms": 900 } }),
+                "calls.adapter and calls.vad cannot both be set; speech runs in the adapter"
+                    .to_owned(),
+            ),
+        ];
+        #[cfg(windows)]
+        {
+            for name in ["a\\b", "push voice", "", long.as_str(), "\\\\.\\pipe\\x"] {
+                cases.push((
+                    json!({ "adapter": { "connect": { "pipe": name } } }),
+                    "calls.adapter.connect.pipe must be the pipe's name only".to_owned(),
+                ));
+            }
+            cases.push((
+                json!({ "adapter": { "connect": { "socket": "/run/x.sock" } } }),
+                "calls.adapter.connect.socket is only available on Unix".to_owned(),
+            ));
+        }
+        #[cfg(unix)]
+        {
+            let _ = &long;
+            cases.push((
+                json!({ "adapter": { "connect": { "pipe": "push-voice-me" } } }),
+                "calls.adapter.connect.pipe is only available on Windows".to_owned(),
+            ));
+            for socket in ["voice.sock", "$XDG_RUNTIME_DIR", "$HOME/voice.sock", ""] {
+                cases.push((
+                    json!({ "adapter": { "connect": { "socket": socket } } }),
+                    "calls.adapter.connect.socket must be an absolute path".to_owned(),
+                ));
+            }
+        }
+        for (calls, expected) in cases {
+            let message = calls_error(&fixture, calls.clone());
+            assert!(message.contains(&expected), "{calls}: {message}");
+        }
+    }
+
+    #[test]
+    fn unknown_adapter_fields_are_refused_by_name() {
+        let fixture = fixture();
+        let cases = [
+            (json!({ "spwan": { "command": ["a"] } }), "spwan"),
+            (json!({ "spawn": { "command": ["a"], "cwd": "x" } }), "cwd"),
+            (
+                json!({ "spawn": { "command": ["a"], "stderr": "file" } }),
+                "file",
+            ),
+            (json!({ "spawn": { "args": ["a"] } }), "args"),
+            (json!({ "connect": { "tcp": "127.0.0.1:1" } }), "tcp"),
+            (json!({ "connect": { "pipe": "x", "socket": "/x" } }), ""),
+            (
+                json!({ "spawn": { "command": ["a"] }, "connect": { "pipe": "x" } }),
+                "",
+            ),
+        ];
+        for (adapter, field) in cases {
+            let error = with_calls(&fixture, json!({ "adapter": adapter.clone() })).unwrap_err();
+            assert!(
+                matches!(&error, ConfigError::Parse { message, .. } if message.contains(field)),
+                "{adapter}: {error}"
             );
         }
     }

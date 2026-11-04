@@ -1572,7 +1572,8 @@ validated (by `run`, `enroll` and `status`) whether or not the build has voice.
 |---|---|---|
 | `calls.answer` | `auto`: the owner's call is answered at once. `ask`: a card asks the owner first ([asking before answering](#asking-before-answering)) | `auto` |
 | `calls.language` | the language spoken, a BCP 47 tag; sent to the speech providers | `en-US` |
-| `calls.stt` | speech-to-text, required: `{"provider": "azure-speech", …}`, `{"provider": "local", …}` or `{"provider": "none"}` (calls are not advertised) | |
+| `calls.adapter` | the voice adapter doing the speech ([voice adapter protocol](voice-adapter-protocol.md)): `{"spawn": {"command": ["<program>", "<arg>", …], "stderr": "log"\|"discard", "env_allow": [ … ]}}`, or `{"connect": {"pipe": "<name>"}}` (Windows, the name in `\\.\pipe\<name>`) / `{"connect": {"socket": "/path"}}` (Unix, may start with `$XDG_RUNTIME_DIR/`). With it, `calls.stt`, `calls.tts` and `calls.vad` stay unset (or `none`) | |
+| `calls.stt` | speech-to-text: `{"provider": "azure-speech", …}`, `{"provider": "local", …}` or `{"provider": "none"}` (calls are not advertised unless `calls.adapter` is set) | `none` |
 | `calls.tts` | text-to-speech: the same three; `none` keeps every reply in the chat and the call silent (no greeting either) | `none` |
 | `calls.vad.silence_ms` | the silence that ends an utterance, 200 to 5000 | `700` |
 | `calls.vad.min_speech_ms` | the speech an utterance needs, 100 to 5000; shorter sounds (a cough, a click) are dropped | `300` |
