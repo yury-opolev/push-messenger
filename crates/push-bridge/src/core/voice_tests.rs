@@ -87,6 +87,7 @@ impl Voice {
             tts: Some(tts.clone()),
             vad: VadConfig::default(),
             policy,
+            adapter: None,
         });
         h.start();
         h.backend.wait_for("start", 1).await;

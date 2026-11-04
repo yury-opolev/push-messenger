@@ -1,42 +1,54 @@
 //! One call's pipeline: the owner's audio in, transcripts out; sentences in, the agent's
-//! audio out.
+//! audio out. The speech itself runs in a [`SpeechEngine`]: the bridge's own providers
+//! ([`Session::start`], [`BuiltinEngine`]) or a voice adapter ([`Session::with_adapter`],
+//! [`AdapterEngine`]).
 //!
 //! - A watcher waits for the media to connect ([`SessionEvent::Connected`]) and for the
 //!   end: [`SessionEvent::Ended`] exactly once, after which every task of the session has
 //!   stopped (the owner's audio closing too does not report a second end).
-//! - The listener runs the [`Vad`] on the owner's audio. When speech starts while the
+//! - The listener gives the owner's audio to the engine. When speech starts while the
 //!   agent speaks, that is a barge-in: the queued sentences and the queued audio are
 //!   dropped ([`SessionEvent::BargedIn`], then `Speaking(false)`); then
 //!   `Listening(true)`. An utterance (or a discarded noise) is `Listening(false)`.
 //!   A barge-in also mutes the agent's reply: [`Session::say_reply`] drops its sentences
 //!   until [`Session::unmute`], so the rest of the interrupted reply is not spoken even
 //!   when the core handles reply text before it handles the `BargedIn` event.
-//! - The STT worker transcribes one utterance at a time, in order: a non-empty text is a
-//!   [`SessionEvent::Transcript`] (stamped with when the detector heard the utterance's
-//!   speech start), a failure a [`SessionEvent::SpeechFailed`] with the provider's
-//!   content-free code.
-//! - The speaker worker synthesizes the queued sentences one by one and queues their
-//!   frames on the line's speaker, which plays them in real time (and may queue seconds
-//!   ahead): it keeps when the queued audio will have played and reports
-//!   `Speaking(false)` only then. Sentences queued before a barge-in or a
-//!   [`Session::hush`] are never spoken.
+//! - The engine transcribes one utterance at a time, in order: a non-empty text is a
+//!   [`SessionEvent::Transcript`] (stamped with when its speech started), a failure a
+//!   [`SessionEvent::SpeechFailed`] with a content-free code.
+//! - The engine speaks the queued sentences one by one and queues their frames on the
+//!   line's speaker, which plays them in real time (and may queue seconds ahead): it keeps
+//!   when the queued audio will have played and reports `Speaking(false)` only then.
+//!   Sentences queued before a barge-in or a [`Session::hush`] are never spoken.
 //!
 //! Logs carry durations, counts and codes only: never audio or text.
+//!
+//! [`BuiltinEngine`]: super::engine::BuiltinEngine
+//! [`AdapterEngine`]: super::adapter::router::AdapterEngine
 
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use push_sdk::{CallEvent, CallId};
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::mpsc;
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio::time::Instant;
 
-use super::phone::{Line, LineControl, LineEnded, Speaker};
+use super::Frame;
+use super::adapter::router::{AdapterEngine, AdapterSetup};
+use super::engine::{BuiltinEngine, Sentence, SpeechContext, SpeechEngine};
+use super::phone::{Line, LineControl, LineEnded};
 use super::provider::{Stt, Tts};
-use super::vad::{Vad, VadConfig, VadEvent};
-use super::{Frame, SAMPLE_RATE, wav};
+use super::vad::VadConfig;
+
+#[cfg(test)]
+use super::phone::Speaker;
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
+#[cfg(test)]
+use std::time::Duration;
+#[cfg(test)]
+use tokio::sync::Notify;
 
 /// What a call's pipeline reports to the core.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,13 +59,24 @@ pub enum SessionEvent {
     Listening(bool),
     /// The owner spoke over the agent: its speech was cut.
     BargedIn,
-    /// An utterance's text (never empty), and when the detector heard its speech start
-    /// (its onset, not its pre-roll).
+    /// An utterance's text (never empty), and when its speech started (the detector's
+    /// onset, not its pre-roll; the adapter's `speech_started`).
     Transcript { text: String, started: Instant },
-    /// The STT provider failed on an utterance (content-free code).
+    /// An utterance could not be transcribed (content-free code: the STT provider's, or
+    /// `recognition_failed` from the voice adapter).
     SpeechFailed(String),
     /// The agent started (true) or stopped (false) speaking.
     Speaking(bool),
+    /// The voice adapter went away during the call (or none was ready when it connected):
+    /// the call stays up without speech (chat-only) until [`SessionEvent::AdapterBack`].
+    AdapterLost,
+    /// A voice adapter is ready again after [`SessionEvent::AdapterLost`]: the call has
+    /// speech again.
+    AdapterBack,
+    /// The voice adapter cannot recognise or synthesise right now
+    /// (`engine_unavailable`): the call is chat-only until it ends (or a new adapter
+    /// connects, [`SessionEvent::AdapterBack`] after a loss).
+    AdapterUnavailable,
     /// The call is over.
     Ended(LineEnded),
 }
@@ -66,109 +89,19 @@ pub enum SessionEvent {
 /// [`Session`] (the core's sink only sends into a channel).
 pub type EventSink = Arc<dyn Fn(SessionEvent) + Send + Sync>;
 
-const FRAME_TIME: Duration = Duration::from_millis(20);
-
 /// A running call's pipeline. Dropping it hangs up a call still running and stops its
 /// tasks.
 pub struct Session {
     call_id: CallId,
-    shared: Arc<Shared>,
+    ctx: Arc<SpeechContext>,
+    engine: Arc<dyn SpeechEngine>,
     control: Arc<dyn LineControl>,
     tasks: Vec<AbortHandle>,
 }
 
-/// What the session's tasks share.
-struct Shared {
-    events: EventSink,
-    speaker: Arc<dyn Speaker>,
-    /// Without TTS the agent never speaks.
-    speaks: bool,
-    /// Bumped by a barge-in or a hush: sentences and audio from before are dropped.
-    generation: AtomicU64,
-    speech: Mutex<Speech>,
-    /// Wakes the speaker worker.
-    wake: Notify,
-    ended: AtomicBool,
-    /// The owner muted the agent (the tray's Mute agent): nothing is spoken.
-    silenced: AtomicBool,
-}
-
-#[derive(Default)]
-struct Speech {
-    /// Sentences to speak, with the generation they were queued in.
-    queue: VecDeque<(u64, String)>,
-    /// The generation of the sentence being synthesized or queued on the speaker.
-    busy: Option<u64>,
-    /// `Speaking(true)` was reported, `Speaking(false)` not yet.
-    speaking: bool,
-    /// When the audio queued so far will have played.
-    playing_until: Option<Instant>,
-    /// A barge-in cut the reply: [`Session::say_reply`] drops sentences until
-    /// [`Session::unmute`].
-    muted: bool,
-}
-
-impl Speech {
-    /// Whether sentences of `generation` are queued, synthesized or playing.
-    fn active(&self, generation: u64) -> bool {
-        self.speaking || self.busy == Some(generation) || !self.queue.is_empty()
-    }
-}
-
-impl Shared {
-    fn emit(&self, event: SessionEvent) {
-        (self.events)(event);
-    }
-
-    fn speech(&self) -> MutexGuard<'_, Speech> {
-        self.speech
-            .lock()
-            .expect("the speech state is not poisoned")
-    }
-
-    fn generation(&self) -> u64 {
-        self.generation.load(Ordering::Acquire)
-    }
-
-    fn ended(&self) -> bool {
-        self.ended.load(Ordering::Acquire)
-    }
-
-    fn speaking(&self) -> bool {
-        self.speech().active(self.generation())
-    }
-
-    /// Stops speaking at once, reporting `Speaking(false)` if `Speaking(true)` was
-    /// reported. A barge-in only stops an agent that speaks, mutes the reply and reports
-    /// `BargedIn` first; whether it did. Nothing happens once the call ended.
-    ///
-    /// The events are emitted under the speech lock, as the speaker worker's are: a
-    /// `Speaking(true)` can never follow the `Speaking(false)` that ends it.
-    fn stop_speaking(&self, barge_in: bool) -> bool {
-        {
-            let mut speech = self.speech();
-            if self.ended() || (barge_in && !speech.active(self.generation())) {
-                return false;
-            }
-            self.generation.fetch_add(1, Ordering::AcqRel);
-            speech.queue.clear();
-            speech.playing_until = None;
-            if barge_in {
-                speech.muted = true;
-                self.emit(SessionEvent::BargedIn);
-            }
-            if std::mem::take(&mut speech.speaking) {
-                self.emit(SessionEvent::Speaking(false));
-            }
-        }
-        self.speaker.clear();
-        self.wake.notify_one();
-        true
-    }
-}
-
 impl Session {
-    /// Runs the call's pipeline on the current runtime until it ends.
+    /// Runs the call's pipeline with the bridge's own speech providers on the current
+    /// runtime until it ends.
     pub fn start(
         line: Line,
         stt: Arc<dyn Stt>,
@@ -176,36 +109,45 @@ impl Session {
         vad: VadConfig,
         events: EventSink,
     ) -> Self {
+        Self::with_engine(line, events, move |ctx| {
+            Arc::new(BuiltinEngine::start(ctx, stt, tts, vad))
+        })
+    }
+
+    /// Runs the call's pipeline with speech in the voice adapter `adapter` supervises.
+    /// `peer`: the owner's display name, for the adapter (cut to 64 characters).
+    pub fn with_adapter(line: Line, adapter: &AdapterSetup, peer: &str, events: EventSink) -> Self {
+        Self::with_engine(line, events, |ctx| {
+            Arc::new(AdapterEngine::start(ctx, adapter, peer))
+        })
+    }
+
+    fn with_engine(
+        line: Line,
+        events: EventSink,
+        engine: impl FnOnce(Arc<SpeechContext>) -> Arc<dyn SpeechEngine>,
+    ) -> Self {
         let Line {
             call_id,
             incoming,
             speaker,
             control,
         } = line;
-        let shared = Arc::new(Shared {
-            events,
-            speaker,
-            speaks: tts.is_some(),
-            generation: AtomicU64::new(0),
-            speech: Mutex::new(Speech::default()),
-            wake: Notify::new(),
-            ended: AtomicBool::new(false),
-            silenced: AtomicBool::new(false),
-        });
-        let (utterances, to_transcribe) = mpsc::unbounded_channel();
-        let mut workers: Vec<JoinHandle<()>> = vec![
-            tokio::spawn(listen(shared.clone(), incoming, Vad::new(vad), utterances)),
-            tokio::spawn(transcribe(shared.clone(), stt, to_transcribe)),
-        ];
-        if let Some(tts) = tts {
-            workers.push(tokio::spawn(speak(shared.clone(), tts)));
-        }
-        let mut tasks: Vec<AbortHandle> = workers.iter().map(JoinHandle::abort_handle).collect();
-        let watcher = tokio::spawn(watch(shared.clone(), control.clone(), workers));
+        let ctx = Arc::new(SpeechContext::new(events, speaker));
+        let engine = engine(ctx.clone());
+        let listener = tokio::spawn(listen(engine.clone(), incoming));
+        let mut tasks = vec![listener.abort_handle()];
+        let watcher = tokio::spawn(watch(
+            ctx.clone(),
+            control.clone(),
+            engine.clone(),
+            listener,
+        ));
         tasks.push(watcher.abort_handle());
         Self {
             call_id,
-            shared,
+            ctx,
+            engine,
             control,
             tasks,
         }
@@ -230,39 +172,45 @@ impl Session {
     /// The owner is answered again: the next replies are spoken. Whether a barge-in had
     /// muted them.
     pub fn unmute(&self) -> bool {
-        std::mem::take(&mut self.shared.speech().muted)
+        std::mem::take(&mut self.ctx.speech().muted)
     }
 
     fn queue(&self, text: String, reply: bool) {
-        if !self.shared.speaks || self.shared.silenced.load(Ordering::Acquire) {
+        if !self.engine.speaks() || self.ctx.silenced.load(Ordering::Acquire) {
             return;
         }
         {
             // Under the lock: the watcher resets the speech state under it once ended,
             // and a barge-in mutes the reply under it.
-            let mut speech = self.shared.speech();
-            if self.shared.ended() || (reply && speech.muted) {
+            let mut speech = self.ctx.speech();
+            if self.ctx.ended() || (reply && speech.muted) {
                 return;
             }
-            let generation = self.shared.generation();
-            speech.queue.push_back((generation, text));
+            let generation = self.ctx.generation();
+            speech.queue.push_back(Sentence {
+                generation,
+                text,
+                own: !reply,
+            });
         }
-        self.shared.wake.notify_one();
+        self.ctx.wake.notify_one();
     }
 
     /// Stops speaking: drops the queued sentences and the queued audio (nothing once the
     /// call ended). Unlike a barge-in it does not mute the reply: who hushes decides what
     /// is said next.
     pub fn hush(&self) {
-        self.shared.stop_speaking(false);
+        self.ctx.stop_speaking(false);
+        self.engine.stop();
     }
 
     /// Mutes the agent (`true`: stops speaking at once and says nothing more, its own
     /// sentences included) or lets it speak again; the owner is still heard.
     pub fn set_silenced(&self, silenced: bool) {
-        self.shared.silenced.store(silenced, Ordering::Release);
+        self.ctx.silenced.store(silenced, Ordering::Release);
         if silenced {
-            self.shared.stop_speaking(false);
+            self.ctx.stop_speaking(false);
+            self.engine.stop();
         }
     }
 
@@ -281,7 +229,7 @@ impl Session {
 
     /// Whether the agent is speaking (queued sentences or audio still playing).
     pub fn speaking(&self) -> bool {
-        self.shared.speaking()
+        self.ctx.speaking()
     }
 }
 
@@ -290,7 +238,7 @@ impl Drop for Session {
         for task in &self.tasks {
             task.abort();
         }
-        if !self.shared.ended() {
+        if !self.ctx.ended() {
             if let Ok(runtime) = tokio::runtime::Handle::try_current() {
                 let control = self.control.clone();
                 runtime.spawn(async move {
@@ -301,31 +249,34 @@ impl Drop for Session {
     }
 }
 
-/// Reports the connection and the end, then stops the workers.
-async fn watch(shared: Arc<Shared>, control: Arc<dyn LineControl>, workers: Vec<JoinHandle<()>>) {
+/// Reports the connection and the end, then stops the listener and the engine.
+async fn watch(
+    ctx: Arc<SpeechContext>,
+    control: Arc<dyn LineControl>,
+    engine: Arc<dyn SpeechEngine>,
+    listener: JoinHandle<()>,
+) {
     let end = match control.connected().await {
         Ok(()) => {
-            shared.emit(SessionEvent::Connected);
+            ctx.emit(SessionEvent::Connected);
+            engine.connected();
             control.ended().await
         }
         Err(end) => end,
     };
-    shared.ended.store(true, Ordering::Release);
-    for worker in &workers {
-        worker.abort();
-    }
-    for worker in workers {
-        let _ = worker.await;
-    }
+    ctx.set_ended();
+    listener.abort();
+    let _ = listener.await;
+    engine.end(end.reason).await;
     {
-        // The aborted speaker worker may have left a sentence busy, sentences queued or
+        // The stopped engine may have left a sentence busy, sentences queued or
         // `Speaking(true)` unanswered: the end stops the speech too.
-        let mut speech = shared.speech();
+        let mut speech = ctx.speech();
         speech.queue.clear();
         speech.busy = None;
         speech.playing_until = None;
         if std::mem::take(&mut speech.speaking) {
-            shared.emit(SessionEvent::Speaking(false));
+            ctx.emit(SessionEvent::Speaking(false));
         }
     }
     tracing::info!(
@@ -333,173 +284,14 @@ async fn watch(shared: Arc<Shared>, control: Arc<dyn LineControl>, workers: Vec<
         reason = end.reason.as_str(),
         duration_s = end.duration_s
     );
-    shared.emit(SessionEvent::Ended(end));
+    ctx.emit(SessionEvent::Ended(end));
 }
 
-/// Runs the detector on the owner's audio.
-async fn listen(
-    shared: Arc<Shared>,
-    mut incoming: mpsc::Receiver<Frame>,
-    mut vad: Vad,
-    utterances: mpsc::UnboundedSender<(Vec<i16>, Instant)>,
-) {
-    let mut started = Instant::now();
+/// Gives the owner's audio to the engine.
+async fn listen(engine: Arc<dyn SpeechEngine>, mut incoming: mpsc::Receiver<Frame>) {
     while let Some(frame) = incoming.recv().await {
-        match vad.push(&frame) {
-            Some(VadEvent::SpeechStarted) => {
-                started = Instant::now();
-                if shared.stop_speaking(true) {
-                    tracing::info!(event = "voice_barge_in");
-                }
-                shared.emit(SessionEvent::Listening(true));
-            }
-            Some(VadEvent::Utterance(samples)) => {
-                shared.emit(SessionEvent::Listening(false));
-                if utterances.send((samples, started)).is_err() {
-                    return;
-                }
-            }
-            Some(VadEvent::Discarded) => shared.emit(SessionEvent::Listening(false)),
-            None => {}
-        }
+        engine.hear(&frame);
     }
-}
-
-/// Transcribes the utterances one at a time, in order.
-async fn transcribe(
-    shared: Arc<Shared>,
-    stt: Arc<dyn Stt>,
-    mut utterances: mpsc::UnboundedReceiver<(Vec<i16>, Instant)>,
-) {
-    while let Some((samples, started)) = utterances.recv().await {
-        let ms = samples.len() as u64 * 1000 / u64::from(SAMPLE_RATE);
-        tracing::info!(event = "voice_utterance", ms);
-        match stt.transcribe(&samples).await {
-            Ok(text) => {
-                let text = text.trim();
-                if !text.is_empty() {
-                    shared.emit(SessionEvent::Transcript {
-                        text: text.to_owned(),
-                        started,
-                    });
-                }
-            }
-            Err(error) => {
-                tracing::warn!(
-                    event = "stt_failed",
-                    provider = error.provider,
-                    code = %error.code
-                );
-                shared.emit(SessionEvent::SpeechFailed(error.code));
-            }
-        }
-    }
-}
-
-/// What the speaker worker does next.
-enum Next {
-    Sentence(u64, String),
-    /// Nothing queued: the audio plays until then.
-    Playing(Instant),
-    /// The audio played: `Speaking(false)` was reported.
-    Done,
-    Idle,
-}
-
-/// Speaks the queued sentences.
-async fn speak(shared: Arc<Shared>, tts: Arc<dyn Tts>) {
-    loop {
-        let next = {
-            let mut speech = shared.speech();
-            if let Some((generation, text)) = speech.queue.pop_front() {
-                speech.busy = Some(generation);
-                Next::Sentence(generation, text)
-            } else if !speech.speaking {
-                Next::Idle
-            } else {
-                match speech.playing_until {
-                    Some(until) if until > Instant::now() => Next::Playing(until),
-                    _ => {
-                        speech.speaking = false;
-                        speech.playing_until = None;
-                        shared.emit(SessionEvent::Speaking(false));
-                        Next::Done
-                    }
-                }
-            }
-        };
-        match next {
-            Next::Sentence(generation, text) => {
-                let spoken = say_sentence(&shared, tts.as_ref(), generation, &text).await;
-                shared.speech().busy = None;
-                if !spoken {
-                    return;
-                }
-            }
-            Next::Playing(until) => {
-                tokio::select! {
-                    () = tokio::time::sleep_until(until) => {}
-                    () = shared.wake.notified() => {}
-                }
-            }
-            Next::Done => {}
-            Next::Idle => shared.wake.notified().await,
-        }
-    }
-}
-
-/// Synthesizes `text` and queues its audio unless a barge-in or a hush overtakes it;
-/// `false` once the call ended.
-async fn say_sentence(shared: &Shared, tts: &dyn Tts, generation: u64, text: &str) -> bool {
-    if generation != shared.generation() {
-        return true;
-    }
-    let samples = match tts.synthesize(text).await {
-        Ok(samples) => samples,
-        Err(error) => {
-            tracing::warn!(
-                event = "tts_failed",
-                provider = error.provider,
-                code = %error.code
-            );
-            return true;
-        }
-    };
-    {
-        let mut speech = shared.speech();
-        if generation != shared.generation() {
-            return true;
-        }
-        if !std::mem::replace(&mut speech.speaking, true) {
-            shared.emit(SessionEvent::Speaking(true));
-        }
-    }
-    let frames = wav::frames(&samples);
-    tracing::info!(
-        event = "voice_sentence",
-        ms = frames.len() as u64 * FRAME_TIME.as_millis() as u64
-    );
-    for frame in frames {
-        if generation != shared.generation() {
-            return true;
-        }
-        if !shared.speaker.send(frame).await {
-            return false;
-        }
-        let mut speech = shared.speech();
-        if generation != shared.generation() {
-            drop(speech);
-            // A barge-in or a hush overtook the frame while the speaker took it: its
-            // `clear()` may have run before the frame was queued, which then carries the
-            // speaker's new generation and would play after the cut. Clear again.
-            shared.speaker.clear();
-            return true;
-        }
-        let now = Instant::now();
-        let from = speech.playing_until.map_or(now, |until| until.max(now));
-        speech.playing_until = Some(from + FRAME_TIME);
-    }
-    true
 }
 
 #[cfg(test)]

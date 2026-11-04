@@ -297,6 +297,11 @@ impl<M: Messenger> Core<M> {
             SessionEvent::BargedIn => call.speech.interrupt(),
             SessionEvent::Transcript { text, started } => self.on_transcript(text, started).await,
             SessionEvent::SpeechFailed(_) => call.session.say(NOT_UNDERSTOOD),
+            // The voice adapter's state during the call: its notes come with the adapter
+            // wiring (PR 2 Task 2.8); the session already stopped or resumed the speech.
+            SessionEvent::AdapterLost
+            | SessionEvent::AdapterBack
+            | SessionEvent::AdapterUnavailable => {}
             SessionEvent::Ended(end) => {
                 let call = self.call.take();
                 tracing::info!(

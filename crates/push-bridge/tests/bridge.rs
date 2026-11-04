@@ -976,6 +976,7 @@ async fn a_voice_call_end_to_end() {
             tts: Some(tts.clone()),
             vad: VadConfig::default(),
             policy: Default::default(),
+            adapter: None,
         }),
     );
     backend.wait_for("start", 1).await;

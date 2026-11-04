@@ -6,5 +6,6 @@ pub mod connect;
 #[cfg(windows)]
 mod job;
 pub mod link;
+pub mod router;
 pub mod spawn;
 pub mod supervisor;

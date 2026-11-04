@@ -267,6 +267,7 @@ fn voice_setup(config: &Config, client: &Client) -> Option<VoiceSetup> {
         tts: providers.tts,
         vad: calls.vad.to_vad(),
         policy,
+        adapter: None,
     })
 }
 

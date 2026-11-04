@@ -410,6 +410,7 @@ impl Agent {
             tts: Some(Arc::new(FakeTts::new())),
             vad: VadConfig::default(),
             policy,
+            adapter: None,
         });
         let (stop, stopped) = oneshot::channel::<()>();
         let run = tokio::spawn(bridge.run(async {
