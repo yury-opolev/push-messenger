@@ -171,6 +171,69 @@ CIDR whose address is its network address.
 {{- join "\n" $cidrs -}}
 {{- end -}}
 
+{{/* "true" for an IPv6 CIDR whose address is IPv4-mapped (within ::ffff:0:0/96). */}}
+{{- define "push.isIpv4MappedCidr" -}}
+{{- $groups := splitList "," (include "push.ipv6Groups" (first (splitList "/" (toString .)))) -}}
+{{- if and (eq (len $groups) 8) (eq (join "," (slice $groups 0 6)) "0,0,0,0,0,65535") -}}true{{- end -}}
+{{- end -}}
+
+{{/*
+A valid CIDR in canonical form, as Go prints it: IPv6 in lower case without leading zeros,
+the first longest run of two or more zero groups as "::" (RFC 5952). IPv4 is already
+canonical (push.ipFamily refuses leading zeros).
+*/}}
+{{- define "push.cidrCanonical" -}}
+{{- $parts := splitList "/" (toString .) -}}
+{{- $address := index $parts 0 -}}
+{{- if eq (include "push.ipFamily" $address) "6" -}}
+{{- $groups := splitList "," (include "push.ipv6Groups" $address) -}}
+{{- $bestStart := -1 -}}
+{{- $bestLength := 1 -}}
+{{- $runStart := -1 -}}
+{{- range $index, $group := $groups -}}
+{{- if eq $group "0" -}}
+{{- if lt $runStart 0 -}}{{- $runStart = $index -}}{{- end -}}
+{{- if gt (sub (add $index 1) $runStart) $bestLength -}}
+{{- $bestStart = $runStart -}}
+{{- $bestLength = sub (add $index 1) $runStart -}}
+{{- end -}}
+{{- else -}}
+{{- $runStart = -1 -}}
+{{- end -}}
+{{- end -}}
+{{- $left := list -}}
+{{- $right := list -}}
+{{- range $index, $group := $groups -}}
+{{- $hex := printf "%x" (int64 $group) -}}
+{{- if or (lt $bestStart 0) (lt $index $bestStart) -}}
+{{- $left = append $left $hex -}}
+{{- else if ge $index (add $bestStart $bestLength) -}}
+{{- $right = append $right $hex -}}
+{{- end -}}
+{{- end -}}
+{{- if lt $bestStart 0 -}}{{ join ":" $left }}{{- else -}}{{ join ":" $left }}::{{ join ":" $right }}{{- end -}}
+/{{ index $parts 1 }}
+{{- else -}}
+{{- . -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+The denied peers as the coturn pod's egress NetworkPolicy excepts them: push.turnDeniedCidrs
+in canonical form, without what Kubernetes refuses in ipBlock. The API server rejects
+IPv4-mapped IPv6 CIDRs (::ffff:0:0/96 and within), and a pod never sends to such an address;
+the IPv4 excepts under 0.0.0.0/0 cover the addresses they embed. coturn keeps denying them.
+*/}}
+{{- define "push.turnPolicyDeniedCidrs" -}}
+{{- $cidrs := list -}}
+{{- range splitList "\n" (include "push.turnDeniedCidrs" .) -}}
+{{- if not (or (hasSuffix "/0" .) (include "push.isIpv4MappedCidr" .)) -}}
+{{- $cidrs = append $cidrs (include "push.cidrCanonical" .) -}}
+{{- end -}}
+{{- end -}}
+{{- join "\n" $cidrs -}}
+{{- end -}}
+
 {{/* coturn's configuration without the shared secret (the init container appends it). */}}
 {{- define "push.coturnConfig" -}}
 {{- $internal := .Values.calls.turn.internal -}}
@@ -334,6 +397,11 @@ relay ports (advertised as external-ip:<port>) would be reachable at their numbe
 (IPv4 too), and /0 would deny every peer. */ -}}
 {{- if or (not $range) (and (not (contains ":" .)) (lt $prefix 8)) (and (contains ":" .) (or (lt $prefix 16) (hasPrefix "0:0:0:0:0:0:0:0-" $range))) -}}
 {{- fail (printf "%s (network addresses such as 10.244.0.0/16 or fd00:10:244::/56; at least /8 for IPv4, /16 for IPv6, not starting at ::), not %v" $cidrError .) -}}
+{{- end -}}
+{{- /* Kubernetes refuses them in the NetworkPolicy's ipBlock; denied-peers.txt already
+denies ::ffff:0:0/96 to coturn. */ -}}
+{{- if include "push.isIpv4MappedCidr" . -}}
+{{- fail (printf "calls.turn.internal.deniedPeerCidrs must not hold IPv4-mapped IPv6 CIDRs (within ::ffff:0:0/96; Kubernetes refuses them in NetworkPolicy ipBlock): list the IPv4 CIDR instead, not %v" .) -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}

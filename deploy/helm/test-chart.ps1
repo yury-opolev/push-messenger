@@ -352,6 +352,8 @@ assert all(line.startswith("denied-peer-ip=") and "/" not in line for line in de
 ranges = [tuple(ipaddress.ip_address(a) for a in line.removeprefix("denied-peer-ip=").split("-")) for line in denied]
 networks = [ipaddress.ip_network(c) for c in cidrs]
 assert ranges == [(n.network_address, n.broadcast_address) for n in networks], ranges
+# coturn still refuses IPv4 peers written as IPv4-mapped IPv6 (left out of the NetworkPolicy).
+assert "denied-peer-ip=0:0:0:0:0:ffff:0:0-0:0:0:0:0:ffff:ffff:ffff" in denied, denied
 assert "static-auth-secret" not in config
 
 secrets = [d for d in docs if d["kind"] == "Secret"]
@@ -438,8 +440,10 @@ if case["metricsPeers"]:
         {"namespaceSelector": {"matchLabels": p["namespaceSelector"]}, "podSelector": {"matchLabels": p["podSelector"]}}
         for p in case["metricsPeers"]]})
 assert policy["ingress"] == rules, policy["ingress"]
-v4 = [c for c in cidrs if ":" not in c]
-v6 = [c for c in cidrs if ":" in c]
+# The NetworkPolicy holds the same networks in canonical form, without the IPv4-mapped ones
+# the API server refuses in ipBlock.
+v4 = [str(n) for n in networks if n.version == 4]
+v6 = [str(n) for n in networks if n.version == 6 and not n.subnet_of(ipaddress.ip_network("::ffff:0:0/96"))]
 assert policy["egress"] == [{"to": [{"ipBlock": {"cidr": "0.0.0.0/0", "except": v4}},
                                     {"ipBlock": {"cidr": "::/0", "except": v6}}]}], policy["egress"]
 assert sum(d["kind"] == "NetworkPolicy" for d in docs) == 7
@@ -460,6 +464,59 @@ assert sum(d["kind"] == "NetworkPolicy" for d in docs) == 7
 }
 
 $turnInternal = helm template push $chart @turnArgs | Out-String
+
+# Every NetworkPolicy ipBlock in $rendered obeys the API server's rules (k8s.io/kubernetes
+# pkg/apis/networking/validation ValidateIPBlock with apimachinery's strict CIDR parsing):
+# a network address (no host bits), no leading zeros, no IPv4-mapped IPv6, and each except
+# entry a strict subset of cidr. Stricter than the API: every value in canonical form.
+function IpBlockRules([string] $rendered) {
+    $validator = @'
+import ipaddress, re, sys, yaml
+def network(value):
+    address, _, prefix = value.partition("/")
+    assert re.fullmatch(r"0|[1-9][0-9]*", prefix), f"{value}: prefix length"
+    net = ipaddress.ip_network(value, strict=True)
+    assert net.version == 4 or net.network_address.ipv4_mapped is None, f"{value}: IPv4-mapped IPv6"
+    assert str(net) == value, f"{value}: not canonical ({net})"
+    return net
+blocks = 0
+for doc in yaml.safe_load_all(sys.stdin.read()):
+    if not doc or doc["kind"] != "NetworkPolicy":
+        continue
+    spec = doc["spec"]
+    for rule in spec.get("egress", []) + spec.get("ingress", []):
+        for peer in rule.get("to", []) + rule.get("from", []):
+            if "ipBlock" not in peer:
+                continue
+            blocks += 1
+            cidr = network(peer["ipBlock"]["cidr"])
+            for value in peer["ipBlock"].get("except", []):
+                entry = network(value)
+                assert entry.version == cidr.version and entry.subnet_of(cidr) and entry.prefixlen > cidr.prefixlen, \
+                    f"{value}: not a strict subset of {cidr}"
+assert blocks, "no ipBlock rendered"
+'@
+    $result = $rendered | & $python.Source -c $validator 2>&1
+    $passed = $LASTEXITCODE -eq 0
+    if (-not $passed) { $result | ForEach-Object { Write-Host $_ } }
+    return $passed
+}
+$badExcept = @'
+kind: NetworkPolicy
+spec:
+  egress:
+    - to:
+        - ipBlock:
+            cidr: "::/0"
+            except: [{0}]
+'@
+Check 'turn: the ipBlock rules refuse IPv4-mapped, non-subset, non-canonical and host-bit excepts' {
+    $outcomes = foreach ($entry in @('"::ffff:0:0/96"', '"::ffff:a00:0/104"', '"::/0"', '"10.0.0.0/8"',
+            '"FD00::/8"', '"fd00:0:0:0::/16"', '"fd00::1/16"')) {
+        IpBlockRules ($badExcept -f $entry) 6>$null
+    }
+    -not ($outcomes -contains $true) -and (IpBlockRules ($badExcept -f '"fd00::/8"'))
+}
 Check 'turn: off by default: no TURN variables, no coturn, no TURN secret; the auth route serves /v1/calls' {
     $default -notmatch 'PUSH_TURN_|push-coturn|turn-shared-secret' -and
         (Doc $default 'Ingress' 'push-auth') -match '(?s)- path: /v1/calls\s+pathType: Prefix\s+backend:\s+service:\s+name: push-auth'
@@ -515,6 +572,14 @@ Check 'turn: an IPv6 publicHost is bracketed and advertised; secrets.volume deli
             cidrs = @('fd00:10:244::/56'); realm = '2001:db8::10'; externalIp = '2001:db8::10'; serviceType = 'ClusterIP'
             volume = (ConvertFrom-Json $csiVolume); secretFile = '/etc/push/application-keys/turn-key'
         })
+}
+Check 'turn: the NetworkPolicies pass the API server''s ipBlock rules (dual-stack, TLS, IPv6 overrides)' {
+    (IpBlockRules $turnInternal) -and (IpBlockRules $turnTls) -and (IpBlockRules $turnIpv6)
+}
+Check 'turn: deniedPeerCidrs overrides are written canonically in the NetworkPolicy, as given to coturn' {
+    $overrides = @('10.244.0.0/16', 'FD00:10:244:0:0:0:0:0/56', 'fd00:0010:0096::/112', '2001:db8:0:0:1::/80')
+    $rendered = helm template push $chart @turnArgs --set "calls.turn.internal.deniedPeerCidrs={$($overrides -join ',')}" | Out-String
+    $LASTEXITCODE -eq 0 -and (IpBlockRules $rendered) -and (CoturnMatrix $rendered @{ cidrs = $overrides })
 }
 Check 'turn: internal.enabled false hands out credentials for a coturn run elsewhere, without deploying one' {
     $rendered = helm template push $chart --set calls.enabled=true --set calls.turn.internal.enabled=false `
@@ -642,6 +707,7 @@ foreach ($invalid in @(
     @{ args = $noCidrs + @('--set', 'calls.turn.internal.deniedPeerCidrs={::/0}'); message = "calls.turn.internal.deniedPeerCidrs must list the cluster's pod and service CIDRs" },
     @{ args = $noCidrs + @('--set', 'calls.turn.internal.deniedPeerCidrs={::/128}'); message = "calls.turn.internal.deniedPeerCidrs must list the cluster's pod and service CIDRs" },
     @{ args = $noCidrs + @('--set', 'calls.turn.internal.deniedPeerCidrs={2001::/15}'); message = "calls.turn.internal.deniedPeerCidrs must list the cluster's pod and service CIDRs" },
+    @{ args = $noCidrs + @('--set', 'calls.turn.internal.deniedPeerCidrs={::ffff:a00:0/104}'); message = 'calls.turn.internal.deniedPeerCidrs must not hold IPv4-mapped IPv6 CIDRs (within ::ffff:0:0/96; Kubernetes refuses them in NetworkPolicy ipBlock)' },
     @{ args = $turnArgs + @('--set', 'calls.turn.internal.quotas.user=0'); message = 'calls.turn.internal.quotas.user must be an integer from 1 to 1000' },
     @{ args = $turnArgs + @('--set', 'calls.turn.internal.quotas.total=100001'); message = 'calls.turn.internal.quotas.total must be an integer from 1 to 100000' },
     @{ args = $turnArgs + @('--set', 'calls.turn.internal.quotas.maxBps=7999'); message = 'calls.turn.internal.quotas.maxBps must be an integer from 8000 to 1000000000' },

@@ -547,7 +547,7 @@ The chart refuses an invalid value naming it, for example `"calls.historyDays mu
 | `calls.turn.internal.tlsSecret` | `calls.turn.internal.tlsSecret must be empty or a Secret name` |
 | `calls.turn.internal.service.*` | `calls.turn.internal.service.type must be LoadBalancer or ClusterIP`; `calls.turn.internal.service.annotations must be a string-valued annotation map`; `calls.turn.internal.service.loadBalancerIP must be empty or an IP address` |
 | `calls.turn.internal.resources` | `calls.turn.internal.resources must be a map of Kubernetes container resources` |
-| `calls.turn.internal.deniedPeerCidrs` | empty: `calls.turn.internal.deniedPeerCidrs must list the cluster's pod and service CIDRs`; a bad entry: `calls.turn.internal.deniedPeerCidrs must list the cluster's pod and service CIDRs (network addresses such as 10.244.0.0/16 or fd00:10:244::/56; at least /8 for IPv4, /16 for IPv6, not starting at ::), not <value>`; a malformed range: `files/coturn/denied-peers.txt or calls.turn.internal.deniedPeerCidrs holds "<value>", which is not a CIDR` |
+| `calls.turn.internal.deniedPeerCidrs` | empty: `calls.turn.internal.deniedPeerCidrs must list the cluster's pod and service CIDRs`; a bad entry: `calls.turn.internal.deniedPeerCidrs must list the cluster's pod and service CIDRs (network addresses such as 10.244.0.0/16 or fd00:10:244::/56; at least /8 for IPv4, /16 for IPv6, not starting at ::), not <value>`; a malformed range: `files/coturn/denied-peers.txt or calls.turn.internal.deniedPeerCidrs holds "<value>", which is not a CIDR`; an IPv4-mapped entry: `calls.turn.internal.deniedPeerCidrs must not hold IPv4-mapped IPv6 CIDRs (within ::ffff:0:0/96; Kubernetes refuses them in NetworkPolicy ipBlock): list the IPv4 CIDR instead, not <value>` |
 | `calls.turn.internal.quotas.*` | `calls.turn.internal.quotas.<user\|total\|maxBps> must be an integer from <min> to <max>` |
 | `calls.turn.internal.image` | `calls.turn.internal.image must be <repository>:<tag>@sha256:<64 hex digits>` |
 | `calls.turn.internal.metricsPeers` | `calls.turn.internal.metricsPeers requires namespaceSelector and podSelector as non-empty label maps on every peer` |
@@ -798,8 +798,9 @@ Client SDKs: push-sdk's `Calls::ice_servers()` ([§18](#18-push-sdk)).
   (`deniedPeerCidrs`, required). The list is
   [`files/coturn/denied-peers.txt`](../deploy/helm/push-messenger/files/coturn/denied-peers.txt);
   an integration test proves the real coturn refuses these peers (403). The coturn pod's
-  NetworkPolicy repeats the list as egress exceptions, as a second layer where the CNI
-  enforces policies.
+  NetworkPolicy repeats the list as egress exceptions (less the IPv4-mapped range, which
+  Kubernetes refuses in `ipBlock`, [§13.4](#134-coturn-in-the-chart)), as a second layer
+  where the CNI enforces policies.
 - **Bandwidth and allocation abuse** is bounded by `user-quota` (12 concurrent
   allocations per user, counted by the user id across credentials), `total-quota` (1200)
   and `max-bps` (512000 bytes per second per session; Opus audio needs about 10 kB/s).
@@ -881,7 +882,15 @@ With `calls.enabled`, `mode: internal` and `internal.enabled`, the chart renders
   without usernames as labels, coturn's default). The chart adds no scrape configuration.
 - **NetworkPolicy `<release>-coturn`** (with `networkPolicy.enabled`): ingress from
   anywhere on 3478 (UDP/TCP), 5349 (TLS) and the relay range; 9641 only from
-  `metricsPeers`; egress to `0.0.0.0/0` and `::/0` except every denied CIDR.
+  `metricsPeers`; egress to `0.0.0.0/0` and `::/0` except every denied CIDR, in
+  canonical form (`FD00:10:244:0:0:0:0:0/56` becomes `fd00:10:244::/56`), but the
+  IPv4-mapped ones (`::ffff:0:0/96` and within): the API server refuses them in `ipBlock`
+  ("must not have an IPv4-mapped IPv6 address"), a pod never sends to such an address,
+  and the IPv4 exceptions cover the addresses they embed. coturn's `denied-peer-ip` still
+  lists every denied CIDR, `::ffff:0:0/96` included. `deniedPeerCidrs` refuses IPv4-mapped
+  entries (list the IPv4 CIDR). CI applies the chart to a real API server on kind for
+  Kubernetes 1.34 to 1.37 (`pwsh deploy/helm/test-chart-cluster.ps1 -Context <context>`
+  runs the same against any disposable cluster).
 
 ### 13.5 AKS
 

@@ -237,18 +237,17 @@ spec:
 {{- if .Values.networkPolicy.enabled }}
 {{- $v4 := list -}}
 {{- $v6 := list -}}
-{{- range splitList "\n" (include "push.turnDeniedCidrs" .) -}}
-{{- if not (hasSuffix "/0" .) -}}
+{{- range splitList "\n" (include "push.turnPolicyDeniedCidrs" .) -}}
 {{- if contains ":" . -}}
 {{- $v6 = append $v6 . -}}
 {{- else -}}
 {{- $v4 = append $v4 . -}}
 {{- end -}}
-{{- end -}}
 {{- end }}
 ---
 # TURN from anywhere; the relay reaches public addresses only (the denied peers, as in
-# coturn's denied-peer-ip). Prometheus only from calls.turn.internal.metricsPeers.
+# coturn's denied-peer-ip, less the IPv4-mapped ones ipBlock refuses: push.turnPolicyDeniedCidrs).
+# Prometheus only from calls.turn.internal.metricsPeers.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:

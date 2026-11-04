@@ -3,6 +3,12 @@
 # (spec 2026-11-03 voice calls, T5). One CIDR per line; the cluster's own pod and service
 # CIDRs come from calls.turn.internal.deniedPeerCidrs. The push-auth-core integration
 # test reads this file too.
+# The NetworkPolicy gets these CIDRs in canonical form, less the IPv4-mapped ones
+# (::ffff:0:0/96 and within; push.turnPolicyDeniedCidrs in templates/_turn.tpl): the API
+# server refuses IPv4-mapped IPv6 in ipBlock ("must not have an IPv4-mapped IPv6 address",
+# "must be a strict subset of cidr"), a pod never sends to such an address, and the IPv4
+# entries cover the addresses they embed. coturn denies them all, ::ffff:0:0/96 included.
+# Every other entry must be a network address (no host bits) Kubernetes accepts in ipBlock.
 0.0.0.0/8
 10.0.0.0/8
 100.64.0.0/10
