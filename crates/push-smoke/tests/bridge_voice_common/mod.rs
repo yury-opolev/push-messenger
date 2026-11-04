@@ -525,7 +525,7 @@ impl Agent {
         let (bridge, adapter, advertiser) = match speech {
             Speech::Adapter(config) => {
                 let hello = BridgeHello::v1(env!("CARGO_PKG_VERSION"), LANGUAGE);
-                let supervisor = supervisor::start(config, hello, dir.join("logs"), Vec::new());
+                let supervisor = supervisor::start(config, hello, dir.join("logs"));
                 let setup = AdapterSetup::new(supervisor, LANGUAGE);
                 let call_flag: CallFlag = Arc::new(watch::channel(false).0);
                 let advertised = client.clone();

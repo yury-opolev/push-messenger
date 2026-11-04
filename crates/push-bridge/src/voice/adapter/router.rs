@@ -975,8 +975,9 @@ impl Router {
             let mut speech = ctx.speech();
             if generation != ctx.generation() {
                 drop(speech);
-                // A barge-in or a hush overtook the frame while the speaker took it (see
-                // the built-in engine): clear again.
+                // A barge-in or a hush overtook the frame while `speaker.send` waited: its
+                // `clear()` may have run before the frame was queued, so the frame would
+                // play after the cut. Clear again and count the frame as dropped.
                 ctx.speaker.clear();
                 self.inner.state().call.frames_dropped += 1;
                 return true;
@@ -1121,7 +1122,7 @@ impl Router {
 #[cfg(test)]
 mod tests {
     use std::io;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     use push_sdk::CallId;
     use push_voice_adapter_proto::{
@@ -1130,6 +1131,7 @@ mod tests {
     };
     use push_voice_adapter_testkit::tones::{self, SPEAK_HZ};
     use push_voice_adapter_testkit::{Event, Log, Script, Word};
+    use tokio::sync::Notify;
     use tokio::time::{sleep, timeout};
 
     use super::*;
@@ -1153,16 +1155,24 @@ mod tests {
         audio
     }
 
-    /// Records when frames reach the line's speaker.
+    /// Records when frames reach the line's speaker; once `hold` is set, holds the next
+    /// frame (announced on `taking`) until `release`.
     struct Recorder {
         inner: Arc<dyn Speaker>,
         sent: Mutex<Vec<Instant>>,
+        hold: AtomicBool,
+        taking: Notify,
+        release: Notify,
     }
 
     #[async_trait::async_trait]
     impl Speaker for Recorder {
         async fn send(&self, frame: Frame) -> bool {
             lock(&self.sent).push(Instant::now());
+            if self.hold.swap(false, Ordering::AcqRel) {
+                self.taking.notify_one();
+                self.release.notified().await;
+            }
             self.inner.send(frame).await
         }
 
@@ -1204,6 +1214,9 @@ mod tests {
         let recorder = Arc::new(Recorder {
             inner: line.speaker.clone(),
             sent: Mutex::default(),
+            hold: AtomicBool::new(false),
+            taking: Notify::new(),
+            release: Notify::new(),
         });
         line.speaker = recorder.clone();
         let (sender, events) = mpsc::unbounded_channel();
@@ -2032,6 +2045,45 @@ mod tests {
             Metrics::default(),
             "until the end"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_frame_overtaken_by_a_hush_does_not_play() {
+        let (mut call, mut adapter, id) = manual_call(capabilities()).await;
+        call.recorder.hold.store(true, Ordering::Release);
+        call.session.say_reply("one");
+        assert!(matches!(adapter.next().await, BridgeMessage::Speak(_)));
+        adapter.sound(0);
+        timeout(Duration::from_secs(10), call.recorder.taking.notified())
+            .await
+            .expect("the speaker takes the frame");
+        call.session.hush();
+        assert_eq!(call.owner.clears(), 1);
+        call.recorder.release.notify_one();
+        call.owner
+            .wait_until("the second clear", |owner| owner.clears() == 2)
+            .await;
+        adapter.speak_done(&id, "s1", true);
+        call.during(Duration::from_millis(300)).await;
+        assert!(call.owner.heard().is_empty());
+        assert!(!call.session.speaking());
+        call.owner.end(CallEndReason::Completed);
+        call.until(&SessionEvent::Ended(LineEnded {
+            reason: CallEndReason::Completed,
+            duration_s: Some(0),
+        }))
+        .await;
+        let mut metrics = call.setup.metrics.snapshot();
+        for _ in 0..100 {
+            if metrics.calls == 1 {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+            metrics = call.setup.metrics.snapshot();
+        }
+        assert_eq!(metrics.calls, 1);
+        assert_eq!(metrics.frames_dropped, 1);
+        assert_eq!(metrics.frames_from_adapter, 0);
     }
 
     #[tokio::test(start_paused = true)]

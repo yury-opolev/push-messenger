@@ -66,14 +66,11 @@ fn named(name: &str, names: &[String]) -> bool {
         .any(|allowed| allowed.eq_ignore_ascii_case(name))
 }
 
-/// Whether `name` must not reach the adapter: [`SECRET_VARS`], [`SECRET_PREFIXES`],
-/// [`SECRET_WORDS`] or one of `extra_secret_names` (the variables the bridge's config
-/// names as key sources), all case-insensitive.
-pub fn is_secret(name: &OsStr, extra_secret_names: &[String]) -> bool {
+/// Whether `name` must not reach the adapter: [`SECRET_VARS`], [`SECRET_PREFIXES`] or
+/// [`SECRET_WORDS`], all case-insensitive.
+pub fn is_secret(name: &OsStr) -> bool {
     let upper = name.to_string_lossy().to_ascii_uppercase();
-    is_always_secret(&upper)
-        || named(&upper, extra_secret_names)
-        || SECRET_WORDS.iter().any(|word| upper.contains(word))
+    is_always_secret(&upper) || SECRET_WORDS.iter().any(|word| upper.contains(word))
 }
 
 /// Whether `name` (any case) is one of [`SECRET_VARS`] or starts with one of
@@ -89,18 +86,16 @@ pub fn is_always_secret(name: &str) -> bool {
 /// The adapter's environment: `vars` without the secret ones ([`is_secret`]). A name in
 /// `allow` (`calls.adapter.spawn.env_allow`, the owner's explicit choice; any case on
 /// Windows, exact elsewhere) overrides only the [`SECRET_WORDS`] guess, never
-/// [`SECRET_VARS`], [`SECRET_PREFIXES`] or `extra_secret_names`.
+/// [`SECRET_VARS`] or [`SECRET_PREFIXES`].
 pub fn adapter_env(
     vars: impl Iterator<Item = (OsString, OsString)>,
     allow: &[String],
-    extra_secret_names: &[String],
 ) -> Vec<(OsString, OsString)> {
     vars.filter(|(name, _)| {
-        let lossy = name.to_string_lossy();
-        if is_always_secret(&lossy) || named(&lossy, extra_secret_names) {
+        if is_always_secret(&name.to_string_lossy()) {
             return false;
         }
-        allowed(name, allow) || !is_secret(name, extra_secret_names)
+        allowed(name, allow) || !is_secret(name)
     })
     .collect()
 }
@@ -119,19 +114,14 @@ fn allowed(name: &OsStr, allow: &[String]) -> bool {
 /// Starts the adapter `config` describes, with the environment [`adapter_env`] leaves
 /// and stderr appended to `<log_dir>/voice-adapter.log` (`log`) or discarded. A failure
 /// names only the program's file name.
-pub fn spawn(
-    config: &SpawnConfig,
-    log_dir: &Path,
-    extra_secret_names: &[String],
-) -> io::Result<Spawned> {
-    spawn_with_env(config, log_dir, std::env::vars_os(), extra_secret_names)
+pub fn spawn(config: &SpawnConfig, log_dir: &Path) -> io::Result<Spawned> {
+    spawn_with_env(config, log_dir, std::env::vars_os())
 }
 
 fn spawn_with_env(
     config: &SpawnConfig,
     log_dir: &Path,
     vars: impl Iterator<Item = (OsString, OsString)>,
-    extra_secret_names: &[String],
 ) -> io::Result<Spawned> {
     let Some((program, args)) = config.command.split_first() else {
         return Err(io::Error::new(
@@ -147,7 +137,7 @@ fn spawn_with_env(
     command
         .args(args)
         .env_clear()
-        .envs(adapter_env(vars, &config.env_allow, extra_secret_names))
+        .envs(adapter_env(vars, &config.env_allow))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(stderr)
@@ -313,13 +303,8 @@ mod tests {
             "AWS_CREDENTIALS_FILE",
             "OAUTH_CLIENT",
             "SQL_CONNECTION_STRING",
-            "MY_SPEECH_ENV",
         ];
-        let env = adapter_env(
-            vars(&[&secret[..], &keep[..]].concat()),
-            &[],
-            &["my_speech_env".to_owned()],
-        );
+        let env = adapter_env(vars(&[&secret[..], &keep[..]].concat()), &[]);
         assert_eq!(names(&env), keep);
     }
 
@@ -328,10 +313,9 @@ mod tests {
         let env = adapter_env(
             vars(&["MY_API_TOKEN", "OTHER_TOKEN", "PATH"]),
             &["MY_API_TOKEN".to_owned()],
-            &[],
         );
         assert_eq!(names(&env), ["MY_API_TOKEN", "PATH"]);
-        let env = adapter_env(vars(&["my_api_token"]), &["MY_API_TOKEN".to_owned()], &[]);
+        let env = adapter_env(vars(&["my_api_token"]), &["MY_API_TOKEN".to_owned()]);
         assert_eq!(names(&env).len(), usize::from(cfg!(windows)));
     }
 
@@ -341,10 +325,10 @@ mod tests {
             "CODA_SERVE_API_KEY",
             "PUSH_AGENT_KEY",
             "CODA_HOME",
-            "MY_SPEECH_ENV",
+            "Azure_Speech_Key",
         ];
         let allow: Vec<String> = always.iter().map(|name| (*name).to_owned()).collect();
-        let env = adapter_env(vars(&always), &allow, &["MY_SPEECH_ENV".to_owned()]);
+        let env = adapter_env(vars(&always), &allow);
         assert!(env.is_empty(), "{:?}", names(&env));
     }
 
@@ -416,7 +400,7 @@ mod tests {
             "VOICE_SPAWN_HELPER",
         ]));
         let config = helper("a b; echo pwned", StderrMode::Discard);
-        let spawned = spawn_with_env(&config, dir.path(), with_secrets, &[]).unwrap();
+        let spawned = spawn_with_env(&config, dir.path(), with_secrets).unwrap();
         let (args, env) = run(spawned).await;
         assert_eq!(args.last().map(String::as_str), Some("a b; echo pwned"));
         assert!(!args.iter().any(|arg| arg == "pwned"));
@@ -434,7 +418,7 @@ mod tests {
         let dir = TestDir::new();
         let logs = dir.path().join("logs");
         let config = helper("x", StderrMode::Log);
-        let spawned = spawn_with_env(&config, &logs, std::env::vars_os(), &[]).unwrap();
+        let spawned = spawn_with_env(&config, &logs, std::env::vars_os()).unwrap();
         run(spawned).await;
         let log = std::fs::read_to_string(log_path(&logs)).unwrap();
         assert!(log.contains("helper stderr line"), "{log}");
@@ -496,7 +480,7 @@ mod tests {
             stderr: StderrMode::Discard,
             env_allow: Vec::new(),
         };
-        let Err(error) = spawn(&config, dir.path(), &[]) else {
+        let Err(error) = spawn(&config, dir.path()) else {
             panic!("spawned a missing program");
         };
         assert_eq!(error.kind(), io::ErrorKind::NotFound);

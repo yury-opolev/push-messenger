@@ -5,7 +5,8 @@
 //! sentences.
 //!
 //! The engine is the [`AdapterEngine`](super::adapter::router::AdapterEngine): speech in
-//! the voice adapter (push-voice-adapter/1); tests may plug in others.
+//! the voice adapter (push-voice-adapter/1). The trait is the seam between the session
+//! and the adapter router.
 //!
 //! The session and its engine share a [`SpeechContext`]: the session queues sentences in
 //! it (with the generation they belong to) and wakes [`SpeechContext::wake`]; the engine

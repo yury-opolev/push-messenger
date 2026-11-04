@@ -354,7 +354,7 @@ fn voice_setup(config: &Config, client: &Client, dir: &Path) -> Option<VoiceSetu
         .map_or_else(|| dir.join("logs"), Path::to_path_buf);
     // No extra secret names: the config names no key variables; the fixed deny-list and
     // the KEY/TOKEN/SECRET/PASS/... name check keep secrets from the adapter.
-    let supervisor = supervisor::start(adapter.clone(), hello, log_dir, Vec::new());
+    let supervisor = supervisor::start(adapter.clone(), hello, log_dir);
     tracing::info!(
         event = "voice_enabled",
         adapter = match adapter {

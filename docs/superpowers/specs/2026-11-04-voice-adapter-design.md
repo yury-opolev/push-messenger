@@ -455,9 +455,9 @@ negotiated (A6). The bridge's `calls` config gains `adapter` in PR 2 (additive) 
   change while connected (or identifying) reconnects at once; it does not count as a
   failure and keeps the backoff history of earlier failures; the same value does nothing.
   `Calls::available()` follows what the current connection advertised.
-- **Spawn.** `spawn(config, log_dir, extra_secret_names)`: the extra names (variables the
-  config names as key sources) are empty on the adapter path (with an adapter there are
-  no provider keys). Name matching is case-insensitive everywhere; `env_allow` (exact
+- **Spawn.** `spawn(config, log_dir)`: only `SECRET_VARS`, `SECRET_PREFIXES` and
+  `SECRET_WORDS` are kept from the adapter (an `extra_secret_names` parameter for the
+  built-in providers' key variables went with them in PR 3). Name matching is case-insensitive everywhere; `env_allow` (exact
   case on Unix) overrides only the word heuristic and may not name `SECRET_VARS` or the
   prefixes (validation error). `.bat`/`.cmd` refused. The stderr log is rotated only at
   (re)start (a long-running adapter can grow it past 5 MiB); a failed rotation logs and
