@@ -5,7 +5,10 @@
 //! `MediaPhone`), with a scripted backend and the tone-based speech fakes. Over real Opus
 //! media the owner hears the greeting and the spoken replies, its recorded fixtures become
 //! a prompt, a steer that cuts the reply short (barge-in) and a voice approval; a stranger's
-//! call never reaches the bridge, and the owner hangs up.
+//! call never reaches the bridge, and the owner hangs up. A second test runs the answering
+//! and calling policies: with `calls.answer` `ask` the owner's call waits for the card's
+//! "Answer"; a card left unanswered makes the bridge call the owner, who hears the summary
+//! and approves by voice; a call the owner lets ring out leaves the card open.
 //!
 //! Opt in with `PUSH_BRIDGE_VOICE=1` (otherwise the test passes without running): it needs
 //! Docker. CI runs it in the `bridge-voice` job.
@@ -28,6 +31,7 @@ use push_bridge::voice::VoiceSetup;
 use push_bridge::voice::fake::{FakeStt, FakeTts, Fixture, TTS_HZ, amplitude};
 use push_bridge::voice::media::MediaPhone;
 use push_bridge::voice::phone::{Line, Phone};
+use push_bridge::voice::policy::{CallPolicy, NotifyPolicy};
 use push_bridge::voice::vad::VadConfig;
 use push_load::accounts::Account as Credentials;
 use push_sdk::media::{
@@ -294,11 +298,12 @@ async fn post(
     body
 }
 
-/// A [`MediaPhone`] that remembers the calls it answered and declined.
+/// A [`MediaPhone`] that remembers the calls it answered, declined and placed.
 struct WatchedPhone {
     phone: MediaPhone,
     answered: Mutex<Vec<CallId>>,
     declined: Mutex<Vec<CallId>>,
+    dialed: Mutex<Vec<UserId>>,
 }
 
 impl WatchedPhone {
@@ -321,6 +326,11 @@ impl Phone for WatchedPhone {
     async fn decline(&self, call_id: CallId, busy: bool) -> Result<(), SdkError> {
         self.declined.lock().unwrap().push(call_id);
         self.phone.decline(call_id, busy).await
+    }
+
+    async fn call(&self, peer: UserId) -> Result<Line, SdkError> {
+        self.dialed.lock().unwrap().push(peer);
+        self.phone.call(peer).await
     }
 }
 
@@ -352,8 +362,9 @@ fn all_words() -> Vec<(f64, String)> {
 }
 
 impl Agent {
-    /// Enrolls with `code` and runs the bridge as `push-agent-bridge run` does.
-    async fn start(stack: &Stack, dir: &Path, code: &str) -> Self {
+    /// Enrolls with `code` and runs the bridge as `push-agent-bridge run` does, answering
+    /// and calling by `policy`.
+    async fn start(stack: &Stack, dir: &Path, code: &str, policy: CallPolicy) -> Self {
         let (client, events) = client(stack, dir, "agent");
         let key = SoftwareKey::generate().unwrap();
         let account = client
@@ -379,6 +390,7 @@ impl Agent {
             phone: MediaPhone::new(&client),
             answered: Mutex::new(Vec::new()),
             declined: Mutex::new(Vec::new()),
+            dialed: Mutex::new(Vec::new()),
         });
         let bridge = Bridge::new(
             messenger,
@@ -397,6 +409,7 @@ impl Agent {
             stt: Some(Arc::new(FakeStt::new(all_words()))),
             tts: Some(Arc::new(FakeTts::new())),
             vad: VadConfig::default(),
+            policy,
         });
         let (stop, stopped) = oneshot::channel::<()>();
         let run = tokio::spawn(bridge.run(async {
@@ -595,7 +608,7 @@ async fn scenario(stack: &Stack) {
     )
     .await;
     let code = created["enrollment_code"].as_str().unwrap();
-    let agent = Agent::start(stack, &dir, code).await;
+    let agent = Agent::start(stack, &dir, code, CallPolicy::default()).await;
     owner.watch(agent.user);
     stranger.watch(agent.user);
     within("the backend starts", agent.backend.wait_for("start", 1)).await;
@@ -786,5 +799,346 @@ async fn scenario(stack: &Stack) {
     client.close().await.unwrap();
     owner.client.close().await.unwrap();
     stranger.client.close().await.unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The owner's side of calls one after the other: every call event goes to the current
+/// call (events that come before it is set are replayed to it), and the bridge's
+/// invitations are reported as they ring.
+struct Line2 {
+    current: Arc<Mutex<Option<Arc<MediaCall>>>>,
+    pending: Arc<Mutex<Vec<CallEvent>>>,
+    incoming: mpsc::UnboundedReceiver<(CallId, String)>,
+}
+
+impl Line2 {
+    fn new(mut events: mpsc::UnboundedReceiver<CallEvent>) -> Self {
+        let current: Arc<Mutex<Option<Arc<MediaCall>>>> = Arc::default();
+        let pending: Arc<Mutex<Vec<CallEvent>>> = Arc::default();
+        let (sender, incoming) = mpsc::unbounded_channel();
+        let (to, kept) = (current.clone(), pending.clone());
+        tokio::spawn(async move {
+            while let Some(event) = events.recv().await {
+                if let CallEvent::Incoming {
+                    call_id, offer_sdp, ..
+                } = &event
+                {
+                    let _ = sender.send((*call_id, offer_sdp.clone()));
+                    continue;
+                }
+                let call = to.lock().unwrap().clone();
+                match call {
+                    Some(call) => {
+                        call.handle(&event);
+                    }
+                    None => kept.lock().unwrap().push(event),
+                }
+            }
+        });
+        Self {
+            current,
+            pending,
+            incoming,
+        }
+    }
+
+    /// `call` gets the call events from now on, and those that came meanwhile.
+    fn set(&self, call: Arc<MediaCall>) {
+        let mut current = self.current.lock().unwrap();
+        for event in self.pending.lock().unwrap().drain(..) {
+            call.handle(&event);
+        }
+        *current = Some(call);
+    }
+
+    fn clear(&self) {
+        *self.current.lock().unwrap() = None;
+        self.pending.lock().unwrap().clear();
+    }
+
+    /// The next call the bridge places to the owner: its id and offer.
+    async fn ringing(&mut self, what: &str) -> (CallId, String) {
+        within(what, self.incoming.recv())
+            .await
+            .expect("the owner's events go on")
+    }
+}
+
+/// The owner calls `peer` with the media helper (retrying while the first invites end
+/// `Unreachable`, as [`call`] does).
+async fn call_with(caller: &Person, line: &Line2, peer: UserId) -> (Arc<MediaCall>, PcmStream) {
+    for _ in 0..40 {
+        let servers = caller.client.calls().ice_servers().await.unwrap();
+        let mut call = MediaCall::start(
+            &caller.client.calls(),
+            &servers,
+            Role::Caller { peer },
+            MediaOptions::default(),
+        )
+        .await
+        .expect("the call starts");
+        let stream = call.incoming().expect("the caller's stream");
+        let call = Arc::new(call);
+        line.set(call.clone());
+        let unreachable = tokio::time::timeout(Duration::from_secs(3), call.on_ended())
+            .await
+            .is_ok_and(|ended| ended.reason == CallEndReason::Unreachable);
+        if unreachable {
+            line.clear();
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            continue;
+        }
+        return (call, stream);
+    }
+    panic!("{}: the call never rang", caller.name);
+}
+
+/// Answers card `card` (as the owner's client saw it) with `values`.
+fn answer_card(person: &Person, card: &Seen, values: &[&str]) {
+    let body = json!({
+        "card": card.message.message_id.expect("a delivered card").to_string(),
+        "values": values,
+        "fallback": values.join(", "),
+    });
+    person
+        .client
+        .send_answer(card.message.conversation_id, &body.to_string())
+        .expect("the answer is queued");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_bridge_asks_before_answering_and_calls_its_owner() {
+    if !enabled() {
+        return;
+    }
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_test_writer()
+        .try_init();
+    let started = Instant::now();
+    let (mut datastores, containers) = common::calls_datastores().await;
+    // A short ring: the missed call ends after 10 s.
+    datastores
+        .message_svc
+        .push(("PUSH_CALLS_RING_SECONDS".to_owned(), "10".to_owned()));
+    datastores
+        .gateway
+        .push(("PUSH_CALLS_ATTEMPTS_PER_HOUR".to_owned(), "1000".to_owned()));
+    for (name, value) in [
+        ("PUSH_TURN_MODE", "stun-only"),
+        ("PUSH_TURN_STUN_URLS", "stun:127.0.0.1:3478"),
+        ("PUSH_AUTH_PROVIDERS", "password,agent-key"),
+        ("PUSH_AUTH_AGENT_KEY_AUDIENCE", AUDIENCE),
+        ("PUSH_AGENTS_PER_USER", "2"),
+    ] {
+        datastores.auth.push((name.to_owned(), value.to_owned()));
+    }
+    let stack = Stack::start(datastores).await;
+    step(&format!(
+        "the stack is up in {} ms",
+        started.elapsed().as_millis()
+    ));
+    tokio::time::timeout(Duration::from_secs(300), policies(&stack))
+        .await
+        .expect("the scenario finishes within 300 s");
+    stack.stop().await;
+    drop(containers);
+    step(&format!("done in {} ms", started.elapsed().as_millis()));
+}
+
+async fn policies(stack: &Stack) {
+    let dir = scratch();
+    let accounts = push_smoke::create_verified_accounts(&stack.smoke_target(String::new()), 1)
+        .await
+        .expect("a verified account");
+    let mut owner = Person::start(stack, &dir, "owner", &accounts[0]).await;
+    let mut line = Line2::new(owner.calls.take().expect("the call events are free"));
+    let http = reqwest::Client::new();
+    let token = access_token(&http, stack, &accounts[0]).await;
+    let created = post(
+        &http,
+        stack,
+        "/v1/agents",
+        Some(&token),
+        json!({"handle": "calling_agent", "display_name": "Calling agent"}),
+    )
+    .await;
+    let code = created["enrollment_code"].as_str().unwrap();
+    // Ask before answering; call about a card after 3 s, at most once a second.
+    let policy = CallPolicy {
+        answer: push_bridge::config::AnswerMode::Ask,
+        notify: NotifyPolicy {
+            after: Some(Duration::from_secs(3)),
+            min_interval: Duration::from_secs(1),
+            ..NotifyPolicy::default()
+        },
+        local_time: None,
+    };
+    let agent = Agent::start(stack, &dir, code, policy).await;
+    owner.watch(agent.user);
+    within("the backend starts", agent.backend.wait_for("start", 1)).await;
+    step("the agent enrolled and its bridge runs (ask, notify_by_call after 3 s)");
+
+    // (a) Ask: the owner's call waits for "Answer" on the card, then is answered.
+    let seen = owner.message_count();
+    let placed = Instant::now();
+    let (owner_call, incoming) = call_with(&owner, &line, agent.user).await;
+    let ask = owner
+        .message("the ask card", seen, |seen| {
+            !seen.edited && template(seen.body()) == "agent.question@1"
+        })
+        .await;
+    assert!(
+        ask.body().contains("Owner is calling Test in work"),
+        "{}",
+        ask.body()
+    );
+    assert!(agent.phone.answered().is_empty(), "not answered yet");
+    assert_eq!(owner_call.state(), MediaState::Connecting);
+    step("the owner's call waits for the ask card");
+    answer_card(&owner, &ask, &["o1"]);
+    let ear = Ear::default();
+    let listening = ear.listen(incoming);
+    within("the owner's media connects", owner_call.connected())
+        .await
+        .expect("the call connects");
+    ear.voice("the greeting", placed).await;
+    ear.quiet("the end of the greeting", placed).await;
+    assert_eq!(agent.phone.answered(), [owner_call.call_id()]);
+    step("answered after the owner accepted the card");
+    let hung_up = Instant::now();
+    within("the owner's hang-up", owner_call.hangup()).await;
+    within("the owner's stream ends", listening)
+        .await
+        .expect("the listener ran");
+    line.clear();
+    until("the agent is idle again", || {
+        let log = owner.log.lock().unwrap();
+        log.activity
+            .iter()
+            .any(|(at, state, _)| *at >= hung_up && *state == ActivityState::Idle)
+            .then_some(())
+    })
+    .await;
+
+    // (b) A card unanswered for 3 s: the bridge calls; the owner answers, hears the
+    // summary and the question, and approves by voice.
+    let seen = owner.message_count();
+    agent.backend.turn_started(TurnSource::Prompt);
+    let answer = agent.backend.request(RequestKind::Permission {
+        tool: "Bash".into(),
+        preview: "cargo test".into(),
+    });
+    let card = owner
+        .message("the card", seen, |seen| {
+            !seen.edited && template(seen.body()) == "agent.approval@1"
+        })
+        .await;
+    let opened = Instant::now();
+    let (call_id, offer_sdp) = line.ringing("the bridge's call").await;
+    let rang = opened.elapsed();
+    step(&format!(
+        "the bridge called {} ms after the card",
+        rang.as_millis()
+    ));
+    assert!(rang >= Duration::from_secs(2), "{rang:?}");
+    assert_eq!(*agent.phone.dialed.lock().unwrap(), [owner.user]);
+    let servers = owner.client.calls().ice_servers().await.unwrap();
+    let mut answered = MediaCall::start(
+        &owner.client.calls(),
+        &servers,
+        Role::Callee { call_id, offer_sdp },
+        MediaOptions::default(),
+    )
+    .await
+    .expect("the owner answers");
+    let ear = Ear::default();
+    let listening = ear.listen(answered.incoming().expect("the callee's stream"));
+    let answered = Arc::new(answered);
+    line.set(answered.clone());
+    let picked_up = Instant::now();
+    within("the media connects", answered.connected())
+        .await
+        .expect("the call connects");
+    ear.voice("the summary", picked_up).await;
+    ear.quiet("the end of the summary and question", picked_up)
+        .await;
+    say(&answered, &fixture("approve").audio()).await;
+    let answer = within("the voice answer", answer).await;
+    assert_eq!(answer, Ok(Answer::Permission(true)));
+    let card_id = card.message.client_msg_id;
+    let edit = owner
+        .message("the card's edit", seen, |seen| {
+            seen.edited && seen.message.client_msg_id == card_id
+        })
+        .await;
+    assert_eq!(
+        param(edit.body(), "text").as_deref(),
+        Some("🎤 Answered by voice: Approve.")
+    );
+    step("the owner heard the summary and approved by voice");
+    agent.backend.turn_ended(false);
+    within("the owner's hang-up", answered.hangup()).await;
+    within("the owner's stream ends", listening)
+        .await
+        .expect("the listener ran");
+    line.clear();
+
+    // (c) The next call is missed: the card stays open and takes the owner's answer.
+    let seen = owner.message_count();
+    agent.backend.turn_started(TurnSource::Prompt);
+    let answer = agent.backend.request(RequestKind::Permission {
+        tool: "Bash".into(),
+        preview: "cargo build".into(),
+    });
+    let card = owner
+        .message("the second card", seen, |seen| {
+            !seen.edited && template(seen.body()) == "agent.approval@1"
+        })
+        .await;
+    let (missed, _) = line.ringing("the bridge's second call").await;
+    step("the owner lets the bridge's call ring out");
+    owner
+        .message("the missed-call note", seen, |seen| {
+            template(seen.body()) == "agent.reply@1"
+                && param(seen.body(), "text").is_some_and(|text| {
+                    text.contains("I called about the open request (no answer)")
+                })
+        })
+        .await;
+    assert_ne!(missed, call_id);
+    let card_id = card.message.client_msg_id;
+    assert!(
+        !owner
+            .log
+            .lock()
+            .unwrap()
+            .messages
+            .iter()
+            .any(|seen| seen.edited && seen.message.client_msg_id == card_id),
+        "the card is untouched"
+    );
+    answer_card(&owner, &card, &["approve"]);
+    let answer = within("the card's answer", answer).await;
+    assert_eq!(answer, Ok(Answer::Permission(true)));
+    step("the missed call fell back to the card");
+    agent.backend.turn_ended(false);
+    assert_eq!(agent.phone.dialed.lock().unwrap().len(), 2);
+
+    let Agent {
+        client,
+        stop,
+        run,
+        phone,
+        ..
+    } = agent;
+    let _ = stop.send(());
+    within("the bridge stops", run)
+        .await
+        .expect("the bridge ran")
+        .expect("the bridge stopped cleanly");
+    drop((owner_call, answered, phone, line));
+    client.close().await.unwrap();
+    owner.client.close().await.unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }

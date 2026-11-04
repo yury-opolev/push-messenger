@@ -837,7 +837,7 @@ async fn subagent_tools_carry_their_task_and_background_events_map() {
     );
     let event = h.event().await;
     assert!(
-        matches!(&event, BackendEvent::AgentMessage { cursor: 4, label, text } if label == "nightly" && text == "done"),
+        matches!(&event, BackendEvent::AgentMessage { cursor: 4, label, text, urgent: false } if label == "nightly" && text == "done"),
         "{event:?}"
     );
     let event = h.event().await;
@@ -1256,4 +1256,29 @@ fn the_executable_is_known_only_when_set() {
         CodaBackend::new(config, sender).executable(),
         Some(PathBuf::from("coda"))
     );
+}
+
+#[test]
+fn a_notification_is_urgent_by_flag_priority_or_label() {
+    let urgent = |params: serde_json::Value| is_urgent(&params);
+    assert!(urgent(
+        serde_json::json!({"label": "Nightly", "urgent": true})
+    ));
+    assert!(urgent(
+        serde_json::json!({"label": "Nightly", "priority": "High"})
+    ));
+    assert!(urgent(
+        serde_json::json!({"label": "Nightly", "priority": "urgent"})
+    ));
+    assert!(urgent(serde_json::json!({"label": "URGENT: build broken"})));
+    assert!(urgent(
+        serde_json::json!({"label": "[urgent] prod is down"})
+    ));
+    assert!(urgent(serde_json::json!({"label": "  urgent"})));
+    assert!(!urgent(serde_json::json!({"label": "Nightly"})));
+    assert!(!urgent(serde_json::json!({"label": "Not urgent"})));
+    assert!(!urgent(serde_json::json!({"label": "urg"})));
+    assert!(!urgent(
+        serde_json::json!({"label": "Nightly", "priority": "low", "urgent": false})
+    ));
 }

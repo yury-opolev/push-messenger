@@ -21,8 +21,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use push_bridge_control::{
-    BridgeState, Call, ErrorBody, Event, EventLine, PauseParams, PeekEntry, Status, instance_id,
-    now_ms,
+    BridgeState, Call, CallInfo, ErrorBody, Event, EventLine, MuteParams, PauseParams, PeekEntry,
+    Status, instance_id, now_ms,
 };
 use serde_json::Value;
 use tokio::sync::{mpsc, watch};
@@ -56,8 +56,8 @@ pub const SWITCH_PATIENCE: Duration = Duration::from_secs(20);
 pub const STOPPED_ELSEWHERE: &str = "stopped outside the tray (exit 0)";
 /// How long a bridge has to exit after `shutdown` before it is killed.
 pub const EXIT_GRACE: Duration = Duration::from_secs(20);
-/// How long `restart_backend`, `reconnect` and `resume_backend` may take (the bridge's
-/// own limit is 30 s).
+/// How long `restart_backend`, `reconnect`, `resume_backend`, `mute` and `hangup` may take
+/// (the bridge's own limit is 30 s).
 pub const CALL_TIMEOUT: Duration = Duration::from_secs(35);
 /// How long `pause_backend` (with the default drain) may take (the bridge's own limit is
 /// the drain plus 2 min: 12 min).
@@ -216,6 +216,9 @@ pub struct InstanceView {
     /// The last action the tray forwarded that the bridge refused or that could not be
     /// sent; cleared by the next action.
     pub refusal: Option<Refusal>,
+    /// The voice call, while one runs or rings (from `status` and `call_changed`; none while
+    /// not connected).
+    pub call: Option<CallInfo>,
 }
 
 /// An action the bridge refused (or that could not be sent), shown next to its button.
@@ -263,6 +266,11 @@ pub enum Command {
     Reconnect(PathBuf),
     Pause(PathBuf),
     Resume(PathBuf),
+    /// Mute the agent's voice in the running call.
+    Mute(PathBuf),
+    Unmute(PathBuf),
+    /// Hang up (or cancel, or decline) the call.
+    Hangup(PathBuf),
     /// Re-fetch every status and look for bridges now.
     Refresh,
     /// Stop the instances the tray started, leave the others, and return from `run`.
@@ -270,7 +278,8 @@ pub enum Command {
 }
 
 impl Command {
-    /// The folder of an agent action (Start, Stop, Restart Coda, Reconnect, Pause, Resume).
+    /// The folder of an agent action (Start, Stop, Restart Coda, Reconnect, Pause, Resume,
+    /// Mute, Unmute, Hang up).
     fn action_dir(&self) -> Option<&Path> {
         match self {
             Command::Start(dir)
@@ -278,7 +287,10 @@ impl Command {
             | Command::RestartBackend(dir)
             | Command::Reconnect(dir)
             | Command::Pause(dir)
-            | Command::Resume(dir) => Some(dir),
+            | Command::Resume(dir)
+            | Command::Mute(dir)
+            | Command::Unmute(dir)
+            | Command::Hangup(dir) => Some(dir),
             Command::SetInstances(_) | Command::Refresh | Command::Quit => None,
         }
     }
@@ -338,6 +350,7 @@ struct Instance {
     last_error: Option<String>,
     peek_changes: u64,
     refusal: Option<Refusal>,
+    call: Option<CallInfo>,
     removed: bool,
 }
 
@@ -370,6 +383,7 @@ impl Instance {
             last_error: None,
             peek_changes: 0,
             refusal: None,
+            call: None,
             removed: false,
         }
     }
@@ -440,6 +454,7 @@ impl Instance {
                 .as_ref()
                 .map(|client| ControlLink(Arc::clone(client))),
             refusal: self.refusal.clone(),
+            call: self.call.clone(),
         }
     }
 
@@ -609,6 +624,7 @@ impl Supervisor {
                 }
             } else {
                 instance.client = None;
+                instance.call = None;
                 instance.attempt = None;
                 instance.next_connect = None;
             }
@@ -662,6 +678,9 @@ impl Supervisor {
                 }),
             ),
             Command::Resume(dir) => self.forward(&dir, AgentAction::Resume, Call::ResumeBackend),
+            Command::Mute(dir) => self.forward(&dir, AgentAction::Mute, mute(true)),
+            Command::Unmute(dir) => self.forward(&dir, AgentAction::Unmute, mute(false)),
+            Command::Hangup(dir) => self.forward(&dir, AgentAction::Hangup, Call::Hangup),
             Command::Refresh => {
                 for instance in &mut self.instances {
                     if instance.client.is_some() {
@@ -911,6 +930,7 @@ impl Supervisor {
                                 instance.report(state);
                             }
                         }
+                        instance.call = status.call.clone();
                         instance.status = Some(status);
                     }
                     Err(error) => {
@@ -1060,6 +1080,12 @@ impl Supervisor {
                 });
             }
             Event::PeekChanged => instance.peek_changes += 1,
+            Event::CallChanged { call } => {
+                if let Some(status) = instance.status.as_mut() {
+                    status.call = call.clone();
+                }
+                instance.call = call;
+            }
             _ => {}
         }
     }
@@ -1071,6 +1097,7 @@ impl Supervisor {
         }
         tracing::info!(event = "bridge_disconnected");
         instance.client = None;
+        instance.call = None;
         instance.reported = None;
         instance.status_pending = false;
         if instance.child.is_some() {
@@ -1217,6 +1244,7 @@ impl Supervisor {
         instance.child = None;
         instance.kill_at = None;
         instance.client = None;
+        instance.call = None;
         instance.attempt = None;
         instance.status_pending = false;
         instance.last_exit = code;
@@ -1287,6 +1315,11 @@ impl Supervisor {
             }
         });
     }
+}
+
+/// `mute` with `muted`.
+fn mute(muted: bool) -> Call {
+    Call::Mute(MuteParams { muted: Some(muted) })
 }
 
 /// Nobody listens on the control channel.

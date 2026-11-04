@@ -84,6 +84,84 @@ pub struct CallsConfig {
     /// The voice activity detector: when an utterance ends.
     #[serde(default)]
     pub vad: VadSettings,
+    /// When the bridge calls the owner; absent: never.
+    #[serde(default)]
+    pub notify_by_call: Option<NotifyByCall>,
+}
+
+/// When the bridge calls its owner: a request unanswered for `after_minutes`, or an
+/// urgent background message; at most once per `min_interval_minutes`, never in the
+/// `do_not_disturb` hours (local time).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NotifyByCall {
+    /// Minutes a permission request, question or plan waits before the call; 0 (the
+    /// default) never calls for them.
+    #[serde(default)]
+    pub after_minutes: u32,
+    /// Calls for background messages Coda marks urgent.
+    #[serde(default)]
+    pub urgent: bool,
+    /// At most one call per this many minutes: 10 (the default) or more.
+    #[serde(default = "default_min_interval")]
+    pub min_interval_minutes: u32,
+    /// Local time ranges without calls: `"22:00-07:00"`, `"mon-fri 22:00-07:00"`, or a list.
+    #[serde(default, deserialize_with = "one_or_many")]
+    pub do_not_disturb: Vec<String>,
+}
+
+impl Default for NotifyByCall {
+    fn default() -> Self {
+        Self {
+            after_minutes: 0,
+            urgent: false,
+            min_interval_minutes: default_min_interval(),
+            do_not_disturb: Vec::new(),
+        }
+    }
+}
+
+/// The longest `after_minutes`: a card expires after 10 minutes, and the call must ring
+/// and talk before then.
+pub const NOTIFY_AFTER_MAX: u32 = 8;
+/// The shortest `min_interval_minutes`.
+pub const NOTIFY_INTERVAL_MIN: u32 = 10;
+/// The longest `min_interval_minutes` (a day).
+pub const NOTIFY_INTERVAL_MAX: u32 = 1440;
+
+fn default_min_interval() -> u32 {
+    NOTIFY_INTERVAL_MIN
+}
+
+/// A string or a list of strings.
+fn one_or_many<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(match OneOrMany::deserialize(deserializer)? {
+        OneOrMany::One(one) => vec![one],
+        OneOrMany::Many(many) => many,
+    })
+}
+
+impl NotifyByCall {
+    /// The policy the core runs; checked by [`CallsConfig::validate`] first.
+    pub fn policy(&self) -> Result<crate::voice::policy::NotifyPolicy, String> {
+        use std::time::Duration;
+        Ok(crate::voice::policy::NotifyPolicy {
+            after: (self.after_minutes > 0)
+                .then(|| Duration::from_secs(u64::from(self.after_minutes) * 60)),
+            urgent: self.urgent,
+            min_interval: Duration::from_secs(u64::from(self.min_interval_minutes) * 60),
+            quiet: crate::voice::policy::QuietHours::parse(
+                &self.do_not_disturb,
+                "calls.notify_by_call.do_not_disturb",
+            )?,
+        })
+    }
 }
 
 fn default_language() -> String {
@@ -97,7 +175,7 @@ pub enum AnswerMode {
     /// At once.
     #[default]
     Auto,
-    /// After the owner confirms on this machine (not supported yet).
+    /// After the owner accepts a card on another device, before the ring ends.
     Ask,
 }
 
@@ -301,11 +379,22 @@ impl VadSettings {
 }
 
 impl CallsConfig {
+    /// How calls are answered and placed (the section is validated already; a policy
+    /// that does not validate is off).
+    pub fn call_policy(&self) -> crate::voice::policy::CallPolicy {
+        crate::voice::policy::CallPolicy {
+            answer: self.answer,
+            notify: self
+                .notify_by_call
+                .as_ref()
+                .and_then(|notify| notify.policy().ok())
+                .unwrap_or_default(),
+            local_time: None,
+        }
+    }
+
     /// Checks the section as [`Config::validate`] does; the error names the field.
     pub fn validate(&self) -> Result<(), String> {
-        if self.answer == AnswerMode::Ask {
-            return Err("calls.answer \"ask\" is not supported yet: use \"auto\"".to_owned());
-        }
         if !matches(r"^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*$", &self.language) {
             return Err("calls.language must be a language tag such as \"en-US\"".to_owned());
         }
@@ -324,6 +413,31 @@ impl CallsConfig {
         }
         if !(100..=5000).contains(&self.vad.min_speech_ms) {
             return Err("calls.vad.min_speech_ms must be 100 to 5000".to_owned());
+        }
+        if let Some(notify) = &self.notify_by_call {
+            let at = "calls.notify_by_call";
+            if notify.after_minutes > NOTIFY_AFTER_MAX {
+                return Err(format!(
+                    "{at}.after_minutes must be 0 (off) to {NOTIFY_AFTER_MAX}: a card expires after 10 minutes"
+                ));
+            }
+            if !(NOTIFY_INTERVAL_MIN..=NOTIFY_INTERVAL_MAX).contains(&notify.min_interval_minutes) {
+                return Err(format!(
+                    "{at}.min_interval_minutes must be {NOTIFY_INTERVAL_MIN} to {NOTIFY_INTERVAL_MAX}"
+                ));
+            }
+            notify.policy()?;
+            let calls = notify.after_minutes > 0 || notify.urgent;
+            if calls && self.stt == SttConfig::None {
+                return Err(format!(
+                    "{at} needs calls.stt: without it the bridge takes no calls and places none"
+                ));
+            }
+            if calls && self.tts == TtsConfig::None {
+                return Err(format!(
+                    "{at} needs calls.tts: the call says what it is about"
+                ));
+            }
         }
         Ok(())
     }
@@ -938,6 +1052,60 @@ mod tests {
         assert_eq!(calls.vad, VadSettings::default());
         let vad = calls.vad.to_vad();
         assert_eq!((vad.silence_ms, vad.min_speech_ms), (700, 300));
+        assert_eq!(calls.notify_by_call, None);
+    }
+
+    #[test]
+    fn ask_and_notify_by_call_parse_with_their_defaults() {
+        let fixture = fixture();
+        let config = with_calls(
+            &fixture,
+            json!({
+                "answer": "ask",
+                "stt": { "provider": "local", "url": "http://127.0.0.1:8080/inference" },
+                "tts": { "provider": "local", "url": "http://127.0.0.1:5000/tts" },
+                "notify_by_call": { "after_minutes": 5, "do_not_disturb": "22:00-07:00" },
+            }),
+        )
+        .unwrap();
+        config.validate().unwrap();
+        let calls = config.calls.unwrap();
+        assert_eq!(calls.answer, AnswerMode::Ask);
+        let notify = calls.notify_by_call.clone().unwrap();
+        assert_eq!(
+            notify,
+            NotifyByCall {
+                after_minutes: 5,
+                urgent: false,
+                min_interval_minutes: 10,
+                do_not_disturb: vec!["22:00-07:00".into()],
+            }
+        );
+        let policy = notify.policy().unwrap();
+        assert_eq!(policy.after, Some(std::time::Duration::from_secs(300)));
+        assert_eq!(policy.min_interval, std::time::Duration::from_secs(600));
+        assert!(!policy.urgent);
+        let written = serde_json::to_value(&calls).unwrap();
+        assert_eq!(
+            written["notify_by_call"]["do_not_disturb"],
+            json!(["22:00-07:00"])
+        );
+        assert_eq!(
+            serde_json::from_value::<CallsConfig>(written).unwrap(),
+            calls
+        );
+        // Off: no wait and no urgent calls, so neither speech provider is needed.
+        let off = with_calls(
+            &fixture,
+            json!({
+                "stt": { "provider": "none" },
+                "notify_by_call": { "do_not_disturb": ["sat,sun 00:00-24:00", "mon-fri 22:00-07:00"], "min_interval_minutes": 1440 },
+            }),
+        )
+        .unwrap();
+        off.validate().unwrap();
+        let policy = off.calls.unwrap().notify_by_call.unwrap().policy().unwrap();
+        assert!(!policy.enabled());
     }
 
     #[test]
@@ -1020,12 +1188,36 @@ mod tests {
         let endpoint = "https://x.cognitiveservices.azure.com";
         let cases = [
             (
-                json!({ "answer": "ask", "stt": { "provider": "none" } }),
-                "calls.answer \"ask\" is not supported yet: use \"auto\"",
-            ),
-            (
                 json!({ "language": "english!", "stt": { "provider": "none" } }),
                 "calls.language",
+            ),
+            (
+                json!({ "stt": { "provider": "local", "url": "http://a" }, "tts": { "provider": "local", "url": "http://b" }, "notify_by_call": { "after_minutes": 9 } }),
+                "calls.notify_by_call.after_minutes must be 0 (off) to 8: a card expires after 10 minutes",
+            ),
+            (
+                json!({ "stt": { "provider": "local", "url": "http://a" }, "tts": { "provider": "local", "url": "http://b" }, "notify_by_call": { "after_minutes": 5, "min_interval_minutes": 9 } }),
+                "calls.notify_by_call.min_interval_minutes must be 10 to 1440",
+            ),
+            (
+                json!({ "stt": { "provider": "local", "url": "http://a" }, "tts": { "provider": "local", "url": "http://b" }, "notify_by_call": { "urgent": true, "min_interval_minutes": 1441 } }),
+                "calls.notify_by_call.min_interval_minutes must be 10 to 1440",
+            ),
+            (
+                json!({ "stt": { "provider": "local", "url": "http://a" }, "tts": { "provider": "local", "url": "http://b" }, "notify_by_call": { "after_minutes": 5, "do_not_disturb": ["22:00-07:00", "night"] } }),
+                "calls.notify_by_call.do_not_disturb[1] needs a time range",
+            ),
+            (
+                json!({ "stt": { "provider": "local", "url": "http://a" }, "tts": { "provider": "local", "url": "http://b" }, "notify_by_call": { "do_not_disturb": "25:00-07:00" } }),
+                "calls.notify_by_call.do_not_disturb[0] has a bad time",
+            ),
+            (
+                json!({ "stt": { "provider": "none" }, "tts": { "provider": "local", "url": "http://b" }, "notify_by_call": { "after_minutes": 5 } }),
+                "calls.notify_by_call needs calls.stt",
+            ),
+            (
+                json!({ "stt": { "provider": "local", "url": "http://a" }, "notify_by_call": { "urgent": true } }),
+                "calls.notify_by_call needs calls.tts",
             ),
             (
                 json!({ "stt": azure(json!({})) }),
@@ -1179,6 +1371,14 @@ mod tests {
             ),
             (json!({ "stt": { "provider": "whisper" } }), "whisper"),
             (json!({ "stt": { "region": "westeurope" } }), "provider"),
+            (
+                json!({ "stt": { "provider": "none" }, "notify_by_call": { "after": 5 } }),
+                "after",
+            ),
+            (
+                json!({ "stt": { "provider": "none" }, "answer": "maybe" }),
+                "maybe",
+            ),
         ];
         for (calls, field) in cases {
             let error = with_calls(&fixture, calls.clone()).unwrap_err();

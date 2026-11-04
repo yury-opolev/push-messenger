@@ -5,7 +5,8 @@ icon (two chat bubbles in the taskbar's text colour, with a badge in the most ur
 agent's colour, pulsing while an agent starts, stops or restarts), a slim menu (a line per
 agent, Open…, Add agent folder…, Start at logon, the switch-over from Scheduled Tasks,
 Quit), and one management window: the agent list, and per agent the Overview (state,
-actions, details, history), Chat (the last messages of its owner conversation, read only),
+actions, the voice call with "Mute agent" and "Hang up", details, history), Chat (the last
+messages of its owner conversation, read only),
 Logs (live tail with level filter and search) and Settings tabs. Everything testable
 lives in [`crates/push-tray-core`](../../crates/push-tray-core); this is the Tauri v2
 shell. The guide:

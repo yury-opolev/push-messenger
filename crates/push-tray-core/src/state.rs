@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use push_bridge_control::BridgeState;
+use push_bridge_control::{BridgeState, CallDirection, CallInfo, CallPhase};
 
 use crate::policy::MAX_EXITS;
 
@@ -156,6 +156,42 @@ fn exit_suffix(code: Option<i32>) -> String {
 /// Seconds, rounded up: "retrying in 1 s" rather than "in 0 s".
 fn whole_seconds(delay: Duration) -> u128 {
     delay.as_millis().div_ceil(1000)
+}
+
+/// The voice call for people, as the window's Overview shows it: "ringing (you are
+/// calling; confirm on your other device)" (the owner's call waits for the owner's
+/// confirmation), "calling you" (the agent rings the owner), "connecting", "in a call —
+/// speaking" / "— listening"; " (muted)" while the agent's voice is muted.
+pub fn call_label(call: &CallInfo) -> String {
+    let mut text = match (call.phase, call.direction) {
+        (CallPhase::Ringing, CallDirection::Incoming) => {
+            "ringing (you are calling; confirm on your other device)".to_owned()
+        }
+        (CallPhase::Ringing, CallDirection::Outgoing) => "calling you".to_owned(),
+        (CallPhase::Connecting, _) => "connecting".to_owned(),
+        (CallPhase::InCall, _) => "in a call".to_owned(),
+    };
+    if call.phase == CallPhase::InCall {
+        if call.speaking {
+            text.push_str(" — speaking");
+        } else if call.listening {
+            text.push_str(" — listening");
+        }
+    }
+    if call.muted && call.phase != CallPhase::Ringing {
+        text.push_str(" (muted)");
+    }
+    text
+}
+
+/// The voice call in a few words, for the menu's agent line and the agent list: "calling
+/// you", "your call is ringing", "on a call" (also while connecting).
+pub fn call_short(call: &CallInfo) -> &'static str {
+    match (call.phase, call.direction) {
+        (CallPhase::Ringing, CallDirection::Outgoing) => "calling you",
+        (CallPhase::Ringing, CallDirection::Incoming) => "your call is ringing",
+        (CallPhase::Connecting | CallPhase::InCall, _) => "on a call",
+    }
 }
 
 /// The agent state for a state the bridge reports.
@@ -354,6 +390,74 @@ mod tests {
             retry_in: Some(Duration::from_millis(1500)),
         };
         assert_eq!(label(&soon), "failed (exit 1), retrying in 2 s");
+    }
+
+    fn call(phase: CallPhase, direction: CallDirection) -> CallInfo {
+        CallInfo {
+            phase,
+            direction,
+            speaking: false,
+            listening: false,
+            muted: false,
+            since: 1,
+        }
+    }
+
+    #[test]
+    fn calls_read_by_phase_direction_and_flags() {
+        use CallDirection::{Incoming, Outgoing};
+        use CallPhase::{Connecting, InCall, Ringing};
+        let cases = [
+            (
+                call(Ringing, Incoming),
+                "ringing (you are calling; confirm on your other device)",
+                "your call is ringing",
+            ),
+            (call(Ringing, Outgoing), "calling you", "calling you"),
+            (call(Connecting, Incoming), "connecting", "on a call"),
+            (call(Connecting, Outgoing), "connecting", "on a call"),
+            (call(InCall, Incoming), "in a call", "on a call"),
+            (
+                CallInfo {
+                    speaking: true,
+                    listening: true,
+                    ..call(InCall, Outgoing)
+                },
+                "in a call — speaking",
+                "on a call",
+            ),
+            (
+                CallInfo {
+                    listening: true,
+                    muted: true,
+                    ..call(InCall, Incoming)
+                },
+                "in a call — listening (muted)",
+                "on a call",
+            ),
+            (
+                CallInfo {
+                    muted: true,
+                    ..call(Connecting, Incoming)
+                },
+                "connecting (muted)",
+                "on a call",
+            ),
+            // Flags of a ringing call mean nothing yet.
+            (
+                CallInfo {
+                    speaking: true,
+                    muted: true,
+                    ..call(Ringing, Outgoing)
+                },
+                "calling you",
+                "calling you",
+            ),
+        ];
+        for (call, text, short) in cases {
+            assert_eq!(call_label(&call), text, "{call:?}");
+            assert_eq!(call_short(&call), short, "{call:?}");
+        }
     }
 
     #[test]

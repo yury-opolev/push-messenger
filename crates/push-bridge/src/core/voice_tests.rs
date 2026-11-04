@@ -3,18 +3,23 @@
 //! per 20 ms of tokio's clock).
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use chrono::NaiveDateTime;
+use push_bridge_control::{CallDirection, CallPhase, NO_CALL};
 use push_sdk::{ActivityState, CallEndReason, CallEvent, CallId, Event, UserId};
 
 use super::tests::{Harness, peeked, permission, settle};
 use crate::backend::{Answer, BackendEvent, RequestKind, TurnSource};
+use crate::config::AnswerMode;
+use crate::control::Action;
 use crate::messenger::{param, template};
 use crate::voice::VoiceSetup;
 use crate::voice::confirm::APPROVE_OR_REJECT;
 use crate::voice::fake::{FakeStt, FakeTts, Fixture, silence, tone};
 use crate::voice::phone::{FakeCall, FakePhone};
+use crate::voice::policy::{CallPolicy, NotifyPolicy, QuietHours};
 use crate::voice::provider::Stt;
 use crate::voice::speech::CODE_NOTE;
 use crate::voice::vad::VadConfig;
@@ -64,6 +69,15 @@ impl Voice {
     }
 
     async fn with_stt(stt: Option<FakeStt>) -> Self {
+        Self::build(stt, CallPolicy::default()).await
+    }
+
+    /// With the answering and calling `policy`.
+    async fn with_policy(policy: CallPolicy) -> Self {
+        Self::build(Some(stt()), policy).await
+    }
+
+    async fn build(stt: Option<FakeStt>, policy: CallPolicy) -> Self {
         let mut h = Harness::named("Coda");
         let phone = FakePhone::new();
         let tts = Arc::new(FakeTts::new());
@@ -72,6 +86,7 @@ impl Voice {
             stt: stt.map(|stt| Arc::new(stt) as Arc<dyn Stt>),
             tts: Some(tts.clone()),
             vad: VadConfig::default(),
+            policy,
         });
         h.start();
         h.backend.wait_for("start", 1).await;
@@ -581,6 +596,7 @@ async fn spoken_replies_and_background_messages_are_masked() {
         cursor: 1,
         label: "Deploy with password=hunter2xyz".into(),
         text: format!("The key is `token: {token}` now."),
+        urgent: false,
     });
     v.until_said("The key is token: hidden now.").await;
     let spoken = v.tts.spoken();
@@ -644,4 +660,456 @@ async fn stopping_the_bridge_hangs_up() {
     v.h.stop().await.unwrap();
     call.wait_until("the hang-up", FakeCall::hung_up).await;
     assert_eq!(call.ended().unwrap().reason, CallEndReason::Completed);
+}
+
+// ── Answering and calling policies (PR 8) ──────────────────────────────────────────
+
+const OWNER_HELLO: &str = "Hi, it's Coda in work.";
+const BASH: &str = "Coda wants to use Bash. Approve or reject?";
+
+fn ask() -> CallPolicy {
+    CallPolicy {
+        answer: AnswerMode::Ask,
+        ..CallPolicy::default()
+    }
+}
+
+/// Calls the owner after `after_s` seconds, at most every `interval_s` seconds.
+fn notify(after_s: u64, interval_s: u64) -> CallPolicy {
+    CallPolicy {
+        notify: NotifyPolicy {
+            after: Some(Duration::from_secs(after_s)),
+            urgent: true,
+            min_interval: Duration::from_secs(interval_s),
+            quiet: QuietHours::default(),
+        },
+        ..CallPolicy::default()
+    }
+}
+
+/// A local clock the test sets.
+fn wall(time: &str) -> (Arc<Mutex<NaiveDateTime>>, crate::voice::policy::LocalTime) {
+    let now = Arc::new(Mutex::new(
+        NaiveDateTime::parse_from_str(time, "%Y-%m-%d %H:%M").unwrap(),
+    ));
+    let clock = now.clone();
+    (now, Arc::new(move || *clock.lock().unwrap()))
+}
+
+impl Voice {
+    /// The call on the control channel.
+    fn call_info(&self) -> Option<(CallPhase, CallDirection)> {
+        self.h
+            .control_status()
+            .call
+            .map(|call| (call.phase, call.direction))
+    }
+
+    /// The `text` of the replies posted (not edits).
+    fn replies(&self) -> Vec<String> {
+        self.h.replies()
+    }
+
+    /// Waits (up to 15 minutes) until the bridge places its `count`th call.
+    async fn dialed(&self, count: usize) -> FakeCall {
+        for _ in 0..900 {
+            if self.phone.dialed().len() >= count {
+                return self.phone.wait_dialed().await;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        panic!("no call {count} was placed");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn ask_mode_answers_once_the_owner_accepts_the_card() {
+    let mut v = Voice::with_policy(ask()).await;
+    v.h.control_events();
+    let call_id = v.ring(v.h.messenger.owner_id());
+    let card = v.card("agent.question@1").await;
+    let body =
+        v.h.messenger
+            .sent_rich()
+            .into_iter()
+            .find(|(id, _)| *id == card)
+            .unwrap()
+            .1;
+    assert!(body.contains("Owner is calling Coda in work"), "{body}");
+    assert!(
+        body.contains("Answer") && body.contains("Decline"),
+        "{body}"
+    );
+    settle().await;
+    assert!(
+        v.phone.answered().is_empty(),
+        "not before the owner says so"
+    );
+    assert_eq!(
+        v.call_info(),
+        Some((CallPhase::Ringing, CallDirection::Incoming))
+    );
+    // Events about the call while it waits reach the line once answered.
+    v.h.messenger
+        .inject(Event::Call(CallEvent::Taken { call_id }));
+    settle().await;
+
+    v.h.messenger.answer(card, &["o1"]);
+    let call = v.phone.wait_answered().await;
+    assert_eq!(call.call_id, call_id);
+    v.until_said(GREETING).await;
+    assert_eq!(call.handled(), [CallEvent::Taken { call_id }]);
+    assert!(
+        v.edits_of(card).is_empty(),
+        "the owner's answer shows on the card"
+    );
+    assert_eq!(
+        v.call_info(),
+        Some((CallPhase::InCall, CallDirection::Incoming))
+    );
+    let phases: Vec<_> = v
+        .h
+        .control_events()
+        .into_iter()
+        .filter_map(|event| match event {
+            push_bridge_control::Event::CallChanged { call } => Some(call.map(|call| call.phase)),
+            _ => None,
+        })
+        .collect();
+    let mut folded = phases.clone();
+    folded.dedup();
+    assert!(
+        in_order_of(
+            &folded,
+            &[
+                Some(CallPhase::Ringing),
+                Some(CallPhase::Connecting),
+                Some(CallPhase::InCall)
+            ]
+        ),
+        "{phases:?}"
+    );
+    call.end(CallEndReason::Completed);
+    v.until("the end", || v.call_info().is_none()).await;
+}
+
+fn in_order_of<T: PartialEq>(seen: &[T], wanted: &[T]) -> bool {
+    let mut rest = seen.iter();
+    wanted.iter().all(|wanted| rest.any(|seen| seen == wanted))
+}
+
+#[tokio::test(start_paused = true)]
+async fn ask_mode_declines_on_decline_and_closes_the_card_when_the_ring_ends() {
+    let v = Voice::with_policy(ask()).await;
+    let owner = v.h.messenger.owner_id();
+    let declined = v.ring(owner);
+    let card = v.card("agent.question@1").await;
+    // A second call while one waits for the owner is busy.
+    let second = v.ring(owner);
+    v.phone.wait_declined(1).await;
+    assert_eq!(v.phone.declined(), [(second, true)]);
+    v.h.messenger.answer(card, &["o2"]);
+    v.phone.wait_declined(2).await;
+    assert_eq!(v.phone.declined()[1], (declined, false));
+    assert!(v.edits_of(card).is_empty());
+    assert!(v.phone.answered().is_empty());
+    assert_eq!(v.call_info(), None);
+
+    // The server ends the ring: the card says so and nothing is answered.
+    let missed = v.ring(owner);
+    settle().await;
+    let card =
+        v.h.messenger
+            .sent_rich()
+            .into_iter()
+            .filter(|(_, body)| template(body) == "agent.question@1")
+            .map(|(id, _)| id)
+            .next_back()
+            .unwrap();
+    v.h.messenger.inject(Event::Call(CallEvent::Ended {
+        call_id: missed,
+        reason: CallEndReason::Missed,
+        duration_s: None,
+    }));
+    v.until("the missed call", || !v.edits_of(card).is_empty())
+        .await;
+    assert_eq!(v.edits_of(card)[0].2, "📞 Missed call.");
+    v.h.messenger.answer(card, &["o1"]);
+    settle().await;
+    assert!(v.phone.answered().is_empty(), "a late answer does nothing");
+    assert_eq!(v.call_info(), None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn ask_mode_gives_up_after_the_ring_without_the_server() {
+    let v = Voice::with_policy(ask()).await;
+    let call_id = CallId::new();
+    v.h.messenger.inject(Event::Call(CallEvent::Incoming {
+        call_id,
+        caller_id: v.h.messenger.owner_id(),
+        offer_sdp: "offer".into(),
+        expires_at_ms: 0,
+    }));
+    let card = v.card("agent.question@1").await;
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    v.phone.wait_declined(1).await;
+    assert_eq!(v.phone.declined(), [(call_id, false)]);
+    assert_eq!(v.edits_of(card)[0].2, "📞 Missed call.");
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unanswered_request_calls_the_owner_who_hears_it_and_approves_by_voice() {
+    let v = Voice::with_policy(notify(120, 600)).await;
+    let owner = v.h.messenger.owner_id();
+    let answer = v.h.backend.request(permission());
+    let _card = v.card("agent.approval@1").await;
+    tokio::time::sleep(Duration::from_secs(100)).await;
+    assert!(v.phone.dialed().is_empty(), "not before the wait");
+    let call = v.dialed(1).await;
+    assert_eq!(v.phone.dialed(), [owner]);
+    assert_eq!(
+        v.call_info(),
+        Some((CallPhase::Ringing, CallDirection::Outgoing))
+    );
+    v.h.messenger
+        .wait_until("waiting", |_| {
+            v.h.messenger.activities().last().map(|(state, _)| *state)
+                == Some(ActivityState::Waiting)
+        })
+        .await;
+    call.pick_up();
+    v.until_said(BASH).await;
+    let spoken = v.tts.spoken();
+    assert_eq!(
+        spoken,
+        [
+            OWNER_HELLO,
+            "A request has waited 2 minutes for your answer.",
+            BASH
+        ]
+    );
+    assert_eq!(
+        v.call_info(),
+        Some((CallPhase::InCall, CallDirection::Outgoing))
+    );
+    quiet().await;
+    call.say(&fixture("approve").audio()).await;
+    assert_eq!(answer.await, Ok(Answer::Permission(true)));
+    v.until_said("Approved.").await;
+    call.end(CallEndReason::Completed);
+    v.until("the end", || v.call_info().is_none()).await;
+    assert!(
+        !v.replies().iter().any(|reply| reply.contains("📞")),
+        "{:?}",
+        v.replies()
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_missed_call_leaves_the_card_open_and_is_not_repeated() {
+    let v = Voice::with_policy(notify(60, 600)).await;
+    let answer = v.h.backend.request(permission());
+    let card = v.card("agent.approval@1").await;
+    let call = v.dialed(1).await;
+    call.end(CallEndReason::Missed);
+    v.h.reply_containing("📞 I called about the open request (no answer). It is still open above.")
+        .await;
+    assert!(v.edits_of(card).is_empty(), "the card is untouched");
+    assert_eq!(v.call_info(), None);
+    // The same request never calls again, even after the interval.
+    tokio::time::sleep(Duration::from_secs(400)).await;
+    assert_eq!(v.phone.dialed().len(), 1);
+    // The card still takes the owner's answer.
+    v.h.messenger.answer(card, &["approve"]);
+    assert_eq!(answer.await, Ok(Answer::Permission(true)));
+}
+
+#[tokio::test(start_paused = true)]
+async fn declined_and_unreachable_calls_fall_back_to_the_card_too() {
+    for (reason, why) in [
+        (CallEndReason::Declined, "you declined"),
+        (CallEndReason::Unreachable, "you could not be reached"),
+    ] {
+        let v = Voice::with_policy(notify(60, 600)).await;
+        let _answer = v.h.backend.request(permission());
+        let _card = v.card("agent.approval@1").await;
+        let call = v.dialed(1).await;
+        call.end(reason);
+        v.h.reply_containing(&format!("({why})")).await;
+    }
+    // A phone that cannot place the call leaves the card as it is, quietly.
+    let v = Voice::with_policy(notify(60, 600)).await;
+    v.phone.fail_next_call(push_sdk::SdkError::Offline);
+    let mut answer = v.h.backend.request(permission());
+    let _card = v.card("agent.approval@1").await;
+    tokio::time::sleep(Duration::from_secs(90)).await;
+    assert!(v.phone.dialed().is_empty());
+    assert_eq!(v.call_info(), None);
+    assert!(answer.try_recv().is_err(), "still open");
+}
+
+#[tokio::test(start_paused = true)]
+async fn calls_are_rate_limited() {
+    let v = Voice::with_policy(notify(60, 600)).await;
+    let _first = v.h.backend.request(permission());
+    let _card = v.card("agent.approval@1").await;
+    let call = v.dialed(1).await;
+    let first_call = tokio::time::Instant::now();
+    call.end(CallEndReason::Missed);
+    v.h.reply_containing("(no answer)").await;
+    // A second request is due a minute later, but the last call was less than ten
+    // minutes ago.
+    let _second = v.h.backend.request(RequestKind::Question {
+        question: "Which region?".into(),
+        options: vec!["EU".into(), "US".into()],
+        multi_select: false,
+        allow_free_text: false,
+    });
+    tokio::time::sleep(Duration::from_secs(120)).await;
+    assert_eq!(v.phone.dialed().len(), 1, "too soon");
+    let call = v.dialed(2).await;
+    assert!(first_call.elapsed() >= Duration::from_secs(600));
+    assert!(first_call.elapsed() < Duration::from_secs(602));
+    call.pick_up();
+    // The first card expired meanwhile: the oldest open one is spoken.
+    v.until_said("Which region? Option one: EU. Option two: US.")
+        .await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn no_call_in_the_do_not_disturb_hours() {
+    let (now, clock) = wall("2026-11-02 23:30");
+    let mut policy = notify(60, 600);
+    policy.notify.quiet = QuietHours::parse(&["22:00-07:00".to_owned()], "dnd").unwrap();
+    policy.local_time = Some(clock);
+    let v = Voice::with_policy(policy).await;
+    let _answer = v.h.backend.request(permission());
+    let _card = v.card("agent.approval@1").await;
+    tokio::time::sleep(Duration::from_secs(180)).await;
+    assert!(v.phone.dialed().is_empty(), "quiet hours");
+    *now.lock().unwrap() =
+        NaiveDateTime::parse_from_str("2026-11-03 07:00", "%Y-%m-%d %H:%M").unwrap();
+    let call = v.dialed(1).await;
+    call.end(CallEndReason::Missed);
+}
+
+#[tokio::test(start_paused = true)]
+async fn urgent_news_calls_and_ordinary_news_does_not() {
+    let v = Voice::with_policy(notify(300, 600)).await;
+    v.h.backend.emit(BackendEvent::AgentMessage {
+        cursor: 1,
+        label: "Nightly".into(),
+        text: "All green.".into(),
+        urgent: false,
+    });
+    v.h.reply_containing("All green.").await;
+    settle().await;
+    assert!(v.phone.dialed().is_empty());
+    v.h.backend.emit(BackendEvent::AgentMessage {
+        cursor: 2,
+        label: "Build broken".into(),
+        text: "The main branch fails to compile.".into(),
+        urgent: true,
+    });
+    let call = v.dialed(1).await;
+    call.pick_up();
+    v.until_said("The main branch fails to compile.").await;
+    assert_eq!(
+        v.tts.spoken(),
+        [
+            "Hi, it's Coda in work. I have something urgent.",
+            "Build broken.",
+            "The main branch fails to compile."
+        ]
+    );
+    call.end(CallEndReason::Completed);
+
+    // Off: urgent news stays in the chat.
+    let mut policy = notify(300, 600);
+    policy.notify.urgent = false;
+    let off = Voice::with_policy(policy).await;
+    off.h.backend.emit(BackendEvent::AgentMessage {
+        cursor: 1,
+        label: "Build broken".into(),
+        text: "Again.".into(),
+        urgent: true,
+    });
+    off.h.reply_containing("Again.").await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert!(off.phone.dialed().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_ringing_call_is_withdrawn_when_the_card_is_answered_on_screen() {
+    let v = Voice::with_policy(notify(60, 600)).await;
+    let answer = v.h.backend.request(permission());
+    let card = v.card("agent.approval@1").await;
+    let call = v.dialed(1).await;
+    v.h.messenger.answer(card, &["reject"]);
+    assert_eq!(answer.await, Ok(Answer::Permission(false)));
+    call.wait_until("the cancel", FakeCall::hung_up).await;
+    assert_eq!(call.ended().unwrap().reason, CallEndReason::Cancelled);
+    v.until("the end", || v.call_info().is_none()).await;
+    settle().await;
+    assert!(!v.replies().iter().any(|reply| reply.contains("📞")));
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_tray_mutes_the_agent_and_hangs_up() {
+    let v = Voice::new().await;
+    let none = v.h.call(Action::Hangup).await.unwrap_err();
+    assert_eq!(none.code, NO_CALL);
+    assert_eq!(
+        v.h.call(Action::Mute(true)).await.unwrap_err().code,
+        NO_CALL
+    );
+
+    let call = v.call().await;
+    assert_eq!(
+        v.h.call(Action::Mute(true)).await,
+        Ok(serde_json::json!({"muted": true}))
+    );
+    assert!(v.h.control_status().call.unwrap().muted);
+    let spoken = v.tts.spoken().len();
+    v.h.backend.turn_started(TurnSource::Prompt);
+    v.h.backend.text("Nobody hears this.\n");
+    v.h.backend.turn_ended(false);
+    quiet().await;
+    assert_eq!(v.tts.spoken().len(), spoken, "muted");
+    assert_eq!(
+        v.h.call(Action::Mute(false)).await,
+        Ok(serde_json::json!({"muted": false}))
+    );
+    v.h.backend.turn_started(TurnSource::Prompt);
+    v.h.backend.text("Now you hear me.\n");
+    v.h.backend.turn_ended(false);
+    v.until_said("Now you hear me.").await;
+
+    assert_eq!(
+        v.h.call(Action::Hangup).await,
+        Ok(serde_json::json!({"hungUp": true}))
+    );
+    call.wait_until("the hang-up", FakeCall::hung_up).await;
+    v.until("the end", || v.call_info().is_none()).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_tray_cancels_a_call_ringing_the_owner_and_declines_an_ask() {
+    let v = Voice::with_policy(notify(60, 600)).await;
+    let _answer = v.h.backend.request(permission());
+    let _card = v.card("agent.approval@1").await;
+    let call = v.dialed(1).await;
+    assert!(v.h.call(Action::Hangup).await.is_ok());
+    call.wait_until("the cancel", FakeCall::hung_up).await;
+    v.until("the end", || v.call_info().is_none()).await;
+    settle().await;
+    assert!(!v.replies().iter().any(|reply| reply.contains("📞")));
+
+    let v = Voice::with_policy(ask()).await;
+    let call_id = v.ring(v.h.messenger.owner_id());
+    let card = v.card("agent.question@1").await;
+    assert!(v.h.call(Action::Hangup).await.is_ok());
+    v.phone.wait_declined(1).await;
+    assert_eq!(v.phone.declined(), [(call_id, false)]);
+    assert_eq!(v.edits_of(card)[0].2, "📞 Declined.");
 }

@@ -2,6 +2,7 @@
 //! the owner's commands, and the backend's lifecycle. It drives a [`Backend`] and talks
 //! to push-messenger through a [`Messenger`].
 
+mod calling;
 mod control;
 mod conversation;
 mod report;
@@ -21,7 +22,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use push_bridge_control::{AgentInfo, BridgeState, CardState, PeekKind};
+use push_bridge_control::{
+    AgentInfo, BridgeState, CallDirection, CallInfo, CallPhase, CardState, PeekKind,
+};
 use push_sdk::{
     ActivityState, CallEvent, CallId, CardBook, ClientMsgId, ConnectionState, ConversationId,
     Event, SdkError, UserId,
@@ -41,6 +44,7 @@ use crate::render::{TurnRenderer, reply_bodies};
 use crate::state::{State, StateFile};
 use crate::voice::VoiceSetup;
 use crate::voice::phone::Line;
+use crate::voice::policy::Verdict;
 use crate::voice::session::SessionEvent;
 
 /// How often the core polls the reply, the cards' deadlines and the activity.
@@ -274,6 +278,8 @@ enum Internal {
         call_id: CallId,
         event: SessionEvent,
     },
+    /// The phone placed (or failed to place) the call to the owner.
+    Dialed { result: Result<Line, SdkError> },
 }
 
 /// The running turn's reply.
@@ -298,6 +304,8 @@ struct OpenRequest {
     title: String,
     /// What a call says about the request.
     spoken: String,
+    /// The bridge called the owner about it (`notify_by_call`): at most once.
+    notified: bool,
 }
 
 /// Unix ms that follow tokio's clock (paused in tests).
@@ -392,10 +400,24 @@ struct Core<M: Messenger> {
 
     /// Takes the owner's calls (see [`voice`]); `None` ignores call events.
     voice: Option<VoiceSetup>,
-    /// The call running.
+    /// The call running (or ringing the owner).
     call: Option<voice::ActiveCall>,
     /// The call being answered, with its call events that came meanwhile.
     answering: Option<(CallId, Vec<CallEvent>)>,
+    /// The owner's call waiting for the owner's answer on a card (`calls.answer` `ask`).
+    asking: Option<calling::Asking>,
+    /// A call to the owner being placed.
+    dialing: Option<calling::Dialing>,
+    /// When the bridge last called the owner (the rate limit).
+    last_dialed: Option<Instant>,
+    /// Why the last due call was held back (logged once per change).
+    held_by: Option<Verdict>,
+    /// The call's phase and direction, and when that phase began (Unix ms).
+    call_since: Option<((CallPhase, CallDirection), i64)>,
+    /// The call last reported to the control channel.
+    call_reported: Option<CallInfo>,
+    /// The tray muted the call being answered: its session starts muted.
+    mute_next: bool,
 }
 
 impl<M: Messenger> Core<M> {
@@ -454,6 +476,13 @@ impl<M: Messenger> Core<M> {
             voice: None,
             call: None,
             answering: None,
+            asking: None,
+            dialing: None,
+            last_dialed: None,
+            held_by: None,
+            call_since: None,
+            call_reported: None,
+            mute_next: false,
         }
     }
 
@@ -571,12 +600,15 @@ impl<M: Messenger> Core<M> {
             Internal::Prepared { pause, result } => self.prepared(pause, result).await,
             Internal::Answered { call_id, result } => self.answered(call_id, result).await,
             Internal::Voice { call_id, event } => self.on_voice(call_id, event).await,
+            Internal::Dialed { result } => self.dialed(result).await,
         }
     }
 
     async fn on_tick(&mut self) {
         self.poll_turn();
         self.expire_requests().await;
+        self.expire_asking();
+        self.call_owner_if_due().await;
         self.watch_pause().await;
         self.update_activity(false).await;
     }

@@ -7,18 +7,23 @@
 
 use std::sync::Arc;
 
+use push_bridge_control::{CallDirection, CallPhase};
 use push_sdk::{CallEvent, CallId, SdkError, UserId};
 use serde_json::{Map, json};
 use tokio::time::Instant;
 
+use super::calling::Purpose;
 use super::{Core, Internal, OpenRequest};
 use crate::backend::Answer;
+use crate::config::AnswerMode;
 use crate::messenger::Messenger;
 use crate::render::{reply_body, rich_body, shown, shown_line};
 use crate::voice::confirm::{self, VoiceAnswer};
 use crate::voice::phone::{Line, is_about};
+use crate::voice::provider::{Stt, Tts};
 use crate::voice::session::{EventSink, Session, SessionEvent};
 use crate::voice::speech::{self, SpeechText};
+use crate::voice::vad::VadConfig;
 
 /// Characters of a transcript's text.
 const TRANSCRIPT: usize = 4_000;
@@ -30,11 +35,11 @@ const ANSWER_LABEL: usize = 200;
 /// Said when the speech-to-text provider failed on an utterance.
 const NOT_UNDERSTOOD: &str = "Sorry, I couldn't make that out.";
 
-/// The owner's call, answered.
+/// The owner's call, answered, or the bridge's call to the owner.
 pub(super) struct ActiveCall {
-    session: Session,
+    pub(super) session: Session,
     /// Audio flows.
-    connected: bool,
+    pub(super) connected: bool,
     /// The owner speaks.
     listening: bool,
     /// The agent speaks.
@@ -42,9 +47,35 @@ pub(super) struct ActiveCall {
     /// The running reply's text, as spoken sentences. After a barge-in the session
     /// mutes the reply ([`Session::say_reply`]) until the core unmutes it.
     speech: SpeechText,
+    /// Who called.
+    pub(super) direction: CallDirection,
+    /// Why the bridge called (outgoing calls).
+    pub(super) purpose: Option<Purpose>,
+    /// The owner muted the agent (the tray's Mute agent).
+    pub(super) muted: bool,
+    /// The bridge hung up a call that still rang: no note about a missed call.
+    pub(super) withdrawn: bool,
 }
 
 impl ActiveCall {
+    pub(super) fn new(
+        session: Session,
+        direction: CallDirection,
+        purpose: Option<Purpose>,
+    ) -> Self {
+        Self {
+            session,
+            connected: false,
+            listening: false,
+            speaking: false,
+            speech: SpeechText::new(),
+            direction,
+            purpose,
+            muted: false,
+            withdrawn: false,
+        }
+    }
+
     /// Speaks sentences of the agent's reply, unless a barge-in muted it.
     fn say_reply(&self, sentences: Vec<String>) {
         for sentence in sentences {
@@ -76,6 +107,25 @@ impl<M: Messenger> Core<M> {
             }
         }
         if self
+            .asking
+            .as_ref()
+            .is_some_and(|asking| is_about(&event, asking.call_id))
+        {
+            self.on_asking_event(event).await;
+            return;
+        }
+        if let Some(dialing) = &mut self.dialing {
+            // The call's id is not known until the phone returns: every event but a new
+            // call may be about it.
+            if !matches!(
+                event,
+                CallEvent::Incoming { .. } | CallEvent::HistoryChanged { .. }
+            ) {
+                dialing.buffered.push(event);
+                return;
+            }
+        }
+        if self
             .call
             .as_ref()
             .is_some_and(|call| call.session.handle(&event))
@@ -87,14 +137,15 @@ impl<M: Messenger> Core<M> {
                 call_id,
                 caller_id,
                 offer_sdp,
-                ..
-            } => self.incoming(call_id, caller_id, offer_sdp),
+                expires_at_ms,
+            } => self.incoming(call_id, caller_id, offer_sdp, expires_at_ms),
             _ => tracing::debug!(event = "call_event_ignored"),
         }
     }
 
-    /// Answers the owner's call unless voice is off or a call runs; declines anyone else's.
-    fn incoming(&mut self, call_id: CallId, caller: UserId, offer_sdp: String) {
+    /// Answers the owner's call (or, with `calls.answer` `ask`, asks the owner first)
+    /// unless voice is off or a call runs; declines anyone else's.
+    fn incoming(&mut self, call_id: CallId, caller: UserId, offer_sdp: String, expires_at_ms: i64) {
         let Some(voice) = &self.voice else {
             return;
         };
@@ -102,7 +153,7 @@ impl<M: Messenger> Core<M> {
             Some(("stranger", false))
         } else if voice.stt.is_none() {
             Some(("voice_off", false))
-        } else if self.call.is_some() || self.answering.is_some() || self.stopping {
+        } else if self.call_busy() {
             Some(("busy", true))
         } else {
             None
@@ -117,9 +168,38 @@ impl<M: Messenger> Core<M> {
             });
             return;
         }
+        if voice.policy.answer == AnswerMode::Ask {
+            self.ask(call_id, offer_sdp, expires_at_ms);
+            return;
+        }
+        self.answer_call(call_id, &offer_sdp, Vec::new());
+    }
+
+    /// Whether a call runs, rings, or is being answered or placed (or the bridge stops).
+    pub(super) fn call_busy(&self) -> bool {
+        self.call.is_some()
+            || self.answering.is_some()
+            || self.asking.is_some()
+            || self.dialing.is_some()
+            || self.stopping
+    }
+
+    /// Answers the owner's call `call_id`; `buffered` are its events that came meanwhile.
+    pub(super) fn answer_call(
+        &mut self,
+        call_id: CallId,
+        offer_sdp: &str,
+        buffered: Vec<CallEvent>,
+    ) {
+        let Some(voice) = &self.voice else {
+            return;
+        };
         tracing::info!(event = "call_answering");
-        self.answering = Some((call_id, Vec::new()));
+        self.answering = Some((call_id, buffered));
+        self.mute_next = false;
+        let phone = voice.phone.clone();
         let internal = self.internal.clone();
+        let offer_sdp = offer_sdp.to_owned();
         tokio::spawn(async move {
             let result = phone.answer(call_id, &offer_sdp).await;
             let _ = internal.send(Internal::Answered { call_id, result });
@@ -162,23 +242,34 @@ impl<M: Messenger> Core<M> {
         else {
             return;
         };
-        let internal = self.internal.clone();
-        let sink: EventSink = Arc::new(move |event| {
-            let _ = internal.send(Internal::Voice { call_id, event });
-        });
-        let session = Session::start(line, stt, tts, vad, sink);
+        let session = self.start_pipeline(line, stt, tts, vad);
         for event in &buffered {
             session.handle(event);
         }
         tracing::info!(event = "call_answered", buffered = buffered.len());
-        self.call = Some(ActiveCall {
-            session,
-            connected: false,
-            listening: false,
-            speaking: false,
-            speech: SpeechText::new(),
-        });
+        let mut call = ActiveCall::new(session, CallDirection::Incoming, None);
+        if std::mem::take(&mut self.mute_next) {
+            call.muted = true;
+            call.session.set_silenced(true);
+        }
+        self.call = Some(call);
         self.update_activity(false).await;
+    }
+
+    /// Starts the pipeline of `line`; its events come back as [`Internal::Voice`].
+    pub(super) fn start_pipeline(
+        &self,
+        line: Line,
+        stt: Arc<dyn Stt>,
+        tts: Option<Arc<dyn Tts>>,
+        vad: VadConfig,
+    ) -> Session {
+        let call_id = line.call_id;
+        let internal = self.internal.clone();
+        let sink: EventSink = Arc::new(move |event| {
+            let _ = internal.send(Internal::Voice { call_id, event });
+        });
+        Session::start(line, stt, tts, vad, sink)
     }
 
     /// An event of the running call's pipeline.
@@ -194,7 +285,11 @@ impl<M: Messenger> Core<M> {
             SessionEvent::Connected => {
                 call.connected = true;
                 tracing::info!(event = "call_connected");
-                self.greet();
+                if call.direction == CallDirection::Outgoing {
+                    self.greet_owner_called();
+                } else {
+                    self.greet();
+                }
             }
             SessionEvent::Listening(listening) => call.listening = listening,
             SessionEvent::Speaking(speaking) => call.speaking = speaking,
@@ -203,12 +298,15 @@ impl<M: Messenger> Core<M> {
             SessionEvent::Transcript { text, started } => self.on_transcript(text, started).await,
             SessionEvent::SpeechFailed(_) => call.session.say(NOT_UNDERSTOOD),
             SessionEvent::Ended(end) => {
-                self.call = None;
+                let call = self.call.take();
                 tracing::info!(
                     event = "call_ended",
                     reason = end.reason.as_str(),
                     duration_s = end.duration_s
                 );
+                if let Some(call) = call.filter(|call| !call.connected) {
+                    self.call_unanswered(call, end.reason);
+                }
             }
         }
         self.update_activity(false).await;
@@ -219,15 +317,22 @@ impl<M: Messenger> Core<M> {
         let Some(call) = &self.call else {
             return;
         };
-        let folder = self.folder.file_name().map_or_else(
-            || self.folder.display().to_string(),
-            |name| name.to_string_lossy().into_owned(),
-        );
-        call.session
-            .say(format!("Connected to {} in {folder}.", self.name));
+        call.session.say(format!(
+            "Connected to {} in {}.",
+            self.name,
+            self.folder_name()
+        ));
         if let Some(request) = self.open.first() {
             call.session.say(request.spoken.clone());
         }
+    }
+
+    /// The last part of the current folder (all of it when it has none).
+    pub(super) fn folder_name(&self) -> String {
+        self.folder.file_name().map_or_else(
+            || self.folder.display().to_string(),
+            |name| name.to_string_lossy().into_owned(),
+        )
     }
 
     /// The owner said `text`, beginning at `started`: it is posted as a transcript, then
@@ -370,25 +475,82 @@ impl<M: Messenger> Core<M> {
         call.session.say(spoken);
     }
 
-    /// The activity label during a call: "speaking", "listening", "thinking" (a turn
-    /// runs) or "on a call"; `None` without a call.
+    /// The activity label during a call: "calling you" (the bridge's call rings),
+    /// "speaking", "listening", "thinking" (a turn runs) or "on a call"; `None` without
+    /// a call.
     pub(super) fn call_label(&self) -> Option<&'static str> {
+        if self.dialing.is_some() {
+            return Some("calling you");
+        }
         let call = self.call.as_ref()?;
-        Some(if call.speaking {
-            "speaking"
-        } else if call.listening {
-            "listening"
-        } else if self.turn.is_some() {
-            "thinking"
-        } else {
-            "on a call"
-        })
+        Some(
+            if !call.connected && call.direction == CallDirection::Outgoing {
+                "calling you"
+            } else if call.speaking {
+                "speaking"
+            } else if call.listening {
+                "listening"
+            } else if self.turn.is_some() {
+                "thinking"
+            } else {
+                "on a call"
+            },
+        )
     }
 
-    /// The bridge stops: the running call is hung up (dropping its session does) and a
-    /// call being answered is forgotten.
+    /// The call as the control channel shows it: its phase, direction and flags.
+    pub(super) fn call_report(&self) -> Option<(CallPhase, CallDirection, bool, bool, bool)> {
+        if self.asking.is_some() {
+            return Some((
+                CallPhase::Ringing,
+                CallDirection::Incoming,
+                false,
+                false,
+                false,
+            ));
+        }
+        if self.dialing.is_some() {
+            return Some((
+                CallPhase::Ringing,
+                CallDirection::Outgoing,
+                false,
+                false,
+                false,
+            ));
+        }
+        if self.answering.is_some() {
+            return Some((
+                CallPhase::Connecting,
+                CallDirection::Incoming,
+                false,
+                false,
+                self.mute_next,
+            ));
+        }
+        let call = self.call.as_ref()?;
+        let phase = if call.connected {
+            CallPhase::InCall
+        } else if call.direction == CallDirection::Outgoing {
+            CallPhase::Ringing
+        } else {
+            CallPhase::Connecting
+        };
+        Some((
+            phase,
+            call.direction,
+            call.speaking,
+            call.listening,
+            call.muted,
+        ))
+    }
+
+    /// The bridge stops: the running call is hung up (dropping its session does), a call
+    /// being answered or placed is forgotten, and a call waiting for the owner's
+    /// confirmation is declined.
     pub(super) fn end_call_at_close(&mut self) {
         self.answering = None;
+        self.dialing = None;
+        self.decline_asking("📞 Declined: the bridge stopped.");
         if self.call.take().is_some() {
             tracing::info!(event = "call_hung_up");
         }

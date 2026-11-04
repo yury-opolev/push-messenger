@@ -89,6 +89,8 @@ struct Shared {
     /// Wakes the speaker worker.
     wake: Notify,
     ended: AtomicBool,
+    /// The owner muted the agent (the tray's Mute agent): nothing is spoken.
+    silenced: AtomicBool,
 }
 
 #[derive(Default)]
@@ -188,6 +190,7 @@ impl Session {
             speech: Mutex::new(Speech::default()),
             wake: Notify::new(),
             ended: AtomicBool::new(false),
+            silenced: AtomicBool::new(false),
         });
         let (utterances, to_transcribe) = mpsc::unbounded_channel();
         let mut workers: Vec<JoinHandle<()>> = vec![
@@ -231,7 +234,7 @@ impl Session {
     }
 
     fn queue(&self, text: String, reply: bool) {
-        if !self.shared.speaks {
+        if !self.shared.speaks || self.shared.silenced.load(Ordering::Acquire) {
             return;
         }
         {
@@ -252,6 +255,15 @@ impl Session {
     /// is said next.
     pub fn hush(&self) {
         self.shared.stop_speaking(false);
+    }
+
+    /// Mutes the agent (`true`: stops speaking at once and says nothing more, its own
+    /// sentences included) or lets it speak again; the owner is still heard.
+    pub fn set_silenced(&self, silenced: bool) {
+        self.shared.silenced.store(silenced, Ordering::Release);
+        if silenced {
+            self.shared.stop_speaking(false);
+        }
     }
 
     /// Forwards a call event to the line; `true` when it was about this call.

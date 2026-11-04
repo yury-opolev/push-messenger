@@ -15,6 +15,7 @@ pub mod local;
 #[cfg(feature = "voice")]
 pub mod media;
 pub mod phone;
+pub mod policy;
 pub mod provider;
 pub mod session;
 pub mod speech;
@@ -26,14 +27,15 @@ pub mod wav;
 use std::sync::Arc;
 
 /// What the bridge needs to take calls: the phone, the speech providers and the
-/// detector's settings. Without `stt` every call is declined; without `tts` the agent's
-/// replies stay in the chat.
+/// detector's settings, and how calls are answered and placed. Without `stt` every call
+/// is declined; without `tts` the agent's replies stay in the chat.
 #[derive(Clone)]
 pub struct VoiceSetup {
     pub phone: Arc<dyn phone::Phone>,
     pub stt: Option<Arc<dyn provider::Stt>>,
     pub tts: Option<Arc<dyn provider::Tts>>,
     pub vad: vad::VadConfig,
+    pub policy: policy::CallPolicy,
 }
 
 /// Samples per second of call audio (push-sdk's media helper).

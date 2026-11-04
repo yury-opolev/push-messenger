@@ -895,3 +895,74 @@ Decisions taken while implementing §9, beyond or refining it:
   of the owner's audio waits for the pipeline, newer frames are dropped beyond. Without
   TTS the call is silent (no greeting) and replies stay in the chat. Call events that
   arrive while the answer is in progress are buffered and handed to the line after it.
+
+### PR 8 (answering and calling policies): decisions and deviations
+
+- **Ask mode.** `calls.answer: "ask"` posts a built-in `agent.question@1` card ("📞 Owner
+  is calling <agent> in <folder> — answer?", options Answer / Decline) instead of an
+  `agent.approval`-style card: the approval template's buttons say Approve / Reject. The
+  card goes to the owner's conversation, so it shows on **all** the owner's devices, the
+  calling one too (push-messenger cannot address one device; §10.4 said "the owner's
+  other devices"). Answer → the bridge answers (call events that came meanwhile are
+  buffered and handed to the line); Decline → `CallDecline`; the server's end of the ring
+  (missed, cancelled) closes the card by editing it into a closed `agent.reply@1`
+  ("📞 Missed call.", "📞 The call was cancelled."); a card the owner answered is not
+  edited (the server refuses edits of answered cards; it shows the owner's choice). A
+  local deadline (the ring's `expires_at` + 5 s, at most 2 minutes) declines if the
+  server's end never comes. The ask card is not one of the agent's requests: no activity,
+  no `openRequests`, no typed or voice answers. While asking, other calls are busy.
+- **notify_by_call.** Config `{after_minutes (0 = off, at most 8), urgent, min_interval_minutes
+  (10–1440, default 10), do_not_disturb (a string or a list)}`; §10.4's single
+  `"22:00-07:00"` became ranges with optional days (`"mon-fri 22:00-07:00"`, `"sat,sun
+  00:00-24:00"`) in the computer's local time zone (chrono `Local`, so daylight saving
+  follows the OS); a range past midnight belongs to the day it starts on. `after_minutes`
+  is capped at 8 because a card still expires after 10 minutes (`CARD_TIMEOUT`, unchanged;
+  extending it during a call was left out). The floor of 10 minutes is the request's "at
+  most 1 call per 10 minutes"; the library's `NotifyPolicy` takes any `Duration` (the E2E
+  uses 3 s and 1 s). The section needs `calls.stt` and `calls.tts` when it can call.
+  Checked on the core's 500 ms tick: a request (permission, question, plan; not `/mode
+  bypass`) unanswered for `after` calls when no call runs, rings, is asked about or
+  answered, the messenger is connected and Coda is not paused; held by the interval or
+  the quiet hours (logged once per change, `call_held`) and placed later if the request
+  is still open. Each request calls at most once (`OpenRequest::notified`); the interval
+  counts from each placed call.
+- **Urgent.** Coda's `notify_user` (`AgentMessageDto`) has no urgency field: the bridge
+  reads `urgent: true`, `priority` `urgent`/`high` (forward compatible) or a label starting
+  with "urgent". `BackendEvent::AgentMessage` gained `urgent`. Urgent messages fetched
+  after a reconnect (`session/pendingMessages`) never call.
+- **Placing the call.** `Phone::call(peer)` (new) runs push-sdk's `MediaCall` as
+  `Role::Caller` through `MediaPhone`; the same `Session` pipeline as an answered call.
+  Until the phone returns the call's id is unknown, so every call event but `Incoming`
+  is buffered and replayed to the line. On connect the bridge says "Hi, it's <agent> in
+  <folder>." plus "A request has waited N minutes for your answer." (or "I have something
+  urgent.", the label and the text, masked), then the oldest open card's question;
+  everything after is an ordinary call. An outgoing call that ends before connecting
+  (missed, declined, busy, unreachable, failed) leaves the card open and posts one
+  `agent.reply@1` note ("📞 I called about the open request (no answer). It is still open
+  above."); a call still ringing is cancelled (`CallHangup` while ringing, no note) once
+  nothing is waiting or from the tray. A phone error (offline, not available) is logged
+  only. The activity label while it rings is `calling you` (an open card's `waiting`
+  label wins, as always).
+- **Control channel** (protocol 1, additive): `Status.call: CallInfo {phase: ringing |
+  connecting | in_call, direction: incoming | outgoing, speaking, listening, muted,
+  since}`, event `call_changed {call?}` (after the snapshot changes, as `state_changed`),
+  requests `call_state` (from the snapshot), `mute {muted?: bool = true}` → `{muted}`,
+  `hangup` → `{hungUp: true}`, error `no_call`; all classified content-free in the
+  protocol tests. Mute silences the session (`Session::set_silenced`: queued speech
+  dropped, nothing said until unmuted, the owner still heard); a mute during the answer
+  applies once the line exists. Hang up: a running call hangs up, a ringing outgoing call
+  is cancelled, an ask is declined, an answer in progress is dropped.
+- **Tray.** push-tray-core keeps each agent's `call` from `status` and `call_changed`;
+  the Overview shows it ("ringing (you are calling; confirm on your other device)",
+  "calling you", "connecting", "in a call — speaking/listening", "(muted)"), the menu's
+  agent line shows "calling you" / "your call is ringing" / "on a call" while a call
+  rings or runs (icon and badge unchanged). New actions Mute agent / Unmute agent / Hang
+  up (enabled when the control channel is up, the bridge is not stopping, and for mute a
+  call is connecting or in a call; hang up for any call).
+- **Tests.** Policy units (`voice/policy.rs`: midnight, days, wrapping day ranges, time
+  zones with fixed offsets, the verdict order quiet hours before interval), config
+  validation by field, Coda urgency parsing, the fake phone's placed calls, and 12 core
+  tests in paused time (`core/voice_tests.rs`). E2E `the_bridge_asks_before_answering_and_calls_its_owner`
+  in `crates/push-smoke/tests/bridge_voice.rs` (job `bridge-voice`, ring 10 s): ask mode,
+  the agent calling after 3 s with the owner answering as `Role::Callee`, hearing the
+  summary and approving by voice, then a missed call whose card still takes the answer.

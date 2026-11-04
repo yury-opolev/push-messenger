@@ -143,7 +143,7 @@ function agentRow(agent) {
   }
   row.badge.className = badgeClass(agent.badge);
   row.name.textContent = text(agent.name);
-  row.stateLabel.textContent = text(agent.state);
+  row.stateLabel.textContent = agent.call ? text(agent.state) + " · " + agent.call : text(agent.state);
   row.folder.textContent = text(agent.folder);
   const selected = agent.id === state.selected;
   row.button.setAttribute("aria-selected", selected ? "true" : "false");
@@ -258,22 +258,48 @@ async function refreshAgent() {
 }
 
 const actionButtons = new Map();
+const callButtons = [];
+
+function actionWrapper(onClick) {
+  const wrapper = el("span", "action");
+  const button = el("button");
+  button.type = "button";
+  button.addEventListener("click", onClick);
+  const refused = el("span", "refused");
+  refused.setAttribute("role", "status");
+  wrapper.append(button, refused);
+  return { wrapper, button, refused };
+}
 
 function actionControl(action) {
   let control = actionButtons.get(action.action);
   if (!control) {
-    const wrapper = el("span", "action");
-    const button = el("button");
-    button.type = "button";
-    button.addEventListener("click", () => act(action.action));
-    const refused = el("span", "refused");
-    refused.setAttribute("role", "status");
-    wrapper.append(button, refused);
-    $("actions").append(wrapper);
-    control = { wrapper, button, refused };
+    control = actionWrapper(() => act(action.action));
+    $("actions").append(control.wrapper);
     actionButtons.set(action.action, control);
   }
   return control;
+}
+
+// The call's buttons by place: the first toggles between "mute" and "unmute".
+function callControl(index) {
+  let control = callButtons[index];
+  if (!control) {
+    control = actionWrapper(() => {
+      if (control.action) act(control.action);
+    });
+    control.action = null;
+    $("callActions").append(control.wrapper);
+    callButtons[index] = control;
+  }
+  return control;
+}
+
+function renderAction(control, action) {
+  control.button.textContent = action.label;
+  control.button.disabled = !action.enabled;
+  const local = state.actionErrors[action.action];
+  control.refused.textContent = local || action.refused || "";
 }
 
 function renderAgent(agent) {
@@ -282,12 +308,18 @@ function renderAgent(agent) {
   $("ovBadge").className = badgeClass(agent.badge);
   $("ovState").textContent = text(agent.state);
   for (const action of agent.actions || []) {
-    const control = actionControl(action);
-    control.button.textContent = action.label;
-    control.button.disabled = !action.enabled;
-    const local = state.actionErrors[action.action];
-    control.refused.textContent = local || action.refused || "";
+    renderAction(actionControl(action), action);
   }
+  const callActions = agent.callActions || [];
+  callActions.forEach((action, index) => {
+    const control = callControl(index);
+    control.action = action.action;
+    renderAction(control, action);
+  });
+  callButtons.forEach((control, index) => {
+    control.wrapper.hidden = index >= callActions.length;
+  });
+  $("ovCall").textContent = agent.call ? agent.call : "no call";
   $("ovFolder").textContent = text(agent.folder);
   $("ovSession").textContent = text(agent.session);
   $("ovCodaVersion").textContent = text(agent.codaVersion);

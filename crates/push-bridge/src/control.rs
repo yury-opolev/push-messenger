@@ -13,8 +13,9 @@ use std::time::Duration;
 
 use push_bridge_control::transport::Listener;
 use push_bridge_control::{
-    BridgeState, Call, ErrorBody, Event, EventLine, MAX_LINE, PEEK_DISABLED, PROTOCOL, PauseParams,
-    PeekEntry, PeekResult, Response, Status, encode, now_ms, parse_request, peek_limit,
+    BridgeState, Call, CallStateResult, ErrorBody, Event, EventLine, MAX_LINE, PEEK_DISABLED,
+    PROTOCOL, PauseParams, PeekEntry, PeekResult, Response, Status, encode, now_ms, parse_request,
+    peek_limit,
 };
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
@@ -44,6 +45,10 @@ pub enum Action {
     Shutdown,
     Pause(PauseParams),
     Resume,
+    /// Mutes (`true`) or unmutes the agent's voice in the running call.
+    Mute(bool),
+    /// Hangs up, cancels or declines the call.
+    Hangup,
 }
 
 impl Action {
@@ -55,6 +60,8 @@ impl Action {
             Action::Shutdown => "shutdown",
             Action::Pause(_) => "pause_backend",
             Action::Resume => "resume_backend",
+            Action::Mute(_) => "mute",
+            Action::Hangup => "hangup",
         }
     }
 }
@@ -375,6 +382,15 @@ impl ControlHub {
                 });
                 return Some(response(id, entries));
             }
+            Call::CallState => {
+                let call = serde_json::to_value(CallStateResult {
+                    call: self.handle.status().call,
+                })
+                .map_err(|_| error("internal", "the call state could not be encoded"));
+                return Some(response(id, call));
+            }
+            Call::Mute(params) => (Action::Mute(params.muted.unwrap_or(true)), ACTION_TIMEOUT),
+            Call::Hangup => (Action::Hangup, ACTION_TIMEOUT),
         };
         tracing::info!(event = "control_request", method = action.name());
         let hub = self.clone();
