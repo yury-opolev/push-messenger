@@ -123,7 +123,22 @@ where
     R: AsyncRead + Unpin + Send,
     W: AsyncWrite + Unpin + Send,
 {
-    match reader.read_frame().await {
+    let result = reader.read_frame().await;
+    on_read(log, writer, result).await
+}
+
+/// Handles what a read returned: at the end the writer is shut down, a framing error is
+/// answered `invalid_frame`. Kept apart from the (cancel-safe) read so a `select!` branch
+/// never cancels a write.
+async fn on_read<W>(
+    log: &Log,
+    writer: &mut Writer<W>,
+    result: Result<Option<Frame>, ReadError>,
+) -> Result<Option<Frame>, AdapterError>
+where
+    W: AsyncWrite + Unpin + Send,
+{
+    match result {
         Ok(Some(frame)) => Ok(Some(frame)),
         Ok(None) => {
             log.push(Event::Closed);
@@ -231,8 +246,8 @@ impl Session<'_> {
                 .is_some_and(|call| !call.speaks.is_empty());
             tokio::select! {
                 biased;
-                frame = read(self.log, reader, writer) => {
-                    let Some(frame) = frame? else {
+                frame = reader.read_frame() => {
+                    let Some(frame) = on_read(self.log, writer, frame).await? else {
                         return Ok(Outcome::Closed);
                     };
                     let was_speaking = speaking;

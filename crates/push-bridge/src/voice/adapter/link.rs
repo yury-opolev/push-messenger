@@ -20,6 +20,13 @@
 //! the link with [`LinkEnd::Shutdown`]: queued control messages are flushed (at most
 //! [`CLOSE_GRACE`]), then the writer is shut down.
 //!
+//! The event channel is unbounded so [`LinkEvent::Closed`] can never be lost or block the
+//! reader. It is bounded in practice by the reader's caps: at most
+//! [`MAX_CONTROL_PER_SECOND`] messages a second (more ends the link) and stream-1 audio at
+//! most [`AUDIO_RATE_FACTOR`] times real time, only during a call. Its consumer must
+//! always drain it: the router during a call, otherwise the supervisor (which drains it
+//! every second when no call runs).
+//!
 //! Content-free (A15): logs carry type names, codes, ids and counts, never text or audio.
 
 use std::collections::{HashSet, VecDeque};
@@ -282,7 +289,8 @@ impl LinkClosed {
 }
 
 impl Link {
-    /// Sends `hello`, waits up to [`HELLO_TIMEOUT`] for the adapter's and starts the
+    /// Sends `hello`, waits for the adapter's (the whole exchange within
+    /// [`HELLO_TIMEOUT`]) and starts the
     /// link's tasks (call it inside a tokio runtime). A failed handshake answers the
     /// adapter with an `error` when the protocol says so, shuts the writer down and
     /// returns why.
@@ -302,12 +310,13 @@ impl Link {
         })?;
         let mut reader = AsyncFrameReader::new(reader);
         let mut writer = AsyncFrameWriter::new(writer);
-        match timeout(HELLO_TIMEOUT, writer.write_frame(&hello)).await {
+        let deadline = Instant::now() + HELLO_TIMEOUT;
+        match timeout_at(deadline, writer.write_frame(&hello)).await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => return Err(LinkEnd::Io(error.to_string())),
             Err(_) => return Err(no_hello()),
         }
-        let answer = timeout(HELLO_TIMEOUT, await_hello(&mut reader, &offered, format))
+        let answer = timeout_at(deadline, await_hello(&mut reader, &offered, format))
             .await
             .unwrap_or_else(|_| Err(Refusal::quiet(no_hello())));
         let adapter = match answer {
@@ -652,14 +661,15 @@ impl<R: AsyncRead + Unpin> Reader<R> {
         let _ = self.events.send(LinkEvent::Closed(end));
     }
 
-    /// Ends the link: the error (if any) and a close go to the writer before the end is
-    /// recorded, so the writer flushes them.
+    /// Ends the link: the error (if any) is queued for the writer to flush, then the end
+    /// is recorded, then the writer is told to close — in that order, so the writer can
+    /// never record its own end first.
     fn fail(&self, reply: Option<ErrorMessage>, end: LinkEnd) {
         if let Some(reply) = reply {
             self.reply(reply);
         }
-        let _ = self.control.send(Outgoing::Close);
         self.shared.finish(end);
+        let _ = self.control.send(Outgoing::Close);
     }
 
     fn reply(&self, message: ErrorMessage) {
@@ -833,7 +843,7 @@ async fn write_loop<W: AsyncWrite + Unpin>(
     let mut ping_id: u32 = 0;
     let result = loop {
         if out.closing() {
-            break drain(&mut out, &mut control, &shared).await;
+            break drain(&mut out, &mut control, &shared).await.err();
         }
         let has_audio = shared.has_audio();
         let frame = tokio::select! {
@@ -841,9 +851,14 @@ async fn write_loop<W: AsyncWrite + Unpin>(
             _ = out.ending.changed() => continue,
             outgoing = control.recv() => match outgoing {
                 Some(Outgoing::Control(frame)) => frame,
-                Some(Outgoing::Close) | None => {
+                // Whoever sent the close recorded the end first.
+                Some(Outgoing::Close) => {
                     out.shutdown().await;
-                    break Ok(());
+                    break None;
+                }
+                None => {
+                    out.shutdown().await;
+                    break Some(LinkEnd::Shutdown);
                 }
             },
             _ = ping.tick() => {
@@ -863,11 +878,13 @@ async fn write_loop<W: AsyncWrite + Unpin>(
             () = shared.audio_ready.notified(), if !has_audio => continue,
         };
         if let Err(end) = out.write(&frame).await {
-            break Err(end);
+            break Some(end);
         }
         bump(&shared.stats.frames_out);
     };
-    shared.finish(result.err().unwrap_or(LinkEnd::Shutdown));
+    if let Some(end) = result {
+        shared.finish(end);
+    }
 }
 
 /// Writes the control messages queued before the close, then shuts the writer down.
@@ -1059,6 +1076,23 @@ mod tests {
         let (read, write, mut fake) = pipe(64 * 1024);
         let start = Instant::now();
         let (opened, _fake) = tokio::join!(Link::open(read, write, hello()), async {
+            fake.message().await;
+            fake
+        });
+        assert_eq!(
+            opened.unwrap_err(),
+            LinkEnd::Protocol("the voice adapter sent no hello within 10 s".into())
+        );
+        assert_eq!(start.elapsed(), HELLO_TIMEOUT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_hello_write_counts_against_the_same_deadline() {
+        // The pipe holds less than the hello, so writing it waits for the adapter to read.
+        let (read, write, mut fake) = pipe(16);
+        let start = Instant::now();
+        let (opened, _fake) = tokio::join!(Link::open(read, write, hello()), async {
+            sleep(Duration::from_secs(6)).await;
             fake.message().await;
             fake
         });
@@ -1372,6 +1406,25 @@ mod tests {
         let (_link, mut events, fake) = ready().await;
         drop(fake);
         assert_eq!(closed(&mut events).await, LinkEnd::Eof);
+    }
+
+    /// The reader records why the link ended before the writer can record `Shutdown`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_end_reason_is_never_misreported_as_shutdown() {
+        for _ in 0..200 {
+            let (link, mut events, fake) = ready().await;
+            let mut signal = link.closed();
+            drop(fake);
+            assert_eq!(closed(&mut events).await, LinkEnd::Eof);
+            assert_eq!(signal.wait().await, LinkEnd::Eof);
+            assert_eq!(link.end(), Some(LinkEnd::Eof));
+        }
+        for _ in 0..200 {
+            let (link, mut events, mut fake) = ready().await;
+            fake.writer.write_all(&[0x7F, 0, 0, 0, 1]).await.unwrap();
+            assert!(matches!(closed(&mut events).await, LinkEnd::Framing(_)));
+            assert!(matches!(link.end(), Some(LinkEnd::Framing(_))));
+        }
     }
 
     #[derive(Clone, Default)]
