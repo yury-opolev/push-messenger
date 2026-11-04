@@ -266,8 +266,9 @@ async fn watch(
 ) {
     let end = match control.connected().await {
         Ok(()) => {
-            ctx.emit(SessionEvent::Connected);
+            // The engine first: a greeting said at `Connected` finds it ready.
             engine.connected();
+            ctx.emit(SessionEvent::Connected);
             control.ended().await
         }
         Err(end) => end,

@@ -1,10 +1,13 @@
 //! The call router ([`AdapterEngine`], design §8, A9, A10, A21, A23): one call's speech in
 //! the voice adapter.
 //!
-//! - When the call connects, the router takes the ready link's events
-//!   ([`ReadyLink::take_events`]) and sends `call_started {call_id, peer, language}`; the
-//!   `call_id` is fresh and random (A8). A new link during the call (a restarted adapter)
-//!   gets `call_started` again with the same `call_id` ([`SessionEvent::AdapterBack`]).
+//! - When the call connects ([`SpeechEngine::connected`]), the engine takes the ready
+//!   link's events ([`ReadyLink::take_events`]) and sends `call_started {call_id, peer,
+//!   language}` at once, so a greeting said right after `Connected` is spoken; the
+//!   `call_id` is fresh and random (A8). While the previous call's router still holds the
+//!   events (it is finishing), the router waits up to [`CLAIM_WAIT`] for them before the
+//!   call goes chat-only. A new link during the call (a restarted adapter) gets
+//!   `call_started` again with the same `call_id` ([`SessionEvent::AdapterBack`]).
 //! - The owner's audio goes to the adapter as stream 0 ([`Link::send_audio`]: its 1 s
 //!   queue drops the oldest); nothing without a link (chat-only).
 //! - `speech_started` → `Listening(true)` and a barge-in (the session's: the queue and the
@@ -61,6 +64,9 @@ use crate::voice::{FRAME, Frame};
 /// "Listening" ends this long after `speech_started` without a final transcript (design
 /// §5, "Slow STT").
 pub const LISTENING_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a connecting call waits for the previous call's router to give the link's
+/// events back.
+pub const CLAIM_WAIT: Duration = Duration::from_secs(2);
 /// How far ahead stream-1 audio is queued on the line's speaker (A12).
 const TO_CALLER_BUFFER: Duration =
     Duration::from_millis(FRAME_TIME.as_millis() as u64 * TO_CALLER_BUFFER_FRAMES as u64);
@@ -210,9 +216,9 @@ struct Unfinished {
 /// What the engine's handle and the router's task share.
 #[derive(Default)]
 struct State {
-    /// The router took a link or found none ([`Router::attach`], [`Router::lose`]); until
-    /// then sentences wait (the greeting comes as the call connects, before the router
-    /// had a chance to attach).
+    /// The call took a link or found none ([`Inner::start_call`], [`Router::lose`]); until
+    /// then sentences wait (the greeting comes as the call connects, maybe while the
+    /// router waits for the previous call to give the link's events back).
     settled: bool,
     /// The link `call_started` went to; `None` before, and while chat-only after a loss.
     link: Option<Link>,
@@ -238,6 +244,9 @@ impl State {
     }
 }
 
+/// A link the call took and its events.
+type Claimed = (ReadyLink, mpsc::UnboundedReceiver<LinkEvent>);
+
 struct Inner {
     ctx: Arc<SpeechContext>,
     call_id: String,
@@ -246,6 +255,8 @@ struct Inner {
     metrics: Arc<AdapterMetrics>,
     state: Mutex<State>,
     phase: watch::Sender<Phase>,
+    /// The link [`SpeechEngine::connected`] took, for the router's task to adopt.
+    pending: Mutex<Option<Claimed>>,
 }
 
 impl Inner {
@@ -257,6 +268,46 @@ impl Inner {
         if let Err(error) = link.send(message) {
             tracing::warn!(event = "adapter_message_invalid", %error);
         }
+    }
+
+    /// Takes `ready`'s events if nobody holds them and its link lives: `call_started`.
+    fn claim_now(&self, ready: &ReadyLink) -> Option<Claimed> {
+        let events = ready.take_events()?;
+        if ready.link().end().is_some() {
+            ready.give_back(events);
+            return None;
+        }
+        self.start_call(ready);
+        Some((ready.clone(), events))
+    }
+
+    /// Sends `call_started` on `ready`'s link: the call speaks there from now on.
+    fn start_call(&self, ready: &ReadyLink) {
+        let link = ready.link().clone();
+        let capabilities = link.info().capabilities;
+        self.send(
+            &link,
+            BridgeMessage::CallStarted(CallStarted {
+                call_id: self.call_id.clone(),
+                peer: self.peer.clone(),
+                language: self.language.clone(),
+            }),
+        );
+        {
+            let mut state = self.state();
+            state.settled = true;
+            state.link = Some(link);
+            state.capabilities = capabilities;
+            state.unavailable = false;
+            state.unfinished.clear();
+            state.call.calls = 1;
+        }
+        tracing::info!(
+            event = "adapter_call_started",
+            call_id = %self.call_id,
+            link = ready.id()
+        );
+        self.ctx.wake.notify_one();
     }
 
     /// Sends `stop_speaking` for every unfinished speak not stopped yet.
@@ -282,6 +333,7 @@ impl Inner {
 /// Speech in the voice adapter for one call (see the module's documentation).
 pub struct AdapterEngine {
     inner: Arc<Inner>,
+    current: watch::Receiver<Option<ReadyLink>>,
     task: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -297,14 +349,17 @@ impl AdapterEngine {
             metrics: setup.metrics.clone(),
             state: Mutex::default(),
             phase: watch::channel(Phase::Ringing).0,
+            pending: Mutex::default(),
         });
+        let current = setup.supervisor.current();
         let task = tokio::spawn(route(
             inner.clone(),
             inner.phase.subscribe(),
-            setup.supervisor.current(),
+            current.clone(),
         ));
         Self {
             inner,
+            current,
             task: Mutex::new(Some(task)),
         }
     }
@@ -337,10 +392,18 @@ impl SpeechEngine for AdapterEngine {
         self.inner.state().may_speak()
     }
 
+    /// Takes the ready link at once (`call_started`), unless the previous call's router
+    /// still holds its events: then the router's task waits for them.
     fn connected(&self) {
+        let ready = self.current.borrow().clone();
+        // Under the phase's lock: the router's task adopts what was taken once it sees
+        // the phase change (even straight to an end).
         self.inner.phase.send_if_modified(|phase| {
             if *phase != Phase::Ringing {
                 return false;
+            }
+            if let Some(claimed) = ready.as_ref().and_then(|ready| self.inner.claim_now(ready)) {
+                *lock(&self.inner.pending) = Some(claimed);
             }
             *phase = Phase::Connected;
             true
@@ -378,12 +441,13 @@ impl Drop for AdapterEngine {
     }
 }
 
-/// How the call ended, for the adapter.
+/// How the call ended, for the adapter (never `other`, which is never sent): a call
+/// that was up ends `completed` or `failed`; the bridge stopping is
+/// [`SpeechEngine::shut_down`]'s `shutdown`.
 fn wire_reason(reason: CallEndReason) -> WireEndReason {
     match reason {
         CallEndReason::Completed => WireEndReason::Completed,
-        CallEndReason::Failed => WireEndReason::Failed,
-        _ => WireEndReason::Other,
+        _ => WireEndReason::Failed,
     }
 }
 
@@ -421,17 +485,6 @@ async fn route(
     mut phase: watch::Receiver<Phase>,
     mut current: watch::Receiver<Option<ReadyLink>>,
 ) {
-    loop {
-        let now = *phase.borrow_and_update();
-        match now {
-            Phase::Ringing => {}
-            Phase::Connected => break,
-            Phase::Ended(_) => return,
-        }
-        if phase.changed().await.is_err() {
-            return;
-        }
-    }
     let mut router = Router {
         inner,
         ready: None,
@@ -441,10 +494,41 @@ async fn route(
         started: HashMap::new(),
         finals: VecDeque::new(),
     };
-    let ready = current.borrow_and_update().clone();
-    match ready {
-        Some(ready) => router.attach(ready),
-        None => router.lose(),
+    loop {
+        let now = *phase.borrow_and_update();
+        match now {
+            Phase::Ringing => {}
+            Phase::Connected => break,
+            Phase::Ended(reason) => {
+                // Connected and ended at once: the adapter's call is ended too.
+                if router.adopt() {
+                    router.finish(reason);
+                }
+                return;
+            }
+        }
+        if phase.changed().await.is_err() {
+            return;
+        }
+    }
+    if !router.adopt() {
+        let ready = current.borrow_and_update().clone();
+        match ready {
+            Some(ready) => {
+                let events = tokio::select! {
+                    events = ready.wait_for_events(CLAIM_WAIT) => events,
+                    reason = ended(&mut phase) => return router.finish(reason),
+                };
+                match events {
+                    Some(events) => router.attach_with(ready, events),
+                    None => {
+                        tracing::warn!(event = "adapter_events_taken", link = ready.id());
+                        router.lose();
+                    }
+                }
+            }
+            None => router.lose(),
+        }
     }
     let mut supervised = true;
     let reason = loop {
@@ -479,6 +563,20 @@ async fn route(
     router.finish(reason);
 }
 
+/// How the call ended, once it has.
+async fn ended(phase: &mut watch::Receiver<Phase>) -> WireEndReason {
+    let Ok(now) = phase
+        .wait_for(|phase| matches!(phase, Phase::Ended(_)))
+        .await
+    else {
+        return WireEndReason::Completed;
+    };
+    match *now {
+        Phase::Ended(reason) => reason,
+        _ => WireEndReason::Completed,
+    }
+}
+
 /// The next link event; `None` once the channel closed; pending without a link.
 async fn next_event(events: &mut Option<mpsc::UnboundedReceiver<LinkEvent>>) -> Option<LinkEvent> {
     match events {
@@ -508,40 +606,32 @@ impl Router {
         self.inner.ctx.emit(event);
     }
 
-    /// Takes `ready` for the call: `call_started` (again, after a loss).
+    /// Adopts the link [`SpeechEngine::connected`] took; whether there was one.
+    fn adopt(&mut self) -> bool {
+        let Some((ready, events)) = lock(&self.inner.pending).take() else {
+            return false;
+        };
+        self.ready = Some(ready);
+        self.events = Some(events);
+        true
+    }
+
+    /// Takes a new `ready` for the call: `call_started` (again, after a loss).
     fn attach(&mut self, ready: ReadyLink) {
         let Some(events) = ready.take_events() else {
             tracing::warn!(event = "adapter_events_taken", link = ready.id());
             return self.lose();
         };
-        let link = ready.link().clone();
-        if link.end().is_some() {
+        self.attach_with(ready, events);
+    }
+
+    /// Takes `ready`, whose `events` the router holds, for the call.
+    fn attach_with(&mut self, ready: ReadyLink, events: mpsc::UnboundedReceiver<LinkEvent>) {
+        if ready.link().end().is_some() {
             ready.give_back(events);
             return self.lose();
         }
-        let capabilities = link.info().capabilities;
-        self.inner.send(
-            &link,
-            BridgeMessage::CallStarted(CallStarted {
-                call_id: self.inner.call_id.clone(),
-                peer: self.inner.peer.clone(),
-                language: self.inner.language.clone(),
-            }),
-        );
-        {
-            let mut state = self.inner.state();
-            state.settled = true;
-            state.link = Some(link);
-            state.capabilities = capabilities;
-            state.unavailable = false;
-            state.unfinished.clear();
-            state.call.calls = 1;
-        }
-        tracing::info!(
-            event = "adapter_call_started",
-            call_id = %self.inner.call_id,
-            link = ready.id()
-        );
+        self.inner.start_call(&ready);
         self.ready = Some(ready);
         self.events = Some(events);
         if std::mem::take(&mut self.lost) {
@@ -992,12 +1082,22 @@ mod tests {
     }
 
     async fn start_call(starter: Arc<dyn Starter>) -> Call {
+        open_call(ready_supervisor(starter).await).await
+    }
+
+    /// A supervisor of `starter`, once its adapter is ready.
+    async fn ready_supervisor(starter: Arc<dyn Starter>) -> Supervisor {
         let supervisor = Supervisor::with_starter(starter, BridgeHello::v1("1.2.3", "en-US"));
         let mut current = supervisor.current();
         timeout(Duration::from_secs(10), current.wait_for(Option::is_some))
             .await
             .expect("the adapter gets ready")
             .unwrap();
+        supervisor
+    }
+
+    /// A call on `supervisor`'s adapter, once connected.
+    async fn open_call(supervisor: Supervisor) -> Call {
         let setup = AdapterSetup::new(supervisor.clone(), "en-US");
         let phone = FakePhone::new();
         let mut line = phone.answer(CallId::new(), "offer").await.unwrap();
@@ -1333,6 +1433,150 @@ mod tests {
         assert_eq!((metrics.calls, metrics.speaks), (1, 1));
         assert!(metrics.frames_from_adapter > 0);
         assert_eq!(metrics.speak_to_audio.count, 1);
+    }
+
+    /// Where the first event `matches` is in the adapter's log.
+    fn position(log: &Log, matches: impl Fn(&Event) -> bool) -> Option<usize> {
+        log.events()
+            .iter()
+            .position(|observed| matches(&observed.event))
+    }
+
+    fn is_speak(event: &Event) -> bool {
+        matches!(event, Event::Speak { .. })
+    }
+
+    fn is_call_started(event: &Event) -> bool {
+        matches!(event, Event::CallStarted { .. })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_greeting_said_as_the_call_connects_is_spoken() {
+        let starter = ScriptedStarter::new([Plan::Adapter(script())]);
+        let mut call = start_call(starter.clone()).await;
+        // At `Connected`, without waiting for the adapter's `call_started`.
+        call.session.say("Hello.");
+        let log = starter.logs()[0].clone();
+        wait_log(&log, is_speak).await;
+        assert!(position(&log, is_call_started) < position(&log, is_speak));
+        assert_eq!(speaks(&log), vec![("s1".into(), false, 6)]);
+        call.until(&SessionEvent::Speaking(true)).await;
+        let seen = call.until(&SessionEvent::Speaking(false)).await;
+        assert!(!seen.contains(&SessionEvent::AdapterLost), "{seen:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_bridge_stop_ends_the_adapters_call_as_a_shutdown() {
+        let (call, starter, log) = scripted_call(vec![script()]).await;
+        let Call {
+            session,
+            supervisor,
+            ..
+        } = call;
+        session.shut_down().await;
+        timeout(Duration::from_secs(10), supervisor.shutdown())
+            .await
+            .expect("the supervisor stops");
+        let ended: Vec<Event> = log
+            .events()
+            .into_iter()
+            .filter_map(|observed| match observed.event {
+                event @ Event::CallEnded { .. } => Some(event),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            ended,
+            vec![Event::CallEnded {
+                call_id: call_id(&log),
+                reason: "shutdown".into()
+            }]
+        );
+        for task in starter.take_serving() {
+            let outcome = timeout(Duration::from_secs(10), task).await.unwrap();
+            assert_eq!(
+                outcome.unwrap().unwrap(),
+                push_voice_adapter_testkit::Outcome::Closed
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_call_waits_for_the_previous_call_to_give_the_adapter_back() {
+        let starter = ScriptedStarter::new([Plan::Adapter(script())]);
+        let supervisor = ready_supervisor(starter.clone()).await;
+        // The previous call's router, still finishing, holds the events.
+        let ready = supervisor.current().borrow().clone().unwrap();
+        let events = ready.take_events().unwrap();
+        tokio::spawn(async move {
+            sleep(Duration::from_millis(300)).await;
+            ready.give_back(events);
+        });
+        let mut call = open_call(supervisor).await;
+        call.session.say("Hello.");
+        let log = starter.logs()[0].clone();
+        wait_log(&log, is_speak).await;
+        let seen = call.until(&SessionEvent::Speaking(false)).await;
+        assert!(!seen.contains(&SessionEvent::AdapterLost), "{seen:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn back_to_back_calls_both_get_the_adapter() {
+        let (call, _starter, log) = scripted_call(vec![script()]).await;
+        let first = call_id(&log);
+        let Call {
+            session,
+            supervisor,
+            ..
+        } = call;
+        drop(session);
+        let mut call = open_call(supervisor).await;
+        call.session.say("Hello.");
+        timeout(Duration::from_secs(10), log.wait_count(2, is_call_started))
+            .await
+            .expect("the second call_started");
+        wait_log(&log, is_speak).await;
+        let seen = call.until(&SessionEvent::Speaking(false)).await;
+        assert!(!seen.contains(&SessionEvent::AdapterLost), "{seen:?}");
+        let ended = position(&log, |e| {
+            *e == Event::CallEnded {
+                call_id: first.clone(),
+                reason: "completed".into(),
+            }
+        })
+        .expect("the first call ended");
+        let second = log
+            .events()
+            .iter()
+            .enumerate()
+            .filter(|(_, observed)| is_call_started(&observed.event))
+            .map(|(at, _)| at)
+            .nth(1)
+            .unwrap();
+        assert!(ended < second);
+        assert!(
+            !log.events()
+                .iter()
+                .any(|observed| matches!(&observed.event, Event::ErrorSent { .. }))
+        );
+    }
+
+    #[test]
+    fn every_end_reason_is_one_the_protocol_sends() {
+        use CallEndReason::*;
+        for reason in [
+            Completed,
+            Missed,
+            Declined,
+            Cancelled,
+            Busy,
+            Failed,
+            Unreachable,
+        ] {
+            assert_ne!(wire_reason(reason), WireEndReason::Other, "{reason:?}");
+        }
+        assert_eq!(wire_reason(Completed), WireEndReason::Completed);
+        assert_eq!(wire_reason(Failed), WireEndReason::Failed);
     }
 
     /// A hand-driven adapter: the test sends its messages and reads the bridge's.

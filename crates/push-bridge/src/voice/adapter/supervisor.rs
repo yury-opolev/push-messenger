@@ -43,8 +43,8 @@ use push_voice_adapter_proto::BridgeHello;
 use push_voice_adapter_proto::message::Message as _;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::process::Child;
-use tokio::sync::{mpsc, watch};
-use tokio::time::{Instant, MissedTickBehavior, interval, sleep_until, timeout};
+use tokio::sync::{Notify, mpsc, watch};
+use tokio::time::{Instant, MissedTickBehavior, interval, sleep_until, timeout, timeout_at};
 
 use super::link::{AdapterInfo, Link, LinkEvent};
 use super::spawn::{KillGuard, spawn};
@@ -196,6 +196,8 @@ pub struct ReadyLink {
     id: u64,
     link: Link,
     events: Arc<Mutex<Option<mpsc::UnboundedReceiver<LinkEvent>>>>,
+    /// Signalled by [`ReadyLink::give_back`].
+    returned: Arc<Notify>,
 }
 
 impl fmt::Debug for ReadyLink {
@@ -228,6 +230,27 @@ impl ReadyLink {
     /// drains it again until it is taken.
     pub fn give_back(&self, events: mpsc::UnboundedReceiver<LinkEvent>) {
         *lock(&self.events) = Some(events);
+        self.returned.notify_waiters();
+    }
+
+    /// The link's events, waiting up to `wait` for the consumer holding them (the
+    /// previous call's router, finishing) to give them back.
+    pub async fn wait_for_events(
+        &self,
+        wait: Duration,
+    ) -> Option<mpsc::UnboundedReceiver<LinkEvent>> {
+        let deadline = Instant::now() + wait;
+        loop {
+            let returned = self.returned.notified();
+            tokio::pin!(returned);
+            returned.as_mut().enable();
+            if let Some(events) = self.take_events() {
+                return Some(events);
+            }
+            if timeout_at(deadline, returned).await.is_err() {
+                return self.take_events();
+            }
+        }
     }
 }
 
@@ -425,11 +448,7 @@ impl Runner {
                 self.restarts.fetch_add(1, Ordering::Relaxed);
             }
             first = false;
-            let reason = self.attempt().await?;
-            let delay = self.backoff.next_delay();
-            self.log_failure(&reason, delay);
-            let until = Instant::now() + delay;
-            self.set(AdapterState::Backoff { until, reason });
+            let until = self.attempt().await?;
             let mut stop = self.stop.clone();
             tokio::select! {
                 () = sleep_until(until) => {}
@@ -438,8 +457,19 @@ impl Runner {
         }
     }
 
-    /// One start: returns why it ended.
-    async fn attempt(&mut self) -> Result<String, Stopped> {
+    /// Publishes the backoff after a failure: when the next start is due.
+    fn back_off(&mut self, reason: String) -> Instant {
+        let delay = self.backoff.next_delay();
+        self.log_failure(&reason, delay);
+        let until = Instant::now() + delay;
+        self.set(AdapterState::Backoff { until, reason });
+        until
+    }
+
+    /// One start: returns when the next one is due. The backoff is published before a
+    /// spawned child is waited for, so the adapter is never `Ready` while it stops; the
+    /// backoff counts from the failure.
+    async fn attempt(&mut self) -> Result<Instant, Stopped> {
         let mut stop = self.stop.clone();
         if *stop.borrow() {
             return Err(Stopped);
@@ -455,7 +485,7 @@ impl Runner {
             child,
         } = match started {
             Ok(started) => started,
-            Err(error) => return Ok(error.to_string()),
+            Err(error) => return Ok(self.back_off(error.to_string())),
         };
         self.set(AdapterState::Handshaking);
         let opened = tokio::select! {
@@ -467,6 +497,7 @@ impl Runner {
             Some(Err(end)) => Ok(end.to_string()),
             Some(Ok((link, events))) => self.ready(link, events).await,
         };
+        let outcome = outcome.map(|reason| self.back_off(reason));
         if let Some(child) = child {
             child.finish(STOP_GRACE).await;
         }
@@ -485,6 +516,7 @@ impl Runner {
             id: self.next_id,
             link: link.clone(),
             events: Arc::new(Mutex::new(Some(events))),
+            returned: Arc::default(),
         };
         let slot = Arc::clone(&ready.events);
         self.set(AdapterState::Ready(link.info().clone()));
@@ -981,5 +1013,111 @@ mod tests {
         .await
         .expect("the child is killed");
         assert!(begun.elapsed() < Duration::from_secs(30));
+    }
+
+    fn sleeper_config() -> SpawnConfig {
+        let exe = std::env::current_exe().unwrap();
+        let mut command = vec![exe.to_string_lossy().into_owned()];
+        command.extend(
+            [SLEEPER, "--exact", "--ignored", "--test-threads=1", MARKER].map(str::to_owned),
+        );
+        SpawnConfig {
+            command,
+            stderr: StderrMode::Discard,
+            env_allow: Vec::new(),
+        }
+    }
+
+    /// The testkit's adapter over pipes, with a spawned child that does not exit by
+    /// itself (as an adapter slow to stop).
+    struct SlowChildStarter {
+        adapters: Arc<ScriptedStarter>,
+        config: SpawnConfig,
+        log_dir: PathBuf,
+    }
+
+    #[async_trait]
+    impl Starter for SlowChildStarter {
+        async fn start(&self) -> io::Result<Started> {
+            let mut started = self.adapters.start().await?;
+            let spawned = spawn(&self.config, &self.log_dir, &[])?;
+            let (stdin, mut stdout) = (spawned.stdin, spawned.stdout);
+            tokio::spawn(async move {
+                let _stdin = stdin;
+                let _ = tokio::io::copy(&mut stdout, &mut tokio::io::sink()).await;
+            });
+            started.child = Some(ChildGuard::new(spawned.child, spawned.job));
+            Ok(started)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_slow_child_is_not_ready_while_it_stops_and_backs_off_meanwhile() {
+        let dir = crate::test_dir::TestDir::new();
+        let adapters = ScriptedStarter::new([]);
+        let starter = Arc::new(SlowChildStarter {
+            adapters: adapters.clone(),
+            config: sleeper_config(),
+            log_dir: dir.path().to_owned(),
+        });
+        let (supervisor, mut states) = observed(starter);
+        expect_ready(&mut states).await;
+        let crashed = Instant::now();
+        adapters.crash();
+        let (at, state) = next(&mut states).await;
+        let AdapterState::Backoff { until, .. } = state else {
+            panic!("expected a backoff, got {state:?}");
+        };
+        assert!(
+            at - crashed < Duration::from_secs(1),
+            "backoff at once, not after the child's grace"
+        );
+        let delay = until - at;
+        assert!(
+            delay <= Duration::from_secs(1) && delay > Duration::from_millis(900),
+            "{delay:?}"
+        );
+        let (started, state) = next(&mut states).await;
+        assert_eq!(state, AdapterState::Starting);
+        assert!(started >= until);
+        assert!(started - crashed >= STOP_GRACE, "after the child stopped");
+        assert!(
+            started - crashed < STOP_GRACE + Duration::from_millis(900),
+            "the backoff only waits for what is left: {:?}",
+            started - crashed
+        );
+        timeout(Duration::from_secs(30), supervisor.shutdown())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn events_given_back_can_be_waited_for() {
+        let starter = ScriptedStarter::new([]);
+        let (supervisor, mut states) = observed(starter);
+        expect_ready(&mut states).await;
+        let current = supervisor.current().borrow().clone().unwrap();
+        let events = current.take_events().unwrap();
+        let begun = Instant::now();
+        assert!(
+            current
+                .wait_for_events(Duration::from_millis(500))
+                .await
+                .is_none()
+        );
+        assert!(Instant::now() - begun >= Duration::from_millis(500));
+        let giver = current.clone();
+        tokio::spawn(async move {
+            sleep(Duration::from_millis(300)).await;
+            giver.give_back(events);
+        });
+        let begun = Instant::now();
+        assert!(
+            current
+                .wait_for_events(Duration::from_secs(2))
+                .await
+                .is_some()
+        );
+        assert_eq!(Instant::now() - begun, Duration::from_millis(300));
     }
 }
