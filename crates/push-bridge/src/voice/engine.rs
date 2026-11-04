@@ -51,6 +51,10 @@ pub trait SpeechEngine: Send + Sync + 'static {
     /// The call is over: stop and return once the engine's tasks have stopped (no event
     /// is reported after).
     async fn end(&self, reason: CallEndReason);
+    /// The bridge stops during the call: an engine with a peer of its own tells it so
+    /// (the voice adapter's `call_ended {reason: shutdown}`) and returns once it did.
+    /// Nothing by default.
+    async fn shut_down(&self) {}
 }
 
 /// A sentence to speak.

@@ -259,10 +259,10 @@ impl<M: Messenger> Core<M> {
         .await;
     }
 
-    /// Whether the bridge could call now: voice with a listener, connected, no call, not
-    /// paused or stopping.
+    /// Whether the bridge could call now: voice with someone to listen (the built-in STT,
+    /// or a voice adapter ready with `stt`), connected, no call, not paused or stopping.
     fn can_dial(&self) -> bool {
-        self.voice.as_ref().is_some_and(|voice| voice.stt.is_some())
+        self.voice.as_ref().is_some_and(|voice| voice.can_listen())
             && !self
                 .connection
                 .is_some_and(|state| state != ConnectionState::Connected)
@@ -327,19 +327,20 @@ impl<M: Messenger> Core<M> {
                 return;
             }
         };
-        let setup = self
-            .voice
-            .as_ref()
-            .and_then(|voice| Some((voice.stt.clone()?, voice.tts.clone(), voice.vad)));
-        let (Some((stt, tts, vad)), false) = (setup, dialing.cancelled || self.stopping) else {
+        let control = line.control.clone();
+        let session = if dialing.cancelled || self.stopping {
+            None
+        } else {
+            self.start_pipeline(line)
+        };
+        let Some(session) = session else {
             tracing::info!(event = "call_dial_cancelled");
             tokio::spawn(async move {
-                line.control.hangup().await;
+                control.hangup().await;
             });
             self.update_activity(false).await;
             return;
         };
-        let session = self.start_pipeline(line, stt, tts, vad);
         for event in &dialing.buffered {
             session.handle(event);
         }
@@ -445,6 +446,15 @@ impl<M: Messenger> Core<M> {
             call.withdrawn = true;
             call.session.hang_up();
         }
+    }
+
+    /// Whether a call rings, is asked about, being answered or placed, or runs: calls
+    /// advertising waits for its end (A20).
+    pub(super) fn call_in_progress(&self) -> bool {
+        self.call.is_some()
+            || self.answering.is_some()
+            || self.asking.is_some()
+            || self.dialing.is_some()
     }
 
     /// `mute`: mutes or unmutes the agent's voice in the running call (or in the call

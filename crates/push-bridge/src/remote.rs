@@ -1,5 +1,5 @@
-//! The running bridge's control channel from the command line (`pause`, `resume`): one
-//! connection, one request at a time, events ignored.
+//! The running bridge's control channel from the command line (`pause`, `resume`, the
+//! voice adapter in `status`): one connection, one request at a time, events ignored.
 
 use std::path::Path;
 use std::time::Duration;
@@ -109,13 +109,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Remote<S> {
             .map_err(|_| RemoteError::Timeout)?
     }
 
+    /// The bridge's status.
+    pub async fn status(&mut self) -> Option<Status> {
+        let status = self.call(Call::Status, QUICK).await.ok()?.ok()?;
+        serde_json::from_value::<Status>(status).ok()
+    }
+
     /// The backend's name from the bridge's status, such as "Coda".
     pub async fn backend_name(&mut self) -> Option<String> {
-        let status = self.call(Call::Status, QUICK).await.ok()?.ok()?;
-        serde_json::from_value::<Status>(status)
-            .ok()?
-            .backend
-            .map(|backend| backend.name)
+        self.status().await?.backend.map(|backend| backend.name)
     }
 }
 

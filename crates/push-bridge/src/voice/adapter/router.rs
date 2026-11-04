@@ -210,6 +210,10 @@ struct Unfinished {
 /// What the engine's handle and the router's task share.
 #[derive(Default)]
 struct State {
+    /// The router took a link or found none ([`Router::attach`], [`Router::lose`]); until
+    /// then sentences wait (the greeting comes as the call connects, before the router
+    /// had a chance to attach).
+    settled: bool,
     /// The link `call_started` went to; `None` before, and while chat-only after a loss.
     link: Option<Link>,
     capabilities: Capabilities,
@@ -226,6 +230,11 @@ struct State {
 impl State {
     fn speaks(&self) -> bool {
         self.link.is_some() && self.capabilities.tts && !self.unavailable
+    }
+
+    /// Whether sentences may be queued: speaking, or not settled yet.
+    fn may_speak(&self) -> bool {
+        !self.settled || self.speaks()
     }
 }
 
@@ -325,7 +334,7 @@ impl SpeechEngine for AdapterEngine {
     }
 
     fn speaks(&self) -> bool {
-        self.inner.state().speaks()
+        self.inner.state().may_speak()
     }
 
     fn connected(&self) {
@@ -347,6 +356,14 @@ impl SpeechEngine for AdapterEngine {
 
     async fn end(&self, reason: CallEndReason) {
         self.end_with(wire_reason(reason));
+        let task = lock(&self.task).take();
+        if let Some(task) = task {
+            let _ = task.await;
+        }
+    }
+
+    async fn shut_down(&self) {
+        self.end_with(WireEndReason::Shutdown);
         let task = lock(&self.task).take();
         if let Some(task) = task {
             let _ = task.await;
@@ -513,6 +530,7 @@ impl Router {
         );
         {
             let mut state = self.inner.state();
+            state.settled = true;
             state.link = Some(link);
             state.capabilities = capabilities;
             state.unavailable = false;
@@ -537,6 +555,7 @@ impl Router {
         self.events = None;
         {
             let mut state = self.inner.state();
+            state.settled = true;
             state.link = None;
             state.unfinished.clear();
         }

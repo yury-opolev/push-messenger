@@ -924,6 +924,48 @@ async fn call_changed_events_and_the_status_carry_the_call() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn adapter_changed_updates_the_status() {
+    let world = Shared::default();
+    let mut harness = start(&world, vec![spec("a", true)]);
+    harness.state("a", AgentState::Idle).await;
+    harness
+        .until("a's status", |views| views[0].status.is_some())
+        .await;
+    let ready = AdapterStatus {
+        state: "ready".into(),
+        name: Some("whisper".into()),
+        version: Some("1.2.3".into()),
+        capabilities: Some(vec!["stt".into()]),
+        ..AdapterStatus::default()
+    };
+    world.emit(
+        "a",
+        Event::AdapterChanged {
+            adapter: Some(ready.clone()),
+        },
+    );
+    let a = harness
+        .until("the adapter", |views| {
+            views[0]
+                .status
+                .as_ref()
+                .is_some_and(|status| status.adapter.is_some())
+        })
+        .await
+        .remove(0);
+    assert_eq!(a.status.unwrap().adapter, Some(ready));
+    world.emit("a", Event::AdapterChanged { adapter: None });
+    harness
+        .until("no adapter", |views| {
+            views[0]
+                .status
+                .as_ref()
+                .is_some_and(|status| status.adapter.is_none())
+        })
+        .await;
+}
+
+#[tokio::test(start_paused = true)]
 async fn mute_and_hangup_are_forwarded_and_no_call_is_kept() {
     let world = Shared::default();
     let mut harness = start(&world, vec![spec("a", true), spec("b", true)]);

@@ -7,15 +7,24 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::NaiveDateTime;
-use push_bridge_control::{CallDirection, CallPhase, NO_CALL};
+use push_bridge_control::{CallDirection, CallPhase, Event as ControlEvent, NO_CALL};
 use push_sdk::{ActivityState, CallEndReason, CallEvent, CallId, Event, UserId};
+use push_voice_adapter_proto::BridgeHello;
+use push_voice_adapter_testkit::{Event as AdapterEvent, Log, Script, Word, tones};
+use tokio::sync::{mpsc, watch};
 
+use super::CallFlag;
 use super::tests::{Harness, peeked, permission, settle};
+use super::voice::{ADAPTER_BACK, ADAPTER_LOST};
 use crate::backend::{Answer, BackendEvent, RequestKind, TurnSource};
 use crate::config::AnswerMode;
 use crate::control::Action;
 use crate::messenger::{param, template};
 use crate::voice::VoiceSetup;
+use crate::voice::adapter::advertise::advertise;
+use crate::voice::adapter::router::AdapterSetup;
+use crate::voice::adapter::supervisor::Supervisor;
+use crate::voice::adapter::supervisor::testing::{Plan, ScriptedStarter};
 use crate::voice::confirm::APPROVE_OR_REJECT;
 use crate::voice::fake::{FakeStt, FakeTts, Fixture, silence, tone};
 use crate::voice::phone::{FakeCall, FakePhone};
@@ -1113,4 +1122,350 @@ async fn the_tray_cancels_a_call_ringing_the_owner_and_declines_an_ask() {
     v.phone.wait_declined(1).await;
     assert_eq!(v.phone.declined(), [(call_id, false)]);
     assert_eq!(v.edits_of(card)[0].2, "📞 Declined.");
+}
+
+// ── Speech in the voice adapter (PR 2) ──────────────────────────────────────────────
+
+/// The testkit adapter's word.
+const WORD_HZ: f64 = 1000.0;
+const WORD: &str = "run the tests";
+
+fn adapter_script() -> Script {
+    Script::with_words(vec![Word::new(WORD_HZ, WORD)])
+}
+
+/// The owner says [`WORD`] (the testkit's tone).
+fn adapter_word() -> Vec<i16> {
+    let mut audio = tones::silence(5);
+    audio.extend(tones::tone(WORD_HZ, 20));
+    audio.extend(tones::silence(25));
+    audio
+}
+
+/// Adapters that start: `first`, then ones that are not found.
+fn then_not_found(first: Vec<Plan>) -> Arc<ScriptedStarter> {
+    ScriptedStarter::new(
+        first
+            .into_iter()
+            .chain((0..50).map(|_| Plan::Fail(std::io::ErrorKind::NotFound))),
+    )
+}
+
+/// A bridge whose speech runs in the voice adapter `supervisor` runs.
+struct Adapted {
+    v: Voice,
+    supervisor: Supervisor,
+    starter: Option<Arc<ScriptedStarter>>,
+    flag: CallFlag,
+}
+
+impl Adapted {
+    async fn new(starter: Arc<ScriptedStarter>) -> Self {
+        let supervisor = Supervisor::with_starter(
+            starter.clone(),
+            BridgeHello::v1(env!("CARGO_PKG_VERSION"), "en-US"),
+        );
+        Self::with(supervisor, Some(starter)).await
+    }
+
+    async fn with(supervisor: Supervisor, starter: Option<Arc<ScriptedStarter>>) -> Self {
+        let mut h = Harness::named("Coda");
+        let phone = FakePhone::new();
+        let flag: CallFlag = Arc::new(watch::channel(false).0);
+        h.voice = Some(VoiceSetup {
+            phone: phone.clone(),
+            stt: None,
+            tts: None,
+            vad: VadConfig::default(),
+            policy: CallPolicy::default(),
+            adapter: Some(AdapterSetup::new(supervisor.clone(), "en-US")),
+        });
+        h.call_flag = Some(flag.clone());
+        h.start();
+        h.backend.wait_for("start", 1).await;
+        settle().await;
+        let tts = Arc::new(FakeTts::new());
+        Self {
+            v: Voice { h, phone, tts },
+            supervisor,
+            starter,
+            flag,
+        }
+    }
+
+    async fn ready(&self) {
+        let mut current = self.supervisor.current();
+        tokio::time::timeout(Duration::from_secs(30), current.wait_for(Option::is_some))
+            .await
+            .expect("the adapter gets ready")
+            .unwrap();
+    }
+
+    /// The log of the `index`th adapter started, once it started.
+    async fn log(&self, index: usize) -> Log {
+        let starter = self.starter.as_ref().unwrap();
+        self.v
+            .until("the adapter", || starter.logs().len() > index)
+            .await;
+        starter.logs()[index].clone()
+    }
+
+    /// The owner calls; returns once the adapter took the call.
+    async fn call(&self) -> FakeCall {
+        self.v.ring(self.v.h.messenger.owner_id());
+        let call = self.v.phone.wait_answered().await;
+        let log = self.log(0).await;
+        wait_log(&log, |event| {
+            matches!(event, AdapterEvent::CallStarted { .. })
+        })
+        .await;
+        call
+    }
+}
+
+async fn wait_log(log: &Log, matches: impl Fn(&AdapterEvent) -> bool) -> AdapterEvent {
+    tokio::time::timeout(Duration::from_secs(60), log.wait_for(matches))
+        .await
+        .expect("the adapter's event")
+        .event
+}
+
+fn adapter_call_id(log: &Log) -> String {
+    log.events()
+        .into_iter()
+        .find_map(|observed| match observed.event {
+            AdapterEvent::CallStarted { call_id } => Some(call_id),
+            _ => None,
+        })
+        .expect("call_started")
+}
+
+/// `speak`s of `chars` characters, interruptible or not.
+fn speak(chars: usize, interruptible: bool) -> impl Fn(&AdapterEvent) -> bool {
+    move |event| {
+        matches!(event, AdapterEvent::Speak { chars: c, interruptible: i, .. }
+            if *c == chars && *i == interruptible)
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn with_a_ready_adapter_the_owner_s_call_is_answered_heard_and_spoken_to() {
+    let a = Adapted::new(then_not_found(vec![Plan::Adapter(adapter_script())])).await;
+    a.ready().await;
+    let call = a.call().await;
+    let log = a.log(0).await;
+    wait_log(&log, speak(GREETING.chars().count(), false)).await;
+
+    call.say_paced(&adapter_word()).await;
+    a.v.h.backend.wait_for("prompt run the tests", 1).await;
+    assert_eq!(a.v.transcripts(), [("owner".to_owned(), WORD.to_owned())]);
+
+    a.v.h.backend.turn_started(TurnSource::Prompt);
+    a.v.h.backend.text("All tests pass.\n");
+    a.v.h.backend.turn_ended(false);
+    wait_log(&log, speak("All tests pass.".chars().count(), true)).await;
+    assert!(
+        a.v.posted()
+            .iter()
+            .any(|text| text.contains("All tests pass.")),
+        "the reply is in the chat too"
+    );
+
+    let adapter = a.v.h.control_status().adapter.unwrap();
+    assert_eq!(adapter.state, "ready");
+    assert_eq!(
+        adapter.name.as_deref(),
+        Some(push_voice_adapter_testkit::script::DEFAULT_NAME)
+    );
+    assert_eq!(
+        adapter.capabilities.unwrap(),
+        ["stt", "tts", "vad", "barge_in"]
+    );
+    call.end(CallEndReason::Completed);
+    wait_log(
+        &log,
+        |event| matches!(event, AdapterEvent::CallEnded { reason, .. } if reason == "completed"),
+    )
+    .await;
+    a.v.until("the end", || a.v.call_info().is_none()).await;
+    let metrics = a.v.h.control_status().adapter.unwrap().metrics.unwrap();
+    assert_eq!(metrics.calls, 1);
+    assert!(metrics.frames_to_adapter >= 50, "{metrics:?}");
+    assert!(metrics.frames_from_adapter > 0, "{metrics:?}");
+    assert_eq!(metrics.speaks, 2);
+    assert!(metrics.final_to_speak.is_some() && metrics.speak_to_audio.is_some());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_lost_adapter_keeps_the_call_up_chat_only_until_it_is_back() {
+    let a = Adapted::new(then_not_found(vec![
+        Plan::Adapter(adapter_script()),
+        Plan::Adapter(adapter_script()),
+    ]))
+    .await;
+    a.ready().await;
+    let call = a.call().await;
+    let first = a.log(0).await;
+    a.starter.as_ref().unwrap().crash();
+    a.v.h.reply_containing(ADAPTER_LOST).await;
+    assert!(call.ended().is_none(), "the call stays up");
+
+    let second = a.log(1).await;
+    wait_log(&second, |event| {
+        matches!(event, AdapterEvent::CallStarted { .. })
+    })
+    .await;
+    assert_eq!(
+        adapter_call_id(&second),
+        adapter_call_id(&first),
+        "the same call goes on"
+    );
+    a.v.h.reply_containing(ADAPTER_BACK).await;
+    let notes = a.v.replies();
+    let lost = notes.iter().position(|note| note == ADAPTER_LOST).unwrap();
+    let back = notes.iter().position(|note| note == ADAPTER_BACK).unwrap();
+    assert!(lost < back, "{notes:?}");
+
+    call.say_paced(&adapter_word()).await;
+    a.v.h.backend.wait_for("prompt run the tests", 1).await;
+    assert!(call.ended().is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_agent_s_replies_stay_in_the_chat_while_the_adapter_is_away() {
+    let a = Adapted::new(then_not_found(vec![Plan::Adapter(adapter_script())])).await;
+    a.ready().await;
+    let call = a.call().await;
+    let log = a.log(0).await;
+    a.starter.as_ref().unwrap().crash();
+    a.v.h.reply_containing(ADAPTER_LOST).await;
+    let speaks = log.count(|event| matches!(event, AdapterEvent::Speak { .. }));
+    a.v.h.backend.turn_started(TurnSource::Prompt);
+    a.v.h.backend.text("Still working on it.\n");
+    a.v.h.backend.turn_ended(false);
+    a.v.until("the reply", || {
+        a.v.posted()
+            .iter()
+            .any(|text| text.contains("Still working on it."))
+    })
+    .await;
+    quiet().await;
+    assert_eq!(
+        log.count(|event| matches!(event, AdapterEvent::Speak { .. })),
+        speaks
+    );
+    assert!(call.ended().is_none());
+    assert!(!a.v.replies().iter().any(|note| note == ADAPTER_BACK));
+}
+
+#[tokio::test(start_paused = true)]
+async fn without_a_ready_adapter_the_owner_s_calls_are_declined() {
+    let a = Adapted::new(then_not_found(Vec::new())).await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let first = a.v.ring(a.v.h.messenger.owner_id());
+    a.v.phone.wait_declined(1).await;
+    assert_eq!(a.v.phone.declined(), [(first, false)]);
+    let adapter = a.v.h.control_status().adapter.unwrap();
+    assert_eq!(adapter.state, "backoff");
+    assert!(adapter.reason.is_some() && adapter.retry_at.is_some());
+
+    let off = Adapted::with(Supervisor::off(), None).await;
+    let second = off.v.ring(off.v.h.messenger.owner_id());
+    off.v.phone.wait_declined(1).await;
+    assert_eq!(off.v.phone.declined(), [(second, false)]);
+    assert!(off.v.phone.answered().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_adapter_s_state_changes_go_to_the_control_channel() {
+    let mut a = Adapted::new(then_not_found(vec![Plan::Adapter(adapter_script())])).await;
+    a.ready().await;
+    a.v.until("ready reported", || {
+        a.v.h
+            .control_status()
+            .adapter
+            .is_some_and(|adapter| adapter.state == "ready")
+    })
+    .await;
+    let changes: Vec<_> =
+        a.v.h
+            .control_events()
+            .into_iter()
+            .filter_map(|event| match event {
+                ControlEvent::AdapterChanged { adapter } => Some(adapter.unwrap()),
+                _ => None,
+            })
+            .collect();
+    let ready = changes.last().unwrap();
+    assert_eq!(ready.state, "ready");
+    assert!(changes.iter().all(|change| change.metrics.is_none()));
+    a.starter.as_ref().unwrap().crash();
+    a.v.until("backoff reported", || {
+        a.v.h
+            .control_status()
+            .adapter
+            .is_some_and(|adapter| adapter.state != "ready")
+    })
+    .await;
+    assert!(a.v.h.control_events().iter().any(|event| matches!(
+        event,
+        ControlEvent::AdapterChanged { adapter: Some(adapter) } if adapter.state != "ready"
+    )));
+}
+
+#[tokio::test(start_paused = true)]
+async fn calls_are_advertised_while_the_adapter_listens_and_never_withdrawn_during_a_call() {
+    let a = Adapted::new(then_not_found(vec![Plan::Adapter(adapter_script())])).await;
+    let (sender, mut changes) = mpsc::unbounded_channel();
+    tokio::spawn(advertise(
+        a.supervisor.state(),
+        a.flag.subscribe(),
+        move |on| {
+            let _ = sender.send((tokio::time::Instant::now(), on));
+        },
+    ));
+    a.ready().await;
+    let ready_at = tokio::time::Instant::now();
+    let (at, on) = changes.recv().await.unwrap();
+    assert!(on);
+    assert!(
+        at - ready_at >= Duration::from_millis(1_900),
+        "after 2 s ready"
+    );
+
+    let call = a.call().await;
+    assert!(*a.flag.borrow(), "a call is in progress");
+    a.starter.as_ref().unwrap().crash();
+    a.v.h.reply_containing(ADAPTER_LOST).await;
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    assert!(changes.try_recv().is_err(), "not withdrawn during the call");
+
+    call.end(CallEndReason::Completed);
+    let (_, on) = tokio::time::timeout(Duration::from_secs(5), changes.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!on, "withdrawn once the call ended");
+    assert!(!*a.flag.borrow());
+}
+
+#[tokio::test(start_paused = true)]
+async fn stopping_the_bridge_ends_the_adapter_s_call_as_a_shutdown() {
+    let mut a = Adapted::new(then_not_found(vec![Plan::Adapter(adapter_script())])).await;
+    a.ready().await;
+    let call = a.call().await;
+    let log = a.log(0).await;
+    a.v.h.stop().await.unwrap();
+    let ended = wait_log(&log, |event| {
+        matches!(event, AdapterEvent::CallEnded { .. })
+    })
+    .await;
+    assert_eq!(
+        ended,
+        AdapterEvent::CallEnded {
+            call_id: adapter_call_id(&log),
+            reason: "shutdown".into(),
+        }
+    );
+    call.wait_until("the hang-up", FakeCall::hung_up).await;
 }

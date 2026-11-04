@@ -21,8 +21,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use push_bridge_control::{
-    BridgeState, Call, CallInfo, ErrorBody, Event, EventLine, MuteParams, PauseParams, PeekEntry,
-    Status, instance_id, now_ms,
+    AdapterStatus, BridgeState, Call, CallInfo, ErrorBody, Event, EventLine, MuteParams,
+    PauseParams, PeekEntry, Status, instance_id, now_ms,
 };
 use serde_json::Value;
 use tokio::sync::{mpsc, watch};
@@ -1085,6 +1085,16 @@ impl Supervisor {
                     status.call = call.clone();
                 }
                 instance.call = call;
+            }
+            Event::AdapterChanged { adapter } => {
+                if let Some(status) = instance.status.as_mut() {
+                    // The event has no counters: keep the last status's.
+                    let metrics = status
+                        .adapter
+                        .as_mut()
+                        .and_then(|adapter| adapter.metrics.take());
+                    status.adapter = adapter.map(|adapter| AdapterStatus { metrics, ..adapter });
+                }
             }
             _ => {}
         }

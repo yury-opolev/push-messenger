@@ -320,6 +320,9 @@ function renderAgent(agent) {
     control.wrapper.hidden = index >= callActions.length;
   });
   $("ovCall").textContent = agent.call ? agent.call : "no call";
+  $("ovVoiceAdapterLabel").hidden = !agent.voiceAdapter;
+  $("ovVoiceAdapter").hidden = !agent.voiceAdapter;
+  $("ovVoiceAdapter").textContent = text(agent.voiceAdapter);
   $("ovFolder").textContent = text(agent.folder);
   $("ovSession").textContent = text(agent.session);
   $("ovCodaVersion").textContent = text(agent.codaVersion);

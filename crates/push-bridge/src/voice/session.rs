@@ -231,6 +231,14 @@ impl Session {
     pub fn speaking(&self) -> bool {
         self.ctx.speaking()
     }
+
+    /// The bridge stops: the engine ends the call as a shutdown (the voice adapter hears
+    /// `call_ended {reason: shutdown}`; at most 2 s), then the session is dropped, which
+    /// hangs up.
+    pub async fn shut_down(self) {
+        let wait = std::time::Duration::from_secs(2);
+        let _ = tokio::time::timeout(wait, self.engine.shut_down()).await;
+    }
 }
 
 impl Drop for Session {

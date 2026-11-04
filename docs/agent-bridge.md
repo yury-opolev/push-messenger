@@ -784,7 +784,9 @@ its folder; below them "Add agent folder…".
 **Right:** the selected agent, in four tabs.
 
 - **Overview:** the state with its badge and label; the actions; the call's buttons; the
-  voice call, the folder, session, Coda's version, uptime, running tasks, last error (the
+  voice call, the voice adapter (with `calls.adapter`: "<name> <version> (ready)",
+  "starting" or "backing off (<reason>)"), the folder, session, Coda's version, uptime,
+  running tasks, last error (the
   tray's own, else the bridge's error code) and last exit code; "Open folder"; the last 50
   states with their times, newest first. A refused action says so next to its button, not
   in a dialog.
@@ -1146,6 +1148,7 @@ a pause normally answers within that limit.
 | `error` | `code` (Coda's JSON-RPC code or the bridge's, such as `-32603`, `exited`, `spawn`, `timeout`), `method` (such as `session/prompt`, `initialize`) | a Coda call failed |
 | `peek_changed` | none | the [chat peek](#chat-peek) changed (only with `"peek": true`); ask `peek` for the entries |
 | `call_changed` | `call` (as in the status object; absent when the call ended) | a voice call started, changed its phase or flags, or ended; the status already shows it |
+| `adapter_changed` | `adapter` (as in the status object, without `metrics`) | the voice adapter's state changed (starting, ready, backing off); only with `calls.adapter` |
 
 States, from the most important: `stopping`; `paused` (detail "upgrading Coda", or
 "waiting for Coda's program"); `reconnecting` (the messenger connection is down, or the
@@ -1177,6 +1180,7 @@ Field names are camelCase; absent values are `null`.
 | `lastError` | `{code, at}` of the last failed Coda call |
 | `startedAt` | when the bridge started, Unix ms |
 | `call` | the [voice call](#18-voice-calls) while one runs or rings, else `null` (absent from older bridges): `{phase, direction, speaking, listening, muted, since}`. `phase` is `ringing` (the owner's call waits for the owner's confirmation, or the bridge's call rings the owner), `connecting` or `in_call`; `direction` is `incoming` (the owner called the agent) or `outgoing` (the agent calls the owner, `notify_by_call`); `speaking`: the agent's voice plays; `listening`: the owner speaks; `muted`: the agent's voice is muted (`mute`); `since`: when the call entered its phase, Unix ms |
+| `adapter` | the voice adapter, only with `calls.adapter` (absent otherwise): `{state, name, version, capabilities, reason, retryAt, metrics}`. `state` is `off`, `starting`, `handshaking`, `ready` or `backoff`; while ready, `name`, `version` and `capabilities` (`stt`, `tts`, `vad`, `barge_in`, `partials`) from its hello; while backing off, `reason` (content-free) and `retryAt` (Unix ms); `metrics`: `{calls, framesToAdapter, framesFromAdapter, droppedToAdapter, droppedFromAdapter, restarts, speaks, finalToSpeak, speakToAudio}`, the latencies as `{lastMs, avgMs, maxMs}` (final transcript → `speak`, `speak` → its first audio) |
 
 ### Limits
 
@@ -1562,6 +1566,20 @@ without the feature.
 | `off (calls.stt is none)` | nobody listens: calls are not advertised |
 | `configured, but this build has no voice (build with --features voice)` | rebuild with the feature |
 | `on: stt <provider>, tts <provider>` | calls are answered; at start the log says `voice_enabled` with the two names |
+| `adapter ready (<name> <version>; stt, tts, vad, barge-in)` | `calls.adapter`: the running bridge's adapter is ready; calls are advertised (after 2 s ready, never during a call) |
+| `adapter ready (…), but calls are not advertised: the adapter cannot listen (no stt)` | the adapter has no `stt` |
+| `adapter starting` | the bridge is starting or connecting to the adapter |
+| `adapter backing off <n> s (<reason>)` | the adapter ended or could not be started or reached; the bridge tries again in `n` seconds |
+| `adapter configured (the bridge is not running)` | `status` asks the running bridge; none runs |
+
+With a running adapter a `Voice adapter:` line follows with its counters (calls, frames to
+and from the adapter, dropped frames each way, restarts, speak latency and audio latency
+as last/avg/max). When the adapter goes away during a call the call stays up: the chat
+says "Voice adapter stopped; reconnecting…", the agent's replies stay in the chat, and
+"Voice adapter is back." once a restarted adapter took the call again; an adapter that
+answers `engine_unavailable` leaves the call chat-only ("Voice adapter cannot listen right
+now."). The log has `adapter_metrics` at each call's end and `adapter_metrics_total` when
+the bridge stops.
 
 ### The calls section
 

@@ -2,13 +2,14 @@
 //! and into the status snapshot) and content-free events. Never message text: only
 //! states, counts, names and error codes.
 
-use push_bridge_control::{BackendInfo, BridgeState, Event, LastError};
+use push_bridge_control::{AdapterStatus, BackendInfo, BridgeState, Event, LastError};
 use push_sdk::ConnectionState;
 
 use super::Core;
 use crate::backend::{BackendError, TurnSource};
 use crate::cards::CardKind;
 use crate::messenger::Messenger;
+use crate::voice::adapter::report::report as adapter_report;
 
 /// A request's kind on the wire.
 fn kind_name(kind: &CardKind) -> &'static str {
@@ -94,6 +95,8 @@ impl<M: Messenger> Core<M> {
             0
         };
         let (call, call_changed) = self.report_call();
+        let adapter = self.report_adapter();
+        let adapter_changed = self.adapter_changed(adapter.as_ref());
         self.control.update_and_emit(
             |status| {
                 status.state = Some(state);
@@ -108,12 +111,43 @@ impl<M: Messenger> Core<M> {
                 status.held_texts = held_texts;
                 status.pause = pause;
                 status.call = call.clone();
+                status.adapter = adapter;
             },
             changed,
         );
         if call_changed {
             self.control.emit(Event::CallChanged { call });
         }
+        if let Some(adapter) = adapter_changed {
+            self.control.emit(Event::AdapterChanged { adapter });
+        }
+        let in_progress = self.call_in_progress();
+        if let Some(flag) = &self.call_flag {
+            flag.send_if_modified(|flag| std::mem::replace(flag, in_progress) != in_progress);
+        }
+    }
+
+    /// The voice adapter with its counters, when `calls.adapter` is set.
+    fn report_adapter(&self) -> Option<AdapterStatus> {
+        let setup = self.voice.as_ref()?.adapter.as_ref()?;
+        Some(adapter_report(setup, self.clock.now_ms()))
+    }
+
+    /// `Some` (the `adapter_changed` event's value, without counters) when the adapter's
+    /// state, hello or backoff changed since the last report.
+    fn adapter_changed(
+        &mut self,
+        adapter: Option<&AdapterStatus>,
+    ) -> Option<Option<AdapterStatus>> {
+        let bare = adapter.map(|adapter| AdapterStatus {
+            metrics: None,
+            ..adapter.clone()
+        });
+        if bare == self.adapter_reported {
+            return None;
+        }
+        self.adapter_reported = bare.clone();
+        Some(bare)
     }
 
     pub(super) fn report_turn_started(&self, source: TurnSource) {
