@@ -177,10 +177,11 @@ jobs:
   # The agent bridge answers its owner's call end to end (docs/agent-bridge.md, "Voice
   # calls"): the whole stack in process with calls and agent-key sign-in, the owner on a
   # push-sdk client with MediaCall, the agent enrolled with a software key running the
-  # bridge (feature voice) with a scripted backend and tone-based speech fakes: greeting,
-  # prompt, spoken reply, barge-in, a voice approval, a stranger refused, the hang-up.
-  # bridge_voice_adapter runs speech in a voice adapter (push-voice-adapter-testkit,
-  # built first: the test runs its binary from the target directory): spawned and
+  # bridge (feature voice) with a scripted backend, its speech in the scripted voice
+  # adapter (push-voice-adapter-testkit, built first: the tests run its binary from the
+  # target directory): greeting, prompt, spoken reply, barge-in, a voice approval, a
+  # stranger refused, the hang-up, ask mode and the agent calling its owner.
+  # bridge_voice_adapter covers the adapter's lifecycle: spawned and
   # connected, a crash mid-call and the restart, no adapter and a refused format (calls
   # not advertised), the final-transcript-to-speak latency and the playback's gaps.
   bridge-voice:
@@ -194,10 +195,10 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: docker pull postgres:17-alpine
       - run: docker pull redis:7-alpine
+      - run: cargo build -p push-voice-adapter-testkit --locked
       - run: cargo test -p push-smoke --test bridge_voice --locked -- --nocapture --test-threads 1
         env:
           PUSH_BRIDGE_VOICE: "1"
-      - run: cargo build -p push-voice-adapter-testkit --locked
       - run: cargo test -p push-smoke --test bridge_voice_adapter --locked -- --nocapture --test-threads 1
         env:
           PUSH_BRIDGE_VOICE: "1"

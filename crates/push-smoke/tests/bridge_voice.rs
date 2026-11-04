@@ -3,10 +3,10 @@
 //! an SDK client placing the call with push-sdk's media helper, and the agent enrolled with
 //! a software key running the bridge as `push-agent-bridge run` does (an `SdkMessenger`,
 //! `MediaPhone`), with a scripted backend and its speech in the testkit's scripted voice
-//! adapter (spawned; `Agent::start`). Over real Opus
-//! media the owner hears the greeting and the spoken replies, its recorded fixtures become
-//! a prompt, a steer that cuts the reply short (barge-in) and a voice approval; a stranger's
-//! call never reaches the bridge, and the owner hangs up. A second test runs the answering
+//! adapter (spawned; `Agent::start`). Over real Opus media the owner hears the greeting
+//! and the spoken replies, its recorded fixtures become a prompt, a steer that cuts the
+//! reply short (barge-in) and a voice approval; a stranger's call never reaches the
+//! bridge, and the owner hangs up. A second test runs the answering
 //! and calling policies: with `calls.answer` `ask` the owner's call waits for the card's
 //! "Answer"; a card left unanswered makes the bridge call the owner, who hears the summary
 //! and approves by voice; a call the owner lets ring out leaves the card open.
