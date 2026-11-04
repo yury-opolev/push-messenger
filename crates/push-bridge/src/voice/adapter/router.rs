@@ -24,7 +24,8 @@
 //!   chat, as the built-in speech without TTS).
 //! - Stream-1 audio belongs to the oldest unfinished speak (A9): it plays on the line's
 //!   speaker in real time, at most [`TO_CALLER_BUFFER_FRAMES`] (2 s) ahead (beyond:
-//!   dropped and counted). `Speaking(true)` at the first frame; `Speaking(false)` once
+//!   dropped and counted), after a [`PREROLL`] (60 ms jitter buffer) whenever the speaker
+//!   had nothing queued. `Speaking(true)` at the first frame; `Speaking(false)` once
 //!   nothing is unfinished or queued and the audio played. Audio of a speak that was
 //!   stopped is dropped until its `speak_done`.
 //! - `error`: `recognition_failed` → `SpeechFailed("recognition_failed")`;
@@ -70,6 +71,14 @@ pub const CLAIM_WAIT: Duration = Duration::from_secs(2);
 /// How far ahead stream-1 audio is queued on the line's speaker (A12).
 const TO_CALLER_BUFFER: Duration =
     Duration::from_millis(FRAME_TIME.as_millis() as u64 * TO_CALLER_BUFFER_FRAMES as u64);
+/// The playback jitter buffer: when the line's speaker has nothing queued (a speak's audio
+/// starts after silence, or the adapter's audio fell behind), stream-1 frames are held
+/// until [`PREROLL_FRAMES`] are there or the first waited this long, whichever comes
+/// first, so an adapter's timer jitter does not become gaps the owner hears. While the
+/// speaker has audio queued (a speak following another), frames go on at once.
+pub const PREROLL: Duration = Duration::from_millis(60);
+/// Frames held before playback starts (see [`PREROLL`]): 60 ms.
+const PREROLL_FRAMES: usize = 3;
 /// Utterances remembered (their `speech_started`, their final).
 const REMEMBERED_UTTERANCES: usize = 64;
 
@@ -493,6 +502,9 @@ async fn route(
         listening_until: None,
         started: HashMap::new(),
         finals: VecDeque::new(),
+        held: Vec::new(),
+        held_generation: 0,
+        held_since: None,
     };
     loop {
         let now = *phase.borrow_and_update();
@@ -533,10 +545,11 @@ async fn route(
     let mut supervised = true;
     let reason = loop {
         let playing = router.pump();
-        let deadline = match (playing, router.listening_until) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        };
+        let held = router.held_since.map(|since| since + PREROLL);
+        let deadline = [playing, router.listening_until, held]
+            .into_iter()
+            .flatten()
+            .min();
         tokio::select! {
             changed = phase.changed() => {
                 let now = *phase.borrow();
@@ -557,6 +570,9 @@ async fn route(
             () = router.inner.ctx.wake.notified() => {}
             () = sleep_until(deadline.unwrap_or_else(Instant::now)), if deadline.is_some() => {
                 router.on_timer();
+                if held.is_some_and(|due| due <= Instant::now()) {
+                    router.flush().await;
+                }
             }
         }
     };
@@ -599,6 +615,11 @@ struct Router {
     started: HashMap<String, Instant>,
     /// Utterances whose final arrived, oldest first.
     finals: VecDeque<String>,
+    /// Stream-1 frames held back for the [`PREROLL`], of `held_generation`.
+    held: Vec<[i16; FRAME]>,
+    held_generation: u64,
+    /// When the first held frame arrived.
+    held_since: Option<Instant>,
 }
 
 impl Router {
@@ -643,6 +664,7 @@ impl Router {
     fn lose(&mut self) {
         self.ready = None;
         self.events = None;
+        self.drop_held();
         {
             let mut state = self.inner.state();
             state.settled = true;
@@ -829,7 +851,8 @@ impl Router {
 
     /// A stream-1 frame: the oldest unfinished speak's (A9).
     async fn on_audio(&mut self, frame: AudioFrame) {
-        let ctx = &self.inner.ctx;
+        let inner = Arc::clone(&self.inner);
+        let ctx = &inner.ctx;
         let generation = {
             let mut state = self.inner.state();
             let generation = ctx.generation();
@@ -857,11 +880,15 @@ impl Router {
             self.inner.state().call.frames_dropped += 1;
             return;
         };
-        {
+        if self.held_since.is_some() && self.held_generation != generation {
+            self.drop_held();
+        }
+        let idle = {
             let mut speech = ctx.speech();
-            let full = speech
-                .playing_until
-                .is_some_and(|until| until >= Instant::now() + TO_CALLER_BUFFER);
+            let now = Instant::now();
+            let held = FRAME_TIME * u32::try_from(self.held.len()).unwrap_or(u32::MAX);
+            let queued_until = speech.playing_until.map_or(now, |until| until.max(now)) + held;
+            let full = queued_until >= now + TO_CALLER_BUFFER;
             if ctx.ended() || generation != ctx.generation() || full {
                 drop(speech);
                 self.inner.state().call.frames_dropped += 1;
@@ -870,9 +897,55 @@ impl Router {
             if !std::mem::replace(&mut speech.speaking, true) {
                 ctx.emit(SessionEvent::Speaking(true));
             }
-        }
-        if !ctx.speaker.send(samples).await {
+            speech.playing_until.is_none_or(|until| until <= now)
+        };
+        if self.held_since.is_some() || idle {
+            self.held.push(samples);
+            self.held_generation = generation;
+            self.held_since.get_or_insert_with(Instant::now);
+            if self.held.len() >= PREROLL_FRAMES {
+                self.flush().await;
+            }
             return;
+        }
+        self.play(samples, generation).await;
+    }
+
+    /// Plays the held frames (see [`PREROLL`]); those of an earlier generation are dropped.
+    async fn flush(&mut self) {
+        self.held_since = None;
+        let generation = self.held_generation;
+        let held = std::mem::take(&mut self.held);
+        let mut frames = held.into_iter();
+        for samples in frames.by_ref() {
+            let ctx = &self.inner.ctx;
+            if ctx.ended() || generation != ctx.generation() {
+                self.inner.state().call.frames_dropped += 1;
+                continue;
+            }
+            if !self.play(samples, generation).await {
+                break;
+            }
+        }
+        let rest = frames.count() as u64;
+        self.inner.state().call.frames_dropped += rest;
+    }
+
+    /// Drops the held frames (counted).
+    fn drop_held(&mut self) {
+        self.held_since = None;
+        let dropped = std::mem::take(&mut self.held).len() as u64;
+        if dropped > 0 {
+            self.inner.state().call.frames_dropped += dropped;
+        }
+    }
+
+    /// Queues `samples` of `generation` on the line's speaker; `false` once the line is
+    /// closed.
+    async fn play(&mut self, samples: [i16; FRAME], generation: u64) -> bool {
+        let ctx = &self.inner.ctx;
+        if !ctx.speaker.send(samples).await {
+            return false;
         }
         {
             let mut speech = ctx.speech();
@@ -882,13 +955,14 @@ impl Router {
                 // the built-in engine): clear again.
                 ctx.speaker.clear();
                 self.inner.state().call.frames_dropped += 1;
-                return;
+                return true;
             }
             let now = Instant::now();
             let from = speech.playing_until.map_or(now, |until| until.max(now));
             speech.playing_until = Some(from + FRAME_TIME);
         }
         self.inner.state().call.frames_from_adapter += 1;
+        true
     }
 
     fn on_timer(&mut self) {
@@ -970,7 +1044,8 @@ impl Router {
             .iter()
             .any(|speak| !speak.stopped && speak.generation == generation);
         speech.busy = busy.then_some(generation);
-        if !speech.speaking || busy || !speech.queue.is_empty() || ctx.ended() {
+        let holding = self.held_since.is_some() && self.held_generation == generation;
+        if !speech.speaking || busy || holding || !speech.queue.is_empty() || ctx.ended() {
             return None;
         }
         match speech.playing_until {
@@ -1408,6 +1483,8 @@ mod tests {
         let (mut call, _starter, log) = scripted_call(vec![script()]).await;
         call.session.say_reply("a".repeat(100));
         call.until(&SessionEvent::Speaking(true)).await;
+        // Past the preroll: some audio played.
+        sleep(PREROLL).await;
         call.owner.end(CallEndReason::Completed);
         let seen = call
             .until(&SessionEvent::Ended(LineEnded {
@@ -1931,6 +2008,41 @@ mod tests {
             Metrics::default(),
             "until the end"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn jittery_audio_plays_without_gaps_after_a_short_preroll() {
+        const JITTER_MS: [u64; 10] = [0, 25, 10, 0, 25, 25, 5, 0, 15, 25];
+        let (mut call, mut adapter, id) = manual_call(capabilities()).await;
+        call.session.say_reply("one");
+        assert!(matches!(adapter.next().await, BridgeMessage::Speak(_)));
+        let start = Instant::now();
+        for seq in 0..50u32 {
+            let at = u64::from(seq) * 20 + JITTER_MS[seq as usize % JITTER_MS.len()];
+            sleep_until(start + Duration::from_millis(at)).await;
+            adapter.sound(seq);
+        }
+        adapter.speak_done(&id, "s1", false);
+        call.until(&SessionEvent::Speaking(false)).await;
+        let sent = lock(&call.recorder.sent).clone();
+        assert_eq!(sent.len(), 50);
+        let first = sent[0] - start;
+        assert!(first <= PREROLL, "the first frame waited {first:?}");
+        let played = call.owner.played_at();
+        assert_eq!(played.len(), 50);
+        let gap = played.windows(2).map(|w| w[1] - w[0]).max().unwrap();
+        assert!(gap <= Duration::from_millis(40), "a gap of {gap:?}");
+
+        // A lone frame plays once it waited the preroll.
+        call.session.say_reply("two");
+        assert!(matches!(adapter.next().await, BridgeMessage::Speak(_)));
+        let alone = Instant::now();
+        adapter.sound(50);
+        adapter.speak_done(&id, "s2", false);
+        call.until(&SessionEvent::Speaking(false)).await;
+        let sent = lock(&call.recorder.sent).clone();
+        assert_eq!(sent.len(), 51);
+        assert_eq!(sent[50] - alone, PREROLL);
     }
 
     #[test]

@@ -1469,3 +1469,88 @@ async fn stopping_the_bridge_ends_the_adapter_s_call_as_a_shutdown() {
     );
     call.wait_until("the hang-up", FakeCall::hung_up).await;
 }
+
+/// A core that does not run, taking calls on a [`FakePhone`] and keeping `flag`.
+struct IdleCore {
+    core: super::Core<crate::messenger::TestMessenger>,
+    _events: mpsc::Receiver<Event>,
+    _dir: crate::test_dir::TestDir,
+}
+
+impl IdleCore {
+    fn new(flag: &CallFlag) -> Self {
+        let dir = crate::test_dir::TestDir::new();
+        let (messenger, events) = crate::messenger::TestMessenger::new();
+        let (sender, _) = mpsc::unbounded_channel();
+        let backend = Arc::new(crate::test_backend::TestBackend::new("Coda", sender));
+        let state =
+            Arc::new(crate::state::StateFile::load(&dir.path().join("state.json")).unwrap());
+        let (internal, _) = mpsc::unbounded_channel();
+        let owner = messenger.owner_id();
+        let conversation = messenger.conversation();
+        let mut core = super::Core::new(
+            messenger,
+            backend,
+            state,
+            super::BridgeOptions {
+                roots: vec![dir.path().to_path_buf()],
+                default_folder: dir.path().to_path_buf(),
+                default_mode: crate::backend::PermissionMode::Default,
+            },
+            internal,
+            owner,
+            conversation,
+        );
+        core.voice = Some(VoiceSetup {
+            phone: FakePhone::new(),
+            stt: Some(Arc::new(stt())),
+            tts: Some(Arc::new(FakeTts::new())),
+            vad: VadConfig::default(),
+            policy: CallPolicy::default(),
+            adapter: None,
+        });
+        core.call_flag = Some(flag.clone());
+        Self {
+            core,
+            _events: events,
+            _dir: dir,
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_call_flag_is_up_before_the_phone_answers_asks_or_dials() {
+    let flag: CallFlag = Arc::new(watch::channel(false).0);
+    let mut idle = IdleCore::new(&flag);
+    let core = &mut idle.core;
+    core.answer_call(CallId::new(), "offer", Vec::new());
+    assert!(*flag.borrow(), "answering");
+
+    core.answering = None;
+    core.sync_call_flag();
+    assert!(!*flag.borrow());
+    core.ask(CallId::new(), "offer".into(), i64::MAX);
+    assert!(*flag.borrow(), "asking");
+
+    core.asking = None;
+    core.sync_call_flag();
+    assert!(!*flag.borrow());
+    core.dial(super::calling::Purpose::Request).await;
+    assert!(*flag.borrow(), "dialing");
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_call_flag_holds_through_the_shutdown() {
+    let mut a = Adapted::new(then_not_found(vec![Plan::Adapter(adapter_script())])).await;
+    a.ready().await;
+    let _call = a.call().await;
+    assert!(*a.flag.borrow());
+    let mut flag = a.flag.subscribe();
+    flag.mark_unchanged();
+    a.v.h.stop().await.unwrap();
+    assert!(*a.flag.borrow(), "still up once the bridge stopped");
+    assert!(
+        !flag.has_changed().unwrap(),
+        "never lowered during the shutdown"
+    );
+}

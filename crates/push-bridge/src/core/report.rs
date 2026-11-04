@@ -9,7 +9,6 @@ use super::Core;
 use crate::backend::{BackendError, TurnSource};
 use crate::cards::CardKind;
 use crate::messenger::Messenger;
-use crate::voice::adapter::report::report as adapter_report;
 
 /// A request's kind on the wire.
 fn kind_name(kind: &CardKind) -> &'static str {
@@ -96,7 +95,7 @@ impl<M: Messenger> Core<M> {
         };
         let (call, call_changed) = self.report_call();
         let adapter = self.report_adapter();
-        let adapter_changed = self.adapter_changed(adapter.as_ref());
+        let adapter_changed = self.adapter_reports.changed(adapter.as_ref());
         self.control.update_and_emit(
             |status| {
                 status.state = Some(state);
@@ -121,6 +120,11 @@ impl<M: Messenger> Core<M> {
         if let Some(adapter) = adapter_changed {
             self.control.emit(Event::AdapterChanged { adapter });
         }
+        self.sync_call_flag();
+    }
+
+    /// Sets the call flag (if any) to [`Self::call_in_progress`].
+    pub(super) fn sync_call_flag(&self) {
         let in_progress = self.call_in_progress();
         if let Some(flag) = &self.call_flag {
             flag.send_if_modified(|flag| std::mem::replace(flag, in_progress) != in_progress);
@@ -128,26 +132,10 @@ impl<M: Messenger> Core<M> {
     }
 
     /// The voice adapter with its counters, when `calls.adapter` is set.
-    fn report_adapter(&self) -> Option<AdapterStatus> {
+    fn report_adapter(&mut self) -> Option<AdapterStatus> {
+        let now_ms = self.clock.now_ms();
         let setup = self.voice.as_ref()?.adapter.as_ref()?;
-        Some(adapter_report(setup, self.clock.now_ms()))
-    }
-
-    /// `Some` (the `adapter_changed` event's value, without counters) when the adapter's
-    /// state, hello or backoff changed since the last report.
-    fn adapter_changed(
-        &mut self,
-        adapter: Option<&AdapterStatus>,
-    ) -> Option<Option<AdapterStatus>> {
-        let bare = adapter.map(|adapter| AdapterStatus {
-            metrics: None,
-            ..adapter.clone()
-        });
-        if bare == self.adapter_reported {
-            return None;
-        }
-        self.adapter_reported = bare.clone();
-        Some(bare)
+        Some(self.adapter_reports.report(setup, now_ms))
     }
 
     pub(super) fn report_turn_started(&self, source: TurnSource) {

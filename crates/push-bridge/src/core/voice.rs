@@ -203,6 +203,7 @@ impl<M: Messenger> Core<M> {
         tracing::info!(event = "call_answering");
         self.answering = Some((call_id, buffered));
         self.mute_next = false;
+        self.sync_call_flag();
         let phone = voice.phone.clone();
         let internal = self.internal.clone();
         let offer_sdp = offer_sdp.to_owned();

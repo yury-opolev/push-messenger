@@ -62,11 +62,56 @@ fn status(state: &str) -> AdapterStatus {
     }
 }
 
-/// The adapter of `setup` with its counters: the router's over every call, the
-/// supervisor's restarts, and the current connection's drops.
-pub fn report(setup: &AdapterSetup, now_ms: i64) -> AdapterStatus {
-    let state = setup.supervisor.state().borrow().clone();
-    let mut status = adapter_status(&state, now_ms);
+/// What the control channel was last told about the adapter: `adapter_changed` fires
+/// only when the state, hello or backoff really changed.
+#[derive(Debug, Default)]
+pub struct AdapterReports {
+    /// The last reported status, without counters.
+    last: Option<AdapterStatus>,
+    /// The backoff's end and its `retry_at`, computed once per backoff: computing it
+    /// again from two clocks jitters by a millisecond.
+    retry: Option<(Instant, i64)>,
+}
+
+impl AdapterReports {
+    /// `state` on the control channel (see [`adapter_status`]), with the `retry_at` of
+    /// a backoff fixed from its first report.
+    pub fn status(&mut self, state: &AdapterState, now_ms: i64) -> AdapterStatus {
+        let mut status = adapter_status(state, now_ms);
+        if let AdapterState::Backoff { until, .. } = state {
+            match self.retry {
+                Some((known, retry_at)) if known == *until => status.retry_at = Some(retry_at),
+                _ => self.retry = status.retry_at.map(|retry_at| (*until, retry_at)),
+            }
+        }
+        status
+    }
+
+    /// The adapter of `setup` with its counters: the router's over every call, the
+    /// supervisor's restarts, and the current connection's drops.
+    pub fn report(&mut self, setup: &AdapterSetup, now_ms: i64) -> AdapterStatus {
+        let state = setup.supervisor.state().borrow().clone();
+        let status = self.status(&state, now_ms);
+        with_metrics(setup, status)
+    }
+
+    /// `Some` (the `adapter_changed` event's value, without counters) when the adapter's
+    /// state, hello or backoff changed since the last report.
+    pub fn changed(&mut self, adapter: Option<&AdapterStatus>) -> Option<Option<AdapterStatus>> {
+        let bare = adapter.map(|adapter| AdapterStatus {
+            metrics: None,
+            ..adapter.clone()
+        });
+        if bare == self.last {
+            return None;
+        }
+        self.last = bare.clone();
+        Some(bare)
+    }
+}
+
+/// `status` with the counters of `setup`.
+fn with_metrics(setup: &AdapterSetup, mut status: AdapterStatus) -> AdapterStatus {
     let calls = setup.metrics.snapshot();
     let link = setup
         .supervisor
@@ -167,5 +212,32 @@ mod tests {
         assert_eq!(backoff.state, "backoff");
         assert_eq!(backoff.retry_at, Some(5_000));
         assert_eq!(backoff.reason.unwrap().len(), REASON);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn one_backoff_is_one_change_though_the_clocks_jitter() {
+        let mut reports = AdapterReports::default();
+        let backoff = AdapterState::Backoff {
+            until: Instant::now() + Duration::from_micros(4_000_500),
+            reason: "exited".into(),
+        };
+        let first = reports.status(&backoff, 1_000);
+        assert!(reports.changed(Some(&first)).is_some());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        // The wall clock has not ticked yet: computed afresh, retry_at would be 4_999.
+        let second = reports.status(&backoff, 1_000);
+        assert_eq!(second.retry_at, Some(5_000));
+        assert!(
+            reports.changed(Some(&second)).is_none(),
+            "exactly one event"
+        );
+
+        let next = AdapterState::Backoff {
+            until: Instant::now() + Duration::from_millis(8_000),
+            reason: "exited".into(),
+        };
+        let third = reports.status(&next, 1_001);
+        assert_eq!(third.retry_at, Some(9_001));
+        assert!(reports.changed(Some(&third)).is_some(), "a new backoff");
     }
 }

@@ -11,8 +11,6 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use push_bridge::coda::CodaBackend;
-#[cfg(feature = "voice")]
-use push_bridge::config::TtsConfig;
 use push_bridge::config::{self, CallsConfig, Config, SttConfig};
 use push_bridge::control::{Action, Calls, ControlCall, ControlHandle, ControlHub, error};
 use push_bridge::core::{Bridge, BridgeError, BridgeOptions, CallFlag};
@@ -357,21 +355,6 @@ fn adapter_metrics(metrics: &AdapterMetrics) -> String {
     )
 }
 
-/// The variables the config names as secret sources (Azure `key_env`), kept from a
-/// spawned voice adapter.
-#[cfg(feature = "voice")]
-fn secret_names(calls: &CallsConfig) -> Vec<String> {
-    let stt = match &calls.stt {
-        SttConfig::AzureSpeech(azure) => azure.key_env.clone(),
-        _ => None,
-    };
-    let tts = match &calls.tts {
-        TtsConfig::AzureSpeech(azure) => azure.key_env.clone(),
-        _ => None,
-    };
-    stt.into_iter().chain(tts).collect()
-}
-
 /// The owner's calls are answered with push-sdk's media helper, and speech runs in the
 /// voice adapter (`calls.adapter`, supervised from here on) or the configured built-in
 /// providers; `None` when the config has nobody to listen.
@@ -390,8 +373,10 @@ fn voice_setup(config: &Config, client: &Client, dir: &Path) -> Option<VoiceSetu
             let log_dir = logging::path(dir)
                 .parent()
                 .map_or_else(|| dir.join("logs"), Path::to_path_buf);
-            let supervisor =
-                supervisor::start(adapter.clone(), hello, log_dir, secret_names(calls));
+            // No extra secret names: with an adapter, calls.stt and calls.tts are none, so
+            // the config names no key variables; the fixed deny-list and the
+            // KEY/TOKEN/SECRET/PASS/... name check still keep secrets from the adapter.
+            let supervisor = supervisor::start(adapter.clone(), hello, log_dir, Vec::new());
             tracing::info!(
                 event = "voice_enabled",
                 adapter = match adapter {

@@ -117,6 +117,7 @@ impl<M: Messenger> Core<M> {
             buffered: Vec::new(),
             deadline: Instant::now() + ring + ASK_GRACE,
         });
+        self.sync_call_flag();
         if card.is_none() {
             self.decline_asking("📞 Declined: the card could not be shown.");
         }
@@ -288,7 +289,7 @@ impl<M: Messenger> Core<M> {
     }
 
     /// Places a call to the owner; the phone's answer comes as [`Internal::Dialed`].
-    async fn dial(&mut self, purpose: Purpose) {
+    pub(super) async fn dial(&mut self, purpose: Purpose) {
         let Some(voice) = &self.voice else {
             return;
         };
@@ -302,6 +303,7 @@ impl<M: Messenger> Core<M> {
             cancelled: false,
             buffered: Vec::new(),
         });
+        self.sync_call_flag();
         tokio::spawn(async move {
             let result = phone.call(owner).await;
             let _ = internal.send(Internal::Dialed { result });
@@ -448,13 +450,15 @@ impl<M: Messenger> Core<M> {
         }
     }
 
-    /// Whether a call rings, is asked about, being answered or placed, or runs: calls
-    /// advertising waits for its end (A20).
+    /// Whether a call rings, is asked about, being answered or placed, or runs, or the
+    /// bridge is stopping: calls advertising waits for its end (A20) and holds still
+    /// through the shutdown.
     pub(super) fn call_in_progress(&self) -> bool {
         self.call.is_some()
             || self.answering.is_some()
             || self.asking.is_some()
             || self.dialing.is_some()
+            || self.stopping
     }
 
     /// `mute`: mutes or unmutes the agent's voice in the running call (or in the call

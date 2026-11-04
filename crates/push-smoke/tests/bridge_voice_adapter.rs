@@ -208,21 +208,16 @@ fn testkit() -> PathBuf {
         .clone()
 }
 
-/// The default script hearing every fixture's words. It sends its voice 100 ms ahead of
-/// real time, as the protocol allows ("at most about 1 s ahead") and a synthesizing
-/// adapter is: the gaps the owner hears are then the bridge's playback and the media
-/// path's, not the testkit's own pacing (strictly real time, its timer's jitter passes
-/// through the bridge, which plays what arrives: design §5, "gaps are the adapter's").
+/// The default script hearing every fixture's words. It sends its voice strictly in real
+/// time (no lead), its timer's jitter included: the bridge's playback pre-roll
+/// (`router::PREROLL`) absorbs it, so the gaps the owner hears stay within [`MAX_GAP`].
 fn hearing() -> Script {
-    Script {
-        speak_lead_ms: 100,
-        ..Script::with_words(
-            all_words()
-                .into_iter()
-                .map(|(hz, text)| Word::new(hz, text))
-                .collect(),
-        )
-    }
+    Script::with_words(
+        all_words()
+            .into_iter()
+            .map(|(hz, text)| Word::new(hz, text))
+            .collect(),
+    )
 }
 
 fn write_script(dir: &Path, script: &Script) -> PathBuf {

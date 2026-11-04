@@ -122,8 +122,8 @@ pub struct Bridge<M: Messenger> {
     call_flag: Option<CallFlag>,
 }
 
-/// `true` while a call rings, is asked about, being answered or placed, or runs: calls
-/// advertising waits for it ([`crate::voice::adapter::advertise`]).
+/// `true` while a call rings, is asked about, being answered or placed, or runs, and
+/// once the bridge is stopping: calls advertising waits for it ([`crate::voice::adapter::advertise`]).
 pub type CallFlag = Arc<watch::Sender<bool>>;
 
 impl<M: Messenger> Bridge<M> {
@@ -159,8 +159,8 @@ impl<M: Messenger> Bridge<M> {
         }
     }
 
-    /// Keeps `flag` `true` while a call is in progress (and `false` once the bridge
-    /// stopped).
+    /// Keeps `flag` `true` while a call is in progress and once the bridge is stopping
+    /// (advertising holds still through the shutdown).
     pub fn with_call_flag(self, flag: CallFlag) -> Self {
         Self {
             call_flag: Some(flag),
@@ -438,8 +438,8 @@ struct Core<M: Messenger> {
     mute_next: bool,
     /// Set while a call is in progress.
     call_flag: Option<CallFlag>,
-    /// The voice adapter last reported to the control channel (without its counters).
-    adapter_reported: Option<push_bridge_control::AdapterStatus>,
+    /// The voice adapter last reported to the control channel.
+    adapter_reports: crate::voice::adapter::report::AdapterReports,
 }
 
 impl<M: Messenger> Core<M> {
@@ -506,7 +506,7 @@ impl<M: Messenger> Core<M> {
             call_reported: None,
             mute_next: false,
             call_flag: None,
-            adapter_reported: None,
+            adapter_reports: Default::default(),
         }
     }
 
@@ -641,6 +641,7 @@ impl<M: Messenger> Core<M> {
     /// once), the activity and the backend.
     async fn close(&mut self) {
         self.stopping = true;
+        self.sync_call_flag();
         if let Some(call) = self.end_call_at_close() {
             call.session.shut_down().await;
         }

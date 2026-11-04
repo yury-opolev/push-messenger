@@ -126,7 +126,11 @@ Example: the first 20 ms of a call (320 zero samples):
   ([§10](#10-limits-and-backpressure)).
 - **Stream 1** carries the audio of the speak being played ([§8](#8-speaking)). Send it at
   real-time pace (at most about 1 s ahead); the bridge plays it in real time and buffers at
-  most 2 s, dropping what does not fit.
+  most 2 s, dropping what does not fit. When the bridge has nothing queued (a speak's audio
+  starts, or the audio fell behind) it holds the first frames until 60 ms are there or the
+  first waited 60 ms, so a timer's jitter of a few tens of milliseconds is not heard.
+  Sending the first frames of a speak a little ahead (100–200 ms) is welcome: it absorbs
+  larger stalls and costs nothing.
 - Audio is only sent while a call is active.
 
 ## 5. Control messages
