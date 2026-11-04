@@ -786,7 +786,8 @@ its folder; below them "Add agent folder…".
 **Right:** the selected agent, in four tabs.
 
 - **Overview:** the state with its badge and label; the actions; the call's buttons; the
-  voice call, the voice adapter (with `calls.adapter`: "<name> <version> (ready)",
+  voice call, the voice adapter (with `calls.adapter`: "<name> <version> (ready: stt,
+  tts, vad, barge-in)" with its capabilities, "…; cannot listen" without `stt`,
   "starting" or "backing off (<reason>)"), the folder, session, Coda's version, uptime,
   running tasks, last error (the
   tray's own, else the bridge's error code) and last exit code; "Open folder"; the last 50
@@ -1723,7 +1724,9 @@ calls: without it no adapter is started and calls are not advertised.
 **With the built-in providers.** `calls.adapter` replaces them: with it, `calls.stt` and
 `calls.tts` stay absent or `{"provider": "none"}` and `calls.vad` absent (or at its
 defaults). `calls.stt` defaults to `none`, so `"calls": {"adapter": …}` alone is a calls
-section, and `calls.notify_by_call` needs no `stt` or `tts` with an adapter. The built-in
+section, and `calls.notify_by_call` needs no `stt` or `tts` with an adapter (the bridge
+then calls its owner only while the adapter is ready with `stt` and `tts` and calls are
+advertised; without `tts` it logs `call_held` `no_tts`). The built-in
 providers are deprecated and go in the next release.
 
 **Spawn**: the bridge starts the adapter and speaks the protocol on its stdin (bridge →
@@ -1812,8 +1815,9 @@ end, and any failure to start, connect or shake hands, is one warning
 again within 60 s is logged at debug), and the state `backoff`: the bridge tries again
 after 1 s, doubling up to 60 s; an adapter that stayed ready 60 s starts the delays from
 1 s again. Each start after the first counts as a restart. When the bridge stops it ends
-the running call with the adapter (`call_ended {reason: shutdown}`), stops the advertising,
-closes the link (queued messages are sent first), and stops a spawned adapter.
+the running call with the adapter (`call_ended {reason: shutdown}`), stops the advertiser
+(closing the client ends the advertisement), closes the link (queued messages are sent
+first), and stops a spawned adapter.
 
 **Advertising.** Calls are advertised (the owner's app sees the agent as callable) only
 once the adapter has been ready **with `stt`** for 2 s, and withdrawn as soon as it is not
@@ -2076,8 +2080,11 @@ the caller) instead of only waiting for a card to be answered:
 | `do_not_disturb` | local time ranges without calls, a string or a list: `"HH:MM-HH:MM"` every day, or with days first, `"mon-fri 22:00-07:00"`, `"sat,sun 00:00-24:00"`, `"mon,wed-fri 12:00-13:00"` (`mon` … `sun`, ranges may wrap, `fri-mon`). A range whose end is not after its start runs past midnight into the next day; its days are the days it starts on (`"fri 22:00-07:00"` covers Friday 22:00 to Saturday 07:00). Times are the computer's local time zone, with its daylight saving | none |
 
 `notify_by_call` needs `calls.stt` and `calls.tts` (validation says so): a call nobody
-hears or that cannot say why it rings is pointless. With both `after_minutes` 0 and
-`urgent` false the section does nothing.
+hears or that cannot say why it rings is pointless. With a [voice adapter](#voice-adapter)
+the same holds at run time: the bridge calls only while the adapter is ready with `stt`
+**and** `tts` and calls are advertised; a ready adapter without `tts` holds the call back
+(`call_held` `no_tts`, logged once). With both `after_minutes` 0 and `urgent` false the
+section does nothing.
 
 **When it calls.** Every half second the bridge checks the open requests. When one has
 waited `after_minutes`, no call runs, rings or is being answered, the messenger is

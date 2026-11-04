@@ -430,6 +430,8 @@ struct Core<M: Messenger> {
     last_dialed: Option<Instant>,
     /// Why the last due call was held back (logged once per change).
     held_by: Option<Verdict>,
+    /// Whether calls are held back because nothing can speak (logged once per change).
+    held_no_tts: bool,
     /// The call's phase and direction, and when that phase began (Unix ms).
     call_since: Option<((CallPhase, CallDirection), i64)>,
     /// The call last reported to the control channel.
@@ -502,6 +504,7 @@ impl<M: Messenger> Core<M> {
             dialing: None,
             last_dialed: None,
             held_by: None,
+            held_no_tts: false,
             call_since: None,
             call_reported: None,
             mute_next: false,

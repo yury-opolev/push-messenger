@@ -177,7 +177,13 @@ fn testkit() -> PathBuf {
             let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
             let mut build = std::process::Command::new(cargo);
             build
-                .args(["build", "-p", "push-voice-adapter-testkit", "--target-dir"])
+                .args([
+                    "build",
+                    "--locked",
+                    "-p",
+                    "push-voice-adapter-testkit",
+                    "--target-dir",
+                ])
                 .arg(target_dir)
                 .current_dir(env!("CARGO_MANIFEST_DIR"));
             match profile {

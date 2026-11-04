@@ -233,24 +233,29 @@ pub fn agent_view(
     }
 }
 
-/// The voice adapter for people: "whisper 1.2.3 (ready)", "whisper 1.2.3 (ready, cannot
-/// listen)", "starting", "backing off (<reason>)", "off".
+/// The voice adapter for people: "whisper 1.2.3 (ready: stt, tts, vad, barge-in)",
+/// "whisper 1.2.3 (ready: tts; cannot listen)", "starting", "backing off (<reason>)", "off".
 pub fn adapter_label(adapter: &AdapterStatus) -> String {
     match adapter.state.as_str() {
         "ready" => {
-            let listens = adapter
-                .capabilities
-                .as_ref()
-                .is_some_and(|capabilities| capabilities.iter().any(|name| name == "stt"));
+            let capabilities = adapter.capabilities.as_deref().unwrap_or_default();
+            let listens = capabilities.iter().any(|name| name == "stt");
+            let mut state = "ready".to_owned();
+            if !capabilities.is_empty() {
+                let names: Vec<String> = capabilities
+                    .iter()
+                    .map(|name| name.replace('_', "-"))
+                    .collect();
+                state = format!("{state}: {}", names.join(", "));
+            }
+            if !listens {
+                state.push_str(if capabilities.is_empty() { ", " } else { "; " });
+                state.push_str("cannot listen");
+            }
             format!(
-                "{} {} ({})",
+                "{} {} ({state})",
                 adapter.name.as_deref().unwrap_or("?"),
                 adapter.version.as_deref().unwrap_or("?"),
-                if listens {
-                    "ready"
-                } else {
-                    "ready, cannot listen"
-                }
             )
         }
         "starting" | "handshaking" => "starting".to_owned(),
@@ -565,13 +570,28 @@ mod tests {
             state: "ready".into(),
             name: Some("whisper".into()),
             version: Some("1.2.3".into()),
-            capabilities: Some(vec!["stt".into(), "tts".into()]),
+            capabilities: Some(vec![
+                "stt".into(),
+                "tts".into(),
+                "vad".into(),
+                "barge_in".into(),
+            ]),
             ..AdapterStatus::default()
         };
-        assert_eq!(show(ready.clone()), "whisper 1.2.3 (ready)");
+        assert_eq!(
+            show(ready.clone()),
+            "whisper 1.2.3 (ready: stt, tts, vad, barge-in)"
+        );
         assert_eq!(
             show(AdapterStatus {
                 capabilities: Some(vec!["tts".into()]),
+                ..ready.clone()
+            }),
+            "whisper 1.2.3 (ready: tts; cannot listen)"
+        );
+        assert_eq!(
+            show(AdapterStatus {
+                capabilities: None,
                 ..ready
             }),
             "whisper 1.2.3 (ready, cannot listen)"

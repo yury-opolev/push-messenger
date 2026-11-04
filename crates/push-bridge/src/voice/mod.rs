@@ -55,6 +55,15 @@ impl VoiceSetup {
         }
     }
 
+    /// Whether a call could say something now: a voice adapter ready with `tts`, or the
+    /// built-in TTS.
+    pub fn can_speak(&self) -> bool {
+        match &self.adapter {
+            Some(adapter) => adapter.can_speak(),
+            None => self.tts.is_some(),
+        }
+    }
+
     /// Starts the pipeline of `line`: in the voice adapter when there is one, else with
     /// the built-in providers; `None` without either STT. `peer`: the owner's display
     /// name (for the adapter).

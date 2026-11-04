@@ -464,10 +464,14 @@ impl Agent {
                 let setup = AdapterSetup::new(supervisor, LANGUAGE);
                 let call_flag: CallFlag = Arc::new(watch::channel(false).0);
                 let advertised = client.clone();
+                let advertised_setup = setup.clone();
                 let advertiser = tokio::spawn(advertise(
                     setup.supervisor.state(),
                     call_flag.subscribe(),
-                    move |on| advertised.set_calls_advertised(on),
+                    move |on| {
+                        advertised_setup.set_advertised(on);
+                        advertised.set_calls_advertised(on);
+                    },
                 ));
                 let bridge = bridge
                     .with_voice(VoiceSetup {

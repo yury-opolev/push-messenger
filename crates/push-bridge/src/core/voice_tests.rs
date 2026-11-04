@@ -1157,28 +1157,43 @@ struct Adapted {
     supervisor: Supervisor,
     starter: Option<Arc<ScriptedStarter>>,
     flag: CallFlag,
+    setup: AdapterSetup,
 }
 
 impl Adapted {
     async fn new(starter: Arc<ScriptedStarter>) -> Self {
+        Self::with_policy(starter, CallPolicy::default()).await
+    }
+
+    /// With the answering and calling `policy`.
+    async fn with_policy(starter: Arc<ScriptedStarter>, policy: CallPolicy) -> Self {
         let supervisor = Supervisor::with_starter(
             starter.clone(),
             BridgeHello::v1(env!("CARGO_PKG_VERSION"), "en-US"),
         );
-        Self::with(supervisor, Some(starter)).await
+        Self::build(supervisor, Some(starter), policy).await
     }
 
     async fn with(supervisor: Supervisor, starter: Option<Arc<ScriptedStarter>>) -> Self {
+        Self::build(supervisor, starter, CallPolicy::default()).await
+    }
+
+    async fn build(
+        supervisor: Supervisor,
+        starter: Option<Arc<ScriptedStarter>>,
+        policy: CallPolicy,
+    ) -> Self {
         let mut h = Harness::named("Coda");
         let phone = FakePhone::new();
         let flag: CallFlag = Arc::new(watch::channel(false).0);
+        let setup = AdapterSetup::new(supervisor.clone(), "en-US");
         h.voice = Some(VoiceSetup {
             phone: phone.clone(),
             stt: None,
             tts: None,
             vad: VadConfig::default(),
-            policy: CallPolicy::default(),
-            adapter: Some(AdapterSetup::new(supervisor.clone(), "en-US")),
+            policy,
+            adapter: Some(setup.clone()),
         });
         h.call_flag = Some(flag.clone());
         h.start();
@@ -1190,6 +1205,7 @@ impl Adapted {
             supervisor,
             starter,
             flag,
+            setup,
         }
     }
 
@@ -1447,6 +1463,75 @@ async fn calls_are_advertised_while_the_adapter_listens_and_never_withdrawn_duri
         .unwrap();
     assert!(!on, "withdrawn once the call ended");
     assert!(!*a.flag.borrow());
+}
+
+#[derive(Clone, Default)]
+struct Captured(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Captured {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_adapter_that_cannot_speak_never_calls_the_owner() {
+    let captured = Captured::default();
+    let make = {
+        let captured = captured.clone();
+        move || captured.clone()
+    };
+    let _guard = tracing::subscriber::set_default(crate::logging::subscriber(
+        make,
+        tracing_subscriber::EnvFilter::new("info"),
+    ));
+    // A callsite another test thread was registering meanwhile may have cached `never`.
+    std::thread::sleep(Duration::from_millis(50));
+    tracing::callsite::rebuild_interest_cache();
+    let mut script = adapter_script();
+    script.capabilities.tts = false;
+    let a =
+        Adapted::with_policy(then_not_found(vec![Plan::Adapter(script)]), notify(60, 600)).await;
+    a.ready().await;
+    a.setup.set_advertised(true);
+    let _answer = a.v.h.backend.request(permission());
+    let _card = a.v.card("agent.approval@1").await;
+    tokio::time::sleep(Duration::from_secs(300)).await;
+    assert!(a.v.phone.dialed().is_empty(), "a silent call");
+    let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+    let held: Vec<_> = logs
+        .lines()
+        .filter(|line| line.contains("call_held") && line.contains("no_tts"))
+        .collect();
+    assert_eq!(held.len(), 1, "logged once: {logs}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_owner_is_called_through_the_adapter_only_while_calls_are_advertised() {
+    let a = Adapted::with_policy(
+        then_not_found(vec![Plan::Adapter(adapter_script())]),
+        notify(60, 600),
+    )
+    .await;
+    a.ready().await;
+    let _answer = a.v.h.backend.request(permission());
+    let _card = a.v.card("agent.approval@1").await;
+    tokio::time::sleep(Duration::from_secs(120)).await;
+    assert!(a.v.phone.dialed().is_empty(), "not advertised");
+    let setup = a.setup.clone();
+    tokio::spawn(advertise(
+        a.supervisor.state(),
+        a.flag.subscribe(),
+        move |on| setup.set_advertised(on),
+    ));
+    let call = a.v.dialed(1).await;
+    assert_eq!(a.v.phone.dialed(), [a.v.h.messenger.owner_id()]);
+    call.end(CallEndReason::Missed);
 }
 
 #[tokio::test(start_paused = true)]

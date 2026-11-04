@@ -580,10 +580,14 @@ async fn run(dir: &Path) -> Result<(), Failure> {
     // With a voice adapter, calls are advertised while it can listen and no call runs.
     let advertiser = adapter.as_ref().map(|adapter| {
         let client = client.clone();
+        let setup = adapter.clone();
         tokio::spawn(advertise(
             adapter.supervisor.state(),
             call_flag.subscribe(),
-            move |on| client.set_calls_advertised(on),
+            move |on| {
+                setup.set_advertised(on);
+                client.set_calls_advertised(on);
+            },
         ))
     });
     let target = forward(events);
@@ -678,8 +682,9 @@ async fn run(dir: &Path) -> Result<(), Failure> {
         }
     };
     set_state(control.as_ref(), BridgeState::Stopping, "offline");
-    // The bridge ended its call (the adapter heard `call_ended {shutdown}`): calls are
-    // no longer advertised from here, and the adapter is stopped.
+    // The bridge ended its call (the adapter heard `call_ended {shutdown}`): the
+    // advertiser stops; closing the client ends the advertisement. Then the adapter is
+    // stopped.
     if let Some(advertiser) = advertiser {
         advertiser.abort();
         let _ = advertiser.await;

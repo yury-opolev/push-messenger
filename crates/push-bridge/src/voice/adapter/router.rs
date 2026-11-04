@@ -40,6 +40,7 @@
 //! the peer's name.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -90,6 +91,9 @@ pub struct AdapterSetup {
     pub language: String,
     /// The router's counters, over every call.
     pub metrics: Arc<AdapterMetrics>,
+    /// Whether calls are advertised now (set by the [`super::advertise::advertise`]
+    /// setter): the owner's app offers calls to the agent only then.
+    advertised: Arc<AtomicBool>,
 }
 
 impl AdapterSetup {
@@ -98,6 +102,7 @@ impl AdapterSetup {
             supervisor,
             language: language.into(),
             metrics: Arc::default(),
+            advertised: Arc::default(),
         }
     }
 
@@ -108,6 +113,25 @@ impl AdapterSetup {
             .borrow()
             .ready()
             .is_some_and(|info| info.capabilities.stt)
+    }
+
+    /// Whether a ready adapter can speak (`tts`): a call to the owner can say something.
+    pub fn can_speak(&self) -> bool {
+        self.supervisor
+            .state()
+            .borrow()
+            .ready()
+            .is_some_and(|info| info.capabilities.tts)
+    }
+
+    /// Records whether calls are advertised (call it from the advertiser's setter).
+    pub fn set_advertised(&self, on: bool) {
+        self.advertised.store(on, Ordering::Relaxed);
+    }
+
+    /// Whether calls are advertised now.
+    pub fn advertised(&self) -> bool {
+        self.advertised.load(Ordering::Relaxed)
     }
 }
 
