@@ -21,7 +21,7 @@
 //!   own lines are not interruptible), at most [`MAX_UNFINISHED_SPEAKS`] unfinished; the
 //!   rest wait in the session's queue. A sentence longer than [`MAX_TEXT_CHARS`] is split
 //!   on a character boundary. Without `tts` nothing is spoken (the replies stay in the
-//!   chat, as the built-in speech without TTS).
+//!   chat).
 //! - Stream-1 audio belongs to the oldest unfinished speak (A9): it plays on the line's
 //!   speaker in real time, at most [`TO_CALLER_BUFFER_FRAMES`] (2 s) ahead (beyond:
 //!   dropped and counted), after a [`PREROLL`] (60 ms jitter buffer) whenever the speaker

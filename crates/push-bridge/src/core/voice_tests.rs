@@ -1,8 +1,8 @@
-//! Voice calls in the core, against a [`FakePhone`], fake speech and the recorded
-//! fixtures in `tests/fixtures/voice`, in paused time (the fake speaker plays one frame
-//! per 20 ms of tokio's clock).
+//! Voice calls in the core, against a [`FakePhone`] and the testkit's scripted voice
+//! adapter (in-process, [`ScriptedStarter`]) hearing the recorded fixtures
+//! ([`push_voice_adapter_testkit::fixture`]), in paused time: the fake speaker plays one
+//! frame per 20 ms of tokio's clock, the adapter hears and speaks in real time.
 
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -10,8 +10,11 @@ use chrono::NaiveDateTime;
 use push_bridge_control::{CallDirection, CallPhase, Event as ControlEvent, NO_CALL};
 use push_sdk::{ActivityState, CallEndReason, CallEvent, CallId, Event, UserId};
 use push_voice_adapter_proto::BridgeHello;
-use push_voice_adapter_testkit::{Event as AdapterEvent, Log, Script, Word, tones};
+use push_voice_adapter_testkit::{
+    Event as AdapterEvent, Fixture, Log, Script, Word, fixture as fixtures, tones,
+};
 use tokio::sync::{mpsc, watch};
+use tokio::task::JoinHandle;
 
 use super::CallFlag;
 use super::tests::{Harness, peeked, permission, settle};
@@ -26,82 +29,62 @@ use crate::voice::adapter::router::AdapterSetup;
 use crate::voice::adapter::supervisor::Supervisor;
 use crate::voice::adapter::supervisor::testing::{Plan, ScriptedStarter};
 use crate::voice::confirm::APPROVE_OR_REJECT;
-use crate::voice::fake::{FakeStt, FakeTts, Fixture, silence, tone};
 use crate::voice::phone::{FakeCall, FakePhone};
 use crate::voice::policy::{CallPolicy, NotifyPolicy, QuietHours};
-use crate::voice::provider::Stt;
 use crate::voice::speech::CODE_NOTE;
-use crate::voice::vad::VadConfig;
 
 const GREETING: &str = "Connected to Coda in work.";
-const FIXTURES: [&str; 5] = ["prompt", "barge_in", "approve", "option_two", "ambiguous"];
 /// A word no fixture uses, with a secret in it.
 const SECRET_HZ: f64 = 2200.0;
 const SECRET_WORDS: &str = "my token=abc123def";
 
 fn fixture(name: &str) -> Fixture {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/voice")
-        .join(format!("{name}.json"));
-    Fixture::load(&path).unwrap()
+    Fixture::named(name)
 }
 
-/// Hears every fixture's words, and [`SECRET_WORDS`].
-fn stt() -> FakeStt {
-    let mut words: Vec<(f64, String)> = FIXTURES
-        .iter()
-        .flat_map(|name| fixture(name).words)
-        .map(|word| (word.hz, word.text))
-        .collect();
-    words.push((SECRET_HZ, SECRET_WORDS.to_owned()));
-    FakeStt::new(words)
+/// The adapter of [`Voice`]: it hears every fixture's words and [`SECRET_WORDS`], and
+/// speaks 20 ms a character.
+fn voice_script() -> Script {
+    let mut words = fixtures::all_words();
+    words.push(Word::new(SECRET_HZ, SECRET_WORDS));
+    Script {
+        ms_per_char: 20,
+        ..Script::with_words(words)
+    }
 }
 
 /// The owner says one word at `hz`.
 fn utterance(hz: f64) -> Vec<i16> {
-    let mut audio = silence(200);
-    audio.extend(tone(hz, 900, 8000.0));
-    audio.extend(silence(1000));
+    let mut audio = tones::silence(10);
+    audio.extend(tones::tone(hz, 45));
+    audio.extend(tones::silence(50));
     audio
 }
 
-/// A bridge with voice, its phone and its voice.
+/// A bridge with voice, its phone and the adapters it started.
 struct Voice {
     h: Harness,
     phone: Arc<FakePhone>,
-    tts: Arc<FakeTts>,
+    starter: Option<Arc<ScriptedStarter>>,
 }
 
 impl Voice {
+    /// With a ready adapter hearing the fixtures ([`voice_script`]).
     async fn new() -> Self {
-        Self::with_stt(Some(stt())).await
-    }
-
-    async fn with_stt(stt: Option<FakeStt>) -> Self {
-        Self::build(stt, CallPolicy::default()).await
+        Self::with_policy(CallPolicy::default()).await
     }
 
     /// With the answering and calling `policy`.
     async fn with_policy(policy: CallPolicy) -> Self {
-        Self::build(Some(stt()), policy).await
+        Self::with_script(voice_script(), policy).await
     }
 
-    async fn build(stt: Option<FakeStt>, policy: CallPolicy) -> Self {
-        let mut h = Harness::named("Coda");
-        let phone = FakePhone::new();
-        let tts = Arc::new(FakeTts::new());
-        h.voice = Some(VoiceSetup {
-            phone: phone.clone(),
-            stt: stt.map(|stt| Arc::new(stt) as Arc<dyn Stt>),
-            tts: Some(tts.clone()),
-            vad: VadConfig::default(),
-            policy,
-            adapter: None,
-        });
-        h.start();
-        h.backend.wait_for("start", 1).await;
-        settle().await;
-        Self { h, phone, tts }
+    /// With an adapter playing `script`, ready, its calls advertised.
+    async fn with_script(script: Script, policy: CallPolicy) -> Self {
+        let a = Adapted::with_policy(then_not_found(vec![Plan::Adapter(script)]), policy).await;
+        a.ready().await;
+        a.setup.set_advertised(true);
+        a.v
     }
 
     /// `caller` calls the agent.
@@ -127,13 +110,16 @@ impl Voice {
         call
     }
 
+    /// What the adapters started to speak, in order.
+    fn spoken(&self) -> Vec<String> {
+        self.starter.as_ref().map_or_else(Vec::new, |starter| {
+            starter.logs().iter().flat_map(Log::spoken).collect()
+        })
+    }
+
     /// How often `text` was spoken.
     fn said(&self, text: &str) -> usize {
-        self.tts
-            .spoken()
-            .iter()
-            .filter(|said| *said == text)
-            .count()
+        self.spoken().iter().filter(|said| *said == text).count()
     }
 
     /// Waits until `text` was spoken.
@@ -149,10 +135,7 @@ impl Voice {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        panic!(
-            "timed out waiting for {what}; spoken {:?}",
-            self.tts.spoken()
-        );
+        panic!("timed out waiting for {what}; spoken {:?}", self.spoken());
     }
 
     /// The transcripts posted: `(speaker, text)`.
@@ -237,9 +220,21 @@ impl Voice {
     }
 }
 
-/// Lets what the agent says play out (FakeTts speaks at most 3 s a sentence).
+/// Lets what the agent says play out (the adapter speaks 20 ms a character).
 async fn quiet() {
     tokio::time::sleep(Duration::from_secs(3)).await;
+}
+
+/// The owner says `audio` in real time (the bridge keeps 1 s of the owner's audio queued
+/// for the adapter).
+async fn say(call: &FakeCall, audio: &[i16]) {
+    call.say_paced(audio).await;
+}
+
+/// The owner starts saying `audio` in real time.
+fn saying(call: &FakeCall, audio: Vec<i16>) -> JoinHandle<()> {
+    let call = call.clone();
+    tokio::spawn(async move { call.say_paced(&audio).await })
 }
 
 /// Whether `wanted` appears in `seen` in order (not necessarily next to each other).
@@ -256,7 +251,7 @@ async fn the_owner_s_call_is_answered_with_a_greeting() {
     let call = v.call().await;
     assert_eq!(v.phone.answered(), [call.call_id]);
     assert!(v.phone.declined().is_empty());
-    assert_eq!(v.tts.spoken(), [GREETING]);
+    assert_eq!(v.spoken(), [GREETING]);
     assert!(!call.heard().is_empty(), "the greeting played");
     v.activity("on a call").await;
     assert!(in_order(
@@ -281,7 +276,10 @@ async fn strangers_second_calls_and_calls_without_stt_are_declined() {
     assert_eq!(v.phone.declined()[1], (second, true));
     assert_eq!(v.phone.answered(), [call.call_id]);
 
-    let off = Voice::with_stt(None).await;
+    // An adapter that cannot listen takes no calls.
+    let mut deaf = voice_script();
+    deaf.capabilities.stt = false;
+    let off = Voice::with_script(deaf, CallPolicy::default()).await;
     let first = off.ring(off.h.messenger.owner_id());
     off.phone.wait_declined(1).await;
     let again = off.ring(off.h.messenger.owner_id());
@@ -295,7 +293,7 @@ async fn an_utterance_is_posted_and_prompted_or_steered_into_a_running_turn() {
     let v = Voice::new().await;
     let call = v.call().await;
     let prompt = fixture("prompt");
-    call.say(&prompt.audio()).await;
+    say(&call, &prompt.audio()).await;
     v.h.backend.wait_for("prompt run the tests", 1).await;
     assert_eq!(
         v.transcripts(),
@@ -306,7 +304,7 @@ async fn an_utterance_is_posted_and_prompted_or_steered_into_a_running_turn() {
 
     v.h.backend.turn_started(TurnSource::Prompt);
     settle().await;
-    call.say(&prompt.audio()).await;
+    say(&call, &prompt.audio()).await;
     v.h.backend.wait_for("steer run the tests", 1).await;
     assert_eq!(v.h.count("prompt"), 1);
     assert_eq!(v.transcripts().len(), 2);
@@ -322,7 +320,7 @@ async fn the_reply_is_spoken_sentence_by_sentence_and_still_posted() {
     v.h.backend.turn_ended(false);
     v.until_said("Next I'll commit.").await;
     assert_eq!(
-        v.tts.spoken()[1..],
+        v.spoken()[1..],
         ["Done.", "All tests pass.", CODE_NOTE, "Next I'll commit."]
     );
     v.activity("on a call").await;
@@ -337,8 +335,9 @@ async fn the_reply_is_spoken_sentence_by_sentence_and_still_posted() {
 
 #[tokio::test(start_paused = true)]
 async fn the_owner_barges_in_and_the_steer_s_answer_is_spoken() {
-    // The STT takes 2 s, so the reply goes on before the owner's words arrive.
-    let v = Voice::with_stt(Some(stt().with_delay(Duration::from_secs(2)))).await;
+    // The barge-in comes with the owner's first word, the transcript once it ended: the
+    // reply goes on in between.
+    let v = Voice::new().await;
     let call = v.call().await;
     let greeting = call.heard().len();
     v.h.backend.turn_started(TurnSource::Prompt);
@@ -352,7 +351,7 @@ async fn the_owner_barges_in_and_the_steer_s_answer_is_spoken() {
         call.heard().len() > greeting + 16 * 400
     })
     .await;
-    call.say(&fixture("barge_in").audio()).await;
+    let owner = saying(&call, fixture("barge_in").audio());
     call.wait_until("the barge-in", |call| call.clears() >= 1)
         .await;
     settle().await;
@@ -364,7 +363,7 @@ async fn the_owner_barges_in_and_the_steer_s_answer_is_spoken() {
     v.h.backend.turn_ended(false);
     v.until_said("Then I switch files.").await;
 
-    let spoken = v.tts.spoken();
+    let spoken = v.spoken();
     assert!(spoken.contains(&sentences[0]), "{spoken:?}");
     assert!(!spoken.contains(&sentences[19]), "{spoken:?}");
     assert!(!spoken.iter().any(|said| said == "This part is cut."));
@@ -377,11 +376,12 @@ async fn the_owner_barges_in_and_the_steer_s_answer_is_spoken() {
         !call.heard_since_clear().is_empty()
     })
     .await;
+    owner.await.unwrap();
 }
 
 #[tokio::test(start_paused = true)]
 async fn reply_text_handled_before_the_barge_in_event_is_not_spoken() {
-    let v = Voice::with_stt(Some(stt().with_delay(Duration::from_secs(2)))).await;
+    let v = Voice::new().await;
     let call = v.call().await;
     let greeting = call.heard().len();
     v.h.backend.turn_started(TurnSource::Prompt);
@@ -397,14 +397,14 @@ async fn reply_text_handled_before_the_barge_in_event_is_not_spoken() {
     // core, preferring backend events, handles the delta first.
     let backend = v.h.backend.clone();
     call.on_next_clear(move || backend.text("This part is cut.\n"));
-    call.say(&fixture("barge_in").audio()).await;
+    let _owner = saying(&call, fixture("barge_in").audio());
     v.h.backend
         .wait_for("steer stop, use the other file", 1)
         .await;
     v.h.backend.text("Then I switch files.\n");
     v.h.backend.turn_ended(false);
     v.until_said("Then I switch files.").await;
-    let spoken = v.tts.spoken();
+    let spoken = v.spoken();
     assert!(
         !spoken.iter().any(|said| said == "This part is cut."),
         "{spoken:?}"
@@ -427,7 +427,7 @@ async fn approve_by_voice_answers_the_card_and_closes_it() {
         .await;
     quiet().await;
 
-    call.say(&fixture("approve").audio()).await;
+    say(&call, &fixture("approve").audio()).await;
     assert_eq!(answer.await, Ok(Answer::Permission(true)));
     v.until_said("Approved.").await;
     assert_eq!(
@@ -468,7 +468,7 @@ async fn option_two_answers_a_question_by_voice() {
     });
     let card = v.card("agent.question@1").await;
     quiet().await;
-    call.say(&fixture("option_two").audio()).await;
+    say(&call, &fixture("option_two").audio()).await;
     assert_eq!(answer.await, Ok(Answer::Question("US".into())));
     v.until_said("Got it: US.").await;
     assert_eq!(
@@ -489,13 +489,13 @@ async fn an_unclear_answer_is_asked_again_and_the_card_stays_open() {
     quiet().await;
     let audio = fixture("ambiguous").audio();
     let (maybe, reject) = audio.split_at(16 * 2100);
-    call.say(maybe).await;
+    say(&call, maybe).await;
     v.until_said(APPROVE_OR_REJECT).await;
     quiet().await;
     assert!(answer.try_recv().is_err(), "still open");
     assert!(v.edits_of(card).is_empty());
 
-    call.say(reject).await;
+    say(&call, reject).await;
     assert_eq!(answer.await, Ok(Answer::Permission(false)));
     v.until_said("Rejected.").await;
     assert_eq!(
@@ -511,7 +511,7 @@ async fn an_unclear_answer_is_asked_again_and_the_card_stays_open() {
 async fn the_activity_follows_the_call() {
     let v = Voice::new().await;
     let call = v.call().await;
-    call.say(&fixture("prompt").audio()).await;
+    say(&call, &fixture("prompt").audio()).await;
     v.h.backend.wait_for("prompt run the tests", 1).await;
     v.h.backend.turn_started(TurnSource::Prompt);
     v.activity("thinking").await;
@@ -578,7 +578,7 @@ async fn call_events_during_the_answer_reach_the_line_after_it() {
 async fn a_transcript_is_masked_and_peeked_as_the_owner_s_text() {
     let v = Voice::new().await;
     let call = v.call().await;
-    call.say(&utterance(SECRET_HZ)).await;
+    say(&call, &utterance(SECRET_HZ)).await;
     v.h.backend.wait_for("prompt my token", 1).await;
     let (speaker, text) = v.transcripts().pop().unwrap();
     assert_eq!(speaker, "owner");
@@ -609,7 +609,7 @@ async fn spoken_replies_and_background_messages_are_masked() {
         urgent: false,
     });
     v.until_said("The key is token: hidden now.").await;
-    let spoken = v.tts.spoken();
+    let spoken = v.spoken();
     assert!(spoken.contains(&"I set api_key=hidden for you.".to_owned()));
     assert!(spoken.contains(&"Deploy with password=hidden.".to_owned()));
     for secret in ["sk-abc123def456", token, "hunter2xyz"] {
@@ -628,12 +628,12 @@ async fn the_owner_speaking_during_a_code_block_keeps_the_code_silent() {
     v.h.backend.text("Here is the fix:\n```\nlet first = 1;\n");
     v.until_said(CODE_NOTE).await;
     quiet().await;
-    call.say(&fixture("prompt").audio()).await;
+    say(&call, &fixture("prompt").audio()).await;
     v.h.backend.wait_for("steer run the tests", 1).await;
     v.h.backend.text("let second = 2;\n```\nThat is all.\n");
     v.h.backend.turn_ended(false);
     v.until_said("That is all.").await;
-    let spoken = v.tts.spoken();
+    let spoken = v.spoken();
     assert!(
         !spoken.iter().any(|said| said.contains("second")),
         "{spoken:?}"
@@ -642,22 +642,23 @@ async fn the_owner_speaking_during_a_code_block_keeps_the_code_silent() {
 
 #[tokio::test(start_paused = true)]
 async fn an_utterance_begun_before_a_card_opened_does_not_answer_it() {
-    // The STT takes 2 s: the card opens while the utterance is transcribed.
-    let v = Voice::with_stt(Some(stt().with_delay(Duration::from_secs(2)))).await;
+    // The card opens while the owner says the word: its transcript comes after.
+    let v = Voice::new().await;
     let call = v.call().await;
     let approve = fixture("approve").audio();
-    call.say(&approve).await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    let owner = saying(&call, approve.clone());
+    tokio::time::sleep(Duration::from_millis(400)).await;
     let mut answer = v.h.backend.request(permission());
     let card = v.card("agent.approval@1").await;
     v.h.backend.wait_for("prompt approve", 1).await;
+    owner.await.unwrap();
     v.until_said("Coda wants to use Bash. Approve or reject?")
         .await;
     quiet().await;
     assert!(answer.try_recv().is_err(), "still open");
     assert!(v.edits_of(card).is_empty());
 
-    call.say(&approve).await;
+    say(&call, &approve).await;
     assert_eq!(answer.await, Ok(Answer::Permission(true)));
     v.until_said("Approved.").await;
     assert_eq!(v.h.count("prompt"), 1);
@@ -889,7 +890,7 @@ async fn an_unanswered_request_calls_the_owner_who_hears_it_and_approves_by_voic
         .await;
     call.pick_up();
     v.until_said(BASH).await;
-    let spoken = v.tts.spoken();
+    let spoken = v.spoken();
     assert_eq!(
         spoken,
         [
@@ -903,7 +904,7 @@ async fn an_unanswered_request_calls_the_owner_who_hears_it_and_approves_by_voic
         Some((CallPhase::InCall, CallDirection::Outgoing))
     );
     quiet().await;
-    call.say(&fixture("approve").audio()).await;
+    say(&call, &fixture("approve").audio()).await;
     assert_eq!(answer.await, Ok(Answer::Permission(true)));
     v.until_said("Approved.").await;
     call.end(CallEndReason::Completed);
@@ -1025,7 +1026,7 @@ async fn urgent_news_calls_and_ordinary_news_does_not() {
     call.pick_up();
     v.until_said("The main branch fails to compile.").await;
     assert_eq!(
-        v.tts.spoken(),
+        v.spoken(),
         [
             "Hi, it's Coda in work. I have something urgent.",
             "Build broken.",
@@ -1080,12 +1081,12 @@ async fn the_tray_mutes_the_agent_and_hangs_up() {
         Ok(serde_json::json!({"muted": true}))
     );
     assert!(v.h.control_status().call.unwrap().muted);
-    let spoken = v.tts.spoken().len();
+    let spoken = v.spoken().len();
     v.h.backend.turn_started(TurnSource::Prompt);
     v.h.backend.text("Nobody hears this.\n");
     v.h.backend.turn_ended(false);
     quiet().await;
-    assert_eq!(v.tts.spoken().len(), spoken, "muted");
+    assert_eq!(v.spoken().len(), spoken, "muted");
     assert_eq!(
         v.h.call(Action::Mute(false)).await,
         Ok(serde_json::json!({"muted": false}))
@@ -1124,7 +1125,7 @@ async fn the_tray_cancels_a_call_ringing_the_owner_and_declines_an_ask() {
     assert_eq!(v.edits_of(card)[0].2, "📞 Declined.");
 }
 
-// ── Speech in the voice adapter (PR 2) ──────────────────────────────────────────────
+// ── The voice adapter itself (PR 2) ─────────────────────────────────────────────────
 
 /// The testkit adapter's word.
 const WORD_HZ: f64 = 1000.0;
@@ -1189,19 +1190,19 @@ impl Adapted {
         let setup = AdapterSetup::new(supervisor.clone(), "en-US");
         h.voice = Some(VoiceSetup {
             phone: phone.clone(),
-            stt: None,
-            tts: None,
-            vad: VadConfig::default(),
             policy,
-            adapter: Some(setup.clone()),
+            adapter: setup.clone(),
         });
         h.call_flag = Some(flag.clone());
         h.start();
         h.backend.wait_for("start", 1).await;
         settle().await;
-        let tts = Arc::new(FakeTts::new());
         Self {
-            v: Voice { h, phone, tts },
+            v: Voice {
+                h,
+                phone,
+                starter: starter.clone(),
+            },
             supervisor,
             starter,
             flag,
@@ -1588,11 +1589,8 @@ impl IdleCore {
         );
         core.voice = Some(VoiceSetup {
             phone: FakePhone::new(),
-            stt: Some(Arc::new(stt())),
-            tts: Some(Arc::new(FakeTts::new())),
-            vad: VadConfig::default(),
             policy: CallPolicy::default(),
-            adapter: None,
+            adapter: AdapterSetup::new(Supervisor::off(), "en-US"),
         });
         core.call_flag = Some(flag.clone());
         Self {

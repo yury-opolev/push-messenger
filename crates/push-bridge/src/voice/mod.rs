@@ -1,95 +1,72 @@
-//! Voice calls with the owner: call audio (16 kHz mono, 20 ms frames) is cut into
-//! utterances by voice activity detection, transcribed and sent to the agent as a prompt;
-//! the agent's Markdown reply becomes short plain sentences that are synthesized and played
-//! back; open approval and question cards can be answered by voice. These are the pure
-//! building blocks: WAV files and resampling, the detector, the spoken text and voice
-//! answers. [`provider`] runs the speech services: Azure AI Speech, local servers or
-//! commands, and tone-based fakes for tests. [`phone`] answers calls (push-sdk's media
-//! helper in `media`, feature `voice`; a fake in tests) and [`session`] runs one call's
-//! pipeline: listening, transcribing, speaking, barge-in, with its speech in an [`engine`].
-//! [`adapter`] starts or connects to a voice adapter, a separate program that runs speech
-//! (push-voice-adapter/1), and routes a call's speech through it.
+//! Voice calls with the owner. Speech runs in a voice adapter, a separate program speaking
+//! push-voice-adapter/1 ([`adapter`]: started or connected to, supervised, and routing a
+//! call's speech through it); the bridge itself has no speech engine. What stays here is
+//! the conversation: the owner's transcripts become prompts, the agent's Markdown reply
+//! becomes short plain sentences to speak ([`speech`]), open approval and question cards
+//! can be answered by voice ([`confirm`]), and when calls are answered and placed
+//! ([`policy`]). [`phone`] answers calls (push-sdk's media helper in `media`, feature
+//! `voice`; a fake in tests) and [`session`] runs one call's pipeline: the owner's audio
+//! to the adapter, its transcripts back, the sentences to speak and barge-in, with the
+//! speech in an [`engine`].
 
 pub mod adapter;
-pub mod azure;
 pub mod confirm;
 pub mod engine;
-pub mod fake;
-pub mod local;
 #[cfg(feature = "voice")]
 pub mod media;
 pub mod phone;
 pub mod policy;
-pub mod provider;
 pub mod session;
 pub mod speech;
-#[cfg(test)]
-pub(crate) mod test_server;
-pub mod vad;
-pub mod wav;
 
 use std::sync::Arc;
 
-/// What the bridge needs to take calls: the phone, the speech providers and the
-/// detector's settings, and how calls are answered and placed. Without `stt` every call
-/// is declined; without `tts` the agent's replies stay in the chat. With `adapter` speech
-/// runs in the voice adapter instead (`stt` and `tts` are then `None`): calls can be taken
-/// while it is ready with `stt`, and it speaks when it has `tts`.
+/// What the bridge needs to take calls: the phone, how calls are answered and placed, and
+/// the voice adapter that runs the speech. Calls are taken while the adapter is ready
+/// with `stt`; it speaks when it has `tts`.
 #[derive(Clone)]
 pub struct VoiceSetup {
     pub phone: Arc<dyn phone::Phone>,
-    pub stt: Option<Arc<dyn provider::Stt>>,
-    pub tts: Option<Arc<dyn provider::Tts>>,
-    pub vad: vad::VadConfig,
     pub policy: policy::CallPolicy,
-    pub adapter: Option<adapter::router::AdapterSetup>,
+    pub adapter: adapter::router::AdapterSetup,
 }
 
 impl VoiceSetup {
-    /// Whether a call could be listened to now: a voice adapter ready with `stt`, or the
-    /// built-in STT.
+    /// Whether a call could be listened to now: the voice adapter is ready with `stt`.
     pub fn can_listen(&self) -> bool {
-        match &self.adapter {
-            Some(adapter) => adapter.can_listen(),
-            None => self.stt.is_some(),
-        }
+        self.adapter.can_listen()
     }
 
-    /// Whether a call could say something now: a voice adapter ready with `tts`, or the
-    /// built-in TTS.
+    /// Whether a call could say something now: the voice adapter is ready with `tts`.
     pub fn can_speak(&self) -> bool {
-        match &self.adapter {
-            Some(adapter) => adapter.can_speak(),
-            None => self.tts.is_some(),
-        }
+        self.adapter.can_speak()
     }
 
-    /// Starts the pipeline of `line`: in the voice adapter when there is one, else with
-    /// the built-in providers; `None` without either STT. `peer`: the owner's display
-    /// name (for the adapter).
+    /// Starts the pipeline of `line`, its speech in the voice adapter. `peer`: the
+    /// owner's display name (for the adapter).
     pub fn start_session(
         &self,
         line: phone::Line,
         peer: &str,
         events: session::EventSink,
-    ) -> Option<session::Session> {
-        if let Some(adapter) = &self.adapter {
-            return Some(session::Session::with_adapter(line, adapter, peer, events));
-        }
-        let stt = self.stt.clone()?;
-        Some(session::Session::start(
-            line,
-            stt,
-            self.tts.clone(),
-            self.vad,
-            events,
-        ))
+    ) -> session::Session {
+        session::Session::with_adapter(line, &self.adapter, peer, events)
     }
 }
 
-/// Samples per second of call audio (push-sdk's media helper).
-pub const SAMPLE_RATE: u32 = 16_000;
-/// Samples in one 20 ms frame.
+/// Samples in one 20 ms frame of call audio (16 kHz mono, push-sdk's media helper).
 pub const FRAME: usize = 320;
 /// One 20 ms frame of 16 kHz mono audio.
 pub type Frame = [i16; FRAME];
+
+/// `samples` as call frames, the last one padded with silence.
+pub fn frames(samples: &[i16]) -> Vec<Frame> {
+    samples
+        .chunks(FRAME)
+        .map(|chunk| {
+            let mut frame = [0; FRAME];
+            frame[..chunk.len()].copy_from_slice(chunk);
+            frame
+        })
+        .collect()
+}

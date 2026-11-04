@@ -260,9 +260,9 @@ impl<M: Messenger> Core<M> {
         .await;
     }
 
-    /// Whether the bridge could call now: voice with someone to listen and to speak (the
-    /// built-in STT and TTS, or a voice adapter ready with `stt` and `tts` whose calls are
-    /// advertised), connected, no call, not paused or stopping. An adapter that listens
+    /// Whether the bridge could call now: voice with someone to listen and to speak (a
+    /// voice adapter ready with `stt` and `tts` whose calls are advertised), connected, no
+    /// call, not paused or stopping. An adapter that listens
     /// but cannot speak holds calls back (`call_held` `no_tts`, logged once per change):
     /// the owner would pick up a silent call.
     fn can_dial(&mut self) -> bool {
@@ -277,10 +277,7 @@ impl<M: Messenger> Core<M> {
             tracing::info!(event = "call_held", reason = "no_tts");
         }
         self.held_no_tts = !speaks;
-        let advertised = voice
-            .adapter
-            .as_ref()
-            .is_none_or(|adapter| adapter.advertised());
+        let advertised = voice.adapter.advertised();
         speaks
             && advertised
             && !self

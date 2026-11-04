@@ -2,7 +2,8 @@
 //! calls"): the whole stack in this process with calls and agent-key sign-in, the owner on
 //! an SDK client placing the call with push-sdk's media helper, and the agent enrolled with
 //! a software key running the bridge as `push-agent-bridge run` does (an `SdkMessenger`,
-//! `MediaPhone`), with a scripted backend and the tone-based speech fakes. Over real Opus
+//! `MediaPhone`), with a scripted backend and its speech in the testkit's scripted voice
+//! adapter (spawned; `Agent::start`). Over real Opus
 //! media the owner hears the greeting and the spoken replies, its recorded fixtures become
 //! a prompt, a steer that cuts the reply short (barge-in) and a voice approval; a stranger's
 //! call never reaches the bridge, and the owner hangs up. A second test runs the answering

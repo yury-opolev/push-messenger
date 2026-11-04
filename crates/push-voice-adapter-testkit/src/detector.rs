@@ -5,8 +5,8 @@
 //! repeating the previous one is not added again); [`END_SILENCE_FRAMES`] frames without
 //! any word end it: the final transcript is its words joined by spaces.
 //!
-//! push-bridge's PR 7 fixtures (one word per utterance, separated by a second of silence)
-//! give the transcripts its built-in fake speech-to-text gives.
+//! The recorded [`crate::fixture`]s say one word per utterance, each followed by a second
+//! of silence: each utterance's transcript is its word.
 
 use crate::script::Word;
 use crate::tones::{HEARING, amplitude};

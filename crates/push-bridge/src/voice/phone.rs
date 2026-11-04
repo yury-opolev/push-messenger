@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use push_sdk::{CallEndReason, CallEvent, CallId, SdkError, UserId};
 use tokio::sync::{Notify, mpsc, oneshot, watch};
 
-use super::{Frame, wav};
+use super::{Frame, frames};
 use crate::messenger::wait;
 
 /// How a call ended, as the server or the media said.
@@ -357,7 +357,7 @@ impl FakeCall {
 
     /// The owner says `samples`: 20 ms frames into the bridge as fast as it takes them.
     pub async fn say(&self, samples: &[i16]) {
-        for frame in wav::frames(samples) {
+        for frame in frames(samples) {
             if !self.send(frame).await {
                 return;
             }
@@ -367,7 +367,7 @@ impl FakeCall {
     /// The owner says `samples` in real time: one frame per 20 ms.
     pub async fn say_paced(&self, samples: &[i16]) {
         let mut ticks = tokio::time::interval(FRAME_TIME);
-        for frame in wav::frames(samples) {
+        for frame in frames(samples) {
             ticks.tick().await;
             if !self.send(frame).await {
                 return;
@@ -591,7 +591,9 @@ impl LineControl for FakeControl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::voice::fake::{TTS_HZ, amplitude, tone};
+    use push_voice_adapter_testkit::tones::{
+        SPEAK_AMPLITUDE, SPEAK_HZ, amplitude, tone, tone_frame,
+    };
 
     fn ended(call_id: CallId, reason: CallEndReason) -> CallEvent {
         CallEvent::Ended {
@@ -647,7 +649,7 @@ mod tests {
         assert_eq!(call.call_id, first);
         assert_eq!(phone.answered(), vec![first]);
 
-        call.say(&tone(450.0, 100, 8000.0)).await;
+        call.say(&tone(450.0, 5)).await;
         for _ in 0..5 {
             assert_eq!(line.incoming.recv().await.unwrap().len(), 320);
         }
@@ -684,7 +686,8 @@ mod tests {
         let line = phone.answer(CallId::new(), "offer").await.unwrap();
         let call = phone.wait_answered().await;
         let started = Instant::now();
-        for frame in wav::frames(&tone(TTS_HZ, 1000, 6000.0)) {
+        for index in 0..50 {
+            let frame = tone_frame(SPEAK_HZ, SPEAK_AMPLITUDE, index);
             assert!(line.speaker.send(frame).await);
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -701,7 +704,7 @@ mod tests {
             call.heard_since_clear().len() == 320
         })
         .await;
-        assert!(amplitude(&call.heard()[..1600], TTS_HZ) > 5000.0);
+        assert!(amplitude(&call.heard()[..1600], SPEAK_HZ) > 5000.0);
     }
 
     #[tokio::test]

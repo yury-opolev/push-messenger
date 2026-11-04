@@ -366,11 +366,8 @@ fn voice_setup(config: &Config, client: &Client, dir: &Path) -> Option<VoiceSetu
     );
     Some(VoiceSetup {
         phone: Arc::new(MediaPhone::new(client)),
-        stt: None,
-        tts: None,
-        vad: Default::default(),
         policy,
-        adapter: Some(AdapterSetup::new(supervisor, calls.language.clone())),
+        adapter: AdapterSetup::new(supervisor, calls.language.clone()),
     })
 }
 
@@ -535,7 +532,7 @@ async fn run(dir: &Path) -> Result<(), Failure> {
     };
     let (client, events) = open_client(&config, &state)?;
     let voice = voice_setup(&config, &client, dir);
-    let adapter = voice.as_ref().and_then(|voice| voice.adapter.clone());
+    let adapter = voice.as_ref().map(|voice| voice.adapter.clone());
     let call_flag: CallFlag = Arc::new(watch::channel(false).0);
     // With a voice adapter, calls are advertised while it can listen and no call runs.
     let advertiser = adapter.as_ref().map(|adapter| {

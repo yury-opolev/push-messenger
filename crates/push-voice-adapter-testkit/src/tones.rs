@@ -1,8 +1,8 @@
 //! Speech is tones: a word is a sine at its frequency, the adapter's voice a sine at
-//! [`crate::Script::speak_hz`]. The same rules as push-bridge's PR 7 fakes
-//! (`push_bridge::voice::fake`), so its recorded fixtures work here too: word frequencies
-//! lie between [`MIN_WORD_HZ`] and [`MAX_WORD_HZ`], at least [`MIN_WORD_GAP_HZ`] apart and
-//! at least [`MIN_SPEAK_GAP_HZ`] from the voice's frequency.
+//! [`crate::Script::speak_hz`]. Word frequencies lie between [`MIN_WORD_HZ`] and
+//! [`MAX_WORD_HZ`], at least [`MIN_WORD_GAP_HZ`] apart and at least [`MIN_SPEAK_GAP_HZ`]
+//! from the voice's frequency (the [`crate::fixture`]s follow these rules), so the
+//! adapter's voice is never heard as the caller's words, even through real Opus media.
 
 use std::f64::consts::PI;
 
@@ -75,7 +75,7 @@ pub fn frames(samples: &[i16]) -> Vec<FrameSamples> {
 }
 
 /// The amplitude of the `hz` component of `samples` (Goertzel): a sine of amplitude `a`
-/// at `hz` gives about `a`. A copy of `push_bridge::voice::fake::amplitude`.
+/// at `hz` gives about `a`.
 pub fn amplitude(samples: &[i16], hz: f64) -> f64 {
     if samples.is_empty() {
         return 0.0;

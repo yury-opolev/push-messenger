@@ -1,6 +1,8 @@
 //! What a scripted adapter saw and did, with when: for tests' assertions and timing
 //! (`final transcript sent → speak received`). Content-free like the protocol's logs:
-//! lengths, never transcript or speech text.
+//! lengths, never transcript or speech text. The one exception stays in memory: the texts
+//! the adapter started to speak ([`Log::spoken`]), for in-process tests' assertions,
+//! never written to the log file.
 
 use std::fs::File;
 use std::io::Write;
@@ -111,6 +113,7 @@ struct Line<'a> {
 struct Inner {
     start: Instant,
     events: Mutex<Vec<Observed>>,
+    spoken: Mutex<Vec<String>>,
     file: Mutex<Option<File>>,
     changed: Notify,
 }
@@ -136,6 +139,7 @@ impl Log {
         Self(Arc::new(Inner {
             start: Instant::now(),
             events: Mutex::new(Vec::new()),
+            spoken: Mutex::new(Vec::new()),
             file: Mutex::new(None),
             changed: Notify::new(),
         }))
@@ -175,6 +179,26 @@ impl Log {
             .expect("the log is not poisoned")
             .push(Observed { at, event });
         self.0.changed.notify_waiters();
+    }
+
+    /// Records that the adapter started to speak `text` (memory only).
+    pub(crate) fn said(&self, text: &str) {
+        self.0
+            .spoken
+            .lock()
+            .expect("the log is not poisoned")
+            .push(text.to_owned());
+        self.0.changed.notify_waiters();
+    }
+
+    /// The texts the adapter started to speak (their first frame was sent), in order.
+    /// Kept in memory only: never written to the log file.
+    pub fn spoken(&self) -> Vec<String> {
+        self.0
+            .spoken
+            .lock()
+            .expect("the log is not poisoned")
+            .clone()
     }
 
     /// Every event so far.

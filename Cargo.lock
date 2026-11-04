@@ -2689,7 +2689,6 @@ dependencies = [
  "push-voice-adapter-proto",
  "push-voice-adapter-testkit",
  "regex",
- "reqwest",
  "serde",
  "serde_json",
  "thiserror",

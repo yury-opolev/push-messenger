@@ -1,7 +1,6 @@
 //! One call's pipeline: the owner's audio in, transcripts out; sentences in, the agent's
-//! audio out. The speech itself runs in a [`SpeechEngine`]: the bridge's own providers
-//! ([`Session::start`], [`BuiltinEngine`]) or a voice adapter ([`Session::with_adapter`],
-//! [`AdapterEngine`]).
+//! audio out. The speech itself runs in a [`SpeechEngine`]: the voice adapter's
+//! ([`Session::with_adapter`], [`AdapterEngine`]).
 //!
 //! - A watcher waits for the media to connect ([`SessionEvent::Connected`]) and for the
 //!   end: [`SessionEvent::Ended`] exactly once, after which every task of the session has
@@ -13,17 +12,16 @@
 //!   A barge-in also mutes the agent's reply: [`Session::say_reply`] drops its sentences
 //!   until [`Session::unmute`], so the rest of the interrupted reply is not spoken even
 //!   when the core handles reply text before it handles the `BargedIn` event.
-//! - The engine transcribes one utterance at a time, in order: a non-empty text is a
+//! - The engine reports each utterance's text, in order: a non-empty text is a
 //!   [`SessionEvent::Transcript`] (stamped with when its speech started), a failure a
 //!   [`SessionEvent::SpeechFailed`] with a content-free code.
 //! - The engine speaks the queued sentences one by one and queues their frames on the
-//!   line's speaker, which plays them in real time (and may queue seconds ahead): it keeps
-//!   when the queued audio will have played and reports `Speaking(false)` only then.
+//!   line's speaker, which plays them in real time: it reports `Speaking(false)` only once
+//!   the queued audio played.
 //!   Sentences queued before a barge-in or a [`Session::hush`] are never spoken.
 //!
 //! Logs carry durations, counts and codes only: never audio or text.
 //!
-//! [`BuiltinEngine`]: super::engine::BuiltinEngine
 //! [`AdapterEngine`]: super::adapter::router::AdapterEngine
 
 use std::sync::Arc;
@@ -36,19 +34,8 @@ use tokio::time::Instant;
 
 use super::Frame;
 use super::adapter::router::{AdapterEngine, AdapterSetup};
-use super::engine::{BuiltinEngine, Sentence, SpeechContext, SpeechEngine};
+use super::engine::{Sentence, SpeechContext, SpeechEngine};
 use super::phone::{Line, LineControl, LineEnded};
-use super::provider::{Stt, Tts};
-use super::vad::VadConfig;
-
-#[cfg(test)]
-use super::phone::Speaker;
-#[cfg(test)]
-use std::sync::atomic::AtomicBool;
-#[cfg(test)]
-use std::time::Duration;
-#[cfg(test)]
-use tokio::sync::Notify;
 
 /// What a call's pipeline reports to the core.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,11 +46,11 @@ pub enum SessionEvent {
     Listening(bool),
     /// The owner spoke over the agent: its speech was cut.
     BargedIn,
-    /// An utterance's text (never empty), and when its speech started (the detector's
-    /// onset, not its pre-roll; the adapter's `speech_started`).
+    /// An utterance's text (never empty), and when its speech started (the adapter's
+    /// `speech_started`).
     Transcript { text: String, started: Instant },
-    /// An utterance could not be transcribed (content-free code: the STT provider's, or
-    /// `recognition_failed` from the voice adapter).
+    /// An utterance could not be transcribed (content-free code: `recognition_failed`
+    /// from the voice adapter).
     SpeechFailed(String),
     /// The agent started (true) or stopped (false) speaking.
     Speaking(bool),
@@ -100,20 +87,6 @@ pub struct Session {
 }
 
 impl Session {
-    /// Runs the call's pipeline with the bridge's own speech providers on the current
-    /// runtime until it ends.
-    pub fn start(
-        line: Line,
-        stt: Arc<dyn Stt>,
-        tts: Option<Arc<dyn Tts>>,
-        vad: VadConfig,
-        events: EventSink,
-    ) -> Self {
-        Self::with_engine(line, events, move |ctx| {
-            Arc::new(BuiltinEngine::start(ctx, stt, tts, vad))
-        })
-    }
-
     /// Runs the call's pipeline with speech in the voice adapter `adapter` supervises.
     /// `peer`: the owner's display name, for the adapter (cut to 64 characters).
     pub fn with_adapter(line: Line, adapter: &AdapterSetup, peer: &str, events: EventSink) -> Self {
@@ -157,14 +130,14 @@ impl Session {
         self.call_id
     }
 
-    /// Queues one sentence to speak (ignored without TTS), muted or not: for what the
+    /// Queues one sentence to speak (ignored when the adapter cannot speak), muted or not: for what the
     /// bridge itself says (the greeting, cards, confirmations).
     pub fn say(&self, text: impl Into<String>) {
         self.queue(text.into(), false);
     }
 
     /// Queues one sentence of the agent's reply to speak, unless a barge-in muted the
-    /// reply (ignored without TTS).
+    /// reply (ignored when the adapter cannot speak).
     pub fn say_reply(&self, text: impl Into<String>) {
         self.queue(text.into(), true);
     }
@@ -305,58 +278,84 @@ async fn listen(engine: Arc<dyn SpeechEngine>, mut incoming: mpsc::Receiver<Fram
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::voice::fake::{FakeStt, FakeTts, TTS_HZ, amplitude, silence, tone};
-    use crate::voice::phone::{FakeCall, FakePhone, Phone};
-    use crate::voice::provider::SpeechError;
+    use std::time::Duration;
+
     use push_sdk::CallEndReason;
+    use push_voice_adapter_proto::BridgeHello;
+    use push_voice_adapter_testkit::{Script, Word, tones};
 
-    const SAMPLES_PER_MS: usize = 16;
-
-    fn stt() -> Arc<FakeStt> {
-        Arc::new(FakeStt::new(vec![
-            (450.0, "hello".into()),
-            (900.0, "approve".into()),
-        ]))
-    }
+    use super::*;
+    use crate::voice::FRAME;
+    use crate::voice::adapter::supervisor::Supervisor;
+    use crate::voice::adapter::supervisor::testing::{Plan, ScriptedStarter};
+    use crate::voice::phone::{FakeCall, FakePhone, Phone};
 
     struct Call {
         session: Session,
         owner: FakeCall,
         events: mpsc::UnboundedReceiver<SessionEvent>,
+        /// Keeps the adapter's supervisor running.
+        _setup: AdapterSetup,
     }
 
-    async fn call_with(stt: Arc<dyn Stt>, tts: Option<Arc<dyn Tts>>) -> Call {
-        let phone = FakePhone::new();
-        let line = phone.answer(CallId::new(), "offer").await.unwrap();
-        let owner = phone.wait_answered().await;
+    const WORD_HZ: f64 = 450.0;
+
+    /// The owner says a word: a tone between silences.
+    fn word() -> Vec<i16> {
+        let mut audio = tones::silence(5);
+        audio.extend(tones::tone(WORD_HZ, 20));
+        audio.extend(tones::silence(25));
+        audio
+    }
+
+    /// The testkit's adapter, hearing [`word`], once ready.
+    async fn adapter() -> AdapterSetup {
+        let script = Script::with_words(vec![Word::new(WORD_HZ, "hello")]);
+        let starter = ScriptedStarter::new([Plan::Adapter(script)]);
+        let supervisor = Supervisor::with_starter(starter, BridgeHello::v1("1.2.3", "en-US"));
+        let mut current = supervisor.current();
+        tokio::time::timeout(Duration::from_secs(10), current.wait_for(Option::is_some))
+            .await
+            .expect("the adapter gets ready")
+            .unwrap();
+        AdapterSetup::new(supervisor, "en-US")
+    }
+
+    fn sink() -> (EventSink, mpsc::UnboundedReceiver<SessionEvent>) {
         let (sender, events) = mpsc::unbounded_channel();
         let sink: EventSink = Arc::new(move |event| {
             let _ = sender.send(event);
         });
-        let session = Session::start(line, stt, tts, VadConfig::default(), sink);
+        (sink, events)
+    }
+
+    /// A connected call whose speech runs in the testkit's adapter.
+    async fn call() -> Call {
+        let setup = adapter().await;
+        let phone = FakePhone::new();
+        let line = phone.answer(CallId::new(), "offer").await.unwrap();
+        let owner = phone.wait_answered().await;
+        let (sink, events) = sink();
+        let session = Session::with_adapter(line, &setup, "", sink);
         let mut call = Call {
             session,
             owner,
             events,
+            _setup: setup,
         };
         call.until(&SessionEvent::Connected).await;
         call
     }
 
-    async fn call() -> Call {
-        call_with(stt(), Some(Arc::new(FakeTts::new()))).await
-    }
-
     impl Call {
-        /// The events up to and including `wanted`; panics after 10 s.
+        /// The events up to and including `wanted`; panics after 60 s.
         async fn until(&mut self, wanted: &SessionEvent) -> Vec<SessionEvent> {
             let mut seen = Vec::new();
-            let deadline = Instant::now() + Duration::from_secs(10);
+            let deadline = Instant::now() + Duration::from_secs(60);
             loop {
                 match tokio::time::timeout_at(deadline, self.events.recv()).await {
                     Ok(Some(event)) => {
-                        let found = same(&event, wanted);
+                        let found = event == *wanted;
                         seen.push(event);
                         if found {
                             return seen;
@@ -379,139 +378,30 @@ mod tests {
         }
     }
 
-    /// A transcript of `text`; [`same`] does not compare its onset.
-    fn transcript(text: &str) -> SessionEvent {
-        SessionEvent::Transcript {
-            text: text.into(),
-            started: Instant::now(),
-        }
-    }
-
-    /// Whether `event` is `wanted`, but for a transcript's onset.
-    fn same(event: &SessionEvent, wanted: &SessionEvent) -> bool {
-        match (event, wanted) {
-            (
-                SessionEvent::Transcript { text, .. },
-                SessionEvent::Transcript { text: wanted, .. },
-            ) => text == wanted,
-            _ => event == wanted,
-        }
-    }
-
     fn words(count: usize) -> String {
         vec!["word"; count].join(" ")
     }
 
-    fn utterance(hz: f64) -> Vec<i16> {
-        let mut audio = silence(200);
-        audio.extend(tone(hz, 900, 8000.0));
-        audio.extend(silence(900));
-        audio
+    /// Frames the testkit's voice speaks `text` for (40 ms a character).
+    fn frames_of(text: &str) -> usize {
+        Script::default().speak_frames(text.chars().count())
     }
 
-    #[tokio::test]
-    async fn an_utterance_becomes_a_transcript() {
-        let mut call = call().await;
-        let before = Instant::now();
-        call.owner.say_paced(&utterance(900.0)).await;
-        let said = Instant::now();
-        let seen = call.until(&transcript("approve")).await;
-        assert_eq!(
-            seen[..2],
-            [
-                SessionEvent::Listening(true),
-                SessionEvent::Listening(false)
-            ]
-        );
-        assert_eq!(seen.len(), 3);
-        let SessionEvent::Transcript { text, started } = &seen[2] else {
-            panic!("{seen:?}");
-        };
-        assert_eq!(text, "approve");
-        // The onset: after the 200 ms of silence, long before the utterance ended.
-        assert!(*started >= before + Duration::from_millis(200), "{seen:?}");
-        assert!(*started + Duration::from_millis(500) < said, "{seen:?}");
-        assert!(!call.session.speaking());
-    }
-
-    #[tokio::test]
-    async fn a_sentence_is_spoken_and_speaking_ends_after_playback() {
-        let mut call = call().await;
-        let started = Instant::now();
-        call.session.say("one two three four five");
-        assert!(call.session.speaking());
-        assert_eq!(
-            call.until(&SessionEvent::Speaking(true)).await,
-            vec![SessionEvent::Speaking(true)]
-        );
-        assert!(call.session.speaking());
-        assert_eq!(
-            call.until(&SessionEvent::Speaking(false)).await,
-            vec![SessionEvent::Speaking(false)]
-        );
-        let elapsed = started.elapsed();
-        assert!(elapsed >= Duration::from_millis(250), "{elapsed:?}");
-        assert!(elapsed < Duration::from_millis(2000), "{elapsed:?}");
-        assert!(!call.session.speaking());
-        call.owner
-            .wait_until("the whole sentence", |owner| {
-                owner.heard().len() >= 300 * SAMPLES_PER_MS
-            })
-            .await;
-        let heard = call.owner.heard();
-        assert_eq!(heard.len(), 300 * SAMPLES_PER_MS);
-        assert!(amplitude(&heard, TTS_HZ) > 5000.0);
-    }
-
-    #[tokio::test]
-    async fn the_owner_barges_in_and_the_agent_stops_at_once() {
-        let mut call = call().await;
-        call.session.say(words(50));
-        call.session.say(words(20));
-        call.until(&SessionEvent::Speaking(true)).await;
-        tokio::time::sleep(Duration::from_millis(400)).await;
-        let owner = call.owner.clone();
-        let speaking = tokio::spawn(async move { owner.say_paced(&utterance(450.0)).await });
-        let seen = call.until(&SessionEvent::BargedIn).await;
-        assert!(!seen.contains(&SessionEvent::Speaking(false)), "{seen:?}");
-        assert_eq!(
-            call.until(&SessionEvent::Listening(true)).await,
-            vec![SessionEvent::Speaking(false), SessionEvent::Listening(true)]
-        );
-        assert!(call.owner.clears() >= 1);
-        assert!(!call.session.speaking());
-        let heard = call.owner.heard().len();
-        assert!(heard < 1500 * SAMPLES_PER_MS, "heard {heard} samples");
-        let seen = call.until(&transcript("hello")).await;
-        assert!(!seen.contains(&SessionEvent::Speaking(true)), "{seen:?}");
-        speaking.await.unwrap();
-        assert_eq!(
-            call.owner.heard().len(),
-            heard,
-            "nothing after the barge-in"
-        );
-
-        call.session.say("one two");
-        call.until(&SessionEvent::Speaking(true)).await;
-        call.until(&SessionEvent::Speaking(false)).await;
-        call.owner
-            .wait_until("the sentence after the barge-in", |owner| {
-                owner.heard_since_clear().len() >= 200 * SAMPLES_PER_MS
-            })
-            .await;
-        let after = call.owner.heard_since_clear();
-        assert_eq!(after.len(), 200 * SAMPLES_PER_MS);
-        assert!(amplitude(&after, TTS_HZ) > 5000.0);
-    }
-
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_barge_in_mutes_the_reply_until_unmuted() {
         let mut call = call().await;
-        call.session.say(words(50));
+        call.session.say_reply(words(50));
         call.until(&SessionEvent::Speaking(true)).await;
-        call.owner.say(&utterance(450.0)).await;
+        let owner = call.owner.clone();
+        let speaking = tokio::spawn(async move { owner.say_paced(&word()).await });
         call.until(&SessionEvent::BargedIn).await;
-        call.until(&transcript("hello")).await;
+        call.until(&SessionEvent::Listening(false)).await;
+        speaking.await.unwrap();
+        let seen = call.during(Duration::from_millis(300)).await;
+        assert!(
+            matches!(&seen[..], [SessionEvent::Transcript { text, .. }] if text == "hello"),
+            "{seen:?}"
+        );
         // The core has not handled `BargedIn` yet: the reply's next sentence is dropped.
         call.session.say_reply("the rest of the reply");
         assert!(!call.session.speaking());
@@ -521,29 +411,25 @@ mod tests {
         call.session.say("one two");
         call.until(&SessionEvent::Speaking(true)).await;
         call.until(&SessionEvent::Speaking(false)).await;
-        call.owner
-            .wait_until("the prompt", |owner| {
-                owner.heard_since_clear().len() >= 200 * SAMPLES_PER_MS
-            })
-            .await;
 
         assert!(call.session.unmute());
         assert!(!call.session.unmute());
         call.session.say_reply("one two three four five");
         call.until(&SessionEvent::Speaking(true)).await;
         call.until(&SessionEvent::Speaking(false)).await;
+        let spoken = frames_of("one two") + frames_of("one two three four five");
         call.owner
-            .wait_until("the reply", |owner| {
-                owner.heard_since_clear().len() >= 500 * SAMPLES_PER_MS
+            .wait_until("the prompt and the reply", |owner| {
+                owner.heard_since_clear().len() >= spoken * FRAME
             })
             .await;
-        assert_eq!(call.owner.heard_since_clear().len(), 500 * SAMPLES_PER_MS);
+        assert_eq!(call.owner.heard_since_clear().len(), spoken * FRAME);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_hush_does_not_mute_the_reply() {
         let mut call = call().await;
-        call.session.say(words(50));
+        call.session.say_reply(words(50));
         call.until(&SessionEvent::Speaking(true)).await;
         call.session.hush();
         call.until(&SessionEvent::Speaking(false)).await;
@@ -552,26 +438,26 @@ mod tests {
         call.until(&SessionEvent::Speaking(true)).await;
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn hush_drops_the_queue_without_a_barge_in() {
         let mut call = call().await;
-        call.session.say(words(50));
-        call.session.say(words(50));
+        call.session.say_reply(words(50));
+        call.session.say_reply(words(50));
         call.until(&SessionEvent::Speaking(true)).await;
         call.session.hush();
         assert!(!call.session.speaking());
         let seen = call.during(Duration::from_millis(500)).await;
         assert_eq!(seen, vec![SessionEvent::Speaking(false)]);
         assert!(call.owner.clears() >= 1);
-        assert!(call.owner.heard().len() < 1000 * SAMPLES_PER_MS);
+        assert!(call.owner.heard().len() < 50 * FRAME);
         call.session.hush();
         assert!(call.during(Duration::from_millis(100)).await.is_empty());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn the_owner_hanging_up_ends_the_session_once() {
         let mut call = call().await;
-        call.session.say(words(50));
+        call.session.say_reply(words(50));
         call.until(&SessionEvent::Speaking(true)).await;
         call.owner.end(CallEndReason::Completed);
         let end = LineEnded {
@@ -587,28 +473,21 @@ mod tests {
         assert!(call.during(Duration::from_millis(100)).await.is_empty());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn the_call_ending_mid_speech_stops_the_speech_first() {
         let mut call = call().await;
-        call.session.say(words(50));
-        call.session.say(words(50));
+        call.session.say_reply(words(50));
+        call.session.say_reply(words(50));
         call.until(&SessionEvent::Speaking(true)).await;
         call.owner.end(CallEndReason::Completed);
-        let seen = call
-            .until(&SessionEvent::Ended(LineEnded {
-                reason: CallEndReason::Completed,
-                duration_s: Some(0),
-            }))
-            .await;
+        let ended = SessionEvent::Ended(LineEnded {
+            reason: CallEndReason::Completed,
+            duration_s: Some(0),
+        });
+        let seen = call.until(&ended).await;
         assert_eq!(
             seen[seen.len() - 2..],
-            [
-                SessionEvent::Speaking(false),
-                SessionEvent::Ended(LineEnded {
-                    reason: CallEndReason::Completed,
-                    duration_s: Some(0),
-                }),
-            ],
+            [SessionEvent::Speaking(false), ended],
             "{seen:?}"
         );
         assert_eq!(
@@ -625,75 +504,7 @@ mod tests {
         assert!(call.during(Duration::from_millis(200)).await.is_empty());
     }
 
-    /// The line's speaker, holding its first frame until released.
-    struct HeldSpeaker {
-        inner: Arc<dyn Speaker>,
-        held: AtomicBool,
-        taking: Notify,
-        release: Notify,
-    }
-
-    #[async_trait::async_trait]
-    impl Speaker for HeldSpeaker {
-        async fn send(&self, frame: Frame) -> bool {
-            if !self.held.swap(true, Ordering::AcqRel) {
-                self.taking.notify_one();
-                self.release.notified().await;
-            }
-            self.inner.send(frame).await
-        }
-
-        fn clear(&self) {
-            self.inner.clear();
-        }
-    }
-
-    #[tokio::test]
-    async fn a_frame_overtaken_by_a_hush_does_not_play() {
-        let phone = FakePhone::new();
-        let mut line = phone.answer(CallId::new(), "offer").await.unwrap();
-        let owner = phone.wait_answered().await;
-        let held = Arc::new(HeldSpeaker {
-            inner: line.speaker.clone(),
-            held: AtomicBool::new(false),
-            taking: Notify::new(),
-            release: Notify::new(),
-        });
-        line.speaker = held.clone();
-        let (sender, events) = mpsc::unbounded_channel();
-        let sink: EventSink = Arc::new(move |event| {
-            let _ = sender.send(event);
-        });
-        let session = Session::start(
-            line,
-            stt(),
-            Some(Arc::new(FakeTts::new())),
-            VadConfig::default(),
-            sink,
-        );
-        let mut call = Call {
-            session,
-            owner,
-            events,
-        };
-        call.until(&SessionEvent::Connected).await;
-        call.session.say("one two");
-        held.taking.notified().await;
-        call.session.hush();
-        assert_eq!(call.owner.clears(), 1);
-        held.release.notify_one();
-        call.owner
-            .wait_until("the second clear", |owner| owner.clears() == 2)
-            .await;
-        assert_eq!(
-            call.during(Duration::from_millis(300)).await,
-            vec![SessionEvent::Speaking(true), SessionEvent::Speaking(false)]
-        );
-        assert!(call.owner.heard().is_empty());
-        assert!(!call.session.speaking());
-    }
-
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn hang_up_hangs_up_and_ends() {
         let mut call = call().await;
         call.session.hang_up();
@@ -706,7 +517,7 @@ mod tests {
         assert!(call.owner.hung_up());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn dropping_the_session_hangs_up() {
         let call = call().await;
         let owner = call.owner.clone();
@@ -716,64 +527,17 @@ mod tests {
             .await;
     }
 
-    #[tokio::test]
-    async fn without_tts_nothing_is_spoken() {
-        let mut call = call_with(stt(), None).await;
-        call.session.say("one two three");
-        assert!(!call.session.speaking());
-        assert!(call.during(Duration::from_millis(300)).await.is_empty());
-        assert!(call.owner.heard().is_empty());
-        call.owner.say(&utterance(450.0)).await;
-        call.until(&transcript("hello")).await;
-    }
-
-    struct FailingStt;
-
-    #[async_trait::async_trait]
-    impl Stt for FailingStt {
-        fn name(&self) -> &'static str {
-            "failing"
-        }
-
-        async fn transcribe(&self, _samples: &[i16]) -> Result<String, SpeechError> {
-            Err(SpeechError::new("failing", "http_500"))
-        }
-    }
-
-    #[tokio::test]
-    async fn an_stt_failure_is_reported_with_its_code() {
-        let mut call = call_with(Arc::new(FailingStt), None).await;
-        call.owner.say(&utterance(450.0)).await;
-        let seen = call
-            .until(&SessionEvent::SpeechFailed("http_500".into()))
-            .await;
-        assert!(
-            !seen
-                .iter()
-                .any(|e| matches!(e, SessionEvent::Transcript { .. }))
-        );
-    }
-
-    #[tokio::test]
-    async fn silence_and_the_unknown_make_no_transcript() {
-        let mut call = call().await;
-        call.owner.say(&utterance(1500.0)).await;
-        call.until(&SessionEvent::Listening(false)).await;
-        assert!(call.during(Duration::from_millis(300)).await.is_empty());
-    }
-
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_call_ending_before_it_connects_ends_without_connecting() {
+        let setup = adapter().await;
         let phone = FakePhone::new();
         phone.delay_connect(Duration::from_secs(5));
         let line = phone.answer(CallId::new(), "offer").await.unwrap();
         let owner = phone.wait_answered().await;
-        let (sender, mut events) = mpsc::unbounded_channel();
-        let sink: EventSink = Arc::new(move |event| {
-            let _ = sender.send(event);
-        });
-        let session = Session::start(line, stt(), None, VadConfig::default(), sink);
+        let (sink, mut events) = sink();
+        let session = Session::with_adapter(line, &setup, "", sink);
         let id = session.call_id();
+        let _setup = setup;
         assert!(session.handle(&CallEvent::Ended {
             call_id: id,
             reason: CallEndReason::Missed,

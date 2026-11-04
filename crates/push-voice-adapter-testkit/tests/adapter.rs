@@ -353,6 +353,11 @@ async fn stop_speaking_cuts_and_drops_with_interrupted_speak_dones() {
         }
     }
     assert_eq!(done, ["s2", "s1", "s3"]);
+    assert_eq!(
+        bridge.log.spoken(),
+        ["x".repeat(100)],
+        "only the speak that started to sound was spoken"
+    );
     // Nothing more plays: the next thing is the pong.
     bridge.send(BridgeMessage::Ping(Ping { id: 9 })).await;
     let AdapterMessage::Pong(pong) = bridge.message().await else {
@@ -578,58 +583,4 @@ async fn no_hello_never_answers_until_the_bridge_leaves() {
     let silent = timeout(limits::HELLO_TIMEOUT * 2, bridge.reader.read_frame()).await;
     assert!(silent.is_err(), "no hello");
     assert_eq!(bridge.close().await.unwrap(), Outcome::Closed);
-}
-
-/// push-bridge's PR 7 voice fixtures give the transcripts its fake speech-to-text gives:
-/// each `say` step is one utterance of its word.
-#[test]
-fn the_bridge_voice_fixtures_hear_their_words() {
-    use push_voice_adapter_testkit::detector::{Detector, Heard};
-    use push_voice_adapter_testkit::tones::frames;
-
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../push-bridge/tests/fixtures/voice");
-    let mut checked = 0;
-    for entry in std::fs::read_dir(&dir).unwrap() {
-        let path = entry.unwrap().path();
-        if path.extension().is_none_or(|extension| extension != "json") {
-            continue;
-        }
-        let fixture: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        let words: Vec<Word> =
-            serde_json::from_value(fixture["words"].clone()).expect("words as in a script");
-        let word_at = |hz: f64| {
-            words
-                .iter()
-                .find(|word| word.hz == hz)
-                .map(|word| word.word.clone())
-                .unwrap()
-        };
-        let mut audio = Vec::new();
-        let mut expected = Vec::new();
-        for step in fixture["script"].as_array().unwrap() {
-            if let Some(say) = step.get("say") {
-                let hz = say["hz"].as_f64().unwrap();
-                audio.extend(tone(hz, say["ms"].as_u64().unwrap() as usize / 20));
-                expected.push(word_at(hz));
-            } else {
-                audio.extend(silence(
-                    step["silence"]["ms"].as_u64().unwrap() as usize / 20,
-                ));
-            }
-        }
-        let mut detector = Detector::new(words.clone());
-        let heard: Vec<String> = frames(&audio)
-            .iter()
-            .flat_map(|frame| detector.push(frame))
-            .filter_map(|heard| match heard {
-                Heard::Final(text) => Some(text),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(heard, expected, "{}", path.display());
-        checked += 1;
-    }
-    assert!(checked >= 5, "the fixtures are found");
 }

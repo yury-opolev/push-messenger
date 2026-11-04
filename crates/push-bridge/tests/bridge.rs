@@ -17,12 +17,14 @@ use push_bridge::messenger::{Call, TestMessenger, param, template};
 use push_bridge::state::StateFile;
 use push_bridge::test_backend::{TestBackend, error};
 use push_bridge::voice::VoiceSetup;
-use push_bridge::voice::fake::{FakeStt, FakeTts, Fixture};
+use push_bridge::voice::adapter::router::AdapterSetup;
+use push_bridge::voice::adapter::supervisor::{Started, Starter, Supervisor};
 use push_bridge::voice::phone::FakePhone;
-use push_bridge::voice::vad::VadConfig;
 use push_bridge_control::transport::{Listener, connect};
 use push_bridge_control::{BridgeState, Event as ControlEvent, ServerLine, Status, endpoint_for};
 use push_sdk::{ActivityState, CallEvent, CallId, ClientMsgId, Event, UserId};
+use push_voice_adapter_proto::BridgeHello;
+use push_voice_adapter_testkit::{Fixture, InProcess, Log, Script, duplex, fixture};
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot};
@@ -941,12 +943,40 @@ async fn a_bridge_without_the_peek_answers_peek_disabled() {
     h.stop().await.unwrap();
 }
 
-/// The fixture `name` from `tests/fixtures/voice`.
-fn voice_fixture(name: &str) -> Fixture {
-    Fixture::load(
-        &Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("tests/fixtures/voice/{name}.json")),
-    )
-    .unwrap()
+/// Starts the testkit's scripted adapter in-process, `script` each time.
+struct TestkitStarter {
+    script: Script,
+    logs: std::sync::Mutex<Vec<Log>>,
+}
+
+#[async_trait::async_trait]
+impl Starter for TestkitStarter {
+    async fn start(&self) -> std::io::Result<Started> {
+        let InProcess {
+            reader,
+            writer,
+            log,
+            task: _,
+        } = duplex(self.script.clone());
+        self.logs.lock().unwrap().push(log);
+        Ok(Started {
+            reader: Box::new(reader),
+            writer: Box::new(writer),
+            child: None,
+        })
+    }
+}
+
+impl TestkitStarter {
+    /// What its adapters started to speak.
+    fn spoken(&self) -> Vec<String> {
+        self.logs
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(Log::spoken)
+            .collect()
+    }
 }
 
 /// A call through the public API: the owner's call is answered and greeted, an utterance
@@ -954,16 +984,19 @@ fn voice_fixture(name: &str) -> Fixture {
 /// stranger's call is declined.
 #[tokio::test(start_paused = true)]
 async fn a_voice_call_end_to_end() {
-    let prompt = voice_fixture("prompt");
-    let approve = voice_fixture("approve");
-    let words = prompt
-        .words
-        .iter()
-        .chain(&approve.words)
-        .map(|word| (word.hz, word.text.clone()))
-        .collect();
+    let prompt = Fixture::named("prompt");
+    let approve = Fixture::named("approve");
+    let starter = Arc::new(TestkitStarter {
+        script: Script::with_words(fixture::all_words()),
+        logs: std::sync::Mutex::default(),
+    });
+    let supervisor = Supervisor::with_starter(
+        Arc::clone(&starter) as Arc<dyn Starter>,
+        BridgeHello::v1("1.2.3", "en-US"),
+    );
+    let mut ready = supervisor.current();
+    within(ready.wait_for(Option::is_some)).await.unwrap();
     let phone = FakePhone::new();
-    let tts = Arc::new(FakeTts::new());
     let (sender, events) = mpsc::unbounded_channel();
     let backend = Arc::new(TestBackend::new("Coda", sender));
     let h = Harness::run_full(
@@ -972,16 +1005,13 @@ async fn a_voice_call_end_to_end() {
         None,
         Some(VoiceSetup {
             phone: phone.clone(),
-            stt: Some(Arc::new(FakeStt::new(words))),
-            tts: Some(tts.clone()),
-            vad: VadConfig::default(),
             policy: Default::default(),
-            adapter: None,
+            adapter: AdapterSetup::new(supervisor, "en-US"),
         }),
     );
     backend.wait_for("start", 1).await;
     settle().await;
-    let spoken = |text: &str| tts.spoken().iter().any(|said| said == text);
+    let spoken = |text: &str| starter.spoken().iter().any(|said| said == text);
     let until_spoken = |text: &'static str| {
         let spoken = &spoken;
         async move {
@@ -1009,7 +1039,7 @@ async fn a_voice_call_end_to_end() {
     until_spoken("Connected to Coda in work.").await;
     tokio::time::sleep(Duration::from_secs(1)).await;
 
-    call.say(&prompt.audio()).await;
+    call.say_paced(&prompt.audio()).await;
     within(backend.wait_for("prompt run the tests", 1)).await;
     let transcript = h
         .messenger
@@ -1029,7 +1059,7 @@ async fn a_voice_call_end_to_end() {
     until_spoken("Coda wants to use Bash. Approve or reject?").await;
     tokio::time::sleep(Duration::from_secs(3)).await;
 
-    call.say(&approve.audio()).await;
+    call.say_paced(&approve.audio()).await;
     assert_eq!(within(answer).await, Ok(Answer::Permission(true)));
     until_spoken("Approved.").await;
     let (_, edit) = h

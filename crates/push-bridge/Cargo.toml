@@ -26,7 +26,6 @@ push-domain.workspace = true
 push-sdk.workspace = true
 push-voice-adapter-proto.workspace = true
 regex.workspace = true
-reqwest = { workspace = true, features = ["rustls-tls"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

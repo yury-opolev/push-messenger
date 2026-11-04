@@ -9,12 +9,14 @@
 //! - It plays faults on demand: a crash, a refused format, another protocol, a stall, a
 //!   flood, no hello ([`Script`]).
 //! - It records what it received and sent, with when, in a [`Log`].
+//! - Its recorded [`fixture`]s (`fixtures/*.json`) script a caller's speech as tones.
 //!
 //! Use it in-process ([`ScriptedAdapter`], [`duplex`]) or as the
 //! `push-voice-adapter-testkit` binary (spawn or connect mode).
 
 mod adapter;
 pub mod detector;
+pub mod fixture;
 pub mod log;
 pub mod script;
 pub mod tones;
@@ -22,6 +24,7 @@ pub mod tones;
 use tokio::io::{AsyncRead, AsyncWrite, DuplexStream};
 use tokio::task::JoinHandle;
 
+pub use fixture::Fixture;
 pub use log::{Event, Log, Observed};
 pub use script::{Script, Word};
 
