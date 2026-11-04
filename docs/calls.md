@@ -1189,8 +1189,12 @@ app's job (a WebRTC stack of its own), or the optional media helper's ([§19](#1
 **Opting in.** Set `Config::calls = true` (default `false`) only in an app that can take
 calls: the client then lists `CAPABILITY_CALLS` in `Identify` and its connections ring.
 `client.calls()` returns a `Calls` handle (a clone of the client: drop it before
-`Client::close`). `Calls::available()` is true while the connection is up and its `Ready`
-offered calls; hide call UI otherwise.
+`Client::close`). `Calls::available()` is true while the connection is up, it advertised
+calls and its `Ready` offered them; hide call UI otherwise.
+`Client::set_calls_advertised(bool)` changes the advertisement at runtime (an agent whose
+speech service came up or went away): a change while connected reconnects at once, without
+backoff, and identifies with the new capabilities (`CallSync` restores call state after it);
+the same value again does nothing. Never change it during a call.
 
 ```rust
 let calls = client.calls();
