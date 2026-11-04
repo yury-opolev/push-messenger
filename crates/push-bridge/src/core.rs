@@ -29,7 +29,7 @@ use push_sdk::{
     ActivityState, CallEvent, CallId, CardBook, ClientMsgId, ConnectionState, ConversationId,
     Event, SdkError, UserId,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::time::{Instant, MissedTickBehavior};
 
 use crate::backend::{
@@ -118,7 +118,13 @@ pub struct Bridge<M: Messenger> {
     _calls: Option<mpsc::Sender<ControlCall>>,
     /// Takes the owner's calls; `None` ignores call events.
     voice: Option<VoiceSetup>,
+    /// Set while a call is in progress (see [`Bridge::with_call_flag`]).
+    call_flag: Option<CallFlag>,
 }
+
+/// `true` while a call rings, is asked about, being answered or placed, or runs, and
+/// once the bridge is stopping: calls advertising waits for it ([`crate::voice::adapter::advertise`]).
+pub type CallFlag = Arc<watch::Sender<bool>>;
 
 impl<M: Messenger> Bridge<M> {
     pub fn new(
@@ -141,6 +147,7 @@ impl<M: Messenger> Bridge<M> {
             calls: Arc::new(tokio::sync::Mutex::new(receiver)),
             _calls: Some(sender),
             voice: None,
+            call_flag: None,
         }
     }
 
@@ -148,6 +155,15 @@ impl<M: Messenger> Bridge<M> {
     pub fn with_voice(self, voice: VoiceSetup) -> Self {
         Self {
             voice: Some(voice),
+            ..self
+        }
+    }
+
+    /// Keeps `flag` `true` while a call is in progress and once the bridge is stopping
+    /// (advertising holds still through the shutdown).
+    pub fn with_call_flag(self, flag: CallFlag) -> Self {
+        Self {
+            call_flag: Some(flag),
             ..self
         }
     }
@@ -177,6 +193,7 @@ impl<M: Messenger> Bridge<M> {
             calls,
             _calls,
             voice,
+            call_flag,
         } = self;
         let mut calls = calls.lock().await;
         let owner = messenger.owner().await.map_err(BridgeError::Messenger)?;
@@ -204,6 +221,7 @@ impl<M: Messenger> Bridge<M> {
         );
         core.control = control;
         core.voice = voice;
+        core.call_flag = call_flag;
         tracing::info!(event = "bridge_started", backend = core.name.as_str());
         core.boot().await;
         core.publish();
@@ -412,12 +430,18 @@ struct Core<M: Messenger> {
     last_dialed: Option<Instant>,
     /// Why the last due call was held back (logged once per change).
     held_by: Option<Verdict>,
+    /// Whether calls are held back because nothing can speak (logged once per change).
+    held_no_tts: bool,
     /// The call's phase and direction, and when that phase began (Unix ms).
     call_since: Option<((CallPhase, CallDirection), i64)>,
     /// The call last reported to the control channel.
     call_reported: Option<CallInfo>,
     /// The tray muted the call being answered: its session starts muted.
     mute_next: bool,
+    /// Set while a call is in progress.
+    call_flag: Option<CallFlag>,
+    /// The voice adapter last reported to the control channel.
+    adapter_reports: crate::voice::adapter::report::AdapterReports,
 }
 
 impl<M: Messenger> Core<M> {
@@ -480,9 +504,12 @@ impl<M: Messenger> Core<M> {
             dialing: None,
             last_dialed: None,
             held_by: None,
+            held_no_tts: false,
             call_since: None,
             call_reported: None,
             mute_next: false,
+            call_flag: None,
+            adapter_reports: Default::default(),
         }
     }
 
@@ -617,7 +644,10 @@ impl<M: Messenger> Core<M> {
     /// once), the activity and the backend.
     async fn close(&mut self) {
         self.stopping = true;
-        self.end_call_at_close();
+        self.sync_call_flag();
+        if let Some(call) = self.end_call_at_close() {
+            call.session.shut_down().await;
+        }
         self.end_pause_at_close();
         self.publish();
         if let Some(mut turn) = self.turn.take() {

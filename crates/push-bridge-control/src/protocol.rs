@@ -314,6 +314,11 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         call: Option<CallInfo>,
     },
+    /// The voice adapter's state changed (its `metrics` are only in the status).
+    AdapterChanged {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        adapter: Option<AdapterStatus>,
+    },
 }
 
 /// The bridge's state, as the tray shows it.
@@ -363,6 +368,72 @@ pub struct Status {
     pub started_at: i64,
     /// The voice call, while one runs or rings.
     pub call: Option<CallInfo>,
+    /// The voice adapter (`calls.adapter`); absent without one (and from older bridges).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub adapter: Option<AdapterStatus>,
+}
+
+/// The voice adapter's state: content-free (a state, the adapter's name, version and
+/// capabilities from its hello, a fixed reason, counts and durations).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+pub struct AdapterStatus {
+    /// "off" | "starting" | "handshaking" | "ready" | "backoff".
+    pub state: String,
+    /// Ready: the adapter's name and version.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// Ready: what it can do: "stt", "tts", "vad", "barge_in", "partials".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<Vec<String>>,
+    /// Backoff: why the last attempt ended (a short fixed phrase or an error code).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Backoff: when the adapter is started again, Unix ms.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_at: Option<i64>,
+    /// The counters since the bridge started (only in the status, not in
+    /// `adapter_changed`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<AdapterMetrics>,
+}
+
+/// The voice adapter's counters: frames, drops, restarts and latencies only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+pub struct AdapterMetrics {
+    /// Calls the adapter took.
+    pub calls: u64,
+    /// The owner's audio frames given to the adapter.
+    pub frames_to_adapter: u64,
+    /// The adapter's audio frames played in calls.
+    pub frames_from_adapter: u64,
+    /// The owner's frames dropped because the adapter did not keep up (the current
+    /// connection).
+    pub dropped_to_adapter: u64,
+    /// The adapter's frames dropped (too many, too fast, of a stopped or no speech).
+    pub dropped_from_adapter: u64,
+    /// How often the adapter was started again.
+    pub restarts: u64,
+    /// `speak` requests sent.
+    pub speaks: u64,
+    /// A final transcript → the first `speak` after it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub final_to_speak: Option<LatencyInfo>,
+    /// A `speak` → its first audio frame.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speak_to_audio: Option<LatencyInfo>,
+}
+
+/// The last, average and longest of a latency, in milliseconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+pub struct LatencyInfo {
+    pub last_ms: u64,
+    pub avg_ms: u64,
+    pub max_ms: u64,
 }
 
 /// Who the bridge is signed in as.
@@ -918,6 +989,73 @@ mod tests {
     }
 
     #[test]
+    fn the_adapter_status_and_adapter_changed_serialize_as_documented() {
+        let ready = AdapterStatus {
+            state: "ready".into(),
+            name: Some("whisper".into()),
+            version: Some("1.2.3".into()),
+            capabilities: Some(vec!["stt".into(), "tts".into(), "barge_in".into()]),
+            ..AdapterStatus::default()
+        };
+        let line = EventLine {
+            event: Event::AdapterChanged {
+                adapter: Some(ready.clone()),
+            },
+            at: 5,
+        };
+        let wire = r#"{"event":"adapter_changed","adapter":{"state":"ready","name":"whisper","version":"1.2.3","capabilities":["stt","tts","barge_in"]},"at":5}"#;
+        assert_eq!(encode(&line), format!("{wire}\n"));
+        assert_eq!(
+            serde_json::from_str::<ServerLine>(wire).unwrap(),
+            ServerLine::Event(line)
+        );
+        let backoff = AdapterStatus {
+            state: "backoff".into(),
+            reason: Some("not_found".into()),
+            retry_at: Some(9),
+            metrics: Some(AdapterMetrics {
+                calls: 1,
+                frames_to_adapter: 2,
+                dropped_from_adapter: 3,
+                restarts: 4,
+                speak_to_audio: Some(LatencyInfo {
+                    last_ms: 5,
+                    avg_ms: 6,
+                    max_ms: 7,
+                }),
+                ..AdapterMetrics::default()
+            }),
+            ..AdapterStatus::default()
+        };
+        let status = Status {
+            adapter: Some(backoff),
+            ..Status::default()
+        };
+        let value = serde_json::to_value(&status).unwrap();
+        assert_eq!(value["adapter"]["retryAt"], 9);
+        assert_eq!(value["adapter"]["metrics"]["droppedFromAdapter"], 3);
+        assert_eq!(value["adapter"]["metrics"]["speakToAudio"]["avgMs"], 6);
+        assert_eq!(serde_json::from_value::<Status>(value).unwrap(), status);
+        // Without an adapter the field is absent (older trays never see it) …
+        let none = serde_json::to_value(Status::default()).unwrap();
+        assert!(none.get("adapter").is_none(), "{none}");
+        // … and an older bridge's status, or an adapter with fields this tray does not
+        // know, still reads.
+        let old: Status = serde_json::from_value(json!({"protocol": 1})).unwrap();
+        assert_eq!(old.adapter, None);
+        let newer: Status = serde_json::from_value(
+            json!({"adapter": {"state": "starting", "future": 1, "metrics": {"x": 2}}}),
+        )
+        .unwrap();
+        assert_eq!(newer.adapter.unwrap().state, "starting");
+        let bare = EventLine {
+            event: Event::AdapterChanged { adapter: None },
+            at: 6,
+        };
+        assert_eq!(encode(&bare), "{\"event\":\"adapter_changed\",\"at\":6}\n");
+    }
+
+    #[test]
     fn mute_params_are_optional_and_checked() {
         for line in [
             r#"{"id":3,"method":"mute"}"#,
@@ -981,7 +1119,33 @@ mod tests {
             last_error: _,     // see LastError
             started_at: _,     // a time
             call: _,           // see CallInfo
+            adapter: _,        // see AdapterStatus
         } = Status::default();
+        let AdapterStatus {
+            state: _,        // a fixed state name
+            name: _,         // the adapter's program name from its hello
+            version: _,      // its version
+            capabilities: _, // fixed capability names
+            reason: _,       // a fixed phrase or an error code, never a message's text
+            retry_at: _,     // a time
+            metrics: _,      // see AdapterMetrics
+        } = AdapterStatus::default();
+        let AdapterMetrics {
+            calls: _,                // counts …
+            frames_to_adapter: _,    //
+            frames_from_adapter: _,  //
+            dropped_to_adapter: _,   //
+            dropped_from_adapter: _, //
+            restarts: _,             //
+            speaks: _,               //
+            final_to_speak: _,       // durations
+            speak_to_audio: _,       //
+        } = AdapterMetrics::default();
+        let LatencyInfo {
+            last_ms: _,
+            avg_ms: _,
+            max_ms: _,
+        } = LatencyInfo::default();
         let CallInfo {
             phase: _,     // a fixed phase name
             direction: _, // incoming or outgoing
@@ -1068,6 +1232,8 @@ mod tests {
                 Event::PeekChanged => false,
                 // A phase, a direction, flags and a time.
                 Event::CallChanged { .. } => false,
+                // A state, the adapter's name, version and capabilities, a fixed reason.
+                Event::AdapterChanged { .. } => false,
             }
         }
         let calls = [
@@ -1120,6 +1286,7 @@ mod tests {
             },
             Event::PeekChanged,
             Event::CallChanged { call: None },
+            Event::AdapterChanged { adapter: None },
         ];
         for event in &events {
             assert!(!event_carries_text(event), "{event:?}");

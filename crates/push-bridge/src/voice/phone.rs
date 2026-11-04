@@ -270,6 +270,8 @@ struct CallInner {
     sender: Option<mpsc::Sender<Frame>>,
     heard: Vec<i16>,
     heard_since_clear: Vec<i16>,
+    /// When each heard frame started to play.
+    played_at: Vec<tokio::time::Instant>,
     clears: usize,
     hung_up: bool,
     handled: Vec<CallEvent>,
@@ -391,6 +393,11 @@ impl FakeCall {
         self.shared.inner().heard_since_clear.clone()
     }
 
+    /// When each frame [`FakeCall::heard`] holds started to play, in order.
+    pub fn played_at(&self) -> Vec<tokio::time::Instant> {
+        self.shared.inner().played_at.clone()
+    }
+
     /// How often the bridge cleared its speaker.
     pub fn clears(&self) -> usize {
         self.shared.inner().clears
@@ -464,6 +471,7 @@ async fn play(shared: Arc<CallShared>, mut played: mpsc::Receiver<(u64, Frame)>)
             let mut inner = shared.inner();
             inner.heard.extend_from_slice(&frame);
             inner.heard_since_clear.extend_from_slice(&frame);
+            inner.played_at.push(slot);
         }
         shared.changed.notify_waiters();
         slot += FRAME_TIME;

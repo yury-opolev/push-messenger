@@ -24,6 +24,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
@@ -82,6 +83,9 @@ pub(crate) enum Command {
     /// A frame nothing answers (activity): sent while a connection is live, dropped
     /// otherwise, never queued for a later connection.
     Frame(Body),
+    /// The capabilities to advertise changed: a connection that identified with others
+    /// (or is identifying) starts again at once, without backoff.
+    CapabilitiesChanged,
 }
 
 /// Where the gateway is.
@@ -99,6 +103,8 @@ enum Ended {
     Disconnected(Option<oneshot::Sender<()>>),
     /// The client is gone.
     Closed,
+    /// The capabilities to advertise changed: identify again at once.
+    CapabilitiesChanged,
     /// No credentials, or auth-svc refused them.
     SignedOut,
     Lost {
@@ -133,8 +139,9 @@ pub(crate) struct Connection {
     shared: Arc<Shared>,
     credentials: Arc<Credentials>,
     endpoint: Endpoint,
-    /// [`crate::Config::calls`]: advertise calls in `Identify`.
-    calls: bool,
+    /// [`crate::Config::calls`], changed by [`crate::Client::set_calls_advertised`]:
+    /// advertise calls in `Identify`. Read for every `Identify`.
+    calls: Arc<AtomicBool>,
     state: Arc<watch::Sender<ConnectionState>>,
     commands: mpsc::UnboundedReceiver<Command>,
     engine: Engine,
@@ -148,7 +155,7 @@ impl Connection {
         shared: Arc<Shared>,
         credentials: Arc<Credentials>,
         endpoint: Endpoint,
-        calls: bool,
+        calls: Arc<AtomicBool>,
         state: Arc<watch::Sender<ConnectionState>>,
         commands: mpsc::UnboundedReceiver<Command>,
     ) -> Self {
@@ -197,12 +204,20 @@ impl Connection {
                         let _ = ack.send(());
                         continue;
                     }
-                    Some(Command::Disconnect | Command::Wake | Command::Frame(_)) => continue,
+                    Some(
+                        Command::Disconnect
+                        | Command::Wake
+                        | Command::Frame(_)
+                        | Command::CapabilitiesChanged,
+                    ) => continue,
                 }
             }
             self.set_state(ConnectionState::Connecting);
             let (after, ready_for, token) = match self.connect_and_serve().await {
                 Ended::Closed => return,
+                // Reconnect at once without counting this one as a failure; the backoff
+                // history of earlier failures stays.
+                Ended::CapabilitiesChanged => continue,
                 Ended::Disconnected(ack) => {
                     wanted = false;
                     self.set_state(ConnectionState::Offline);
@@ -295,7 +310,10 @@ impl Connection {
                         Some(Command::Request { reply, .. }) => {
                             let _ = reply.send(Err(SdkError::Offline));
                         }
-                        Some(Command::Wake | Command::Frame(_)) => {}
+                        // The next attempt reads the new capabilities anyway.
+                        Some(
+                            Command::Wake | Command::Frame(_) | Command::CapabilitiesChanged,
+                        ) => {}
                     },
                 }
             }
@@ -306,11 +324,12 @@ impl Connection {
     /// connection serves, nothing of it is worth keeping, and a `Stop` must not wait for
     /// a slow gateway.
     async fn connect_and_serve(&mut self) -> Ended {
+        let calls = self.calls.load(Ordering::SeqCst);
         let mut handshake = Box::pin(Self::handshake(
             self.credentials.clone(),
             self.shared.clone(),
             self.endpoint.clone(),
-            self.calls,
+            calls,
         ));
         let shaken = loop {
             tokio::select! {
@@ -326,12 +345,19 @@ impl Connection {
                     Some(Command::Request { reply, .. }) => {
                         let _ = reply.send(Err(SdkError::Offline));
                     }
+                    Some(Command::CapabilitiesChanged) => {
+                        if self.calls.load(Ordering::SeqCst) != calls {
+                            tracing::debug!(reason = "capabilities_changed", "identifying again");
+                            drop(handshake);
+                            return Ended::CapabilitiesChanged;
+                        }
+                    }
                     Some(Command::Connect | Command::Wake | Command::Frame(_)) => {}
                 },
             }
         };
         match shaken {
-            Ok((socket, session, ready)) => self.serve(socket, &session, &ready).await,
+            Ok((socket, session, ready)) => self.serve(socket, &session, &ready, calls).await,
             Err(ended) => ended,
         }
     }
@@ -433,7 +459,15 @@ impl Connection {
         Ok((socket, session, ready))
     }
 
-    async fn serve(&mut self, socket: Socket, session: &Session, ready: &v1::Ready) -> Ended {
+    /// Serves an identified connection; `advertised_calls`: whether its `Identify`
+    /// advertised calls.
+    async fn serve(
+        &mut self,
+        socket: Socket,
+        session: &Session,
+        ready: &v1::Ready,
+        advertised_calls: bool,
+    ) -> Ended {
         let ready_at = Instant::now();
         let heartbeat = Duration::from_millis(u64::from(ready.heartbeat_ms).clamp(1_000, 600_000));
         let mut live = Live {
@@ -448,7 +482,7 @@ impl Connection {
             refresh_at: None,
             reauth_at: None,
         };
-        let calls = self.calls && ready.capabilities.contains(&Capability::Calls.into());
+        let calls = advertised_calls && ready.capabilities.contains(&Capability::Calls.into());
         self.shared.set_calls_offered(Some(calls));
         self.set_state(ConnectionState::Connected);
         let mut out = Vec::new();
@@ -512,6 +546,14 @@ impl Connection {
                         return Ended::Disconnected(Some(ack));
                     }
                     Some(Command::Connect) => {}
+                    Some(Command::CapabilitiesChanged) => {
+                        if self.calls.load(Ordering::SeqCst) != advertised_calls {
+                            tracing::debug!(reason = "capabilities_changed", "identifying again");
+                            live.close().await;
+                            self.end(&mut live);
+                            return Ended::CapabilitiesChanged;
+                        }
+                    }
                     Some(Command::Wake) => self.engine.wake(unix_ms(), &mut out),
                     Some(Command::Frame(body)) => out.push(body),
                     Some(Command::Request { body, reply }) => {
@@ -840,8 +882,14 @@ mod tests {
             socket_url: gateway.url.clone(),
             host: None,
         };
-        let mut connection =
-            Connection::new(shared, credentials, endpoint, false, state_sender, receiver);
+        let mut connection = Connection::new(
+            shared,
+            credentials,
+            endpoint,
+            Arc::new(AtomicBool::new(false)),
+            state_sender,
+            receiver,
+        );
         tune(&mut connection);
         tokio::spawn(connection.run());
         commands.send(Command::Connect).unwrap();

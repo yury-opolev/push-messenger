@@ -5,6 +5,8 @@
 
 use serde::Serialize;
 
+use push_bridge_control::AdapterStatus;
+
 use crate::menu::{AgentAction, enabled};
 use crate::policy::MAX_EXITS;
 use crate::state::{IconState, call_label, call_short, icon_for_view, label};
@@ -63,6 +65,8 @@ pub struct AgentView {
     pub actions: Vec<ActionView>,
     /// The voice call ([`call_label`]), while one runs or rings.
     pub call: Option<String>,
+    /// The voice adapter ([`adapter_label`]), when the bridge has one.
+    pub voice_adapter: Option<String>,
     /// The call's buttons: "Mute agent" ("Unmute agent" while muted), then "Hang up".
     pub call_actions: Vec<ActionView>,
     pub folder: String,
@@ -195,6 +199,9 @@ pub fn agent_view(
         state: label(&view.state),
         actions,
         call: view.call.as_ref().map(call_label),
+        voice_adapter: status
+            .and_then(|status| status.adapter.as_ref())
+            .map(adapter_label),
         call_actions,
         folder: view.dir.display().to_string(),
         session: status.and_then(|status| status.session.clone()),
@@ -223,6 +230,40 @@ pub fn agent_view(
                 .map_or(PEEK_MESSAGES_DEFAULT, |instance| instance.peek_messages()),
             config_path: view.dir.join("config.json").display().to_string(),
         },
+    }
+}
+
+/// The voice adapter for people: "whisper 1.2.3 (ready: stt, tts, vad, barge-in)",
+/// "whisper 1.2.3 (ready: tts; cannot listen)", "starting", "backing off (<reason>)", "off".
+pub fn adapter_label(adapter: &AdapterStatus) -> String {
+    match adapter.state.as_str() {
+        "ready" => {
+            let capabilities = adapter.capabilities.as_deref().unwrap_or_default();
+            let listens = capabilities.iter().any(|name| name == "stt");
+            let mut state = "ready".to_owned();
+            if !capabilities.is_empty() {
+                let names: Vec<String> = capabilities
+                    .iter()
+                    .map(|name| name.replace('_', "-"))
+                    .collect();
+                state = format!("{state}: {}", names.join(", "));
+            }
+            if !listens {
+                state.push_str(if capabilities.is_empty() { ", " } else { "; " });
+                state.push_str("cannot listen");
+            }
+            format!(
+                "{} {} ({state})",
+                adapter.name.as_deref().unwrap_or("?"),
+                adapter.version.as_deref().unwrap_or("?"),
+            )
+        }
+        "starting" | "handshaking" => "starting".to_owned(),
+        "backoff" => match &adapter.reason {
+            Some(reason) => format!("backing off ({reason})"),
+            None => "backing off".to_owned(),
+        },
+        other => other.to_owned(),
     }
 }
 
@@ -513,10 +554,72 @@ mod tests {
     }
 
     #[test]
+    fn the_voice_adapter_shows_its_name_and_state() {
+        let mut view = view("a", AgentState::Idle, true);
+        view.status = Some(status());
+        assert_eq!(
+            agent_view(&view, None, 0).voice_adapter,
+            None,
+            "none configured"
+        );
+        let mut show = |adapter: AdapterStatus| {
+            view.status.as_mut().unwrap().adapter = Some(adapter);
+            agent_view(&view, None, 0).voice_adapter.unwrap()
+        };
+        let ready = AdapterStatus {
+            state: "ready".into(),
+            name: Some("whisper".into()),
+            version: Some("1.2.3".into()),
+            capabilities: Some(vec![
+                "stt".into(),
+                "tts".into(),
+                "vad".into(),
+                "barge_in".into(),
+            ]),
+            ..AdapterStatus::default()
+        };
+        assert_eq!(
+            show(ready.clone()),
+            "whisper 1.2.3 (ready: stt, tts, vad, barge-in)"
+        );
+        assert_eq!(
+            show(AdapterStatus {
+                capabilities: Some(vec!["tts".into()]),
+                ..ready.clone()
+            }),
+            "whisper 1.2.3 (ready: tts; cannot listen)"
+        );
+        assert_eq!(
+            show(AdapterStatus {
+                capabilities: None,
+                ..ready
+            }),
+            "whisper 1.2.3 (ready, cannot listen)"
+        );
+        let state = |state: &str| AdapterStatus {
+            state: state.into(),
+            ..AdapterStatus::default()
+        };
+        assert_eq!(show(state("starting")), "starting");
+        assert_eq!(show(state("handshaking")), "starting");
+        assert_eq!(show(state("off")), "off");
+        assert_eq!(
+            show(AdapterStatus {
+                reason: Some("not_found".into()),
+                ..state("backoff")
+            }),
+            "backing off (not_found)"
+        );
+        let json = serde_json::to_value(agent_view(&view, None, 0)).unwrap();
+        assert_eq!(json["voiceAdapter"], "backing off (not_found)");
+    }
+
+    #[test]
     fn a_view_without_status_has_no_details_from_the_bridge() {
         let agent = agent_view(&view("a", AgentState::Stopped, false), None, 5);
         assert_eq!(agent.session, None);
         assert_eq!(agent.coda_version, None);
+        assert_eq!(agent.voice_adapter, None);
         assert_eq!(agent.uptime, None);
         assert_eq!(agent.running_tasks, None);
         assert_eq!(agent.last_error, None);

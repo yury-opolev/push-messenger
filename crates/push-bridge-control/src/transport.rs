@@ -75,6 +75,14 @@ pub async fn connect(endpoint: &Endpoint) -> io::Result<Stream> {
     imp::connect(endpoint).await
 }
 
+/// Connects as a client to a server that runs as the current user (Windows: or SYSTEM),
+/// for endpoints that are not a bridge's: on Unix the server's uid is compared with ours
+/// rather than with the runtime dir's owner, so the socket may be anywhere. Errors as
+/// [`connect`].
+pub async fn connect_same_user(endpoint: &Endpoint) -> io::Result<Stream> {
+    imp::connect_same_user(endpoint).await
+}
+
 fn wrong_endpoint() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,

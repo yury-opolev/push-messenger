@@ -40,6 +40,7 @@ and the spec differ, this guide describes what the code does.
 | push-sdk media helper `MediaCall` (feature `calls-media`: a native WebRTC audio peer, PCM in and out; [§19](#19-media-helper)) | available in this release (Rust) |
 | Agents in calls: push-agent-bridge answers its owner's calls (phase 2's bridge voice pipeline, PR 7: speech-to-text, spoken replies, barge-in, voice answers to cards; [agent bridge §18](agent-bridge.md#18-voice-calls)) | available in this release (build with `--features voice`) |
 | Agents' answering and calling policies (PR 8: `calls.answer: "ask"`, the agent calling its owner with `calls.notify_by_call`, do-not-disturb hours and a rate limit, the tray's call state with Mute agent and Hang up; [agent bridge §18](agent-bridge.md#18-voice-calls)) | available in this release (build with `--features voice`) |
+| Agents' voice adapter: speech in a separate, swappable process (`calls.adapter`, [`push-voice-adapter/1`](voice-adapter-protocol.md); calls advertised only while it is ready; [agent bridge §18](agent-bridge.md#voice-adapter)); the built-in speech providers are deprecated | available in this release (build with `--features voice`) |
 
 This guide is meant to be enough to build a client without reading the server code. In
 short, a browser client:
@@ -1189,8 +1190,12 @@ app's job (a WebRTC stack of its own), or the optional media helper's ([§19](#1
 **Opting in.** Set `Config::calls = true` (default `false`) only in an app that can take
 calls: the client then lists `CAPABILITY_CALLS` in `Identify` and its connections ring.
 `client.calls()` returns a `Calls` handle (a clone of the client: drop it before
-`Client::close`). `Calls::available()` is true while the connection is up and its `Ready`
-offered calls; hide call UI otherwise.
+`Client::close`). `Calls::available()` is true while the connection is up, it advertised
+calls and its `Ready` offered them; hide call UI otherwise.
+`Client::set_calls_advertised(bool)` changes the advertisement at runtime (an agent whose
+speech service came up or went away): a change while connected reconnects at once, without
+backoff, and identifies with the new capabilities (`CallSync` restores call state after it);
+the same value again does nothing. Never change it during a call.
 
 ```rust
 let calls = client.calls();
@@ -1264,6 +1269,9 @@ push-sdk = { …, features = ["calls-media"] }
 ```
 
 push-agent-bridge uses it to take its owner's calls and, with `calls.notify_by_call`, to call its owner (`Role::Caller`): [agent bridge §18](agent-bridge.md#18-voice-calls).
+With a [voice adapter](agent-bridge.md#voice-adapter) (`calls.adapter`) the bridge
+advertises calls only while its adapter is ready to listen, switching with
+`Client::set_calls_advertised` ([§18](#18-push-sdk)) outside calls.
 
 ### 19.1 Requirements
 

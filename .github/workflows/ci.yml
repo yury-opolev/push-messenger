@@ -179,6 +179,10 @@ jobs:
   # push-sdk client with MediaCall, the agent enrolled with a software key running the
   # bridge (feature voice) with a scripted backend and tone-based speech fakes: greeting,
   # prompt, spoken reply, barge-in, a voice approval, a stranger refused, the hang-up.
+  # bridge_voice_adapter runs speech in a voice adapter (push-voice-adapter-testkit,
+  # built first: the test runs its binary from the target directory): spawned and
+  # connected, a crash mid-call and the restart, no adapter and a refused format (calls
+  # not advertised), the final-transcript-to-speak latency and the playback's gaps.
   bridge-voice:
     runs-on: ubuntu-latest
     timeout-minutes: 40
@@ -191,6 +195,10 @@ jobs:
       - run: docker pull postgres:17-alpine
       - run: docker pull redis:7-alpine
       - run: cargo test -p push-smoke --test bridge_voice --locked -- --nocapture --test-threads 1
+        env:
+          PUSH_BRIDGE_VOICE: "1"
+      - run: cargo build -p push-voice-adapter-testkit --locked
+      - run: cargo test -p push-smoke --test bridge_voice_adapter --locked -- --nocapture --test-threads 1
         env:
           PUSH_BRIDGE_VOICE: "1"
 

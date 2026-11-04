@@ -58,7 +58,7 @@ pub fn init(dir: &Path) -> io::Result<PathBuf> {
 }
 
 /// Renames `path` to `<path>.1` (replacing it) when `path` is larger than `limit` bytes.
-fn rotate(path: &Path, limit: u64) -> io::Result<()> {
+pub(crate) fn rotate(path: &Path, limit: u64) -> io::Result<()> {
     let size = match std::fs::metadata(path) {
         Ok(metadata) => metadata.len(),
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),

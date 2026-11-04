@@ -13,15 +13,18 @@ use std::time::Duration;
 use push_bridge::coda::CodaBackend;
 use push_bridge::config::{self, CallsConfig, Config, SttConfig};
 use push_bridge::control::{Action, Calls, ControlCall, ControlHandle, ControlHub, error};
-use push_bridge::core::{Bridge, BridgeError, BridgeOptions};
+use push_bridge::core::{Bridge, BridgeError, BridgeOptions, CallFlag};
 use push_bridge::folders;
 use push_bridge::logging;
 use push_bridge::messenger::{EVENT_QUEUE, Reconnect, SdkMessenger};
 use push_bridge::state::{self, BridgeSecretStore, StateFile};
 use push_bridge::voice::VoiceSetup;
+use push_bridge::voice::adapter::advertise::advertise;
+use push_bridge::voice::adapter::report::log_totals;
 use push_bridge_control::transport::Listener;
 use push_bridge_control::{
-    BridgeState, Call, ErrorBody, Event as ControlEvent, PauseParams, endpoint, instance_id,
+    AdapterMetrics, AdapterStatus, BridgeState, Call, ErrorBody, Event as ControlEvent,
+    LatencyInfo, PauseParams, endpoint, instance_id,
 };
 use push_sdk::{Client, Event, Events, Platform, SdkError};
 use serde_json::json;
@@ -120,7 +123,7 @@ async fn main() -> ExitCode {
         }
         Command::Keygen => keygen(&dir),
         Command::Thumbprint => thumbprint(&dir),
-        Command::Status => status(&dir),
+        Command::Status => status(&dir).await,
         Command::Enroll { code } => enroll(&dir, &code).await,
         Command::Run => run(&dir).await,
         Command::Pause {
@@ -177,7 +180,7 @@ fn thumbprint(dir: &Path) -> Result<(), Failure> {
     Ok(())
 }
 
-fn status(dir: &Path) -> Result<(), Failure> {
+async fn status(dir: &Path) -> Result<(), Failure> {
     let config_path = dir.join(config::FILE_NAME);
     println!("Configuration: {}", config_path.display());
     let config = load_config(dir, false)?;
@@ -209,12 +212,38 @@ fn status(dir: &Path) -> Result<(), Failure> {
             println!("  {folder}: {session}");
         }
     }
+    let adapter_configured = config
+        .calls
+        .as_ref()
+        .is_some_and(|calls| calls.adapter.is_some());
+    let adapter = if adapter_configured && VOICE_BUILT {
+        running_adapter(dir).await
+    } else {
+        None
+    };
     println!(
         "Voice:         {}",
-        voice_status(config.calls.as_ref(), VOICE_BUILT)
+        voice_status(
+            config.calls.as_ref(),
+            VOICE_BUILT,
+            adapter.as_ref(),
+            push_bridge_control::now_ms()
+        )
     );
+    if let Some(metrics) = adapter
+        .as_ref()
+        .and_then(|adapter| adapter.metrics.as_ref())
+    {
+        println!("Voice adapter: {}", adapter_metrics(metrics));
+    }
     println!("Log:           {}", logging::path(dir).display());
     Ok(())
+}
+
+/// The voice adapter of the bridge running for `dir`, if it runs.
+async fn running_adapter(dir: &Path) -> Option<AdapterStatus> {
+    let mut remote = remote::connect(dir).await.ok()?;
+    remote.status().await?.adapter
 }
 
 /// The calls section, when it has someone to listen (an STT provider).
@@ -222,16 +251,32 @@ fn listening(calls: Option<&CallsConfig>) -> Option<&CallsConfig> {
     calls.filter(|calls| calls.stt != SttConfig::None)
 }
 
-/// Whether the client advertises calls: only a build with voice whose config listens.
-/// Otherwise the owner's app shows the agent as unreachable.
+/// Whether the client advertises calls from the start: only a build with voice whose
+/// config listens with a built-in STT provider. With `calls.adapter` calls are advertised
+/// later, while the adapter can listen ([`advertise`]). Otherwise the owner's app shows
+/// the agent as unreachable.
 fn advertises_calls(calls: Option<&CallsConfig>, voice_built: bool) -> bool {
-    voice_built && listening(calls).is_some()
+    voice_built && listening(calls).is_some_and(|calls| calls.adapter.is_none())
 }
 
-/// `status`'s voice line: provider names only, never their settings.
-fn voice_status(calls: Option<&CallsConfig>, voice_built: bool) -> String {
+/// `status`'s voice line: provider names only, never their settings; with a voice
+/// adapter, its state in the running bridge (`adapter`; `None` when it does not run).
+/// `now_ms`: now in Unix ms.
+fn voice_status(
+    calls: Option<&CallsConfig>,
+    voice_built: bool,
+    adapter: Option<&AdapterStatus>,
+    now_ms: i64,
+) -> String {
     match calls {
         None => "off (no calls section)".to_owned(),
+        Some(calls) if calls.adapter.is_some() && !voice_built => {
+            "configured, but this build has no voice (build with --features voice)".to_owned()
+        }
+        Some(calls) if calls.adapter.is_some() => match adapter {
+            Some(adapter) => adapter_line(adapter, now_ms),
+            None => "adapter configured (the bridge is not running)".to_owned(),
+        },
         Some(calls) if calls.stt == SttConfig::None => "off (calls.stt is none)".to_owned(),
         Some(_) if !voice_built => {
             "configured, but this build has no voice (build with --features voice)".to_owned()
@@ -244,13 +289,113 @@ fn voice_status(calls: Option<&CallsConfig>, voice_built: bool) -> String {
     }
 }
 
-/// The owner's calls are answered with push-sdk's media helper and the configured
-/// speech providers; `None` when the config does not listen.
+/// The voice adapter's state for people.
+fn adapter_line(adapter: &AdapterStatus, now_ms: i64) -> String {
+    match adapter.state.as_str() {
+        "ready" => {
+            let capabilities = adapter.capabilities.clone().unwrap_or_default();
+            let who = format!(
+                "{} {}; {}",
+                adapter.name.as_deref().unwrap_or("?"),
+                adapter.version.as_deref().unwrap_or("?"),
+                if capabilities.is_empty() {
+                    "no capabilities".to_owned()
+                } else {
+                    capabilities
+                        .iter()
+                        .map(|name| name.replace('_', "-"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                }
+            );
+            if capabilities.iter().any(|name| name == "stt") {
+                format!("adapter ready ({who})")
+            } else {
+                format!(
+                    "adapter ready ({who}), but calls are not advertised: the adapter cannot listen (no stt)"
+                )
+            }
+        }
+        "starting" => "adapter starting".to_owned(),
+        "handshaking" => "adapter starting (handshake)".to_owned(),
+        "backoff" => {
+            let left_ms = adapter
+                .retry_at
+                .map_or(0, |at| at.saturating_sub(now_ms).max(0));
+            let seconds = (left_ms + 999) / 1000;
+            match &adapter.reason {
+                Some(reason) => format!("adapter backing off {seconds} s ({reason})"),
+                None => format!("adapter backing off {seconds} s"),
+            }
+        }
+        "off" => "adapter off".to_owned(),
+        other => format!("adapter {other}"),
+    }
+}
+
+/// The voice adapter's counters for people.
+fn adapter_metrics(metrics: &AdapterMetrics) -> String {
+    let latency = |name: &str, latency: Option<&LatencyInfo>| match latency {
+        Some(latency) => format!(
+            "{name} last {} ms, avg {} ms, max {} ms",
+            latency.last_ms, latency.avg_ms, latency.max_ms
+        ),
+        None => format!("{name} none yet"),
+    };
+    format!(
+        "calls {}; frames to adapter {}, from adapter {}; dropped to adapter {}, from adapter {}; restarts {}; {}; {}",
+        metrics.calls,
+        metrics.frames_to_adapter,
+        metrics.frames_from_adapter,
+        metrics.dropped_to_adapter,
+        metrics.dropped_from_adapter,
+        metrics.restarts,
+        latency("speak latency", metrics.final_to_speak.as_ref()),
+        latency("audio latency", metrics.speak_to_audio.as_ref()),
+    )
+}
+
+/// The owner's calls are answered with push-sdk's media helper, and speech runs in the
+/// voice adapter (`calls.adapter`, supervised from here on) or the configured built-in
+/// providers; `None` when the config has nobody to listen.
 #[cfg(feature = "voice")]
-fn voice_setup(config: &Config, client: &Client) -> Option<VoiceSetup> {
+fn voice_setup(config: &Config, client: &Client, dir: &Path) -> Option<VoiceSetup> {
+    use push_bridge::voice::adapter::router::AdapterSetup;
+    use push_bridge::voice::adapter::supervisor;
     use push_bridge::voice::media::MediaPhone;
     use push_bridge::voice::provider;
+    use push_voice_adapter_proto::BridgeHello;
 
+    if let Some(calls) = config.calls.as_ref() {
+        if let Some(adapter) = &calls.adapter {
+            let policy = calls.call_policy();
+            let hello = BridgeHello::v1(env!("CARGO_PKG_VERSION"), calls.language.clone());
+            let log_dir = logging::path(dir)
+                .parent()
+                .map_or_else(|| dir.join("logs"), Path::to_path_buf);
+            // No extra secret names: with an adapter, calls.stt and calls.tts are none, so
+            // the config names no key variables; the fixed deny-list and the
+            // KEY/TOKEN/SECRET/PASS/... name check still keep secrets from the adapter.
+            let supervisor = supervisor::start(adapter.clone(), hello, log_dir, Vec::new());
+            tracing::info!(
+                event = "voice_enabled",
+                adapter = match adapter {
+                    config::AdapterConfig::Spawn(_) => "spawn",
+                    config::AdapterConfig::Connect(_) => "connect",
+                },
+                answer = ?calls.answer,
+                notify_by_call = policy.notify.enabled(),
+            );
+            return Some(VoiceSetup {
+                phone: Arc::new(MediaPhone::new(client)),
+                stt: None,
+                tts: None,
+                vad: calls.vad.to_vad(),
+                policy,
+                adapter: Some(AdapterSetup::new(supervisor, calls.language.clone())),
+            });
+        }
+    }
     let calls = listening(config.calls.as_ref())?;
     let providers = provider::build(calls);
     let policy = calls.call_policy();
@@ -267,12 +412,13 @@ fn voice_setup(config: &Config, client: &Client) -> Option<VoiceSetup> {
         tts: providers.tts,
         vad: calls.vad.to_vad(),
         policy,
+        adapter: None,
     })
 }
 
 /// Without the media helper there is no voice: a calls section only gets a warning.
 #[cfg(not(feature = "voice"))]
-fn voice_setup(config: &Config, _client: &Client) -> Option<VoiceSetup> {
+fn voice_setup(config: &Config, _client: &Client, _dir: &Path) -> Option<VoiceSetup> {
     if config.calls.is_some() {
         tracing::warn!(event = "voice_unavailable");
         eprintln!(
@@ -428,7 +574,22 @@ async fn run(dir: &Path) -> Result<(), Failure> {
         default_mode: config.default_permission_mode,
     };
     let (client, events) = open_client(&config, &state)?;
-    let voice = voice_setup(&config, &client);
+    let voice = voice_setup(&config, &client, dir);
+    let adapter = voice.as_ref().and_then(|voice| voice.adapter.clone());
+    let call_flag: CallFlag = Arc::new(watch::channel(false).0);
+    // With a voice adapter, calls are advertised while it can listen and no call runs.
+    let advertiser = adapter.as_ref().map(|adapter| {
+        let client = client.clone();
+        let setup = adapter.clone();
+        tokio::spawn(advertise(
+            adapter.supervisor.state(),
+            call_flag.subscribe(),
+            move |on| {
+                setup.set_advertised(on);
+                client.set_calls_advertised(on);
+            },
+        ))
+    });
     let target = forward(events);
     let (stop, stopped) = watch::channel(false);
     tokio::spawn(async move {
@@ -509,6 +670,7 @@ async fn run(dir: &Path) -> Result<(), Failure> {
         if let Some(voice) = &voice {
             bridge = bridge.with_voice(voice.clone());
         }
+        bridge = bridge.with_call_flag(Arc::clone(&call_flag));
         let mut stopping = stopped.clone();
         let shutdown = async move {
             let _ = stopping.wait_for(|stop| *stop).await;
@@ -520,6 +682,17 @@ async fn run(dir: &Path) -> Result<(), Failure> {
         }
     };
     set_state(control.as_ref(), BridgeState::Stopping, "offline");
+    // The bridge ended its call (the adapter heard `call_ended {shutdown}`): the
+    // advertiser stops; closing the client ends the advertisement. Then the adapter is
+    // stopped.
+    if let Some(advertiser) = advertiser {
+        advertiser.abort();
+        let _ = advertiser.await;
+    }
+    if let Some(adapter) = adapter {
+        adapter.supervisor.shutdown().await;
+        log_totals(&adapter);
+    }
     // The phone holds a handle of the client: only the last one closes it.
     drop(voice);
     if client.close().await.is_err() {
@@ -673,22 +846,104 @@ mod tests {
         assert!(!advertises_calls(Some(&on), false));
         assert!(!advertises_calls(Some(&calls("none", "local")), true));
         assert!(!advertises_calls(None, true));
+        assert!(
+            !advertises_calls(Some(&with_adapter()), true),
+            "not before the adapter is ready"
+        );
+    }
+
+    fn with_adapter() -> CallsConfig {
+        serde_json::from_value(json!({"adapter": {"connect": {"pipe": "push-voice-me"}}})).unwrap()
     }
 
     #[test]
     fn the_voice_line_names_the_providers_only() {
-        assert_eq!(voice_status(None, true), "off (no calls section)");
+        let line = |calls: Option<&CallsConfig>, built| voice_status(calls, built, None, 0);
+        assert_eq!(line(None, true), "off (no calls section)");
         assert_eq!(
-            voice_status(Some(&calls("none", "azure-speech")), true),
+            line(Some(&calls("none", "azure-speech")), true),
             "off (calls.stt is none)"
         );
         assert_eq!(
-            voice_status(Some(&calls("azure-speech", "local")), true),
+            line(Some(&calls("azure-speech", "local")), true),
             "on: stt azure-speech, tts local"
         );
         assert_eq!(
-            voice_status(Some(&calls("local", "none")), false),
+            line(Some(&calls("local", "none")), false),
             "configured, but this build has no voice (build with --features voice)"
+        );
+    }
+
+    #[test]
+    fn the_voice_line_shows_the_running_adapter() {
+        let calls = with_adapter();
+        let line = |adapter: Option<&AdapterStatus>, built| {
+            voice_status(Some(&calls), built, adapter, 10_000)
+        };
+        assert_eq!(
+            line(None, false),
+            "configured, but this build has no voice (build with --features voice)"
+        );
+        assert_eq!(
+            line(None, true),
+            "adapter configured (the bridge is not running)"
+        );
+        let ready = |capabilities: &[&str]| AdapterStatus {
+            state: "ready".into(),
+            name: Some("whisper".into()),
+            version: Some("1.2.3".into()),
+            capabilities: Some(capabilities.iter().map(|name| (*name).to_owned()).collect()),
+            ..AdapterStatus::default()
+        };
+        assert_eq!(
+            line(Some(&ready(&["stt", "tts", "vad", "barge_in"])), true),
+            "adapter ready (whisper 1.2.3; stt, tts, vad, barge-in)"
+        );
+        assert_eq!(
+            line(Some(&ready(&["tts"])), true),
+            "adapter ready (whisper 1.2.3; tts), but calls are not advertised: the adapter cannot listen (no stt)"
+        );
+        let state = |state: &str| AdapterStatus {
+            state: state.into(),
+            ..AdapterStatus::default()
+        };
+        assert_eq!(line(Some(&state("starting")), true), "adapter starting");
+        assert_eq!(
+            line(Some(&state("handshaking")), true),
+            "adapter starting (handshake)"
+        );
+        let backoff = AdapterStatus {
+            reason: Some("no voice adapter is listening on push-voice-me".into()),
+            retry_at: Some(13_500),
+            ..state("backoff")
+        };
+        assert_eq!(
+            line(Some(&backoff), true),
+            "adapter backing off 4 s (no voice adapter is listening on push-voice-me)"
+        );
+    }
+
+    #[test]
+    fn the_adapter_s_counters_are_counts_and_durations() {
+        let metrics = AdapterMetrics {
+            calls: 2,
+            frames_to_adapter: 1200,
+            frames_from_adapter: 800,
+            dropped_to_adapter: 1,
+            dropped_from_adapter: 3,
+            restarts: 4,
+            speaks: 9,
+            final_to_speak: Some(LatencyInfo {
+                last_ms: 12,
+                avg_ms: 14,
+                max_ms: 30,
+            }),
+            speak_to_audio: None,
+        };
+        assert_eq!(
+            adapter_metrics(&metrics),
+            "calls 2; frames to adapter 1200, from adapter 800; dropped to adapter 1, from adapter 3; \
+             restarts 4; speak latency last 12 ms, avg 14 ms, max 30 ms; audio latency none yet"
         );
     }
 }

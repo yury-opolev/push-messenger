@@ -113,6 +113,9 @@ troubleshooting: [docs/agent-bridge.md](docs/agent-bridge.md).
   that moves speech out of the bridge into a separate, swappable voice adapter process:
   framing, control messages, limits and JSON Schemas
   ([reference](docs/voice-adapter-protocol.md)). The bridge's adapter client follows.
+- `crates/push-voice-adapter-testkit`: a scripted voice adapter for tests (library and
+  binary): tones in, transcripts out; text in, a 600 Hz tone out; crashes, stalls and
+  refusals on demand.
 
 ## Run it on minikube
 

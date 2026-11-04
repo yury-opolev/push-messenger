@@ -6,6 +6,46 @@ Notable changes for consumers of push-messenger. Newest first.
 
 ### Added
 
+- **Agent bridge voice adapter client** (second of three steps that move speech out of
+  push-agent-bridge): the new `calls.adapter` runs a call's speech in a separate voice
+  adapter process speaking [`push-voice-adapter/1`](docs/voice-adapter-protocol.md).
+  `{"spawn": {"command": [...], "stderr": "log"|"discard", "env_allow": [...]}}` starts
+  it (argv only, never a shell, no window, batch files refused, the environment stripped
+  of the bridge's secrets: `CODA_SERVE_API_KEY`, `AZURE_SPEECH_KEY`, `PUSH_*`, `CODA_*`
+  and names containing `KEY`, `TOKEN`, `SECRET`, `PASS`, `CREDENTIAL`, `AUTH` or
+  `CONNECTION_STRING`; stderr to `logs/voice-adapter.log`, rotated at 5 MiB at each
+  start; killed with the bridge, on Windows through a job object) and speaks on its
+  stdin/stdout; `{"connect": {"pipe": "<name>"}}` (Windows) or `{"connect": {"socket":
+  "<path>"}}` (Unix, `$XDG_RUNTIME_DIR/` allowed) connects to a running adapter of the
+  same user (Windows: or SYSTEM). The bridge supervises it (handshake within 10 s,
+  ping/pong with a 30 s dead-peer timeout, rate caps, restarts with backoff from 1 s to
+  60 s), advertises calls only while the adapter has been ready with `stt` for 2 s and
+  never changes that during a call, and keeps a call up when the adapter goes away:
+  chat-only with "Voice adapter stopped; reconnecting…", then "Voice adapter is back."
+  once a restarted adapter took the call (or "Voice adapter cannot listen right now." on
+  `engine_unavailable`). `push-agent-bridge status` shows the adapter's state and
+  counters (from the running bridge); the control channel's `status` gains a
+  content-free `adapter` (state, name, version, capabilities, backoff reason and
+  `retryAt`, metrics) and the event `adapter_changed`; the tray's Overview shows it.
+  Metrics: frames each way, dropped frames, restarts, final transcript → `speak` and
+  `speak` → audio latencies, logged per call (`adapter_metrics`) and at shutdown
+  (`adapter_metrics_total`). The client needs no cargo feature (MSRV 1.85); taking calls
+  still needs `--features voice`. A new end-to-end test
+  (`crates/push-smoke/tests/bridge_voice_adapter.rs`, job `bridge-voice`) covers spawn
+  and connect modes, a crash mid-call, a missing adapter, a refused format, timing and
+  content-free logs. Guide: [agent bridge §18](docs/agent-bridge.md#voice-adapter).
+- **push-sdk `Client::set_calls_advertised`** (and `Client::calls_advertised`): start or
+  stop advertising calls at runtime. A change while connected reconnects at once and
+  identifies with the new capability, without backoff and without counting as a failure;
+  `Calls::available()` follows what the current connection advertised. Never change it
+  during a call. See [docs/calls.md §18](docs/calls.md#18-push-sdk).
+- **`push-voice-adapter-testkit`** (`crates/push-voice-adapter-testkit`): a scripted
+  voice adapter for tests, as a library (`ScriptedAdapter`, in-process over in-memory
+  pipes) and a binary (spawn mode on stdin/stdout, or `--pipe`/`--socket`): tones in,
+  transcripts out; text in, a 600 Hz tone out; crashes, refused formats, other protocol
+  versions, stalls, floods and a missing hello on demand; `--events` and `--dump-env`
+  for assertions. See [docs/voice-adapter-protocol.md](docs/voice-adapter-protocol.md).
+
 - **Voice adapter protocol** (`push-voice-adapter/1`, first of three steps that move
   speech out of push-agent-bridge into a separate, swappable voice adapter process): the
   new crate `crates/push-voice-adapter-proto` (MSRV 1.85, no media dependency) with the
@@ -433,6 +473,16 @@ Notable changes for consumers of push-messenger. Newest first.
   makes.
 
 ### Changed
+
+- **Agent bridge `calls.stt` defaults to `none`**, so `"calls": {"adapter": …}` alone is
+  a valid calls section; with `calls.adapter`, `calls.stt` and `calls.tts` must be absent
+  or `none` and `calls.vad` absent or default (a config error names the field). A
+  `calls` section without `calls.stt` and without `calls.adapter` is now accepted and
+  advertises no calls, as `none` did.
+- **Agent bridge built-in speech providers deprecated**: `calls.stt`, `calls.tts` and
+  `calls.vad` (`azure-speech`, `local`, the energy detector) work as before without
+  `calls.adapter`, and are removed in the next release in favour of a voice adapter
+  ([guide](docs/agent-bridge.md#voice-adapter)).
 
 - **Gateway logging**: the gateway never logs WebSocket payloads, even with
   `RUST_LOG=trace`: the WebSocket library (`tungstenite`) is capped at `debug`, since at

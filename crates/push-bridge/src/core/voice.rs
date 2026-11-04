@@ -1,9 +1,11 @@
 //! Voice calls with the owner: answering them, the call's pipeline events, transcripts as
 //! prompts, steers or card answers, and the agent's replies and cards spoken.
 //!
-//! Only the owner's calls are answered, one at a time; without a speech-to-text provider
-//! every call is declined. Logs carry event names, codes, counts and durations: never a
-//! transcript or spoken text.
+//! Only the owner's calls are answered, one at a time; without anyone to listen (a
+//! speech-to-text provider, or a voice adapter ready with `stt`) every call is declined.
+//! When the voice adapter goes away during a call the call stays up, chat-only, with a
+//! note (A21). Logs carry event names, codes, counts and durations: never a transcript
+//! or spoken text.
 
 use std::sync::Arc;
 
@@ -20,10 +22,8 @@ use crate::messenger::Messenger;
 use crate::render::{reply_body, rich_body, shown, shown_line};
 use crate::voice::confirm::{self, VoiceAnswer};
 use crate::voice::phone::{Line, is_about};
-use crate::voice::provider::{Stt, Tts};
 use crate::voice::session::{EventSink, Session, SessionEvent};
 use crate::voice::speech::{self, SpeechText};
-use crate::voice::vad::VadConfig;
 
 /// Characters of a transcript's text.
 const TRANSCRIPT: usize = 4_000;
@@ -34,6 +34,12 @@ const TRANSCRIPT_PREFIX: &str = "🎤 voice: ";
 const ANSWER_LABEL: usize = 200;
 /// Said when the speech-to-text provider failed on an utterance.
 const NOT_UNDERSTOOD: &str = "Sorry, I couldn't make that out.";
+/// Posted when the voice adapter went away during a call (A21).
+pub(super) const ADAPTER_LOST: &str = "Voice adapter stopped; reconnecting…";
+/// Posted when a voice adapter took the call again.
+pub(super) const ADAPTER_BACK: &str = "Voice adapter is back.";
+/// Posted when the voice adapter cannot recognise or speak during this call.
+pub(super) const ADAPTER_UNAVAILABLE: &str = "Voice adapter cannot listen right now.";
 
 /// The owner's call, answered, or the bridge's call to the owner.
 pub(super) struct ActiveCall {
@@ -151,7 +157,7 @@ impl<M: Messenger> Core<M> {
         };
         let refusal = if caller != self.owner {
             Some(("stranger", false))
-        } else if voice.stt.is_none() {
+        } else if !voice.can_listen() {
             Some(("voice_off", false))
         } else if self.call_busy() {
             Some(("busy", true))
@@ -197,6 +203,7 @@ impl<M: Messenger> Core<M> {
         tracing::info!(event = "call_answering");
         self.answering = Some((call_id, buffered));
         self.mute_next = false;
+        self.sync_call_flag();
         let phone = voice.phone.clone();
         let internal = self.internal.clone();
         let offer_sdp = offer_sdp.to_owned();
@@ -235,14 +242,9 @@ impl<M: Messenger> Core<M> {
                 return;
             }
         };
-        let Some((stt, tts, vad)) = self
-            .voice
-            .as_ref()
-            .and_then(|voice| Some((voice.stt.clone()?, voice.tts.clone(), voice.vad)))
-        else {
+        let Some(session) = self.start_pipeline(line) else {
             return;
         };
-        let session = self.start_pipeline(line, stt, tts, vad);
         for event in &buffered {
             session.handle(event);
         }
@@ -256,20 +258,18 @@ impl<M: Messenger> Core<M> {
         self.update_activity(false).await;
     }
 
-    /// Starts the pipeline of `line`; its events come back as [`Internal::Voice`].
-    pub(super) fn start_pipeline(
-        &self,
-        line: Line,
-        stt: Arc<dyn Stt>,
-        tts: Option<Arc<dyn Tts>>,
-        vad: VadConfig,
-    ) -> Session {
+    /// Starts the pipeline of `line` (in the voice adapter when there is one, else with the
+    /// built-in speech); its events come back as [`Internal::Voice`]. `None` (the line is
+    /// dropped) without anyone to listen.
+    pub(super) fn start_pipeline(&self, line: Line) -> Option<Session> {
+        let voice = self.voice.as_ref()?;
         let call_id = line.call_id;
         let internal = self.internal.clone();
         let sink: EventSink = Arc::new(move |event| {
             let _ = internal.send(Internal::Voice { call_id, event });
         });
-        Session::start(line, stt, tts, vad, sink)
+        // The owner's display name is not known to the core: the adapter gets none.
+        voice.start_session(line, "", sink)
     }
 
     /// An event of the running call's pipeline.
@@ -297,6 +297,22 @@ impl<M: Messenger> Core<M> {
             SessionEvent::BargedIn => call.speech.interrupt(),
             SessionEvent::Transcript { text, started } => self.on_transcript(text, started).await,
             SessionEvent::SpeechFailed(_) => call.session.say(NOT_UNDERSTOOD),
+            // The voice adapter's state during the call (A21): the session already stopped
+            // or resumed the speech; the agent's replies stay in the chat meanwhile.
+            SessionEvent::AdapterLost => {
+                tracing::info!(event = "call_chat_only", reason = "adapter_lost");
+                call.session.hush();
+                self.reply(ADAPTER_LOST);
+            }
+            SessionEvent::AdapterBack => {
+                tracing::info!(event = "call_speech_back");
+                self.reply(ADAPTER_BACK);
+            }
+            SessionEvent::AdapterUnavailable => {
+                tracing::info!(event = "call_chat_only", reason = "adapter_unavailable");
+                call.session.hush();
+                self.reply(ADAPTER_UNAVAILABLE);
+            }
             SessionEvent::Ended(end) => {
                 let call = self.call.take();
                 tracing::info!(
@@ -544,15 +560,18 @@ impl<M: Messenger> Core<M> {
         ))
     }
 
-    /// The bridge stops: the running call is hung up (dropping its session does), a call
-    /// being answered or placed is forgotten, and a call waiting for the owner's
-    /// confirmation is declined.
-    pub(super) fn end_call_at_close(&mut self) {
+    /// The bridge stops: a call being answered or placed is forgotten, and a call waiting
+    /// for the owner's confirmation is declined; the running call is returned, to be shut
+    /// down ([`Session::shut_down`]: the voice adapter hears of it, then the call is hung
+    /// up).
+    pub(super) fn end_call_at_close(&mut self) -> Option<ActiveCall> {
         self.answering = None;
         self.dialing = None;
         self.decline_asking("📞 Declined: the bridge stopped.");
-        if self.call.take().is_some() {
+        let call = self.call.take();
+        if call.is_some() {
             tracing::info!(event = "call_hung_up");
         }
+        call
     }
 }

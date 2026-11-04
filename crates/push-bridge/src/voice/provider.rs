@@ -227,6 +227,7 @@ pub(crate) mod tests {
         CallsConfig {
             answer: crate::config::AnswerMode::Auto,
             language: "en-US".into(),
+            adapter: None,
             stt,
             tts,
             vad: VadSettings::default(),

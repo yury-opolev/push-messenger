@@ -41,6 +41,8 @@ pub(super) struct Harness {
     events: broadcast::Receiver<EventLine>,
     /// Calls are taken with this (see `voice_tests`).
     pub(super) voice: Option<crate::voice::VoiceSetup>,
+    /// Set while a call is in progress (see `voice_tests`).
+    pub(super) call_flag: Option<CallFlag>,
     _dir: TestDir,
 }
 
@@ -78,6 +80,7 @@ impl Harness {
             hub,
             events,
             voice: None,
+            call_flag: None,
             _dir: dir,
         }
     }
@@ -99,6 +102,9 @@ impl Harness {
         .with_control(self.hub.handle(), self.hub.calls());
         if let Some(voice) = self.voice.take() {
             bridge = bridge.with_voice(voice);
+        }
+        if let Some(flag) = self.call_flag.take() {
+            bridge = bridge.with_call_flag(flag);
         }
         let (stop, stopped) = oneshot::channel::<()>();
         self.stop = Some(stop);

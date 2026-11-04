@@ -15,6 +15,7 @@ pub use calls::Calls;
 
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use push_domain::{ConversationId, DeviceId, UserId};
@@ -60,7 +61,8 @@ pub struct Config {
     /// development clusters reached over a private network.
     pub allow_insecure_transport: bool,
     /// Advertises that this app can take calls (it has call UI or a media helper):
-    /// only such connections ring and may use [`Client::calls`]. Off by default.
+    /// only such connections ring and may use [`Client::calls`]. Off by default. The
+    /// starting value: [`Client::set_calls_advertised`] changes it at runtime.
     pub calls: bool,
 }
 
@@ -345,6 +347,8 @@ struct Inner {
     state: watch::Receiver<ConnectionState>,
     state_sender: Arc<watch::Sender<ConnectionState>>,
     request_timeout: Duration,
+    /// Whether `Identify` advertises calls; shared with the connection task.
+    calls_advertised: Arc<AtomicBool>,
 }
 
 impl Drop for Inner {
@@ -394,11 +398,12 @@ impl Client {
             socket_url: config.socket_url,
             host: config.host,
         };
+        let calls_advertised = Arc::new(AtomicBool::new(config.calls));
         let connection = Connection::new(
             shared.clone(),
             credentials.clone(),
             endpoint,
-            config.calls,
+            calls_advertised.clone(),
             state_sender.clone(),
             command_receiver,
         );
@@ -413,6 +418,7 @@ impl Client {
             state,
             state_sender,
             request_timeout: config.request_timeout,
+            calls_advertised,
         };
         Ok((
             Self {
@@ -803,6 +809,29 @@ impl Client {
         *self.inner.state.borrow()
     }
 
+    /// Whether this client advertises calls in `Identify` ([`Config::calls`], or the
+    /// last [`Client::set_calls_advertised`]).
+    pub fn calls_advertised(&self) -> bool {
+        self.inner.calls_advertised.load(Ordering::SeqCst)
+    }
+
+    /// Starts or stops advertising calls (an agent whose speech service came up or went
+    /// away). A change while connected (or connecting) closes the connection and
+    /// identifies again at once, without backoff; offline, the next connection uses it.
+    /// No change, no reconnect. Only connections that advertise calls ring and may use
+    /// [`Client::calls`].
+    ///
+    /// The reconnect is cheap, and `CallSync` (voice spec D7) restores the state of the
+    /// user's calls after it, but callers must never change this during a call: the call
+    /// would lose its signalling for the reconnect, and without calls advertised the
+    /// server no longer routes it here.
+    pub fn set_calls_advertised(&self, on: bool) {
+        if self.inner.calls_advertised.swap(on, Ordering::SeqCst) != on {
+            // A closed client has no connection to change.
+            let _ = self.command(Command::CapabilitiesChanged);
+        }
+    }
+
     /// Encrypts the local database with `key`, re-encrypts it with a new one (the user
     /// changed their PIN), or with `None` decrypts it. The next [`Client::open`] needs the
     /// new key in [`Config::database_key`]; the client does not keep it.
@@ -1048,6 +1077,54 @@ mod tests {
             request_timeout: Duration::from_secs(3),
             ..Config::new(&auth.url, &gateway.url, database)
         }
+    }
+
+    #[tokio::test]
+    async fn calls_advertising_changes_reconnect_with_the_new_capability() {
+        let calls = || vec![i32::from(push_proto::v1::Capability::Calls)];
+        let within = Duration::from_secs(5);
+        let mut f = Fixture::with_calls().await;
+        assert!(f.client.calls_advertised());
+        f.client.connect().unwrap();
+        let (_first, identify) = f.ready_with(calls()).await;
+        assert_eq!(identify.capabilities, calls());
+        f.client.wait_connected(within).await.unwrap();
+        assert!(f.client.calls().available());
+
+        f.client.set_calls_advertised(false);
+        assert!(!f.client.calls_advertised());
+        let (_second, identify) = tokio::time::timeout(within, f.ready_with(calls()))
+            .await
+            .expect("a new Identify within 5 s");
+        assert!(identify.capabilities.is_empty());
+        f.client.wait_connected(within).await.unwrap();
+        assert!(!f.client.calls().available(), "not advertised any more");
+
+        // Unchanged: no reconnect.
+        f.client.set_calls_advertised(false);
+        f.gateway.quiet(Duration::from_secs(1)).await;
+        assert_eq!(f.client.connection_state(), ConnectionState::Connected);
+
+        f.client.set_calls_advertised(true);
+        let (_third, identify) = tokio::time::timeout(within, f.ready_with(calls()))
+            .await
+            .expect("a new Identify within 5 s");
+        assert_eq!(identify.capabilities, calls());
+        f.client.wait_connected(within).await.unwrap();
+        assert!(f.client.calls().available());
+    }
+
+    #[tokio::test]
+    async fn changing_calls_advertising_offline_only_changes_the_next_identify() {
+        let mut f = Fixture::new().await;
+        f.client.set_calls_advertised(true);
+        f.gateway.quiet(Duration::from_millis(300)).await;
+        f.client.connect().unwrap();
+        let (_socket, identify) = f.ready_with(Vec::new()).await;
+        assert_eq!(
+            identify.capabilities,
+            vec![i32::from(push_proto::v1::Capability::Calls)]
+        );
     }
 
     #[tokio::test]

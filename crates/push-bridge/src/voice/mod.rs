@@ -6,10 +6,14 @@
 //! answers. [`provider`] runs the speech services: Azure AI Speech, local servers or
 //! commands, and tone-based fakes for tests. [`phone`] answers calls (push-sdk's media
 //! helper in `media`, feature `voice`; a fake in tests) and [`session`] runs one call's
-//! pipeline: listening, transcribing, speaking, barge-in.
+//! pipeline: listening, transcribing, speaking, barge-in, with its speech in an [`engine`].
+//! [`adapter`] starts or connects to a voice adapter, a separate program that runs speech
+//! (push-voice-adapter/1), and routes a call's speech through it.
 
+pub mod adapter;
 pub mod azure;
 pub mod confirm;
+pub mod engine;
 pub mod fake;
 pub mod local;
 #[cfg(feature = "voice")]
@@ -28,7 +32,9 @@ use std::sync::Arc;
 
 /// What the bridge needs to take calls: the phone, the speech providers and the
 /// detector's settings, and how calls are answered and placed. Without `stt` every call
-/// is declined; without `tts` the agent's replies stay in the chat.
+/// is declined; without `tts` the agent's replies stay in the chat. With `adapter` speech
+/// runs in the voice adapter instead (`stt` and `tts` are then `None`): calls can be taken
+/// while it is ready with `stt`, and it speaks when it has `tts`.
 #[derive(Clone)]
 pub struct VoiceSetup {
     pub phone: Arc<dyn phone::Phone>,
@@ -36,6 +42,49 @@ pub struct VoiceSetup {
     pub tts: Option<Arc<dyn provider::Tts>>,
     pub vad: vad::VadConfig,
     pub policy: policy::CallPolicy,
+    pub adapter: Option<adapter::router::AdapterSetup>,
+}
+
+impl VoiceSetup {
+    /// Whether a call could be listened to now: a voice adapter ready with `stt`, or the
+    /// built-in STT.
+    pub fn can_listen(&self) -> bool {
+        match &self.adapter {
+            Some(adapter) => adapter.can_listen(),
+            None => self.stt.is_some(),
+        }
+    }
+
+    /// Whether a call could say something now: a voice adapter ready with `tts`, or the
+    /// built-in TTS.
+    pub fn can_speak(&self) -> bool {
+        match &self.adapter {
+            Some(adapter) => adapter.can_speak(),
+            None => self.tts.is_some(),
+        }
+    }
+
+    /// Starts the pipeline of `line`: in the voice adapter when there is one, else with
+    /// the built-in providers; `None` without either STT. `peer`: the owner's display
+    /// name (for the adapter).
+    pub fn start_session(
+        &self,
+        line: phone::Line,
+        peer: &str,
+        events: session::EventSink,
+    ) -> Option<session::Session> {
+        if let Some(adapter) = &self.adapter {
+            return Some(session::Session::with_adapter(line, adapter, peer, events));
+        }
+        let stt = self.stt.clone()?;
+        Some(session::Session::start(
+            line,
+            stt,
+            self.tts.clone(),
+            self.vad,
+            events,
+        ))
+    }
 }
 
 /// Samples per second of call audio (push-sdk's media helper).

@@ -2686,6 +2686,8 @@ dependencies = [
  "push-bridge-control",
  "push-domain",
  "push-sdk",
+ "push-voice-adapter-proto",
+ "push-voice-adapter-testkit",
  "regex",
  "reqwest",
  "serde",
@@ -2949,6 +2951,8 @@ dependencies = [
  "push-proto",
  "push-sdk",
  "push-store",
+ "push-voice-adapter-proto",
+ "push-voice-adapter-testkit",
  "push-worker",
  "redis",
  "reqwest",
@@ -3014,6 +3018,18 @@ version = "0.1.0"
 dependencies = [
  "proptest",
  "schemars 1.2.2",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "push-voice-adapter-testkit"
+version = "0.1.0"
+dependencies = [
+ "push-bridge-control",
+ "push-voice-adapter-proto",
  "serde",
  "serde_json",
  "thiserror",

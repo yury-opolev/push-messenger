@@ -117,6 +117,7 @@ impl<M: Messenger> Core<M> {
             buffered: Vec::new(),
             deadline: Instant::now() + ring + ASK_GRACE,
         });
+        self.sync_call_flag();
         if card.is_none() {
             self.decline_asking("📞 Declined: the card could not be shown.");
         }
@@ -259,10 +260,29 @@ impl<M: Messenger> Core<M> {
         .await;
     }
 
-    /// Whether the bridge could call now: voice with a listener, connected, no call, not
-    /// paused or stopping.
-    fn can_dial(&self) -> bool {
-        self.voice.as_ref().is_some_and(|voice| voice.stt.is_some())
+    /// Whether the bridge could call now: voice with someone to listen and to speak (the
+    /// built-in STT and TTS, or a voice adapter ready with `stt` and `tts` whose calls are
+    /// advertised), connected, no call, not paused or stopping. An adapter that listens
+    /// but cannot speak holds calls back (`call_held` `no_tts`, logged once per change):
+    /// the owner would pick up a silent call.
+    fn can_dial(&mut self) -> bool {
+        let Some(voice) = &self.voice else {
+            return false;
+        };
+        if !voice.can_listen() {
+            return false;
+        }
+        let speaks = voice.can_speak();
+        if !speaks && !self.held_no_tts {
+            tracing::info!(event = "call_held", reason = "no_tts");
+        }
+        self.held_no_tts = !speaks;
+        let advertised = voice
+            .adapter
+            .as_ref()
+            .is_none_or(|adapter| adapter.advertised());
+        speaks
+            && advertised
             && !self
                 .connection
                 .is_some_and(|state| state != ConnectionState::Connected)
@@ -288,7 +308,7 @@ impl<M: Messenger> Core<M> {
     }
 
     /// Places a call to the owner; the phone's answer comes as [`Internal::Dialed`].
-    async fn dial(&mut self, purpose: Purpose) {
+    pub(super) async fn dial(&mut self, purpose: Purpose) {
         let Some(voice) = &self.voice else {
             return;
         };
@@ -302,6 +322,7 @@ impl<M: Messenger> Core<M> {
             cancelled: false,
             buffered: Vec::new(),
         });
+        self.sync_call_flag();
         tokio::spawn(async move {
             let result = phone.call(owner).await;
             let _ = internal.send(Internal::Dialed { result });
@@ -327,19 +348,20 @@ impl<M: Messenger> Core<M> {
                 return;
             }
         };
-        let setup = self
-            .voice
-            .as_ref()
-            .and_then(|voice| Some((voice.stt.clone()?, voice.tts.clone(), voice.vad)));
-        let (Some((stt, tts, vad)), false) = (setup, dialing.cancelled || self.stopping) else {
+        let control = line.control.clone();
+        let session = if dialing.cancelled || self.stopping {
+            None
+        } else {
+            self.start_pipeline(line)
+        };
+        let Some(session) = session else {
             tracing::info!(event = "call_dial_cancelled");
             tokio::spawn(async move {
-                line.control.hangup().await;
+                control.hangup().await;
             });
             self.update_activity(false).await;
             return;
         };
-        let session = self.start_pipeline(line, stt, tts, vad);
         for event in &dialing.buffered {
             session.handle(event);
         }
@@ -445,6 +467,17 @@ impl<M: Messenger> Core<M> {
             call.withdrawn = true;
             call.session.hang_up();
         }
+    }
+
+    /// Whether a call rings, is asked about, being answered or placed, or runs, or the
+    /// bridge is stopping: calls advertising waits for its end (A20) and holds still
+    /// through the shutdown.
+    pub(super) fn call_in_progress(&self) -> bool {
+        self.call.is_some()
+            || self.answering.is_some()
+            || self.asking.is_some()
+            || self.dialing.is_some()
+            || self.stopping
     }
 
     /// `mute`: mutes or unmutes the agent's voice in the running call (or in the call

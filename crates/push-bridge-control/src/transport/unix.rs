@@ -62,22 +62,45 @@ impl Drop for Listener {
 
 pub(super) async fn connect(endpoint: &Endpoint) -> io::Result<Stream> {
     let path = socket_path(endpoint)?;
-    let stream = UnixStream::connect(path)
+    let stream = connect_path(path).await?;
+    let (_, uid) = socket_dir(path)?;
+    check_peer(&stream, uid)?;
+    Ok(Box::new(stream))
+}
+
+pub(super) async fn connect_same_user(endpoint: &Endpoint) -> io::Result<Stream> {
+    let path = socket_path(endpoint)?;
+    let stream = connect_path(path).await?;
+    check_peer(&stream, own_uid()?)?;
+    Ok(Box::new(stream))
+}
+
+/// Nobody listening (no socket file, or a stale one) is `NotFound`.
+async fn connect_path(path: &Path) -> io::Result<UnixStream> {
+    UnixStream::connect(path)
         .await
         .map_err(|error| match error.kind() {
             io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused => {
                 io::Error::new(io::ErrorKind::NotFound, error)
             }
             _ => error,
-        })?;
-    let (_, uid) = socket_dir(path)?;
+        })
+}
+
+fn check_peer(stream: &UnixStream, uid: u32) -> io::Result<()> {
     if stream.peer_cred()?.uid() != uid {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "the socket's server runs as another user",
         ));
     }
-    Ok(Box::new(stream))
+    Ok(())
+}
+
+/// This process's uid: the peer credentials of a socket pair's other end.
+fn own_uid() -> io::Result<u32> {
+    let (ours, _other) = UnixStream::pair()?;
+    Ok(ours.peer_cred()?.uid())
 }
 
 fn socket_path(endpoint: &Endpoint) -> io::Result<&Path> {
