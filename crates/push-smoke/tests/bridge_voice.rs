@@ -252,6 +252,8 @@ async fn scenario(stack: &Stack) {
         run,
         backend,
         phone,
+        adapter,
+        advertiser,
         ..
     } = agent;
     let _ = stop.send(());
@@ -259,6 +261,7 @@ async fn scenario(stack: &Stack) {
         .await
         .expect("the bridge ran")
         .expect("the bridge stopped cleanly");
+    stop_adapter(adapter, advertiser).await;
     assert!(backend.calls().iter().any(|call| call == "stop"));
     // The phone holds a handle of the client: only the last one closes it.
     drop((owner_call, phone));
@@ -492,6 +495,8 @@ async fn policies(stack: &Stack) {
         stop,
         run,
         phone,
+        adapter,
+        advertiser,
         ..
     } = agent;
     let _ = stop.send(());
@@ -499,6 +504,7 @@ async fn policies(stack: &Stack) {
         .await
         .expect("the bridge ran")
         .expect("the bridge stopped cleanly");
+    stop_adapter(adapter, advertiser).await;
     drop((owner_call, answered, phone, line));
     client.close().await.unwrap();
     owner.client.close().await.unwrap();

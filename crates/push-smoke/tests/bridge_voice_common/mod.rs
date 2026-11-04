@@ -582,17 +582,26 @@ impl Agent {
             .await
             .expect("the bridge ran")
             .expect("the bridge stopped cleanly");
-        if let Some(advertiser) = advertiser {
-            advertiser.abort();
-            let _ = advertiser.await;
-        }
-        if let Some(adapter) = adapter {
-            within("the voice adapter stops", adapter.supervisor.shutdown()).await;
-            log_totals(&adapter);
-        }
+        stop_adapter(adapter, advertiser).await;
         // The phone holds a handle of the client: only the last one closes it.
         drop(phone);
         client.close().await.unwrap();
+    }
+}
+
+/// Once the bridge stopped: stops advertising calls and the voice adapter (its totals
+/// logged), as `push-agent-bridge run` does; both hold a handle of the agent's client.
+pub async fn stop_adapter(
+    adapter: Option<AdapterSetup>,
+    advertiser: Option<tokio::task::JoinHandle<()>>,
+) {
+    if let Some(advertiser) = advertiser {
+        advertiser.abort();
+        let _ = advertiser.await;
+    }
+    if let Some(adapter) = adapter {
+        within("the voice adapter stops", adapter.supervisor.shutdown()).await;
+        log_totals(&adapter);
     }
 }
 
