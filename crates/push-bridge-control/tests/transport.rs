@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use push_bridge_control::Endpoint;
 use push_bridge_control::endpoint_for;
-use push_bridge_control::transport::{Listener, Stream, connect};
+use push_bridge_control::transport::{Listener, Stream, connect, connect_same_user};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::time::timeout;
 
@@ -121,6 +121,23 @@ async fn nobody_listening_is_not_found() {
     let scratch = Scratch::new();
     let error = connect(&scratch.endpoint).await.err().unwrap();
     assert_eq!(error.kind(), io::ErrorKind::NotFound, "{error}");
+    let error = connect_same_user(&scratch.endpoint).await.err().unwrap();
+    assert_eq!(error.kind(), io::ErrorKind::NotFound, "{error}");
+}
+
+#[tokio::test]
+async fn a_server_of_this_user_passes_connect_same_user() {
+    let scratch = Scratch::new();
+    let server = echo_server(Listener::bind(&scratch.endpoint).unwrap(), 1);
+    let stream = timeout(WAIT, connect_same_user(&scratch.endpoint))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        timeout(WAIT, round_trip(stream, "same")).await.unwrap(),
+        "same\n"
+    );
+    assert_eq!(timeout(WAIT, server).await.unwrap().unwrap(), 0);
 }
 
 #[cfg(windows)]

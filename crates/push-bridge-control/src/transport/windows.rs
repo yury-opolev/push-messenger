@@ -158,6 +158,11 @@ impl Listener {
     }
 }
 
+/// The same check as [`connect`]: the server's SID is ours or SYSTEM.
+pub(super) async fn connect_same_user(endpoint: &Endpoint) -> io::Result<Stream> {
+    connect(endpoint).await
+}
+
 pub(super) async fn connect(endpoint: &Endpoint) -> io::Result<Stream> {
     let Endpoint::Pipe(name) = endpoint else {
         return Err(wrong_endpoint());
