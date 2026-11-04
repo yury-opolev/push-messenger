@@ -528,6 +528,16 @@ Notable changes for consumers of push-messenger. Newest first.
 
 ### Fixed
 
+- **Chart: coturn's NetworkPolicy refused by the API server**: with `calls.enabled` and
+  internal TURN, `helm install`/`upgrade` failed on a real cluster
+  (`NetworkPolicy "<release>-coturn" is invalid: ... "::ffff:0:0/96": must not have an
+  IPv4-mapped IPv6 address`), as Kubernetes refuses IPv4-mapped IPv6 CIDRs in `ipBlock`.
+  The policy's egress exceptions now leave out `::ffff:0:0/96` (and anything within) and
+  are written in canonical form; coturn's `denied-peer-ip` lines are unchanged, so it
+  still denies `::ffff:0:0/96`. `calls.turn.internal.deniedPeerCidrs` now refuses
+  IPv4-mapped entries. CI applies the chart to kind clusters of Kubernetes 1.34 to 1.37
+  (`chart-cluster`, [docs/calls.md §13.4](docs/calls.md#134-coturn-in-the-chart)).
+
 - **push-sdk media helper on coarse timers**: the helper now sends a frame every 20 ms on
   average where the timer is coarse. On Windows (a ~15.6 ms timer) a late 20 ms tick came
   every ~31 ms, about 32 frames a second, so the peer heard gaps and the audio fell

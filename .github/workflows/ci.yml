@@ -242,6 +242,39 @@ jobs:
       - run: python -m pip install --require-hashes --requirement deploy/helm/requirements-test.txt
       - run: pwsh deploy/helm/test-chart.ps1
 
+  # The chart's manifests through a real API server's validation, which helm template
+  # skips (an ipBlock the API refuses once broke helm upgrade): deploy/helm/test-chart-cluster.ps1
+  # on kind, for the newest kindest/node image of each Kubernetes minor AKS supports.
+  chart-cluster:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - kubernetes: v1.34.11
+            digest: sha256:44e222ee2132dab25ff87301682f89eb82c7880ea3a1bf543bfe9708fd08d67d
+          - kubernetes: v1.35.8
+            digest: sha256:07b2536e30b803ed61d1677a79df6115f798ce64c80f9e22f6ed45afd09323c0
+          - kubernetes: v1.36.4
+            digest: sha256:099e049362a1526b2db71494e1947aae99bd16290d7c895f2b7ea312e3cbfaed
+          - kubernetes: v1.37.0
+            digest: sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5
+    name: chart-cluster (${{ matrix.kubernetes }})
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
+        with:
+          version: v3.16.3
+      - uses: helm/kind-action@ea822c7bf1874f08e5a491df991c228edffc3376 # v1.15.2
+        with:
+          version: v0.33.0
+          node_image: kindest/node:${{ matrix.kubernetes }}@${{ matrix.digest }}
+          cluster_name: push-chart
+          kubectl_version: ${{ matrix.kubernetes }}
+          wait: 120s
+      - run: pwsh deploy/helm/test-chart-cluster.ps1 -Context kind-push-chart
+
   # The chart's third-party coturn image (calls.turn.internal.image) is pinned by digest
   # and has no HIGH or CRITICAL vulnerability with a fix, unless accepted with a reason in
   # deploy/helm/coturn.trivyignore.yaml. Upgrade path: docs/calls.md, "Upgrading coturn".
