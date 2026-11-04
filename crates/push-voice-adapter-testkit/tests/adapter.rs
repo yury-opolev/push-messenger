@@ -285,6 +285,39 @@ async fn a_speak_is_a_600_hz_tone_in_real_time_then_speak_done() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_speak_lead_sends_its_first_frames_at_once() {
+    let script = Script {
+        speak_lead_ms: 100,
+        ..script()
+    };
+    let mut bridge = Bridge::start(script);
+    bridge.hello().await;
+    bridge.call("c1").await;
+    let started = Instant::now();
+    bridge.speak("s1", "hello").await;
+    // 10 frames: the first and 5 more (100 ms) at once, then one every 20 ms.
+    let mut arrivals = Vec::new();
+    for seq in 0..10u32 {
+        let Some(In::Audio(frame)) = bridge.next().await else {
+            panic!("frame {seq}");
+        };
+        assert_eq!(frame.seq, seq);
+        arrivals.push(started.elapsed());
+    }
+    assert!(
+        arrivals[..6].iter().all(|at| *at == Duration::ZERO),
+        "{arrivals:?}"
+    );
+    assert_eq!(arrivals[6], Duration::from_millis(20), "{arrivals:?}");
+    assert_eq!(arrivals[9], Duration::from_millis(80), "{arrivals:?}");
+    let AdapterMessage::SpeakDone(done) = bridge.message().await else {
+        panic!("speak_done after the audio");
+    };
+    assert!(!done.interrupted);
+    bridge.close().await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
 async fn stop_speaking_cuts_and_drops_with_interrupted_speak_dones() {
     let mut bridge = Bridge::start(script());
     bridge.hello().await;

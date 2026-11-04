@@ -40,6 +40,10 @@ push-sdk = { workspace = true, features = ["calls-media"] }
 # the msrv build for the same reason).
 push-bridge = { workspace = true, features = ["voice"] }
 push-agent-key.workspace = true
+# bridge_voice_adapter.rs: the scripted voice adapter's scripts (its binary is built by
+# the test, see there) and the bridge's hello.
+push-voice-adapter-proto.workspace = true
+push-voice-adapter-testkit.workspace = true
 async-trait.workspace = true
 push-credentials = { workspace = true, features = ["testing"] }
 tokio = { workspace = true, features = ["io-util", "process"] }

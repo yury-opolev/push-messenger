@@ -254,8 +254,11 @@ impl Session<'_> {
                     self.on_frame(frame, writer).await?;
                     let speaking = self.call.as_ref().is_some_and(|call| !call.speaks.is_empty());
                     if speaking && !was_speaking {
-                        // The first frame at once, then one every 20 ms.
-                        self.speak_frame(writer).await?;
+                        // The first frame (and the script's lead) at once, then one every
+                        // 20 ms.
+                        for _ in 0..=self.script.speak_lead_frames() {
+                            self.speak_frame(writer).await?;
+                        }
                         speaker.reset();
                     }
                 }

@@ -2012,11 +2012,16 @@ there:
   10 s ring: `ask` (the call waits for the card's "Answer"), a card unanswered for 3 s
   making the bridge call the owner, who answers, hears the summary and approves by voice,
   and a call the owner lets ring out, after which the card is still open and takes the
-  answer. Locally, with Docker:
+  answer. `crates/push-smoke/tests/bridge_voice_adapter.rs` (same job) runs speech in a
+  voice adapter, `push-voice-adapter-testkit` (the test builds its binary): spawned and
+  connected, a crash mid-call (the owner is told, the restarted adapter takes the call
+  again), no adapter and a refused audio format (calls not advertised, one warning), a
+  final transcript becoming a `speak` within 100 ms, the agent's voice without gaps over
+  40 ms, and a log free of what was said. Locally, with Docker:
 
   ```powershell
   $env:PUSH_BRIDGE_VOICE = "1"
-  cargo test -p push-smoke --test bridge_voice -- --nocapture --test-threads 1
+  cargo test -p push-smoke --test bridge_voice --test bridge_voice_adapter -- --nocapture --test-threads 1
   ```
 
 - **Real providers**: the opt-in [live speech test](#12-live-smoke-test-opt-in).

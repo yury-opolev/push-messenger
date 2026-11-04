@@ -8,6 +8,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::tones::{MAX_WORD_HZ, MIN_SPEAK_GAP_HZ, MIN_WORD_GAP_HZ, MIN_WORD_HZ, SPEAK_HZ};
 
+/// The most [`Script::speak_lead_ms`] may be.
+pub const MAX_SPEAK_LEAD_MS: u32 = 1000;
+
 /// The adapter's name in its hello by default.
 pub const DEFAULT_NAME: &str = "push-voice-adapter-testkit";
 
@@ -32,6 +35,10 @@ pub struct Script {
     /// How long a character of a `speak` sounds: `max(1, chars × ms_per_char / 20)`
     /// frames.
     pub ms_per_char: u32,
+    /// How far ahead of real time a speak's audio is sent (the protocol allows about 1 s):
+    /// when speaking starts, the first `1 + speak_lead_ms / 20` frames go at once, then one
+    /// every 20 ms. 0 (the default): strictly real time. At most 1000.
+    pub speak_lead_ms: u32,
 
     /// Fault: after this many stream-0 frames on a connection, crash: the library returns
     /// [`crate::AdapterError::Crashed`] without closing the stream properly, the binary
@@ -87,6 +94,7 @@ impl Default for Script {
             words: Vec::new(),
             speak_hz: SPEAK_HZ,
             ms_per_char: 40,
+            speak_lead_ms: 0,
             crash_after_frames: None,
             crash_once_marker: None,
             refuse_format: false,
@@ -151,7 +159,15 @@ impl Script {
         if self.ms_per_char == 0 {
             return Err("ms_per_char must be at least 1".to_owned());
         }
+        if self.speak_lead_ms > MAX_SPEAK_LEAD_MS {
+            return Err(format!("speak_lead_ms must be at most {MAX_SPEAK_LEAD_MS}"));
+        }
         Ok(())
+    }
+
+    /// Frames sent at once when speaking starts, ahead of the real-time pace.
+    pub fn speak_lead_frames(&self) -> usize {
+        (self.speak_lead_ms / crate::tones::FRAME_MS) as usize
     }
 
     /// Frames a speak of `chars` characters sounds for.
@@ -194,6 +210,7 @@ mod tests {
     #[test]
     fn typos_and_bad_tones_are_refused() {
         assert!(Script::from_json(r#"{"crash_after_frame": 3}"#).is_err());
+        assert!(Script::from_json(r#"{"speak_lead_ms": 1001}"#).is_err());
         for words in [
             r#"[{"hz": 300, "word": "low"}]"#,
             r#"[{"hz": 2500, "word": "high"}]"#,

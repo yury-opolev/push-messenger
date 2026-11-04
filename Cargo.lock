@@ -2951,6 +2951,8 @@ dependencies = [
  "push-proto",
  "push-sdk",
  "push-store",
+ "push-voice-adapter-proto",
+ "push-voice-adapter-testkit",
  "push-worker",
  "redis",
  "reqwest",
