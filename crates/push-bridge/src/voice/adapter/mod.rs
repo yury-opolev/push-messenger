@@ -5,4 +5,5 @@
 pub mod connect;
 #[cfg(windows)]
 mod job;
+pub mod link;
 pub mod spawn;
