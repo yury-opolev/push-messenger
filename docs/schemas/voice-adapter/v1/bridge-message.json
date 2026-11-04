@@ -65,7 +65,10 @@
             "type": "string"
           },
           "maxItems": 16,
-          "type": "array"
+          "type": [
+            "array",
+            "null"
+          ]
         }
       },
       "required": [

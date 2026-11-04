@@ -30,7 +30,10 @@
             "$ref": "#/$defs/Voice"
           },
           "maxItems": 256,
-          "type": "array"
+          "type": [
+            "array",
+            "null"
+          ]
         }
       },
       "required": [

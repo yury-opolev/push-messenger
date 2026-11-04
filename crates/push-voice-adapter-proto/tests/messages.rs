@@ -64,6 +64,24 @@ fn unknown_fields_are_ignored_and_optional_ones_default() {
         }
     );
     assert!(hello.voices.is_empty());
+    // Optional lists may be null too.
+    let message: AdapterMessage = known(json!({
+        "type": "hello", "protocol": "push-voice-adapter/1", "name": "a", "version": "",
+        "capabilities": {}, "voices": null
+    }));
+    let AdapterMessage::Hello(hello) = message else {
+        panic!()
+    };
+    assert!(hello.voices.is_empty());
+    let message: BridgeMessage = known(json!({
+        "type": "hello", "protocol": "push-voice-adapter/1", "protocols": null,
+        "bridge_version": "0", "language": "en",
+        "audio": {"rate": 16000, "channels": 1, "format": "s16le", "frame_ms": 20}
+    }));
+    let BridgeMessage::Hello(hello) = message else {
+        panic!()
+    };
+    assert_eq!(hello.offered(), vec![PROTOCOL]);
     let message: BridgeMessage = known(json!({
         "type": "stop_speaking", "call_id": "c", "speak_id": null, "extra": 1
     }));

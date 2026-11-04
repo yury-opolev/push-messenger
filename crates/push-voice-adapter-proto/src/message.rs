@@ -40,6 +40,15 @@ mod sealed {
     impl Sealed for super::AdapterMessage {}
 }
 
+/// An optional list: absent and `null` are both empty.
+fn null_as_empty<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<Vec<T>>::deserialize(deserializer).map(Option::unwrap_or_default)
+}
+
 /// What the bridge sends.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -74,8 +83,12 @@ pub struct BridgeHello {
     #[schemars(length(min = 1, max = 64))]
     pub protocol: String,
     /// Every version the bridge speaks (including `protocol`). Absent: only `protocol`.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[schemars(length(max = 16))]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "null_as_empty"
+    )]
+    #[schemars(with = "Option<Vec<String>>", length(max = 16))]
     pub protocols: Vec<String>,
     /// The bridge's version, for the adapter's diagnostics.
     #[schemars(length(max = 64))]
@@ -116,8 +129,12 @@ pub struct AdapterHello {
     /// What the adapter can do. The bridge advertises calls only with `stt`.
     pub capabilities: Capabilities,
     /// Voices `speak.voice` may name.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[schemars(length(max = 256))]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "null_as_empty"
+    )]
+    #[schemars(with = "Option<Vec<Voice>>", length(max = 256))]
     pub voices: Vec<Voice>,
 }
 
