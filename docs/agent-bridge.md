@@ -1775,13 +1775,13 @@ tool) and listens; the bridge connects and never creates the endpoint.
 ```
 
 ```json
-"calls": { "adapter": { "connect": { "socket": "$XDG_RUNTIME_DIR/push-voice-adapter.sock" } } }
+"calls": { "adapter": { "connect": { "socket": "$XDG_RUNTIME_DIR/push-voice/adapter.sock" } } }
 ```
 
 | Field | Meaning |
 |---|---|
 | `pipe` | Windows: the pipe's name only (1 to 200 of `A-Z a-z 0-9 . _ -`); the bridge opens `\\.\pipe\<name>` |
-| `socket` | Unix: the socket's absolute path; a leading `$XDG_RUNTIME_DIR/` is replaced by that variable (unset: the connect fails and backs off) |
+| `socket` | Unix: the socket's absolute path; a leading `$XDG_RUNTIME_DIR/` is replaced by that variable (unset: the connect fails and backs off). Adapters keep the socket in a private (0700) folder of their own inside the runtime dir, as the control channel does |
 
 The adapter must run as the same user: on Windows the pipe server's user must be the
 bridge's (or SYSTEM), on Unix the socket peer's uid must be the bridge's. Another user's

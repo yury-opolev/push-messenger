@@ -336,7 +336,9 @@ fn endpoint(suffix: &str) -> (&'static str, String, AdapterConfig) {
         .map(PathBuf::from)
         .filter(|dir| dir.is_absolute() && dir.is_dir())
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_TARGET_TMPDIR")));
-    let path = dir.join(format!("pve-{suffix}.sock"));
+    // push-bridge-control's listener wants a private (0700) folder of its own inside the
+    // runtime dir, like the control channel's.
+    let path = dir.join(format!("pve-{suffix}")).join("a.sock");
     let path = path.to_string_lossy().into_owned();
     assert!(path.len() < 100, "a socket path this long: {path}");
     let config = AdapterConfig::Connect(ConnectConfig::Socket(path.clone()));

@@ -53,3 +53,6 @@ vulnerabilities:
   - id: CVE-2026-9100
     statement: MongoDB GridFS API; the chart configures no MongoDB user database
     expired_at: 2027-02-01
+  - id: CVE-2026-93393
+    statement: MongoDB driver TLS (Windows Secure Channel); the chart configures no MongoDB user database
+    expired_at: 2027-02-01
