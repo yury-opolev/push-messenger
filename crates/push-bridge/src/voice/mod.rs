@@ -6,8 +6,10 @@
 //! answers. [`provider`] runs the speech services: Azure AI Speech, local servers or
 //! commands, and tone-based fakes for tests. [`phone`] answers calls (push-sdk's media
 //! helper in `media`, feature `voice`; a fake in tests) and [`session`] runs one call's
-//! pipeline: listening, transcribing, speaking, barge-in.
+//! pipeline: listening, transcribing, speaking, barge-in. [`adapter`] starts or connects to a
+//! voice adapter, a separate program that runs speech (push-voice-adapter/1).
 
+pub mod adapter;
 pub mod azure;
 pub mod confirm;
 pub mod fake;

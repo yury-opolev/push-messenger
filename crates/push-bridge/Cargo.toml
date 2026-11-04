@@ -35,11 +35,12 @@ tracing-subscriber.workspace = true
 uuid.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 # Not `workspace = true`: the workspace forbids unsafe code, and the file version needs it.
 [lints.rust]
-# Only src/exe/windows.rs uses unsafe (version-info FFI), each block with a SAFETY note.
+# Only src/exe/windows.rs (version-info FFI) and src/voice/adapter/job.rs (job object FFI)
+# use unsafe, each block with a SAFETY note.
 unsafe_code = "deny"
 unsafe_op_in_unsafe_fn = "deny"
 
