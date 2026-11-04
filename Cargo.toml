@@ -72,7 +72,7 @@ push-testkit = { path = "crates/push-testkit" }
 push-voice-adapter-proto = { path = "crates/push-voice-adapter-proto" }
 push-voice-adapter-testkit = { path = "crates/push-voice-adapter-testkit" }
 push-worker = { path = "crates/push-worker" }
-rand = "0.9"
+rand = "0.10"
 rcgen = "0.13"
 redis = { version = "1", default-features = false, features = [
     "connection-manager",
