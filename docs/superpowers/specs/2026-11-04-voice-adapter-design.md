@@ -540,7 +540,9 @@ negotiated (A6). The bridge's `calls` config gains `adapter` in PR 2 (additive) 
   client), so it stays in the bridge's dependency tree. "No speech dependency" means no
   speech engine or provider crate or code in the bridge.
 - **E2E.** `crates/push-smoke/tests/bridge_voice.rs` runs on the spawned testkit adapter
-  (`Speech::Builtin` removed); `bridge_voice_adapter.rs` is unchanged.
+  (`Speech::Builtin` removed); `bridge_voice_adapter.rs` keeps its scenarios; its
+  testkit-build and `hearing()` helpers moved to `bridge_voice_common`, shared with
+  `bridge_voice.rs`.
 - **The `voice` feature stays** and now builds only the media helper (`voice/media.rs`).
 - **Release order.** The plan said PR 3 lands only after PRs 1 and 2 are released. No
   release tags exist in the repository and the owner asked for the change delivered now,
