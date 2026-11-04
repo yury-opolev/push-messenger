@@ -4,14 +4,13 @@
 //! engine hears the owner's audio, turns it into transcripts and speaks the queued
 //! sentences.
 //!
-//! - [`BuiltinEngine`]: the bridge's own speech (the detector, the STT and TTS
-//!   providers), removed with them in PR 3.
-//! - [`AdapterEngine`](super::adapter::router::AdapterEngine): speech in the voice
-//!   adapter (push-voice-adapter/1).
+//! The engine is the [`AdapterEngine`](super::adapter::router::AdapterEngine): speech in
+//! the voice adapter (push-voice-adapter/1). The trait is the seam between the session
+//! and the adapter router.
 //!
-//! Both share a [`SpeechContext`]: the session queues sentences in it (with the
-//! generation they belong to) and wakes [`SpeechContext::wake`]; the engine takes them
-//! from there. A barge-in or a hush bumps the generation, drops the queue and clears the
+//! The session and its engine share a [`SpeechContext`]: the session queues sentences in
+//! it (with the generation they belong to) and wakes [`SpeechContext::wake`]; the engine
+//! takes them from there. A barge-in or a hush bumps the generation, drops the queue and clears the
 //! speaker ([`SpeechContext::stop_speaking`]), then the session calls
 //! [`SpeechEngine::stop`].
 
@@ -21,15 +20,12 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use push_sdk::CallEndReason;
-use tokio::sync::{Notify, mpsc};
-use tokio::task::JoinHandle;
+use tokio::sync::Notify;
 use tokio::time::Instant;
 
+use super::Frame;
 use super::phone::Speaker;
-use super::provider::{Stt, Tts};
 use super::session::{EventSink, SessionEvent};
-use super::vad::{Vad, VadConfig, VadEvent};
-use super::{Frame, SAMPLE_RATE, wav};
 
 /// One frame of call audio.
 pub(crate) const FRAME_TIME: Duration = Duration::from_millis(20);
@@ -169,240 +165,4 @@ impl SpeechContext {
         self.wake.notify_one();
         true
     }
-}
-
-/// The bridge's own speech: the detector cuts the owner's audio into utterances, the STT
-/// worker transcribes them one at a time, the speaker worker synthesizes the queued
-/// sentences (without TTS nothing is spoken).
-pub struct BuiltinEngine {
-    ctx: Arc<SpeechContext>,
-    listener: Mutex<Listener>,
-    utterances: mpsc::UnboundedSender<(Vec<i16>, Instant)>,
-    speaks: bool,
-    workers: Mutex<Vec<JoinHandle<()>>>,
-}
-
-struct Listener {
-    vad: Vad,
-    /// When the detector heard the current utterance's speech start.
-    started: Instant,
-}
-
-impl BuiltinEngine {
-    /// Starts the workers on the current runtime.
-    pub(crate) fn start(
-        ctx: Arc<SpeechContext>,
-        stt: Arc<dyn Stt>,
-        tts: Option<Arc<dyn Tts>>,
-        vad: VadConfig,
-    ) -> Self {
-        let (utterances, to_transcribe) = mpsc::unbounded_channel();
-        let mut workers = vec![tokio::spawn(transcribe(ctx.clone(), stt, to_transcribe))];
-        let speaks = tts.is_some();
-        if let Some(tts) = tts {
-            workers.push(tokio::spawn(speak(ctx.clone(), tts)));
-        }
-        Self {
-            ctx,
-            listener: Mutex::new(Listener {
-                vad: Vad::new(vad),
-                started: Instant::now(),
-            }),
-            utterances,
-            speaks,
-            workers: Mutex::new(workers),
-        }
-    }
-
-    fn take_workers(&self) -> Vec<JoinHandle<()>> {
-        std::mem::take(&mut *self.workers.lock().expect("the workers are not poisoned"))
-    }
-}
-
-#[async_trait::async_trait]
-impl SpeechEngine for BuiltinEngine {
-    /// Runs the detector: speech starting while the agent speaks is a barge-in.
-    fn hear(&self, frame: &Frame) {
-        let ctx = &self.ctx;
-        let mut listener = self.listener.lock().expect("the listener is not poisoned");
-        match listener.vad.push(frame) {
-            Some(VadEvent::SpeechStarted) => {
-                listener.started = Instant::now();
-                if ctx.stop_speaking(true) {
-                    tracing::info!(event = "voice_barge_in");
-                }
-                ctx.emit(SessionEvent::Listening(true));
-            }
-            Some(VadEvent::Utterance(samples)) => {
-                ctx.emit(SessionEvent::Listening(false));
-                let _ = self.utterances.send((samples, listener.started));
-            }
-            Some(VadEvent::Discarded) => ctx.emit(SessionEvent::Listening(false)),
-            None => {}
-        }
-    }
-
-    fn speaks(&self) -> bool {
-        self.speaks
-    }
-
-    fn connected(&self) {}
-
-    /// The context dropped the queue and woke the speaker worker: nothing more to do.
-    fn stop(&self) {}
-
-    async fn end(&self, _reason: CallEndReason) {
-        let workers = self.take_workers();
-        for worker in &workers {
-            worker.abort();
-        }
-        for worker in workers {
-            let _ = worker.await;
-        }
-    }
-}
-
-impl Drop for BuiltinEngine {
-    fn drop(&mut self) {
-        for worker in self.take_workers() {
-            worker.abort();
-        }
-    }
-}
-
-/// Transcribes the utterances one at a time, in order.
-async fn transcribe(
-    ctx: Arc<SpeechContext>,
-    stt: Arc<dyn Stt>,
-    mut utterances: mpsc::UnboundedReceiver<(Vec<i16>, Instant)>,
-) {
-    while let Some((samples, started)) = utterances.recv().await {
-        let ms = samples.len() as u64 * 1000 / u64::from(SAMPLE_RATE);
-        tracing::info!(event = "voice_utterance", ms);
-        match stt.transcribe(&samples).await {
-            Ok(text) => {
-                let text = text.trim();
-                if !text.is_empty() {
-                    ctx.emit(SessionEvent::Transcript {
-                        text: text.to_owned(),
-                        started,
-                    });
-                }
-            }
-            Err(error) => {
-                tracing::warn!(
-                    event = "stt_failed",
-                    provider = error.provider,
-                    code = %error.code
-                );
-                ctx.emit(SessionEvent::SpeechFailed(error.code));
-            }
-        }
-    }
-}
-
-/// What the speaker worker does next.
-enum Next {
-    Sentence(u64, String),
-    /// Nothing queued: the audio plays until then.
-    Playing(Instant),
-    /// The audio played: `Speaking(false)` was reported.
-    Done,
-    Idle,
-}
-
-/// Speaks the queued sentences.
-async fn speak(ctx: Arc<SpeechContext>, tts: Arc<dyn Tts>) {
-    loop {
-        let next = {
-            let mut speech = ctx.speech();
-            if let Some(sentence) = speech.queue.pop_front() {
-                speech.busy = Some(sentence.generation);
-                Next::Sentence(sentence.generation, sentence.text)
-            } else if !speech.speaking {
-                Next::Idle
-            } else {
-                match speech.playing_until {
-                    Some(until) if until > Instant::now() => Next::Playing(until),
-                    _ => {
-                        speech.speaking = false;
-                        speech.playing_until = None;
-                        ctx.emit(SessionEvent::Speaking(false));
-                        Next::Done
-                    }
-                }
-            }
-        };
-        match next {
-            Next::Sentence(generation, text) => {
-                let spoken = say_sentence(&ctx, tts.as_ref(), generation, &text).await;
-                ctx.speech().busy = None;
-                if !spoken {
-                    return;
-                }
-            }
-            Next::Playing(until) => {
-                tokio::select! {
-                    () = tokio::time::sleep_until(until) => {}
-                    () = ctx.wake.notified() => {}
-                }
-            }
-            Next::Done => {}
-            Next::Idle => ctx.wake.notified().await,
-        }
-    }
-}
-
-/// Synthesizes `text` and queues its audio unless a barge-in or a hush overtakes it;
-/// `false` once the call ended.
-async fn say_sentence(ctx: &SpeechContext, tts: &dyn Tts, generation: u64, text: &str) -> bool {
-    if generation != ctx.generation() {
-        return true;
-    }
-    let samples = match tts.synthesize(text).await {
-        Ok(samples) => samples,
-        Err(error) => {
-            tracing::warn!(
-                event = "tts_failed",
-                provider = error.provider,
-                code = %error.code
-            );
-            return true;
-        }
-    };
-    {
-        let mut speech = ctx.speech();
-        if generation != ctx.generation() {
-            return true;
-        }
-        if !std::mem::replace(&mut speech.speaking, true) {
-            ctx.emit(SessionEvent::Speaking(true));
-        }
-    }
-    let frames = wav::frames(&samples);
-    tracing::info!(
-        event = "voice_sentence",
-        ms = frames.len() as u64 * FRAME_TIME.as_millis() as u64
-    );
-    for frame in frames {
-        if generation != ctx.generation() {
-            return true;
-        }
-        if !ctx.speaker.send(frame).await {
-            return false;
-        }
-        let mut speech = ctx.speech();
-        if generation != ctx.generation() {
-            drop(speech);
-            // A barge-in or a hush overtook the frame while the speaker took it: its
-            // `clear()` may have run before the frame was queued, which then carries the
-            // speaker's new generation and would play after the cut. Clear again.
-            ctx.speaker.clear();
-            return true;
-        }
-        let now = Instant::now();
-        let from = speech.playing_until.map_or(now, |until| until.max(now));
-        speech.playing_until = Some(from + FRAME_TIME);
-    }
-    true
 }

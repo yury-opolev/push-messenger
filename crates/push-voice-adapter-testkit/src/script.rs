@@ -59,8 +59,8 @@ pub struct Script {
     pub no_hello: bool,
 }
 
-/// A word: heard when a tone at `hz` sounds. `text` is accepted for `word`, as in
-/// push-bridge's voice fixtures.
+/// A word: heard when a tone at `hz` sounds. `text` is accepted for `word`, as in the
+/// recorded [`crate::fixture`]s.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Word {

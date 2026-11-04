@@ -107,15 +107,15 @@ troubleshooting: [docs/agent-bridge.md](docs/agent-bridge.md).
   / `resume` around a Coda upgrade, and other tools
   ([guide](docs/agent-bridge.md#14-control-channel-for-other-tools)).
 - Voice calls: built with `--features voice`, the bridge answers its owner's calls, turns
-  speech into prompts, speaks the replies and takes spoken answers to its cards (Azure AI
-  Speech or local engines) ([guide](docs/agent-bridge.md#18-voice-calls)).
+  speech into prompts, speaks the replies and takes spoken answers to its cards; the
+  speech runs in a separate voice adapter process (`calls.adapter`: any engine, local or
+  cloud) ([guide](docs/agent-bridge.md#18-voice-calls)).
 - `crates/push-voice-adapter-proto`: the voice adapter protocol (`push-voice-adapter/1`)
-  that moves speech out of the bridge into a separate, swappable voice adapter process:
-  framing, control messages, limits and JSON Schemas
-  ([reference](docs/voice-adapter-protocol.md)). The bridge's adapter client follows.
+  between the bridge and its voice adapter: framing, control messages, limits and JSON
+  Schemas ([reference and how to write an adapter](docs/voice-adapter-protocol.md)).
 - `crates/push-voice-adapter-testkit`: a scripted voice adapter for tests (library and
   binary): tones in, transcripts out; text in, a 600 Hz tone out; crashes, stalls and
-  refusals on demand.
+  refusals on demand; the voice tests' recorded fixtures.
 
 ## Run it on minikube
 

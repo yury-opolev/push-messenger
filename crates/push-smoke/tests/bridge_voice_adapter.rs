@@ -45,7 +45,7 @@ use push_bridge::voice::adapter::supervisor::AdapterState;
 use push_bridge::voice::policy::CallPolicy;
 use push_sdk::media::{MediaCall, MediaOptions, MediaState, Role};
 use push_sdk::{CallEndReason, UserId};
-use push_voice_adapter_testkit::{Script, Word};
+use push_voice_adapter_testkit::Script;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tracing_subscriber::EnvFilter;
@@ -160,93 +160,6 @@ fn failures(mark: usize, code: &str) -> (usize, usize) {
 
 // ---------------------------------------------------------------------------------------
 // The scripted adapter.
-
-/// The testkit's binary, built once per run (see the module's documentation).
-fn testkit() -> PathBuf {
-    static BINARY: OnceLock<PathBuf> = OnceLock::new();
-    BINARY
-        .get_or_init(|| {
-            let test = std::env::current_exe().expect("the test's path");
-            // target/<profile>/deps/<test> → target/<profile>
-            let profile_dir = test
-                .parent()
-                .and_then(Path::parent)
-                .expect("the test runs from target/<profile>/deps");
-            let profile = profile_dir.file_name().and_then(|name| name.to_str());
-            let target_dir = profile_dir.parent().expect("target/<profile>");
-            let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-            let mut build = std::process::Command::new(cargo);
-            build
-                .args([
-                    "build",
-                    "--locked",
-                    "-p",
-                    "push-voice-adapter-testkit",
-                    "--target-dir",
-                ])
-                .arg(target_dir)
-                .current_dir(env!("CARGO_MANIFEST_DIR"));
-            match profile {
-                Some("debug") => {}
-                Some("release") => {
-                    build.arg("--release");
-                }
-                Some(other) => {
-                    build.args(["--profile", other]);
-                }
-                None => panic!("the profile directory {}", profile_dir.display()),
-            }
-            let started = Instant::now();
-            let status = build.status().expect("cargo runs");
-            assert!(status.success(), "building push-voice-adapter-testkit");
-            let binary = profile_dir.join(format!(
-                "push-voice-adapter-testkit{}",
-                std::env::consts::EXE_SUFFIX
-            ));
-            assert!(binary.is_file(), "{} exists", binary.display());
-            step(&format!(
-                "the testkit adapter is built in {} ms: {}",
-                started.elapsed().as_millis(),
-                binary.display()
-            ));
-            binary
-        })
-        .clone()
-}
-
-/// The default script hearing every fixture's words. It sends its voice strictly in real
-/// time (no lead), its timer's jitter included: the bridge's playback pre-roll
-/// (`router::PREROLL`) absorbs it, so the gaps the owner hears stay within [`MAX_GAP`].
-fn hearing() -> Script {
-    Script::with_words(
-        all_words()
-            .into_iter()
-            .map(|(hz, text)| Word::new(hz, text))
-            .collect(),
-    )
-}
-
-fn write_script(dir: &Path, script: &Script) -> PathBuf {
-    let path = dir.join("script.json");
-    std::fs::write(&path, serde_json::to_vec_pretty(script).unwrap()).unwrap();
-    path
-}
-
-/// `calls.adapter.spawn` running the testkit with `script`, its events in `events`.
-fn spawned(dir: &Path, script: &Script, events: &Path) -> AdapterConfig {
-    let script = write_script(dir, script);
-    AdapterConfig::Spawn(SpawnConfig {
-        command: vec![
-            testkit().to_string_lossy().into_owned(),
-            "--script".to_owned(),
-            script.to_string_lossy().into_owned(),
-            "--events".to_owned(),
-            events.to_string_lossy().into_owned(),
-        ],
-        stderr: StderrMode::Log,
-        env_allow: Vec::new(),
-    })
-}
 
 /// The testkit's events so far (JSON lines; `[]` before the first).
 fn events(path: &Path) -> Vec<Value> {
@@ -380,19 +293,6 @@ async fn new_agent(stack: &Stack, token: &str, handle: &str) -> String {
     )
     .await;
     created["enrollment_code"].as_str().unwrap().to_owned()
-}
-
-/// Waits until the agent advertises calls (its adapter has listened for 2 s).
-async fn advertised(agent: &Agent) {
-    let since = Instant::now();
-    until("calls advertised", || {
-        agent.client.calls_advertised().then_some(())
-    })
-    .await;
-    step(&format!(
-        "calls advertised {} ms after the bridge started",
-        since.elapsed().as_millis()
-    ));
 }
 
 async fn spawned_adapter(stack: &Stack) {

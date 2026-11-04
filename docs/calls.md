@@ -38,9 +38,9 @@ and the spec differ, this guide describes what the code does.
 | push-load `calls` scenario: concurrent calls and setup latency ([§15.3](#153-load)) | available in this release |
 | push-sdk calls API ([§18](#18-push-sdk)) | available in this release (Rust; the C and Node bindings follow) |
 | push-sdk media helper `MediaCall` (feature `calls-media`: a native WebRTC audio peer, PCM in and out; [§19](#19-media-helper)) | available in this release (Rust) |
-| Agents in calls: push-agent-bridge answers its owner's calls (phase 2's bridge voice pipeline, PR 7: speech-to-text, spoken replies, barge-in, voice answers to cards; [agent bridge §18](agent-bridge.md#18-voice-calls)) | available in this release (build with `--features voice`) |
+| Agents in calls: push-agent-bridge answers its owner's calls (phase 2's bridge voice pipeline, PR 7: transcripts as prompts, spoken replies, barge-in, voice answers to cards; [agent bridge §18](agent-bridge.md#18-voice-calls)) | available in this release (build with `--features voice`) |
 | Agents' answering and calling policies (PR 8: `calls.answer: "ask"`, the agent calling its owner with `calls.notify_by_call`, do-not-disturb hours and a rate limit, the tray's call state with Mute agent and Hang up; [agent bridge §18](agent-bridge.md#18-voice-calls)) | available in this release (build with `--features voice`) |
-| Agents' voice adapter: speech in a separate, swappable process (`calls.adapter`, [`push-voice-adapter/1`](voice-adapter-protocol.md); calls advertised only while it is ready; [agent bridge §18](agent-bridge.md#voice-adapter)); the built-in speech providers are deprecated | available in this release (build with `--features voice`) |
+| Agents' voice adapter: speech in a separate, swappable process (`calls.adapter`, [`push-voice-adapter/1`](voice-adapter-protocol.md); calls advertised only while it is ready; [agent bridge §18](agent-bridge.md#voice-adapter)); the bridge carries the audio and has no speech engine of its own (its former built-in speech providers are removed) | available in this release (build with `--features voice`) |
 
 This guide is meant to be enough to build a client without reading the server code. In
 short, a browser client:
@@ -1278,9 +1278,13 @@ push-sdk = { …, features = ["calls-media"] }
 ```
 
 push-agent-bridge uses it to take its owner's calls and, with `calls.notify_by_call`, to call its owner (`Role::Caller`): [agent bridge §18](agent-bridge.md#18-voice-calls).
-With a [voice adapter](agent-bridge.md#voice-adapter) (`calls.adapter`) the bridge
-advertises calls only while its adapter is ready to listen, switching with
-`Client::set_calls_advertised` ([§18](#18-push-sdk)) outside calls.
+The bridge carries the call's audio to and from a
+[voice adapter](agent-bridge.md#voice-adapter), a separate process that does the speech.
+The helper's PCM, 16 kHz mono s16le in 20 ms frames of 320 samples, converted from and to
+Opus at 48 kHz ([§19.4](#194-audio)), is exactly the audio format of the adapter protocol
+[`push-voice-adapter/1`](voice-adapter-protocol.md#4-audio), so adapters never deal with
+Opus or WebRTC. The bridge advertises calls only while its adapter is ready to listen,
+switching with `Client::set_calls_advertised` ([§18](#18-push-sdk)) outside calls.
 
 ### 19.1 Requirements
 

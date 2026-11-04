@@ -2,10 +2,11 @@
 //! calls"): the whole stack in this process with calls and agent-key sign-in, the owner on
 //! an SDK client placing the call with push-sdk's media helper, and the agent enrolled with
 //! a software key running the bridge as `push-agent-bridge run` does (an `SdkMessenger`,
-//! `MediaPhone`), with a scripted backend and the tone-based speech fakes. Over real Opus
-//! media the owner hears the greeting and the spoken replies, its recorded fixtures become
-//! a prompt, a steer that cuts the reply short (barge-in) and a voice approval; a stranger's
-//! call never reaches the bridge, and the owner hangs up. A second test runs the answering
+//! `MediaPhone`), with a scripted backend and its speech in the testkit's scripted voice
+//! adapter (spawned; `Agent::start`). Over real Opus media the owner hears the greeting
+//! and the spoken replies, its recorded fixtures become a prompt, a steer that cuts the
+//! reply short (barge-in) and a voice approval; a stranger's call never reaches the
+//! bridge, and the owner hangs up. A second test runs the answering
 //! and calling policies: with `calls.answer` `ask` the owner's call waits for the card's
 //! "Answer"; a card left unanswered makes the bridge call the owner, who hears the summary
 //! and approves by voice; a call the owner lets ring out leaves the card open.
@@ -251,6 +252,8 @@ async fn scenario(stack: &Stack) {
         run,
         backend,
         phone,
+        adapter,
+        advertiser,
         ..
     } = agent;
     let _ = stop.send(());
@@ -258,6 +261,7 @@ async fn scenario(stack: &Stack) {
         .await
         .expect("the bridge ran")
         .expect("the bridge stopped cleanly");
+    stop_adapter(adapter, advertiser).await;
     assert!(backend.calls().iter().any(|call| call == "stop"));
     // The phone holds a handle of the client: only the last one closes it.
     drop((owner_call, phone));
@@ -491,6 +495,8 @@ async fn policies(stack: &Stack) {
         stop,
         run,
         phone,
+        adapter,
+        advertiser,
         ..
     } = agent;
     let _ = stop.send(());
@@ -498,6 +504,7 @@ async fn policies(stack: &Stack) {
         .await
         .expect("the bridge ran")
         .expect("the bridge stopped cleanly");
+    stop_adapter(adapter, advertiser).await;
     drop((owner_call, answered, phone, line));
     client.close().await.unwrap();
     owner.client.close().await.unwrap();

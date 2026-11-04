@@ -134,7 +134,7 @@ impl<M: Messenger> Core<M> {
     /// The voice adapter with its counters, when `calls.adapter` is set.
     fn report_adapter(&mut self) -> Option<AdapterStatus> {
         let now_ms = self.clock.now_ms();
-        let setup = self.voice.as_ref()?.adapter.as_ref()?;
+        let setup = &self.voice.as_ref()?.adapter;
         Some(self.adapter_reports.report(setup, now_ms))
     }
 

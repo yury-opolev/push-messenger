@@ -222,6 +222,8 @@ struct Call {
 
 struct SpeakJob {
     speak_id: String,
+    /// Kept in memory for [`Log::said`] only.
+    text: String,
     frames: usize,
     sent: usize,
 }
@@ -373,6 +375,7 @@ impl Session<'_> {
                 if let Some(call) = self.call.as_mut() {
                     call.speaks.push_back(SpeakJob {
                         speak_id: speak.speak_id,
+                        text: speak.text,
                         frames,
                         sent: 0,
                     });
@@ -528,6 +531,7 @@ impl Session<'_> {
             return Ok(());
         };
         if job.sent == 0 {
+            self.log.said(&job.text);
             self.log.push(Event::SpeakAudioStarted {
                 call_id: call.id.clone(),
                 speak_id: job.speak_id.clone(),

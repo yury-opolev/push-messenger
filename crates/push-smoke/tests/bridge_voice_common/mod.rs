@@ -1,18 +1,18 @@
-//! What the bridge's voice smoke tests share (`bridge_voice.rs`, the built-in speech;
-//! `bridge_voice_adapter.rs`, speech in the voice adapter): the stack, the owner on an SDK
-//! client with push-sdk's media helper, the agent running the bridge in this process, and
-//! what the owner hears.
+//! What the bridge's voice smoke tests share (`bridge_voice.rs`, `bridge_voice_adapter.rs`):
+//! the stack, the owner on an SDK client with push-sdk's media helper, the agent running
+//! the bridge in this process with its speech in a voice adapter (the testkit's scripted
+//! adapter, built here), and what the owner hears.
 
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::common::{self, Containers, Stack};
 use push_agent_key::software::SoftwareKey;
 use push_bridge::backend::Backend;
-use push_bridge::config::AdapterConfig;
+use push_bridge::config::{AdapterConfig, SpawnConfig, StderrMode};
 use push_bridge::core::{Bridge, BridgeError, BridgeOptions, CallFlag};
 use push_bridge::folders;
 use push_bridge::messenger::SdkMessenger;
@@ -23,11 +23,9 @@ use push_bridge::voice::adapter::advertise::advertise;
 use push_bridge::voice::adapter::report::log_totals;
 use push_bridge::voice::adapter::router::AdapterSetup;
 use push_bridge::voice::adapter::supervisor;
-use push_bridge::voice::fake::{FakeStt, FakeTts, Fixture, TTS_HZ, amplitude};
 use push_bridge::voice::media::MediaPhone;
 use push_bridge::voice::phone::{Line, Phone};
 use push_bridge::voice::policy::CallPolicy;
-use push_bridge::voice::vad::VadConfig;
 use push_load::accounts::Account as Credentials;
 use push_sdk::media::{
     FRAME_SAMPLES, MediaCall, MediaOptions, MediaState, PcmFrame, PcmStream, Role,
@@ -37,6 +35,8 @@ use push_sdk::{
     MemorySecretStore, Message, Platform, SdkError, UserId,
 };
 use push_voice_adapter_proto::BridgeHello;
+use push_voice_adapter_testkit::tones::{SPEAK_HZ, amplitude};
+use push_voice_adapter_testkit::{Fixture, Script, Word, fixture as fixtures};
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -362,28 +362,101 @@ pub struct Agent {
 
 /// Where the agent's speech runs.
 pub enum Speech {
-    /// The built-in tone fakes ([`FakeStt`] hearing [`all_words`], [`FakeTts`]).
-    Builtin,
     /// A voice adapter (`calls.adapter`), supervised and advertised as
     /// `push-agent-bridge run` does.
     Adapter(AdapterConfig),
 }
 
-pub fn fixtures_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../push-bridge/tests/fixtures/voice")
-}
-
+/// The testkit's recorded fixture `name`.
 pub fn fixture(name: &str) -> Fixture {
-    Fixture::load(&fixtures_dir().join(format!("{name}.json"))).unwrap()
+    Fixture::named(name)
 }
 
-/// The words of every fixture: what the agent's fake speech-to-text hears.
-pub fn all_words() -> Vec<(f64, String)> {
-    ["prompt", "barge_in", "approve", "option_two", "ambiguous"]
-        .into_iter()
-        .flat_map(|name| fixture(name).words)
-        .map(|word| (word.hz, word.text))
-        .collect()
+/// The words of every fixture: what the testkit's adapter hears.
+pub fn all_words() -> Vec<Word> {
+    fixtures::all_words()
+}
+
+/// The testkit's binary, built once per run (see the module's documentation).
+pub fn testkit() -> PathBuf {
+    static BINARY: OnceLock<PathBuf> = OnceLock::new();
+    BINARY
+        .get_or_init(|| {
+            let test = std::env::current_exe().expect("the test's path");
+            // target/<profile>/deps/<test> → target/<profile>
+            let profile_dir = test
+                .parent()
+                .and_then(Path::parent)
+                .expect("the test runs from target/<profile>/deps");
+            let profile = profile_dir.file_name().and_then(|name| name.to_str());
+            let target_dir = profile_dir.parent().expect("target/<profile>");
+            let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+            let mut build = std::process::Command::new(cargo);
+            build
+                .args([
+                    "build",
+                    "--locked",
+                    "-p",
+                    "push-voice-adapter-testkit",
+                    "--target-dir",
+                ])
+                .arg(target_dir)
+                .current_dir(env!("CARGO_MANIFEST_DIR"));
+            match profile {
+                Some("debug") => {}
+                Some("release") => {
+                    build.arg("--release");
+                }
+                Some(other) => {
+                    build.args(["--profile", other]);
+                }
+                None => panic!("the profile directory {}", profile_dir.display()),
+            }
+            let started = Instant::now();
+            let status = build.status().expect("cargo runs");
+            assert!(status.success(), "building push-voice-adapter-testkit");
+            let binary = profile_dir.join(format!(
+                "push-voice-adapter-testkit{}",
+                std::env::consts::EXE_SUFFIX
+            ));
+            assert!(binary.is_file(), "{} exists", binary.display());
+            step(&format!(
+                "the testkit adapter is built in {} ms: {}",
+                started.elapsed().as_millis(),
+                binary.display()
+            ));
+            binary
+        })
+        .clone()
+}
+
+/// The default script hearing every fixture's words. It sends its voice strictly in real
+/// time (no lead), its timer's jitter included: the bridge's playback pre-roll
+/// (`router::PREROLL`) absorbs it, so the gaps the owner hears stay small.
+pub fn hearing() -> Script {
+    Script::with_words(all_words())
+}
+
+pub fn write_script(dir: &Path, script: &Script) -> PathBuf {
+    let path = dir.join("script.json");
+    std::fs::write(&path, serde_json::to_vec_pretty(script).unwrap()).unwrap();
+    path
+}
+
+/// `calls.adapter.spawn` running the testkit with `script`, its events in `events`.
+pub fn spawned(dir: &Path, script: &Script, events: &Path) -> AdapterConfig {
+    let script = write_script(dir, script);
+    AdapterConfig::Spawn(SpawnConfig {
+        command: vec![
+            testkit().to_string_lossy().into_owned(),
+            "--script".to_owned(),
+            script.to_string_lossy().into_owned(),
+            "--events".to_owned(),
+            events.to_string_lossy().into_owned(),
+        ],
+        stderr: StderrMode::Log,
+        env_allow: Vec::new(),
+    })
 }
 
 /// `calls.language`'s default.
@@ -391,9 +464,13 @@ pub const LANGUAGE: &str = "en-US";
 
 impl Agent {
     /// Enrolls with `code` and runs the bridge as `push-agent-bridge run` does, answering
-    /// and calling by `policy`.
+    /// and calling by `policy`, its speech in the testkit's adapter ([`hearing`], spawned,
+    /// its events in `<dir>/adapter-events.jsonl`); returns once calls are advertised.
     pub async fn start(stack: &Stack, dir: &Path, code: &str, policy: CallPolicy) -> Self {
-        Self::start_with(stack, dir, code, policy, Speech::Builtin).await
+        let adapter = spawned(dir, &hearing(), &dir.join("adapter-events.jsonl"));
+        let agent = Self::start_with(stack, dir, code, policy, Speech::Adapter(adapter)).await;
+        advertised(&agent).await;
+        agent
     }
 
     /// [`Agent::start`] with its speech in `speech`. With a voice adapter, calls are not
@@ -406,8 +483,7 @@ impl Agent {
         policy: CallPolicy,
         speech: Speech,
     ) -> Self {
-        let builtin = matches!(speech, Speech::Builtin);
-        let (client, events) = client_with(stack, dir, "agent", builtin);
+        let (client, events) = client_with(stack, dir, "agent", false);
         let key = SoftwareKey::generate().unwrap();
         let account = client
             .enroll_with_agent_key(
@@ -447,20 +523,9 @@ impl Agent {
             },
         );
         let (bridge, adapter, advertiser) = match speech {
-            Speech::Builtin => {
-                let bridge = bridge.with_voice(VoiceSetup {
-                    phone: phone.clone(),
-                    stt: Some(Arc::new(FakeStt::new(all_words()))),
-                    tts: Some(Arc::new(FakeTts::new())),
-                    vad: VadConfig::default(),
-                    policy,
-                    adapter: None,
-                });
-                (bridge, None, None)
-            }
             Speech::Adapter(config) => {
                 let hello = BridgeHello::v1(env!("CARGO_PKG_VERSION"), LANGUAGE);
-                let supervisor = supervisor::start(config, hello, dir.join("logs"), Vec::new());
+                let supervisor = supervisor::start(config, hello, dir.join("logs"));
                 let setup = AdapterSetup::new(supervisor, LANGUAGE);
                 let call_flag: CallFlag = Arc::new(watch::channel(false).0);
                 let advertised = client.clone();
@@ -476,11 +541,8 @@ impl Agent {
                 let bridge = bridge
                     .with_voice(VoiceSetup {
                         phone: phone.clone(),
-                        stt: None,
-                        tts: None,
-                        vad: VadConfig::default(),
                         policy,
-                        adapter: Some(setup.clone()),
+                        adapter: setup.clone(),
                     })
                     .with_call_flag(call_flag);
                 (bridge, Some(setup), Some(advertiser))
@@ -520,17 +582,26 @@ impl Agent {
             .await
             .expect("the bridge ran")
             .expect("the bridge stopped cleanly");
-        if let Some(advertiser) = advertiser {
-            advertiser.abort();
-            let _ = advertiser.await;
-        }
-        if let Some(adapter) = adapter {
-            within("the voice adapter stops", adapter.supervisor.shutdown()).await;
-            log_totals(&adapter);
-        }
+        stop_adapter(adapter, advertiser).await;
         // The phone holds a handle of the client: only the last one closes it.
         drop(phone);
         client.close().await.unwrap();
+    }
+}
+
+/// Once the bridge stopped: stops advertising calls and the voice adapter (its totals
+/// logged), as `push-agent-bridge run` does; both hold a handle of the agent's client.
+pub async fn stop_adapter(
+    adapter: Option<AdapterSetup>,
+    advertiser: Option<tokio::task::JoinHandle<()>>,
+) {
+    if let Some(advertiser) = advertiser {
+        advertiser.abort();
+        let _ = advertiser.await;
+    }
+    if let Some(adapter) = adapter {
+        within("the voice adapter stops", adapter.supervisor.shutdown()).await;
+        log_totals(&adapter);
     }
 }
 
@@ -567,7 +638,7 @@ impl Ear {
             .filter(|chunk| chunk.len() == WINDOW)
             .map(|chunk| {
                 let samples: Vec<i16> = chunk.iter().flat_map(|(_, frame)| *frame).collect();
-                (chunk[0].0, amplitude(&samples, TTS_HZ))
+                (chunk[0].0, amplitude(&samples, SPEAK_HZ))
             })
             .collect()
     }
@@ -792,4 +863,17 @@ pub fn answer_card(person: &Person, card: &Seen, values: &[&str]) {
         .client
         .send_answer(card.message.conversation_id, &body.to_string())
         .expect("the answer is queued");
+}
+
+/// Waits until the agent advertises calls (its adapter has listened for 2 s).
+pub async fn advertised(agent: &Agent) {
+    let since = Instant::now();
+    until("calls advertised", || {
+        agent.client.calls_advertised().then_some(())
+    })
+    .await;
+    step(&format!(
+        "calls advertised {} ms after the bridge started",
+        since.elapsed().as_millis()
+    ));
 }

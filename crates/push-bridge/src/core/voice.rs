@@ -1,8 +1,8 @@
 //! Voice calls with the owner: answering them, the call's pipeline events, transcripts as
 //! prompts, steers or card answers, and the agent's replies and cards spoken.
 //!
-//! Only the owner's calls are answered, one at a time; without anyone to listen (a
-//! speech-to-text provider, or a voice adapter ready with `stt`) every call is declined.
+//! Only the owner's calls are answered, one at a time; without anyone to listen (a voice
+//! adapter ready with `stt`) every call is declined.
 //! When the voice adapter goes away during a call the call stays up, chat-only, with a
 //! note (A21). Logs carry event names, codes, counts and durations: never a transcript
 //! or spoken text.
@@ -32,7 +32,7 @@ const TRANSCRIPT_FALLBACK: usize = 2_000;
 const TRANSCRIPT_PREFIX: &str = "🎤 voice: ";
 /// Characters of a voice answer's label shown on its card.
 const ANSWER_LABEL: usize = 200;
-/// Said when the speech-to-text provider failed on an utterance.
+/// Said when the voice adapter could not recognise an utterance.
 const NOT_UNDERSTOOD: &str = "Sorry, I couldn't make that out.";
 /// Posted when the voice adapter went away during a call (A21).
 pub(super) const ADAPTER_LOST: &str = "Voice adapter stopped; reconnecting…";
@@ -258,9 +258,8 @@ impl<M: Messenger> Core<M> {
         self.update_activity(false).await;
     }
 
-    /// Starts the pipeline of `line` (in the voice adapter when there is one, else with the
-    /// built-in speech); its events come back as [`Internal::Voice`]. `None` (the line is
-    /// dropped) without anyone to listen.
+    /// Starts the pipeline of `line`, its speech in the voice adapter; its events come
+    /// back as [`Internal::Voice`]. `None` (the line is dropped) without voice.
     pub(super) fn start_pipeline(&self, line: Line) -> Option<Session> {
         let voice = self.voice.as_ref()?;
         let call_id = line.call_id;
@@ -269,7 +268,7 @@ impl<M: Messenger> Core<M> {
             let _ = internal.send(Internal::Voice { call_id, event });
         });
         // The owner's display name is not known to the core: the adapter gets none.
-        voice.start_session(line, "", sink)
+        Some(voice.start_session(line, "", sink))
     }
 
     /// An event of the running call's pipeline.

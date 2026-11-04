@@ -139,13 +139,12 @@ impl ChildGuard {
 pub struct SpawnStarter {
     pub config: SpawnConfig,
     pub log_dir: PathBuf,
-    pub extra_secret_names: Vec<String>,
 }
 
 #[async_trait]
 impl Starter for SpawnStarter {
     async fn start(&self) -> io::Result<Started> {
-        let spawned = spawn(&self.config, &self.log_dir, &self.extra_secret_names)?;
+        let spawned = spawn(&self.config, &self.log_dir)?;
         Ok(Started {
             reader: Box::new(spawned.stdout),
             writer: Box::new(spawned.stdin),
@@ -173,19 +172,10 @@ impl Starter for ConnectStarter {
     }
 }
 
-/// The real starter for `config`. `extra_secret_names`: the variables the bridge's config
-/// names as key sources, kept from a spawned adapter.
-pub fn starter_for(
-    config: AdapterConfig,
-    log_dir: PathBuf,
-    extra_secret_names: Vec<String>,
-) -> Arc<dyn Starter> {
+/// The real starter for `config`.
+pub fn starter_for(config: AdapterConfig, log_dir: PathBuf) -> Arc<dyn Starter> {
     match config {
-        AdapterConfig::Spawn(config) => Arc::new(SpawnStarter {
-            config,
-            log_dir,
-            extra_secret_names,
-        }),
+        AdapterConfig::Spawn(config) => Arc::new(SpawnStarter { config, log_dir }),
         AdapterConfig::Connect(config) => Arc::new(ConnectStarter { config }),
     }
 }
@@ -294,18 +284,12 @@ impl fmt::Debug for Supervisor {
 }
 
 /// Supervises the adapter `config` describes (call inside a tokio runtime). `log_dir`: the
-/// spawned adapter's stderr log folder; `extra_secret_names`: the variables the bridge's
-/// config names as key sources (e.g. Azure `key_env`), never passed to a spawned adapter.
-pub fn start(
-    config: AdapterConfig,
-    hello: BridgeHello,
-    log_dir: PathBuf,
-    extra_secret_names: Vec<String>,
-) -> Supervisor {
+/// spawned adapter's stderr log folder.
+pub fn start(config: AdapterConfig, hello: BridgeHello, log_dir: PathBuf) -> Supervisor {
     if let AdapterConfig::Spawn(spawn) = &config {
         warn_relative(spawn);
     }
-    Supervisor::with_starter(starter_for(config, log_dir, extra_secret_names), hello)
+    Supervisor::with_starter(starter_for(config, log_dir), hello)
 }
 
 /// A program path relative to the bridge's working directory (not a bare name, which
@@ -893,7 +877,6 @@ mod tests {
             config,
             BridgeHello::v1("1.2.3", "en-US"),
             dir.path().to_owned(),
-            Vec::new(),
         );
         let mut state = supervisor.state();
         let backoff = timeout(
@@ -953,7 +936,6 @@ mod tests {
             AdapterConfig::Connect(config),
             BridgeHello::v1("1.2.3", "en-US"),
             dir.path().to_owned(),
-            Vec::new(),
         );
         let mut state = supervisor.state();
         timeout(
@@ -1000,7 +982,6 @@ mod tests {
                 env_allow: Vec::new(),
             },
             log_dir: dir.path().to_owned(),
-            extra_secret_names: Vec::new(),
         };
         let started = starter.start().await.unwrap();
         drop(started.writer);
@@ -1040,7 +1021,7 @@ mod tests {
     impl Starter for SlowChildStarter {
         async fn start(&self) -> io::Result<Started> {
             let mut started = self.adapters.start().await?;
-            let spawned = spawn(&self.config, &self.log_dir, &[])?;
+            let spawned = spawn(&self.config, &self.log_dir)?;
             let (stdin, mut stdout) = (spawned.stdin, spawned.stdout);
             tokio::spawn(async move {
                 let _stdin = stdin;

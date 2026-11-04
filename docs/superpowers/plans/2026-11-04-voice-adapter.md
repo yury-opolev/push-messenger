@@ -476,42 +476,45 @@ Scenarios (each a `step(...)` in the existing style, `PUSH_BRIDGE_VOICE=1`):
 
 Branch `feat/voice-adapter-only`. Lands only after PRs 1 and 2 are released.
 
+**Status: complete** (branch `feat/voice-adapter-remove-builtins`; merged before PRs 1–2
+were released as a tagged release, see design §12 "PR 3").
+
 ### Task 3.1: Migration errors first (TDD)
 
 **Files:** Modify `crates/push-bridge/src/config.rs`.
 
-- [ ] **Step 1: failing tests**: a config with `calls.stt` (any value, `none` included),
+- [x] **Step 1: failing tests**: a config with `calls.stt` (any value, `none` included),
   `calls.tts` or `calls.vad` fails to load with exactly:
   `calls.stt is no longer supported: speech runs in a voice adapter. Configure
   calls.adapter (docs/agent-bridge.md §18, docs/voice-adapter-protocol.md).` (and the same
   for `tts`/`vad`); a `calls` section without `adapter` loads, calls are not advertised and
   `status` says `Voice: off (no calls.adapter)`.
-- [ ] **Step 2:** FAIL. **Step 3:** keep `stt`/`tts`/`vad` as
+- [x] **Step 2:** FAIL. **Step 3:** keep `stt`/`tts`/`vad` as
   `Option<serde_json::Value>` fields used only to produce the error (so `deny_unknown_fields`
   does not hide the helpful message). **Step 4:** PASS. **Step 5:** commit.
 
 ### Task 3.2: Remove the providers
 
-- [ ] Delete `voice/{azure,local,provider,vad,wav,test_server}.rs` and `BuiltinEngine`;
+- [x] Delete `voice/{azure,local,provider,vad,wav,test_server}.rs` and `BuiltinEngine`;
   move `voice/fake.rs`'s Goertzel and fixtures into `crates/push-voice-adapter-testkit`
   (the testkit then owns the PR 7 fixture rules), update `tests/fixtures/voice` users.
-- [ ] `VoiceSetup` loses `stt`, `tts`, `vad`; `Session` uses the adapter engine only.
-- [ ] Drop `reqwest` from push-bridge if no other module uses it
+- [x] `VoiceSetup` loses `stt`, `tts`, `vad`; `Session` uses the adapter engine only.
+- [x] Drop `reqwest` from push-bridge if no other module uses it
   (`cargo tree -p push-bridge -i reqwest`); `cargo update --workspace --offline`.
-- [ ] Rewrite affected `core/voice_tests.rs` tests onto the testkit library adapter.
-- [ ] Full checks (Conventions); commit.
+- [x] Rewrite affected `core/voice_tests.rs` tests onto the testkit library adapter.
+- [x] Full checks (Conventions); commit.
 
 ### Task 3.3: Docs
 
-- [ ] `docs/agent-bridge.md` §18 rewritten around adapters (providers, "Privacy: what each
+- [x] `docs/agent-bridge.md` §18 rewritten around adapters (providers, "Privacy: what each
   provider receives" → "what the adapter receives"); migration note.
-- [ ] `docs/calls.md` §19 updated.
-- [ ] `docs/voice-adapter-protocol.md`: add "Writing an adapter" (pseudo-code main loop:
+- [x] `docs/calls.md` §19 updated.
+- [x] `docs/voice-adapter-protocol.md`: add "Writing an adapter" (pseudo-code main loop:
   read hello → answer → loop over frames: audio → VAD/STT, speak → queue TTS, pacing
   with a 20 ms clock, ping/pong, call_ended → reset) and "Troubleshooting" (no audio;
   adapter not found / not on PATH; pipe in use — `FILE_FLAG_FIRST_PIPE_INSTANCE`;
   `belongs to another user`; version mismatch; stdout polluted by prints).
-- [ ] Voice spec §10.3 marked superseded by the addendum; design §12 "PR 3" notes;
+- [x] Voice spec §10.3 marked superseded by the addendum; design §12 "PR 3" notes;
   CHANGELOG `### Removed` (built-in providers) and `### Changed` (migration).
-- [ ] push-sdk docs: `push_sdk::media`'s 16 kHz mono PCM named as the adapter format.
-- [ ] Commit, PR, CI green, merge.
+- [x] push-sdk docs: `push_sdk::media`'s 16 kHz mono PCM named as the adapter format.
+- [x] Commit, PR, CI green, merge.

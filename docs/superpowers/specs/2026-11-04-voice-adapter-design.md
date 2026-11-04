@@ -455,9 +455,9 @@ negotiated (A6). The bridge's `calls` config gains `adapter` in PR 2 (additive) 
   change while connected (or identifying) reconnects at once; it does not count as a
   failure and keeps the backoff history of earlier failures; the same value does nothing.
   `Calls::available()` follows what the current connection advertised.
-- **Spawn.** `spawn(config, log_dir, extra_secret_names)`: the extra names (variables the
-  config names as key sources) are empty on the adapter path (with an adapter there are
-  no provider keys). Name matching is case-insensitive everywhere; `env_allow` (exact
+- **Spawn.** `spawn(config, log_dir)`: only `SECRET_VARS`, `SECRET_PREFIXES` and
+  `SECRET_WORDS` are kept from the adapter (an `extra_secret_names` parameter for the
+  built-in providers' key variables went with them in PR 3). Name matching is case-insensitive everywhere; `env_allow` (exact
   case on Unix) overrides only the word heuristic and may not name `SECRET_VARS` or the
   prefixes (validation error). `.bat`/`.cmd` refused. The stderr log is rotated only at
   (re)start (a long-running adapter can grow it past 5 MiB); a failed rotation logs and
@@ -512,3 +512,39 @@ negotiated (A6). The bridge's `calls` config gains `adapter` in PR 2 (additive) 
   testkit binary itself. Measured: final transcript → `speak` 1.6–1.7 ms (bridge side, no
   backend; threshold 100 ms); the owner-side largest gap in the agent's voice 32–33 ms
   with the testkit at strict real-time pacing (threshold 40 ms).
+
+### PR 3 (built-in providers removed, migration): decisions and deviations
+
+- **Migration error.** `calls.stt`, `calls.tts` and `calls.vad` stay in `CallsConfig` as
+  private fields that only record presence (any value, `null` included) and are never
+  written back; `CallsConfig::validate` reports the first of `stt`, `tts`, `vad` with
+  exactly "calls.<field> is no longer supported: speech runs in a voice adapter. Configure
+  calls.adapter (docs/agent-bridge.md §18, docs/voice-adapter-protocol.md)." (§9's text
+  gained the protocol reference). `run`/`enroll` refuse to start; `status` prints the error
+  under `Configuration:`.
+- **`VoiceSetup.adapter` is required**: no `Option`, no `BuiltinEngine`; without
+  `calls.adapter` no `VoiceSetup` is built, calls are not advertised (`voice_off`
+  `no_adapter`) and `status` prints `Voice: off (no calls.adapter)`.
+- **`calls.notify_by_call` without `calls.adapter` is a config error** when it could call
+  (`after_minutes` > 0 or `urgent`): "calls.notify_by_call needs calls.adapter: without it
+  the bridge takes no calls and places none". A section that never calls still loads.
+- **`live_speech.rs` deleted** rather than converted to an adapter test: live engines are
+  tested in their own adapters (e.g. yuopolev/voice-adapter); the bridge's tests need
+  none.
+- **Fixtures moved into the testkit** (`crates/push-voice-adapter-testkit/fixtures`, a
+  `fixture` module with `Fixture::named`, `NAMES`, `all_words`), which now owns the PR 7
+  fixture rules (`Script::check`). The core tests needed the texts the adapter spoke:
+  `Log::spoken()` keeps them **in memory only**, never written to the `--events` file,
+  so the testkit's log stays content-free.
+- **reqwest.** push-bridge no longer depends on `reqwest`; push-sdk still does (its HTTP
+  client), so it stays in the bridge's dependency tree. "No speech dependency" means no
+  speech engine or provider crate or code in the bridge.
+- **E2E.** `crates/push-smoke/tests/bridge_voice.rs` runs on the spawned testkit adapter
+  (`Speech::Builtin` removed); `bridge_voice_adapter.rs` keeps its scenarios; its
+  testkit-build and `hearing()` helpers moved to `bridge_voice_common`, shared with
+  `bridge_voice.rs`.
+- **The `voice` feature stays** and now builds only the media helper (`voice/media.rs`).
+- **Release order.** The plan said PR 3 lands only after PRs 1 and 2 are released. No
+  release tags exist in the repository and the owner asked for the change delivered now,
+  so PR 3 merged before PRs 1–2 were released as a tagged release; the CHANGELOG's
+  Unreleased section records the deprecation and the removal together.
