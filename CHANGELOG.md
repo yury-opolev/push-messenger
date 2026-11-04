@@ -6,6 +6,29 @@ Notable changes for consumers of push-messenger. Newest first.
 
 ### Added
 
+- **Agent bridge answering and calling policies** (phase 2, the voice feature's last
+  part): `calls.answer: "ask"` makes push-agent-bridge post a card "📞 Owner is calling
+  <agent> in <folder> — answer?" (Answer / Decline) on the owner's devices when the owner
+  calls, and answer only once "Answer" comes back before the ring ends (declined, missed
+  or cancelled calls close the card saying so); `auto` stays the default. The new
+  `calls.notify_by_call` section (off by default: `after_minutes` 0 to 8, `urgent`,
+  `min_interval_minutes` 10 to 1440, default 10, and `do_not_disturb` local time ranges
+  such as `"22:00-07:00"` or `"mon-fri 22:00-07:00"`) lets the bridge call its owner when
+  a permission request, question or plan has waited `after_minutes`, or when Coda marks a
+  `notify_user` message urgent: the call opens with who calls and why, then the card's
+  question, which can be answered by voice. A missed, declined or unreachable call leaves
+  the card open and posts a short note; each request calls at most once; a call still
+  ringing is cancelled when the card is answered on screen. The control channel gains a
+  content-free `call` in `status`, a `call_changed` event and the requests `call_state`,
+  `mute` and `hangup` (error `no_call`); the tray shows each agent's call (ringing,
+  connecting, in a call, speaking or listening, muted) in the menu line and the window's
+  Overview, with **Mute agent** / **Unmute agent** and **Hang up** buttons. Field-named
+  validation errors; tests for the policies (paused time), the protocol's content-free
+  classification, the tray's view models, and a second end-to-end test in the
+  `bridge-voice` job (ask mode, the agent calling its owner who approves by voice, a
+  missed call falling back to the card). Guide: [agent bridge
+  §18](docs/agent-bridge.md#18-voice-calls).
+
 - **Agent bridge voice calls** (phase 2's bridge voice pipeline): with the new feature
   `voice` (`cargo build --release -p push-bridge --features voice`: push-sdk's media
   helper, Rust 1.89 and CMake) and a `calls` section in `config.json`, push-agent-bridge

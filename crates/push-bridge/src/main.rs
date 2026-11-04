@@ -253,16 +253,20 @@ fn voice_setup(config: &Config, client: &Client) -> Option<VoiceSetup> {
 
     let calls = listening(config.calls.as_ref())?;
     let providers = provider::build(calls);
+    let policy = calls.call_policy();
     tracing::info!(
         event = "voice_enabled",
         stt = providers.stt.as_ref().map_or("none", |stt| stt.name()),
         tts = providers.tts.as_ref().map_or("none", |tts| tts.name()),
+        answer = ?calls.answer,
+        notify_by_call = policy.notify.enabled(),
     );
     Some(VoiceSetup {
         phone: Arc::new(MediaPhone::new(client)),
         stt: providers.stt,
         tts: providers.tts,
         vad: calls.vad.to_vad(),
+        policy,
     })
 }
 

@@ -6,8 +6,12 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use push_bridge_control::CallPhase;
+
 use crate::schedtask::Offer;
-use crate::state::{AgentState, IconState, icon_for_view, label, tooltip as state_tooltip, worst};
+use crate::state::{
+    AgentState, IconState, call_short, icon_for_view, label, tooltip as state_tooltip, worst,
+};
 use crate::supervisor::InstanceView;
 
 /// An agent's item id is this followed by the instance id.
@@ -31,11 +35,31 @@ pub enum AgentAction {
     Reconnect,
     Pause,
     Resume,
+    /// `mute`: mutes the agent's voice in the running call.
+    Mute,
+    /// `mute` with `muted: false`.
+    Unmute,
+    /// `hangup`: hangs up, cancels a call ringing the owner, or declines a call waiting
+    /// for the owner's confirmation.
+    Hangup,
 }
 
 impl AgentAction {
-    /// Every action, in the window's order.
-    pub const ALL: [AgentAction; 6] = [
+    /// Every action: the agent's ([`AgentAction::AGENT`]), then the call's.
+    pub const ALL: [AgentAction; 9] = [
+        AgentAction::Start,
+        AgentAction::Stop,
+        AgentAction::RestartBackend,
+        AgentAction::Reconnect,
+        AgentAction::Pause,
+        AgentAction::Resume,
+        AgentAction::Mute,
+        AgentAction::Unmute,
+        AgentAction::Hangup,
+    ];
+
+    /// The agent's actions, in the window's order (the call's have their own row).
+    pub const AGENT: [AgentAction; 6] = [
         AgentAction::Start,
         AgentAction::Stop,
         AgentAction::RestartBackend,
@@ -52,6 +76,9 @@ impl AgentAction {
             AgentAction::Reconnect => "reconnect",
             AgentAction::Pause => "pause",
             AgentAction::Resume => "resume",
+            AgentAction::Mute => "mute",
+            AgentAction::Unmute => "unmute",
+            AgentAction::Hangup => "hangup",
         }
     }
 
@@ -63,6 +90,9 @@ impl AgentAction {
             AgentAction::Reconnect => "Reconnect",
             AgentAction::Pause => "Pause for upgrade",
             AgentAction::Resume => "Resume",
+            AgentAction::Mute => "Mute agent",
+            AgentAction::Unmute => "Unmute agent",
+            AgentAction::Hangup => "Hang up",
         }
     }
 
@@ -141,9 +171,10 @@ pub fn escape(text: &str) -> String {
 }
 
 /// The tray menu: a line per agent ("<name>: <state>", or "<name>: <menu line>" when
-/// `menu_lines` has one for its instance id), then "Open…", "Add agent folder…",
-/// "Start at logon", the switch-over when offered, and "Quit". A `config_error` (tray.json
-/// unreadable) comes first.
+/// `menu_lines` has one for its instance id, or "<name>: <call>" ([`call_short`]) while a
+/// voice call runs or rings), then "Open…", "Add agent folder…", "Start at logon", the
+/// switch-over when offered, and "Quit". A `config_error` (tray.json unreadable) comes
+/// first.
 pub fn build(
     views: &[InstanceView],
     tray_autostart: bool,
@@ -160,10 +191,13 @@ pub fn build(
         items.push(Item::Info("No agents".into()));
     }
     items.extend(views.iter().map(|view| {
-        let line = menu_lines
-            .get(&view.id)
-            .cloned()
-            .unwrap_or_else(|| label(&view.state));
+        let line = match &view.call {
+            Some(call) => call_short(call).to_owned(),
+            None => menu_lines
+                .get(&view.id)
+                .cloned()
+                .unwrap_or_else(|| label(&view.state)),
+        };
         Item::Agent {
             id: agent_id(&view.id),
             label: escape(&format!("{}: {line}", view.name)),
@@ -209,6 +243,8 @@ pub fn enabled(view: &InstanceView, action: AgentAction) -> bool {
             | AgentState::External { .. }
     );
     let live = view.connected && *state != AgentState::Stopping;
+    let call = view.call.as_ref().filter(|_| live);
+    let answered = call.filter(|call| call.phase != CallPhase::Ringing);
     match action {
         AgentAction::Start => matches!(
             state,
@@ -218,6 +254,9 @@ pub fn enabled(view: &InstanceView, action: AgentAction) -> bool {
         AgentAction::RestartBackend | AgentAction::Reconnect => live,
         AgentAction::Pause => live && *state != AgentState::Paused,
         AgentAction::Resume => live && *state == AgentState::Paused,
+        AgentAction::Mute => answered.is_some_and(|call| !call.muted),
+        AgentAction::Unmute => answered.is_some_and(|call| call.muted),
+        AgentAction::Hangup => call.is_some(),
     }
 }
 
@@ -249,6 +288,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::history::History;
     use crate::schedtask::TaskFor;
+    use push_bridge_control::{CallDirection, CallInfo};
     use std::time::Duration;
 
     /// An instance view for tests (also used by the window's tests).
@@ -269,6 +309,19 @@ pub(crate) mod tests {
             peek_changes: 0,
             control: None,
             refusal: None,
+            call: None,
+        }
+    }
+
+    /// A call for tests (also used by the window's tests).
+    pub(crate) fn call(phase: CallPhase, muted: bool) -> CallInfo {
+        CallInfo {
+            phase,
+            direction: CallDirection::Incoming,
+            speaking: false,
+            listening: true,
+            muted,
+            since: 1,
         }
     }
 
@@ -319,6 +372,10 @@ pub(crate) mod tests {
         assert_eq!(AgentAction::parse(""), None);
         assert_eq!(AgentAction::Pause.label(), "Pause for upgrade");
         assert_eq!(AgentAction::RestartBackend.label(), "Restart Coda");
+        assert_eq!(AgentAction::Mute.label(), "Mute agent");
+        assert_eq!(AgentAction::Unmute.label(), "Unmute agent");
+        assert_eq!(AgentAction::Hangup.label(), "Hang up");
+        assert_eq!(AgentAction::ALL[..6], AgentAction::AGENT);
     }
 
     #[test]
@@ -470,6 +527,73 @@ pub(crate) mod tests {
                 .collect();
             assert_eq!(enabled, expected, "{state:?}");
         }
+    }
+
+    #[test]
+    fn call_actions_are_enabled_by_the_call() {
+        let call_actions = [AgentAction::Mute, AgentAction::Unmute, AgentAction::Hangup];
+        let enabled_for = |view: &InstanceView| -> Vec<&str> {
+            call_actions
+                .into_iter()
+                .filter(|action| enabled(view, *action))
+                .map(AgentAction::as_str)
+                .collect()
+        };
+        let cases: [(Option<CallInfo>, &[&str]); 6] = [
+            (None, &[]),
+            (Some(call(CallPhase::Ringing, false)), &["hangup"]),
+            (
+                Some(call(CallPhase::Connecting, false)),
+                &["mute", "hangup"],
+            ),
+            (Some(call(CallPhase::InCall, false)), &["mute", "hangup"]),
+            (Some(call(CallPhase::InCall, true)), &["unmute", "hangup"]),
+            (
+                Some(call(CallPhase::Connecting, true)),
+                &["unmute", "hangup"],
+            ),
+        ];
+        for (call, expected) in cases {
+            for state in [AgentState::Idle, AgentState::Working, AgentState::Paused] {
+                let mut view = view("a", state, true);
+                view.call = call.clone();
+                assert_eq!(enabled_for(&view), expected, "{call:?}");
+                // Not while the control channel is down or the bridge stops.
+                view.connected = false;
+                assert!(enabled_for(&view).is_empty(), "{call:?}");
+                view.connected = true;
+                view.state = AgentState::Stopping;
+                assert!(enabled_for(&view).is_empty(), "{call:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_call_shows_in_the_agent_line() {
+        let mut calling = view("Coda", AgentState::Working, true);
+        calling.call = Some(CallInfo {
+            direction: CallDirection::Outgoing,
+            ..call(CallPhase::Ringing, false)
+        });
+        let mut talking = view("Ops", AgentState::Idle, true);
+        talking.call = Some(call(CallPhase::InCall, true));
+        let lines = HashMap::from([("Ops-id".to_owned(), "Done".to_owned())]);
+        let menu = build(&[calling, talking], false, &Offer::None, None, &lines);
+        assert_eq!(
+            menu.items[..2],
+            [
+                Item::Agent {
+                    id: "agent:Coda-id".into(),
+                    label: "Coda: calling you".into(),
+                    icon: IconState::Busy,
+                },
+                Item::Agent {
+                    id: "agent:Ops-id".into(),
+                    label: "Ops: on a call".into(),
+                    icon: IconState::Normal,
+                },
+            ]
+        );
     }
 
     #[test]

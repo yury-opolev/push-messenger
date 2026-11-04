@@ -110,8 +110,8 @@ async fn agent_view(
     ))
 }
 
-/// Start, Stop, Restart Coda, Reconnect, Pause for upgrade or Resume. The bridge's later
-/// refusal shows in the agent's view.
+/// Start, Stop, Restart Coda, Reconnect, Pause for upgrade, Resume, Mute agent, Unmute
+/// agent or Hang up. The bridge's later refusal shows in the agent's view.
 #[tauri::command]
 async fn act(
     window: WebviewWindow,
@@ -123,6 +123,13 @@ async fn act(
     let action = AgentAction::parse(&action).ok_or_else(|| "Unknown action.".to_owned())?;
     let view = agent(&app, &id)?;
     if !menu::enabled(&view, action) {
+        let call_action = matches!(
+            action,
+            AgentAction::Mute | AgentAction::Unmute | AgentAction::Hangup
+        );
+        if call_action && view.connected && view.call.is_none() {
+            return Err("No call is running.".to_owned());
+        }
         return Err(format!("Not available while {}.", label(&view.state)));
     }
     let dir = view.dir;
@@ -133,6 +140,9 @@ async fn act(
         AgentAction::Reconnect => Command::Reconnect(dir),
         AgentAction::Pause => Command::Pause(dir),
         AgentAction::Resume => Command::Resume(dir),
+        AgentAction::Mute => Command::Mute(dir),
+        AgentAction::Unmute => Command::Unmute(dir),
+        AgentAction::Hangup => Command::Hangup(dir),
     })
 }
 

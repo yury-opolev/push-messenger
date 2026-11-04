@@ -80,6 +80,15 @@ impl<M: Messenger> Core<M> {
             }
             Action::Pause(params) => self.pause_backend(params, reply).await,
             Action::Resume => self.resume_backend(reply).await,
+            Action::Mute(muted) => {
+                let result = self.mute_call(muted);
+                answer(reply, result);
+            }
+            Action::Hangup => {
+                let result = self.hang_up_call();
+                answer(reply, result);
+                self.update_activity(false).await;
+            }
         }
         Flow::Continue
     }

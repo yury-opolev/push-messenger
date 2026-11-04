@@ -43,6 +43,9 @@ impl Serialize for Request {
             Call::Peek(params) if params.limit.is_some() => {
                 map.serialize_entry("params", params)?;
             }
+            Call::Mute(params) if params.muted.is_some() => {
+                map.serialize_entry("params", params)?;
+            }
             _ => {}
         }
         map.end()
@@ -69,6 +72,13 @@ pub enum Call {
     ResumeBackend,
     /// The owner conversation's last messages; see [`PeekResult`].
     Peek(PeekParams),
+    /// The voice call's state: `{"call": CallInfo | null}`, from the snapshot.
+    CallState,
+    /// Mutes (or unmutes) the agent's voice in the running call.
+    Mute(MuteParams),
+    /// Hangs up the running call, cancels a call ringing the owner, or declines a call
+    /// waiting for the owner's confirmation.
+    Hangup,
 }
 
 impl Call {
@@ -82,8 +92,70 @@ impl Call {
             Call::PauseBackend(_) => "pause_backend",
             Call::ResumeBackend => "resume_backend",
             Call::Peek(_) => "peek",
+            Call::CallState => "call_state",
+            Call::Mute(_) => "mute",
+            Call::Hangup => "hangup",
         }
     }
+}
+
+/// `mute`'s parameters.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct MuteParams {
+    /// `true` (the default) mutes the agent's voice, `false` unmutes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub muted: Option<bool>,
+}
+
+/// The error code of `mute` and `hangup` when no call runs.
+pub const NO_CALL: &str = "no_call";
+
+/// Where a voice call stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CallPhase {
+    /// The owner's call waits for the owner's confirmation (`calls.answer` `ask`), or the
+    /// bridge's call rings the owner.
+    Ringing,
+    /// Answered (or accepted by the owner); the audio is being connected.
+    Connecting,
+    /// Audio flows.
+    InCall,
+}
+
+/// Who started a voice call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CallDirection {
+    /// The owner called the agent.
+    Incoming,
+    /// The agent called the owner (`notify_by_call`).
+    Outgoing,
+}
+
+/// The voice call's state: content-free (a phase, a direction, flags and a time).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CallInfo {
+    pub phase: CallPhase,
+    pub direction: CallDirection,
+    /// The agent's voice plays.
+    #[serde(default)]
+    pub speaking: bool,
+    /// The owner speaks.
+    #[serde(default)]
+    pub listening: bool,
+    /// The agent's voice is muted (`mute`).
+    #[serde(default)]
+    pub muted: bool,
+    /// When the call entered its phase, Unix ms.
+    pub since: i64,
+}
+
+/// The `call_state` result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct CallStateResult {
+    pub call: Option<CallInfo>,
 }
 
 /// `peek`'s parameters.
@@ -237,6 +309,11 @@ pub enum Event {
     },
     /// The peek's entries changed (content-free: no entry in it).
     PeekChanged,
+    /// The voice call started, changed phase or flags, or ended (`call` absent).
+    CallChanged {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call: Option<CallInfo>,
+    },
 }
 
 /// The bridge's state, as the tray shows it.
@@ -284,6 +361,8 @@ pub struct Status {
     pub pause: Option<PauseInfo>,
     pub last_error: Option<LastError>,
     pub started_at: i64,
+    /// The voice call, while one runs or rings.
+    pub call: Option<CallInfo>,
 }
 
 /// Who the bridge is signed in as.
@@ -400,6 +479,20 @@ fn request_from_value(value: Value) -> Result<Request, (Option<u64>, ErrorBody)>
                 call: Call::Peek(params),
             })
         }
+        "call_state" => unit(Call::CallState),
+        "hangup" => unit(Call::Hangup),
+        "mute" => {
+            let params = match params {
+                None => MuteParams::default(),
+                Some(params @ Value::Object(_)) => serde_json::from_value(params)
+                    .map_err(|_| bad_request(Some(id), "bad mute params"))?,
+                Some(_) => return Err(bad_request(Some(id), "params must be an object")),
+            };
+            Ok(Request {
+                id,
+                call: Call::Mute(params),
+            })
+        }
         _ => Err((
             Some(id),
             ErrorBody {
@@ -454,6 +547,16 @@ mod tests {
             (
                 Call::Peek(PeekParams { limit: Some(5) }),
                 r#"{"id":7,"method":"peek","params":{"limit":5}}"#,
+            ),
+            (Call::CallState, r#"{"id":7,"method":"call_state"}"#),
+            (Call::Hangup, r#"{"id":7,"method":"hangup"}"#),
+            (
+                Call::Mute(MuteParams::default()),
+                r#"{"id":7,"method":"mute"}"#,
+            ),
+            (
+                Call::Mute(MuteParams { muted: Some(false) }),
+                r#"{"id":7,"method":"mute","params":{"muted":false}}"#,
             ),
         ];
         for (call, wire) in cases {
@@ -763,6 +866,85 @@ mod tests {
     }
 
     #[test]
+    fn call_changed_and_the_call_state_serialize_as_documented() {
+        let call = CallInfo {
+            phase: CallPhase::InCall,
+            direction: CallDirection::Outgoing,
+            speaking: true,
+            listening: false,
+            muted: false,
+            since: 4,
+        };
+        let line = EventLine {
+            event: Event::CallChanged {
+                call: Some(call.clone()),
+            },
+            at: 5,
+        };
+        let wire = r#"{"event":"call_changed","call":{"phase":"in_call","direction":"outgoing","speaking":true,"listening":false,"muted":false,"since":4},"at":5}"#;
+        assert_eq!(encode(&line), format!("{wire}\n"));
+        assert_eq!(
+            serde_json::from_str::<ServerLine>(wire).unwrap(),
+            ServerLine::Event(line)
+        );
+        let ended = EventLine {
+            event: Event::CallChanged { call: None },
+            at: 6,
+        };
+        assert_eq!(encode(&ended), "{\"event\":\"call_changed\",\"at\":6}\n");
+        for (phase, name) in [
+            (CallPhase::Ringing, "ringing"),
+            (CallPhase::Connecting, "connecting"),
+            (CallPhase::InCall, "in_call"),
+        ] {
+            assert_eq!(serde_json::to_value(phase).unwrap(), json!(name));
+        }
+        assert_eq!(
+            serde_json::to_value(CallDirection::Incoming).unwrap(),
+            json!("incoming")
+        );
+        let state = CallStateResult { call: Some(call) };
+        let value = serde_json::to_value(&state).unwrap();
+        assert_eq!(value["call"]["phase"], "in_call");
+        assert_eq!(
+            serde_json::to_value(CallStateResult::default()).unwrap(),
+            json!({"call": null})
+        );
+        let status = Status::default();
+        assert_eq!(serde_json::to_value(&status).unwrap()["call"], json!(null));
+        // An older bridge's status has no call: it reads as none.
+        let old: Status = serde_json::from_value(json!({"protocol": 1})).unwrap();
+        assert_eq!(old.call, None);
+    }
+
+    #[test]
+    fn mute_params_are_optional_and_checked() {
+        for line in [
+            r#"{"id":3,"method":"mute"}"#,
+            r#"{"id":3,"method":"mute","params":null}"#,
+            r#"{"id":3,"method":"mute","params":{}}"#,
+        ] {
+            assert_eq!(
+                parse_request(line).unwrap(),
+                req(3, Call::Mute(MuteParams::default())),
+                "{line}"
+            );
+        }
+        for line in [
+            r#"{"id":4,"method":"mute","params":{"muted":"yes"}}"#,
+            r#"{"id":4,"method":"mute","params":[true]}"#,
+            r#"{"id":4,"method":"hangup","params":[1]}"#,
+        ] {
+            let (id, error) = parse_request(line).unwrap_err();
+            assert_eq!(
+                (id, error.code.as_str()),
+                (Some(4), "bad_request"),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
     fn peek_changed_is_a_bare_event() {
         let line = EventLine {
             event: Event::PeekChanged,
@@ -798,7 +980,23 @@ mod tests {
             pause: _,          // see PauseInfo
             last_error: _,     // see LastError
             started_at: _,     // a time
+            call: _,           // see CallInfo
         } = Status::default();
+        let CallInfo {
+            phase: _,     // a fixed phase name
+            direction: _, // incoming or outgoing
+            speaking: _,  // a flag
+            listening: _, // a flag
+            muted: _,     // a flag
+            since: _,     // a time
+        } = CallInfo {
+            phase: CallPhase::Ringing,
+            direction: CallDirection::Incoming,
+            speaking: false,
+            listening: false,
+            muted: false,
+            since: 0,
+        };
         let AgentInfo {
             display_name: _,
             handle: _,
@@ -848,6 +1046,10 @@ mod tests {
                 Call::PauseBackend(_) => false,
                 // The owner conversation's last messages, masked and capped, when allowed.
                 Call::Peek(_) => true,
+                // No parameters; the result is a content-free `CallInfo`.
+                Call::CallState | Call::Hangup => false,
+                // A flag.
+                Call::Mute(_) => false,
             }
         }
         fn event_carries_text(event: &Event) -> bool {
@@ -864,6 +1066,8 @@ mod tests {
                 Event::Error { .. } => false,
                 // Only that the peek changed; clients ask `peek` for the entries.
                 Event::PeekChanged => false,
+                // A phase, a direction, flags and a time.
+                Event::CallChanged { .. } => false,
             }
         }
         let calls = [
@@ -874,6 +1078,9 @@ mod tests {
             Call::PauseBackend(PauseParams::default()),
             Call::ResumeBackend,
             Call::Peek(PeekParams::default()),
+            Call::CallState,
+            Call::Mute(MuteParams::default()),
+            Call::Hangup,
         ];
         for call in &calls {
             assert_eq!(
@@ -912,6 +1119,7 @@ mod tests {
                 method: None,
             },
             Event::PeekChanged,
+            Event::CallChanged { call: None },
         ];
         for event in &events {
             assert!(!event_carries_text(event), "{event:?}");

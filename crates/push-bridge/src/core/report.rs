@@ -93,6 +93,7 @@ impl<M: Messenger> Core<M> {
         } else {
             0
         };
+        let (call, call_changed) = self.report_call();
         self.control.update_and_emit(
             |status| {
                 status.state = Some(state);
@@ -106,9 +107,13 @@ impl<M: Messenger> Core<M> {
                 status.open_requests = open_requests;
                 status.held_texts = held_texts;
                 status.pause = pause;
+                status.call = call.clone();
             },
             changed,
         );
+        if call_changed {
+            self.control.emit(Event::CallChanged { call });
+        }
     }
 
     pub(super) fn report_turn_started(&self, source: TurnSource) {

@@ -419,6 +419,7 @@ impl Session {
                 cursor: params.get("cursor").and_then(Value::as_u64).unwrap_or(0),
                 label: text(params, "label"),
                 text: text(params, "text"),
+                urgent: is_urgent(params),
             }),
             "event/taskStarted" => {
                 let id = text(params, "taskId");
@@ -597,6 +598,24 @@ fn flag(params: &Value, key: &str) -> bool {
 
 fn is_background(params: &Value) -> bool {
     params.get("mode").and_then(Value::as_str) == Some("background")
+}
+
+/// Whether a `notify_user` message is urgent. Coda has no urgency field yet: `urgent:
+/// true` or `priority` `"urgent"`/`"high"` (for when it does), or a label that starts
+/// with "urgent" (`"urgent"`, `"URGENT: build broken"`, `"[urgent] …"`).
+fn is_urgent(params: &Value) -> bool {
+    let priority = params
+        .get("priority")
+        .and_then(Value::as_str)
+        .is_some_and(|priority| {
+            priority.eq_ignore_ascii_case("urgent") || priority.eq_ignore_ascii_case("high")
+        });
+    let label = text(params, "label");
+    let label = label.trim_start().trim_start_matches(['[', '(', '!']);
+    let marked = label
+        .get(..6)
+        .is_some_and(|start| start.eq_ignore_ascii_case("urgent"));
+    flag(params, "urgent") || priority || marked
 }
 
 /// Whitespace collapsed to single spaces, capped at `max` characters.

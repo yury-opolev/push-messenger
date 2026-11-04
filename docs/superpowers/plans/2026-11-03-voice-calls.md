@@ -850,6 +850,37 @@ falls back to the card".
   methods `call_state`, `mute`, `hangup`; push-tray-core view model; window page).
 - **Task 8.4** tests (paused tokio time), docs, CHANGELOG.
 
+## PR 8 refined (at implementation time)
+
+Decisions taken on 2026-11-04 (details and deviations in spec §15, "PR 8"):
+
+- **Ask** is an `agent.question@1` card (Answer / Decline) in the owner's conversation,
+  so on every owner device; not one of the agent's requests. The server's end of the
+  ring or the bridge's own deadline closes it by an edit; an answered card keeps the
+  owner's choice.
+- **notify_by_call** in `config.rs` (`NotifyByCall`, field-named validation) →
+  `voice::policy::{CallPolicy, NotifyPolicy, QuietHours, Verdict}` (pure; local time
+  injected as a closure, `chrono::Local` by default). `VoiceSetup` gained `policy`.
+  `after_minutes` ≤ 8 (cards expire at 10 minutes), `min_interval_minutes` ≥ 10.
+- **Outgoing calls**: `Phone::call(peer)` (`MediaPhone`: `Role::Caller`; `FakePhone`:
+  rings until `FakeCall::pick_up`); `core/calling.rs` (ask, dialing with buffered call
+  events, greeting, unanswered fallback, withdraw, tray actions, call report).
+- **Urgent**: `BackendEvent::AgentMessage::urgent` from Coda's `urgent` / `priority` /
+  a label starting with "urgent" (Coda has no field yet).
+- **Control channel**: `Status.call`, `call_changed`, `call_state`, `mute`, `hangup`,
+  `no_call`; tray view models, menu line and window buttons.
+
+- [x] **8.1** ask card flow + core tests.
+- [x] **8.2** `notify_by_call`: policy module, config, `Phone::call`, dialing, greeting,
+  fallback, rate limit, do-not-disturb, urgent; core tests.
+- [x] **8.3** control channel (`Status.call`, `call_changed`, `call_state`, `mute`,
+  `hangup`) and the tray (push-tray-core view models, supervisor, window, menu; Tauri
+  shell wiring).
+- [x] **8.4** E2E in `bridge_voice.rs`, docs (agent-bridge.md §13, §14, §18; calls.md),
+  CHANGELOG, spec §15.
+
+All eight PRs of this plan are complete.
+
 ---
 
 ## Request acceptance → PR map

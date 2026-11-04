@@ -19,6 +19,7 @@ voice = ["push-sdk/calls-media"]
 
 [dependencies]
 async-trait.workspace = true
+chrono.workspace = true
 push-agent-key.workspace = true
 push-bridge-control.workspace = true
 push-domain.workspace = true

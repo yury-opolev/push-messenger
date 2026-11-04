@@ -315,6 +315,7 @@ async fn a_turn_with_an_approval_end_to_end() {
         cursor: 7,
         label: "Deploy".into(),
         text: "Deployed to staging.".into(),
+        urgent: false,
     });
     h.reply_containing("Deployed to staging.").await;
     let (_, body) = h.messenger.sent_rich().pop().unwrap();
@@ -678,6 +679,7 @@ async fn the_log_holds_no_input_text() {
         cursor: 1,
         label: "SECRET-LABEL".into(),
         text: "SECRET-AGENT-MESSAGE".into(),
+        urgent: false,
     });
     h.reply_containing("SECRET-AGENT-MESSAGE").await;
 
@@ -973,6 +975,7 @@ async fn a_voice_call_end_to_end() {
             stt: Some(Arc::new(FakeStt::new(words))),
             tts: Some(tts.clone()),
             vad: VadConfig::default(),
+            policy: Default::default(),
         }),
     );
     backend.wait_for("start", 1).await;

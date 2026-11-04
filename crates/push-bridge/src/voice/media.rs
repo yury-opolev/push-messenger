@@ -1,10 +1,10 @@
-//! The app's [`Phone`]: answers the owner's calls with push-sdk's media helper
-//! ([`MediaCall`], feature `voice`).
+//! The app's [`Phone`]: answers the owner's calls and calls the owner with push-sdk's
+//! media helper ([`MediaCall`], feature `voice`).
 
 use std::sync::Arc;
 
 use push_sdk::media::{MediaCall, MediaEnded, MediaOptions, PcmFrame, PcmSink, Role};
-use push_sdk::{CallEvent, CallId, Calls, Client, SdkError};
+use push_sdk::{CallEvent, CallId, Calls, Client, SdkError, UserId};
 use tokio::sync::mpsc;
 
 use super::Frame;
@@ -37,11 +37,26 @@ impl MediaPhone {
 #[async_trait::async_trait]
 impl Phone for MediaPhone {
     async fn answer(&self, call_id: CallId, offer_sdp: &str) -> Result<Line, SdkError> {
-        let servers = self.calls.ice_servers().await?;
         let role = Role::Callee {
             call_id,
             offer_sdp: offer_sdp.to_owned(),
         };
+        self.start(role).await
+    }
+
+    async fn decline(&self, call_id: CallId, busy: bool) -> Result<(), SdkError> {
+        self.calls.decline(call_id, busy).await
+    }
+
+    async fn call(&self, peer: UserId) -> Result<Line, SdkError> {
+        self.start(Role::Caller { peer }).await
+    }
+}
+
+impl MediaPhone {
+    /// Starts the helper's call in `role` and wires it up as a [`Line`].
+    async fn start(&self, role: Role) -> Result<Line, SdkError> {
+        let servers = self.calls.ice_servers().await?;
         let mut call = MediaCall::start(&self.calls, &servers, role, self.options.clone()).await?;
         let (sender, incoming) = mpsc::channel(INCOMING_FRAMES);
         if let Some(mut stream) = call.incoming() {
@@ -67,10 +82,6 @@ impl Phone for MediaPhone {
                 call: Arc::new(call),
             }),
         })
-    }
-
-    async fn decline(&self, call_id: CallId, busy: bool) -> Result<(), SdkError> {
-        self.calls.decline(call_id, busy).await
     }
 }
 

@@ -230,6 +230,7 @@ pub(crate) mod tests {
             stt,
             tts,
             vad: VadSettings::default(),
+            notify_by_call: None,
         }
     }
 

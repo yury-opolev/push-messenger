@@ -39,7 +39,7 @@ and the spec differ, this guide describes what the code does.
 | push-sdk calls API ([§18](#18-push-sdk)) | available in this release (Rust; the C and Node bindings follow) |
 | push-sdk media helper `MediaCall` (feature `calls-media`: a native WebRTC audio peer, PCM in and out; [§19](#19-media-helper)) | available in this release (Rust) |
 | Agents in calls: push-agent-bridge answers its owner's calls (phase 2's bridge voice pipeline, PR 7: speech-to-text, spoken replies, barge-in, voice answers to cards; [agent bridge §18](agent-bridge.md#18-voice-calls)) | available in this release (build with `--features voice`) |
-| Agents' answering and calling policies (`calls.answer: "ask"`, the agent calling its owner) | coming |
+| Agents' answering and calling policies (PR 8: `calls.answer: "ask"`, the agent calling its owner with `calls.notify_by_call`, do-not-disturb hours and a rate limit, the tray's call state with Mute agent and Hang up; [agent bridge §18](agent-bridge.md#18-voice-calls)) | available in this release (build with `--features voice`) |
 
 This guide is meant to be enough to build a client without reading the server code. In
 short, a browser client:
@@ -1263,7 +1263,7 @@ the app plain PCM: **16 kHz, mono, signed 16-bit, 20 ms frames** (320 samples).
 push-sdk = { …, features = ["calls-media"] }
 ```
 
-push-agent-bridge uses it to take its owner's calls: [agent bridge §18](agent-bridge.md#18-voice-calls).
+push-agent-bridge uses it to take its owner's calls and, with `calls.notify_by_call`, to call its owner (`Role::Caller`): [agent bridge §18](agent-bridge.md#18-voice-calls).
 
 ### 19.1 Requirements
 
@@ -1391,7 +1391,7 @@ both calls end `COMPLETED` (the callee's with a duration) and both PCM streams c
 
 CI runs them in the `calls-media` job; `calls-media-windows` builds the feature on
 Windows and runs its unit tests there, and the bridge's voice tests with it. The
-`bridge-voice` job runs push-agent-bridge answering its owner's call through the helper
+`bridge-voice` job runs push-agent-bridge answering its owner's call (and asking first, and calling its owner) through the helper
 ([agent bridge §18](agent-bridge.md#testing)). Locally (Docker running):
 
 ```

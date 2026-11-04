@@ -336,6 +336,8 @@ pub enum BackendEvent {
         cursor: u64,
         label: String,
         text: String,
+        /// The agent marked it urgent (`notify_by_call` may call the owner).
+        urgent: bool,
     },
     TaskStarted {
         id: String,
@@ -524,10 +526,16 @@ impl fmt::Debug for BackendEvent {
                 .field("failed", failed)
                 .finish(),
             Self::Request(request) => write!(formatter, "Request({:?})", request.kind),
-            Self::AgentMessage { cursor, text, .. } => formatter
+            Self::AgentMessage {
+                cursor,
+                text,
+                urgent,
+                ..
+            } => formatter
                 .debug_struct("AgentMessage")
                 .field("cursor", cursor)
                 .field("text", &Length(text))
+                .field("urgent", urgent)
                 .finish_non_exhaustive(),
             Self::TaskStarted { id, background, .. } => formatter
                 .debug_struct("TaskStarted")
@@ -679,6 +687,7 @@ mod tests {
                     cursor: 1,
                     label: secret.into(),
                     text: secret.into(),
+                    urgent: true,
                 }
             ),
             format!(

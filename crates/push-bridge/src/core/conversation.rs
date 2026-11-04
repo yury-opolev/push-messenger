@@ -117,6 +117,9 @@ impl<M: Messenger> Core<M> {
     async fn on_answer(&mut self, message: &Message) {
         match self.cards.check(message, self.clock.now_ms()) {
             CardCheck::Accepted { card, values } => {
+                if self.ask_answered(card.client_msg_id, &values) {
+                    return;
+                }
                 let Some(index) = self
                     .open
                     .iter()

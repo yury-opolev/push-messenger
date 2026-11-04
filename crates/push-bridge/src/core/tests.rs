@@ -144,7 +144,7 @@ impl Harness {
         self.cards()[count - 1].0
     }
 
-    async fn reply_containing(&self, text: &str) {
+    pub(super) async fn reply_containing(&self, text: &str) {
         self.messenger
             .wait_until(text, |_| {
                 self.replies().iter().any(|reply| reply.contains(text))
@@ -176,12 +176,12 @@ impl Harness {
     }
 
     /// Asks the bridge to do `action` over the control channel.
-    async fn call(&self, action: Action) -> Reply {
+    pub(super) async fn call(&self, action: Action) -> Reply {
         self.hub.call(action).await
     }
 
     /// The control events emitted since the last look.
-    fn control_events(&mut self) -> Vec<ControlEvent> {
+    pub(super) fn control_events(&mut self) -> Vec<ControlEvent> {
         let mut events = Vec::new();
         while let Ok(line) = self.events.try_recv() {
             events.push(line.event);
@@ -219,6 +219,11 @@ impl Harness {
             }))
             .await
         })
+    }
+
+    /// The control channel's status snapshot.
+    pub(super) fn control_status(&self) -> push_bridge_control::Status {
+        self.hub.handle().status()
     }
 
     /// The pause's phase on the control channel.
@@ -352,6 +357,7 @@ async fn another_engine_starts_the_cursor_over_without_fetching() {
         cursor: 1,
         label: "Note".into(),
         text: "hello".into(),
+        urgent: false,
     });
     h.reply_containing("hello").await;
     assert_eq!(h.state.get().agent_message_cursor, Some(1));
@@ -1240,6 +1246,7 @@ async fn a_markdown_backend_s_turns_and_messages_go_out_as_reply_v2() {
         cursor: 1,
         label: "Build".into(),
         text: "`cargo test` passed".into(),
+        urgent: false,
     });
     h.reply_containing("passed").await;
     h.messenger.owner_says("/help");
@@ -1274,6 +1281,7 @@ async fn a_plain_backend_s_text_goes_out_as_reply_v1() {
         cursor: 1,
         label: "Note".into(),
         text: "**hi**".into(),
+        urgent: false,
     });
     h.reply_containing("**hi**").await;
     assert!(
@@ -1810,6 +1818,7 @@ async fn the_pause_tells_the_backend_the_last_message_shown() {
         cursor: 3,
         label: "Note".into(),
         text: "hello".into(),
+        urgent: false,
     });
     h.reply_containing("hello").await;
     h.backend.next_prepare(Ok(prepared(0)));

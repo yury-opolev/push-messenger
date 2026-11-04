@@ -51,9 +51,13 @@ impl<M: Messenger> Core<M> {
                 cursor,
                 label,
                 text,
+                urgent,
             } => {
                 if self.agent_message(cursor, &label, &text) {
                     self.speak_agent_message(&label, &text);
+                    if urgent {
+                        self.call_owner_urgent(&label, &text).await;
+                    }
                 }
             }
             BackendEvent::TaskStarted { id, background, .. } => {

@@ -83,6 +83,7 @@ impl<M: Messenger> Core<M> {
             waiting_label: plan.waiting_label,
             title: plan.title,
             spoken: plan.spoken,
+            notified: false,
         });
         if let Some(request) = self.open.last() {
             self.request_opened(&request.kind);

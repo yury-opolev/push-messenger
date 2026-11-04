@@ -7,7 +7,7 @@ use serde::Serialize;
 
 use crate::menu::{AgentAction, enabled};
 use crate::policy::MAX_EXITS;
-use crate::state::{IconState, icon_for_view, label};
+use crate::state::{IconState, call_label, call_short, icon_for_view, label};
 use crate::supervisor::{InstanceView, Notice};
 use crate::tray_config::{self, PEEK_MESSAGES_DEFAULT};
 
@@ -46,6 +46,8 @@ pub struct AgentRow {
     pub badge: &'static str,
     /// The state's label.
     pub state: String,
+    /// The voice call in a few words ([`call_short`]), while one runs or rings.
+    pub call: Option<String>,
     pub folder: String,
 }
 
@@ -59,6 +61,10 @@ pub struct AgentView {
     pub state: String,
     /// Start, Stop, Restart Coda, Reconnect, Pause for upgrade, Resume.
     pub actions: Vec<ActionView>,
+    /// The voice call ([`call_label`]), while one runs or rings.
+    pub call: Option<String>,
+    /// The call's buttons: "Mute agent" ("Unmute agent" while muted), then "Hang up".
+    pub call_actions: Vec<ActionView>,
     pub folder: String,
     pub session: Option<String>,
     pub coda_version: Option<String>,
@@ -140,6 +146,7 @@ pub fn window_view(views: &[InstanceView], global: GlobalSettings) -> WindowView
                     handle: agent.map(|agent| agent.handle.clone()),
                     badge: badge(view),
                     state: label(&view.state),
+                    call: view.call.as_ref().map(|call| call_short(call).to_owned()),
                     folder: view.dir.display().to_string(),
                 }
             })
@@ -157,18 +164,26 @@ pub fn agent_view(
 ) -> AgentView {
     let status = view.status.as_ref();
     let backend = status.and_then(|status| status.backend.as_ref());
-    let actions = AgentAction::ALL
+    let action_view = |action: AgentAction| ActionView {
+        action: action.as_str(),
+        label: action.label(),
+        enabled: enabled(view, action),
+        refused: view
+            .refusal
+            .as_ref()
+            .filter(|refusal| refusal.action == action)
+            .map(|refusal| refusal.message.clone()),
+    };
+    let actions = AgentAction::AGENT.into_iter().map(action_view).collect();
+    let muted = view.call.as_ref().is_some_and(|call| call.muted);
+    let toggle = if muted {
+        AgentAction::Unmute
+    } else {
+        AgentAction::Mute
+    };
+    let call_actions = [toggle, AgentAction::Hangup]
         .into_iter()
-        .map(|action| ActionView {
-            action: action.as_str(),
-            label: action.label(),
-            enabled: enabled(view, action),
-            refused: view
-                .refusal
-                .as_ref()
-                .filter(|refusal| refusal.action == action)
-                .map(|refusal| refusal.message.clone()),
-        })
+        .map(action_view)
         .collect();
     let started_at = status
         .map(|status| status.started_at)
@@ -179,6 +194,8 @@ pub fn agent_view(
         badge: badge(view),
         state: label(&view.state),
         actions,
+        call: view.call.as_ref().map(call_label),
+        call_actions,
         folder: view.dir.display().to_string(),
         session: status.and_then(|status| status.session.clone()),
         coda_version: backend.and_then(|backend| backend.version.clone()),
@@ -250,10 +267,10 @@ pub fn notice_text(notice: &Notice) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::menu::tests::{enabled_cases, view};
+    use crate::menu::tests::{call, enabled_cases, view};
     use crate::state::AgentState;
     use crate::supervisor::Refusal;
-    use push_bridge_control::{AgentInfo, BackendInfo, LastError, Status};
+    use push_bridge_control::{AgentInfo, BackendInfo, CallPhase, LastError, Status};
     use std::path::PathBuf;
 
     fn status() -> Status {
@@ -299,7 +316,9 @@ mod tests {
     fn rows_come_from_the_views() {
         let mut coda = view("Coda (coda)", AgentState::Waiting(None), true);
         coda.status = Some(status());
-        let views = [coda, view("b", AgentState::Idle, false)];
+        let mut b = view("b", AgentState::Idle, true);
+        b.call = Some(call(CallPhase::InCall, false));
+        let views = [coda, b];
         let global = GlobalSettings {
             start_at_logon: true,
             menu_peek: true,
@@ -318,6 +337,7 @@ mod tests {
                     handle: Some("coda".into()),
                     badge: "amber",
                     state: "waiting for you".into(),
+                    call: None,
                     folder: PathBuf::from("bridges/Coda (coda)").display().to_string(),
                 },
                 AgentRow {
@@ -325,8 +345,9 @@ mod tests {
                     name: "b".into(),
                     display_name: None,
                     handle: None,
-                    badge: "grey",
+                    badge: "green",
                     state: "connected, idle".into(),
+                    call: Some("on a call".into()),
                     folder: PathBuf::from("bridges/b").display().to_string(),
                 },
             ]
@@ -367,6 +388,70 @@ mod tests {
                 .collect();
             assert_eq!(enabled, expected, "{state:?}");
         }
+    }
+
+    #[test]
+    fn the_call_shows_with_its_buttons() {
+        let names = |actions: &[ActionView]| -> Vec<(&str, &str, bool)> {
+            actions
+                .iter()
+                .map(|action| (action.action, action.label, action.enabled))
+                .collect()
+        };
+        let mut view = view("a", AgentState::Working, true);
+        let agent = agent_view(&view, None, 0);
+        assert_eq!(agent.call, None);
+        assert_eq!(
+            names(&agent.call_actions),
+            [("mute", "Mute agent", false), ("hangup", "Hang up", false)]
+        );
+
+        view.call = Some(call(CallPhase::Ringing, false));
+        let agent = agent_view(&view, None, 0);
+        assert_eq!(
+            agent.call.as_deref(),
+            Some("ringing (you are calling; confirm on your other device)")
+        );
+        assert_eq!(
+            names(&agent.call_actions),
+            [("mute", "Mute agent", false), ("hangup", "Hang up", true)]
+        );
+
+        view.call = Some(call(CallPhase::InCall, false));
+        let agent = agent_view(&view, None, 0);
+        assert_eq!(agent.call.as_deref(), Some("in a call — listening"));
+        assert_eq!(
+            names(&agent.call_actions),
+            [("mute", "Mute agent", true), ("hangup", "Hang up", true)]
+        );
+
+        view.call = Some(call(CallPhase::InCall, true));
+        view.refusal = Some(Refusal {
+            action: AgentAction::Hangup,
+            message: "no call is running (no_call)".into(),
+            at: 5,
+        });
+        let agent = agent_view(&view, None, 0);
+        assert_eq!(agent.call.as_deref(), Some("in a call — listening (muted)"));
+        assert_eq!(
+            names(&agent.call_actions),
+            [
+                ("unmute", "Unmute agent", true),
+                ("hangup", "Hang up", true)
+            ]
+        );
+        assert_eq!(
+            agent.call_actions[1].refused.as_deref(),
+            Some("no call is running (no_call)")
+        );
+        assert!(agent.actions.iter().all(|action| action.refused.is_none()));
+        let json = serde_json::to_value(&agent).unwrap();
+        assert_eq!(json["call"], "in a call — listening (muted)");
+        assert_eq!(json["callActions"][0]["action"], "unmute");
+
+        view.connected = false;
+        let agent = agent_view(&view, None, 0);
+        assert!(agent.call_actions.iter().all(|action| !action.enabled));
     }
 
     #[test]

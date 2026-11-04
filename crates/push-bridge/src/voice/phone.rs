@@ -1,13 +1,13 @@
-//! The phone: answering and declining the owner's calls, and an answered call's [`Line`]:
-//! the owner's audio in, the agent's audio out, the call's signalling and lifetime. The
-//! app answers with push-sdk's media helper (`media::MediaPhone`, feature `voice`);
+//! The phone: answering and declining the owner's calls, calling the owner, and a call's
+//! [`Line`]: the owner's audio in, the agent's audio out, the call's signalling and
+//! lifetime. The app uses push-sdk's media helper (`media::MediaPhone`, feature `voice`);
 //! tests use [`FakePhone`], whose [`FakeCall`] is the owner's side of a call.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use push_sdk::{CallEndReason, CallEvent, CallId, SdkError};
+use push_sdk::{CallEndReason, CallEvent, CallId, SdkError, UserId};
 use tokio::sync::{Notify, mpsc, oneshot, watch};
 
 use super::{Frame, wav};
@@ -51,11 +51,15 @@ pub struct Line {
     pub control: Arc<dyn LineControl>,
 }
 
-/// Answers and declines calls (the media helper in the app, a fake in tests).
+/// Answers, declines and places calls (the media helper in the app, a fake in tests).
 #[async_trait::async_trait]
 pub trait Phone: Send + Sync + 'static {
     async fn answer(&self, call_id: CallId, offer_sdp: &str) -> Result<Line, SdkError>;
     async fn decline(&self, call_id: CallId, busy: bool) -> Result<(), SdkError>;
+    /// Calls `peer`: returns once the call rings. The line's `connected` waits for the
+    /// answer; a call that is not answered ends (missed, declined, unreachable, …)
+    /// before it connects.
+    async fn call(&self, peer: UserId) -> Result<Line, SdkError>;
 }
 
 /// Whether `event` is about `call_id` (as push-sdk's media helper decides).
@@ -96,6 +100,11 @@ struct PhoneState {
     calls: Vec<FakeCall>,
     /// Calls [`FakePhone::wait_answered`] returned so far.
     returned: usize,
+    fail_next_call: Option<SdkError>,
+    /// The calls placed, with whom they ring.
+    dialed: Vec<(UserId, FakeCall)>,
+    /// Calls [`FakePhone::wait_dialed`] returned so far.
+    dialed_returned: usize,
 }
 
 impl FakePhone {
@@ -157,6 +166,33 @@ impl FakePhone {
         })
         .await;
     }
+
+    /// The next call placed fails with `error`.
+    pub fn fail_next_call(&self, error: SdkError) {
+        self.state().fail_next_call = Some(error);
+    }
+
+    /// Whom the calls placed so far rang, in order.
+    pub fn dialed(&self) -> Vec<UserId> {
+        self.state().dialed.iter().map(|(peer, _)| *peer).collect()
+    }
+
+    /// The owner's side of the latest placed call that this did not return yet (it
+    /// rings until [`FakeCall::pick_up`] or [`FakeCall::end`]); panics after 60 s.
+    pub async fn wait_dialed(&self) -> FakeCall {
+        wait(&self.changed, "a placed call", || {
+            let state = self.state();
+            state.dialed.len() > state.dialed_returned
+        })
+        .await;
+        let mut state = self.state();
+        state.dialed_returned = state.dialed.len();
+        state
+            .dialed
+            .last()
+            .map(|(_, call)| call.clone())
+            .expect("a call was placed")
+    }
 }
 
 #[async_trait::async_trait]
@@ -176,7 +212,7 @@ impl Phone for FakePhone {
         if let Some(error) = fail {
             return Err(error);
         }
-        let (call, line) = FakeCall::open(call_id, delay);
+        let (call, line) = FakeCall::open(call_id, delay, false);
         self.state().calls.push(call);
         self.changed.notify_waiters();
         Ok(line)
@@ -186,6 +222,20 @@ impl Phone for FakePhone {
         self.state().declined.push((call_id, busy));
         self.changed.notify_waiters();
         Ok(())
+    }
+
+    async fn call(&self, peer: UserId) -> Result<Line, SdkError> {
+        let (fail, delay) = {
+            let mut state = self.state();
+            (state.fail_next_call.take(), state.connect_delay)
+        };
+        if let Some(error) = fail {
+            return Err(error);
+        }
+        let (call, line) = FakeCall::open(CallId::new(), delay, true);
+        self.state().dialed.push((peer, call));
+        self.changed.notify_waiters();
+        Ok(line)
     }
 }
 
@@ -206,6 +256,8 @@ struct CallShared {
     generation: AtomicU64,
     started: Instant,
     connect_delay: Option<Duration>,
+    /// The owner answered (at once for a call the bridge answered).
+    picked_up: watch::Sender<bool>,
     /// Runs on the speaker's next `clear()`.
     on_clear: Mutex<Option<ClearHook>>,
 }
@@ -267,7 +319,8 @@ impl CallShared {
 }
 
 impl FakeCall {
-    fn open(call_id: CallId, connect_delay: Option<Duration>) -> (Self, Line) {
+    /// A call; `ringing` until the owner picks up (a call the bridge placed).
+    fn open(call_id: CallId, connect_delay: Option<Duration>, ringing: bool) -> (Self, Line) {
         let (sender, incoming) = mpsc::channel(FAKE_INCOMING);
         let (ended, _) = watch::channel(None);
         let shared = Arc::new(CallShared {
@@ -280,6 +333,7 @@ impl FakeCall {
             generation: AtomicU64::new(0),
             started: Instant::now(),
             connect_delay,
+            picked_up: watch::Sender::new(!ringing),
             on_clear: Mutex::new(None),
         });
         let (queue, played) = mpsc::channel(FAKE_QUEUE);
@@ -355,6 +409,17 @@ impl FakeCall {
     /// The owner hangs up (or the server ends the call) with `reason`.
     pub fn end(&self, reason: CallEndReason) {
         self.shared.finish(reason);
+    }
+
+    /// The owner answers a call the bridge placed.
+    pub fn pick_up(&self) {
+        self.shared.picked_up.send_replace(true);
+        self.shared.changed.notify_waiters();
+    }
+
+    /// Whether the owner answered.
+    pub fn picked_up(&self) -> bool {
+        *self.shared.picked_up.borrow()
     }
 
     /// Whether the bridge hung up.
@@ -473,8 +538,21 @@ impl LineControl for FakeControl {
         if let Some(end) = self.shared.ended_now() {
             return Err(end);
         }
+        let mut picked_up = self.shared.picked_up.subscribe();
+        let answered = async move { picked_up.wait_for(|picked_up| *picked_up).await.is_ok() };
+        tokio::select! {
+            answered = answered => {
+                if !answered {
+                    return Err(self.shared.wait_ended().await);
+                }
+            }
+            end = self.shared.wait_ended() => return Err(end),
+        }
         let Some(delay) = self.shared.connect_delay else {
-            return Ok(());
+            return match self.shared.ended_now() {
+                Some(end) => Err(end),
+                None => Ok(()),
+            };
         };
         tokio::select! {
             () = tokio::time::sleep(delay) => match self.shared.ended_now() {
@@ -491,7 +569,13 @@ impl LineControl for FakeControl {
 
     async fn hangup(&self) -> LineEnded {
         self.shared.inner().hung_up = true;
-        self.shared.finish(CallEndReason::Completed);
+        // Hanging up a call that still rings cancels it.
+        let reason = if *self.shared.picked_up.borrow() {
+            CallEndReason::Completed
+        } else {
+            CallEndReason::Cancelled
+        };
+        self.shared.finish(reason);
         self.shared.wait_ended().await
     }
 }
@@ -507,6 +591,42 @@ mod tests {
             reason,
             duration_s: Some(7),
         }
+    }
+
+    #[tokio::test]
+    async fn a_placed_call_rings_until_the_owner_picks_up_or_it_ends() {
+        let phone = FakePhone::new();
+        let owner = UserId::new();
+        let line = phone.call(owner).await.unwrap();
+        let call = phone.wait_dialed().await;
+        assert_eq!(call.call_id, line.call_id);
+        assert_eq!(phone.dialed(), vec![owner]);
+        let control = line.control.clone();
+        let connecting = tokio::spawn(async move { control.connected().await });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(!connecting.is_finished(), "rings");
+        call.pick_up();
+        assert_eq!(connecting.await.unwrap(), Ok(()));
+
+        let missed = phone.call(owner).await.unwrap();
+        let call = phone.wait_dialed().await;
+        call.end(CallEndReason::Missed);
+        assert_eq!(
+            missed.control.connected().await.unwrap_err().reason,
+            CallEndReason::Missed
+        );
+
+        let cancelled = phone.call(owner).await.unwrap();
+        let call = phone.wait_dialed().await;
+        assert_eq!(
+            cancelled.control.hangup().await.reason,
+            CallEndReason::Cancelled
+        );
+        assert!(call.hung_up());
+
+        phone.fail_next_call(SdkError::Offline);
+        assert!(matches!(phone.call(owner).await, Err(SdkError::Offline)));
+        assert_eq!(phone.dialed().len(), 3);
     }
 
     #[tokio::test]

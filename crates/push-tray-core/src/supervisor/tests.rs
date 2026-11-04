@@ -5,8 +5,8 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use push_bridge_control::{
-    AgentInfo, BridgeState, MAX_LINE, PeekEntry, PeekFrom, PeekKind, PeekResult, Response,
-    ServerLine, encode, parse_request,
+    AgentInfo, BridgeState, CallDirection, CallPhase, MAX_LINE, NO_CALL, PeekEntry, PeekFrom,
+    PeekKind, PeekResult, Response, ServerLine, encode, parse_request,
 };
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -28,6 +28,8 @@ struct Bridge {
     hang_connects: bool,
     /// Calls of this method fail with the error `busy`.
     refuse: Option<&'static str>,
+    /// The voice call: in `status`; `mute` and `hangup` fail with `no_call` without one.
+    call: Option<CallInfo>,
     /// The process the tray started for it.
     process: Option<Arc<Mutex<Option<Exit>>>>,
     /// Open connections: `Some(line)` to send, `None` to close.
@@ -44,6 +46,7 @@ impl Default for Bridge {
             refuse_connects: false,
             hang_connects: false,
             refuse: None,
+            call: None,
             process: None,
             connections: Vec::new(),
             connects: 0,
@@ -233,87 +236,111 @@ async fn serve(
     }
     loop {
         tokio::select! {
-            line = lines.next_line() => {
-                let Ok(Some(line)) = line else { return };
-                let request = parse_request(&line).unwrap();
-                world.with(|w| w.log.push(format!("{} {name}", request.call.method())));
-                let refused = world.bridge(&name, |bridge| bridge.refuse)
-                    == Some(request.call.method());
-                if refused {
-                    let response = encode(&ServerLine::Response(Response {
-                        id: request.id,
-                        ok: false,
-                        result: None,
-                        error: Some(ErrorBody {
-                            code: "busy".into(),
-                            message: "Coda is busy".into(),
-                        }),
-                    }));
-                    if writer.write_all(response.as_bytes()).await.is_err() {
-                        return;
-                    }
-                    continue;
-                }
-                let result = match &request.call {
-                    Call::Peek(params) => serde_json::to_value(PeekResult {
-                        entries: (0..params.limit.unwrap_or(1))
-                            .map(|n| PeekEntry {
-                                time: n as i64,
-                                from: PeekFrom::Agent,
-                                kind: PeekKind::Reply,
-                                text: format!("line {n}"),
-                                card_state: None,
+                    line = lines.next_line() => {
+                        let Ok(Some(line)) = line else { return };
+                        let request = parse_request(&line).unwrap();
+                        world.with(|w| w.log.push(format!("{} {name}", request.call.method())));
+                        let refused = world.bridge(&name, |bridge| bridge.refuse)
+                            == Some(request.call.method());
+                        let no_call = matches!(request.call, Call::Mute(_) | Call::Hangup)
+                            && world.bridge(&name, |bridge| bridge.call.is_none());
+                        if refused || no_call {
+                            let error = if refused {
+                                ErrorBody {
+                                    code: "busy".into(),
+                                    message: "Coda is busy".into(),
+                                }
+                            } else {
+                                ErrorBody {
+                                    code: NO_CALL.into(),
+                                    message: "no call is running".into(),
+                                }
+                            };
+                            let response = encode(&ServerLine::Response(Response {
+                                id: request.id,
+                                ok: false,
+                                result: None,
+                                error: Some(error),
+                            }));
+                            if writer.write_all(response.as_bytes()).await.is_err() {
+                                return;
+                            }
+                            continue;
+                        }
+                        let result = match &request.call {
+                            Call::Peek(params) => serde_json::to_value(PeekResult {
+                                entries: (0..params.limit.unwrap_or(1))
+                                    .map(|n| PeekEntry {
+                                        time: n as i64,
+                                        from: PeekFrom::Agent,
+                                        kind: PeekKind::Reply,
+                                        text: format!("line {n}"),
+                                        card_state: None,
+                                    })
+                                    .collect(),
                             })
-                            .collect(),
-                    })
-                    .unwrap(),
-                    Call::Status => serde_json::to_value(Status {
-                        state: Some(world.bridge(&name, |bridge| bridge.state)),
-                        agent: Some(AgentInfo {
-                            display_name: "Coda".into(),
-                            handle: name.clone(),
-                        }),
-                        session: Some("s-1".into()),
-                        ..Status::default()
-                    })
-                    .unwrap(),
-                    _ => json!({}),
-                };
-                let response = encode(&ServerLine::Response(Response {
-                    id: request.id,
-                    ok: true,
-                    result: Some(result),
-                    error: None,
-                }));
-                if writer.write_all(response.as_bytes()).await.is_err() {
-                    return;
-                }
-                if request.call == Call::Shutdown {
-                    let exits = world.bridge(&name, |bridge| {
-                        if bridge.ignore_shutdown {
-                            return false;
+                            .unwrap(),
+                            Call::Status => serde_json::to_value(Status {
+                                state: Some(world.bridge(&name, |bridge| bridge.state)),
+                                agent: Some(AgentInfo {
+                                    display_name: "Coda".into(),
+                                    handle: name.clone(),
+                                }),
+                                session: Some("s-1".into()),
+                                call: world.bridge(&name, |bridge| bridge.call.clone()),
+                                ..Status::default()
+                            })
+                            .unwrap(),
+        Call::Mute(params) => {
+                                let muted = params.muted.unwrap_or(true);
+                                world.bridge(&name, |bridge| {
+                                    if let Some(call) = bridge.call.as_mut() {
+                                        call.muted = muted;
+                                    }
+                                });
+                                json!({ "muted": muted })
+                            }
+                            Call::Hangup => {
+                                world.bridge(&name, |bridge| bridge.call = None);
+                                json!({ "hungUp": true })
+                            }
+                            _ => json!({}),
+                        };
+                        let response = encode(&ServerLine::Response(Response {
+                            id: request.id,
+                            ok: true,
+                            result: Some(result),
+                            error: None,
+                        }));
+                        if writer.write_all(response.as_bytes()).await.is_err() {
+                            return;
                         }
-                        bridge.listening = false;
-                        bridge.connections.clear();
-                        if let Some(process) = &bridge.process {
-                            *process.lock().unwrap() = Some(Exit { code: Some(0) });
+                        if request.call == Call::Shutdown {
+                            let exits = world.bridge(&name, |bridge| {
+                                if bridge.ignore_shutdown {
+                                    return false;
+                                }
+                                bridge.listening = false;
+                                bridge.connections.clear();
+                                if let Some(process) = &bridge.process {
+                                    *process.lock().unwrap() = Some(Exit { code: Some(0) });
+                                }
+                                true
+                            });
+                            if exits {
+                                return;
+                            }
                         }
-                        true
-                    });
-                    if exits {
-                        return;
                     }
+                    message = control.recv() => match message {
+                        Some(Some(line)) => {
+                            if writer.write_all(line.as_bytes()).await.is_err() {
+                                return;
+                            }
+                        }
+                        _ => return,
+                    },
                 }
-            }
-            message = control.recv() => match message {
-                Some(Some(line)) => {
-                    if writer.write_all(line.as_bytes()).await.is_err() {
-                        return;
-                    }
-                }
-                _ => return,
-            },
-        }
     }
 }
 
@@ -825,6 +852,136 @@ async fn calls_are_forwarded_and_failures_kept() {
     ] {
         assert_eq!(world.count(&format!("{call} a")), 1, "{call}");
     }
+}
+
+fn in_call() -> CallInfo {
+    CallInfo {
+        phase: CallPhase::InCall,
+        direction: CallDirection::Outgoing,
+        speaking: true,
+        listening: false,
+        muted: false,
+        since: 3,
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn call_changed_events_and_the_status_carry_the_call() {
+    let world = Shared::default();
+    let mut harness = start(&world, vec![spec("a", true)]);
+    harness.state("a", AgentState::Idle).await;
+    let a = harness
+        .until("a's status", |views| views[0].status.is_some())
+        .await
+        .remove(0);
+    assert_eq!(a.call, None);
+    let ringing = CallInfo {
+        phase: CallPhase::Ringing,
+        speaking: false,
+        ..in_call()
+    };
+    world.emit(
+        "a",
+        Event::CallChanged {
+            call: Some(ringing.clone()),
+        },
+    );
+    let a = harness
+        .until("ringing", |views| views[0].call.is_some())
+        .await
+        .remove(0);
+    assert_eq!(a.call, Some(ringing.clone()));
+    assert_eq!(a.status.unwrap().call, Some(ringing));
+    world.emit("a", Event::CallChanged { call: None });
+    harness
+        .until("the call ended", |views| views[0].call.is_none())
+        .await;
+
+    // A missed event: the status poll brings the call.
+    world.bridge("a", |bridge| bridge.call = Some(in_call()));
+    harness
+        .until("the call from the status", |views| {
+            views[0].call == Some(in_call())
+        })
+        .await;
+    // Gone with the connection.
+    world.bridge("a", |bridge| bridge.call = None);
+    world.emit(
+        "a",
+        Event::CallChanged {
+            call: Some(in_call()),
+        },
+    );
+    harness
+        .until("the call again", |views| views[0].call.is_some())
+        .await;
+    world.cut("a");
+    let a = harness
+        .until("disconnected", |views| !views[0].connected)
+        .await
+        .remove(0);
+    assert_eq!(a.call, None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn mute_and_hangup_are_forwarded_and_no_call_is_kept() {
+    let world = Shared::default();
+    let mut harness = start(&world, vec![spec("a", true), spec("b", true)]);
+    harness.state("a", AgentState::Idle).await;
+    harness.state("b", AgentState::Idle).await;
+    world.bridge("a", |bridge| bridge.call = Some(in_call()));
+    harness.send(Command::Refresh).await;
+    harness
+        .until("a's call", |views| views[0].call.is_some())
+        .await;
+
+    harness.send(Command::Mute(dir("a"))).await;
+    harness
+        .until("muted", |views| {
+            views[0].call.as_ref().is_some_and(|call| call.muted)
+        })
+        .await;
+    harness.send(Command::Unmute(dir("a"))).await;
+    harness
+        .until("unmuted", |views| {
+            views[0].call.as_ref().is_some_and(|call| !call.muted)
+        })
+        .await;
+    harness.send(Command::Hangup(dir("a"))).await;
+    let views = harness
+        .until("hung up", |views| views[0].call.is_none())
+        .await;
+    assert_eq!(views[0].refusal, None);
+    assert_eq!(world.count("mute a"), 2);
+    assert_eq!(world.count("hangup a"), 1);
+    assert_eq!(world.count("mute b") + world.count("hangup b"), 0);
+
+    // No call: the bridge's `no_call` shows on the action.
+    harness.send(Command::Hangup(dir("b"))).await;
+    let views = harness
+        .until("b's refusal", |views| views[1].refusal.is_some())
+        .await;
+    let refusal = views[1].refusal.clone().unwrap();
+    assert_eq!(refusal.action, AgentAction::Hangup);
+    assert_eq!(refusal.message, "no call is running (no_call)");
+    assert_eq!(
+        views[1].last_error.as_deref(),
+        Some("hangup: no call is running (no_call)")
+    );
+    assert_eq!(world.count("hangup b"), 1);
+    harness.send(Command::Mute(dir("b"))).await;
+    let views = harness
+        .until("b's mute refusal", |views| {
+            views[1]
+                .refusal
+                .as_ref()
+                .is_some_and(|refusal| refusal.action == AgentAction::Mute)
+        })
+        .await;
+    assert_eq!(
+        views[1].refusal.as_ref().unwrap().message,
+        "no call is running (no_call)"
+    );
 }
 
 #[tokio::test(start_paused = true)]

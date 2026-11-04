@@ -762,6 +762,13 @@ state, cut to 60 characters ("Coda: Tests pass; 3 files changed…"). This is th
 place outside the window where [chat peek](#chat-peek) text appears; never in the tooltip
 or a notification.
 
+While a [voice call](#18-voice-calls) runs or rings, an agent's line shows the call
+instead of its state or last line: "`<name>: calling you`" (the agent rings you,
+`notify_by_call`), "`<name>: your call is ringing`" (your call waits for you to confirm it
+on another device, `calls.answer` `ask`) or "`<name>: on a call`" (connecting or in the
+call). The call does not change the badge or the tooltip: the badge keeps the agent's
+state colour.
+
 ### The window
 
 One window, "push-agent-tray" (900 × 600 at first, resizable; its size and position are
@@ -771,14 +778,16 @@ Everything in it works with the keyboard (Tab, the arrow keys in the agent list 
 tabs).
 
 **Left:** the agents, each with its name (display name and handle), its badge, its state
-label and its folder; below them "Add agent folder…".
+label (followed by the call in a few words, as in the menu, while one runs or rings) and
+its folder; below them "Add agent folder…".
 
 **Right:** the selected agent, in four tabs.
 
-- **Overview:** the state with its badge and label; the actions; the folder, session,
-  Coda's version, uptime, running tasks, last error (the tray's own, else the bridge's
-  error code) and last exit code; "Open folder"; the last 50 states with their times,
-  newest first. A refused action says so next to its button, not in a dialog.
+- **Overview:** the state with its badge and label; the actions; the call's buttons; the
+  voice call, the folder, session, Coda's version, uptime, running tasks, last error (the
+  tray's own, else the bridge's error code) and last exit code; "Open folder"; the last 50
+  states with their times, newest first. A refused action says so next to its button, not
+  in a dialog.
 
   | Action | Does | Enabled when |
   |---|---|---|
@@ -788,6 +797,15 @@ label and its folder; below them "Add agent folder…".
   | Reconnect | `reconnect`: the bridge signs in again and reconnects; Coda is untouched | the same |
   | Pause for upgrade | `pause_backend` with the reason "paused from the tray" and the default drain ([upgrade mode](#15-upgrade-mode)) | the same, and not paused |
   | Resume | `resume_backend` | the same, and paused |
+  | Mute agent | `mute`: the agent's voice is muted in the call (the button reads "Unmute agent", `mute` with `muted: false`, while it is muted) | the control channel is connected (not while stopping) and a call is connecting or in progress (not while it rings) |
+  | Hang up | `hangup`: hangs up the call, cancels a call ringing you, or declines your call waiting for confirmation | the control channel is connected (not while stopping) and a call runs or rings |
+
+  The call reads "ringing (you are calling; confirm on your other device)", "calling
+  you", "connecting", or "in a call — speaking" / "— listening", with " (muted)" while
+  the agent's voice is muted; "no call" without one. The tray follows it from the
+  bridge's `status` and `call_changed` events ([control channel](#events)); it forgets it
+  when the connection is lost. A `no_call` refusal (the call ended meanwhile) shows next
+  to the button like any other.
 
   An agent whose bridge exited with code 2 shows "Not set up: run keygen and enroll"; only
   Start is enabled.
@@ -1094,6 +1112,9 @@ read, else `id` 0) and the connection stays; an unknown method gets `unknown_met
 | `pause_backend` | `reason` (string, trimmed, at most 100 characters kept), `drainTimeoutMs` (default 600,000) | at the release: `{"state": "paused", "prepared": <bool>, "drained": <bool>, "interruptedTasks": <n>}`; already released: at once `{"state": "paused", "phase": "<phase>"}` ([upgrade mode](#15-upgrade-mode)) | `prepare_failed`, `cancelled` (a `resume_backend` cancelled the drain), `stopping` (the bridge stopped meanwhile), `unavailable`, `timeout` |
 | `resume_backend` | none | `{"resumed": true}`; a draining pause is cancelled: `{"resumed": true, "cancelled": true}` | `not_paused`, `exe_unavailable` ("coda.exe is missing or in use"), `unavailable`, `timeout` |
 | `peek` | `limit` (default 20, clamped to 1–50) | `{"entries": [...]}`: the [chat peek](#chat-peek)'s last `limit` entries, oldest first (newest last), at once | `peek_disabled` (`"peek": false` in the bridge's `config.json`) |
+| `call_state` | none | `{"call": <call> \| null}`: the [voice call](#18-voice-calls) as in the status object's `call`, at once | none |
+| `mute` | `muted` (default `true`; `false` unmutes) | `{"muted": <bool>}`: the agent's voice in the running call is muted (or unmuted) | `no_call` ("no call is running"), `unavailable`, `timeout` |
+| `hangup` | none | `{"hungUp": true}`: the running call is hung up, a call ringing the owner is cancelled, or the owner's call waiting for confirmation is declined | `no_call`, `unavailable`, `timeout` |
 
 A peek entry is `{"time": <unix ms>, "from": "owner"|"agent", "kind": "text"|"reply"|"card"|"answer"|"step"|"note", "text": "…", "card_state": "open"|"answered"|"declined"|"expired"}`
 (`card_state` only for cards). `text` is masked as it was sent and at most 300
@@ -1124,6 +1145,7 @@ a pause normally answers within that limit.
 | `request_closed` | `kind`; `outcome`: `answered`, `declined` or `expired`; `open` | a card is answered, declined or expires |
 | `error` | `code` (Coda's JSON-RPC code or the bridge's, such as `-32603`, `exited`, `spawn`, `timeout`), `method` (such as `session/prompt`, `initialize`) | a Coda call failed |
 | `peek_changed` | none | the [chat peek](#chat-peek) changed (only with `"peek": true`); ask `peek` for the entries |
+| `call_changed` | `call` (as in the status object; absent when the call ended) | a voice call started, changed its phase or flags, or ended; the status already shows it |
 
 States, from the most important: `stopping`; `paused` (detail "upgrading Coda", or
 "waiting for Coda's program"); `reconnecting` (the messenger connection is down, or the
@@ -1154,6 +1176,7 @@ Field names are camelCase; absent values are `null`.
 | `pause` | `{phase, reason, since}` while paused: `phase` is `draining`, `released`, `waiting_for_file` or `resuming`; `since` in Unix ms |
 | `lastError` | `{code, at}` of the last failed Coda call |
 | `startedAt` | when the bridge started, Unix ms |
+| `call` | the [voice call](#18-voice-calls) while one runs or rings, else `null` (absent from older bridges): `{phase, direction, speaking, listening, muted, since}`. `phase` is `ringing` (the owner's call waits for the owner's confirmation, or the bridge's call rings the owner), `connecting` or `in_call`; `direction` is `incoming` (the owner called the agent) or `outgoing` (the agent calls the owner, `notify_by_call`); `speaking`: the agent's voice plays; `listening`: the owner speaks; `muted`: the agent's voice is muted (`mute`); `since`: when the call entered its phase, Unix ms |
 
 ### Limits
 
@@ -1213,7 +1236,9 @@ $pipe.Dispose()
 - Content-free: no message bodies, previews, plans, answers, tool targets or labels,
   thinking, tokens, keys or enrollment codes, in events, in the status or in the bridge's
   logs about the channel; only states, counts, names (the agent's display name and handle,
-  the backend's name and version, the folder, the session id) and error codes. The one
+  the backend's name and version, the folder, the session id), the voice call's phase,
+  direction, flags and time (`call`, `call_changed`, `call_state`, `mute`, `hangup`) and
+  error codes. The one
   exception is the `peek` result: the owner conversation's last messages, masked as sent
   and cut to 300 characters, kept in memory only, and only when `config.json` has
   `"peek": true` (the default). Tests check this: the protocol's types classify every
@@ -1506,14 +1531,16 @@ describes what the code does.
 
 | Call | What happens |
 |---|---|
-| The owner calls, nothing else runs | answered at once (`calls.answer` `auto`); the bridge says "Connected to <name> in <folder>." (the backend's name and the last part of the current folder), then the oldest open card's question, if any |
+| The owner calls, nothing else runs | answered at once (`calls.answer` `auto`, the default); the bridge says "Connected to <name> in <folder>." (the backend's name and the last part of the current folder), then the oldest open card's question, if any |
+| The owner calls, `calls.answer` `ask` | a card asks first ([asking before answering](#asking-before-answering)); answered only when the owner picks "Answer" before the ring ends, then greeted as above |
 | Anyone else calls | refused by the server when they are not the agent's contact (`NOT_CONTACT`); a call from anyone but the owner that reaches the bridge is declined |
-| A second call while one runs (or is being answered, or the bridge is stopping) | declined busy |
+| A second call while one runs (or is being answered, asked about or placed, or the bridge is stopping) | declined busy |
 | No `calls` section, or `calls.stt` is `none` | calls are not advertised, so the owner's app sees the agent as unreachable (the server answers `UNREACHABLE`) |
 | A build without `--features voice` | calls are not advertised; a `calls` section only prints a warning at start (`voice_unavailable`) |
 
-One call at a time. The owner ends it by hanging up; stopping the bridge hangs it up. The
-agent cannot call its owner yet ([not yet](#not-yet)).
+One call at a time. The owner ends it by hanging up; stopping the bridge hangs it up, and
+so does the tray's **Hang up** ([call controls](#call-controls-in-the-tray)). The agent
+can also call its owner ([the agent calls you](#the-agent-calls-you)).
 
 ### Build with voice
 
@@ -1543,12 +1570,13 @@ validated (by `run`, `enroll` and `status`) whether or not the build has voice.
 
 | Field | Meaning | Default |
 |---|---|---|
-| `calls.answer` | `auto`: the owner's call is answered at once. `ask` is refused for now | `auto` |
+| `calls.answer` | `auto`: the owner's call is answered at once. `ask`: a card asks the owner first ([asking before answering](#asking-before-answering)) | `auto` |
 | `calls.language` | the language spoken, a BCP 47 tag; sent to the speech providers | `en-US` |
 | `calls.stt` | speech-to-text, required: `{"provider": "azure-speech", …}`, `{"provider": "local", …}` or `{"provider": "none"}` (calls are not advertised) | |
 | `calls.tts` | text-to-speech: the same three; `none` keeps every reply in the chat and the call silent (no greeting either) | `none` |
 | `calls.vad.silence_ms` | the silence that ends an utterance, 200 to 5000 | `700` |
 | `calls.vad.min_speech_ms` | the speech an utterance needs, 100 to 5000; shorter sounds (a cough, a click) are dropped | `300` |
+| `calls.notify_by_call` | when the agent calls its owner ([the agent calls you](#the-agent-calls-you)); absent: never | |
 
 **`azure-speech`** ([Azure AI Speech](https://learn.microsoft.com/azure/ai-services/speech-service/),
 REST, no SDK):
@@ -1631,7 +1659,6 @@ configuration: <message>"). `<at>` is `calls.stt` or `calls.tts`:
 
 | Message | Fix |
 |---|---|
-| `calls.answer "ask" is not supported yet: use "auto"` | use `auto` or leave it out |
 | `calls.language must be a language tag such as "en-US"` | a tag like `en-US`, `de-DE`, `en` |
 | `<at>: set exactly one of <at>.region or <at>.endpoint` | `azure-speech` needs one of them |
 | `<at>.region must be an Azure region such as "westeurope"` | lower-case letters and digits |
@@ -1651,6 +1678,11 @@ configuration: <message>"). `<at>` is `calls.stt` or `calls.tts`:
 | `calls.tts.sample_rate is only for calls.tts.command: the WAV header says` | remove it with `url` |
 | `calls.vad.silence_ms must be 200 to 5000` | |
 | `calls.vad.min_speech_ms must be 100 to 5000` | |
+| `calls.notify_by_call.after_minutes must be 0 (off) to 8: a card expires after 10 minutes` | the call must ring and talk before the card's 10 minutes are over |
+| `calls.notify_by_call.min_interval_minutes must be 10 to 1440` | at most one call per 10 minutes, or less often |
+| `calls.notify_by_call.do_not_disturb[<i>] <why>: write "22:00-07:00", "mon-fri 22:00-07:00" or "sat,sun 00:00-24:00"` | `<why>` is `needs a time range`, `has a bad time "…"` (`HH:MM`, two digits each; `24:00` only as an end), `has an unknown day "…"` (`mon` … `sun`) or `is empty (its start and end are the same)` |
+| `calls.notify_by_call needs calls.stt: without it the bridge takes no calls and places none` | a speech-to-text provider, or `after_minutes` 0 and `urgent` false |
+| `calls.notify_by_call needs calls.tts: the call says what it is about` | a text-to-speech provider |
 
 ### The pipeline
 
@@ -1781,6 +1813,114 @@ unanswered card may be edited by its sender; the new body has no buttons, so the
 refuses answers from the app to it afterwards. The owner can still answer on screen or
 type an answer during a call, as without one.
 
+### Asking before answering
+
+With `"answer": "ask"` the owner's call is not answered at once: the bridge posts a
+question card in the owner's conversation, so it shows on every device of the owner
+(also the one calling):
+
+> 📞 Owner is calling Coda in app — answer? **[Answer]** **[Decline]**
+
+- **Answer** before the ring ends (45 s by default, the server's `calls.ringSeconds`):
+  the bridge answers and greets as usual; the card keeps the owner's choice, as any
+  answered card.
+- **Decline**: the call is declined (the caller hears `declined`).
+- No answer: the server ends the call as missed and the card is edited into a closed
+  reply "📞 Missed call."; if the server's end never arrives, the bridge declines 5 s
+  after the ring's end (at most 2 minutes after the call came in). The owner hanging up
+  first: "📞 The call was cancelled.". The tray's **Hang up** declines it: "📞 Declined.".
+- An answer after that is refused by the card (it is closed). While the bridge waits for
+  the answer, another call is declined busy and the bridge places no call itself.
+
+The card is not a request of the agent's: it does not change the activity, the
+control channel's `openRequests`, typed answers or voice answers. Its state is in the
+[chat peek](#chat-peek) like any card, and the control channel shows the call as
+`ringing`, `incoming`.
+
+### The agent calls you
+
+`calls.notify_by_call` lets the bridge call its owner (with push-sdk's media helper as
+the caller) instead of only waiting for a card to be answered:
+
+```json
+"calls": {
+  "stt": { "provider": "local", "url": "http://127.0.0.1:8080/inference" },
+  "tts": { "provider": "local", "command": ["C:\\Tools\\piper\\piper.exe", "--model", "C:\\Tools\\piper\\en_US-lessac-medium.onnx", "--output_raw"], "sample_rate": 22050 },
+  "notify_by_call": {
+    "after_minutes": 5,
+    "urgent": true,
+    "min_interval_minutes": 10,
+    "do_not_disturb": ["22:00-07:00", "sat,sun 00:00-24:00"]
+  }
+}
+```
+
+| Field | Meaning | Default |
+|---|---|---|
+| `after_minutes` | a permission request, question or plan (not `/mode bypass`, which the owner asked for) still unanswered after this many minutes makes the bridge call; `0` never calls for them. At most 8: a card expires after 10 minutes, and the call must ring and talk before then | `0` |
+| `urgent` | a background message (`notify_user`) Coda marks urgent makes the bridge call | `false` |
+| `min_interval_minutes` | at most one call per this many minutes, whatever it is about (counted from when each call was placed, answered or not); 10 to 1440 | `10` |
+| `do_not_disturb` | local time ranges without calls, a string or a list: `"HH:MM-HH:MM"` every day, or with days first, `"mon-fri 22:00-07:00"`, `"sat,sun 00:00-24:00"`, `"mon,wed-fri 12:00-13:00"` (`mon` … `sun`, ranges may wrap, `fri-mon`). A range whose end is not after its start runs past midnight into the next day; its days are the days it starts on (`"fri 22:00-07:00"` covers Friday 22:00 to Saturday 07:00). Times are the computer's local time zone, with its daylight saving | none |
+
+`notify_by_call` needs `calls.stt` and `calls.tts` (validation says so): a call nobody
+hears or that cannot say why it rings is pointless. With both `after_minutes` 0 and
+`urgent` false the section does nothing.
+
+**When it calls.** Every half second the bridge checks the open requests. When one has
+waited `after_minutes`, no call runs, rings or is being answered, the messenger is
+connected and the agent is not paused, it calls, unless the last call was placed less
+than `min_interval_minutes` ago or it is do-not-disturb time (then it calls once that is
+over, if the request is still open; the log says `call_held` with `reason` `too_soon` or
+`do_not_disturb` once per change). Each request starts at most one call. An urgent
+message calls at once under the same rules (or not at all: the message is in the chat).
+
+**Urgent.** Coda's `notify_user` has no urgency field yet; the bridge treats a message as
+urgent when its event carries `"urgent": true` or `"priority": "urgent"` / `"high"` (for
+when Coda adds one), or when its label starts with "urgent" (`"urgent"`, `"URGENT: build
+broken"`, `"[urgent] prod is down"`): the agent can be told to label urgent
+notifications that way.
+
+**The call.** The owner's devices ring like for any call (the activity says `calling
+you` unless a card is open). When the owner answers, the bridge says who calls and why,
+then the question:
+
+- about a request: "Hi, it's Coda in app. A request has waited 5 minutes for your
+  answer." and the oldest open card's question ("Coda wants to use Bash. Approve or
+  reject?"), answered by voice as in any call ([voice answers](#voice-answers-to-cards));
+  if it was answered meanwhile: "It was answered meanwhile; nothing is waiting.";
+- about urgent news: "Hi, it's Coda in app. I have something urgent.", the message's label
+  and text (masked as always), then the oldest open card's question, if any.
+
+From then on it is an ordinary call: the owner can talk to the agent, answer cards, hang
+up.
+
+**Not answered.** A call that ends before the owner picks up (missed after the ring,
+declined, busy, unreachable, failed) changes nothing about what it was for: the card
+stays open and takes answers as before, the message stays in the chat. The bridge posts
+one note, "📞 I called about the open request (no answer). It is still open above." (or
+"(you declined)", "(you were busy)", "(you could not be reached)", "(the call failed)";
+for urgent news, "📞 I called about "<label>" (…)."). A call still ringing is cancelled
+(without a note) when nothing is waiting any more, for example when the owner answered
+the card on screen, and when the tray's **Hang up** cancels it. If the phone cannot place
+the call at all (offline, calls not available on the server), the log says
+`call_dial_failed` with the code and the card stays as it is.
+
+### Call controls in the tray
+
+The control channel reports the call ([§14](#14-control-channel-for-other-tools): `call`
+in the status, `call_changed`), so the tray shows each agent's call (ringing, connecting,
+in a call, speaking or listening, muted) and offers two actions ([§13](#13-the-tray-app-push-agent-tray)):
+
+- **Mute agent** / **Unmute agent** (`mute`): the agent stops speaking at once and says
+  nothing more in this call (replies, its own sentences, card questions) until unmuted;
+  the owner is still heard, transcripts and voice answers work, and everything is still
+  posted in the chat. For connecting and running calls.
+- **Hang up** (`hangup`): hangs up a running call, cancels the bridge's call while it
+  rings, declines a call waiting for the ask card (the card says "📞 Declined."), or drops
+  one being answered.
+
+Both answer `no_call` when there is no call.
+
 ### Privacy: what each provider receives
 
 The call's audio travels end to end encrypted (DTLS-SRTP) between the owner's app and the
@@ -1806,7 +1946,13 @@ there:
   `voice_utterance` (`ms`), `voice_transcript` (`chars`), `voice_sentence` (`ms`),
   `voice_barge_in`, `stt_failed` and `tts_failed` (`provider`, `code`),
   `card_answered_by_voice` (`values`), `voice_call_ended` and `call_ended` (`reason`,
-  `duration_s`), `call_hung_up` (the bridge stopped); at `debug`, `call_ignored`,
+  `duration_s`), `call_hung_up` (the bridge stopped); for the
+  [policies](#the-agent-calls-you): `call_asking` (`card`), `call_ask_answered`
+  (`answer`), `call_ask_ended` (`reason`), `call_ask_expired`, `call_ask_failed`,
+  `call_dialing` (`reason`: `request` or `urgent`), `call_ringing` (`buffered`),
+  `call_held` (`reason`), `call_dial_failed` and `call_dial_cancelled`,
+  `call_unanswered` (`reason`), `call_withdrawn`, `urgent_call_skipped`, `call_muted`
+  (`muted`), `call_hangup_requested`; at `debug`, `call_ignored`,
   `call_event_ignored`, `call_decline_failed` and `call_answer_dropped`.
 - Provider error codes are content-free too: `no_key`, `bad_credential`, `token_<code>`,
   `no_token`, `http_<status>`, `timeout`, `connect_failed`, `request_failed`,
@@ -1830,14 +1976,24 @@ there:
   spoken text, voice answers, WAV and the providers against local test servers and
   commands; the core with a `FakePhone`, `TestBackend` and `TestMessenger` in paused time
   (`src/core/voice_tests.rs`): greeting, declines, spoken replies, barge-in, voice
-  answers, activity, masking and the peek. `tests/bridge.rs` runs a call through the
+  answers, activity, masking and the peek; the policies: ask mode (answer, decline, a
+  busy second call, the ring ending, the bridge's own deadline), a request unanswered
+  calling the owner who approves by voice, missed, declined and unreachable calls leaving
+  the card open (and never calling twice for it), the rate limit, do-not-disturb hours,
+  urgent and ordinary news, a ringing call withdrawn when the card is answered on screen,
+  and the tray's `mute` and `hangup` (`src/voice/policy.rs` has the do-not-disturb ranges,
+  across midnight, days and time zones). `tests/bridge.rs` runs a call through the
   public API. CI's `calls-media-windows` job also runs the `voice::` tests with the feature
   on Windows.
 - **End to end** (`crates/push-smoke/tests/bridge_voice.rs`, CI job `bridge-voice`): the
   whole stack in one process, the owner calling with push-sdk's `MediaCall`, the bridge
   enrolled with a software key and running with `SdkMessenger`, `MediaPhone`, a scripted
   backend and the fakes, over real media: greeting, a prompt, a spoken reply, barge-in, a
-  voice approval, a stranger refused, the hang-up. Locally, with Docker:
+  voice approval, a stranger refused, the hang-up. A second test runs the policies with a
+  10 s ring: `ask` (the call waits for the card's "Answer"), a card unanswered for 3 s
+  making the bridge call the owner, who answers, hears the summary and approves by voice,
+  and a call the owner lets ring out, after which the card is still open and takes the
+  answer. Locally, with Docker:
 
   ```powershell
   $env:PUSH_BRIDGE_VOICE = "1"
@@ -1846,9 +2002,14 @@ there:
 
 - **Real providers**: the opt-in [live speech test](#12-live-smoke-test-opt-in).
 
-### Not yet
+### Limitations
 
-Coming with the answering and calling policies (spec §10.4): `calls.answer: "ask"`
-(confirm on another device before answering), the agent calling its owner
-(`calls.notify_by_call`, after an unanswered card or for urgent news, with do-not-disturb
-hours and a rate limit), and the tray's call state with Mute and Hang up.
+- The ask card goes to the owner's conversation, so it shows on every device of the
+  owner, the calling one too; push-messenger cannot address one device.
+- Coda's `notify_user` has no urgency field yet: urgent means a label starting with
+  "urgent" (or the forward-compatible `urgent` / `priority` fields).
+- A card still expires after 10 minutes, during a call too; hence `after_minutes` of at
+  most 8. A request's call happens once; a missed call is not tried again for it.
+- Do-not-disturb uses the computer's local time zone only (no `time_zone` field).
+- One call at a time; no video; the owner's push notifications do not ring (calls ring
+  only on connected devices, as for every call).
