@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use push_bridge::coda::CodaBackend;
-use push_bridge::config::{self, CallsConfig, Config, SttConfig};
+use push_bridge::config::{self, CallsConfig, Config};
 use push_bridge::control::{Action, Calls, ControlCall, ControlHandle, ControlHub, error};
 use push_bridge::core::{Bridge, BridgeError, BridgeOptions, CallFlag};
 use push_bridge::folders;
@@ -246,22 +246,8 @@ async fn running_adapter(dir: &Path) -> Option<AdapterStatus> {
     remote.status().await?.adapter
 }
 
-/// The calls section, when it has someone to listen (an STT provider).
-fn listening(calls: Option<&CallsConfig>) -> Option<&CallsConfig> {
-    calls.filter(|calls| calls.stt != SttConfig::None)
-}
-
-/// Whether the client advertises calls from the start: only a build with voice whose
-/// config listens with a built-in STT provider. With `calls.adapter` calls are advertised
-/// later, while the adapter can listen ([`advertise`]). Otherwise the owner's app shows
-/// the agent as unreachable.
-fn advertises_calls(calls: Option<&CallsConfig>, voice_built: bool) -> bool {
-    voice_built && listening(calls).is_some_and(|calls| calls.adapter.is_none())
-}
-
-/// `status`'s voice line: provider names only, never their settings; with a voice
-/// adapter, its state in the running bridge (`adapter`; `None` when it does not run).
-/// `now_ms`: now in Unix ms.
+/// `status`'s voice line: with a voice adapter, its state in the running bridge
+/// (`adapter`; `None` when it does not run). `now_ms`: now in Unix ms.
 fn voice_status(
     calls: Option<&CallsConfig>,
     voice_built: bool,
@@ -270,22 +256,14 @@ fn voice_status(
 ) -> String {
     match calls {
         None => "off (no calls section)".to_owned(),
-        Some(calls) if calls.adapter.is_some() && !voice_built => {
-            "configured, but this build has no voice (build with --features voice)".to_owned()
-        }
-        Some(calls) if calls.adapter.is_some() => match adapter {
-            Some(adapter) => adapter_line(adapter, now_ms),
-            None => "adapter configured (the bridge is not running)".to_owned(),
-        },
-        Some(calls) if calls.stt == SttConfig::None => "off (calls.stt is none)".to_owned(),
+        Some(calls) if calls.adapter.is_none() => "off (no calls.adapter)".to_owned(),
         Some(_) if !voice_built => {
             "configured, but this build has no voice (build with --features voice)".to_owned()
         }
-        Some(calls) => format!(
-            "on: stt {}, tts {}",
-            calls.stt.provider(),
-            calls.tts.provider()
-        ),
+        Some(_) => match adapter {
+            Some(adapter) => adapter_line(adapter, now_ms),
+            None => "adapter configured (the bridge is not running)".to_owned(),
+        },
     }
 }
 
@@ -356,63 +334,43 @@ fn adapter_metrics(metrics: &AdapterMetrics) -> String {
 }
 
 /// The owner's calls are answered with push-sdk's media helper, and speech runs in the
-/// voice adapter (`calls.adapter`, supervised from here on) or the configured built-in
-/// providers; `None` when the config has nobody to listen.
+/// voice adapter (`calls.adapter`, supervised from here on); `None` without one.
 #[cfg(feature = "voice")]
 fn voice_setup(config: &Config, client: &Client, dir: &Path) -> Option<VoiceSetup> {
     use push_bridge::voice::adapter::router::AdapterSetup;
     use push_bridge::voice::adapter::supervisor;
     use push_bridge::voice::media::MediaPhone;
-    use push_bridge::voice::provider;
     use push_voice_adapter_proto::BridgeHello;
 
-    if let Some(calls) = config.calls.as_ref() {
-        if let Some(adapter) = &calls.adapter {
-            let policy = calls.call_policy();
-            let hello = BridgeHello::v1(env!("CARGO_PKG_VERSION"), calls.language.clone());
-            let log_dir = logging::path(dir)
-                .parent()
-                .map_or_else(|| dir.join("logs"), Path::to_path_buf);
-            // No extra secret names: with an adapter, calls.stt and calls.tts are none, so
-            // the config names no key variables; the fixed deny-list and the
-            // KEY/TOKEN/SECRET/PASS/... name check still keep secrets from the adapter.
-            let supervisor = supervisor::start(adapter.clone(), hello, log_dir, Vec::new());
-            tracing::info!(
-                event = "voice_enabled",
-                adapter = match adapter {
-                    config::AdapterConfig::Spawn(_) => "spawn",
-                    config::AdapterConfig::Connect(_) => "connect",
-                },
-                answer = ?calls.answer,
-                notify_by_call = policy.notify.enabled(),
-            );
-            return Some(VoiceSetup {
-                phone: Arc::new(MediaPhone::new(client)),
-                stt: None,
-                tts: None,
-                vad: calls.vad.to_vad(),
-                policy,
-                adapter: Some(AdapterSetup::new(supervisor, calls.language.clone())),
-            });
-        }
-    }
-    let calls = listening(config.calls.as_ref())?;
-    let providers = provider::build(calls);
+    let calls = config.calls.as_ref()?;
+    let Some(adapter) = &calls.adapter else {
+        tracing::info!(event = "voice_off", reason = "no_adapter");
+        return None;
+    };
     let policy = calls.call_policy();
+    let hello = BridgeHello::v1(env!("CARGO_PKG_VERSION"), calls.language.clone());
+    let log_dir = logging::path(dir)
+        .parent()
+        .map_or_else(|| dir.join("logs"), Path::to_path_buf);
+    // No extra secret names: the config names no key variables; the fixed deny-list and
+    // the KEY/TOKEN/SECRET/PASS/... name check keep secrets from the adapter.
+    let supervisor = supervisor::start(adapter.clone(), hello, log_dir, Vec::new());
     tracing::info!(
         event = "voice_enabled",
-        stt = providers.stt.as_ref().map_or("none", |stt| stt.name()),
-        tts = providers.tts.as_ref().map_or("none", |tts| tts.name()),
+        adapter = match adapter {
+            config::AdapterConfig::Spawn(_) => "spawn",
+            config::AdapterConfig::Connect(_) => "connect",
+        },
         answer = ?calls.answer,
         notify_by_call = policy.notify.enabled(),
     );
     Some(VoiceSetup {
         phone: Arc::new(MediaPhone::new(client)),
-        stt: providers.stt,
-        tts: providers.tts,
-        vad: calls.vad.to_vad(),
+        stt: None,
+        tts: None,
+        vad: Default::default(),
         policy,
-        adapter: None,
+        adapter: Some(AdapterSetup::new(supervisor, calls.language.clone())),
     })
 }
 
@@ -507,7 +465,9 @@ fn open_client(config: &Config, state: &Arc<StateFile>) -> Result<(Client, Event
     let mut sdk = push_sdk::Config::new(&config.api_url, &config.socket_url(), ":memory:");
     sdk.host = config.host.clone();
     sdk.allow_insecure_transport = config.allow_insecure_transport;
-    sdk.calls = advertises_calls(config.calls.as_ref(), VOICE_BUILT);
+    // Calls are advertised later, while the voice adapter can listen ([`advertise`]);
+    // until then the owner's app shows the agent as unreachable.
+    sdk.calls = false;
     let secrets = Arc::new(BridgeSecretStore::new(Arc::clone(state)));
     Client::open(sdk, secrets).map_err(|e| Failure::general(format!("Cannot start: {e}")))
 }
@@ -830,48 +790,17 @@ mod tests {
         assert_eq!(pause_limit(Some(u64::MAX)), Duration::MAX);
     }
 
-    fn calls(stt: &str, tts: &str) -> CallsConfig {
-        let provider = |name: &str| match name {
-            "azure-speech" => json!({"provider": name, "region": "westeurope", "key_env": "K"}),
-            "local" => json!({"provider": name, "url": "http://127.0.0.1:8080/x"}),
-            _ => json!({"provider": name}),
-        };
-        serde_json::from_value(json!({"stt": provider(stt), "tts": provider(tts)})).unwrap()
-    }
-
-    #[test]
-    fn calls_are_advertised_only_by_a_voice_build_that_listens() {
-        let on = calls("local", "none");
-        assert!(advertises_calls(Some(&on), true));
-        assert!(!advertises_calls(Some(&on), false));
-        assert!(!advertises_calls(Some(&calls("none", "local")), true));
-        assert!(!advertises_calls(None, true));
-        assert!(
-            !advertises_calls(Some(&with_adapter()), true),
-            "not before the adapter is ready"
-        );
-    }
-
     fn with_adapter() -> CallsConfig {
         serde_json::from_value(json!({"adapter": {"connect": {"pipe": "push-voice-me"}}})).unwrap()
     }
 
     #[test]
-    fn the_voice_line_names_the_providers_only() {
+    fn without_an_adapter_voice_is_off() {
+        let without: CallsConfig = serde_json::from_value(json!({"answer": "ask"})).unwrap();
         let line = |calls: Option<&CallsConfig>, built| voice_status(calls, built, None, 0);
         assert_eq!(line(None, true), "off (no calls section)");
-        assert_eq!(
-            line(Some(&calls("none", "azure-speech")), true),
-            "off (calls.stt is none)"
-        );
-        assert_eq!(
-            line(Some(&calls("azure-speech", "local")), true),
-            "on: stt azure-speech, tts local"
-        );
-        assert_eq!(
-            line(Some(&calls("local", "none")), false),
-            "configured, but this build has no voice (build with --features voice)"
-        );
+        assert_eq!(line(Some(&without), true), "off (no calls.adapter)");
+        assert_eq!(line(Some(&without), false), "off (no calls.adapter)");
     }
 
     #[test]

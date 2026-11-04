@@ -8,11 +8,6 @@ use std::time::Duration;
 
 use tokio::io::AsyncWriteExt;
 
-use crate::config::{CallsConfig, SttConfig, TtsConfig};
-
-use super::azure::{AzureStt, AzureTts};
-use super::local::{LocalStt, LocalTts};
-
 /// How long one request or command may take.
 pub const TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -55,32 +50,6 @@ pub trait Tts: Send + Sync + 'static {
 pub struct Providers {
     pub stt: Option<Arc<dyn Stt>>,
     pub tts: Option<Arc<dyn Tts>>,
-}
-
-/// The providers `calls` configures (validated by `Config::validate`).
-pub fn build(calls: &CallsConfig) -> Providers {
-    let stt: Option<Arc<dyn Stt>> = match &calls.stt {
-        SttConfig::AzureSpeech(azure) => Some(Arc::new(AzureStt::new(azure, &calls.language))),
-        SttConfig::Local(local) => match (&local.url, &local.command) {
-            (Some(url), _) => Some(Arc::new(LocalStt::http(url, &calls.language))),
-            (None, Some(argv)) => Some(Arc::new(LocalStt::command(argv.clone(), &calls.language))),
-            (None, None) => None,
-        },
-        SttConfig::None => None,
-    };
-    let tts: Option<Arc<dyn Tts>> = match &calls.tts {
-        TtsConfig::AzureSpeech(azure) => Some(Arc::new(AzureTts::new(azure, &calls.language))),
-        TtsConfig::Local(local) => match (&local.url, &local.command) {
-            (Some(url), _) => Some(Arc::new(LocalTts::http(url))),
-            (None, Some(argv)) => Some(Arc::new(LocalTts::command(
-                argv.clone(),
-                local.sample_rate.unwrap_or(super::SAMPLE_RATE),
-            ))),
-            (None, None) => None,
-        },
-        TtsConfig::None => None,
-    };
-    Providers { stt, tts }
 }
 
 /// An HTTP client whose requests time out after `timeout`.
@@ -166,7 +135,6 @@ pub(crate) async fn run_command(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::config::{AzureSpeechConfig, LocalSttConfig, LocalTtsConfig, VadSettings};
 
     /// `windows` on Windows, else `unix`, as owned arguments.
     pub(crate) fn argv(windows: &[&str], unix: &[&str]) -> Vec<String> {
@@ -221,49 +189,5 @@ pub(crate) mod tests {
             Err("timeout".to_owned())
         );
         assert!(started.elapsed() < Duration::from_secs(4));
-    }
-
-    fn calls(stt: SttConfig, tts: TtsConfig) -> CallsConfig {
-        CallsConfig {
-            answer: crate::config::AnswerMode::Auto,
-            language: "en-US".into(),
-            adapter: None,
-            stt,
-            tts,
-            vad: VadSettings::default(),
-            notify_by_call: None,
-        }
-    }
-
-    #[test]
-    fn build_makes_the_configured_providers() {
-        let azure = AzureSpeechConfig {
-            region: Some("westeurope".into()),
-            ..AzureSpeechConfig::default()
-        };
-        let providers = build(&calls(
-            SttConfig::AzureSpeech(azure.clone()),
-            TtsConfig::AzureSpeech(azure),
-        ));
-        assert_eq!(providers.stt.unwrap().name(), "azure-speech");
-        assert_eq!(providers.tts.unwrap().name(), "azure-speech");
-
-        let providers = build(&calls(
-            SttConfig::Local(LocalSttConfig {
-                url: Some("http://127.0.0.1:8080/inference".into()),
-                command: None,
-            }),
-            TtsConfig::Local(LocalTtsConfig {
-                url: None,
-                command: Some(vec!["piper".into()]),
-                sample_rate: Some(22050),
-            }),
-        ));
-        assert_eq!(providers.stt.unwrap().name(), "local");
-        assert_eq!(providers.tts.unwrap().name(), "local");
-
-        let providers = build(&calls(SttConfig::None, TtsConfig::None));
-        assert!(providers.stt.is_none());
-        assert!(providers.tts.is_none());
     }
 }
