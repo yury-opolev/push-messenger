@@ -1,5 +1,11 @@
 //! A Windows job object that kills the adapter (and whatever it started) when the bridge
 //! closes it or exits.
+//!
+//! The adapter is assigned to the job just after it starts, not atomically with the
+//! spawn: a grandchild the adapter starts in that short window is not in the job and
+//! escapes it. Closing the window needs a suspended spawn (`CREATE_SUSPENDED` + resuming
+//! the main thread) or `PROC_THREAD_ATTRIBUTE_JOB_LIST`, neither of which stable std's
+//! `Command` offers.
 
 #![allow(unsafe_code)]
 

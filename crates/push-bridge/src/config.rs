@@ -244,6 +244,13 @@ pub fn validate_adapter(adapter: &AdapterConfig) -> Result<(), String> {
             if let Some(index) = spawn.command.iter().position(|arg| arg.is_empty()) {
                 return Err(format!("{at}.command[{index}] is empty"));
             }
+            let program = spawn.command[0].to_ascii_lowercase();
+            if program.ends_with(".bat") || program.ends_with(".cmd") {
+                return Err(format!(
+                    "{at}.command[0] is a batch file; batch files run through cmd.exe — use an \
+                     .exe or a script interpreter with the script as an argument"
+                ));
+            }
             if let Some(index) = spawn
                 .env_allow
                 .iter()
@@ -251,6 +258,15 @@ pub fn validate_adapter(adapter: &AdapterConfig) -> Result<(), String> {
             {
                 return Err(format!(
                     "{at}.env_allow[{index}] must be an environment variable's name"
+                ));
+            }
+            if let Some(index) = spawn
+                .env_allow
+                .iter()
+                .position(|name| crate::voice::adapter::spawn::is_always_secret(name))
+            {
+                return Err(format!(
+                    "{at}.env_allow[{index}] names a variable the bridge never passes on"
                 ));
             }
         }
@@ -1580,6 +1596,24 @@ mod tests {
             (
                 json!({ "adapter": { "spawn": { "command": ["adapter"], "env_allow": ["A B"] } } }),
                 "calls.adapter.spawn.env_allow[0]".to_owned(),
+            ),
+            (
+                json!({ "adapter": { "spawn": { "command": ["adapter"], "env_allow": ["HF_TOKEN", "coda_serve_api_key"] } } }),
+                "calls.adapter.spawn.env_allow[1] names a variable the bridge never passes on"
+                    .to_owned(),
+            ),
+            (
+                json!({ "adapter": { "spawn": { "command": ["adapter"], "env_allow": ["Push_Agent_Key"] } } }),
+                "calls.adapter.spawn.env_allow[0] names a variable the bridge never passes on"
+                    .to_owned(),
+            ),
+            (
+                json!({ "adapter": { "spawn": { "command": ["C:\\tools\\adapter.CMD"] } } }),
+                "calls.adapter.spawn.command[0] is a batch file".to_owned(),
+            ),
+            (
+                json!({ "adapter": { "spawn": { "command": ["/opt/adapter.bat", "x"] } } }),
+                "calls.adapter.spawn.command[0] is a batch file".to_owned(),
             ),
             (
                 json!({ "adapter": spawn, "stt": { "provider": "local", "url": "http://a" } }),

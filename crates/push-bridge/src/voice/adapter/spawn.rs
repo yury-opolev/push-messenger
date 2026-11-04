@@ -2,6 +2,13 @@
 //! without the bridge's secrets; stdin and stdout piped for push-voice-adapter/1, stderr
 //! to its own log or nowhere; killed with the bridge (`kill_on_drop`, and on Windows a
 //! job object that also takes whatever the adapter started).
+//!
+//! The adapter's log is rotated only when the adapter is (re)started, never while it
+//! runs: a long-running adapter can grow its log past [`LOG_ROTATE_BYTES`].
+//!
+//! On Windows there is a short window between the spawn and `AssignProcessToJobObject`
+//! ([`super::job`]): a process the adapter starts in it is not in the job and survives
+//! the bridge. Stable std offers no suspended spawn or job attribute to close it.
 
 use std::ffi::{OsStr, OsString};
 use std::fs::OpenOptions;
@@ -18,7 +25,16 @@ pub const SECRET_VARS: &[&str] = &["CODA_SERVE_API_KEY", "AZURE_SPEECH_KEY"];
 /// Prefixes of variables never passed to the adapter (any case): the bridge's and Coda's.
 pub const SECRET_PREFIXES: &[&str] = &["PUSH_", "CODA_"];
 /// Variables whose names contain one of these (any case) are not passed either.
-pub const SECRET_WORDS: &[&str] = &["KEY", "TOKEN", "SECRET", "PASSWORD"];
+/// `PASS` covers `PASSWD` and `PASSWORD`.
+pub const SECRET_WORDS: &[&str] = &[
+    "KEY",
+    "TOKEN",
+    "SECRET",
+    "PASS",
+    "CREDENTIAL",
+    "AUTH",
+    "CONNECTION_STRING",
+];
 /// The adapter's stderr log in the bridge's logs folder.
 pub const LOG_FILE: &str = "voice-adapter.log";
 /// A log larger than this at spawn is renamed to `voice-adapter.log.1`, replacing it.
@@ -55,24 +71,38 @@ fn named(name: &str, names: &[String]) -> bool {
 /// names as key sources), all case-insensitive.
 pub fn is_secret(name: &OsStr, extra_secret_names: &[String]) -> bool {
     let upper = name.to_string_lossy().to_ascii_uppercase();
+    is_always_secret(&upper)
+        || named(&upper, extra_secret_names)
+        || SECRET_WORDS.iter().any(|word| upper.contains(word))
+}
+
+/// Whether `name` (any case) is one of [`SECRET_VARS`] or starts with one of
+/// [`SECRET_PREFIXES`]: never passed on, whatever `env_allow` says.
+pub fn is_always_secret(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
     SECRET_VARS.iter().any(|secret| upper == *secret)
         || SECRET_PREFIXES
             .iter()
             .any(|prefix| upper.starts_with(prefix))
-        || SECRET_WORDS.iter().any(|word| upper.contains(word))
-        || named(&upper, extra_secret_names)
 }
 
-/// The adapter's environment: `vars` without the secret ones ([`is_secret`]), except
-/// those named in `allow` (`calls.adapter.spawn.env_allow`, the owner's explicit choice;
-/// any case on Windows, exact elsewhere).
+/// The adapter's environment: `vars` without the secret ones ([`is_secret`]). A name in
+/// `allow` (`calls.adapter.spawn.env_allow`, the owner's explicit choice; any case on
+/// Windows, exact elsewhere) overrides only the [`SECRET_WORDS`] guess, never
+/// [`SECRET_VARS`], [`SECRET_PREFIXES`] or `extra_secret_names`.
 pub fn adapter_env(
     vars: impl Iterator<Item = (OsString, OsString)>,
     allow: &[String],
     extra_secret_names: &[String],
 ) -> Vec<(OsString, OsString)> {
-    vars.filter(|(name, _)| allowed(name, allow) || !is_secret(name, extra_secret_names))
-        .collect()
+    vars.filter(|(name, _)| {
+        let lossy = name.to_string_lossy();
+        if is_always_secret(&lossy) || named(&lossy, extra_secret_names) {
+            return false;
+        }
+        allowed(name, allow) || !is_secret(name, extra_secret_names)
+    })
+    .collect()
 }
 
 fn allowed(name: &OsStr, allow: &[String]) -> bool {
@@ -159,12 +189,18 @@ fn spawn_error(program: &str, error: &io::Error) -> io::Error {
     io::Error::new(error.kind(), message)
 }
 
-/// `<log_dir>/voice-adapter.log` for appending (rotated first when too large); on Unix
-/// created 0600.
+/// `<log_dir>/voice-adapter.log` for appending (rotated first when too large; when that
+/// fails, e.g. another process holds it open on Windows, appended to as is); on Unix
+/// 0600.
 fn open_log(log_dir: &Path) -> io::Result<std::fs::File> {
     std::fs::create_dir_all(log_dir)?;
     let path = log_path(log_dir);
-    crate::logging::rotate(&path, LOG_ROTATE_BYTES)?;
+    if let Err(e) = crate::logging::rotate(&path, LOG_ROTATE_BYTES) {
+        tracing::warn!(
+            event = "voice_adapter_log_rotate_failed",
+            code = ?e.raw_os_error()
+        );
+    }
     let mut options = OpenOptions::new();
     options.create(true).append(true);
     #[cfg(unix)]
@@ -172,7 +208,16 @@ fn open_log(log_dir: &Path) -> io::Result<std::fs::File> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    options.open(path)
+    let file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = file.metadata()?.permissions().mode();
+        if mode & 0o077 != 0 {
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    Ok(file)
 }
 
 /// `<log_dir>/voice-adapter.log`.
@@ -233,48 +278,49 @@ mod tests {
 
     #[test]
     fn secrets_are_not_passed() {
+        let keep = [
+            "PATH",
+            "PATHEXT",
+            "SystemRoot",
+            "TEMP",
+            "TMP",
+            "USERPROFILE",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "HOME",
+            "LANG",
+            "ComSpec",
+            "windir",
+            "PROCESSOR_ARCHITECTURE",
+            "PROCESSOR_IDENTIFIER",
+            "PROCESSOR_LEVEL",
+            "PROCESSOR_REVISION",
+            "NUMBER_OF_PROCESSORS",
+            "OS",
+            "USERNAME",
+            "XDG_RUNTIME_DIR",
+        ];
+        let secret = [
+            "CODA_SERVE_API_KEY",
+            "AZURE_SPEECH_KEY",
+            "PUSH_AGENT_KEY",
+            "push_bridge_log",
+            "Coda_Home",
+            "MY_API_TOKEN",
+            "db_password",
+            "MYSQL_PASSWD",
+            "GitHub_Secret",
+            "AWS_CREDENTIALS_FILE",
+            "OAUTH_CLIENT",
+            "SQL_CONNECTION_STRING",
+            "MY_SPEECH_ENV",
+        ];
         let env = adapter_env(
-            vars(&[
-                "CODA_SERVE_API_KEY",
-                "AZURE_SPEECH_KEY",
-                "PUSH_AGENT_KEY",
-                "push_bridge_log",
-                "Coda_Home",
-                "MY_API_TOKEN",
-                "db_password",
-                "GitHub_Secret",
-                "MY_SPEECH_ENV",
-                "PATH",
-                "SystemRoot",
-                "HOME",
-                "LANG",
-                "TEMP",
-                "USERPROFILE",
-                "APPDATA",
-                "LOCALAPPDATA",
-                "PATHEXT",
-                "ComSpec",
-                "windir",
-            ]),
+            vars(&[&secret[..], &keep[..]].concat()),
             &[],
             &["my_speech_env".to_owned()],
         );
-        assert_eq!(
-            names(&env),
-            [
-                "PATH",
-                "SystemRoot",
-                "HOME",
-                "LANG",
-                "TEMP",
-                "USERPROFILE",
-                "APPDATA",
-                "LOCALAPPDATA",
-                "PATHEXT",
-                "ComSpec",
-                "windir"
-            ]
-        );
+        assert_eq!(names(&env), keep);
     }
 
     #[test]
@@ -287,6 +333,19 @@ mod tests {
         assert_eq!(names(&env), ["MY_API_TOKEN", "PATH"]);
         let env = adapter_env(vars(&["my_api_token"]), &["MY_API_TOKEN".to_owned()], &[]);
         assert_eq!(names(&env).len(), usize::from(cfg!(windows)));
+    }
+
+    #[test]
+    fn allowing_never_passes_the_bridges_own_secrets() {
+        let always = [
+            "CODA_SERVE_API_KEY",
+            "PUSH_AGENT_KEY",
+            "CODA_HOME",
+            "MY_SPEECH_ENV",
+        ];
+        let allow: Vec<String> = always.iter().map(|name| (*name).to_owned()).collect();
+        let env = adapter_env(vars(&always), &allow, &["MY_SPEECH_ENV".to_owned()]);
+        assert!(env.is_empty(), "{:?}", names(&env));
     }
 
     /// Runs in a child process (see [`helper`]): prints its arguments and variable names.
@@ -400,6 +459,32 @@ mod tests {
         let mut rotated = path.into_os_string();
         rotated.push(".1");
         assert!(Path::new(&rotated).exists());
+    }
+
+    #[test]
+    fn a_log_that_cannot_be_rotated_is_appended_to() {
+        let dir = TestDir::new();
+        let path = log_path(dir.path());
+        std::fs::write(&path, vec![b'x'; 5 * 1024 * 1024 + 1]).unwrap();
+        let mut rotated = path.clone().into_os_string();
+        rotated.push(".1");
+        // A non-empty directory in the way makes the rename fail everywhere.
+        std::fs::create_dir_all(Path::new(&rotated).join("busy")).unwrap();
+        drop(open_log(dir.path()).unwrap());
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 5 * 1024 * 1024 + 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_open_log_is_made_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TestDir::new();
+        let path = log_path(dir.path());
+        std::fs::write(&path, b"old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        drop(open_log(dir.path()).unwrap());
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 
     #[tokio::test]

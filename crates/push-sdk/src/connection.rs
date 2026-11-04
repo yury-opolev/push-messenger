@@ -215,13 +215,9 @@ impl Connection {
             self.set_state(ConnectionState::Connecting);
             let (after, ready_for, token) = match self.connect_and_serve().await {
                 Ended::Closed => return,
-                Ended::CapabilitiesChanged => {
-                    // Like a fresh start: no backoff for a reconnect the app asked for.
-                    attempts = 0;
-                    not_ready = 0;
-                    refreshed = false;
-                    continue;
-                }
+                // Reconnect at once without counting this one as a failure; the backoff
+                // history of earlier failures stays.
+                Ended::CapabilitiesChanged => continue,
                 Ended::Disconnected(ack) => {
                     wanted = false;
                     self.set_state(ConnectionState::Offline);
