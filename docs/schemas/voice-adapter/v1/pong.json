@@ -1,0 +1,22 @@
+{
+  "$id": "https://raw.githubusercontent.com/yury-opolev/push-messenger/main/docs/schemas/voice-adapter/v1/pong.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "The answer to a `ping`.",
+  "properties": {
+    "id": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "type": {
+      "const": "pong",
+      "type": "string"
+    }
+  },
+  "required": [
+    "type",
+    "id"
+  ],
+  "title": "Pong",
+  "type": "object"
+}

@@ -1,0 +1,47 @@
+{
+  "$defs": {
+    "CallEndReason": {
+      "description": "Why a call ended. Unknown values decode as `other`.",
+      "oneOf": [
+        {
+          "const": "completed",
+          "description": "Either side hung up.",
+          "type": "string"
+        },
+        {
+          "const": "failed",
+          "description": "The media or signalling failed.",
+          "type": "string"
+        },
+        {
+          "const": "shutdown",
+          "description": "The bridge is stopping.",
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "$id": "https://raw.githubusercontent.com/yury-opolev/push-messenger/main/docs/schemas/voice-adapter/v1/call-ended.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "The call is over: release its state.",
+  "properties": {
+    "call_id": {
+      "pattern": "^[!-~]{1,64}$",
+      "type": "string"
+    },
+    "reason": {
+      "$ref": "#/$defs/CallEndReason"
+    },
+    "type": {
+      "const": "call_ended",
+      "type": "string"
+    }
+  },
+  "required": [
+    "type",
+    "call_id",
+    "reason"
+  ],
+  "title": "CallEnded",
+  "type": "object"
+}

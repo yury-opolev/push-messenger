@@ -1,0 +1,109 @@
+{
+  "$defs": {
+    "ErrorCode": {
+      "description": "Error codes. Unknown values decode as `other`.",
+      "oneOf": [
+        {
+          "const": "unsupported_protocol",
+          "description": "No common protocol version (the sender closes).",
+          "type": "string"
+        },
+        {
+          "const": "unsupported_format",
+          "description": "The audio format cannot be carried (in place of a hello: the sender closes).",
+          "type": "string"
+        },
+        {
+          "const": "invalid_frame",
+          "description": "A framing error (the sender closes).",
+          "type": "string"
+        },
+        {
+          "const": "invalid_message",
+          "description": "A control message was malformed and ignored.",
+          "type": "string"
+        },
+        {
+          "const": "engine_unavailable",
+          "description": "The adapter's engine cannot work right now.",
+          "type": "string"
+        },
+        {
+          "const": "overloaded",
+          "description": "Too many messages or too much audio.",
+          "type": "string"
+        },
+        {
+          "const": "recognition_failed",
+          "description": "An utterance could not be transcribed.",
+          "type": "string"
+        },
+        {
+          "const": "synthesis_failed",
+          "description": "A speak could not be synthesized (with `speak_id`).",
+          "type": "string"
+        },
+        {
+          "const": "unknown_call",
+          "description": "A `call_id` that is not active.",
+          "type": "string"
+        },
+        {
+          "const": "busy",
+          "description": "A second call, or a second bridge on one adapter.",
+          "type": "string"
+        },
+        {
+          "const": "internal",
+          "description": "Anything else.",
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "$id": "https://raw.githubusercontent.com/yury-opolev/push-messenger/main/docs/schemas/voice-adapter/v1/error.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Something failed. The message is content-free: no audio, transcript or speech text.",
+  "properties": {
+    "call_id": {
+      "pattern": "^[!-~]{1,64}$",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "code": {
+      "$ref": "#/$defs/ErrorCode"
+    },
+    "message": {
+      "default": "",
+      "description": "A short, content-free explanation (at most 512 characters, no control characters).",
+      "maxLength": 512,
+      "type": "string"
+    },
+    "speak_id": {
+      "pattern": "^[!-~]{1,64}$",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "type": {
+      "const": "error",
+      "type": "string"
+    },
+    "utterance_id": {
+      "pattern": "^[!-~]{1,64}$",
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "type",
+    "code"
+  ],
+  "title": "ErrorMessage",
+  "type": "object"
+}

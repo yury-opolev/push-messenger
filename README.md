@@ -109,6 +109,10 @@ troubleshooting: [docs/agent-bridge.md](docs/agent-bridge.md).
 - Voice calls: built with `--features voice`, the bridge answers its owner's calls, turns
   speech into prompts, speaks the replies and takes spoken answers to its cards (Azure AI
   Speech or local engines) ([guide](docs/agent-bridge.md#18-voice-calls)).
+- `crates/push-voice-adapter-proto`: the voice adapter protocol (`push-voice-adapter/1`)
+  that moves speech out of the bridge into a separate, swappable voice adapter process:
+  framing, control messages, limits and JSON Schemas
+  ([reference](docs/voice-adapter-protocol.md)). The bridge's adapter client follows.
 
 ## Run it on minikube
 

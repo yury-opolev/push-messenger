@@ -1,0 +1,86 @@
+{
+  "$defs": {
+    "AudioSpec": {
+      "description": "An audio format as the bridge's hello describes it.",
+      "properties": {
+        "channels": {
+          "description": "Channels: 1.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "format": {
+          "description": "Sample format: `s16le` (signed 16-bit little-endian).",
+          "maxLength": 16,
+          "minLength": 1,
+          "type": "string"
+        },
+        "frame_ms": {
+          "description": "Milliseconds of audio per frame: 20.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "rate": {
+          "description": "Samples per second: 16000.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "rate",
+        "channels",
+        "format",
+        "frame_ms"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://raw.githubusercontent.com/yury-opolev/push-messenger/main/docs/schemas/voice-adapter/v1/bridge-hello.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "The bridge's first message on every connection.",
+  "properties": {
+    "audio": {
+      "$ref": "#/$defs/AudioSpec",
+      "description": "The call audio's format: in v1 always 16000 Hz, 1 channel, s16le, 20 ms."
+    },
+    "bridge_version": {
+      "description": "The bridge's version, for the adapter's diagnostics.",
+      "maxLength": 64,
+      "type": "string"
+    },
+    "language": {
+      "description": "The language spoken on calls, a BCP 47 tag such as `en-US`.",
+      "pattern": "^[A-Za-z0-9-]{1,35}$",
+      "type": "string"
+    },
+    "protocol": {
+      "description": "The bridge's preferred protocol version, `push-voice-adapter/<n>`.",
+      "maxLength": 64,
+      "minLength": 1,
+      "type": "string"
+    },
+    "protocols": {
+      "description": "Every version the bridge speaks (including `protocol`). Absent: only `protocol`.",
+      "items": {
+        "type": "string"
+      },
+      "maxItems": 16,
+      "type": "array"
+    },
+    "type": {
+      "const": "hello",
+      "type": "string"
+    }
+  },
+  "required": [
+    "type",
+    "protocol",
+    "bridge_version",
+    "language",
+    "audio"
+  ],
+  "title": "BridgeHello",
+  "type": "object"
+}

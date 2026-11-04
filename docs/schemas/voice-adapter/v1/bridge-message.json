@@ -1,0 +1,441 @@
+{
+  "$defs": {
+    "AudioSpec": {
+      "description": "An audio format as the bridge's hello describes it.",
+      "properties": {
+        "channels": {
+          "description": "Channels: 1.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "format": {
+          "description": "Sample format: `s16le` (signed 16-bit little-endian).",
+          "maxLength": 16,
+          "minLength": 1,
+          "type": "string"
+        },
+        "frame_ms": {
+          "description": "Milliseconds of audio per frame: 20.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "rate": {
+          "description": "Samples per second: 16000.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "rate",
+        "channels",
+        "format",
+        "frame_ms"
+      ],
+      "type": "object"
+    },
+    "BridgeHello": {
+      "description": "The bridge's first message on every connection.",
+      "properties": {
+        "audio": {
+          "$ref": "#/$defs/AudioSpec",
+          "description": "The call audio's format: in v1 always 16000 Hz, 1 channel, s16le, 20 ms."
+        },
+        "bridge_version": {
+          "description": "The bridge's version, for the adapter's diagnostics.",
+          "maxLength": 64,
+          "type": "string"
+        },
+        "language": {
+          "description": "The language spoken on calls, a BCP 47 tag such as `en-US`.",
+          "pattern": "^[A-Za-z0-9-]{1,35}$",
+          "type": "string"
+        },
+        "protocol": {
+          "description": "The bridge's preferred protocol version, `push-voice-adapter/<n>`.",
+          "maxLength": 64,
+          "minLength": 1,
+          "type": "string"
+        },
+        "protocols": {
+          "description": "Every version the bridge speaks (including `protocol`). Absent: only `protocol`.",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 16,
+          "type": "array"
+        }
+      },
+      "required": [
+        "protocol",
+        "bridge_version",
+        "language",
+        "audio"
+      ],
+      "type": "object"
+    },
+    "CallEndReason": {
+      "description": "Why a call ended. Unknown values decode as `other`.",
+      "oneOf": [
+        {
+          "const": "completed",
+          "description": "Either side hung up.",
+          "type": "string"
+        },
+        {
+          "const": "failed",
+          "description": "The media or signalling failed.",
+          "type": "string"
+        },
+        {
+          "const": "shutdown",
+          "description": "The bridge is stopping.",
+          "type": "string"
+        }
+      ]
+    },
+    "CallEnded": {
+      "description": "The call is over: release its state.",
+      "properties": {
+        "call_id": {
+          "pattern": "^[!-~]{1,64}$",
+          "type": "string"
+        },
+        "reason": {
+          "$ref": "#/$defs/CallEndReason"
+        }
+      },
+      "required": [
+        "call_id",
+        "reason"
+      ],
+      "type": "object"
+    },
+    "CallStarted": {
+      "description": "A call starts (or continues with a reconnected adapter): listen to stream 0.",
+      "properties": {
+        "call_id": {
+          "description": "Opaque, chosen by the bridge per call: 1–64 printable ASCII characters.",
+          "pattern": "^[!-~]{1,64}$",
+          "type": "string"
+        },
+        "language": {
+          "description": "The language spoken, BCP 47.",
+          "pattern": "^[A-Za-z0-9-]{1,35}$",
+          "type": "string"
+        },
+        "peer": {
+          "description": "The caller's display name only.",
+          "maxLength": 64,
+          "type": "string"
+        }
+      },
+      "required": [
+        "call_id",
+        "peer",
+        "language"
+      ],
+      "type": "object"
+    },
+    "ErrorCode": {
+      "description": "Error codes. Unknown values decode as `other`.",
+      "oneOf": [
+        {
+          "const": "unsupported_protocol",
+          "description": "No common protocol version (the sender closes).",
+          "type": "string"
+        },
+        {
+          "const": "unsupported_format",
+          "description": "The audio format cannot be carried (in place of a hello: the sender closes).",
+          "type": "string"
+        },
+        {
+          "const": "invalid_frame",
+          "description": "A framing error (the sender closes).",
+          "type": "string"
+        },
+        {
+          "const": "invalid_message",
+          "description": "A control message was malformed and ignored.",
+          "type": "string"
+        },
+        {
+          "const": "engine_unavailable",
+          "description": "The adapter's engine cannot work right now.",
+          "type": "string"
+        },
+        {
+          "const": "overloaded",
+          "description": "Too many messages or too much audio.",
+          "type": "string"
+        },
+        {
+          "const": "recognition_failed",
+          "description": "An utterance could not be transcribed.",
+          "type": "string"
+        },
+        {
+          "const": "synthesis_failed",
+          "description": "A speak could not be synthesized (with `speak_id`).",
+          "type": "string"
+        },
+        {
+          "const": "unknown_call",
+          "description": "A `call_id` that is not active.",
+          "type": "string"
+        },
+        {
+          "const": "busy",
+          "description": "A second call, or a second bridge on one adapter.",
+          "type": "string"
+        },
+        {
+          "const": "internal",
+          "description": "Anything else.",
+          "type": "string"
+        }
+      ]
+    },
+    "ErrorMessage": {
+      "description": "Something failed. The message is content-free: no audio, transcript or speech text.",
+      "properties": {
+        "call_id": {
+          "pattern": "^[!-~]{1,64}$",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "code": {
+          "$ref": "#/$defs/ErrorCode"
+        },
+        "message": {
+          "default": "",
+          "description": "A short, content-free explanation (at most 512 characters, no control characters).",
+          "maxLength": 512,
+          "type": "string"
+        },
+        "speak_id": {
+          "pattern": "^[!-~]{1,64}$",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "utterance_id": {
+          "pattern": "^[!-~]{1,64}$",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "code"
+      ],
+      "type": "object"
+    },
+    "Ping": {
+      "description": "Liveness: answer with a `pong` of the same id.",
+      "properties": {
+        "id": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "Pong": {
+      "description": "The answer to a `ping`.",
+      "properties": {
+        "id": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "Speak": {
+      "description": "Speak this text after any earlier unfinished speak.",
+      "properties": {
+        "call_id": {
+          "pattern": "^[!-~]{1,64}$",
+          "type": "string"
+        },
+        "interruptible": {
+          "description": "Whether the adapter may cut it on its own barge-in; `stop_speaking` always does.",
+          "type": "boolean"
+        },
+        "speak_id": {
+          "description": "Opaque, chosen by the bridge: 1–64 printable ASCII characters.",
+          "pattern": "^[!-~]{1,64}$",
+          "type": "string"
+        },
+        "text": {
+          "description": "Plain text prepared for speech, 1–4000 characters.",
+          "maxLength": 4000,
+          "minLength": 1,
+          "type": "string"
+        },
+        "voice": {
+          "description": "A voice from the adapter's hello; absent: its default.",
+          "maxLength": 64,
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "call_id",
+        "speak_id",
+        "text",
+        "interruptible"
+      ],
+      "type": "object"
+    },
+    "StopSpeaking": {
+      "description": "Stop one speak, or every unfinished one.",
+      "properties": {
+        "call_id": {
+          "pattern": "^[!-~]{1,64}$",
+          "type": "string"
+        },
+        "speak_id": {
+          "description": "Absent: every unfinished speak.",
+          "pattern": "^[!-~]{1,64}$",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "call_id"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://raw.githubusercontent.com/yury-opolev/push-messenger/main/docs/schemas/voice-adapter/v1/bridge-message.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "What the bridge sends.",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/BridgeHello",
+      "properties": {
+        "type": {
+          "const": "hello",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "$ref": "#/$defs/CallStarted",
+      "properties": {
+        "type": {
+          "const": "call_started",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "$ref": "#/$defs/Speak",
+      "properties": {
+        "type": {
+          "const": "speak",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "$ref": "#/$defs/StopSpeaking",
+      "properties": {
+        "type": {
+          "const": "stop_speaking",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "$ref": "#/$defs/CallEnded",
+      "properties": {
+        "type": {
+          "const": "call_ended",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "$ref": "#/$defs/ErrorMessage",
+      "properties": {
+        "type": {
+          "const": "error",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "$ref": "#/$defs/Ping",
+      "properties": {
+        "type": {
+          "const": "ping",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "$ref": "#/$defs/Pong",
+      "properties": {
+        "type": {
+          "const": "pong",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    }
+  ],
+  "title": "BridgeMessage"
+}

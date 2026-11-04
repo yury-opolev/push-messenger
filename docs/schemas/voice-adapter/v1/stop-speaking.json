@@ -1,0 +1,29 @@
+{
+  "$id": "https://raw.githubusercontent.com/yury-opolev/push-messenger/main/docs/schemas/voice-adapter/v1/stop-speaking.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Stop one speak, or every unfinished one.",
+  "properties": {
+    "call_id": {
+      "pattern": "^[!-~]{1,64}$",
+      "type": "string"
+    },
+    "speak_id": {
+      "description": "Absent: every unfinished speak.",
+      "pattern": "^[!-~]{1,64}$",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "type": {
+      "const": "stop_speaking",
+      "type": "string"
+    }
+  },
+  "required": [
+    "type",
+    "call_id"
+  ],
+  "title": "StopSpeaking",
+  "type": "object"
+}

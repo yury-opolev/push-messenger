@@ -21,10 +21,11 @@ members = [
     "crates/push-store",
     "crates/push-tray-core",
     "crates/push-testkit",
+    "crates/push-voice-adapter-proto",
     "crates/push-worker",
 ]
 # The tray app's Tauri shell is its own workspace (apps/push-agent-tray/Cargo.toml).
-exclude = ["apps/push-agent-tray"]
+exclude = ["apps/push-agent-tray", "crates/push-voice-adapter-proto/fuzz"]
 
 [workspace.package]
 version = "0.1.0"
@@ -67,6 +68,7 @@ push-sdk-c = { path = "bindings/c" }
 push-sdk-ffi = { path = "bindings/ffi" }
 push-store = { path = "crates/push-store" }
 push-testkit = { path = "crates/push-testkit" }
+push-voice-adapter-proto = { path = "crates/push-voice-adapter-proto" }
 push-worker = { path = "crates/push-worker" }
 rand = "0.9"
 rcgen = "0.13"

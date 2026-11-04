@@ -1,0 +1,56 @@
+{
+  "$id": "https://raw.githubusercontent.com/yury-opolev/push-messenger/main/docs/schemas/voice-adapter/v1/transcript.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "What the caller said: partial (`final: false`) or final.",
+  "properties": {
+    "call_id": {
+      "pattern": "^[!-~]{1,64}$",
+      "type": "string"
+    },
+    "confidence": {
+      "description": "0 to 1.",
+      "format": "float",
+      "maximum": 1.0,
+      "minimum": 0.0,
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "final": {
+      "description": "Final: the bridge acts on it. One per utterance.",
+      "type": "boolean"
+    },
+    "language": {
+      "description": "The language recognised, BCP 47.",
+      "pattern": "^[A-Za-z0-9-]{1,35}$",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "text": {
+      "description": "The words, 1–4000 characters.",
+      "maxLength": 4000,
+      "minLength": 1,
+      "type": "string"
+    },
+    "type": {
+      "const": "transcript",
+      "type": "string"
+    },
+    "utterance_id": {
+      "pattern": "^[!-~]{1,64}$",
+      "type": "string"
+    }
+  },
+  "required": [
+    "type",
+    "call_id",
+    "utterance_id",
+    "text",
+    "final"
+  ],
+  "title": "Transcript",
+  "type": "object"
+}
