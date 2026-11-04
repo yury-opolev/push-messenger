@@ -13,11 +13,25 @@ adapter without reading the bridge's source.
 - Rust implementation (framing, messages, limits, version negotiation):
   `crates/push-voice-adapter-proto`.
 
-**Status.** The protocol and its crate are released first. The bridge's adapter client
-(`calls.adapter` in the bridge's config, spawn and connect modes) and the test adapter
-`crates/push-voice-adapter-testkit` come next; then the bridge's built-in speech providers
-(`calls.stt`, `calls.tts`) are removed. Until the client ships, docs/agent-bridge.md §18
-describes the built-in providers.
+**Status.** The bridge's adapter client ships in this release: `calls.adapter` in the
+bridge's config, spawn and connect modes ([agent bridge §18, voice
+adapter](agent-bridge.md#voice-adapter)). The bridge's built-in speech providers
+(`calls.stt`, `calls.tts`, `calls.vad`) are deprecated and removed in the next release.
+
+A reference adapter for tests is `crates/push-voice-adapter-testkit` (a library,
+`ScriptedAdapter`, and a binary): it hears tones as words and speaks a 600 Hz tone, and
+plays faults on demand (a crash, a refused format, another protocol version, a stall, a
+flood, no hello), driven by a JSON script. The binary:
+
+```text
+push-voice-adapter-testkit [--script <file>] [--pipe <name> | --socket <path>] [--events <path>] [--dump-env]
+```
+
+Without `--pipe`/`--socket` it speaks on stdin/stdout (spawn mode); with one it listens
+there, private to the user, serves one bridge at a time and answers a second one
+`error busy`. `--events` appends what it saw and did as JSON lines (content-free);
+`--dump-env` prints its argv and environment and exits. Exit codes: 0 when the bridge
+closed the stream, 1 on an error, 2 on bad arguments, 3 on a scripted crash.
 
 Contents: [1 Overview](#1-overview) · [2 Transport](#2-transport) ·
 [3 Framing](#3-framing) · [4 Audio](#4-audio) · [5 Control messages](#5-control-messages) ·

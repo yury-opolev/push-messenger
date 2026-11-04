@@ -129,19 +129,19 @@ providers still work when `calls.adapter` is absent (they are removed in PR 3).
 **Files:** Modify `crates/push-sdk/src/client.rs` (the `calls: bool` config is read where
 `Identify` is built, around `config.calls` at line ~401); test in the same file's tests.
 
-- [ ] **Step 1: failing test** `calls_advertising_changes_reconnect_with_the_new_capability`:
+- [x] **Step 1: failing test** `calls_advertising_changes_reconnect_with_the_new_capability`:
   start `Client::with_calls()`'s test server helper (client.rs ~954), connect, assert the
   server saw `CAPABILITY_CALLS` in `Identify`; call `client.set_calls_advertised(false)`;
   assert a new `Identify` without it arrives within 5 s; `set_calls_advertised(false)`
   again sends nothing.
-- [ ] **Step 2:** run `cargo test -p push-sdk --lib calls_advertising` → FAIL (no method).
-- [ ] **Step 3: implement** an `AtomicBool calls_advertised` initialised from
+- [x] **Step 2:** run `cargo test -p push-sdk --lib calls_advertising` → FAIL (no method).
+- [x] **Step 3: implement** an `AtomicBool calls_advertised` initialised from
   `config.calls`, read when building `Identify`; `pub fn set_calls_advertised(&self, on:
   bool)`: swap; if changed and connected, close the socket with the normal reconnect path
   (no backoff penalty; reason `capabilities_changed`). Document: a reconnect is cheap and
   `CallSync` (voice spec D7) restores call state; never call it during a call.
-- [ ] **Step 4:** test passes; `cargo test -p push-sdk --lib` green.
-- [ ] **Step 5:** commit `feat(push-sdk): change calls advertising at runtime`.
+- [x] **Step 4:** test passes; `cargo test -p push-sdk --lib` green.
+- [x] **Step 5:** commit `feat(push-sdk): change calls advertising at runtime`.
 
 ### Task 2.2: `calls.adapter` config
 
@@ -182,7 +182,7 @@ pub enum ConnectConfig {
 
 `CallsConfig` gains `#[serde(default)] pub adapter: Option<AdapterConfig>`.
 
-- [ ] **Step 1: failing tests** (`config.rs` tests): parses
+- [x] **Step 1: failing tests** (`config.rs` tests): parses
   `{"adapter":{"spawn":{"command":["C:\\a.exe","--x"]}}}` and
   `{"adapter":{"connect":{"pipe":"push-voice-me"}}}`; refuses with field-named errors:
   empty `command` (`calls.adapter.spawn.command is empty`), an empty argument, a pipe name
@@ -190,9 +190,9 @@ pub enum ConnectConfig {
   only available on Windows`), `adapter` together with `stt` other than `none`
   (`calls.adapter and calls.stt cannot both be set; speech runs in the adapter`), unknown
   keys. A relative program path is accepted (warning logged at startup, not a test here).
-- [ ] **Step 2:** `cargo test -p push-bridge --lib config::` → FAIL.
-- [ ] **Step 3:** implement the types and `validate_adapter(&AdapterConfig) -> Result<(), String>`.
-- [ ] **Step 4:** PASS. **Step 5:** commit `feat(push-bridge): calls.adapter config`.
+- [x] **Step 2:** `cargo test -p push-bridge --lib config::` → FAIL.
+- [x] **Step 3:** implement the types and `validate_adapter(&AdapterConfig) -> Result<(), String>`.
+- [x] **Step 4:** PASS. **Step 5:** commit `feat(push-bridge): calls.adapter config`.
 
 ### Task 2.3: Spawning the adapter safely
 
@@ -224,14 +224,14 @@ Windows `creation_flags(CREATE_NO_WINDOW)` (0x0800_0000) and the child assigned 
 job object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` (reuse `exe/windows.rs` patterns;
 `unsafe` stays confined there).
 
-- [ ] **Step 1: failing tests**: `adapter_env` drops `CODA_SERVE_API_KEY`, `PUSH_AGENT_KEY`,
+- [x] **Step 1: failing tests**: `adapter_env` drops `CODA_SERVE_API_KEY`, `PUSH_AGENT_KEY`,
   `MY_API_TOKEN`, `db_password`, keeps `PATH`, `SystemRoot`, `HOME`, `LANG`, keeps an
   allowed `MY_API_TOKEN` with `env_allow`; `spawn` of a test program prints its argv and
   environment: an argument `"a b; echo pwned"` arrives as one argument (no shell), the
   secret variable is absent. Test program: the testkit binary's `--dump-env` mode
   (Task 2.8) — until then, a `#[cfg(test)]` use of `std::env::current_exe()` with a
   `--dump-env` test hook is acceptable.
-- [ ] **Step 2–4:** fail, implement, pass. **Step 5:** commit.
+- [x] **Step 2–4:** fail, implement, pass. **Step 5:** commit.
 
 ### Task 2.4: Connecting to an adapter's endpoint
 
@@ -248,12 +248,12 @@ pub async fn connect(config: &ConnectConfig) -> std::io::Result<push_bridge_cont
 server's user (SID or uid). Map `NotFound` → "no voice adapter is listening on <name>",
 `PermissionDenied` → "<name> belongs to another user", others as is (content-free).
 
-- [ ] **Step 1: failing tests**: endpoint naming; a `push_bridge_control::transport::Listener`
+- [x] **Step 1: failing tests**: endpoint naming; a `push_bridge_control::transport::Listener`
   bound on a unique name accepts our connection and frames cross both ways
   (`AsyncFrameWriter`/`AsyncFrameReader` from push-voice-adapter-proto); nobody listening
   is `NotFound` with the friendly message. (Windows: also runs in `tray-windows`'s
   `cargo test -p push-bridge --lib`.)
-- [ ] **Step 2–4.** **Step 5:** commit.
+- [x] **Step 2–4.** **Step 5:** commit.
 
 ### Task 2.5: The link — handshake, liveness, caps
 
@@ -293,7 +293,7 @@ name)`); stream-0 frames from the adapter or wrong-size frames dropped (+ one
 at `TO_ADAPTER_QUEUE_FRAMES` (drop oldest, count `dropped_to_adapter`). Seq/timestamp of
 stream 0 per call (reset at `call_started`).
 
-- [ ] **Step 1: failing tests** (paused tokio time, `tokio::io::duplex`, a hand-driven fake
+- [x] **Step 1: failing tests** (paused tokio time, `tokio::io::duplex`, a hand-driven fake
   adapter using push-voice-adapter-proto): hello exchange gives `AdapterInfo`; no hello in
   10 s → `Closed(Protocol("hello timeout"))`; a `push-voice-adapter/2` answer →
   `unsupported_protocol` sent and closed; ping answered with the same id; silence 30 s →
@@ -301,7 +301,7 @@ stream 0 per call (reset at `call_started`).
   `invalid_frame`; an unknown type is ignored and the link stays up; with a stalled
   reader the 51st queued audio frame drops the oldest and control still goes first; logs
   captured with a tracing test subscriber contain no text from a transcript.
-- [ ] **Step 2–4.** **Step 5:** commit.
+- [x] **Step 2–4.** **Step 5:** commit.
 
 ### Task 2.6: The supervisor — lifecycle and state
 
@@ -326,11 +326,11 @@ core) → wait for `Closed` → (spawn: kill child, wait 2 s) → Backoff with
 `RESET_AFTER`) → Starting. Restarts counted (`adapter_restarts`). Shutdown: send
 `call_ended {shutdown}` if a call runs, close, wait 2 s, kill.
 
-- [ ] **Step 1: failing tests** (paused time, the testkit library adapter over duplex
+- [x] **Step 1: failing tests** (paused time, the testkit library adapter over duplex
   streams via an injectable `Starter` trait so no process is needed): states in order
   Starting → Handshaking → Ready; adapter closes → Backoff 1 s → Ready again; three quick
   failures → 1 s, 2 s, 4 s; 60 s Ready then failure → 1 s again.
-- [ ] **Step 2–4.** **Step 5:** commit.
+- [x] **Step 2–4.** **Step 5:** commit.
 
 ### Task 2.7: SpeechEngine split and the adapter router
 
@@ -375,14 +375,14 @@ for construction). `AdapterEngine` (router.rs):
   `synthesis_failed` → skip; `engine_unavailable` → `AdapterUnavailable` event;
 - link closed → `SessionEvent::AdapterLost`; new link → `AdapterBack` (new variants).
 
-- [ ] **Step 1: failing tests** (paused time, `FakePhone` + testkit library adapter): the
+- [x] **Step 1: failing tests** (paused time, `FakePhone` + testkit library adapter): the
   owner's tone becomes a `Transcript`; a sentence becomes `speak` and its tone plays on
   the fake call; barge-in sends `stop_speaking` and silences the call within 40 ms of
   `speech_started`; 20 sentences keep ≤ 16 outstanding; `own` lines are
   `interruptible: false`; final transcript → `Transcript` event < 100 ms (paused clock);
   stream-1 playback has no gap > 40 ms with a well-behaved adapter; link loss mid-speech
   → `AdapterLost`, silence, no panic; a new link → `call_started` with the same id.
-- [ ] **Step 2–4.** **Step 5:** commit.
+- [x] **Step 2–4.** **Step 5:** commit.
 
 ### Task 2.8: Core integration, advertising, status, tray, metrics
 
@@ -408,13 +408,13 @@ for construction). `AdapterEngine` (router.rs):
 - Metrics (log lines `event = "adapter_metrics"` at call end and in `status`): frames in/out,
   dropped by direction, restarts, speak latency last/avg/max.
 
-- [ ] **Step 1: failing tests** in `core/voice_tests.rs`: with a Ready adapter the owner's
+- [x] **Step 1: failing tests** in `core/voice_tests.rs`: with a Ready adapter the owner's
   call is answered and a transcript becomes a prompt through `TestBackend`; adapter lost
   mid-call → the note is posted and the call stays; back → note, `call_started` again;
   no adapter → `advertised == false` and an incoming call event is ignored; advertising
   does not change during a call. Control protocol test for `adapter` content-freeness.
   Tray-core view-model test for the adapter line.
-- [ ] **Step 2–4.** **Step 5:** commit.
+- [x] **Step 2–4.** **Step 5:** commit.
 
 ### Task 2.9: Testkit adapter
 
@@ -432,11 +432,11 @@ src/script.rs, src/tones.rs}`; workspace member.
   [--dump-env]`: stdio by default; connect mode listens with
   `push_bridge_control::transport::Listener` (same DACL/SID rules) and answers a second
   bridge `busy`.
-- [ ] **Step 1: failing tests**: the library against push-voice-adapter-proto readers: a
+- [x] **Step 1: failing tests**: the library against push-voice-adapter-proto readers: a
   tone fixture becomes `speech_started` + final transcript of the scripted words; `speak`
   returns 600 Hz frames for `len × ms_per_char` then `speak_done`; `stop_speaking` →
   `speak_done {interrupted: true}`; each fault behaves as named.
-- [ ] **Step 2–4.** **Step 5:** commit.
+- [x] **Step 2–4.** **Step 5:** commit.
 
 ### Task 2.10: E2E through the testkit adapter, CI
 
@@ -446,29 +446,29 @@ first: `cargo build -p push-voice-adapter-testkit --locked`).
 
 Scenarios (each a `step(...)` in the existing style, `PUSH_BRIDGE_VOICE=1`):
 
-- [ ] spawn mode: call → `call_started` → audio flows → a final transcript becomes a Coda
+- [x] spawn mode: call → `call_started` → audio flows → a final transcript becomes a Coda
   prompt through the scripted backend; the reply is spoken (600 Hz heard by the owner's
   `MediaCall`), barge-in stops it; a voice answer closes a card (existing assertions);
-- [ ] connect mode: the testkit listening on a unique pipe/socket, same assertions (short);
-- [ ] crash mid-call (`crash_after_frames`) → the "Voice adapter stopped; reconnecting…"
+- [x] connect mode: the testkit listening on a unique pipe/socket, same assertions (short);
+- [x] crash mid-call (`crash_after_frames`) → the "Voice adapter stopped; reconnecting…"
   message reaches the owner, the call stays, after restart a new utterance becomes a
   prompt;
-- [ ] no adapter (`calls.adapter` pointing at a missing program) → the owner's call is
+- [x] no adapter (`calls.adapter` pointing at a missing program) → the owner's call is
   `UNREACHABLE`;
-- [ ] format mismatch (`refuse_format`) → the bridge's log has one
+- [x] format mismatch (`refuse_format`) → the bridge's log has one
   `unsupported_format` line and calls are not advertised;
-- [ ] timing: final transcript → `speak` < 100 ms excluding the backend (timestamps from the
+- [x] timing: final transcript → `speak` < 100 ms excluding the backend (timestamps from the
   testkit's log of received frames); owner-side gaps in the agent's audio ≤ 40 ms;
-- [ ] content-free logs: the bridge's log file contains none of the scripted words or
+- [x] content-free logs: the bridge's log file contains none of the scripted words or
   spoken text (the existing helper in this file).
-- [ ] Commit; push; `gh pr checks --watch`.
+- [x] Commit; push; `gh pr checks --watch`.
 
 ### Task 2.11: Docs and changelog
 
-- [ ] `docs/agent-bridge.md` §18: new subsection "Voice adapter" (config, spawn/connect,
+- [x] `docs/agent-bridge.md` §18: new subsection "Voice adapter" (config, spawn/connect,
   status, fallback) — the built-in providers are documented as deprecated.
-- [ ] `docs/voice-adapter-protocol.md`: Status paragraph updated (the client shipped).
-- [ ] Design §12 "PR 2: decisions and deviations"; CHANGELOG `### Added`.
+- [x] `docs/voice-adapter-protocol.md`: Status paragraph updated (the client shipped).
+- [x] Design §12 "PR 2: decisions and deviations"; CHANGELOG `### Added`.
 
 ---
 

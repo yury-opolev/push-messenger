@@ -603,6 +603,7 @@ All in the bridge's folder: `%LOCALAPPDATA%\push-messenger\coda-bridge` by defau
 | `config.json` | the configuration ([fields](#2-write-configjson)); written by you |
 | `state.json` | written by the bridge (atomically): `device_id` and `registration_id` (the SDK's device and pending registration), `enrolled_user_id`, `folder` (the current folder), `sessions` (folder → session id), `agent_message_cursor` and `engine_instance` (background messages already shown). No tokens, no keys |
 | `logs\bridge.log` | JSON lines (`tracing`), appended; at start a log over 10 MB is renamed to `bridge.log.1` (replacing it). Level from `PUSH_BRIDGE_LOG` (`tracing` filter syntax, e.g. `debug`), default `info` |
+| `logs\voice-adapter.log` | only with a spawned [voice adapter](#voice-adapter) and `stderr` `log`: the adapter's stderr, appended; at each (re)start a log over 5 MiB is renamed to `voice-adapter.log.1` (replacing it). What it holds is up to the adapter |
 | `agent-key.p8` | only with `"storage": "software-file"`: the private key as a plain PKCS#8 file |
 
 With `"storage": "windows"` the key is in the user's CNG key store under `key.name`, not in
@@ -651,6 +652,7 @@ The tray keeps `tray.json` outside the bridge folders
 | The tray shows "running (started outside the tray)" | The bridge answers but the tray did not start it and no Scheduled Task runs it: it was started in a console, by a script, or by an earlier tray process. Stop, Quit and restarts as for a Scheduled Task's bridge |
 | The tray shows "stopped" and its history in the window lists "stopped outside the tray (exit 0)" | A bridge the tray started was stopped on purpose elsewhere: Ctrl-C, or `shutdown` from another tool (`push-agent-bridge` CLI or another control-channel client). The tray does not restart it and does not count it as a failure; Start runs it again |
 | "Coda is paused for an upgrade; try again when it is back." | Upgrade mode: wait for the upgrade, or `push-agent-bridge resume` |
+| The agent cannot be called with `calls.adapter`, or "Voice adapter stopped; reconnecting…" | `status` shows the adapter's state and the last reason; see [voice adapter troubleshooting](#voice-adapter) |
 
 ## 12. Live smoke test (opt-in)
 
@@ -1539,7 +1541,8 @@ describes what the code does.
 | The owner calls, `calls.answer` `ask` | a card asks first ([asking before answering](#asking-before-answering)); answered only when the owner picks "Answer" before the ring ends, then greeted as above |
 | Anyone else calls | refused by the server when they are not the agent's contact (`NOT_CONTACT`); a call from anyone but the owner that reaches the bridge is declined |
 | A second call while one runs (or is being answered, asked about or placed, or the bridge is stopping) | declined busy |
-| No `calls` section, or `calls.stt` is `none` | calls are not advertised, so the owner's app sees the agent as unreachable (the server answers `UNREACHABLE`) |
+| No `calls` section, or `calls.stt` is `none` without `calls.adapter` | calls are not advertised, so the owner's app sees the agent as unreachable (the server answers `UNREACHABLE`) |
+| `calls.adapter`, and the [voice adapter](#voice-adapter) is not ready (or cannot listen) | the same: calls are advertised only while the adapter is ready with `stt` |
 | A build without `--features voice` | calls are not advertised; a `calls` section only prints a warning at start (`voice_unavailable`) |
 
 One call at a time. The owner ends it by hanging up; stopping the bridge hangs it up, and
@@ -1555,8 +1558,9 @@ cargo build --release -p push-bridge --features voice
 The feature `voice` brings push-sdk's [media helper](calls.md#19-media-helper) (feature
 `calls-media`: ICE, DTLS-SRTP and Opus natively), which needs **Rust 1.89** and **CMake**
 with the MSVC build tools; the bridge without it keeps Rust 1.85. Everything else of the
-pipeline (speech providers, detector, spoken text, voice answers) builds and is tested
-without the feature.
+pipeline (speech providers, detector, spoken text, voice answers, the
+[voice adapter](#voice-adapter) client) builds and is tested without the feature; without
+it no adapter is started and calls are not advertised.
 
 `push-agent-bridge status` prints a `Voice:` line with provider names only:
 
@@ -1568,18 +1572,12 @@ without the feature.
 | `on: stt <provider>, tts <provider>` | calls are answered; at start the log says `voice_enabled` with the two names |
 | `adapter ready (<name> <version>; stt, tts, vad, barge-in)` | `calls.adapter`: the running bridge's adapter is ready; calls are advertised (after 2 s ready, never during a call) |
 | `adapter ready (…), but calls are not advertised: the adapter cannot listen (no stt)` | the adapter has no `stt` |
-| `adapter starting` | the bridge is starting or connecting to the adapter |
+| `adapter starting`, `adapter starting (handshake)` | the bridge is starting or connecting to the adapter, or waits for its hello |
 | `adapter backing off <n> s (<reason>)` | the adapter ended or could not be started or reached; the bridge tries again in `n` seconds |
 | `adapter configured (the bridge is not running)` | `status` asks the running bridge; none runs |
 
-With a running adapter a `Voice adapter:` line follows with its counters (calls, frames to
-and from the adapter, dropped frames each way, restarts, speak latency and audio latency
-as last/avg/max). When the adapter goes away during a call the call stays up: the chat
-says "Voice adapter stopped; reconnecting…", the agent's replies stay in the chat, and
-"Voice adapter is back." once a restarted adapter took the call again; an adapter that
-answers `engine_unavailable` leaves the call chat-only ("Voice adapter cannot listen right
-now."). The log has `adapter_metrics` at each call's end and `adapter_metrics_total` when
-the bridge stops.
+With a running adapter a `Voice adapter:` line follows with its counters
+([metrics](#voice-adapter)).
 
 ### The calls section
 
@@ -1590,12 +1588,18 @@ validated (by `run`, `enroll` and `status`) whether or not the build has voice.
 |---|---|---|
 | `calls.answer` | `auto`: the owner's call is answered at once. `ask`: a card asks the owner first ([asking before answering](#asking-before-answering)) | `auto` |
 | `calls.language` | the language spoken, a BCP 47 tag; sent to the speech providers | `en-US` |
-| `calls.adapter` | the voice adapter doing the speech ([voice adapter protocol](voice-adapter-protocol.md)): `{"spawn": {"command": ["<program>", "<arg>", …], "stderr": "log"\|"discard", "env_allow": [ … ]}}`, or `{"connect": {"pipe": "<name>"}}` (Windows, the name in `\\.\pipe\<name>`) / `{"connect": {"socket": "/path"}}` (Unix, may start with `$XDG_RUNTIME_DIR/`). With it, `calls.stt`, `calls.tts` and `calls.vad` stay unset (or `none`) | |
-| `calls.stt` | speech-to-text: `{"provider": "azure-speech", …}`, `{"provider": "local", …}` or `{"provider": "none"}` (calls are not advertised unless `calls.adapter` is set) | `none` |
-| `calls.tts` | text-to-speech: the same three; `none` keeps every reply in the chat and the call silent (no greeting either) | `none` |
-| `calls.vad.silence_ms` | the silence that ends an utterance, 200 to 5000 | `700` |
-| `calls.vad.min_speech_ms` | the speech an utterance needs, 100 to 5000; shorter sounds (a cough, a click) are dropped | `300` |
+| `calls.adapter` | the [voice adapter](#voice-adapter) doing the speech: `{"spawn": {…}}` or `{"connect": {…}}`. With it, `calls.stt`, `calls.tts` and `calls.vad` stay unset (or `none`) | |
+| `calls.stt` | speech-to-text, **deprecated**: `{"provider": "azure-speech", …}`, `{"provider": "local", …}` or `{"provider": "none"}` (calls are not advertised unless `calls.adapter` is set) | `none` |
+| `calls.tts` | text-to-speech, **deprecated**: the same three; `none` keeps every reply in the chat and the call silent (no greeting either) | `none` |
+| `calls.vad.silence_ms` | **deprecated**: the silence that ends an utterance, 200 to 5000 | `700` |
+| `calls.vad.min_speech_ms` | **deprecated**: the speech an utterance needs, 100 to 5000; shorter sounds (a cough, a click) are dropped | `300` |
 | `calls.notify_by_call` | when the agent calls its owner ([the agent calls you](#the-agent-calls-you)); absent: never | |
+
+**The built-in providers are deprecated.** `azure-speech`, `local` and the detector
+(`calls.stt`, `calls.tts`, `calls.vad`) still work in this release when `calls.adapter` is
+absent, exactly as before; the next release removes them (a config that still sets them
+then fails to start, naming the field). Move the speech into a
+[voice adapter](#voice-adapter).
 
 **`azure-speech`** ([Azure AI Speech](https://learn.microsoft.com/azure/ai-services/speech-service/),
 REST, no SDK):
@@ -1700,8 +1704,198 @@ configuration: <message>"). `<at>` is `calls.stt` or `calls.tts`:
 | `calls.notify_by_call.after_minutes must be 0 (off) to 8: a card expires after 10 minutes` | the call must ring and talk before the card's 10 minutes are over |
 | `calls.notify_by_call.min_interval_minutes must be 10 to 1440` | at most one call per 10 minutes, or less often |
 | `calls.notify_by_call.do_not_disturb[<i>] <why>: write "22:00-07:00", "mon-fri 22:00-07:00" or "sat,sun 00:00-24:00"` | `<why>` is `needs a time range`, `has a bad time "…"` (`HH:MM`, two digits each; `24:00` only as an end), `has an unknown day "…"` (`mon` … `sun`) or `is empty (its start and end are the same)` |
-| `calls.notify_by_call needs calls.stt: without it the bridge takes no calls and places none` | a speech-to-text provider, or `after_minutes` 0 and `urgent` false |
-| `calls.notify_by_call needs calls.tts: the call says what it is about` | a text-to-speech provider |
+| `calls.notify_by_call needs calls.stt: without it the bridge takes no calls and places none` | without `calls.adapter`: a speech-to-text provider, or `after_minutes` 0 and `urgent` false |
+| `calls.notify_by_call needs calls.tts: the call says what it is about` | without `calls.adapter`: a text-to-speech provider |
+
+The `calls.adapter` messages are in [voice adapter](#voice-adapter).
+
+### Voice adapter
+
+With `calls.adapter` the speech runs in a separate process, the **voice adapter**: it hears
+the call's audio and says what was said, and it speaks the sentences the bridge sends it.
+Any engine fits behind it (local models, a cloud service, a realtime speech model); the
+wire is [`push-voice-adapter/1`](voice-adapter-protocol.md). Everything else stays in the
+bridge: answering and the policies, transcripts in the chat, prompts and steers, voice
+answers to cards, spoken text and masking, barge-in, mute, activity and the tray. The
+client is plain tokio and needs no feature, but only a build with `--features voice` takes
+calls: without it no adapter is started and calls are not advertised.
+
+**With the built-in providers.** `calls.adapter` replaces them: with it, `calls.stt` and
+`calls.tts` stay absent or `{"provider": "none"}` and `calls.vad` absent (or at its
+defaults). `calls.stt` defaults to `none`, so `"calls": {"adapter": …}` alone is a calls
+section, and `calls.notify_by_call` needs no `stt` or `tts` with an adapter. The built-in
+providers are deprecated and go in the next release.
+
+**Spawn**: the bridge starts the adapter and speaks the protocol on its stdin (bridge →
+adapter) and stdout (adapter → bridge).
+
+```json
+"calls": {
+  "language": "en-US",
+  "adapter": {
+    "spawn": {
+      "command": ["C:\\Tools\\voice\\voice-adapter.exe", "--model", "C:\\Tools\\voice\\models\\base.en"],
+      "stderr": "log",
+      "env_allow": ["HF_TOKEN"]
+    }
+  }
+}
+```
+
+| Field | Meaning | Default |
+|---|---|---|
+| `command` | the program and its arguments, a list (argv), required, no empty item. Use an absolute path: a path with a folder that is relative is resolved against the bridge's working directory (warning `voice_adapter_relative_path` at start); a bare name is looked up on `PATH` | |
+| `stderr` | `log`: appended to `logs\voice-adapter.log` in the bridge's folder (on Unix mode 0600); at each (re)start a log over 5 MiB is renamed to `voice-adapter.log.1`, replacing it (a failed rename only logs `voice_adapter_log_rotate_failed`). `discard`: nowhere | `log` |
+| `env_allow` | variables to pass although their names look secret (below) | `[]` |
+
+How it is started:
+
+- **No shell.** The argv goes to the OS as is; `.bat` and `.cmd` files are refused (they
+  run through cmd.exe): name an `.exe`, or an interpreter with the script as an argument.
+  On Windows the adapter gets no window (`CREATE_NO_WINDOW`).
+- **Environment.** The adapter inherits the bridge's environment without its secrets
+  (names compared in any case): `CODA_SERVE_API_KEY` and `AZURE_SPEECH_KEY`, every name
+  starting with `PUSH_` or `CODA_`, and every name containing `KEY`, `TOKEN`, `SECRET`,
+  `PASS`, `CREDENTIAL`, `AUTH` or `CONNECTION_STRING`. A name in `env_allow` (any case on
+  Windows, exact elsewhere) overrides only the last rule (the words); `env_allow` cannot
+  name the fixed names or prefixes (a config error).
+- **Killed with the bridge.** The child is killed when the bridge drops it; on Windows it
+  also runs in a job object that kills whatever it started when the bridge goes away (a
+  process it starts in the first moments, before it is assigned to the job, is not in it).
+  Stopping: the bridge closes stdin, waits 2 s, then kills.
+
+**Connect**: the adapter is already running (started by the user, a service, another
+tool) and listens; the bridge connects and never creates the endpoint.
+
+```json
+"calls": { "adapter": { "connect": { "pipe": "push-voice-adapter" } } }
+```
+
+```json
+"calls": { "adapter": { "connect": { "socket": "$XDG_RUNTIME_DIR/push-voice-adapter.sock" } } }
+```
+
+| Field | Meaning |
+|---|---|
+| `pipe` | Windows: the pipe's name only (1 to 200 of `A-Z a-z 0-9 . _ -`); the bridge opens `\\.\pipe\<name>` |
+| `socket` | Unix: the socket's absolute path; a leading `$XDG_RUNTIME_DIR/` is replaced by that variable (unset: the connect fails and backs off) |
+
+The adapter must run as the same user: on Windows the pipe server's user must be the
+bridge's (or SYSTEM), on Unix the socket peer's uid must be the bridge's. Another user's
+endpoint is refused ("… belongs to another user") and backed off from; the
+[protocol](voice-adapter-protocol.md#2-transport) says how an adapter secures its side.
+
+**Validation messages** (as for [the calls section](#the-calls-section)):
+
+| Message | Fix |
+|---|---|
+| `calls.adapter and calls.stt cannot both be set; speech runs in the adapter` (also `tts`, `vad`) | remove the field, or set it to `none` |
+| `calls.adapter.spawn.command is empty`, `calls.adapter.spawn.command[<i>] is empty` | the program, then its arguments |
+| `calls.adapter.spawn.command[0] is a batch file; …` | an `.exe`, or the interpreter with the script as an argument |
+| `calls.adapter.spawn.env_allow[<i>] must be an environment variable's name` | letters, digits and `_`, not starting with a digit |
+| `calls.adapter.spawn.env_allow[<i>] names a variable the bridge never passes on` | the fixed names and the `PUSH_`/`CODA_` prefixes cannot be allowed |
+| `calls.adapter.connect.pipe must be the pipe's name only: …` | `push-voice-adapter`, not `\\.\pipe\push-voice-adapter` |
+| `calls.adapter.connect.pipe is only available on Windows`, `calls.adapter.connect.socket is only available on Unix` | |
+| `calls.adapter.connect.socket must be an absolute path (it may start with $XDG_RUNTIME_DIR/)` | |
+
+Unknown fields, both `spawn` and `connect`, or both `pipe` and `socket` are refused when
+`config.json` is read.
+
+**Lifecycle.** The adapter client is `starting` (spawning or connecting), then
+`handshaking`: the bridge sends its hello and the adapter must answer with its own within
+10 s (unknown message types before it are skipped; audio or any other known message is
+fatal). Then it is `ready`: the bridge pings every 10 s; 30 s without a frame from the
+adapter (or a write that cannot finish), more than 100 control messages in a second
+(partial transcripts over 10 a second are dropped first), or a bad frame end the link. Any
+end, and any failure to start, connect or shake hands, is one warning
+`voice_adapter_failed` with a content-free `reason` and `retry_in_s` (the same reason
+again within 60 s is logged at debug), and the state `backoff`: the bridge tries again
+after 1 s, doubling up to 60 s; an adapter that stayed ready 60 s starts the delays from
+1 s again. Each start after the first counts as a restart. When the bridge stops it ends
+the running call with the adapter (`call_ended {reason: shutdown}`), stops the advertising,
+closes the link (queued messages are sent first), and stops a spawned adapter.
+
+**Advertising.** Calls are advertised (the owner's app sees the agent as callable) only
+once the adapter has been ready **with `stt`** for 2 s, and withdrawn as soon as it is not
+ready. The advertisement never changes while a call rings, is asked about, being answered
+or placed, or runs, or while the bridge stops: it changes once the call ended. A change
+makes the bridge reconnect to the server at once, identifying with the new capability
+(`calls_advertised`, `on`); it is not a failure and waits for no backoff. An adapter
+without `stt` is ready but calls are not advertised (`status` says so).
+
+**During a call.** When the call connects, the adapter gets `call_started` with a fresh
+random `call_id`, an empty `peer` (the bridge does not send the owner's name) and
+`calls.language`; then the owner's audio (stream 0, a 1 s queue that drops the oldest
+frames). Its `speech_started` is a barge-in (with `stop_speaking`) and the activity
+"listening"; its final `transcript` is handled as described in
+[the pipeline](#the-pipeline) (an agent.transcript card, a card's answer, a prompt or a
+steer); partials only keep "listening", which ends 30 s after `speech_started` without a
+final. Without `vad` the final transcript is the barge-in. The sentences to say become
+`speak`s (the agent's replies interruptible, the bridge's own lines not; a text over 4,000
+characters is split), at most 16 unfinished, the rest waiting in the bridge. The adapter's
+audio (stream 1) plays in real time with at most 2 s buffered; after silence the first
+frames wait up to 60 ms (a jitter buffer), so send a speak's first frames a little ahead.
+Without `tts` nothing is spoken (the replies stay in the chat). The call's end sends
+`call_ended` with `completed`, `failed` or `shutdown`.
+
+**Fallback.** The call never fails because of the adapter; the chat carries on:
+
+| Chat note | When | Then |
+|---|---|---|
+| "Voice adapter stopped; reconnecting…" | the adapter's link ended during the call, or none was ready when the call connected (a new call also waits up to 2 s for the previous call to give the adapter back) | the call stays up, chat-only: the agent's replies are posted but not spoken, nothing is heard (words said meanwhile are lost) |
+| "Voice adapter is back." | a restarted adapter is ready: it gets `call_started` again with the same `call_id` | speech goes on |
+| "Voice adapter cannot listen right now." | the adapter answered `engine_unavailable` | chat-only until the call ends or a restarted adapter takes it |
+
+A `recognition_failed` makes the bridge say "Sorry, I couldn't make that out."; a
+`synthesis_failed` skips that sentence.
+
+**Status.** `push-agent-bridge status` asks the running bridge over the control channel
+and prints the adapter's state on the `Voice:` line ([build with voice](#build-with-voice))
+and its counters on a `Voice adapter:` line. The control channel's
+[status object](#the-status-object) has `adapter` (state, name, version, capabilities,
+backoff reason and `retryAt`, metrics) and the event `adapter_changed`; the tray's
+Overview shows "<name> <version> (ready)", "starting" or "backing off (<reason>)".
+
+**Metrics** (content-free): calls, frames to and from the adapter, dropped frames each way
+(the 1 s queue to the adapter; beyond the 2 s playback buffer, wrong or late audio from
+it), restarts, speaks, and two latencies as last/avg/max: speak latency (final transcript
+→ its `speak`) and audio latency (`speak` → its first audio). The log has
+`adapter_metrics` at each call's end (`call_id`, `frames_to_adapter`,
+`frames_from_adapter`, `frames_dropped`, `speaks`, the latencies' last and max ms) and
+`adapter_metrics_total` when the bridge stops (the totals, `restarts`, last/avg/max).
+Other events: `adapter_ready` (`name`, `version`, `stt`, `tts`, `vad`),
+`adapter_handshake_failed` and `adapter_link_closed` (`reason`), `voice_adapter_failed`,
+`calls_advertised`, `adapter_call_started`, `adapter_lost`, `adapter_unavailable`,
+`adapter_recognition_failed`, `adapter_synthesis_failed`, `adapter_listening_timeout`,
+`adapter_overloaded`, `voice_adapter_job_failed`; at debug, `adapter_error` (`code`),
+`adapter_unknown_type`, `voice_adapter_event_dropped`, `voice_adapter_killed`.
+
+**Troubleshooting**
+
+- *`voice adapter program <file> was not found`*: `command[0]` is wrong, or a bare name
+  is not on the bridge's `PATH` (a Scheduled Task's `PATH` may differ from a console's):
+  use an absolute path.
+- *`no voice adapter is listening on \\.\pipe\<name>`* (or the socket's path): the adapter
+  is not running, or listens on another name. The bridge keeps retrying (up to every
+  60 s); start the adapter.
+- *`\\.\pipe\<name> belongs to another user`*: a process of another user holds the name
+  (or the adapter runs as another user): run the adapter as the bridge's user, or pick
+  another name.
+- *A version or format mismatch*: the reason names it with the protocol's code, e.g.
+  `voice adapter speaks push-voice-adapter/2; this bridge speaks push-voice-adapter/1`,
+  `voice adapter does not speak push-voice-adapter/1 (unsupported_protocol)` or
+  `voice adapter cannot take the bridge's audio (16000 Hz, 1 channel(s), s16le, 20 ms
+  frames) (unsupported_format)`. Update the adapter or the bridge; calls stay unadvertised
+  meanwhile.
+- *`the voice adapter sent a bad frame: …` right after the start* (spawn): the adapter
+  prints something to stdout (a banner, a progress bar, a `print`), which is the protocol
+  stream. Send everything else to stderr (it lands in `voice-adapter.log`).
+- *`the voice adapter sent no hello within 10 s`*: the adapter must answer the hello
+  within 10 s ([handshake](voice-adapter-protocol.md#6-handshake-and-versions)); one
+  that loads a model first should answer at once and load afterwards (answering a call's
+  speech it cannot handle yet with `engine_unavailable`).
+- Its own output: `logs\voice-adapter.log` (spawn with `stderr` `log`); more detail from
+  the bridge with `PUSH_BRIDGE_LOG=debug`.
 
 ### The pipeline
 
@@ -1954,6 +2148,7 @@ there:
 | `local` STT, `command` | each utterance's WAV in a temporary file in the user's temp folder (only the user can read it), deleted after the utterance, also on failure | the command |
 | `local` TTS | each sentence's text, on stdin or in the request | the command or the URL |
 | `none` | nothing | |
+| `calls.adapter` | the call's audio (16 kHz mono, as it arrives) and the text of each sentence spoken, masked; the `call_id` and `calls.language`, never the owner's name, keys or file paths | the adapter process, as the same user; where it sends them is up to the adapter |
 
 - The bridge persists nothing of a call: no audio, no transcripts beyond the
   `agent.transcript@1` messages it posts (masked, and stored on the server like every

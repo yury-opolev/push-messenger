@@ -254,7 +254,7 @@ calls advertisable (A20).
 | Adapter crashes mid-speech | EOF / child exit | Playback buffer drained (≤ 2 s) then silence; unfinished speaks dropped; the rest of the reply stays in the chat; A21 | Speech stops; the reply is in the chat |
 | Adapter hangs | 30 s without a frame | Treated as a crash; spawn mode kills the child | As above, after ≤ 30 s |
 | Slow STT | Nothing to detect | The bridge waits: no timeout on transcripts (engines differ). The activity is "listening" from `speech_started` until the utterance's final transcript, a `recognition_failed`, or 30 s, whichever comes first | Late answers |
-| Slow TTS / audio behind | Stream 1 starves | Plays what arrives; gaps are the adapter's | Gaps |
+| Slow TTS / audio behind | Stream 1 starves | Plays what arrives; whenever the speaker ran empty, holds the first frames up to 60 ms (a pre-roll that absorbs timer jitter); longer gaps are the adapter's | Gaps |
 | Adapter floods audio | > 2 s buffered | Drops and counts (A12) | Clipped speech |
 | Adapter floods control | > 100/s | `error overloaded`, close, backoff (A13) | As a crash |
 | Oversize / bad frame | Header check | `error invalid_frame`, close, backoff | As a crash |
@@ -437,3 +437,78 @@ negotiated (A6). The bridge's `calls` config gains `adapter` in PR 2 (additive) 
   `shutdown`). An adapter-side `audio` in the adapter's hello was **not** added: the
   bridge's `audio` is the v1 format, and an adapter that cannot take it answers
   `unsupported_format`.
+
+### PR 2 (bridge client, testkit, E2E): decisions and deviations
+
+- **No feature gate for the client.** `voice/adapter/*` and `voice/engine.rs` are plain
+  tokio + push-voice-adapter-proto (MSRV 1.85) and are tested in the ordinary `rust` job;
+  only calls (the media helper, `voice/media.rs`) need the `voice` feature. Without
+  `voice` no supervisor runs and calls are not advertised.
+- **Coexistence in PR 2.** `calls.adapter` is optional; with it `calls.stt`/`calls.tts`
+  must be absent or `none` and `calls.vad` absent or default ("calls.adapter and
+  calls.<field> cannot both be set; speech runs in the adapter"). `calls.stt` now defaults
+  to `none`. Without `calls.adapter` everything is as before (`BuiltinEngine`); the
+  built-in providers are documented as deprecated, removed in PR 3.
+- **Task order** 2.9 (testkit) before 2.6, so the supervisor and router tests use its
+  library over in-memory pipes.
+- **push-sdk.** `Client::set_calls_advertised(bool)` / `Client::calls_advertised()`. A
+  change while connected (or identifying) reconnects at once; it does not count as a
+  failure and keeps the backoff history of earlier failures; the same value does nothing.
+  `Calls::available()` follows what the current connection advertised.
+- **Spawn.** `spawn(config, log_dir, extra_secret_names)`: the extra names (variables the
+  config names as key sources) are empty on the adapter path (with an adapter there are
+  no provider keys). Name matching is case-insensitive everywhere; `env_allow` (exact
+  case on Unix) overrides only the word heuristic and may not name `SECRET_VARS` or the
+  prefixes (validation error). `.bat`/`.cmd` refused. The stderr log is rotated only at
+  (re)start (a long-running adapter can grow it past 5 MiB); a failed rotation logs and
+  never blocks the start. On Windows a process the adapter starts between the spawn and
+  `AssignProcessToJobObject` is not in the job (stable std has no suspended spawn).
+- **Connect.** New `push_bridge_control::transport::connect_same_user`: Windows as
+  `connect` (the server is the user or SYSTEM); Unix compares the peer's uid with our own
+  rather than the socket directory's owner, because `$XDG_RUNTIME_DIR`'s parent is
+  root-owned and an adapter's socket may be anywhere.
+- **Link.** `Link` is `Clone` (an `Arc`); `send` returns `Result`; `LinkEnd::Shutdown` when
+  the bridge closes; `Link::closed()` → `LinkClosed` lets the supervisor wait for the end
+  without keeping the link open. The event channel is unbounded (so `Closed` is never lost
+  or blocking), bounded in practice by the caps, and always drained. One 10 s deadline
+  covers the whole hello exchange; unknown types before the hello are skipped, anything
+  known (or audio) is fatal. Every control message counts toward 100/s, except partials
+  over 10/s, which are dropped first. Writes have the 30 s dead-peer deadline. The end
+  reason is recorded before the writer is told to close (no race between `Shutdown` and
+  the real cause).
+- **Supervisor.** `Supervisor::{state, current, restarts, shutdown}`; `current` publishes
+  `ReadyLink {id, link, take_events, give_back, wait_for_events}`; while no call holds
+  the events they are drained every 1 s. `Backoff` is published before waiting for a
+  stopping child (≤ 2 s). The same failure reason within 60 s is logged at debug. The
+  relative-path warning only fires when the path has a folder (a bare name is a `PATH`
+  lookup). Starting is a `Starter` trait (spawn, connect; tests use the testkit).
+- **Engine and router.** `SpeechEngine {hear, speaks, connected, stop, async end, async
+  shut_down}` — no `say`: sentences stay in the session's `SpeechContext` queue tagged
+  with their generation and `own`, and the engine takes them. `call_started` goes out
+  when the call connects (synchronously in `connected()`), so a greeting right after is
+  spoken. `peer` is sent as `""`: the core does not know the owner's display name, and it
+  keeps the protocol content-free. A text over 4,000 characters is split. End reasons map
+  to `completed`, `failed` or `shutdown`, never `other`. A 60 ms playback pre-roll (jitter
+  buffer) whenever the speaker ran empty (§5 "Slow TTS"). A new call waits up to 2 s for
+  the previous call's router to give the events back, then goes chat-only.
+- **Core.** `CallFlag` (`Arc<watch::Sender<bool>>`) is the advertiser's "in a call": set
+  as soon as answering, asking or dialing starts, kept up while the bridge stops. Shutdown
+  order: `call_ended {shutdown}` (the bridge's run ends) → the advertiser task aborted →
+  `Supervisor::shutdown` → `adapter_metrics_total`. The three A21 notes are chat
+  messages. The `status` CLI asks the running bridge over the control channel; the
+  control channel's `Status` gained an additive `adapter {state, name, version,
+  capabilities, reason, retryAt, metrics}` and the event `adapter_changed` (without
+  metrics); `retryAt` is computed once per backoff so it does not jitter between polls.
+- **Testkit** (`crates/push-voice-adapter-testkit`). A JSON `Script` (every field optional,
+  unknown fields refused): hello fields, `words` (`{hz, word}`), `speak_hz`,
+  `ms_per_char`, `speak_lead_ms` (0–1000: frames sent ahead when a speak starts) and the
+  faults `crash_after_frames` (+ `crash_once_marker`, so a restarted adapter works),
+  `refuse_format`, `protocol`, `stall_after_hello`, `flood_messages`, `no_hello`. The
+  binary: `--script`, `--pipe`/`--socket` (connect mode: one bridge at a time, `error
+  busy` to a second), `--events` (content-free JSON lines), `--dump-env`; exit codes 0
+  closed, 1 error, 2 bad arguments, 3 scripted crash.
+- **E2E.** A new file `crates/push-smoke/tests/bridge_voice_adapter.rs` (shared helpers
+  moved to `bridge_voice_common`) instead of rewriting `bridge_voice.rs`; it builds the
+  testkit binary itself. Measured: final transcript → `speak` 1.6–1.7 ms (bridge side, no
+  backend; threshold 100 ms); the owner-side largest gap in the agent's voice 32–33 ms
+  with the testkit at strict real-time pacing (threshold 40 ms).
