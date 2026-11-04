@@ -1,0 +1,31 @@
+{
+  "$id": "https://raw.githubusercontent.com/yury-opolev/push-messenger/main/docs/schemas/voice-adapter/v1/speak-done.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "A speak finished (after its last stream-1 frame) or was cut or dropped.",
+  "properties": {
+    "call_id": {
+      "pattern": "^[!-~]{1,64}$",
+      "type": "string"
+    },
+    "interrupted": {
+      "description": "Stopped, dropped or failed before its end.",
+      "type": "boolean"
+    },
+    "speak_id": {
+      "pattern": "^[!-~]{1,64}$",
+      "type": "string"
+    },
+    "type": {
+      "const": "speak_done",
+      "type": "string"
+    }
+  },
+  "required": [
+    "type",
+    "call_id",
+    "speak_id",
+    "interrupted"
+  ],
+  "title": "SpeakDone",
+  "type": "object"
+}

@@ -1,0 +1,48 @@
+{
+  "$id": "https://raw.githubusercontent.com/yury-opolev/push-messenger/main/docs/schemas/voice-adapter/v1/speak.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Speak this text after any earlier unfinished speak.",
+  "properties": {
+    "call_id": {
+      "pattern": "^[!-~]{1,64}$",
+      "type": "string"
+    },
+    "interruptible": {
+      "description": "Whether the adapter may cut it on its own barge-in; `stop_speaking` always does.",
+      "type": "boolean"
+    },
+    "speak_id": {
+      "description": "Opaque, chosen by the bridge: 1–64 printable ASCII characters.",
+      "pattern": "^[!-~]{1,64}$",
+      "type": "string"
+    },
+    "text": {
+      "description": "Plain text prepared for speech, 1–4000 characters.",
+      "maxLength": 4000,
+      "minLength": 1,
+      "type": "string"
+    },
+    "type": {
+      "const": "speak",
+      "type": "string"
+    },
+    "voice": {
+      "description": "A voice from the adapter's hello; absent: its default.",
+      "maxLength": 64,
+      "minLength": 1,
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "type",
+    "call_id",
+    "speak_id",
+    "text",
+    "interruptible"
+  ],
+  "title": "Speak",
+  "type": "object"
+}

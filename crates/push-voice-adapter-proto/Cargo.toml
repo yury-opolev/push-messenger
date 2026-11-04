@@ -1,0 +1,28 @@
+[package]
+name = "push-voice-adapter-proto"
+description = "The voice adapter protocol (push-voice-adapter/1) between push-agent-bridge and a voice adapter: framing, control messages, limits and JSON Schemas."
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["tokio"]
+# Async frame reader and writer over tokio's AsyncRead/AsyncWrite.
+tokio = ["dep:tokio"]
+
+[dependencies]
+schemars = { version = "1", default-features = false, features = ["derive", "std"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util"], optional = true }
+
+[dev-dependencies]
+proptest.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "rt", "time"] }
+
+[lints]
+workspace = true

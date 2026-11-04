@@ -1,0 +1,27 @@
+{
+  "$id": "https://raw.githubusercontent.com/yury-opolev/push-messenger/main/docs/schemas/voice-adapter/v1/speech-started.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "The caller started speaking (adapters with `vad`).",
+  "properties": {
+    "call_id": {
+      "pattern": "^[!-~]{1,64}$",
+      "type": "string"
+    },
+    "type": {
+      "const": "speech_started",
+      "type": "string"
+    },
+    "utterance_id": {
+      "description": "Opaque, chosen by the adapter: 1–64 printable ASCII characters.",
+      "pattern": "^[!-~]{1,64}$",
+      "type": "string"
+    }
+  },
+  "required": [
+    "type",
+    "call_id",
+    "utterance_id"
+  ],
+  "title": "SpeechStarted",
+  "type": "object"
+}

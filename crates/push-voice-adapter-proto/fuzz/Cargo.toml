@@ -1,0 +1,32 @@
+[package]
+name = "push-voice-adapter-proto-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "MIT"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+push-voice-adapter-proto = { path = "..", default-features = false }
+
+# Its own workspace: the main workspace excludes it, and `cargo build --workspace` (the
+# MSRV job) never builds libFuzzer. Run with nightly: `cargo +nightly fuzz run frames`.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "frames"
+path = "fuzz_targets/frames.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "messages"
+path = "fuzz_targets/messages.rs"
+test = false
+doc = false
+bench = false

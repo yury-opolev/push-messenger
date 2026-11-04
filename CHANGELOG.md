@@ -6,6 +6,27 @@ Notable changes for consumers of push-messenger. Newest first.
 
 ### Added
 
+- **Voice adapter protocol** (`push-voice-adapter/1`, first of three steps that move
+  speech out of push-agent-bridge into a separate, swappable voice adapter process): the
+  new crate `crates/push-voice-adapter-proto` (MSRV 1.85, no media dependency) with the
+  frame codec (`u32` big-endian payload length, a kind byte, JSON control or audio
+  payloads of at most 64 KiB; audio frames carry `stream`, `seq` and `timestamp_ms` and
+  16 kHz mono s16le samples in 20 ms frames), an incremental sans-IO decoder that refuses
+  oversize frames from the header alone, blocking and tokio (cancel-safe) readers and
+  writers, typed control messages for both directions (`hello`, `call_started`,
+  `speech_started`, `transcript`, `speak` of at most 4,000 characters, `speak_done`,
+  `stop_speaking`, `call_ended`, `error`, `ping`/`pong`) that ignore unknown fields and
+  message types, validation of every cap with content-free errors and `Debug` output that
+  never shows transcripts or speech text, protocol version negotiation, and the protocol's
+  limits and timers. JSON Schemas of every control message are generated from the types
+  and checked in under `docs/schemas/voice-adapter/v1/` (a test keeps them current).
+  Tests: unit and property tests (split and merged frames, length limits, bad kinds,
+  arbitrary bytes, round trips) and two cargo-fuzz targets, run briefly by the new CI job
+  `voice-adapter-fuzz`. Reference: [docs/voice-adapter-protocol.md](docs/voice-adapter-protocol.md);
+  design: `docs/superpowers/specs/2026-11-04-voice-adapter-design.md`. The bridge's
+  adapter client and the test adapter follow; the built-in speech providers are then
+  removed.
+
 - **Agent bridge answering and calling policies** (phase 2, the voice feature's last
   part): `calls.answer: "ask"` makes push-agent-bridge post a card "📞 Owner is calling
   <agent> in <folder> — answer?" (Answer / Decline) on the owner's devices when the owner

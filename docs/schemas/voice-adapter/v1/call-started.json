@@ -1,0 +1,34 @@
+{
+  "$id": "https://raw.githubusercontent.com/yury-opolev/push-messenger/main/docs/schemas/voice-adapter/v1/call-started.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "A call starts (or continues with a reconnected adapter): listen to stream 0.",
+  "properties": {
+    "call_id": {
+      "description": "Opaque, chosen by the bridge per call: 1–64 printable ASCII characters.",
+      "pattern": "^[!-~]{1,64}$",
+      "type": "string"
+    },
+    "language": {
+      "description": "The language spoken, BCP 47.",
+      "pattern": "^[A-Za-z0-9-]{1,35}$",
+      "type": "string"
+    },
+    "peer": {
+      "description": "The caller's display name only.",
+      "maxLength": 64,
+      "type": "string"
+    },
+    "type": {
+      "const": "call_started",
+      "type": "string"
+    }
+  },
+  "required": [
+    "type",
+    "call_id",
+    "peer",
+    "language"
+  ],
+  "title": "CallStarted",
+  "type": "object"
+}

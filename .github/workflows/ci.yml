@@ -42,6 +42,27 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo build --workspace --locked
 
+  # The voice adapter protocol's decoders under libFuzzer (docs/voice-adapter-protocol.md):
+  # a short smoke run of each cargo-fuzz target on nightly. The crate's own tests run the
+  # proptest equivalents in the rust job; longer runs are manual (`cargo +nightly fuzz run
+  # frames` in crates/push-voice-adapter-proto).
+  voice-adapter-fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: nightly
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: "crates/push-voice-adapter-proto/fuzz -> target"
+      - run: cargo install cargo-fuzz --version 0.13.2 --locked
+      - run: cargo fuzz run frames -- -max_total_time=60
+        working-directory: crates/push-voice-adapter-proto
+      - run: cargo fuzz run messages -- -max_total_time=30
+        working-directory: crates/push-voice-adapter-proto
+
   # Known vulnerabilities, licences and sources of the Rust dependencies (deny.toml), and
   # known vulnerabilities of the Node binding's runtime dependencies.
   supply-chain:

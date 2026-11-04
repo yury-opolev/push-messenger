@@ -1,0 +1,421 @@
+{
+  "$defs": {
+    "AdapterHello": {
+      "description": "The adapter's answer to the bridge's hello.",
+      "properties": {
+        "capabilities": {
+          "$ref": "#/$defs/Capabilities",
+          "description": "What the adapter can do. The bridge advertises calls only with `stt`."
+        },
+        "name": {
+          "description": "The adapter's name, for the bridge's status.",
+          "maxLength": 64,
+          "minLength": 1,
+          "type": "string"
+        },
+        "protocol": {
+          "description": "The protocol version chosen, one the bridge offered.",
+          "maxLength": 64,
+          "minLength": 1,
+          "type": "string"
+        },
+        "version": {
+          "description": "The adapter's version, for the bridge's status.",
+          "maxLength": 64,
+          "type": "string"
+        },
+        "voices": {
+          "description": "Voices `speak.voice` may name.",
+          "items": {
+            "$ref": "#/$defs/Voice"
+          },
+          "maxItems": 256,
+          "type": [
+            "array",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "protocol",
+        "name",
+        "version",
+        "capabilities"
+      ],
+      "type": "object"
+    },
+    "Capabilities": {
+      "description": "An adapter's capabilities; absent ones are false, unknown ones ignored.",
+      "properties": {
+        "barge_in": {
+          "default": false,
+          "description": "It stops its own speech when the caller speaks.",
+          "type": "boolean"
+        },
+        "partials": {
+          "default": false,
+          "description": "It sends partial transcripts (`final: false`).",
+          "type": "boolean"
+        },
+        "stt": {
+          "default": false,
+          "description": "It transcribes the caller (sends `transcript`).",
+          "type": "boolean"
+        },
+        "tts": {
+          "default": false,
+          "description": "It speaks (`speak` answers stream-1 audio).",
+          "type": "boolean"
+        },
+        "vad": {
+          "default": false,
+          "description": "It detects speech (sends `speech_started`).",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "ErrorCode": {
+      "description": "Error codes. Unknown values decode as `other`.",
+      "oneOf": [
+        {
+          "const": "unsupported_protocol",
+          "description": "No common protocol version (the sender closes).",
+          "type": "string"
+        },
+        {
+          "const": "unsupported_format",
+          "description": "The audio format cannot be carried (in place of a hello: the sender closes).",
+          "type": "string"
+        },
+        {
+          "const": "invalid_frame",
+          "description": "A framing error (the sender closes).",
+          "type": "string"
+        },
+        {
+          "const": "invalid_message",
+          "description": "A control message was malformed and ignored.",
+          "type": "string"
+        },
+        {
+          "const": "engine_unavailable",
+          "description": "The adapter's engine cannot work right now.",
+          "type": "string"
+        },
+        {
+          "const": "overloaded",
+          "description": "Too many messages or too much audio.",
+          "type": "string"
+        },
+        {
+          "const": "recognition_failed",
+          "description": "An utterance could not be transcribed.",
+          "type": "string"
+        },
+        {
+          "const": "synthesis_failed",
+          "description": "A speak could not be synthesized (with `speak_id`).",
+          "type": "string"
+        },
+        {
+          "const": "unknown_call",
+          "description": "A `call_id` that is not active.",
+          "type": "string"
+        },
+        {
+          "const": "busy",
+          "description": "A second call, or a second bridge on one adapter.",
+          "type": "string"
+        },
+        {
+          "const": "internal",
+          "description": "Anything else.",
+          "type": "string"
+        }
+      ]
+    },
+    "ErrorMessage": {
+      "description": "Something failed. The message is content-free: no audio, transcript or speech text.",
+      "properties": {
+        "call_id": {
+          "pattern": "^[!-~]{1,64}$",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "code": {
+          "$ref": "#/$defs/ErrorCode"
+        },
+        "message": {
+          "default": "",
+          "description": "A short, content-free explanation (at most 512 characters, no control characters).",
+          "maxLength": 512,
+          "type": "string"
+        },
+        "speak_id": {
+          "pattern": "^[!-~]{1,64}$",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "utterance_id": {
+          "pattern": "^[!-~]{1,64}$",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "code"
+      ],
+      "type": "object"
+    },
+    "Ping": {
+      "description": "Liveness: answer with a `pong` of the same id.",
+      "properties": {
+        "id": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "Pong": {
+      "description": "The answer to a `ping`.",
+      "properties": {
+        "id": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "SpeakDone": {
+      "description": "A speak finished (after its last stream-1 frame) or was cut or dropped.",
+      "properties": {
+        "call_id": {
+          "pattern": "^[!-~]{1,64}$",
+          "type": "string"
+        },
+        "interrupted": {
+          "description": "Stopped, dropped or failed before its end.",
+          "type": "boolean"
+        },
+        "speak_id": {
+          "pattern": "^[!-~]{1,64}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "call_id",
+        "speak_id",
+        "interrupted"
+      ],
+      "type": "object"
+    },
+    "SpeechStarted": {
+      "description": "The caller started speaking (adapters with `vad`).",
+      "properties": {
+        "call_id": {
+          "pattern": "^[!-~]{1,64}$",
+          "type": "string"
+        },
+        "utterance_id": {
+          "description": "Opaque, chosen by the adapter: 1–64 printable ASCII characters.",
+          "pattern": "^[!-~]{1,64}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "call_id",
+        "utterance_id"
+      ],
+      "type": "object"
+    },
+    "Transcript": {
+      "description": "What the caller said: partial (`final: false`) or final.",
+      "properties": {
+        "call_id": {
+          "pattern": "^[!-~]{1,64}$",
+          "type": "string"
+        },
+        "confidence": {
+          "description": "0 to 1.",
+          "format": "float",
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "final": {
+          "description": "Final: the bridge acts on it. One per utterance.",
+          "type": "boolean"
+        },
+        "language": {
+          "description": "The language recognised, BCP 47.",
+          "pattern": "^[A-Za-z0-9-]{1,35}$",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "text": {
+          "description": "The words, 1–4000 characters.",
+          "maxLength": 4000,
+          "minLength": 1,
+          "type": "string"
+        },
+        "utterance_id": {
+          "pattern": "^[!-~]{1,64}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "call_id",
+        "utterance_id",
+        "text",
+        "final"
+      ],
+      "type": "object"
+    },
+    "Voice": {
+      "description": "A voice the adapter offers.",
+      "properties": {
+        "id": {
+          "maxLength": 64,
+          "minLength": 1,
+          "type": "string"
+        },
+        "language": {
+          "pattern": "^[A-Za-z0-9-]{1,35}$",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "maxLength": 64,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://raw.githubusercontent.com/yury-opolev/push-messenger/main/docs/schemas/voice-adapter/v1/adapter-message.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "What the adapter sends.",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/AdapterHello",
+      "properties": {
+        "type": {
+          "const": "hello",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "$ref": "#/$defs/SpeechStarted",
+      "properties": {
+        "type": {
+          "const": "speech_started",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "$ref": "#/$defs/Transcript",
+      "properties": {
+        "type": {
+          "const": "transcript",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "$ref": "#/$defs/SpeakDone",
+      "properties": {
+        "type": {
+          "const": "speak_done",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "$ref": "#/$defs/ErrorMessage",
+      "properties": {
+        "type": {
+          "const": "error",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "$ref": "#/$defs/Ping",
+      "properties": {
+        "type": {
+          "const": "ping",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "$ref": "#/$defs/Pong",
+      "properties": {
+        "type": {
+          "const": "pong",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    }
+  ],
+  "title": "AdapterMessage"
+}

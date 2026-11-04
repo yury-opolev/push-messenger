@@ -1,0 +1,113 @@
+{
+  "$defs": {
+    "Capabilities": {
+      "description": "An adapter's capabilities; absent ones are false, unknown ones ignored.",
+      "properties": {
+        "barge_in": {
+          "default": false,
+          "description": "It stops its own speech when the caller speaks.",
+          "type": "boolean"
+        },
+        "partials": {
+          "default": false,
+          "description": "It sends partial transcripts (`final: false`).",
+          "type": "boolean"
+        },
+        "stt": {
+          "default": false,
+          "description": "It transcribes the caller (sends `transcript`).",
+          "type": "boolean"
+        },
+        "tts": {
+          "default": false,
+          "description": "It speaks (`speak` answers stream-1 audio).",
+          "type": "boolean"
+        },
+        "vad": {
+          "default": false,
+          "description": "It detects speech (sends `speech_started`).",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "Voice": {
+      "description": "A voice the adapter offers.",
+      "properties": {
+        "id": {
+          "maxLength": 64,
+          "minLength": 1,
+          "type": "string"
+        },
+        "language": {
+          "pattern": "^[A-Za-z0-9-]{1,35}$",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "maxLength": 64,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://raw.githubusercontent.com/yury-opolev/push-messenger/main/docs/schemas/voice-adapter/v1/adapter-hello.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "The adapter's answer to the bridge's hello.",
+  "properties": {
+    "capabilities": {
+      "$ref": "#/$defs/Capabilities",
+      "description": "What the adapter can do. The bridge advertises calls only with `stt`."
+    },
+    "name": {
+      "description": "The adapter's name, for the bridge's status.",
+      "maxLength": 64,
+      "minLength": 1,
+      "type": "string"
+    },
+    "protocol": {
+      "description": "The protocol version chosen, one the bridge offered.",
+      "maxLength": 64,
+      "minLength": 1,
+      "type": "string"
+    },
+    "type": {
+      "const": "hello",
+      "type": "string"
+    },
+    "version": {
+      "description": "The adapter's version, for the bridge's status.",
+      "maxLength": 64,
+      "type": "string"
+    },
+    "voices": {
+      "description": "Voices `speak.voice` may name.",
+      "items": {
+        "$ref": "#/$defs/Voice"
+      },
+      "maxItems": 256,
+      "type": [
+        "array",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "type",
+    "protocol",
+    "name",
+    "version",
+    "capabilities"
+  ],
+  "title": "AdapterHello",
+  "type": "object"
+}
