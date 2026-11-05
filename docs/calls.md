@@ -869,7 +869,9 @@ With `calls.enabled`, `mode: internal` and `internal.enabled`, the chart renders
   in one process), `Recreate` updates, the pinned image as user 65534 with a read-only
   root, no capabilities and no service account token. An init container writes the
   configuration with `static-auth-secret` into memory (`/run/coturn`), so the secret is
-  never in a ConfigMap or on a command line. TCP readiness and liveness probes on 3478.
+  never in a ConfigMap or on a command line. A second one copies `/usr/bin/turnserver`
+  to an `emptyDir` (`/opt/coturn/bin`), and coturn runs that copy (see "Operating
+  internal TURN" below). TCP readiness and liveness probes on 3478.
 - **ConfigMap**: [`files/coturn/turnserver.conf`](../deploy/helm/push-messenger/files/coturn/turnserver.conf)
   plus `realm`, `external-ip`, `min-port`/`max-port`, the quotas, TLS (`cert`/`pkey` or
   `no-tls`) and one `denied-peer-ip` range per denied CIDR.
@@ -890,7 +892,39 @@ With `calls.enabled`, `mode: internal` and `internal.enabled`, the chart renders
   lists every denied CIDR, `::ffff:0:0/96` included. `deniedPeerCidrs` refuses IPv4-mapped
   entries (list the IPv4 CIDR). CI applies the chart to a real API server on kind for
   Kubernetes 1.34 to 1.37 (`pwsh deploy/helm/test-chart-cluster.ps1 -Context <context>`
-  runs the same against any disposable cluster).
+  runs the same against any disposable cluster): it installs and upgrades the release in
+  a namespace enforcing the `restricted` Pod Security Standard, waits for the coturn pod
+  to be Ready (`kubectl rollout status deploy/<release>-coturn`; the application pods are
+  not waited for, CI does not build their images there) and runs one TURN allocation and
+  refresh against the Service with `turnutils_uclient` from the pinned image, with TURN
+  REST credentials minted from `turn-shared-secret`.
+
+**Operating internal TURN.** The upstream image gives `/usr/bin/turnserver` the file
+capability `cap_net_bind_service=ep` (so it can bind ports below 1024 as a non-root
+user). The chart runs coturn with `capabilities.drop: [ALL]` and
+`allowPrivilegeEscalation: false` (`no_new_privs`); the kernel then refuses to exec a
+binary whose file capabilities it cannot grant (`exec /usr/bin/turnserver: operation not
+permitted`, a crash loop). Instead of weakening the security context, the `turnserver`
+init container copies the binary with a plain `cp`, which does not carry the
+`security.capability` extended attribute, into an `emptyDir` mounted at
+`/opt/coturn/bin`; the `coturn` container runs `/opt/coturn/bin/turnserver -c
+/run/coturn/turnserver.conf` from it (read-only), with the image's own libraries. coturn
+listens on 3478, 5349 and 9641 only, so it never needs the capability; the configuration
+path, ports and probes are unchanged. For operators:
+
+- The pod still uses only the pinned upstream image (both init containers and coturn):
+  import or mirror that one digest (`az acr import --name <registry> --source
+  docker.io/coturn/coturn@sha256:<digest> --image coturn/coturn:<tag>`) and point
+  `calls.turn.internal.image` at the mirror with the same digest. There is no derived
+  image to build or mirror.
+- The pod passes the `restricted` Pod Security Standard: non-root (65534), no
+  capabilities, no privilege escalation, read-only root, `RuntimeDefault` seccomp. Do not
+  add `NET_BIND_SERVICE` or allow privilege escalation for coturn; neither is needed.
+- A low public port such as 443 for `turns:` belongs on the Service (`ports.tls`); the
+  container ports stay above 1024.
+- The copy is about 3 MB on the node's ephemeral storage (`emptyDir`, `sizeLimit:
+  16Mi`), made at every pod start; a node mounting `emptyDir` volumes `noexec` would
+  prevent it from running (not the case on AKS or kind).
 
 ### 13.5 AKS
 

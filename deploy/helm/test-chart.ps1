@@ -370,10 +370,16 @@ assert pod["automountServiceAccountToken"] is False
 security = {"runAsNonRoot": True, "runAsUser": 65534, "runAsGroup": 65534, "allowPrivilegeEscalation": False,
             "readOnlyRootFilesystem": True, "capabilities": {"drop": ["ALL"]},
             "seccompProfile": {"type": "RuntimeDefault"}}
-[init] = pod["initContainers"]
+[init, binary] = pod["initContainers"]
 [main] = pod["containers"]
 image = "coturn/coturn:4.18.0-alpine@sha256:c29135c08565810d37053f384584392b7c24b69570fc81a721b878d6fe63e04e"
 assert init["name"] == "config" and init["image"] == image and main["image"] == image
+# The image's /usr/bin/turnserver carries file capabilities (cap_net_bind_service=ep), which
+# execve refuses with drop ALL and no_new_privs: coturn runs a plain cp of it, without them.
+assert binary["name"] == "turnserver" and binary["image"] == image
+assert binary["command"] == ["cp", "/usr/bin/turnserver", "/opt/coturn/bin/turnserver"]
+assert binary["securityContext"] == security and binary["resources"] == init["resources"]
+assert binary["volumeMounts"] == [{"name": "bin", "mountPath": "/opt/coturn/bin"}]
 assert init["command"][:2] == ["sh", "-c"] and len(init["command"]) == 3
 assert "umask 077" in init["command"][2] and "static-auth-secret=" in init["command"][2]
 assert "> /run/coturn/turnserver.conf" in init["command"][2]
@@ -394,7 +400,8 @@ else:
     assert init_mounts["/etc/coturn/secret"] == {"name": "turn-secret", "mountPath": "/etc/coturn/secret", "readOnly": True}
     assert volumes["turn-secret"]["secret"] == {"secretName": case["secretName"], "defaultMode": 0o440,
         "items": [{"key": "turn-shared-secret", "path": "turn-shared-secret"}]}
-assert main["command"] == ["turnserver", "-c", "/run/coturn/turnserver.conf"]
+assert main["command"] == ["/opt/coturn/bin/turnserver", "-c", "/run/coturn/turnserver.conf"]
+assert "/usr/bin/turnserver" not in json.dumps(main) and "args" not in main
 assert [(p["name"], p["containerPort"], p["protocol"]) for p in main["ports"]] == (
     [("turn-udp", 3478, "UDP"), ("turn-tcp", 3478, "TCP")] + ([("turns", 5349, "TCP")] if tls else [])
     + [("metrics", 9641, "TCP")])
@@ -406,6 +413,8 @@ assert mounts["/run/coturn"] == {"name": "run", "mountPath": "/run/coturn", "rea
 assert volumes["run"]["emptyDir"]["medium"] == "Memory"
 assert mounts["/var/tmp"]["name"] == "var-tmp" and "emptyDir" in volumes["var-tmp"]
 assert mounts["/var/lib/coturn"]["name"] == "var-lib" and "emptyDir" in volumes["var-lib"]
+assert mounts["/opt/coturn/bin"] == {"name": "bin", "mountPath": "/opt/coturn/bin", "readOnly": True}
+assert volumes["bin"] == {"name": "bin", "emptyDir": {"sizeLimit": "16Mi"}}
 assert not {"turn-secret", "application-keys", "config"} & {m["name"] for m in main["volumeMounts"]}
 assert ("/etc/coturn/tls" in mounts) == tls and ("tls" in volumes) == tls
 if tls:

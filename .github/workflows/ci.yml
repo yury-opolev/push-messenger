@@ -245,7 +245,9 @@ jobs:
 
   # The chart's manifests through a real API server's validation, which helm template
   # skips (an ipBlock the API refuses once broke helm upgrade): deploy/helm/test-chart-cluster.ps1
-  # on kind, for the newest kindest/node image of each Kubernetes minor AKS supports.
+  # on kind, for the newest kindest/node image of each Kubernetes minor AKS supports. It
+  # installs internal TURN in a namespace enforcing the restricted Pod Security Standard,
+  # waits for coturn to be Ready (a crash loop once shipped) and runs a TURN allocation.
   chart-cluster:
     runs-on: ubuntu-latest
     timeout-minutes: 20
