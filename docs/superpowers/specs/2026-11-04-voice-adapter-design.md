@@ -33,7 +33,8 @@ behaviour of PRs #61–#62 kept, through the adapter.
 Non-goals (v1): several calls per adapter connection (call_id is on every message so v2
 can multiplex), audio formats other than 16 kHz mono s16le 20 ms (negotiated in a later
 version, never assumed), a network transport (local only), an adapter shipped as a
-product (the testkit adapter is for tests; ours lives in yuopolev/voice-adapter).
+product (the testkit adapter is for tests; real ones are external adapters, for example a
+private implementation).
 
 ## 1. Decisions
 
@@ -529,8 +530,8 @@ negotiated (A6). The bridge's `calls` config gains `adapter` in PR 2 (additive) 
   (`after_minutes` > 0 or `urgent`): "calls.notify_by_call needs calls.adapter: without it
   the bridge takes no calls and places none". A section that never calls still loads.
 - **`live_speech.rs` deleted** rather than converted to an adapter test: live engines are
-  tested in their own adapters (e.g. yuopolev/voice-adapter); the bridge's tests need
-  none.
+  tested in their own external adapters (for example, a private implementation); the
+  bridge's tests need none.
 - **Fixtures moved into the testkit** (`crates/push-voice-adapter-testkit/fixtures`, a
   `fixture` module with `Fixture::named`, `NAMES`, `all_words`), which now owns the PR 7
   fixture rules (`Script::check`). The core tests needed the texts the adapter spoke:

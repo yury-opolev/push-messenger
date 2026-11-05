@@ -576,8 +576,7 @@ closes. The bridge reconnects with the same backoff.
 **Reference.** `crates/push-voice-adapter-testkit` implements all of this for tests (its
 `ScriptedAdapter` in `src/adapter.rs`, spawn and connect modes in `src/main.rs`): tones
 stand for words, so it shows the protocol, not a speech engine. Real engines live in
-adapters of their own, for example
-[yuopolev/voice-adapter](https://github.com/yuopolev/voice-adapter).
+external adapters (for example, a private implementation).
 
 ## 15. Troubleshooting
 

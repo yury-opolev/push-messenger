@@ -2172,9 +2172,9 @@ there the bridge gives the voice adapter only what speech needs:
   cargo test -p push-smoke --test bridge_voice --test bridge_voice_adapter -- --nocapture --test-threads 1
   ```
 
-- **Real speech engines** are tested in their own adapters (for example
-  [yuopolev/voice-adapter](https://github.com/yuopolev/voice-adapter)), against the
-  [protocol](voice-adapter-protocol.md); the bridge's tests need none.
+- **Real speech engines** are tested in their own adapters (for example, a private
+  implementation), against the [protocol](voice-adapter-protocol.md); the bridge's tests
+  need none.
 
 ### Limitations
 
