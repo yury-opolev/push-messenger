@@ -1,7 +1,9 @@
 # Runs the chart's manifests through a real API server's validation, which helm template
 # (test-chart.ps1) never reaches: kubectl apply --dry-run=server of every scenario below,
-# then a real helm upgrade --install (twice: install, upgrade) of internal TURN. CI runs it
-# on kind for each Kubernetes version AKS supports (.github/workflows/ci.yml, chart-cluster).
+# then a real helm upgrade --install (twice: install, upgrade) of internal TURN in a namespace
+# enforcing the restricted Pod Security Standard, waiting for coturn to be Ready and running
+# one TURN allocation against it. CI runs it on kind for each Kubernetes version AKS supports
+# (.github/workflows/ci.yml, chart-cluster).
 # Requires Helm and kubectl; use a disposable cluster, such as kind:
 #
 #   kind create cluster --name push-chart
@@ -32,8 +34,66 @@ function ServerDryRun([string] $manifest) {
 $version = kubectl --context $Context version -o json | ConvertFrom-Json
 if ($LASTEXITCODE -ne 0) { throw "kubectl cannot reach context $Context" }
 Write-Output "API server $($version.serverVersion.gitVersion)"
+# Enforces the restricted Pod Security Standard: coturn's pod is refused unless it complies.
 kubectl --context $Context create namespace $Namespace --dry-run=client -o yaml |
     kubectl --context $Context apply -f - | Out-Null
+kubectl --context $Context label namespace $Namespace --overwrite `
+    pod-security.kubernetes.io/enforce=restricted pod-security.kubernetes.io/enforce-version=latest | Out-Null
+$coturnImage = 'coturn/coturn:4.18.0-alpine@sha256:c29135c08565810d37053f384584392b7c24b69570fc81a721b878d6fe63e04e'
+
+# coturn's Deployment is rolled out and Ready (helm --wait would also wait for the
+# application images, which CI does not build here).
+function CoturnReady {
+    $result = kubectl --context $Context --namespace $Namespace rollout status deploy/push-coturn --timeout=180s 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host $result
+        kubectl --context $Context --namespace $Namespace describe pods -l app.kubernetes.io/name=coturn 2>&1 | Write-Host
+        kubectl --context $Context --namespace $Namespace logs deploy/push-coturn -c coturn --tail 20 2>&1 | Write-Host
+        return $false
+    }
+    $true
+}
+
+# One TURN allocation (and refresh) against the coturn Service with TURN REST credentials
+# minted from the chart's shared secret: username "<expiry>:<user>", password
+# base64(HMAC-SHA1(secret, username)). turnutils_uclient runs from coturn's own image in a
+# restricted pod; -n 0 sends no data, so the peer is never contacted. Returns the exit code
+# and the log.
+function TurnAllocation([string] $password) {
+    $encoded = kubectl --context $Context --namespace $Namespace get secret push-secrets -o jsonpath='{.data.turn-shared-secret}'
+    $secret = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($encoded))
+    $username = "$([DateTimeOffset]::UtcNow.AddMinutes(10).ToUnixTimeSeconds()):chart-cluster"
+    if (-not $password) {
+        $hmac = [Security.Cryptography.HMACSHA1]::new([Text.Encoding]::UTF8.GetBytes($secret))
+        $password = [Convert]::ToBase64String($hmac.ComputeHash([Text.Encoding]::UTF8.GetBytes($username)))
+    }
+    $pod = @{
+        spec = @{
+            securityContext = @{ runAsNonRoot = $true; runAsUser = 65534; runAsGroup = 65534
+                seccompProfile = @{ type = 'RuntimeDefault' } }
+            containers = @(@{
+                name = 'uclient'; image = $coturnImage
+                command = @('turnutils_uclient', '-v', '-u', $username, '-w', $password, '-n', '0', '-m', '1',
+                    '-e', '1.1.1.1', 'push-coturn')
+                securityContext = @{ allowPrivilegeEscalation = $false; readOnlyRootFilesystem = $true
+                    capabilities = @{ drop = @('ALL') } }
+            })
+        }
+    } | ConvertTo-Json -Depth 10 -Compress
+    kubectl --context $Context --namespace $Namespace delete pod turn-allocation --ignore-not-found --wait | Out-Null
+    kubectl --context $Context --namespace $Namespace run turn-allocation --restart=Never `
+        --image=$coturnImage --overrides=$pod | Out-Null
+    $deadline = (Get-Date).AddSeconds(120)
+    do {
+        Start-Sleep -Seconds 2
+        $phase = kubectl --context $Context --namespace $Namespace get pod turn-allocation -o jsonpath='{.status.phase}'
+    } while ($phase -notin 'Succeeded', 'Failed' -and (Get-Date) -lt $deadline)
+    $exit = kubectl --context $Context --namespace $Namespace get pod turn-allocation `
+        -o jsonpath='{.status.containerStatuses[0].state.terminated.exitCode}'
+    $log = kubectl --context $Context --namespace $Namespace logs turn-allocation 2>&1 | Out-String
+    kubectl --context $Context --namespace $Namespace delete pod turn-allocation --ignore-not-found --wait=false | Out-Null
+    @{ exit = "$exit"; log = $log }
+}
 
 $coturnPeers = '[{"namespaceSelector":{"kubernetes.io/metadata.name":"monitoring"},"podSelector":{"app":"prometheus"}}]'
 $turn = @('--set', 'calls.enabled=true', '--set', 'calls.turn.internal.publicHost=turn.example.com',
@@ -92,16 +152,40 @@ foreach ($scenario in $scenarios.GetEnumerator()) {
 }
 
 # A real install and upgrade, as the DEV deployment runs it; hooks (the migration Job) and
-# waiting for pods need the application images, so neither runs here.
+# the application pods need the application images, so neither runs or is waited for here:
+# coturn's own rollout is, and one TURN allocation runs against it.
 $release = @('push', $chart, '--kube-context', $Context, '--namespace', $Namespace, '--no-hooks')
 $installed = $scenarios['internal TURN, default denied-peers.txt, dual-stack cluster CIDRs']
 try {
+    Check 'coturn passes the restricted Pod Security Standard (server dry run, no PodSecurity warning)' {
+        $manifest = helm template push $chart --namespace $Namespace @installed --show-only templates/coturn.yaml 2>&1 | Out-String
+        if ($LASTEXITCODE -ne 0) { Write-Host $manifest; return $false }
+        $result = ServerDryRun $manifest
+        $passed = $LASTEXITCODE -eq 0 -and $result -match 'deployment\.apps/push-coturn created \(server dry run\)' -and
+            $result -notmatch 'PodSecurity'
+        if (-not $passed) { Write-Host $result }
+        $passed
+    }
     Check 'helm upgrade --install creates the internal TURN release' {
         $result = helm upgrade --install @release @installed 2>&1 | Out-String
         $passed = $LASTEXITCODE -eq 0
         if (-not $passed) { Write-Host $result }
         $passed -and (kubectl --context $Context --namespace $Namespace get networkpolicy push-coturn -o name) -eq
             'networkpolicy.networking.k8s.io/push-coturn'
+    }
+    Check 'the coturn pod becomes Ready in the restricted namespace' { CoturnReady }
+    Check 'a TURN allocation and refresh against the coturn Service succeed with REST credentials' {
+        $allocation = TurnAllocation
+        $passed = $allocation.exit -eq '0' -and $allocation.log -match 'Received relay addr: 203\.0\.113\.10:' -and
+            $allocation.log -match 'refresh response received: \s*\S*\s*INFO success'
+        if (-not $passed) { Write-Host "exit code $($allocation.exit)"; Write-Host $allocation.log }
+        $passed
+    }
+    Check 'coturn refuses an allocation with a wrong password (control)' {
+        $allocation = TurnAllocation 'not-the-hmac'
+        $passed = $allocation.exit -ne '0' -and $allocation.log -match 'Cannot complete Allocation'
+        if (-not $passed) { Write-Host "exit code $($allocation.exit)"; Write-Host $allocation.log }
+        $passed
     }
     Check 'helm upgrade updates it with other deniedPeerCidrs' {
         $result = helm upgrade --install @release @turn `
@@ -112,6 +196,7 @@ try {
             -o jsonpath='{.spec.egress[0].to[1].ipBlock.except}'
         $passed -and $except -match 'fd00:10:240::/48' -and $except -notmatch 'ffff'
     }
+    Check 'the upgraded coturn pod becomes Ready' { CoturnReady }
 } finally {
     helm uninstall push --kube-context $Context --namespace $Namespace 2>&1 | Out-Null
 }

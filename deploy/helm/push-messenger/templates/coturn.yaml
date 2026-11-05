@@ -95,11 +95,30 @@ spec:
             limits:
               cpu: 100m
               memory: 32Mi
+        # The image's /usr/bin/turnserver has file capabilities (cap_net_bind_service=ep):
+        # with drop ALL and allowPrivilegeEscalation false (no_new_privs) execve refuses it
+        # ("operation not permitted"). A plain cp leaves the security.capability xattr
+        # behind; coturn listens above 1024 only and runs the copy (docs/calls.md).
+        - name: turnserver
+          image: {{ $internal.image }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          command: ["cp", "/usr/bin/turnserver", "/opt/coturn/bin/turnserver"]
+          {{- include "push.coturnSecurity" . | nindent 10 }}
+          volumeMounts:
+            - name: bin
+              mountPath: /opt/coturn/bin
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 32Mi
       containers:
         - name: coturn
           image: {{ $internal.image }}
           imagePullPolicy: {{ .Values.images.pullPolicy }}
-          command: ["turnserver", "-c", "/run/coturn/turnserver.conf"]
+          command: ["/opt/coturn/bin/turnserver", "-c", "/run/coturn/turnserver.conf"]
           {{- include "push.coturnSecurity" . | nindent 10 }}
           ports:
             - name: turn-udp
@@ -130,6 +149,9 @@ spec:
             {{- toYaml . | nindent 12 }}
           {{- end }}
           volumeMounts:
+            - name: bin
+              mountPath: /opt/coturn/bin
+              readOnly: true
             - name: run
               mountPath: /run/coturn
               readOnly: true
@@ -146,6 +168,9 @@ spec:
         - name: config
           configMap:
             name: {{ $name }}
+        - name: bin
+          emptyDir:
+            sizeLimit: 16Mi
         - name: run
           emptyDir:
             medium: Memory

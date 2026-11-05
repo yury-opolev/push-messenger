@@ -556,6 +556,21 @@ Notable changes for consumers of push-messenger. Newest first.
 
 ### Fixed
 
+- **Chart: coturn crash-looped with `exec /usr/bin/turnserver: operation not
+  permitted`**: with `calls.enabled` and internal TURN the coturn pod never started (so
+  `helm upgrade --atomic --wait` timed out and rolled back). The pinned image gives
+  `/usr/bin/turnserver` the file capability `cap_net_bind_service=ep`, and the kernel
+  refuses to exec such a binary when the capability cannot be granted, as with the
+  chart's `capabilities.drop: [ALL]` and `allowPrivilegeEscalation: false`. An init
+  container (`turnserver`, same pinned image) now copies the binary with a plain `cp`,
+  which leaves the capability behind, into an `emptyDir` at `/opt/coturn/bin`, and coturn
+  runs that copy; it listens above 1024 only (3478, 5349, 9641). The security context is
+  unchanged (non-root, no capabilities, no privilege escalation, read-only root,
+  `RuntimeDefault` seccomp: restricted Pod Security Standard) and there is no new image
+  to mirror. `chart-cluster` CI now installs in a namespace enforcing `restricted`, waits
+  for coturn to be Ready and runs a TURN allocation against it
+  ([docs/calls.md §13.4](docs/calls.md#134-coturn-in-the-chart)).
+
 - **Chart: coturn's NetworkPolicy refused by the API server**: with `calls.enabled` and
   internal TURN, `helm install`/`upgrade` failed on a real cluster
   (`NetworkPolicy "<release>-coturn" is invalid: ... "::ffff:0:0/96": must not have an
