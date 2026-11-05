@@ -12,6 +12,8 @@ mod upgrade;
 mod voice;
 
 #[cfg(test)]
+mod echo_tests;
+#[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod voice_tests;
@@ -33,8 +35,8 @@ use tokio::sync::{mpsc, watch};
 use tokio::time::{Instant, MissedTickBehavior};
 
 use crate::backend::{
-    Backend, BackendCommand, BackendError, BackendEvent, Capability, CommandReply, PermissionMode,
-    Prepared, Responder, TextFormat,
+    ActivityLabels, Backend, BackendCommand, BackendError, BackendEvent, Capability, CommandReply,
+    PermissionMode, Prepared, Responder, TextFormat,
 };
 use crate::backoff::Backoff;
 use crate::cards::CardKind;
@@ -317,7 +319,7 @@ struct OpenRequest {
     deadline: Instant,
     /// When the card was posted: only an utterance begun after it answers it.
     opened: Instant,
-    waiting_label: &'static str,
+    waiting_label: String,
     /// The card's title as shown (a voice answer keeps it).
     title: String,
     /// What a call says about the request.
@@ -355,6 +357,12 @@ struct Core<M: Messenger> {
     name: String,
     /// How the backend writes its turns and background messages.
     format: TextFormat,
+    /// The backend's activity labels.
+    labels: ActivityLabels,
+    /// How long a card waits.
+    answer_timeout: Duration,
+    /// The owner's texts stored before this (server time, µs) are not delivered.
+    skip_before_us: Option<i64>,
     state: Arc<StateFile>,
     options: BridgeOptions,
     internal: mpsc::UnboundedSender<Internal>,
@@ -456,11 +464,21 @@ impl<M: Messenger> Core<M> {
     ) -> Self {
         let name = backend.name().to_owned();
         let format = backend.text_format();
+        let labels = backend.activity_labels();
+        let answer_timeout = backend.answer_timeout();
+        let clock = Clock::new();
+        let skip_before_us = backend.skip_texts_older_than().map(|age| {
+            let age_ms = i64::try_from(age.as_millis()).unwrap_or(i64::MAX);
+            clock.now_ms().saturating_sub(age_ms).saturating_mul(1000)
+        });
         Self {
             messenger,
             backend,
             name,
             format,
+            labels,
+            answer_timeout,
+            skip_before_us,
             state,
             folder: options.default_folder.clone(),
             mode: options.default_mode,
@@ -468,7 +486,7 @@ impl<M: Messenger> Core<M> {
             internal,
             owner,
             conversation,
-            clock: Clock::new(),
+            clock,
             session: None,
             version: None,
             engine_instance: None,
@@ -600,7 +618,11 @@ impl<M: Messenger> Core<M> {
         } else if let Some(label) = self.call_label() {
             (ActivityState::Working, Some(label.to_owned()))
         } else if let Some(turn) = &self.turn {
-            (ActivityState::Working, Some(turn.renderer.current_label()))
+            let label = turn
+                .renderer
+                .running_label()
+                .unwrap_or_else(|| self.labels.working.clone());
+            (ActivityState::Working, Some(label))
         } else {
             (ActivityState::Idle, None)
         }

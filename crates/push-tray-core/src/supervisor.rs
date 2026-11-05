@@ -33,7 +33,7 @@ use crate::history::History;
 use crate::menu::AgentAction;
 use crate::policy::{Decision, RestartPolicy};
 use crate::schedtask::{Scheduler, TaskFor, TaskId};
-use crate::state::{AgentState, from_bridge, label};
+use crate::state::{AgentState, backend_name, from_bridge, label};
 use crate::tray_config::TrayConfig;
 
 /// How often the supervisor looks at its processes and timers.
@@ -278,7 +278,7 @@ pub enum Command {
 }
 
 impl Command {
-    /// The folder of an agent action (Start, Stop, Restart Coda, Reconnect, Pause, Resume,
+    /// The folder of an agent action (Start, Stop, Restart <backend>, Reconnect, Pause, Resume,
     /// Mute, Unmute, Hang up).
     fn action_dir(&self) -> Option<&Path> {
         match self {
@@ -405,7 +405,10 @@ impl Instance {
     /// The state the bridge reports, as the tray shows it: an idle bridge the tray did
     /// not start is external.
     fn shown(&self, state: BridgeState, detail: Option<String>) -> AgentState {
-        let state = from_bridge(state, detail);
+        let mut state = from_bridge(state, detail);
+        if let AgentState::Restarting(backend) = &mut state {
+            *backend = backend_name(self.status.as_ref()).map(str::to_owned);
+        }
         if self.child.is_none() && state == AgentState::Idle {
             return self.external();
         }
@@ -922,16 +925,19 @@ impl Supervisor {
                 instance.status_pending = false;
                 match *result {
                     Ok(status) => {
+                        let state = status.state;
+                        let detail = status.detail.clone();
+                        instance.call = status.call.clone();
+                        // First, so the state shown names this status's backend.
+                        instance.status = Some(status);
                         // Corrects a missed `state_changed` (a lagging connection skips
                         // events).
-                        if let Some(state) = status.state {
-                            let state = instance.shown(state, status.detail.clone());
+                        if let Some(state) = state {
+                            let state = instance.shown(state, detail);
                             if instance.reported.as_ref() != Some(&state) {
                                 instance.report(state);
                             }
                         }
-                        instance.call = status.call.clone();
-                        instance.status = Some(status);
                     }
                     Err(error) => {
                         tracing::debug!(event = "bridge_status_failed", code = %error.code);

@@ -1,6 +1,6 @@
 //! The agent bridge: reaches a local AI coding agent from push-messenger as a private
 //! agent contact. A backend-independent core drives a small [`backend::Backend`] trait;
-//! Coda is the first backend.
+//! Coda is the first backend; [`echo`] is a deterministic test agent.
 
 pub mod backend;
 pub mod backoff;
@@ -10,6 +10,7 @@ pub mod commands;
 pub mod config;
 pub mod control;
 pub mod core;
+pub mod echo;
 pub mod exe;
 pub mod folders;
 pub mod logging;

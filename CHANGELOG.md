@@ -6,6 +6,18 @@ Notable changes for consumers of push-messenger. Newest first.
 
 ### Added
 
+- **Echo backend for push-agent-bridge** (`"backend": "echo", "echo": {"answerTimeoutS":
+  300}`): a deterministic, credential-free test agent that signs in with the bridge's
+  agent key and runs under push-agent-tray. It echoes the owner's texts as `agent.reply@2`
+  "echo: <text>" (activity "echoing", long echoes paged), posts `agent.question@1` on
+  `ask` and the built-in multi-select `agent.choose@1` on `pick` ("you chose: …";
+  activity "question open"; the owner's free text answers), skips an unanswered card
+  after `answerTimeoutS` (10–3600 s) with "No answer; skipped", ignores texts stored more
+  than 60 s before it started, reports no capabilities (only `/help`, `/status`, `/stop`
+  work), and with `calls.adapter` speaks each final transcript back as "echo: <text>".
+  Only the owner reaches it, as for Coda ([echo backend](docs/agent-bridge.md#19-echo-backend)).
+- **Backend trait hooks** (all defaulted, Coda unchanged): `answer_timeout()`,
+  `activity_labels()` and `skip_texts_older_than()`.
 - **Agent bridge voice adapter client** (second of three steps that move speech out of
   push-agent-bridge): the new `calls.adapter` runs a call's speech in a separate voice
   adapter process speaking [`push-voice-adapter/1`](docs/voice-adapter-protocol.md).
@@ -476,6 +488,14 @@ Notable changes for consumers of push-messenger. Newest first.
 
 ### Changed
 
+- **Agent bridge commands:** `/new` and `/cd` now need the backend's `Sessions`
+  capability like `/sessions` and `/resume`, and `/help` lists only the commands the
+  backend supports (Coda: all, as before).
+- **push-agent-tray:** the backend's name comes from the bridge's status ("Restart Echo",
+  "Echo restarting", "Echo version"; "backend" before the first status) instead of a
+  fixed "Coda". The window's agent JSON has `backendName` and `backendVersion` instead of
+  `codaVersion`; `AgentState::Restarting` carries the backend's name and
+  `AgentAction::label` takes it.
 - **Agent bridge: speech runs only in a voice adapter** (third of three steps that move
   speech out of push-agent-bridge). A `config.json` whose `calls` has `stt`, `tts` or
   `vad` (whatever the value, `none` and `null` included) no longer starts: `run` and

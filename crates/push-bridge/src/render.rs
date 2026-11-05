@@ -362,6 +362,12 @@ impl TurnRenderer {
 
     /// The activity label: the latest running tool as `<tool> <target>`, else "thinking".
     pub fn current_label(&self) -> String {
+        self.running_label()
+            .unwrap_or_else(|| "thinking".to_owned())
+    }
+
+    /// The latest running tool as `<tool> <target>`, if a tool runs.
+    pub fn running_label(&self) -> Option<String> {
         self.pages
             .iter()
             .rev()
@@ -369,7 +375,6 @@ impl TurnRenderer {
             .filter(|step| step.status == Status::Running)
             .find_map(|step| step.activity.clone())
             .filter(|label| !label.is_empty())
-            .unwrap_or_else(|| "thinking".to_owned())
     }
 
     fn new_line(&mut self) {

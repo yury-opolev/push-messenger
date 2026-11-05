@@ -14,7 +14,7 @@ use crate::backend::{
     BackendCommand, BackendError, Capability, CommandReply, ErrorKind, PermissionMode,
 };
 use crate::cards;
-use crate::commands::{Command, HELP};
+use crate::commands::{self, Command};
 use crate::control::{Action, ControlCall, Reply, error};
 use crate::folders;
 use crate::messenger::Messenger;
@@ -35,7 +35,9 @@ fn needs(command: &Command) -> Option<Capability> {
         Command::Effort(_) => Capability::Effort,
         Command::Mode(_) => Capability::PermissionModes,
         Command::Goal(_) => Capability::Goal,
-        Command::Sessions | Command::Resume(_) => Capability::Sessions,
+        Command::New | Command::Cd(_) | Command::Sessions | Command::Resume(_) => {
+            Capability::Sessions
+        }
         Command::Fork => Capability::Fork,
         Command::Tasks | Command::TaskStop(_) => Capability::Tasks,
         Command::Btw(_) => Capability::AskAside,
@@ -157,7 +159,10 @@ impl<M: Messenger> Core<M> {
             Command::Stop if busy => self.interrupt().await,
             Command::Stop => self.reply("Nothing is running."),
             Command::Status => self.status().await,
-            Command::Help => self.reply(HELP),
+            Command::Help => {
+                let help = commands::help(|capability| self.has(capability));
+                self.reply(&help);
+            }
             Command::Mode(mode) if mode == "bypass" => {
                 if self.mode == PermissionMode::BypassPermissions {
                     self.reply("Approvals are already off.");

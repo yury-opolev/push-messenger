@@ -1,5 +1,6 @@
-//! `push-agent-bridge`: reaches a local AI coding agent (Coda) from push-messenger as a
-//! private agent contact. A console program: the logon task runs it in the background.
+//! `push-agent-bridge`: reaches a local AI coding agent (Coda, or the echo test agent)
+//! from push-messenger as a private agent contact. A console program: the logon task runs
+//! it in the background.
 
 mod cli;
 mod remote;
@@ -10,10 +11,12 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use push_bridge::backend::Backend;
 use push_bridge::coda::CodaBackend;
-use push_bridge::config::{self, CallsConfig, Config};
+use push_bridge::config::{self, BackendKind, CallsConfig, Config};
 use push_bridge::control::{Action, Calls, ControlCall, ControlHandle, ControlHub, error};
 use push_bridge::core::{Bridge, BridgeError, BridgeOptions, CallFlag};
+use push_bridge::echo::EchoBackend;
 use push_bridge::folders;
 use push_bridge::logging;
 use push_bridge::messenger::{EVENT_QUEUE, Reconnect, SdkMessenger};
@@ -519,10 +522,16 @@ async fn run(dir: &Path) -> Result<(), Failure> {
     let serving = hub.as_ref().and_then(serve_control);
     let control = hub.as_ref().map(ControlHub::handle);
     let calls = hub.as_ref().map(ControlHub::calls);
-    let coda = config
-        .coda
-        .clone()
-        .ok_or_else(|| Failure::general("backend \"coda\" needs a \"coda\" section"))?;
+    let coda = match config.backend {
+        BackendKind::Coda => Some(
+            config
+                .coda
+                .clone()
+                .ok_or_else(|| Failure::general("backend \"coda\" needs a \"coda\" section"))?,
+        ),
+        BackendKind::Echo => None,
+    };
+    let echo = config.echo.unwrap_or_default();
     let default_folder =
         default_folder(&config).ok_or_else(|| Failure::general("default_folder is not usable"))?;
     let options = BridgeOptions {
@@ -612,7 +621,10 @@ async fn run(dir: &Path) -> Result<(), Failure> {
             Err(error) => break Err(Failure::general(format!("Cannot start: {error}"))),
         };
         let (backend_sender, backend_events) = mpsc::unbounded_channel();
-        let backend = Arc::new(CodaBackend::new(coda.clone(), backend_sender));
+        let backend: Arc<dyn Backend> = match &coda {
+            Some(coda) => Arc::new(CodaBackend::new(coda.clone(), backend_sender)),
+            None => Arc::new(EchoBackend::new(echo, backend_sender)),
+        };
         let mut bridge = Bridge::new(
             messenger,
             backend,

@@ -410,6 +410,24 @@ pub struct PendingMessages {
     pub lost: bool,
 }
 
+/// The activity labels the core shows for a backend.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivityLabels {
+    /// While a turn runs and no tool does.
+    pub working: String,
+    /// While a question card is open.
+    pub question: String,
+}
+
+impl Default for ActivityLabels {
+    fn default() -> Self {
+        Self {
+            working: "thinking".to_owned(),
+            question: "question".to_owned(),
+        }
+    }
+}
+
 /// An agent backend the core drives.
 #[async_trait::async_trait]
 pub trait Backend: Send + Sync + 'static {
@@ -419,6 +437,19 @@ pub trait Backend: Send + Sync + 'static {
     /// How the agent writes its text; plain unless the backend says Markdown.
     fn text_format(&self) -> TextFormat {
         TextFormat::Plain
+    }
+    /// How long a card waits for the owner's answer.
+    fn answer_timeout(&self) -> Duration {
+        crate::cards::CARD_TIMEOUT
+    }
+    /// The activity labels while working and while a question is open.
+    fn activity_labels(&self) -> ActivityLabels {
+        ActivityLabels::default()
+    }
+    /// The owner's texts sent more than this before the bridge started are not
+    /// delivered (a restart does not replay them); `None` delivers them all.
+    fn skip_texts_older_than(&self) -> Option<Duration> {
+        None
     }
     /// Starts the agent in `options.folder` (restarting its process when the folder
     /// changed or it is not running) and opens `options.session`, or a new session when

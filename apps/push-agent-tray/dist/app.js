@@ -325,7 +325,8 @@ function renderAgent(agent) {
   $("ovVoiceAdapter").textContent = text(agent.voiceAdapter);
   $("ovFolder").textContent = text(agent.folder);
   $("ovSession").textContent = text(agent.session);
-  $("ovCodaVersion").textContent = text(agent.codaVersion);
+  $("ovBackendVersionLabel").textContent = (agent.backendName || "Backend") + " version";
+  $("ovBackendVersion").textContent = text(agent.backendVersion);
   $("ovUptime").textContent = text(agent.uptime);
   $("ovRunningTasks").textContent = text(agent.runningTasks);
   $("ovLastError").textContent = text(agent.lastError);

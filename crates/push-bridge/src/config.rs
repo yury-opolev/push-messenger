@@ -48,6 +48,9 @@ pub struct Config {
     /// Required when `backend` is `coda`.
     #[serde(default)]
     pub coda: Option<CodaConfig>,
+    /// The echo backend's settings (`backend` `echo`); absent, the defaults.
+    #[serde(default)]
+    pub echo: Option<EchoConfig>,
     /// Serves the local control channel (the tray's status and actions); `false` turns
     /// it off.
     #[serde(default = "yes")]
@@ -405,6 +408,8 @@ pub enum KeyStorage {
 #[serde(try_from = "String", into = "String")]
 pub enum BackendKind {
     Coda,
+    /// The echo test agent ([`crate::echo`]).
+    Echo,
 }
 
 impl TryFrom<String> for BackendKind {
@@ -413,8 +418,9 @@ impl TryFrom<String> for BackendKind {
     fn try_from(name: String) -> Result<Self, Self::Error> {
         match name.as_str() {
             "coda" => Ok(Self::Coda),
+            "echo" => Ok(Self::Echo),
             _ => Err(format!(
-                "unknown backend \"{name}\": the only backend is \"coda\""
+                "unknown backend \"{name}\": the backends are \"coda\" and \"echo\""
             )),
         }
     }
@@ -424,6 +430,33 @@ impl From<BackendKind> for String {
     fn from(kind: BackendKind) -> Self {
         match kind {
             BackendKind::Coda => "coda".to_owned(),
+            BackendKind::Echo => "echo".to_owned(),
+        }
+    }
+}
+
+/// The echo backend's settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EchoConfig {
+    /// How long an `ask` or `pick` card waits for the answer, in seconds.
+    #[serde(rename = "answerTimeoutS", default = "EchoConfig::default_timeout")]
+    pub answer_timeout_s: u64,
+}
+
+impl EchoConfig {
+    /// The answer timeout's bounds, in seconds.
+    pub const TIMEOUT_RANGE: std::ops::RangeInclusive<u64> = 10..=3600;
+
+    fn default_timeout() -> u64 {
+        300
+    }
+}
+
+impl Default for EchoConfig {
+    fn default() -> Self {
+        Self {
+            answer_timeout_s: Self::default_timeout(),
         }
     }
 }
@@ -545,6 +578,12 @@ impl Config {
             (BackendKind::Coda, None) => invalid("backend \"coda\" needs a \"coda\" section"),
             (BackendKind::Coda, Some(coda)) if coda.exe.as_os_str().is_empty() => {
                 invalid("coda.exe must name Coda's executable")
+            }
+            (BackendKind::Echo, _)
+                if !EchoConfig::TIMEOUT_RANGE
+                    .contains(&self.echo.unwrap_or_default().answer_timeout_s) =>
+            {
+                invalid("echo.answerTimeoutS must be 10 to 3600 seconds")
             }
             _ => Ok(()),
         }
@@ -732,9 +771,29 @@ mod tests {
         config["backend"] = json!("cortex");
         let error = load(&fixture, &config).unwrap_err().to_string();
         assert!(
-            error.contains("unknown backend \"cortex\": the only backend is \"coda\""),
+            error.contains("unknown backend \"cortex\": the backends are \"coda\" and \"echo\""),
             "{error}"
         );
+    }
+
+    #[test]
+    fn the_echo_backend_needs_no_section_and_checks_its_timeout() {
+        let fixture = fixture();
+        let mut config = minimal(&fixture);
+        config["backend"] = json!("echo");
+        config.as_object_mut().unwrap().remove("coda");
+        let loaded = load(&fixture, &config).unwrap();
+        loaded.validate().unwrap();
+        assert_eq!(loaded.backend, BackendKind::Echo);
+        assert_eq!(loaded.echo.unwrap_or_default().answer_timeout_s, 300);
+        for (seconds, ok) in [(10, true), (3600, true), (9, false), (3601, false)] {
+            config["echo"] = json!({ "answerTimeoutS": seconds });
+            let loaded = load(&fixture, &config).unwrap();
+            assert_eq!(loaded.validate().is_ok(), ok, "{seconds}");
+            assert_eq!(loaded.echo.unwrap().answer_timeout_s, seconds);
+        }
+        config["echo"] = json!({ "answerTimeout": 30 });
+        assert!(load(&fixture, &config).is_err());
     }
 
     #[test]

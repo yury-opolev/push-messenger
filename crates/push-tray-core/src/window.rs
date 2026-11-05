@@ -9,7 +9,7 @@ use push_bridge_control::AdapterStatus;
 
 use crate::menu::{AgentAction, enabled};
 use crate::policy::MAX_EXITS;
-use crate::state::{IconState, call_label, call_short, icon_for_view, label};
+use crate::state::{IconState, backend_name, call_label, call_short, icon_for_view, label};
 use crate::supervisor::{InstanceView, Notice};
 use crate::tray_config::{self, PEEK_MESSAGES_DEFAULT};
 
@@ -61,7 +61,7 @@ pub struct AgentView {
     pub name: String,
     pub badge: &'static str,
     pub state: String,
-    /// Start, Stop, Restart Coda, Reconnect, Pause for upgrade, Resume.
+    /// Start, Stop, Restart <backend> (Restart Coda), Reconnect, Pause for upgrade, Resume.
     pub actions: Vec<ActionView>,
     /// The voice call ([`call_label`]), while one runs or rings.
     pub call: Option<String>,
@@ -71,7 +71,9 @@ pub struct AgentView {
     pub call_actions: Vec<ActionView>,
     pub folder: String,
     pub session: Option<String>,
-    pub coda_version: Option<String>,
+    /// The backend's name (Coda, Echo), once the bridge said it.
+    pub backend_name: Option<String>,
+    pub backend_version: Option<String>,
     /// While connected: how long the bridge runs (see [`uptime`]).
     pub uptime: Option<String>,
     pub running_tasks: Option<usize>,
@@ -89,7 +91,7 @@ pub struct AgentView {
 pub struct ActionView {
     /// [`AgentAction::as_str`].
     pub action: &'static str,
-    pub label: &'static str,
+    pub label: String,
     pub enabled: bool,
     /// Why the bridge refused this action the last time (shown next to the button).
     pub refused: Option<String>,
@@ -170,7 +172,7 @@ pub fn agent_view(
     let backend = status.and_then(|status| status.backend.as_ref());
     let action_view = |action: AgentAction| ActionView {
         action: action.as_str(),
-        label: action.label(),
+        label: action.label(backend_name(status)),
         enabled: enabled(view, action),
         refused: view
             .refusal
@@ -205,7 +207,8 @@ pub fn agent_view(
         call_actions,
         folder: view.dir.display().to_string(),
         session: status.and_then(|status| status.session.clone()),
-        coda_version: backend.and_then(|backend| backend.version.clone()),
+        backend_name: backend_name(status).map(str::to_owned),
+        backend_version: backend.and_then(|backend| backend.version.clone()),
         uptime: started_at.map(|started_at| uptime(now_ms - started_at)),
         running_tasks: backend.map(|backend| backend.running_tasks),
         last_error: view.last_error.clone().or_else(|| {
@@ -322,7 +325,7 @@ mod tests {
             }),
             session: Some("s-42".into()),
             backend: Some(BackendInfo {
-                name: "coda".into(),
+                name: "Coda".into(),
                 version: Some("1.2.3".into()),
                 running: true,
                 running_tasks: 2,
@@ -433,12 +436,12 @@ mod tests {
 
     #[test]
     fn the_call_shows_with_its_buttons() {
-        let names = |actions: &[ActionView]| -> Vec<(&str, &str, bool)> {
+        fn names(actions: &[ActionView]) -> Vec<(&str, &str, bool)> {
             actions
                 .iter()
-                .map(|action| (action.action, action.label, action.enabled))
+                .map(|action| (action.action, action.label.as_str(), action.enabled))
                 .collect()
-        };
+        }
         let mut view = view("a", AgentState::Working, true);
         let agent = agent_view(&view, None, 0);
         assert_eq!(agent.call, None);
@@ -526,7 +529,7 @@ mod tests {
         assert_eq!(agent.badge, "green");
         assert_eq!(agent.state, "connected, idle");
         assert_eq!(agent.session.as_deref(), Some("s-42"));
-        assert_eq!(agent.coda_version.as_deref(), Some("1.2.3"));
+        assert_eq!(agent.backend_version.as_deref(), Some("1.2.3"));
         assert_eq!(agent.uptime.as_deref(), Some("2 min"));
         assert_eq!(agent.running_tasks, Some(2));
         assert_eq!(agent.last_error.as_deref(), Some("backend_crashed"));
@@ -615,10 +618,28 @@ mod tests {
     }
 
     #[test]
+    fn the_backend_is_named_as_the_bridge_says() {
+        let mut view = view("Echo (echo)", AgentState::Idle, true);
+        let mut status = status();
+        status.backend.as_mut().unwrap().name = "Echo".into();
+        view.status = Some(status);
+        let agent = agent_view(&view, None, 0);
+        assert_eq!(agent.backend_name.as_deref(), Some("Echo"));
+        let restart = agent
+            .actions
+            .iter()
+            .find(|action| action.action == "restart_backend")
+            .unwrap();
+        assert_eq!(restart.label, "Restart Echo");
+    }
+
+    #[test]
     fn a_view_without_status_has_no_details_from_the_bridge() {
         let agent = agent_view(&view("a", AgentState::Stopped, false), None, 5);
         assert_eq!(agent.session, None);
-        assert_eq!(agent.coda_version, None);
+        assert_eq!(agent.backend_name, None);
+        assert_eq!(agent.backend_version, None);
+        assert_eq!(agent.actions[2].label, "Restart backend");
         assert_eq!(agent.voice_adapter, None);
         assert_eq!(agent.uptime, None);
         assert_eq!(agent.running_tasks, None);
@@ -679,7 +700,8 @@ mod tests {
         view.last_exit = Some(3);
         let json = serde_json::to_value(agent_view(&view, None, 61_000)).unwrap();
         for key in [
-            "codaVersion",
+            "backendName",
+            "backendVersion",
             "runningTasks",
             "lastError",
             "lastExit",

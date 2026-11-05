@@ -275,7 +275,7 @@ impl TestMessenger {
             kind,
             body: Some(body.to_owned()),
             client_ts: None,
-            server_ts: Some(seq),
+            server_ts: Some(now_us()),
             edited_at: None,
             deleted: false,
             status: MessageStatus::Received,
@@ -532,6 +532,14 @@ fn check_rich(body: &str) -> Result<(), SdkError> {
     parsed
         .check(&definition)
         .map_err(|error| invalid(error.to_string()))
+}
+
+/// Now, in Unix microseconds (the server's `server_ts`).
+fn now_us() -> i64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    i64::try_from(now.as_micros()).unwrap_or(i64::MAX)
 }
 
 /// The template a RICH body names, such as `agent.reply@1`.
