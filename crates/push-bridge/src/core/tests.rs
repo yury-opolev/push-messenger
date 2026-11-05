@@ -43,12 +43,31 @@ pub(super) struct Harness {
     pub(super) voice: Option<crate::voice::VoiceSetup>,
     /// Set while a call is in progress (see `voice_tests`).
     pub(super) call_flag: Option<CallFlag>,
+    /// Runs instead of `backend` (see [`Harness::echo`]).
+    custom: Option<Arc<dyn Backend>>,
     _dir: TestDir,
 }
 
 impl Harness {
     fn new() -> Self {
         Self::named("Test")
+    }
+
+    /// With the echo backend (answers wait `answer_timeout_s`) instead of the test one.
+    pub(super) fn echo(answer_timeout_s: u64) -> Self {
+        let mut harness = Self::named("Unused");
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let config = crate::config::EchoConfig { answer_timeout_s };
+        harness.custom = Some(Arc::new(crate::echo::EchoBackend::new(config, sender)));
+        if let Some(channels) = &mut harness.channels {
+            channels.0 = receiver;
+        }
+        harness
+    }
+
+    /// Runs the echo backend (see [`Harness::echo`]).
+    pub(super) fn is_echo(&self) -> bool {
+        self.custom.is_some()
     }
 
     /// With a backend named `name`.
@@ -81,15 +100,20 @@ impl Harness {
             events,
             voice: None,
             call_flag: None,
+            custom: None,
             _dir: dir,
         }
     }
 
     pub(super) fn start(&mut self) {
         let (backend_events, messenger_events) = self.channels.take().expect("not started");
+        let backend = self
+            .custom
+            .clone()
+            .unwrap_or_else(|| Arc::clone(&self.backend) as Arc<dyn Backend>);
         let mut bridge = Bridge::new(
             Arc::clone(&self.messenger),
-            Arc::clone(&self.backend) as Arc<dyn Backend>,
+            backend,
             backend_events,
             messenger_events,
             Arc::clone(&self.state),
@@ -133,7 +157,7 @@ impl Harness {
     }
 
     /// The cards sent (not replies): `(id, template)`.
-    fn cards(&self) -> Vec<(ClientMsgId, String)> {
+    pub(super) fn cards(&self) -> Vec<(ClientMsgId, String)> {
         self.messenger
             .sent_rich()
             .into_iter()
@@ -143,7 +167,7 @@ impl Harness {
     }
 
     /// The `count`th card, once sent.
-    async fn card(&self, count: usize) -> ClientMsgId {
+    pub(super) async fn card(&self, count: usize) -> ClientMsgId {
         self.messenger
             .wait_until("a card", |_| self.cards().len() >= count)
             .await;

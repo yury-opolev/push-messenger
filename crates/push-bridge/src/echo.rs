@@ -1,0 +1,239 @@
+//! The echo backend: a deterministic test agent with no engine behind it. It echoes the
+//! owner's texts, asks a question on `ask` and a multi-select on `pick`, and reports no
+//! capabilities. Operators run it under the bridge for contract checks and manual tests:
+//! sign-in, cards, activity, the tray and voice calls work as for Coda.
+//!
+//! | Text | Turn |
+//! |---|---|
+//! | `ask` | a question (Red, Blue; free text allowed), then "you chose: <answer>" |
+//! | `pick` | a multi-select (Red, Blue, Green), then "you chose: <labels>" |
+//! | anything else | "echo: <text>" |
+//!
+//! The core does the rest: the answer checks, the card deadline (the backend's
+//! [`Backend::answer_timeout`], "No answer; skipped"), paging long replies, skipping texts
+//! older than [`MAX_TEXT_AGE`] at startup, and voice calls.
+
+use std::collections::BTreeSet;
+use std::sync::{Mutex, PoisonError};
+use std::time::Duration;
+
+use tokio::sync::{mpsc, oneshot};
+
+use crate::backend::{
+    ActivityLabels, Answer, Backend, BackendCommand, BackendError, BackendEvent, BackendRequest,
+    BackendStatus, Capability, CommandReply, ErrorKind, PendingMessages, RequestKind, Responder,
+    StartOptions, Started, SteerOutcome, TextFormat, TurnSource, unsupported,
+};
+use crate::config::EchoConfig;
+
+/// The name in replies, `/status` and the tray.
+pub const NAME: &str = "Echo";
+/// Texts sent this long before the bridge started are not echoed.
+pub const MAX_TEXT_AGE: Duration = Duration::from_secs(60);
+/// The question `ask` posts.
+pub const ASK_QUESTION: &str = "Red or blue?";
+pub const ASK_OPTIONS: [&str; 2] = ["Red", "Blue"];
+/// The question `pick` posts.
+pub const PICK_QUESTION: &str = "Pick any colours.";
+pub const PICK_OPTIONS: [&str; 3] = ["Red", "Blue", "Green"];
+const SESSION: &str = "echo";
+
+#[derive(Default)]
+struct Inner {
+    running: bool,
+    busy: bool,
+    /// Ends the running turn early (`interrupt`, `stop`); `true` reports it interrupted.
+    cancel: Option<oneshot::Sender<bool>>,
+}
+
+/// The echo test agent.
+pub struct EchoBackend {
+    events: mpsc::UnboundedSender<BackendEvent>,
+    answer_timeout: Duration,
+    inner: Mutex<Inner>,
+}
+
+impl EchoBackend {
+    /// An echo backend set up by `config`, reporting through `events`.
+    pub fn new(config: EchoConfig, events: mpsc::UnboundedSender<BackendEvent>) -> Self {
+        Self {
+            events,
+            answer_timeout: Duration::from_secs(config.answer_timeout_s),
+            inner: Mutex::new(Inner::default()),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn emit(&self, event: BackendEvent) {
+        let _ = self.events.send(event);
+    }
+
+    fn not_running(method: &str) -> BackendError {
+        BackendError {
+            method: method.to_owned(),
+            code: "not_running".to_owned(),
+            message: "the echo agent is not running".to_owned(),
+            kind: ErrorKind::NotRunning,
+        }
+    }
+
+    /// Asks `question` and waits for the answer or the turn's end; the reply to the
+    /// answer, or `Err(interrupted)` when the turn was ended early.
+    async fn ask(
+        &self,
+        question: &str,
+        options: &[&str],
+        multi_select: bool,
+        cancel: oneshot::Receiver<bool>,
+    ) -> Result<Option<String>, bool> {
+        let (responder, answer) = Responder::new();
+        self.emit(BackendEvent::Request(BackendRequest {
+            kind: RequestKind::Question {
+                question: question.to_owned(),
+                options: options.iter().map(|&option| option.to_owned()).collect(),
+                multi_select,
+                allow_free_text: true,
+            },
+            responder,
+        }));
+        tokio::select! {
+            answer = answer => Ok(match answer {
+                Ok(Answer::Question(answer)) => Some(format!("you chose: {answer}")),
+                // Declined: the core said why ("No answer; skipped", …).
+                _ => None,
+            }),
+            interrupted = cancel => Err(interrupted.unwrap_or(false)),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Backend for EchoBackend {
+    fn name(&self) -> &str {
+        NAME
+    }
+
+    fn capabilities(&self) -> BTreeSet<Capability> {
+        BTreeSet::new()
+    }
+
+    fn text_format(&self) -> TextFormat {
+        TextFormat::Markdown
+    }
+
+    fn answer_timeout(&self) -> Duration {
+        self.answer_timeout
+    }
+
+    fn activity_labels(&self) -> ActivityLabels {
+        ActivityLabels {
+            working: "echoing".to_owned(),
+            question: "question open".to_owned(),
+        }
+    }
+
+    fn skip_texts_older_than(&self) -> Option<Duration> {
+        Some(MAX_TEXT_AGE)
+    }
+
+    async fn start(&self, options: StartOptions) -> Result<Started, BackendError> {
+        self.lock().running = true;
+        Ok(Started {
+            session_id: options.session.unwrap_or_else(|| SESSION.to_owned()),
+            engine_instance: None,
+            version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+            restored: None,
+        })
+    }
+
+    async fn stop(&self) {
+        let mut inner = self.lock();
+        inner.running = false;
+        if let Some(cancel) = inner.cancel.take() {
+            let _ = cancel.send(false);
+        }
+    }
+
+    async fn prompt(&self, text: &str) -> Result<(), BackendError> {
+        let cancel = {
+            let mut inner = self.lock();
+            if !inner.running {
+                return Err(Self::not_running("prompt"));
+            }
+            if inner.busy {
+                return Err(BackendError {
+                    method: "prompt".to_owned(),
+                    code: "busy".to_owned(),
+                    message: "a turn is running".to_owned(),
+                    kind: ErrorKind::Busy,
+                });
+            }
+            inner.busy = true;
+            let (sender, receiver) = oneshot::channel();
+            inner.cancel = Some(sender);
+            receiver
+        };
+        self.emit(BackendEvent::TurnStarted {
+            source: TurnSource::Prompt,
+        });
+        let command = text.trim();
+        let reply = if command.eq_ignore_ascii_case("ask") {
+            self.ask(ASK_QUESTION, &ASK_OPTIONS, false, cancel).await
+        } else if command.eq_ignore_ascii_case("pick") {
+            self.ask(PICK_QUESTION, &PICK_OPTIONS, true, cancel).await
+        } else {
+            Ok(Some(format!("echo: {text}")))
+        };
+        {
+            let mut inner = self.lock();
+            inner.busy = false;
+            inner.cancel = None;
+        }
+        match reply {
+            Ok(reply) => {
+                if let Some(reply) = reply {
+                    self.emit(BackendEvent::TextDelta(reply));
+                }
+                self.emit(BackendEvent::TurnEnded { interrupted: false });
+            }
+            Err(true) => self.emit(BackendEvent::TurnEnded { interrupted: true }),
+            // Stopped: the core ended the turn itself.
+            Err(false) => {}
+        }
+        Ok(())
+    }
+
+    async fn steer(&self, _text: &str) -> Result<SteerOutcome, BackendError> {
+        Err(unsupported("steer"))
+    }
+
+    async fn interrupt(&self) -> Result<(), BackendError> {
+        if let Some(cancel) = self.lock().cancel.take() {
+            let _ = cancel.send(true);
+        }
+        Ok(())
+    }
+
+    async fn command(&self, _command: BackendCommand) -> Result<CommandReply, BackendError> {
+        Err(unsupported("command"))
+    }
+
+    async fn status(&self) -> Result<BackendStatus, BackendError> {
+        Ok(BackendStatus {
+            model: None,
+            version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+            running_tasks: None,
+        })
+    }
+
+    async fn pending_messages(
+        &self,
+        _after: Option<u64>,
+        _engine_instance: Option<&str>,
+    ) -> Result<PendingMessages, BackendError> {
+        Ok(PendingMessages::default())
+    }
+}

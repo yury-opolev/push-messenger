@@ -74,6 +74,10 @@ impl<M: Messenger> Core<M> {
                 self.stranger(message.sender_id, message.conversation_id);
             }
             MessageKind::Text if message.conversation_id == self.conversation => {
+                if self.before_start(&message) {
+                    tracing::info!(event = "old_text_skipped");
+                    return;
+                }
                 if let Some(text) = message.body {
                     let time = self.clock.now_ms();
                     self.control.record(|ring| ring.owner_text(time, &text));
@@ -82,6 +86,15 @@ impl<M: Messenger> Core<M> {
             }
             _ => tracing::debug!(event = "message_ignored"),
         }
+    }
+
+    /// The text was stored too long before the bridge started for the backend to take it
+    /// (see [`crate::backend::Backend::skip_texts_older_than`]).
+    fn before_start(&self, message: &Message) -> bool {
+        matches!(
+            (self.skip_before_us, message.server_ts),
+            (Some(limit), Some(stored)) if stored < limit
+        )
     }
 
     /// Remembers a delivered message; `false` when it was handled already.

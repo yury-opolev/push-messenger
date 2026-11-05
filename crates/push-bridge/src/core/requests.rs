@@ -9,7 +9,7 @@ use super::{Core, OpenRequest};
 use crate::backend::{
     Answer, BackendCommand, BackendRequest, PermissionMode, RequestKind, Responder,
 };
-use crate::cards::{self, CARD_TIMEOUT, CardKind, CardPlan};
+use crate::cards::{self, CardKind, CardPlan};
 use crate::messenger::Messenger;
 
 impl<M: Messenger> Core<M> {
@@ -63,7 +63,7 @@ impl<M: Messenger> Core<M> {
             self.send_rich(body);
         }
         if let Some(id) = card {
-            let timeout_ms = i64::try_from(CARD_TIMEOUT.as_millis()).unwrap_or(i64::MAX);
+            let timeout_ms = i64::try_from(self.answer_timeout.as_millis()).unwrap_or(i64::MAX);
             self.cards.open(OpenCard {
                 conversation: self.conversation,
                 client_msg_id: id,
@@ -74,13 +74,17 @@ impl<M: Messenger> Core<M> {
                 deadline_ms: self.clock.now_ms().saturating_add(timeout_ms),
             });
         }
+        let waiting_label = match plan.kind {
+            CardKind::Question { .. } => self.labels.question.clone(),
+            _ => plan.waiting_label.to_owned(),
+        };
         self.open.push(OpenRequest {
             kind: plan.kind,
             responder,
             card,
-            deadline: Instant::now() + CARD_TIMEOUT,
+            deadline: Instant::now() + self.answer_timeout,
             opened: Instant::now(),
-            waiting_label: plan.waiting_label,
+            waiting_label,
             title: plan.title,
             spoken: plan.spoken,
             notified: false,

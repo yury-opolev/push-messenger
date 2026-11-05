@@ -1184,7 +1184,31 @@ impl Adapted {
         starter: Option<Arc<ScriptedStarter>>,
         policy: CallPolicy,
     ) -> Self {
-        let mut h = Harness::named("Coda");
+        Self::build_on(Harness::named("Coda"), supervisor, starter, policy).await
+    }
+
+    /// With the echo backend and a ready-to-start adapter.
+    async fn echo(starter: Arc<ScriptedStarter>) -> Self {
+        let supervisor = Supervisor::with_starter(
+            starter.clone(),
+            BridgeHello::v1(env!("CARGO_PKG_VERSION"), "en-US"),
+        );
+        Self::build_on(
+            Harness::echo(300),
+            supervisor,
+            Some(starter),
+            CallPolicy::default(),
+        )
+        .await
+    }
+
+    async fn build_on(
+        mut h: Harness,
+        supervisor: Supervisor,
+        starter: Option<Arc<ScriptedStarter>>,
+        policy: CallPolicy,
+    ) -> Self {
+        let echo = h.is_echo();
         let phone = FakePhone::new();
         let flag: CallFlag = Arc::new(watch::channel(false).0);
         let setup = AdapterSetup::new(supervisor.clone(), "en-US");
@@ -1195,7 +1219,9 @@ impl Adapted {
         });
         h.call_flag = Some(flag.clone());
         h.start();
-        h.backend.wait_for("start", 1).await;
+        if !echo {
+            h.backend.wait_for("start", 1).await;
+        }
         settle().await;
         Self {
             v: Voice {
@@ -1311,6 +1337,26 @@ async fn with_a_ready_adapter_the_owner_s_call_is_answered_heard_and_spoken_to()
     assert!(metrics.frames_from_adapter > 0, "{metrics:?}");
     assert_eq!(metrics.speaks, 2);
     assert!(metrics.final_to_speak.is_some() && metrics.speak_to_audio.is_some());
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_echo_agent_speaks_each_final_transcript_back() {
+    let a = Adapted::echo(then_not_found(vec![Plan::Adapter(adapter_script())])).await;
+    a.ready().await;
+    let call = a.call().await;
+    let log = a.log(0).await;
+    wait_log(&log, speak(GREETING.chars().count(), false)).await;
+
+    call.say_paced(&adapter_word()).await;
+    let echoed = format!("echo: {WORD}");
+    wait_log(&log, speak(echoed.chars().count(), true)).await;
+    assert_eq!(a.v.transcripts(), [("owner".to_owned(), WORD.to_owned())]);
+    a.v.until("the echo in the chat", || {
+        a.v.posted().iter().any(|text| text == &echoed)
+    })
+    .await;
+    call.end(CallEndReason::Completed);
+    a.v.until("the end", || a.v.call_info().is_none()).await;
 }
 
 #[tokio::test(start_paused = true)]

@@ -110,7 +110,7 @@ async fn agent_view(
     ))
 }
 
-/// Start, Stop, Restart Coda, Reconnect, Pause for upgrade, Resume, Mute agent, Unmute
+/// Start, Stop, Restart <backend>, Reconnect, Pause for upgrade, Resume, Mute agent, Unmute
 /// agent or Hang up. The bridge's later refusal shows in the agent's view.
 #[tauri::command]
 async fn act(

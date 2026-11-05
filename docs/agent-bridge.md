@@ -5,7 +5,8 @@ their own Windows machine reach it from a phone or a browser through push-messen
 agent becomes a private [owned agent](entra-sign-in.md#owned-agents-and-app-only-authentication-opt-in)
 contact: the owner sends it tasks, watches it think and work, approves its edits and
 commands, answers its questions and approves its plans from cards, and controls the session
-with `/` commands. Coda is the first backend. Design: the implementation plan
+with `/` commands. Coda is the first backend; `echo` is a deterministic test agent
+([echo backend](#19-echo-backend)). Design: the implementation plan
 [2026-10-29-agent-bridge](superpowers/plans/2026-10-29-agent-bridge.md). Where this guide
 and the plan differ, this guide describes what the code does.
 
@@ -27,6 +28,7 @@ and the plan differ, this guide describes what the code does.
 - [16. Linux plan](#16-linux-plan)
 - [17. Manual smoke test on Windows](#17-manual-smoke-test-on-windows)
 - [18. Voice calls](#18-voice-calls)
+- [19. Echo backend](#19-echo-backend)
 
 Design of the tray, the control channel and upgrade mode: the plan
 [2026-11-02-agent-tray-upgrade-mode](superpowers/plans/2026-11-02-agent-tray-upgrade-mode.md);
@@ -81,6 +83,9 @@ backend with backoff. It talks to push-messenger through a small `Messenger` tra
 | `command(BackendCommand)` | compact, models, set model/effort/permission mode/goal, sessions, fork, tasks, stop a task, ask aside, schedules, skills; returns plain text the core masks |
 | `status()` | model, version and running tasks for `/status` |
 | `pending_messages(after, engine)` | background messages missed after a cursor |
+| `answer_timeout()` | how long a card waits for the owner (default 10 minutes) |
+| `activity_labels()` | the activity labels while working with no tool running (default `thinking`) and while a question is open (default `question`) |
+| `skip_texts_older_than()` | owner texts stored more than this before the bridge started are not delivered (default: all are) |
 
 The backend reports through an unbounded channel of `BackendEvent`s: turn started (by a
 prompt or by the engine) and ended (interrupted or not), thinking and text deltas, tool
@@ -104,7 +109,8 @@ the events a test asks for. The core's tests and the integration tests
 which shows that the core runs without Coda. `cargo test -p push-bridge` runs them all,
 including a fake `coda serve` for the Coda backend.
 
-**Adding a backend** (Cortex, for example) needs no second bridge:
+**Adding a backend** (Cortex, for example) needs no second bridge (`EchoBackend`, module
+`echo`, is a small example):
 
 1. Implement `Backend` in a new module: map the agent's protocol to the calls and events
    above, report only the capabilities it has, and answer each `Responder`.
@@ -204,7 +210,8 @@ Create `%LOCALAPPDATA%\push-messenger\coda-bridge\config.json`. Every field:
 | `roots` | yes | the folders the agent may work in and below; at least one | |
 | `default_folder` | yes | the folder a new bridge starts in: a real folder inside `roots`; a relative path is relative to the first root | |
 | `default_permission_mode` | no | `default`, `acceptEdits` or `plan`; `bypassPermissions` is refused (use `/mode bypass`) | `default` |
-| `backend` | yes | `coda`, the only backend | |
+| `backend` | yes | `coda`, or `echo` (the [echo test agent](#echo-backend)) | |
+| `echo.answerTimeoutS` | no | with `echo`: how long an `ask` or `pick` card waits, 10 to 3600 seconds | `300` |
 | `coda.exe` | with `coda` | the path to `coda.exe` (a bare name is looked up on `PATH`) | |
 | `coda.args` | no | extra arguments after `serve`, as a list | `[]` |
 | `control` | no | serve the local [control channel](#14-control-channel-for-other-tools) (the tray's status and actions, `pause`, `resume`); `false` turns it off, and the bridge works as without it (the tray then cannot see or reach it) | `true` |
@@ -500,7 +507,10 @@ was declined."
 
 ## 8. Commands
 
-Only the owner's commands run. Arguments are checked; a bad one is answered with the usage
+Only the owner's commands run. A command needing a capability the backend lacks (`/new`,
+`/cd`, `/sessions` and `/resume` need `Sessions`; `/mode` and `/yolo` need
+`PermissionModes`; the others their own) answers "Not supported by <name>.", and `/help`
+lists only the commands the backend supports. Arguments are checked; a bad one is answered with the usage
 line (`Usage: /effort <low|medium|high|xhigh|max|auto>`). Command names are case-sensitive:
 `/NEW` goes to Coda as a prompt. Results come back as masked `agent.reply@1` text (plain, never Markdown).
 While Coda is [paused for an upgrade](#15-upgrade-mode), only `/status` and `/help` run;
@@ -724,7 +734,7 @@ around it so it reads on any taskbar. With no agents there is no badge.
 | grey `#8c8c8c` | an agent that is up (idle, working, waiting, paused, running) while the tray has no control connection to it | |
 | amber `#e8a317` | "waiting for you (approval needed)", "… (question)", "… (plan approval)" | `waiting` with its detail |
 | purple `#8a5cd1` | "paused for an upgrade" | `paused` |
-| blue, pulsing `#3b7be8` | "starting", "stopping", "Coda restarting", "disconnected, reconnecting" | `starting`, `stopping`, `restarting`, `reconnecting` |
+| blue, pulsing `#3b7be8` | "starting", "stopping", "<backend> restarting" ("Coda restarting", "Echo restarting"), "disconnected, reconnecting" | `starting`, `stopping`, `restarting`, `reconnecting` |
 | blue `#3b7be8` | "working" | `working` |
 | green `#2e9d4f` | "connected, idle"; "running (Scheduled Task)"; "running (started outside the tray)" | `idle` (the second label when the tray did not start the process and the folder's Scheduled Task runs it, the third when no task runs it) |
 
@@ -778,7 +788,8 @@ its folder; below them "Add agent folder…".
 - **Overview:** the state with its badge and label; the actions; the call's buttons; the
   voice call, the voice adapter (with `calls.adapter`: "<name> <version> (ready: stt,
   tts, vad, barge-in)" with its capabilities, "…; cannot listen" without `stt`,
-  "starting" or "backing off (<reason>)"), the folder, session, Coda's version, uptime,
+  "starting" or "backing off (<reason>)"), the folder, session, the backend's version
+  ("Coda version", "Echo version"), uptime,
   running tasks, last error (the
   tray's own, else the bridge's error code) and last exit code; "Open folder"; the last 50
   states with their times, newest first. A refused action says so next to its button, not
@@ -788,7 +799,7 @@ its folder; below them "Add agent folder…".
   |---|---|---|
   | Start | starts the bridge (or runs its Scheduled Task); starts the failure count over | stopped, failed, stopped after 5 failures, not set up |
   | Stop | [stops](#stop-and-quit) the bridge gracefully | running (any running state, also one the tray did not start) or failed (cancels the pending restart) |
-  | Restart Coda | `restart_backend`: Coda is stopped and started again at once; the chat stays connected | the control channel is connected (not while stopping) |
+  | Restart Coda (Restart <backend>) | `restart_backend`: the backend is stopped and started again at once; the chat stays connected | the control channel is connected (not while stopping) |
   | Reconnect | `reconnect`: the bridge signs in again and reconnects; Coda is untouched | the same |
   | Pause for upgrade | `pause_backend` with the reason "paused from the tray" and the default drain ([upgrade mode](#15-upgrade-mode)) | the same, and not paused |
   | Resume | `resume_backend` | the same, and paused |
@@ -823,6 +834,10 @@ its folder; below them "Add agent folder…".
 
 **Bottom:** "Start at logon", "Reduce motion", "Show last agent line in the menu",
 "Switch from Scheduled Task…" (when offered) and "Quit".
+
+Wherever the tray names the agent's backend ("Restart Coda", "Coda restarting", "Coda
+version") it uses the name the bridge reports in its `status` (`backend.name`: "Coda",
+"Echo"); before the first status it says "backend".
 
 ### Chat peek
 
@@ -2187,3 +2202,60 @@ there the bridge gives the voice adapter only what speech needs:
 - Do-not-disturb uses the computer's local time zone only (no `time_zone` field).
 - One call at a time; no video; the owner's push notifications do not ring (calls ring
   only on connected devices, as for every call).
+
+## 19. Echo backend
+
+`"backend": "echo"` runs a deterministic test agent instead of Coda: no engine, no model,
+no credentials beyond the bridge's own agent key. It exists for contract checks and
+manual tests from a dev box (texts, cards and their answer rules, activity, the tray,
+voice calls) where a cloud-hosted test agent cannot sign in. Everything else works as for
+Coda: `api_url`, the key and `keygen`, `enroll --code`, the state folder, the control
+channel, the tray, `calls`. `roots` and `default_folder` are still required (the core
+needs a folder); any existing folder will do, nothing is read or written there.
+
+```json
+{
+  "api_url": "https://push.example.com",
+  "key": { "name": "push-messenger-echo" },
+  "roots": ["C:\\src"],
+  "default_folder": "C:\\src",
+  "backend": "echo",
+  "echo": { "answerTimeoutS": 300 }
+}
+```
+
+`echo` is optional; `answerTimeoutS` (default 300) must be 10 to 3600 seconds
+(`enroll` and `run` refuse anything else; `status` says what is wrong). Use `--dir` for a folder of its own, and a
+`key.name` of its own, as for [several agents](#several-agents-on-one-machine).
+
+**Behaviour.** Texts are matched after trimming, in any case.
+
+| The owner sends | The echo agent |
+|---|---|
+| `ask` | posts `agent.question@1` "Red or blue?" (Red, Blue); activity `waiting` / `question open`. The answer (a button, a label or number, or any other text, which is the free-text answer) gets "you chose: <answer>" |
+| `pick` | posts `agent.choose@1` "Pick any colours." (Red, Blue, Green; any number of them; typed answers separated by commas); "you chose: Red, Green" in option order |
+| anything else | replies `agent.reply@2` (Markdown) "echo: <text>", with activity `working` / `echoing`; a text over 4,000 characters continues in further replies, as every turn does |
+
+- **Who may talk to it:** the bridge's rule, unchanged: only the agent's owner, in the
+  owner's direct conversation. Anyone else, an accepted contact too, gets "This agent is
+  private." and nothing reaches the backend. So the one who asked is always the owner;
+  anyone else's answer to the card is refused (`answer_refused`) and the card stays open.
+  While a card is open, the owner's next text answers it.
+- **Timeout:** an unanswered card closes after `answerTimeoutS`: "No answer; skipped".
+- **`/stop`** while a card is open declines it ("Declined: the turn was stopped.").
+- **Old texts:** a text stored more than 60 s before the bridge started is skipped
+  (logged as `old_text_skipped`, without content), so a restart does not replay the
+  backlog.
+- **Commands:** the echo agent reports no capabilities. `/help`, `/status` and `/stop`
+  are the core's and work; every other command (`/new`, `/cd`, `/sessions`, `/model`,
+  `/tasks`, `/mode`, …) answers "Not supported by Echo.". Any other `/text` is echoed.
+- **Calls:** with `calls.adapter` configured (a build with `--features voice`), the owner's
+  call is answered as for Coda and each final transcript is echoed and spoken back
+  through the adapter as "echo: <text>". Without an adapter, calls are not advertised.
+- **Tray:** the tray shows "Echo" where it would show "Coda" ("Restart Echo", "Echo
+  restarting", "Echo version").
+- **Not modelled:** sessions, folders, tasks, background messages, plans and approvals;
+  `pause` stops it until `resume` (it has no program to watch and no state to save).
+
+`cargo test -p push-bridge --lib echo` runs its tests (the core with a `TestMessenger`,
+and a call through the testkit adapter).

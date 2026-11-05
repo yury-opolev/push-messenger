@@ -2,9 +2,20 @@
 
 use std::time::Duration;
 
-use push_bridge_control::{BridgeState, CallDirection, CallInfo, CallPhase};
+use push_bridge_control::{BridgeState, CallDirection, CallInfo, CallPhase, Status};
 
 use crate::policy::MAX_EXITS;
+
+/// What the tray calls a bridge's backend before the bridge said its name.
+pub const UNKNOWN_BACKEND: &str = "backend";
+
+/// The backend's name from a bridge's `status` ("Coda", "Echo"), if it said.
+pub fn backend_name(status: Option<&Status>) -> Option<&str> {
+    status
+        .and_then(|status| status.backend.as_ref())
+        .map(|backend| backend.name.as_str())
+        .filter(|name| !name.trim().is_empty())
+}
 
 /// An agent (bridge instance) as the tray sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,8 +30,8 @@ pub enum AgentState {
     Starting,
     /// The messenger connection is down; the bridge reconnects.
     Reconnecting,
-    /// Coda is down and restarts.
-    Restarting,
+    /// The backend (named once the bridge said so) is down and restarts.
+    Restarting(Option<String>),
     /// Upgrade mode.
     Paused,
     Stopping,
@@ -51,7 +62,7 @@ pub enum IconState {
     Normal,
     /// Working.
     Busy,
-    /// On the way between states: starting, stopping, Coda restarting, reconnecting.
+    /// On the way between states: starting, stopping, the backend restarting, reconnecting.
     Transition,
     /// Paused for an upgrade.
     Paused,
@@ -85,7 +96,7 @@ pub fn icon_for(state: &AgentState) -> IconState {
         AgentState::Paused => IconState::Paused,
         AgentState::Starting
         | AgentState::Reconnecting
-        | AgentState::Restarting
+        | AgentState::Restarting(_)
         | AgentState::Stopping => IconState::Transition,
         AgentState::Stopped
         | AgentState::Failed { .. }
@@ -128,7 +139,12 @@ pub fn label(state: &AgentState) -> String {
         AgentState::Waiting(_) => "waiting for you".to_owned(),
         AgentState::Starting => "starting".to_owned(),
         AgentState::Reconnecting => "disconnected, reconnecting".to_owned(),
-        AgentState::Restarting => "Coda restarting".to_owned(),
+        AgentState::Restarting(backend) => {
+            format!(
+                "{} restarting",
+                backend.as_deref().unwrap_or(UNKNOWN_BACKEND)
+            )
+        }
         AgentState::Paused => "paused for an upgrade".to_owned(),
         AgentState::Stopping => "stopping".to_owned(),
         AgentState::Stopped => "stopped".to_owned(),
@@ -202,7 +218,7 @@ pub fn from_bridge(state: BridgeState, detail: Option<String>) -> AgentState {
         BridgeState::Working => AgentState::Working,
         BridgeState::Waiting => AgentState::Waiting(detail),
         BridgeState::Reconnecting => AgentState::Reconnecting,
-        BridgeState::Restarting => AgentState::Restarting,
+        BridgeState::Restarting => AgentState::Restarting(None),
         BridgeState::Paused => AgentState::Paused,
         BridgeState::Stopping => AgentState::Stopping,
     }
@@ -269,7 +285,7 @@ mod tests {
             (AgentState::Paused, IconState::Paused),
             (AgentState::Starting, IconState::Transition),
             (AgentState::Reconnecting, IconState::Transition),
-            (AgentState::Restarting, IconState::Transition),
+            (AgentState::Restarting(None), IconState::Transition),
             (AgentState::Stopping, IconState::Transition),
             (AgentState::Stopped, IconState::Error),
             (failed(Some(1), Some(4)), IconState::Error),
@@ -292,7 +308,7 @@ mod tests {
             (AgentState::External { task: true }, IconState::Disconnected),
             (AgentState::Starting, IconState::Transition),
             (AgentState::Reconnecting, IconState::Transition),
-            (AgentState::Restarting, IconState::Transition),
+            (AgentState::Restarting(None), IconState::Transition),
             (AgentState::Stopping, IconState::Transition),
             (AgentState::Stopped, IconState::Error),
             (failed(Some(1), None), IconState::Error),
@@ -361,7 +377,15 @@ mod tests {
             (AgentState::Waiting(None), "waiting for you"),
             (AgentState::Paused, "paused for an upgrade"),
             (AgentState::Reconnecting, "disconnected, reconnecting"),
-            (AgentState::Restarting, "Coda restarting"),
+            (
+                AgentState::Restarting(Some("Coda".into())),
+                "Coda restarting",
+            ),
+            (
+                AgentState::Restarting(Some("Echo".into())),
+                "Echo restarting",
+            ),
+            (AgentState::Restarting(None), "backend restarting"),
             (AgentState::Stopped, "stopped"),
             (failed(Some(1), Some(4)), "failed (exit 1), retrying in 4 s"),
             (failed(Some(1), None), "failed (exit 1)"),
@@ -471,7 +495,7 @@ mod tests {
                 AgentState::Waiting(Some("detail".into())),
             ),
             (BridgeState::Reconnecting, AgentState::Reconnecting),
-            (BridgeState::Restarting, AgentState::Restarting),
+            (BridgeState::Restarting, AgentState::Restarting(None)),
             (BridgeState::Paused, AgentState::Paused),
             (BridgeState::Stopping, AgentState::Stopping),
         ];

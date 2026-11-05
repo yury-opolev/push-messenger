@@ -3,6 +3,8 @@
 
 use std::fmt;
 
+use crate::backend::Capability;
+
 /// One parsed command.
 #[derive(Clone, PartialEq, Eq)]
 pub enum Command {
@@ -89,6 +91,37 @@ pub const HELP: &str = "\
 /skills: list the skills
 /help: this list
 Any other /command goes to the agent as a prompt.";
+
+/// The capability each `/help` line needs, by the command's first word.
+fn help_needs(word: &str) -> Option<Capability> {
+    Some(match word {
+        "new" | "cd" | "sessions" | "resume" => Capability::Sessions,
+        "compact" => Capability::Compact,
+        "model" => Capability::Models,
+        "effort" => Capability::Effort,
+        "mode" | "yolo" => Capability::PermissionModes,
+        "goal" => Capability::Goal,
+        "fork" => Capability::Fork,
+        "tasks" | "task" => Capability::Tasks,
+        "btw" => Capability::AskAside,
+        "schedule" => Capability::Schedules,
+        "skills" => Capability::Skills,
+        _ => return None,
+    })
+}
+
+/// [`HELP`] without the commands whose capability the backend lacks (`has`).
+pub fn help(has: impl Fn(Capability) -> bool) -> String {
+    HELP.lines()
+        .filter(|line| {
+            let word = line
+                .strip_prefix('/')
+                .and_then(|rest| rest.split([' ', ':']).next());
+            word.and_then(help_needs).is_none_or(&has)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
 /// `None` when `text` is not a command (does not start with '/').
 pub fn parse(text: &str) -> Option<Command> {
@@ -502,6 +535,28 @@ mod tests {
                 "{command}"
             );
         }
+    }
+
+    #[test]
+    fn help_lists_only_what_the_backend_supports() {
+        assert_eq!(help(|_| true), HELP);
+        let bare = help(|_| false);
+        let commands: Vec<_> = bare
+            .lines()
+            .map(|line| line.split(':').next().unwrap())
+            .collect();
+        assert_eq!(
+            commands,
+            [
+                "/stop",
+                "/status",
+                "/help",
+                "Any other /command goes to the agent as a prompt."
+            ]
+        );
+        let sessions = help(|capability| capability == Capability::Sessions);
+        assert!(sessions.contains("/new:") && sessions.contains("/resume <id>:"));
+        assert!(!sessions.contains("/model"));
     }
 
     #[test]

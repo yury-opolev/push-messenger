@@ -10,7 +10,8 @@ use push_bridge_control::CallPhase;
 
 use crate::schedtask::Offer;
 use crate::state::{
-    AgentState, IconState, call_short, icon_for_view, label, tooltip as state_tooltip, worst,
+    AgentState, IconState, UNKNOWN_BACKEND, call_short, icon_for_view, label,
+    tooltip as state_tooltip, worst,
 };
 use crate::supervisor::InstanceView;
 
@@ -82,11 +83,15 @@ impl AgentAction {
         }
     }
 
-    pub fn label(self) -> &'static str {
+    /// The button's text; `backend` names the bridge's backend ("Restart Coda"), or
+    /// [`UNKNOWN_BACKEND`] while not known.
+    pub fn label(self, backend: Option<&str>) -> String {
         match self {
             AgentAction::Start => "Start",
             AgentAction::Stop => "Stop",
-            AgentAction::RestartBackend => "Restart Coda",
+            AgentAction::RestartBackend => {
+                return format!("Restart {}", backend.unwrap_or(UNKNOWN_BACKEND));
+            }
             AgentAction::Reconnect => "Reconnect",
             AgentAction::Pause => "Pause for upgrade",
             AgentAction::Resume => "Resume",
@@ -94,6 +99,7 @@ impl AgentAction {
             AgentAction::Unmute => "Unmute agent",
             AgentAction::Hangup => "Hang up",
         }
+        .to_owned()
     }
 
     /// The action [`AgentAction::as_str`] names.
@@ -238,7 +244,7 @@ pub fn enabled(view: &InstanceView, action: AgentAction) -> bool {
             | AgentState::Waiting(_)
             | AgentState::Starting
             | AgentState::Reconnecting
-            | AgentState::Restarting
+            | AgentState::Restarting(_)
             | AgentState::Paused
             | AgentState::External { .. }
     );
@@ -370,11 +376,19 @@ pub(crate) mod tests {
         }
         assert_eq!(AgentAction::parse("open_log"), None);
         assert_eq!(AgentAction::parse(""), None);
-        assert_eq!(AgentAction::Pause.label(), "Pause for upgrade");
-        assert_eq!(AgentAction::RestartBackend.label(), "Restart Coda");
-        assert_eq!(AgentAction::Mute.label(), "Mute agent");
-        assert_eq!(AgentAction::Unmute.label(), "Unmute agent");
-        assert_eq!(AgentAction::Hangup.label(), "Hang up");
+        assert_eq!(AgentAction::Pause.label(None), "Pause for upgrade");
+        assert_eq!(
+            AgentAction::RestartBackend.label(Some("Coda")),
+            "Restart Coda"
+        );
+        assert_eq!(
+            AgentAction::RestartBackend.label(Some("Echo")),
+            "Restart Echo"
+        );
+        assert_eq!(AgentAction::RestartBackend.label(None), "Restart backend");
+        assert_eq!(AgentAction::Mute.label(None), "Mute agent");
+        assert_eq!(AgentAction::Unmute.label(None), "Unmute agent");
+        assert_eq!(AgentAction::Hangup.label(None), "Hang up");
         assert_eq!(AgentAction::ALL[..6], AgentAction::AGENT);
     }
 
