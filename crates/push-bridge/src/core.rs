@@ -674,6 +674,7 @@ impl<M: Messenger> Core<M> {
         self.poll_turn();
         self.expire_requests().await;
         self.expire_contact_requests();
+        self.refresh_contact_activity(false).await;
         self.expire_asking();
         self.call_owner_if_due().await;
         self.watch_pause().await;

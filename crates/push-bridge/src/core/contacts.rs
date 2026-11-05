@@ -48,6 +48,8 @@ pub(super) struct Contacts {
     conversations: std::collections::HashMap<UserId, ConversationId>,
     /// The contacts' open questions, oldest first.
     pub(super) open: Vec<ContactRequest>,
+    /// The activity shown in each contact's conversation (not idle), and when it was sent.
+    activity: std::collections::HashMap<ConversationId, (ActivityState, Option<String>, Instant)>,
 }
 
 impl<M: Messenger> Core<M> {
@@ -404,13 +406,40 @@ impl<M: Messenger> Core<M> {
     }
 
     async fn contact_activity(
-        &self,
+        &mut self,
         conversation: ConversationId,
         state: ActivityState,
         label: Option<&str>,
     ) {
+        if state == ActivityState::Idle {
+            self.contacts.activity.remove(&conversation);
+        } else {
+            self.contacts.activity.insert(
+                conversation,
+                (state, label.map(str::to_owned), Instant::now()),
+            );
+        }
         if let Err(error) = self.messenger.activity(conversation, state, label).await {
             tracing::debug!(event = "activity_failed", code = error.code());
+        }
+    }
+
+    /// Sends the contacts' lasting activity again when due (others show it for 30 s), or
+    /// at once with `force` (after a reconnect).
+    pub(super) async fn refresh_contact_activity(&mut self, force: bool) {
+        let now = Instant::now();
+        let due: Vec<_> = self
+            .contacts
+            .activity
+            .iter()
+            .filter(|(_, (_, _, sent))| {
+                force || now.saturating_duration_since(*sent) >= super::ACTIVITY_REFRESH
+            })
+            .map(|(conversation, (state, label, _))| (*conversation, *state, label.clone()))
+            .collect();
+        for (conversation, state, label) in due {
+            self.contact_activity(conversation, state, label.as_deref())
+                .await;
         }
     }
 }

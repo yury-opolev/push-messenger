@@ -52,6 +52,7 @@ impl<M: Messenger> Core<M> {
                 if reconnected {
                     tracing::info!(event = "messenger_reconnected");
                     self.update_activity(true).await;
+                    self.refresh_contact_activity(true).await;
                     self.fetch_pending().await;
                 }
                 Ok(())

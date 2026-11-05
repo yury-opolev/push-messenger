@@ -568,6 +568,9 @@ impl Config {
         let Some(first_root) = self.roots.first() else {
             return invalid("roots must name at least one folder");
         };
+        if self.default_folder.as_os_str().is_empty() {
+            return invalid("default_folder must name a folder");
+        }
         let Some(default_folder) = self.default_folder.to_str() else {
             return invalid("default_folder is not valid Unicode");
         };
@@ -853,6 +856,16 @@ mod tests {
         let mut half = config.clone();
         half["default_folder"] = json!(fixture.root);
         assert!(load(&fixture, &half).unwrap().validate().is_err());
+        for backend in ["coda", "echo"] {
+            let mut roots_only = minimal(&fixture);
+            roots_only["backend"] = json!(backend);
+            roots_only.as_object_mut().unwrap().remove("default_folder");
+            let error = load(&fixture, &roots_only).unwrap().validate().unwrap_err();
+            assert!(
+                error.to_string().contains("default_folder"),
+                "{backend}: {error}"
+            );
+        }
         let configured = load(&fixture, &minimal(&fixture)).unwrap();
         let (roots, _) = configured.folders(fixture.dir.path()).unwrap();
         assert_eq!(roots, std::slice::from_ref(&fixture.root));

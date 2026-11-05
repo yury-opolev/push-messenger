@@ -602,3 +602,33 @@ async fn coda_still_answers_only_its_owner() {
     assert_eq!(h.count("prompt"), 0);
     assert!(replies_to(&h.messenger.calls(), with_alice).is_empty());
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_contact_s_open_question_keeps_its_activity_fresh() {
+    let h = started(300).await;
+    let alice = contact(&h);
+    let with_alice = h.messenger.conversation_with(alice);
+    h.messenger.says(alice, "ask");
+    card_in(&h, with_alice, 1).await;
+    tokio::time::sleep(Duration::from_secs(31)).await;
+    let waiting = (ActivityState::Waiting, Some("question open".to_owned()));
+    let sent = activities_in(&h, with_alice)
+        .into_iter()
+        .filter(|activity| *activity == waiting)
+        .count();
+    assert!(sent >= 3, "sent {sent} times in 31 s");
+    h.messenger.says(alice, "red");
+    reply_in(&h, with_alice, "you chose: Red").await;
+    settle().await;
+    assert_eq!(
+        activities_in(&h, with_alice).last(),
+        Some(&(ActivityState::Idle, None))
+    );
+    let before = activities_in(&h, with_alice).len();
+    tokio::time::sleep(Duration::from_secs(31)).await;
+    assert_eq!(
+        activities_in(&h, with_alice).len(),
+        before,
+        "idle is sent once"
+    );
+}
