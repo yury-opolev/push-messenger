@@ -175,10 +175,17 @@ try {
     }
     Check 'the coturn pod becomes Ready in the restricted namespace' { CoturnReady }
     Check 'a TURN allocation and refresh against the coturn Service succeed with REST credentials' {
-        $allocation = TurnAllocation
-        $passed = $allocation.exit -eq '0' -and $allocation.log -match 'Received relay addr: 203\.0\.113\.10:' -and
-            $allocation.log -match 'refresh response received: \s*\S*\s*INFO success'
-        if (-not $passed) { Write-Host "exit code $($allocation.exit)"; Write-Host $allocation.log }
+        # The Service's UDP forwarding can lag the pod's readiness by a few seconds
+        # ("recv: Connection refused"): a bounded retry.
+        for ($attempt = 1; $attempt -le 10; $attempt++) {
+            $allocation = TurnAllocation
+            $passed = $allocation.exit -eq '0' -and $allocation.log -match 'Received relay addr: 203\.0\.113\.10:' -and
+                $allocation.log -match 'refresh response received: \s*\S*\s*INFO success'
+            if ($passed) { break }
+            Write-Host "allocation attempt $attempt failed (exit code $($allocation.exit))"
+            Start-Sleep -Seconds 3
+        }
+        if (-not $passed) { Write-Host $allocation.log }
         $passed
     }
     Check 'coturn refuses an allocation with a wrong password (control)' {
