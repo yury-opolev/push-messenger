@@ -34,6 +34,7 @@ impl<M: Messenger> Core<M> {
             Event::OpenedElsewhere => return Err(BridgeError::OpenedElsewhere),
             Event::EventsLost => tracing::warn!(event = "messenger_events_lost"),
             Event::Call(event) => self.on_call(event).await,
+            Event::ContactChanged(contact) => self.contact_changed(contact.user_id, contact.state),
             _ => {}
         }
         Ok(())
@@ -51,6 +52,7 @@ impl<M: Messenger> Core<M> {
                 if reconnected {
                     tracing::info!(event = "messenger_reconnected");
                     self.update_activity(true).await;
+                    self.refresh_contact_activity(true).await;
                     self.fetch_pending().await;
                 }
                 Ok(())
@@ -70,6 +72,9 @@ impl<M: Messenger> Core<M> {
         }
         match message.kind {
             MessageKind::Answer => self.on_answer(&message).await,
+            MessageKind::Text if message.sender_id != self.owner && self.accepts_contacts => {
+                self.contact_message(message).await;
+            }
             MessageKind::Text | MessageKind::Rich if message.sender_id != self.owner => {
                 self.stranger(message.sender_id, message.conversation_id);
             }
@@ -90,7 +95,7 @@ impl<M: Messenger> Core<M> {
 
     /// The text was stored too long before the bridge started for the backend to take it
     /// (see [`crate::backend::Backend::skip_texts_older_than`]).
-    fn before_start(&self, message: &Message) -> bool {
+    pub(super) fn before_start(&self, message: &Message) -> bool {
         matches!(
             (self.skip_before_us, message.server_ts),
             (Some(limit), Some(stored)) if stored < limit
@@ -113,7 +118,7 @@ impl<M: Messenger> Core<M> {
 
     /// Anyone but the owner hears [`PRIVATE`], at most once an hour; nothing reaches the
     /// backend.
-    fn stranger(&mut self, sender: UserId, conversation: ConversationId) {
+    pub(super) fn stranger(&mut self, sender: UserId, conversation: ConversationId) {
         let now = Instant::now();
         let quiet = |at: &Instant| now.saturating_duration_since(*at) < STRANGER_QUIET;
         if self.strangers.get(&sender).is_some_and(quiet) {
@@ -138,6 +143,8 @@ impl<M: Messenger> Core<M> {
                     .iter()
                     .position(|request| request.card == Some(card.client_msg_id))
                 else {
+                    self.contact_card_answered(card.client_msg_id, &values)
+                        .await;
                     return;
                 };
                 let request = self.open.remove(index);
@@ -304,6 +311,7 @@ impl<M: Messenger> Core<M> {
             .iter()
             .position(|request| request.card == Some(id))
         else {
+            self.contact_card_refused(id, error.code());
             return;
         };
         let request = self.open.remove(index);

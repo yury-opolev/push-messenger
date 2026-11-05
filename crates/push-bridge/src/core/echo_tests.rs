@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-use push_sdk::{ActivityState, Event, MessageKind, UserId};
+use push_sdk::{ActivityState, ContactState, Event, MessageKind, UserId};
 
 use super::tests::{Harness, settle};
 use crate::commands;
@@ -290,4 +290,345 @@ async fn stop_declines_an_open_question_and_echoing_goes_on() {
     h.idle().await;
     h.messenger.owner_says("again");
     reply(&h, "echo: again").await;
+}
+
+/// The latest text of every agent reply sent into `conversation`, in order.
+fn replies_to(calls: &[Call], conversation: push_sdk::ConversationId) -> Vec<String> {
+    let mut bodies: Vec<(push_sdk::ClientMsgId, String)> = Vec::new();
+    for call in calls {
+        match call {
+            Call::SendRich {
+                conversation: to,
+                id,
+                body,
+            } if *to == conversation => bodies.push((*id, body.clone())),
+            Call::EditRich { id, body, .. } => {
+                if let Some(entry) = bodies.iter_mut().find(|(sent, _)| sent == id) {
+                    entry.1 = body.clone();
+                }
+            }
+            _ => {}
+        }
+    }
+    bodies
+        .into_iter()
+        .filter(|(_, body)| template(body).starts_with("agent.reply@"))
+        .filter_map(|(_, body)| param(&body, "text"))
+        .collect()
+}
+
+/// The cards sent into `conversation`: `(id, template)`.
+fn cards_to(
+    calls: &[Call],
+    conversation: push_sdk::ConversationId,
+) -> Vec<(push_sdk::ClientMsgId, String)> {
+    calls
+        .iter()
+        .filter_map(|call| match call {
+            Call::SendRich {
+                conversation: to,
+                id,
+                body,
+            } if *to == conversation && !template(body).starts_with("agent.reply@") => {
+                Some((*id, template(body)))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Waits for a reply that is exactly `text` in `conversation`.
+async fn reply_in(h: &Harness, conversation: push_sdk::ConversationId, text: &str) {
+    h.messenger
+        .wait_until(text, |calls| {
+            replies_to(calls, conversation)
+                .iter()
+                .any(|shown| shown == text)
+        })
+        .await;
+}
+
+/// The `count`th card in `conversation`, once sent.
+async fn card_in(
+    h: &Harness,
+    conversation: push_sdk::ConversationId,
+    count: usize,
+) -> push_sdk::ClientMsgId {
+    h.messenger
+        .wait_until("a card", |calls| {
+            cards_to(calls, conversation).len() >= count
+        })
+        .await;
+    cards_to(&h.messenger.calls(), conversation)[count - 1].0
+}
+
+/// A new user who is the agent's accepted contact.
+fn contact(h: &Harness) -> UserId {
+    let user = UserId::new();
+    h.messenger.set_contact(user, ContactState::Accepted);
+    user
+}
+
+fn activities_in(
+    h: &Harness,
+    conversation: push_sdk::ConversationId,
+) -> Vec<(ActivityState, Option<String>)> {
+    h.messenger
+        .calls()
+        .into_iter()
+        .filter_map(|call| match call {
+            Call::Activity {
+                conversation: to,
+                state,
+                label,
+            } if to == conversation => Some((state, label)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_accepted_contact_s_text_is_echoed_in_their_conversation() {
+    let h = started(300).await;
+    let alice = contact(&h);
+    let with_alice = h.messenger.conversation_with(alice);
+    h.messenger.says(alice, "hi *there*");
+    reply_in(&h, with_alice, "echo: hi *there*").await;
+    settle().await;
+    let calls = h.messenger.calls();
+    assert!(replies_to(&calls, h.messenger.conversation()).is_empty());
+    assert!(calls.iter().any(|call| matches!(call,
+        Call::SendRich { conversation, body, .. }
+            if *conversation == with_alice && template(body) == "agent.reply@2")));
+    assert_eq!(
+        activities_in(&h, with_alice),
+        [
+            (ActivityState::Working, Some("echoing".to_owned())),
+            (ActivityState::Idle, None)
+        ]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn strangers_requests_and_blocked_users_are_refused() {
+    let h = started(300).await;
+    for state in [
+        ContactState::None,
+        ContactState::RequestedIn,
+        ContactState::RequestedOut,
+        ContactState::Blocked,
+    ] {
+        let user = UserId::new();
+        h.messenger.set_contact(user, state);
+        h.messenger.says(user, "hello");
+        let with_user = h.messenger.conversation_with(user);
+        h.messenger
+            .wait_until("private", |_| {
+                h.messenger
+                    .texts()
+                    .contains(&(with_user, super::PRIVATE.to_owned()))
+            })
+            .await;
+        settle().await;
+        assert!(
+            replies_to(&h.messenger.calls(), with_user).is_empty(),
+            "{state:?}"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_contact_who_becomes_accepted_is_echoed_after_the_change() {
+    let h = started(300).await;
+    let bob = UserId::new();
+    let with_bob = h.messenger.conversation_with(bob);
+    h.messenger.says(bob, "first");
+    settle().await;
+    assert!(replies_to(&h.messenger.calls(), with_bob).is_empty());
+    h.messenger.inject(Event::ContactChanged(push_sdk::Contact {
+        user_id: bob,
+        state: ContactState::Accepted,
+    }));
+    h.messenger.set_contact(bob, ContactState::Accepted);
+    h.messenger.says(bob, "second");
+    reply_in(&h, with_bob, "echo: second").await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn only_the_asker_answers_their_card() {
+    let h = started(300).await;
+    let (alice, bob) = (contact(&h), contact(&h));
+    let (with_alice, with_bob) = (
+        h.messenger.conversation_with(alice),
+        h.messenger.conversation_with(bob),
+    );
+    h.messenger.says(alice, "ask");
+    let alice_card = card_in(&h, with_alice, 1).await;
+    assert_eq!(
+        cards_to(&h.messenger.calls(), with_alice)[0].1,
+        "agent.question@1"
+    );
+    h.messenger
+        .wait_until("waiting", |_| {
+            activities_in(&h, with_alice)
+                .contains(&(ActivityState::Waiting, Some("question open".to_owned())))
+        })
+        .await;
+    h.messenger.owner_says("ask");
+    let owner_card = card_in(&h, h.messenger.conversation(), 1).await;
+
+    // Anyone else's answer to a card is ignored; the cards stay open.
+    h.messenger.answer_in(with_alice, bob, alice_card, &["o1"]);
+    h.messenger
+        .answer_in(with_alice, h.messenger.owner_id(), alice_card, &["o1"]);
+    h.messenger.answer_as(alice, owner_card, &["o1"]);
+    // Bob's own text is just echoed, in his conversation.
+    h.messenger.says(bob, "Red");
+    reply_in(&h, with_bob, "echo: Red").await;
+    settle().await;
+    let chose = |conversation| {
+        replies_to(&h.messenger.calls(), conversation)
+            .iter()
+            .any(|text| text.starts_with("you chose"))
+    };
+    assert!(!chose(with_alice) && !chose(h.messenger.conversation()));
+
+    h.messenger
+        .answer_in(with_alice, alice, alice_card, &["o2"]);
+    reply_in(&h, with_alice, "you chose: Blue").await;
+    h.messenger.answer(owner_card, &["o1"]);
+    reply(&h, "you chose: Red").await;
+    assert!(!chose(with_bob));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_contact_answers_by_text_and_picks_several() {
+    let h = started(300).await;
+    let alice = contact(&h);
+    let with_alice = h.messenger.conversation_with(alice);
+    h.messenger.says(alice, "pick");
+    card_in(&h, with_alice, 1).await;
+    assert_eq!(
+        cards_to(&h.messenger.calls(), with_alice)[0].1,
+        "agent.choose@1"
+    );
+    h.messenger.says(alice, "green, red");
+    reply_in(&h, with_alice, "you chose: Red, Green").await;
+    h.messenger.says(alice, "ask");
+    card_in(&h, with_alice, 2).await;
+    h.messenger.says(alice, "teal");
+    reply_in(&h, with_alice, "you chose: teal").await;
+    h.messenger.says(alice, "ask");
+    let card = card_in(&h, with_alice, 3).await;
+    h.messenger.answer_in(with_alice, alice, card, &["o1"]);
+    reply_in(&h, with_alice, "you chose: Red").await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn each_contact_s_card_times_out_on_its_own() {
+    let h = started(10).await;
+    let (alice, bob) = (contact(&h), contact(&h));
+    let (with_alice, with_bob) = (
+        h.messenger.conversation_with(alice),
+        h.messenger.conversation_with(bob),
+    );
+    h.messenger.says(alice, "ask");
+    card_in(&h, with_alice, 1).await;
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    h.messenger.says(bob, "ask");
+    card_in(&h, with_bob, 1).await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    reply_in(&h, with_alice, "No answer; skipped").await;
+    assert!(replies_to(&h.messenger.calls(), with_bob).is_empty());
+    h.messenger.says(alice, "after");
+    reply_in(&h, with_alice, "echo: after").await;
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    reply_in(&h, with_bob, "No answer; skipped").await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn contacts_may_run_only_help_and_status() {
+    let h = started(300).await;
+    let alice = contact(&h);
+    let with_alice = h.messenger.conversation_with(alice);
+    h.messenger.says(alice, "/help");
+    reply_in(&h, with_alice, super::contacts::CONTACT_HELP).await;
+    h.messenger.says(alice, "/status");
+    reply_in(
+        &h,
+        with_alice,
+        &format!("{NAME}: {}", env!("CARGO_PKG_VERSION")),
+    )
+    .await;
+    for command in ["/new", "/stop", "/cd ..", "/model", "/mode bypass"] {
+        h.messenger.says(alice, command);
+    }
+    h.messenger
+        .wait_until("refusals", |calls| {
+            replies_to(calls, with_alice)
+                .iter()
+                .filter(|text| *text == super::contacts::OWNER_ONLY)
+                .count()
+                == 5
+        })
+        .await;
+    h.messenger.says(alice, "/shrug");
+    reply_in(&h, with_alice, "echo: /shrug").await;
+    assert!(
+        h.replies()
+            .iter()
+            .all(|text| !text.contains("Not supported"))
+    );
+    assert!(replies_to(&h.messenger.calls(), h.messenger.conversation()).is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn coda_still_answers_only_its_owner() {
+    let mut h = Harness::named("Coda");
+    h.start();
+    h.backend.wait_for("start", 1).await;
+    settle().await;
+    let alice = contact(&h);
+    let with_alice = h.messenger.conversation_with(alice);
+    h.messenger.says(alice, "hi");
+    h.messenger
+        .wait_until("private", |_| {
+            h.messenger
+                .texts()
+                .contains(&(with_alice, super::PRIVATE.to_owned()))
+        })
+        .await;
+    settle().await;
+    assert_eq!(h.count("prompt"), 0);
+    assert!(replies_to(&h.messenger.calls(), with_alice).is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_contact_s_open_question_keeps_its_activity_fresh() {
+    let h = started(300).await;
+    let alice = contact(&h);
+    let with_alice = h.messenger.conversation_with(alice);
+    h.messenger.says(alice, "ask");
+    card_in(&h, with_alice, 1).await;
+    tokio::time::sleep(Duration::from_secs(31)).await;
+    let waiting = (ActivityState::Waiting, Some("question open".to_owned()));
+    let sent = activities_in(&h, with_alice)
+        .into_iter()
+        .filter(|activity| *activity == waiting)
+        .count();
+    assert!(sent >= 3, "sent {sent} times in 31 s");
+    h.messenger.says(alice, "red");
+    reply_in(&h, with_alice, "you chose: Red").await;
+    settle().await;
+    assert_eq!(
+        activities_in(&h, with_alice).last(),
+        Some(&(ActivityState::Idle, None))
+    );
+    let before = activities_in(&h, with_alice).len();
+    tokio::time::sleep(Duration::from_secs(31)).await;
+    assert_eq!(
+        activities_in(&h, with_alice).len(),
+        before,
+        "idle is sent once"
+    );
 }

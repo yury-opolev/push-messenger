@@ -35,10 +35,13 @@ pub struct Config {
     /// The device's name; by default the computer's name.
     #[serde(default)]
     pub device_name: Option<String>,
-    /// The folders the agent may work in (and below); at least one.
+    /// The folders the agent may work in (and below); at least one (the echo backend may
+    /// leave this and `default_folder` out: it works in the bridge's folder).
+    #[serde(default)]
     pub roots: Vec<PathBuf>,
     /// The folder a new bridge starts in: inside `roots`; a relative path is relative to
     /// the first root.
+    #[serde(default)]
     pub default_folder: PathBuf,
     /// `default`, `acceptEdits` or `plan`; never `bypassPermissions` (the owner turns
     /// approvals off with `/mode bypass`, confirmed by a card, until `/new`).
@@ -559,9 +562,15 @@ impl Config {
                 "default_permission_mode cannot be bypassPermissions: the owner turns approvals off with /mode bypass",
             );
         }
+        if self.uses_bridge_folder() {
+            return self.validate_rest();
+        }
         let Some(first_root) = self.roots.first() else {
             return invalid("roots must name at least one folder");
         };
+        if self.default_folder.as_os_str().is_empty() {
+            return invalid("default_folder must name a folder");
+        }
         let Some(default_folder) = self.default_folder.to_str() else {
             return invalid("default_folder is not valid Unicode");
         };
@@ -571,6 +580,33 @@ impl Config {
                 self.default_folder.display()
             )));
         }
+        self.validate_rest()
+    }
+
+    /// The echo backend without `roots` and `default_folder`: it works in the bridge's
+    /// own folder.
+    pub fn uses_bridge_folder(&self) -> bool {
+        self.backend == BackendKind::Echo
+            && self.roots.is_empty()
+            && self.default_folder.as_os_str().is_empty()
+    }
+
+    /// The roots and the default folder's real path (a relative one is inside the first
+    /// root); the echo backend without them works in the bridge's folder `dir`. `None`
+    /// when the default folder is not usable.
+    pub fn folders(&self, dir: &Path) -> Option<(Vec<PathBuf>, PathBuf)> {
+        if self.uses_bridge_folder() {
+            let folder = folders::resolve(".", dir, &[dir.to_path_buf()]).ok()?;
+            return Some((vec![folder.clone()], folder));
+        }
+        let first = self.roots.first()?;
+        let folder = folders::resolve(self.default_folder.to_str()?, first, &self.roots).ok()?;
+        Some((self.roots.clone(), folder))
+    }
+
+    /// The checks after the folders': the calls section and the backend's section.
+    fn validate_rest(&self) -> Result<(), ConfigError> {
+        let invalid = |message: &str| Err(ConfigError::Invalid(message.to_owned()));
         if let Some(calls) = &self.calls {
             calls.validate().map_err(ConfigError::Invalid)?;
         }
@@ -794,6 +830,45 @@ mod tests {
         }
         config["echo"] = json!({ "answerTimeout": 30 });
         assert!(load(&fixture, &config).is_err());
+    }
+
+    #[test]
+    fn the_echo_backend_may_work_in_the_bridge_s_folder() {
+        let fixture = fixture();
+        let config = json!({
+            "api_url": "https://push.example.com",
+            "backend": "echo",
+        });
+        let loaded = load(&fixture, &config).unwrap();
+        loaded.validate().unwrap();
+        assert!(loaded.uses_bridge_folder());
+        let (roots, folder) = loaded.folders(fixture.dir.path()).unwrap();
+        assert_eq!(roots, std::slice::from_ref(&folder));
+        assert_eq!(
+            folder,
+            folders::resolve(".", fixture.dir.path(), &[fixture.dir.path().to_path_buf()]).unwrap()
+        );
+
+        let mut coda = minimal(&fixture);
+        coda.as_object_mut().unwrap().remove("roots");
+        coda.as_object_mut().unwrap().remove("default_folder");
+        assert!(load(&fixture, &coda).unwrap().validate().is_err());
+        let mut half = config.clone();
+        half["default_folder"] = json!(fixture.root);
+        assert!(load(&fixture, &half).unwrap().validate().is_err());
+        for backend in ["coda", "echo"] {
+            let mut roots_only = minimal(&fixture);
+            roots_only["backend"] = json!(backend);
+            roots_only.as_object_mut().unwrap().remove("default_folder");
+            let error = load(&fixture, &roots_only).unwrap().validate().unwrap_err();
+            assert!(
+                error.to_string().contains("default_folder"),
+                "{backend}: {error}"
+            );
+        }
+        let configured = load(&fixture, &minimal(&fixture)).unwrap();
+        let (roots, _) = configured.folders(fixture.dir.path()).unwrap();
+        assert_eq!(roots, std::slice::from_ref(&fixture.root));
     }
 
     #[test]

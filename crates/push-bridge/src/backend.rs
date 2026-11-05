@@ -359,7 +359,22 @@ pub enum BackendEvent {
     Exited {
         reason: String,
     },
+    /// A reply to an accepted contact's text (see [`Backend::contact_prompt`]).
+    ContactReply {
+        contact: ContactId,
+        text: String,
+    },
+    /// A question to an accepted contact; only that contact's answer counts.
+    ContactRequest {
+        contact: ContactId,
+        request: BackendRequest,
+    },
 }
+
+/// An accepted contact the core passed to [`Backend::contact_prompt`]: an opaque id the
+/// backend hands back in its contact events.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ContactId(pub String);
 
 /// A backend command, from the owner's `/…` commands.
 #[derive(Clone, PartialEq, Eq)]
@@ -450,6 +465,19 @@ pub trait Backend: Send + Sync + 'static {
     /// delivered (a restart does not replay them); `None` delivers them all.
     fn skip_texts_older_than(&self) -> Option<Duration> {
         None
+    }
+    /// Takes texts from the agent's accepted contacts too (through
+    /// [`Backend::contact_prompt`]), not only from its owner. `false` (the default): only
+    /// the owner reaches the backend.
+    fn accepts_contacts(&self) -> bool {
+        false
+    }
+    /// An accepted contact's text, in their direct conversation with the agent. The
+    /// backend answers with [`BackendEvent::ContactReply`] and
+    /// [`BackendEvent::ContactRequest`] naming `contact`; it resolves when it is done with
+    /// the text. Called only when [`Backend::accepts_contacts`].
+    async fn contact_prompt(&self, _contact: ContactId, _text: &str) -> Result<(), BackendError> {
+        Err(unsupported("contact/prompt"))
     }
     /// Starts the agent in `options.folder` (restarting its process when the folder
     /// changed or it is not running) and opens `options.session`, or a new session when
@@ -587,6 +615,12 @@ impl fmt::Debug for BackendEvent {
             Self::Error(message) => write!(formatter, "Error({:?})", Length(message)),
             Self::TurnEnded { interrupted } => write!(formatter, "TurnEnded({interrupted})"),
             Self::Exited { reason } => write!(formatter, "Exited({:?})", Length(reason)),
+            Self::ContactReply { text, .. } => {
+                write!(formatter, "ContactReply({:?})", Length(text))
+            }
+            Self::ContactRequest { request, .. } => {
+                write!(formatter, "ContactRequest({:?})", request.kind)
+            }
         }
     }
 }
@@ -732,6 +766,13 @@ mod tests {
                 }
             ),
             format!("{:?}", BackendCommand::AskAside(secret.into())),
+            format!(
+                "{:?}",
+                BackendEvent::ContactReply {
+                    contact: ContactId("u-1".into()),
+                    text: secret.into(),
+                }
+            ),
             format!("{:?}", BackendCommand::SetGoal(Some(secret.into()))),
             format!(
                 "{:?}",

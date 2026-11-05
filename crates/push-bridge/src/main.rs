@@ -17,7 +17,6 @@ use push_bridge::config::{self, BackendKind, CallsConfig, Config};
 use push_bridge::control::{Action, Calls, ControlCall, ControlHandle, ControlHub, error};
 use push_bridge::core::{Bridge, BridgeError, BridgeOptions, CallFlag};
 use push_bridge::echo::EchoBackend;
-use push_bridge::folders;
 use push_bridge::logging;
 use push_bridge::messenger::{EVENT_QUEUE, Reconnect, SdkMessenger};
 use push_bridge::state::{self, BridgeSecretStore, StateFile};
@@ -162,10 +161,9 @@ fn load_state(dir: &Path) -> Result<Arc<StateFile>, Failure> {
         .map_err(|e| Failure::general(e.to_string()))
 }
 
-/// The default folder's real path (a relative one is inside the first root).
-fn default_folder(config: &Config) -> Option<PathBuf> {
-    let first = config.roots.first()?;
-    folders::resolve(config.default_folder.to_str()?, first, &config.roots).ok()
+/// The roots and the default folder's real path (see [`Config::folders`]).
+fn folders_of(config: &Config, dir: &Path) -> Option<(Vec<PathBuf>, PathBuf)> {
+    config.folders(dir)
 }
 
 fn keygen(dir: &Path) -> Result<(), Failure> {
@@ -204,7 +202,7 @@ async fn status(dir: &Path) -> Result<(), Failure> {
     println!("Device:        {}", or_none(state.device_id));
     let folder = state
         .folder
-        .or_else(|| default_folder(&config))
+        .or_else(|| folders_of(&config, dir).map(|(_, folder)| folder))
         .unwrap_or_else(|| config.default_folder.clone());
     println!("Folder:        {}", folder.display());
     if state.sessions.is_empty() {
@@ -532,10 +530,10 @@ async fn run(dir: &Path) -> Result<(), Failure> {
         BackendKind::Echo => None,
     };
     let echo = config.echo.unwrap_or_default();
-    let default_folder =
-        default_folder(&config).ok_or_else(|| Failure::general("default_folder is not usable"))?;
+    let (roots, default_folder) =
+        folders_of(&config, dir).ok_or_else(|| Failure::general("default_folder is not usable"))?;
     let options = BridgeOptions {
-        roots: config.roots.clone(),
+        roots,
         default_folder,
         default_mode: config.default_permission_mode,
     };
