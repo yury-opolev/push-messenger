@@ -41,7 +41,7 @@ here too, this guide describes what the code does.
 | What runs | one `push-agent-bridge.exe run` per agent, as the logged-on user, started at logon by a Scheduled Task or by the [tray app](#13-the-tray-app-push-agent-tray) (never both) |
 | Local control | each bridge serves a per-user [control channel](#14-control-channel-for-other-tools) (a named pipe): states and counts out, `restart_backend`, `reconnect`, `shutdown`, `pause_backend` and `resume_backend` in; never message content |
 | Identity | an owned agent signed in with [agent-key](agent-key-sign-in.md): a non-exportable P-256 key in the TPM (or the software key storage provider) |
-| Who may use it | only the agent's owner (`owner_user_id` of the agent's own profile); anyone else gets "This agent is private." |
+| Who may use it | only the agent's owner (`owner_user_id` of the agent's own profile); anyone else gets "This agent is private." (the [echo test agent](#19-echo-backend) also answers accepted contacts) |
 | The agent | `coda serve` over stdio (JSON-RPC 2.0 with Content-Length framing), started and restarted by the bridge |
 | Replies | `agent.reply@2` cards (Coda writes Markdown; `agent.reply@1` for a plain-text backend): thinking, tool steps and text, edited as the turn runs |
 | Questions to the owner | `agent.approval@1`, `agent.question@1`, `agent.choose@1`, `agent.plan-approval@1` ([built-ins](rich-messages.md#6-built-in-templates)) |
@@ -86,6 +86,7 @@ backend with backoff. It talks to push-messenger through a small `Messenger` tra
 | `answer_timeout()` | how long a card waits for the owner (default 10 minutes) |
 | `activity_labels()` | the activity labels while working with no tool running (default `thinking`) and while a question is open (default `question`) |
 | `skip_texts_older_than()` | owner texts stored more than this before the bridge started are not delivered (default: all are) |
+| `accepts_contacts()`, `contact_prompt(contact, text)` | take accepted contacts' texts too (default: no, owner-only); replies come back as `ContactReply` and questions as `ContactRequest` events naming the contact, posted in that contact's conversation, answerable only by them. Commands (but `/help`, `/status`) and calls stay the owner's |
 
 The backend reports through an unbounded channel of `BackendEvent`s: turn started (by a
 prompt or by the engine) and ended (interrupted or not), thinking and text deltas, tool
@@ -207,8 +208,8 @@ Create `%LOCALAPPDATA%\push-messenger\coda-bridge\config.json`. Every field:
 | `key.name` | no | the key's name in Windows key storage: one key per agent; not empty | `push-messenger-coda-bridge` |
 | `key.storage` | no | `windows` (CNG: the TPM, else the software provider; never exportable) or `software-file` (`<dir>\agent-key.p8`, a plain file, for development and tests only) | `windows` |
 | `device_name` | no | the device's name on the server | `%COMPUTERNAME%`, else `push-agent-bridge` |
-| `roots` | yes | the folders the agent may work in and below; at least one | |
-| `default_folder` | yes | the folder a new bridge starts in: a real folder inside `roots`; a relative path is relative to the first root | |
+| `roots` | yes (`echo`: no) | the folders the agent may work in and below; at least one. The echo backend may leave out `roots` and `default_folder` together and works in the bridge's folder | |
+| `default_folder` | yes (`echo`: no) | the folder a new bridge starts in: a real folder inside `roots`; a relative path is relative to the first root | |
 | `default_permission_mode` | no | `default`, `acceptEdits` or `plan`; `bypassPermissions` is refused (use `/mode bypass`) | `default` |
 | `backend` | yes | `coda`, or `echo` (the [echo test agent](#19-echo-backend)) | |
 | `echo.answerTimeoutS` | no | with `echo`: how long an `ask` or `pick` card waits, 10 to 3600 seconds | `300` |
@@ -550,7 +551,7 @@ restarts."
 
 | Threat | Mitigation |
 |---|---|
-| Someone else controls the agent | Only text from `owner_user_id` (from the agent's own profile) in the owner's direct conversation reaches Coda. Only the owner's card answers count, checked by the bridge with `CardBook` (sender, card, offered values, deadline), since the server does not check who answers |
+| Someone else controls the agent | Only text from `owner_user_id` (from the agent's own profile) in the owner's direct conversation reaches Coda (a backend that opts in with `accepts_contacts`, only the echo test agent, also gets accepted contacts' plain texts, never their commands or calls). Only the owner's card answers count, checked by the bridge with `CardBook` (sender, card, offered values, deadline), since the server does not check who answers |
 | Key theft | A non-exportable P-256 key in the TPM (or the software provider, encrypted with the user's DPAPI keys); signing happens inside the provider and only the public key leaves it. Each assertion lives 120 s, has a new `jti` and is accepted once by auth-svc. `software-file` keys are plain files: development only |
 | Secrets leaving the machine | Everything sent is masked first (below) and capped. **Message history is stored on the server unencrypted**: bodies, cards and answers are plaintext to the server and its operators, and stay in the history |
 | Approval bypass from a stolen messenger session | `/mode bypass` (and `/yolo`) needs a confirmation card; `default_permission_mode` cannot be `bypassPermissions`; `/new`, `/cd` and a bridge restart reset it; `/status` shows it |
@@ -2210,52 +2211,67 @@ no credentials beyond the bridge's own agent key. It exists for contract checks 
 manual tests from a dev box (texts, cards and their answer rules, activity, the tray,
 voice calls) where a cloud-hosted test agent cannot sign in. Everything else works as for
 Coda: `api_url`, the key and `keygen`, `enroll --code`, the state folder, the control
-channel, the tray, `calls`. `roots` and `default_folder` are still required (the core
-needs a folder); any existing folder will do, nothing is read or written there.
+channel, the tray, `calls`. `roots` and `default_folder` may be left out (both, not
+one): the echo agent then works in the bridge's own folder (`--dir`); nothing is read or
+written there.
 
 ```json
 {
   "api_url": "https://push.example.com",
   "key": { "name": "push-messenger-echo" },
-  "roots": ["C:\\src"],
-  "default_folder": "C:\\src",
   "backend": "echo",
   "echo": { "answerTimeoutS": 300 }
 }
 ```
 
 `echo` is optional; `answerTimeoutS` (default 300) must be 10 to 3600 seconds
-(`enroll` and `run` refuse anything else; `status` says what is wrong). Use `--dir` for a folder of its own, and a
-`key.name` of its own, as for [several agents](#several-agents-on-one-machine).
+(`enroll` and `run` refuse anything else; `status` says what is wrong). Use `--dir` for
+a folder of its own, and a `key.name` of its own, as for
+[several agents](#several-agents-on-one-machine).
 
 **Behaviour.** Texts are matched after trimming, in any case.
 
-| The owner sends | The echo agent |
+| The owner or an accepted contact sends | The echo agent |
 |---|---|
 | `ask` | posts `agent.question@1` "Red or blue?" (Red, Blue); activity `waiting` / `question open`. The answer (a button, a label or number, or any other text, which is the free-text answer) gets "you chose: <answer>" |
 | `pick` | posts `agent.choose@1` "Pick any colours." (Red, Blue, Green; any number of them; typed answers separated by commas); "you chose: Red, Green" in option order |
 | anything else | replies `agent.reply@2` (Markdown) "echo: <text>", with activity `working` / `echoing`; a text over 4,000 characters continues in further replies, as every turn does |
 
-- **Who may talk to it:** the bridge's rule, unchanged: only the agent's owner, in the
-  owner's direct conversation. Anyone else, an accepted contact too, gets "This agent is
-  private." and nothing reaches the backend. So the one who asked is always the owner;
-  anyone else's answer to the card is refused (`answer_refused`) and the card stays open.
-  While a card is open, the owner's next text answers it.
-- **Timeout:** an unanswered card closes after `answerTimeoutS`: "No answer; skipped".
-- **`/stop`** while a card is open declines it ("Declined: the turn was stopped.").
+- **Who may talk to it:** the owner, and the agent's **accepted contacts**, each in their
+  own direct conversation with the agent, where its replies and cards go. The echo backend
+  opts in with `Backend::accepts_contacts` (Coda does not: it stays owner-only). The
+  relationship is the server's (`list_contacts`, kept for 60 s and updated by contact
+  events): requests either way, blocked users and strangers get "This agent is private."
+  and nothing reaches the backend. The agent never accepts a contact request by itself:
+  the owner adds contacts (for example by inviting the test user from the agent's
+  account in the app) as for any agent.
+- **Only the asker answers:** each open card belongs to whoever asked (the owner or that
+  contact). Anyone else's answer to it is refused (`answer_refused`) and the card stays
+  open; while a card is open, the asker's next text answers it, and other users' texts
+  are echoed as usual. Several users may have cards open at once.
+- **Timeout:** each unanswered card closes after `answerTimeoutS` on its own: "No answer;
+  skipped" in the asker's conversation.
+- **`/stop`** (the owner's) while the owner's card is open declines it ("Declined: the
+  turn was stopped.").
 - **Old texts:** a text stored more than 60 s before the bridge started is skipped
   (logged as `old_text_skipped`, without content), so a restart does not replay the
   backlog.
-- **Commands:** the echo agent reports no capabilities. `/help`, `/status` and `/stop`
-  are the core's and work; every other command (`/new`, `/cd`, `/sessions`, `/model`,
-  `/tasks`, `/mode`, …) answers "Not supported by Echo.". Any other `/text` is echoed.
-- **Calls:** with `calls.adapter` configured (a build with `--features voice`), the owner's
-  call is answered as for Coda and each final transcript is echoed and spoken back
+- **Commands:** the echo agent reports no capabilities. For the owner, `/help`, `/status`
+  and `/stop` are the core's and work; every other command (`/new`, `/cd`, `/sessions`,
+  `/model`, `/tasks`, `/mode`, …) answers "Not supported by Echo.". A contact may run
+  `/help` (their short list) and `/status` (the agent's name and version only, nothing
+  about the owner's folder or session); any other command answers "Only the agent's
+  owner can use this command.". Any other `/text` is echoed.
+- **Calls** stay the owner's (contacts' calls are declined, as for every backend): with
+  `calls.adapter` configured (a build with `--features voice`), the owner's call is answered as for Coda and each final transcript is echoed and spoken back
   through the adapter as "echo: <text>". Without an adapter, calls are not advertised.
 - **Tray:** the tray shows "Echo" where it would show "Coda" ("Restart Echo", "Echo
   restarting", "Echo version").
 - **Not modelled:** sessions, folders, tasks, background messages, plans and approvals;
   `pause` stops it until `resume` (it has no program to watch and no state to save).
 
+- **Old texts** are skipped for contacts too; activity (`echoing`, `question open`) is
+  sent in each user's own conversation.
+
 `cargo test -p push-bridge --lib echo` runs its tests (the core with a `TestMessenger`,
-and a call through the testkit adapter).
+contacts, the asker-only rule across users, and a call through the testkit adapter).

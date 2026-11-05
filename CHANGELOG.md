@@ -6,6 +6,17 @@ Notable changes for consumers of push-messenger. Newest first.
 
 ### Added
 
+- **Echo backend: accepted contacts** — the echo test agent now also answers the
+  agent's accepted contacts (server-side relationship; requests, blocked users and
+  strangers still get "This agent is private."), each in their own direct conversation.
+  Every `ask`/`pick` card belongs to whoever asked: anyone else's answer is ignored and
+  the card stays open, the asker's text answers it, and each card times out on its own.
+  Contacts may run only `/help` and `/status`; other commands and calls stay the owner's.
+  New defaulted `Backend` hooks `accepts_contacts()` / `contact_prompt()` and events
+  `ContactReply` / `ContactRequest` (Coda does not opt in and stays owner-only);
+  `Messenger::contact_state`. The echo backend may leave out `roots` and
+  `default_folder` (it then works in the bridge's folder).
+
 - **Echo backend for push-agent-bridge** (`"backend": "echo", "echo": {"answerTimeoutS":
   300}`): a deterministic, credential-free test agent that signs in with the bridge's
   agent key and runs under push-agent-tray. It echoes the owner's texts as `agent.reply@2`
@@ -15,7 +26,7 @@ Notable changes for consumers of push-messenger. Newest first.
   after `answerTimeoutS` (10–3600 s) with "No answer; skipped", ignores texts stored more
   than 60 s before it started, reports no capabilities (only `/help`, `/status`, `/stop`
   work), and with `calls.adapter` speaks each final transcript back as "echo: <text>".
-  Only the owner reaches it, as for Coda ([echo backend](docs/agent-bridge.md#19-echo-backend)).
+  The owner and the agent's accepted contacts reach it ([echo backend](docs/agent-bridge.md#19-echo-backend)).
 - **Backend trait hooks** (all defaulted, Coda unchanged): `answer_timeout()`,
   `activity_labels()` and `skip_texts_older_than()`.
 - **Agent bridge voice adapter client** (second of three steps that move speech out of

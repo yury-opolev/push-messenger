@@ -3,6 +3,7 @@
 //! to push-messenger through a [`Messenger`].
 
 mod calling;
+mod contacts;
 mod control;
 mod conversation;
 mod report;
@@ -300,6 +301,11 @@ enum Internal {
     },
     /// The phone placed (or failed to place) the call to the owner.
     Dialed { result: Result<Line, SdkError> },
+    /// The backend is done with a contact's text.
+    ContactPrompted {
+        conversation: ConversationId,
+        result: Result<(), BackendError>,
+    },
 }
 
 /// The running turn's reply.
@@ -363,6 +369,10 @@ struct Core<M: Messenger> {
     answer_timeout: Duration,
     /// The owner's texts stored before this (server time, µs) are not delivered.
     skip_before_us: Option<i64>,
+    /// The backend takes the agent's accepted contacts too.
+    accepts_contacts: bool,
+    /// The accepted contacts' conversations and questions.
+    contacts: contacts::Contacts,
     state: Arc<StateFile>,
     options: BridgeOptions,
     internal: mpsc::UnboundedSender<Internal>,
@@ -466,6 +476,7 @@ impl<M: Messenger> Core<M> {
         let format = backend.text_format();
         let labels = backend.activity_labels();
         let answer_timeout = backend.answer_timeout();
+        let accepts_contacts = backend.accepts_contacts();
         let clock = Clock::new();
         let skip_before_us = backend.skip_texts_older_than().map(|age| {
             let age_ms = i64::try_from(age.as_millis()).unwrap_or(i64::MAX);
@@ -479,6 +490,8 @@ impl<M: Messenger> Core<M> {
             labels,
             answer_timeout,
             skip_before_us,
+            accepts_contacts,
+            contacts: contacts::Contacts::default(),
             state,
             folder: options.default_folder.clone(),
             mode: options.default_mode,
@@ -650,12 +663,17 @@ impl<M: Messenger> Core<M> {
             Internal::Answered { call_id, result } => self.answered(call_id, result).await,
             Internal::Voice { call_id, event } => self.on_voice(call_id, event).await,
             Internal::Dialed { result } => self.dialed(result).await,
+            Internal::ContactPrompted {
+                conversation,
+                result,
+            } => self.contact_prompted(conversation, result).await,
         }
     }
 
     async fn on_tick(&mut self) {
         self.poll_turn();
         self.expire_requests().await;
+        self.expire_contact_requests();
         self.expire_asking();
         self.call_owner_if_due().await;
         self.watch_pause().await;
@@ -690,6 +708,7 @@ impl<M: Messenger> Core<M> {
             drop(open);
             self.reply("Declined: the bridge was stopped.");
         }
+        self.close_contact_requests().await;
         self.update_activity(false).await;
         self.publish();
         self.backend.stop().await;

@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use push_domain::templates::{RichBody, builtins};
 use push_sdk::{
-    ActivityState, Client, ClientMsgId, ConversationId, Event, Events, Message, MessageId,
-    MessageKind, MessageStatus, OutboxKind, SdkError, UserId,
+    ActivityState, Client, ClientMsgId, ContactState, ConversationId, Event, Events, Message,
+    MessageId, MessageKind, MessageStatus, OutboxKind, SdkError, UserId,
 };
 use serde_json::{Value, json};
 use tokio::sync::{Notify, mpsc};
@@ -47,6 +47,10 @@ pub trait Messenger: Send + Sync + 'static {
     /// The agent's own display name and handle, for the control channel's status.
     async fn profile(&self) -> Option<(String, String)> {
         None
+    }
+    /// The agent's relationship with `user`, as the server says (`None` when unknown).
+    async fn contact_state(&self, _user: UserId) -> Result<ContactState, SdkError> {
+        Ok(ContactState::None)
     }
     /// Drops the connection and signs in again with a fresh assertion, then connects.
     async fn reconnect(&self) -> Result<(), SdkError> {
@@ -165,6 +169,14 @@ impl Messenger for SdkMessenger {
             None => Err(SdkError::Invalid("reconnect is not available".into())),
         }
     }
+
+    async fn contact_state(&self, user: UserId) -> Result<ContactState, SdkError> {
+        let contacts = self.client.list_contacts().await?;
+        Ok(contacts
+            .into_iter()
+            .find(|contact| contact.user_id == user)
+            .map_or(ContactState::None, |contact| contact.state))
+    }
 }
 
 /// One call the core made on a [`TestMessenger`].
@@ -204,6 +216,8 @@ struct Recorded {
     next_seq: i64,
     /// The next RICH sends the server refuses, with these errors.
     refusals: Vec<SdkError>,
+    /// The agent's relationships (None for anyone else).
+    contacts: HashMap<UserId, ContactState>,
 }
 
 /// A [`Messenger`] for tests: records every call, plays the server (each send is stored
@@ -297,9 +311,25 @@ impl TestMessenger {
         message
     }
 
+    /// Sets the agent's relationship with `user`.
+    pub fn set_contact(&self, user: UserId, state: ContactState) {
+        self.lock().contacts.insert(user, state);
+    }
+
     /// `sender` answers the agent's card `card` (a `ClientMsgId` the core sent) with
     /// `values`, in the owner's conversation.
     pub fn answer_as(&self, sender: UserId, card: ClientMsgId, values: &[&str]) -> Message {
+        self.answer_in(self.conversation(), sender, card, values)
+    }
+
+    /// `sender` answers the agent's card `card` with `values` in `conversation`.
+    pub fn answer_in(
+        &self,
+        conversation: ConversationId,
+        sender: UserId,
+        card: ClientMsgId,
+        values: &[&str],
+    ) -> Message {
         let target = self
             .lock()
             .stored
@@ -307,12 +337,8 @@ impl TestMessenger {
             .copied()
             .expect("the card was stored");
         let body = json!({"card": target.to_string(), "values": values, "fallback": "answer"});
-        let mut message = self.message(
-            self.conversation(),
-            sender,
-            MessageKind::Answer,
-            &body.to_string(),
-        );
+        let mut message =
+            self.message(conversation, sender, MessageKind::Answer, &body.to_string());
         message.card_seq = Some(1);
         self.inject(Event::MessageAdded(message.clone()));
         message
@@ -518,6 +544,15 @@ impl Messenger for TestMessenger {
     async fn reconnect(&self) -> Result<(), SdkError> {
         self.record(Call::Reconnect);
         Ok(())
+    }
+
+    async fn contact_state(&self, user: UserId) -> Result<ContactState, SdkError> {
+        Ok(self
+            .lock()
+            .contacts
+            .get(&user)
+            .copied()
+            .unwrap_or(ContactState::None))
     }
 }
 

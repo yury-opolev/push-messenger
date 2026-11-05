@@ -1,5 +1,5 @@
 //! The echo backend: a deterministic test agent with no engine behind it. It echoes the
-//! owner's texts, asks a question on `ask` and a multi-select on `pick`, and reports no
+//! owner's and accepted contacts' texts (each in their own conversation), asks a question on `ask` and a multi-select on `pick`, and reports no
 //! capabilities. Operators run it under the bridge for contract checks and manual tests:
 //! sign-in, cards, activity, the tray and voice calls work as for Coda.
 //!
@@ -11,7 +11,8 @@
 //!
 //! The core does the rest: the answer checks, the card deadline (the backend's
 //! [`Backend::answer_timeout`], "No answer; skipped"), paging long replies, skipping texts
-//! older than [`MAX_TEXT_AGE`] at startup, and voice calls.
+//! older than [`MAX_TEXT_AGE`] at startup, voice calls (the owner's only), and keeping each
+//! contact's question to that contact.
 
 use std::collections::BTreeSet;
 use std::sync::{Mutex, PoisonError};
@@ -21,8 +22,8 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::backend::{
     ActivityLabels, Answer, Backend, BackendCommand, BackendError, BackendEvent, BackendRequest,
-    BackendStatus, Capability, CommandReply, ErrorKind, PendingMessages, RequestKind, Responder,
-    StartOptions, Started, SteerOutcome, TextFormat, TurnSource, unsupported,
+    BackendStatus, Capability, CommandReply, ContactId, ErrorKind, PendingMessages, RequestKind,
+    Responder, StartOptions, Started, SteerOutcome, TextFormat, TurnSource, unsupported,
 };
 use crate::config::EchoConfig;
 
@@ -90,15 +91,12 @@ impl EchoBackend {
         mut cancel: oneshot::Receiver<bool>,
     ) -> Result<Option<String>, bool> {
         let (responder, answer) = Responder::new();
-        self.emit(BackendEvent::Request(BackendRequest {
-            kind: RequestKind::Question {
-                question: question.to_owned(),
-                options: options.iter().map(|&option| option.to_owned()).collect(),
-                multi_select,
-                allow_free_text: true,
-            },
+        self.emit(BackendEvent::Request(question_request(
+            question,
+            options,
+            multi_select,
             responder,
-        }));
+        )));
         tokio::select! {
             biased;
             interrupted = &mut cancel => Err(interrupted.unwrap_or(false)),
@@ -111,6 +109,24 @@ impl EchoBackend {
                 Err(_) => Err(cancel.await.unwrap_or(false)),
             },
         }
+    }
+}
+
+/// A question with free text allowed.
+fn question_request(
+    question: &str,
+    options: &[&str],
+    multi_select: bool,
+    responder: Responder,
+) -> BackendRequest {
+    BackendRequest {
+        kind: RequestKind::Question {
+            question: question.to_owned(),
+            options: options.iter().map(|&option| option.to_owned()).collect(),
+            multi_select,
+            allow_free_text: true,
+        },
+        responder,
     }
 }
 
@@ -141,6 +157,40 @@ impl Backend for EchoBackend {
 
     fn skip_texts_older_than(&self) -> Option<Duration> {
         Some(MAX_TEXT_AGE)
+    }
+
+    fn accepts_contacts(&self) -> bool {
+        true
+    }
+
+    async fn contact_prompt(&self, contact: ContactId, text: &str) -> Result<(), BackendError> {
+        let command = text.trim();
+        let question = if command.eq_ignore_ascii_case("ask") {
+            Some((ASK_QUESTION, &ASK_OPTIONS[..], false))
+        } else if command.eq_ignore_ascii_case("pick") {
+            Some((PICK_QUESTION, &PICK_OPTIONS[..], true))
+        } else {
+            None
+        };
+        let reply = match question {
+            None => Some(format!("echo: {text}")),
+            Some((question, options, multi_select)) => {
+                let (responder, answer) = Responder::new();
+                self.emit(BackendEvent::ContactRequest {
+                    contact: contact.clone(),
+                    request: question_request(question, options, multi_select, responder),
+                });
+                match answer.await {
+                    Ok(Answer::Question(answer)) => Some(format!("you chose: {answer}")),
+                    // Declined or closed: the core said why.
+                    _ => None,
+                }
+            }
+        };
+        if let Some(text) = reply {
+            self.emit(BackendEvent::ContactReply { contact, text });
+        }
+        Ok(())
     }
 
     async fn start(&self, options: StartOptions) -> Result<Started, BackendError> {

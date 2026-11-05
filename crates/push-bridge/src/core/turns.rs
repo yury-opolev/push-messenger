@@ -85,6 +85,12 @@ impl<M: Messenger> Core<M> {
                 self.end_turn(interrupted).await;
             }
             BackendEvent::Exited { .. } => self.exited().await,
+            BackendEvent::ContactReply { contact, text } => {
+                self.contact_backend_reply(&contact, &text);
+            }
+            BackendEvent::ContactRequest { contact, request } => {
+                self.open_contact_request(&contact, request).await;
+            }
         }
     }
 
