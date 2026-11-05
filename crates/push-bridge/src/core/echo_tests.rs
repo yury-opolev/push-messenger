@@ -263,6 +263,24 @@ async fn only_help_and_status_are_offered() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn restarting_the_echo_agent_with_a_card_open_ends_its_turn_once() {
+    let mut h = started(300).await;
+    h.messenger.owner_says("ask");
+    h.card(1).await;
+    let restarted = h.call(crate::control::Action::RestartBackend).await;
+    assert!(restarted.is_ok(), "{restarted:?}");
+    h.messenger.owner_says("after");
+    reply(&h, "echo: after").await;
+    h.idle().await;
+    let ended = h
+        .control_events()
+        .into_iter()
+        .filter(|event| matches!(event, push_bridge_control::Event::TurnEnded { .. }))
+        .count();
+    assert_eq!(ended, 2, "the ask turn (cut by the core) and the echo");
+}
+
+#[tokio::test(start_paused = true)]
 async fn stop_declines_an_open_question_and_echoing_goes_on() {
     let h = started(300).await;
     h.messenger.owner_says("ask");

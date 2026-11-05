@@ -925,16 +925,19 @@ impl Supervisor {
                 instance.status_pending = false;
                 match *result {
                     Ok(status) => {
+                        let state = status.state;
+                        let detail = status.detail.clone();
+                        instance.call = status.call.clone();
+                        // First, so the state shown names this status's backend.
+                        instance.status = Some(status);
                         // Corrects a missed `state_changed` (a lagging connection skips
                         // events).
-                        if let Some(state) = status.state {
-                            let state = instance.shown(state, status.detail.clone());
+                        if let Some(state) = state {
+                            let state = instance.shown(state, detail);
                             if instance.reported.as_ref() != Some(&state) {
                                 instance.report(state);
                             }
                         }
-                        instance.call = status.call.clone();
-                        instance.status = Some(status);
                     }
                     Err(error) => {
                         tracing::debug!(event = "bridge_status_failed", code = %error.code);

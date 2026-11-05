@@ -87,7 +87,7 @@ impl EchoBackend {
         question: &str,
         options: &[&str],
         multi_select: bool,
-        cancel: oneshot::Receiver<bool>,
+        mut cancel: oneshot::Receiver<bool>,
     ) -> Result<Option<String>, bool> {
         let (responder, answer) = Responder::new();
         self.emit(BackendEvent::Request(BackendRequest {
@@ -100,12 +100,16 @@ impl EchoBackend {
             responder,
         }));
         tokio::select! {
-            answer = answer => Ok(match answer {
-                Ok(Answer::Question(answer)) => Some(format!("you chose: {answer}")),
+            biased;
+            interrupted = &mut cancel => Err(interrupted.unwrap_or(false)),
+            answer = answer => match answer {
+                Ok(Answer::Question(answer)) => Ok(Some(format!("you chose: {answer}"))),
                 // Declined: the core said why ("No answer; skipped", …).
-                _ => None,
-            }),
-            interrupted = cancel => Err(interrupted.unwrap_or(false)),
+                Ok(_) => Ok(None),
+                // Dropped: the core closed the request itself (stopping or restarting the
+                // backend, which cancels next); it ends the turn too.
+                Err(_) => Err(cancel.await.unwrap_or(false)),
+            },
         }
     }
 }
@@ -187,11 +191,8 @@ impl Backend for EchoBackend {
         } else {
             Ok(Some(format!("echo: {text}")))
         };
-        {
-            let mut inner = self.lock();
-            inner.busy = false;
-            inner.cancel = None;
-        }
+        // Ends the turn under the lock, so a next prompt starts only after it.
+        let mut inner = self.lock();
         match reply {
             Ok(reply) => {
                 if let Some(reply) = reply {
@@ -203,6 +204,8 @@ impl Backend for EchoBackend {
             // Stopped: the core ended the turn itself.
             Err(false) => {}
         }
+        inner.busy = false;
+        inner.cancel = None;
         Ok(())
     }
 

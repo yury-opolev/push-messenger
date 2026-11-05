@@ -210,7 +210,7 @@ Create `%LOCALAPPDATA%\push-messenger\coda-bridge\config.json`. Every field:
 | `roots` | yes | the folders the agent may work in and below; at least one | |
 | `default_folder` | yes | the folder a new bridge starts in: a real folder inside `roots`; a relative path is relative to the first root | |
 | `default_permission_mode` | no | `default`, `acceptEdits` or `plan`; `bypassPermissions` is refused (use `/mode bypass`) | `default` |
-| `backend` | yes | `coda`, or `echo` (the [echo test agent](#echo-backend)) | |
+| `backend` | yes | `coda`, or `echo` (the [echo test agent](#19-echo-backend)) | |
 | `echo.answerTimeoutS` | no | with `echo`: how long an `ask` or `pick` card waits, 10 to 3600 seconds | `300` |
 | `coda.exe` | with `coda` | the path to `coda.exe` (a bare name is looked up on `PATH`) | |
 | `coda.args` | no | extra arguments after `serve`, as a list | `[]` |

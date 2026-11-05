@@ -5,8 +5,8 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use push_bridge_control::{
-    AgentInfo, BridgeState, CallDirection, CallPhase, MAX_LINE, NO_CALL, PeekEntry, PeekFrom,
-    PeekKind, PeekResult, Response, ServerLine, encode, parse_request,
+    AgentInfo, BackendInfo, BridgeState, CallDirection, CallPhase, MAX_LINE, NO_CALL, PeekEntry,
+    PeekFrom, PeekKind, PeekResult, Response, ServerLine, encode, parse_request,
 };
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -287,6 +287,12 @@ async fn serve(
                                     handle: name.clone(),
                                 }),
                                 session: Some("s-1".into()),
+                                backend: Some(BackendInfo {
+                                    name: "Echo".into(),
+                                    version: None,
+                                    running: true,
+                                    running_tasks: 0,
+                                }),
                                 call: world.bridge(&name, |bridge| bridge.call.clone()),
                                 ..Status::default()
                             })
@@ -755,6 +761,18 @@ async fn events_map_to_states() {
             views[0].last_error.as_deref() == Some("backend_crashed")
         })
         .await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_restarting_backend_is_named_as_its_status_says() {
+    let world = Shared::default();
+    let mut harness = start(&world, vec![spec("a", true)]);
+    harness.state("a", AgentState::Idle).await;
+    world.bridge("a", |bridge| bridge.state = BridgeState::Restarting);
+    let a = harness
+        .state("a", AgentState::Restarting(Some("Echo".into())))
+        .await;
+    assert_eq!(labels(&a).last().unwrap(), "Echo restarting");
 }
 
 #[tokio::test(start_paused = true)]
