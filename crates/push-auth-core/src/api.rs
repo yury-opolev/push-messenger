@@ -124,6 +124,15 @@ pub fn router(api: Api) -> Router {
         )
         .route("/v1/agents/{agent_id}/contacts", get(owners::list_contacts))
         .route(
+            "/v1/agents/{agent_id}/conversations",
+            get(owners::conversations),
+        )
+        .route(
+            "/v1/agents/{agent_id}/conversations/{conversation_id}/messages",
+            get(owners::messages),
+        )
+        .route("/v1/agents/{agent_id}/calls", get(owners::calls))
+        .route(
             "/v1/agents/{agent_id}/contacts/{user_id}",
             delete(owners::remove_contact),
         )

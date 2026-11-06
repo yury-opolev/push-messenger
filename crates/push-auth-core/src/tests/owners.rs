@@ -12,10 +12,14 @@ use uuid::Uuid;
 use super::agents::{app_token, call, setup};
 use crate::AuthError;
 use crate::api::{Api, router};
+use crate::calls::{CallCursor, CallEntry};
 use crate::entra::testing::TENANT;
 use crate::limits::{Limits, MemoryCounter};
 use crate::owners::{AgentOwnerApi, Resolve};
 use crate::service::Auth;
+use push_proto::id_bytes;
+use push_proto::internal::v1 as internal;
+use push_proto::v1::{ContentType, ConversationKind, Deliver, EntryKind, HistoryPage};
 
 /// Records every call; answers from what it holds.
 #[derive(Debug, Default)]
@@ -25,6 +29,8 @@ struct Stub {
     waiting: Vec<(Uuid, DateTime<Utc>)>,
     contacts: Vec<(Uuid, &'static str)>,
     owner: Mutex<Option<Uuid>>,
+    conversations: Vec<internal::AgentConversation>,
+    page: HistoryPage,
 }
 
 impl Stub {
@@ -82,6 +88,35 @@ impl AgentOwnerApi for Stub {
         }
         Ok(())
     }
+    async fn conversations(
+        &self,
+        _: Uuid,
+        _: Uuid,
+    ) -> Result<Vec<internal::AgentConversation>, AuthError> {
+        self.record("conversations".into());
+        Ok(self.conversations.clone())
+    }
+    async fn history(
+        &self,
+        _: Uuid,
+        _: Uuid,
+        conversation: Uuid,
+        before_seq: Option<i64>,
+        limit: u32,
+    ) -> Result<HistoryPage, AuthError> {
+        self.record(format!("history {conversation} {before_seq:?} {limit}"));
+        Ok(self.page.clone())
+    }
+    async fn calls(
+        &self,
+        _: Uuid,
+        _: Uuid,
+        before: Option<CallCursor>,
+        limit: u32,
+    ) -> Result<Vec<CallEntry>, AuthError> {
+        self.record(format!("calls {} {limit}", before.is_some()));
+        Ok(Vec::new())
+    }
 }
 
 fn with_owners(auth: Auth, owners: Arc<Stub>) -> Router {
@@ -123,6 +158,17 @@ fn routes(agent: &str, user: &str) -> Vec<(&'static str, String, Value)> {
             json!({}),
         ),
         ("GET", format!("/v1/agents/{agent}/contacts"), json!({})),
+        (
+            "GET",
+            format!("/v1/agents/{agent}/conversations"),
+            json!({}),
+        ),
+        (
+            "GET",
+            format!("/v1/agents/{agent}/conversations/{user}/messages"),
+            json!({}),
+        ),
+        ("GET", format!("/v1/agents/{agent}/calls"), json!({})),
         (
             "DELETE",
             format!("/v1/agents/{agent}/contacts/{user}"),
@@ -361,6 +407,146 @@ async fn the_owner_reads_and_sets_the_policy_and_acts_on_requests() {
             format!("resolve {requester} Block"),
             format!("remove {requester}"),
             format!("remove {me}"),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn the_owner_view_shows_the_agents_chats_and_has_no_write_path() {
+    super::capture_logs();
+    let (world, auth, plain, owner) = setup().await;
+    let (_, reservation) = call(
+        &plain,
+        "POST",
+        "/v1/agents",
+        &owner.access_token,
+        json!({"handle":"viewed","display_name":"Viewed"}),
+    )
+    .await;
+    let agent = reservation["user_id"].as_str().unwrap().to_owned();
+    let peer = super::password_user(&auth, &world.pool, "peer", 1)
+        .await
+        .remove(0);
+    let chat = Uuid::now_v7();
+    let (message, client) = (Uuid::now_v7(), Uuid::now_v7());
+    let stub = Arc::new(Stub {
+        conversations: vec![internal::AgentConversation {
+            conversation_id: id_bytes(chat),
+            kind: ConversationKind::Direct.into(),
+            title: None,
+            peer_user_id: Some(id_bytes(peer.user_id)),
+            peer_owner_user_id: None,
+            member_count: 2,
+            last_activity_at: 1_790_000_000_000_000,
+            message_count: 7,
+            hidden: false,
+            peer_deleted: false,
+        }],
+        page: HistoryPage {
+            entries: vec![Deliver {
+                conversation_id: id_bytes(chat),
+                seq: 3,
+                message_id: id_bytes(message),
+                client_msg_id: id_bytes(client),
+                kind: EntryKind::Message.into(),
+                sender_id: id_bytes(peer.user_id),
+                content_type: ContentType::Text.into(),
+                body: Some(b"secret words".to_vec()),
+                server_ts: 1_790_000_000_000_000,
+                ..Deliver::default()
+            }],
+            has_more: true,
+        },
+        ..Stub::default()
+    });
+    let api = with_owners(auth.clone(), Arc::clone(&stub));
+    let token = owner.access_token.as_str();
+    let base = format!("/v1/agents/{agent}");
+
+    let (status, listed) = call(
+        &api,
+        "GET",
+        &format!("{base}/conversations"),
+        token,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    let first = &listed["conversations"][0];
+    assert_eq!(first["conversation_id"], chat.to_string());
+    assert_eq!(first["kind"], "direct");
+    assert_eq!(first["peer"]["handle"], "peer");
+    assert_eq!(first["peer_owner"], Value::Null);
+    assert_eq!(first["message_count"], 7);
+    assert_eq!(first["last_activity_at"], "2026-09-21T14:13:20.000Z");
+
+    let path = format!("{base}/conversations/{chat}/messages?before_seq=9&limit=20");
+    let (status, page) = call(&api, "GET", &path, token, json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(page["has_more"], true);
+    assert_eq!(
+        page["entries"][0],
+        json!({"seq": 3, "message_id": message, "client_msg_id": client, "kind": "message",
+               "sender_id": peer.user_id, "content_type": "text", "body": "secret words",
+               "deleted": false, "target_seq": null, "answer_seq": null, "client_ts": null,
+               "server_ts": "2026-09-21T14:13:20.000Z", "edited_at": null, "edit_seq": null})
+    );
+    let (status, calls) = call(
+        &api,
+        "GET",
+        &format!("{base}/calls?limit=10"),
+        token,
+        json!({}),
+    )
+    .await;
+    assert_eq!((status, calls), (StatusCode::OK, json!({"calls": []})));
+    let (status, _) = call(
+        &api,
+        "GET",
+        &format!("{base}/conversations/{chat}/messages?limit=0"),
+        token,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // There is no way to write as the agent through the view.
+    for (method, path) in [
+        ("POST", format!("{base}/conversations")),
+        ("POST", format!("{base}/conversations/{chat}/messages")),
+        ("PUT", format!("{base}/conversations/{chat}/messages")),
+        ("PATCH", format!("{base}/conversations/{chat}/messages")),
+        ("DELETE", format!("{base}/conversations/{chat}/messages")),
+        ("POST", format!("{base}/calls")),
+    ] {
+        let (status, _) = call(&api, method, &path, token, json!({"body": "hi"})).await;
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "{method} {path}");
+    }
+    // Every read is audited with ids and counts, never the content.
+    let events: Vec<Value> = super::security_events()
+        .into_iter()
+        .filter(|event| event["agent_id"] == agent.as_str())
+        .collect();
+    let named = |name: &str| {
+        events
+            .iter()
+            .find(|event| event["event"] == name)
+            .cloned()
+            .unwrap_or_else(|| panic!("{name} in {events:?}"))
+    };
+    let read = named("agent.view.history");
+    assert_eq!(read["conversation_id"], chat.to_string());
+    assert_eq!(read["count"], 1);
+    assert_eq!(read["user_id"], owner.user_id.to_string());
+    assert_eq!(named("agent.view.conversations")["count"], 1);
+    assert_eq!(named("agent.view.calls")["count"], 0);
+    assert!(!super::captured_logs().contains("secret words"));
+    assert_eq!(
+        stub.calls(),
+        [
+            "conversations".to_owned(),
+            format!("history {chat} Some(9) 20"),
+            "calls false 10".to_owned(),
         ]
     );
 }

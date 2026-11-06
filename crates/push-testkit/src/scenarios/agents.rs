@@ -658,6 +658,141 @@ async fn only_the_owner_reaches_the_agent<B: Backend>(backend: &B) {
     );
 }
 
+async fn the_owner_view_reads_what_the_agent_sees_and_changes_nothing<B: Backend>(backend: &B) {
+    let (world, owner, agent) = owned(backend).await;
+    set_policy(&world, &owner, &agent, AgentPolicy::AutoAny).await;
+    let person = world.person().await;
+    world
+        .svc
+        .contact_request(person.user, agent.user)
+        .await
+        .unwrap();
+    let chat = world
+        .svc
+        .open_direct(person.user, agent.user)
+        .await
+        .unwrap();
+    let first = world.send(&person, chat, "hello agent").await;
+    world.send(&agent, chat, "hello person").await;
+    world.edit(&person, chat, &first, "hello, agent").await;
+    world.send(&person, chat, "are you there?").await;
+    // Another owner's agent talks to this one: its owner is named.
+    let other_owner = world.person().await;
+    let other = world.agent(&other_owner).await;
+    world
+        .svc
+        .contact_request(other.user, agent.user)
+        .await
+        .unwrap();
+    let robots = world.svc.open_direct(other.user, agent.user).await.unwrap();
+    world.send(&other, robots, "beep").await;
+    world.notifier.take();
+
+    let before_listing = world
+        .svc
+        .list_conversations_with(agent.user, None, true)
+        .await
+        .unwrap();
+    let before_member = world.member(chat, &agent).await;
+    let before_position = world.position(agent.device, chat).await;
+
+    let conversations = world
+        .svc
+        .owner_conversations(owner.user, agent.user)
+        .await
+        .unwrap();
+    let with_person = conversations
+        .iter()
+        .find(|conversation| conversation.conversation_id == chat)
+        .unwrap();
+    assert_eq!(with_person.peer, Some(person.user));
+    assert_eq!(with_person.peer_owner, None);
+    assert_eq!(with_person.message_count, 3);
+    assert_eq!(with_person.member_count, 2);
+    let with_robot = conversations
+        .iter()
+        .find(|conversation| conversation.conversation_id == robots)
+        .unwrap();
+    assert_eq!(with_robot.peer, Some(other.user));
+    assert_eq!(with_robot.peer_owner, Some(other_owner.user));
+    assert_eq!(with_robot.message_count, 1);
+    // The owner's own chat with the agent is listed too, once opened.
+    assert!(conversations.len() >= 2);
+
+    let page = world
+        .svc
+        .owner_history(owner.user, agent.user, chat, None, 50)
+        .await
+        .unwrap();
+    assert_eq!(
+        page,
+        world.svc.history(agent.user, chat, None, 50).await.unwrap(),
+        "exactly what the agent sees"
+    );
+    assert_eq!(page.entries.len(), 3);
+    assert_eq!(
+        page.entries[0].body.as_deref(),
+        Some(b"hello, agent".as_slice())
+    );
+    assert!(page.entries[0].edited_at.is_some());
+    let older = world
+        .svc
+        .owner_history(owner.user, agent.user, chat, Some(page.entries[1].seq), 50)
+        .await
+        .unwrap();
+    assert_eq!(older.entries.len(), 1);
+    assert_eq!(
+        world
+            .svc
+            .owner_call_history(owner.user, agent.user, None, 50)
+            .await,
+        Ok(vec![])
+    );
+
+    // Nothing of the agent's moved, and nobody heard of the reads.
+    assert_eq!(
+        world
+            .svc
+            .list_conversations_with(agent.user, None, true)
+            .await
+            .unwrap(),
+        before_listing
+    );
+    assert_eq!(world.member(chat, &agent).await, before_member);
+    assert_eq!(world.position(agent.device, chat).await, before_position);
+    assert_eq!(world.notifier.take(), []);
+
+    // Only the owner reads; a conversation the agent is not in is not found.
+    for reader in [&person, &agent, &other_owner] {
+        assert_eq!(
+            world.svc.owner_conversations(reader.user, agent.user).await,
+            Err(DomainError::AgentNotFound)
+        );
+        assert_eq!(
+            world
+                .svc
+                .owner_history(reader.user, agent.user, chat, None, 50)
+                .await,
+            Err(DomainError::AgentNotFound)
+        );
+        assert_eq!(
+            world
+                .svc
+                .owner_call_history(reader.user, agent.user, None, 50)
+                .await,
+            Err(DomainError::AgentNotFound)
+        );
+    }
+    let elsewhere = world.direct_chat(&person, &other_owner).await;
+    assert_eq!(
+        world
+            .svc
+            .owner_history(owner.user, agent.user, elsewhere, None, 50)
+            .await,
+        Err(DomainError::NotMember)
+    );
+}
+
 pub(super) fn cases<B: Backend>() -> Vec<Case<B>> {
     case_list![
         ask_holds_requests_from_people_and_agents_for_the_owner,
@@ -674,5 +809,6 @@ pub(super) fn cases<B: Backend>() -> Vec<Case<B>> {
         agents_cannot_make_contacts_through_invites,
         the_owner_lists_and_removes_contacts,
         only_the_owner_reaches_the_agent,
+        the_owner_view_reads_what_the_agent_sees_and_changes_nothing,
     ]
 }

@@ -5,18 +5,22 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use push_domain::{AgentPolicy, Clock, Messaging, Notifier, OwnerAction, Store, UserId};
+use push_domain::{
+    AgentPolicy, Clock, ConversationId, ConversationKind, MAX_HISTORY_PAGE, Messaging, Notifier,
+    OwnerAction, Store, UserId,
+};
 use push_proto::id_bytes;
 use push_proto::internal::v1::{
     self as internal, AgentConversations, AgentHistoryRequest, AgentOwnersDone, AgentPeerRequest,
     AgentPolicyReply, AgentRef, CallHistoryPage, ResolveAction, ResolveRequest,
     SetAgentPolicyRequest, WaitingRequest, WaitingRequests, agent_owners_server,
 };
-use push_proto::v1::{Contact, ContactList, HistoryPage};
+use push_proto::v1::{self, Contact, ContactList, HistoryPage};
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status};
 
-use crate::convert::{contact_state, domain_error, invalid, micros, parse_id};
+use crate::calls::history::{cursor, entry};
+use crate::convert::{contact_state, deliver, domain_error, invalid, micros, parse_id};
 
 /// Serves `AgentOwners` over the messaging service.
 pub struct AgentOwnersApi<S, C, N> {
@@ -178,23 +182,74 @@ where
 
     async fn conversations(
         &self,
-        _request: Request<AgentRef>,
+        request: Request<AgentRef>,
     ) -> Result<Response<AgentConversations>, Status> {
-        Err(Status::unimplemented("the owner view is not served yet"))
+        let (owner, agent) = agent_ref(Some(request.get_ref()))?;
+        let conversations = self
+            .messaging
+            .owner_conversations(owner, agent)
+            .await
+            .map_err(domain_error)?;
+        Ok(Response::new(AgentConversations {
+            conversations: conversations
+                .into_iter()
+                .map(|conversation| internal::AgentConversation {
+                    conversation_id: id_bytes(conversation.conversation_id.0),
+                    kind: match conversation.kind {
+                        ConversationKind::Direct => v1::ConversationKind::Direct,
+                        ConversationKind::Group => v1::ConversationKind::Group,
+                    }
+                    .into(),
+                    title: conversation.title,
+                    peer_user_id: conversation.peer.map(|peer| id_bytes(peer.0)),
+                    peer_owner_user_id: conversation.peer_owner.map(|owner| id_bytes(owner.0)),
+                    member_count: conversation.member_count,
+                    last_activity_at: micros(conversation.last_activity_at),
+                    message_count: conversation.message_count,
+                    hidden: conversation.hidden,
+                    peer_deleted: conversation.peer_deleted,
+                })
+                .collect(),
+        }))
     }
 
     async fn history(
         &self,
-        _request: Request<AgentHistoryRequest>,
+        request: Request<AgentHistoryRequest>,
     ) -> Result<Response<HistoryPage>, Status> {
-        Err(Status::unimplemented("the owner view is not served yet"))
+        let request = request.into_inner();
+        let (owner, agent) = agent_ref(request.agent.as_ref())?;
+        let conversation = parse_id(&request.conversation_id, "conversation_id", ConversationId)?;
+        let limit = match request.limit {
+            0 => MAX_HISTORY_PAGE,
+            limit => limit,
+        };
+        let page = self
+            .messaging
+            .owner_history(owner, agent, conversation, request.before_seq, limit)
+            .await
+            .map_err(domain_error)?;
+        Ok(Response::new(HistoryPage {
+            entries: page.entries.into_iter().map(deliver).collect(),
+            has_more: page.has_more,
+        }))
     }
 
     async fn call_history(
         &self,
-        _request: Request<internal::AgentCallHistoryRequest>,
+        request: Request<internal::AgentCallHistoryRequest>,
     ) -> Result<Response<CallHistoryPage>, Status> {
-        Err(Status::unimplemented("the owner view is not served yet"))
+        let request = request.into_inner();
+        let (owner, agent) = agent_ref(request.agent.as_ref())?;
+        let before = request.before.as_ref().map(cursor).transpose()?;
+        let rows = self
+            .messaging
+            .owner_call_history(owner, agent, before, request.limit)
+            .await
+            .map_err(domain_error)?;
+        Ok(Response::new(CallHistoryPage {
+            calls: rows.iter().map(entry).collect(),
+        }))
     }
 }
 

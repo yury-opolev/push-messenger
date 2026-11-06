@@ -51,7 +51,7 @@ impl CallCursor {
         })
     }
 
-    fn to_proto(self) -> internal::CallHistoryCursor {
+    pub(crate) fn to_proto(self) -> internal::CallHistoryCursor {
         internal::CallHistoryCursor {
             ended_at: self.ended_at,
             call_id: id_bytes(self.call_id),
@@ -214,7 +214,7 @@ fn malformed(what: &str) -> AuthError {
     AuthError::Unavailable
 }
 
-fn entry(entry: &internal::CallHistoryEntry) -> Result<CallEntry, AuthError> {
+pub(crate) fn entry(entry: &internal::CallHistoryEntry) -> Result<CallEntry, AuthError> {
     let time =
         |micros: i64| DateTime::from_timestamp_micros(micros).ok_or_else(|| malformed("a time"));
     let call_id = id(&entry.call_id).map_err(|_| malformed("a call id"))?;
