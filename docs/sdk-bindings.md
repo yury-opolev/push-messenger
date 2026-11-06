@@ -93,9 +93,12 @@ ending in `Ms`, which are milliseconds, and absent values are `null`.
 - **Contact:** `{userId, state}`; `state` is `none`, `requestedOut`, `requestedIn`,
   `accepted` or `blocked`.
 - **Invite:** `{code, expiresAt, maxUses, uses}`. **Profile:** `{userId, handle,
-  displayName, kind, ownerUserId, deleted}`; a deleted account the user could already see is a
+  displayName, kind, ownerUserId, ownerDisplayName, ownerHandle, deleted}`; an agent's
+  `ownerDisplayName` and `ownerHandle` name its owner for the notice "Chats with <agent>
+  are visible to its owner, <owner>" ([agent connections](superpowers/specs/2026-11-06-agent-connections-and-owner-view.md#7-client-guidance-notice));
+  a deleted account the user could already see is a
   tombstone: `deleted` true, `displayName` `Deleted agent` or `Deleted account`, `handle`
-  empty, `ownerUserId` null. **Device:** `{deviceId, name, platform, createdAt, lastSeenAt, current}`.
+  empty, `ownerUserId`, `ownerDisplayName` and `ownerHandle` null. **Device:** `{deviceId, name, platform, createdAt, lastSeenAt, current}`.
 - **Error** (inside `sendFailed`): `{code, message, retryable, retryAfterS}`.
 - **Activity:** `{conversationId, userId, state, label, expiresAtMs}`; `state` is
   `typing`, `working`, `waiting` or `idle`; `label` is plain text to show inert, or `null`;
@@ -121,6 +124,8 @@ One ordered stream per client, each event an object with a `type`:
 | `contactChanged` | `contact` |
 | `activityChanged` | `activity`: another member's activity; a newer one from the same user and conversation replaces it |
 | `presenceChanged` | `presence`: a contact's presence changed |
+| `agentRequestWaiting` | `agentId`, `requesterId`: a request to one of the user's agents waits for the user's decision (owner methods: Rust SDK) |
+| `agentContactChanged` | `agentId`, `userId`, `state` (as a contact's): another relationship of one of the user's agents changed |
 | `call` | `call`: something happened to a call ([below](#calls)); not emitted through the bindings yet |
 | `signedOut` | sign in again |
 | `deviceRemoved` | the device was revoked |

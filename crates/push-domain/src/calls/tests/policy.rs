@@ -128,3 +128,36 @@ async fn owner_and_agent_without_contact_rows_may_call() {
     );
     assert!(may_call(&service, agent, owner).await);
 }
+
+#[tokio::test]
+async fn agents_never_call_each_other() {
+    let (service, _) = service();
+    let (owner, agent, sibling) = (UserId::new(), UserId::new(), UserId::new());
+    service.enroll_agent(owner, agent).await.unwrap();
+    service.enroll_agent(owner, sibling).await.unwrap();
+    let other_owner = user(&service).await;
+    let stranger_agent = UserId::new();
+    service
+        .enroll_agent(other_owner, stranger_agent)
+        .await
+        .unwrap();
+    // Contacts through the owner's policy: still messages and cards only.
+    service
+        .set_agent_policy(owner, sibling, crate::model::AgentPolicy::AutoOwn)
+        .await
+        .unwrap();
+    service.contact_request(agent, sibling).await.unwrap();
+    for (caller, callee) in [(agent, sibling), (sibling, agent)] {
+        assert_eq!(
+            service.call_permission(caller, callee).await,
+            Err(DomainError::NotAllowed)
+        );
+    }
+    // Agents that are not contacts are strangers, as anyone else.
+    assert_eq!(
+        service.call_permission(agent, stranger_agent).await,
+        Err(DomainError::NotContact)
+    );
+    assert!(may_call(&service, owner, agent).await);
+    assert!(may_call(&service, sibling, owner).await);
+}

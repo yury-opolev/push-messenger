@@ -250,7 +250,10 @@ async fn only_help_and_status_are_offered() {
     h.messenger.owner_says("/help");
     h.reply_containing("/status").await;
     let help = h.replies().last().unwrap().clone();
-    assert_eq!(help, commands::help(|_| false));
+    assert_eq!(
+        help,
+        format!("{}\n\n{}", commands::help(|_| false), commands::OWNER_NOTE)
+    );
     assert!(!help.contains("/new") && !help.contains("/cd"));
 
     h.messenger.owner_says("/status");
@@ -539,11 +542,66 @@ async fn each_contact_s_card_times_out_on_its_own() {
     card_in(&h, with_bob, 1).await;
     tokio::time::sleep(Duration::from_secs(5)).await;
     reply_in(&h, with_alice, "No answer; skipped").await;
-    assert!(replies_to(&h.messenger.calls(), with_bob).is_empty());
+    assert!(
+        !replies_to(&h.messenger.calls(), with_bob)
+            .iter()
+            .any(|text| text == "No answer; skipped")
+    );
     h.messenger.says(alice, "after");
     reply_in(&h, with_alice, "echo: after").await;
     tokio::time::sleep(Duration::from_secs(6)).await;
     reply_in(&h, with_bob, "No answer; skipped").await;
+}
+
+/// The notice the test messenger's agent and owner give.
+const NOTICE: &str =
+    "Chats with Coda on Devbox are visible to its owner, Test Owner (@test-owner).";
+
+#[tokio::test(start_paused = true)]
+async fn every_contact_is_told_once_that_the_owner_can_read_the_chat() {
+    let h = started(300).await;
+    let (alice, bob) = (contact(&h), contact(&h));
+    let (with_alice, with_bob) = (
+        h.messenger.conversation_with(alice),
+        h.messenger.conversation_with(bob),
+    );
+    h.messenger.says(alice, "one");
+    reply_in(&h, with_alice, "echo: one").await;
+    h.messenger.says(alice, "two");
+    reply_in(&h, with_alice, "echo: two").await;
+    h.messenger.says(bob, "hi");
+    reply_in(&h, with_bob, "echo: hi").await;
+    let calls = h.messenger.calls();
+    assert_eq!(
+        replies_to(&calls, with_alice),
+        [NOTICE, "echo: one", "echo: two"]
+    );
+    assert_eq!(replies_to(&calls, with_bob), [NOTICE, "echo: hi"]);
+    assert_eq!(
+        super::contacts::notice(None, None),
+        "Chats with this agent are visible to its owner."
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn another_agents_replies_and_refusals_never_start_a_loop() {
+    let h = started(300).await;
+    let other_agent = contact(&h);
+    let with_other = h.messenger.conversation_with(other_agent);
+    // An accepted contact's card or reply (another bridge's echo) is not a prompt.
+    let reply = r#"{"tpl":"agent.reply@1","params":{"text":"echo: hi"},"fallback":"echo: hi"}"#;
+    h.messenger.inject(Event::MessageAdded(h.messenger.message(
+        with_other,
+        other_agent,
+        MessageKind::Rich,
+        reply,
+    )));
+    // A stranger bridge's "This agent is private." is not answered with another.
+    let stranger = UserId::new();
+    h.messenger.says(stranger, super::PRIVATE);
+    settle().await;
+    assert!(replies_to(&h.messenger.calls(), with_other).is_empty());
+    assert!(h.messenger.texts().is_empty(), "{:?}", h.messenger.texts());
 }
 
 #[tokio::test(start_paused = true)]
@@ -552,7 +610,12 @@ async fn contacts_may_run_only_help_and_status() {
     let alice = contact(&h);
     let with_alice = h.messenger.conversation_with(alice);
     h.messenger.says(alice, "/help");
-    reply_in(&h, with_alice, super::contacts::CONTACT_HELP).await;
+    reply_in(
+        &h,
+        with_alice,
+        &format!("{}\n\n{NOTICE}", super::contacts::CONTACT_HELP),
+    )
+    .await;
     h.messenger.says(alice, "/status");
     reply_in(
         &h,

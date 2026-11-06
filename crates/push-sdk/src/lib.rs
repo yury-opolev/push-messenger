@@ -28,6 +28,7 @@ mod key;
 #[cfg(feature = "calls-media")]
 pub mod media;
 mod model;
+mod owners;
 mod policy;
 mod secrets;
 mod store;
@@ -52,6 +53,9 @@ pub use model::{
     Activity, ActivityState, ConnectionState, Contact, ContactState, Conversation,
     ConversationKind, Event, Invite, Message, MessageKind, MessageStatus, OutboxKind, Presence,
     PresenceState,
+};
+pub use owners::{
+    AgentContact, AgentConversation, AgentHistoryEntry, AgentHistoryPage, AgentPolicy, AgentRequest,
 };
 pub use push_domain::{CallId, ClientMsgId, ConversationId, DeviceId, MessageId, UserId};
 pub use secrets::{MemorySecretStore, SECRET_KEYS, SecretError, SecretStore};

@@ -73,6 +73,11 @@ pub struct Profile {
     /// `user` or `agent`.
     pub kind: String,
     pub owner_user_id: Option<UserId>,
+    /// An agent's owner, as the owner's account says now: show "Chats with <agent> are
+    /// visible to its owner, <owner>" (spec 2026-11-06 agent connections §7). `None` for
+    /// people, tombstones and servers before agent connections.
+    pub owner_display_name: Option<String>,
+    pub owner_handle: Option<String>,
     /// The account was deleted: this is its tombstone.
     pub deleted: bool,
 }
@@ -134,13 +139,18 @@ impl From<TokensBody> for Tokens {
 }
 
 #[derive(Deserialize)]
-struct ProfileBody {
+pub(crate) struct ProfileBody {
     user_id: Uuid,
     handle: String,
     display_name: String,
     #[serde(default = "user_kind")]
     kind: String,
     owner_user_id: Option<Uuid>,
+    /// Absent from servers before agent connections.
+    #[serde(default)]
+    owner_display_name: Option<String>,
+    #[serde(default)]
+    owner_handle: Option<String>,
     /// Absent from servers before tombstones.
     #[serde(default)]
     deleted: bool,
@@ -158,6 +168,8 @@ impl From<ProfileBody> for Profile {
             display_name: body.display_name,
             kind: body.kind,
             owner_user_id: body.owner_user_id.map(UserId),
+            owner_display_name: body.owner_display_name,
+            owner_handle: body.owner_handle,
             deleted: body.deleted,
         }
     }
@@ -179,6 +191,20 @@ mod profile_contract {
         assert_eq!(profile.kind, "agent");
         assert_eq!(profile.owner_user_id, Some(UserId(owner)));
         assert!(!profile.deleted);
+    }
+
+    #[test]
+    fn an_agent_profile_names_its_owner_for_the_notice() {
+        let (user, owner) = (Uuid::new_v4(), Uuid::new_v4());
+        let body: ProfileBody = serde_json::from_value(json!({
+            "user_id": user, "handle": "coda", "display_name": "Coda", "kind": "agent",
+            "owner_user_id": owner, "owner_display_name": "Yuri", "owner_handle": "yuri",
+            "deleted": false, "state": "active",
+        }))
+        .unwrap();
+        let profile = Profile::from(body);
+        assert_eq!(profile.owner_display_name.as_deref(), Some("Yuri"));
+        assert_eq!(profile.owner_handle.as_deref(), Some("yuri"));
     }
 
     #[test]
@@ -216,7 +242,7 @@ pub(crate) struct AuthApi {
 /// How long each attempt of a request may take, and the time from the first attempt by
 /// which every attempt must have ended.
 #[derive(Debug, Clone, Copy)]
-struct Attempts {
+pub(crate) struct Attempts {
     timeout: Duration,
     window: Option<Duration>,
 }
@@ -247,7 +273,7 @@ impl AuthApi {
         })
     }
 
-    fn request(&self, method: Method, path: &str) -> RequestBuilder {
+    pub(crate) fn request(&self, method: Method, path: &str) -> RequestBuilder {
         let request = self
             .http
             .request(method, format!("{}{path}", self.base_url));
@@ -579,23 +605,6 @@ impl AuthApi {
         since: Option<&str>,
         limit: Option<u32>,
     ) -> Result<CallPage, SdkError> {
-        #[derive(Deserialize)]
-        struct EntryBody {
-            call_id: CallId,
-            peer_user_id: UserId,
-            direction: String,
-            started_at: String,
-            answered_at: Option<String>,
-            ended_at: String,
-            duration_s: u32,
-            outcome: String,
-            cursor: String,
-        }
-        #[derive(Deserialize)]
-        struct PageBody {
-            calls: Vec<EntryBody>,
-            next: Option<String>,
-        }
         let mut query: Vec<(&str, String)> = Vec::new();
         if let Some(before) = before {
             query.push(("before", before.to_owned()));
@@ -612,40 +621,7 @@ impl AuthApi {
                 .bearer_auth(access_token)
         })
         .await?;
-        let body: PageBody =
-            serde_json::from_value(answer).map_err(|_| unreadable("the call history"))?;
-        let entry = |entry: EntryBody| -> Option<CallLogEntry> {
-            Some(CallLogEntry {
-                call_id: entry.call_id,
-                peer_user_id: entry.peer_user_id,
-                direction: match entry.direction.as_str() {
-                    "in" => CallDirection::Incoming,
-                    "out" => CallDirection::Outgoing,
-                    // The direction set is closed, so an unknown one is a broken answer
-                    // and fails the page; outcomes may grow, so an unknown one is Failed.
-                    _ => return None,
-                },
-                started_at_ms: millis(&entry.started_at)?,
-                answered_at_ms: match entry.answered_at {
-                    Some(time) => Some(millis(&time)?),
-                    None => None,
-                },
-                ended_at_ms: millis(&entry.ended_at)?,
-                duration_s: entry.duration_s,
-                outcome: CallEndReason::from_name(&entry.outcome),
-                cursor: entry.cursor,
-            })
-        };
-        let calls = body
-            .calls
-            .into_iter()
-            .map(entry)
-            .collect::<Option<Vec<_>>>()
-            .ok_or_else(|| unreadable("the call history"))?;
-        Ok(CallPage {
-            calls,
-            next: body.next,
-        })
+        call_page(answer)
     }
 
     /// `DELETE /v1/calls/{call_id}`: hides the call from the user's history; `204`
@@ -661,8 +637,66 @@ impl AuthApi {
     }
 }
 
+/// A page of call history as `GET /v1/calls` answers it.
+pub(crate) fn call_page(answer: Value) -> Result<CallPage, SdkError> {
+    #[derive(Deserialize)]
+    struct EntryBody {
+        call_id: CallId,
+        peer_user_id: UserId,
+        direction: String,
+        started_at: String,
+        answered_at: Option<String>,
+        ended_at: String,
+        duration_s: u32,
+        outcome: String,
+        cursor: String,
+    }
+    #[derive(Deserialize)]
+    struct PageBody {
+        calls: Vec<EntryBody>,
+        next: Option<String>,
+    }
+    let body: PageBody =
+        serde_json::from_value(answer).map_err(|_| unreadable("the call history"))?;
+    let entry = |entry: EntryBody| -> Option<CallLogEntry> {
+        Some(CallLogEntry {
+            call_id: entry.call_id,
+            peer_user_id: entry.peer_user_id,
+            direction: match entry.direction.as_str() {
+                "in" => CallDirection::Incoming,
+                "out" => CallDirection::Outgoing,
+                // The direction set is closed, so an unknown one is a broken answer
+                // and fails the page; outcomes may grow, so an unknown one is Failed.
+                _ => return None,
+            },
+            started_at_ms: millis(&entry.started_at)?,
+            answered_at_ms: match entry.answered_at {
+                Some(time) => Some(millis(&time)?),
+                None => None,
+            },
+            ended_at_ms: millis(&entry.ended_at)?,
+            duration_s: entry.duration_s,
+            outcome: CallEndReason::from_name(&entry.outcome),
+            cursor: entry.cursor,
+        })
+    };
+    let calls = body
+        .calls
+        .into_iter()
+        .map(entry)
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| unreadable("the call history"))?;
+    Ok(CallPage {
+        calls,
+        next: body.next,
+    })
+}
+
+/// The attempts of an ordinary request.
+pub(crate) const ORDINARY: Attempts = Attempts::ORDINARY;
+
 /// An RFC 3339 time as milliseconds since the Unix epoch.
-fn millis(time: &str) -> Option<i64> {
+pub(crate) fn millis(time: &str) -> Option<i64> {
     chrono::DateTime::parse_from_rfc3339(time)
         .ok()
         .map(|time| time.timestamp_millis())
@@ -674,12 +708,12 @@ fn tokens(answer: Value) -> Result<Tokens, SdkError> {
         .map_err(|_| unreadable("the tokens"))
 }
 
-fn unreadable(what: &str) -> SdkError {
+pub(crate) fn unreadable(what: &str) -> SdkError {
     SdkError::Network(format!("auth-svc answered {what} in an unexpected form"))
 }
 
 /// Sends a request once; its JSON answer (`null` for an empty one).
-async fn once(request: RequestBuilder) -> Result<Value, SdkError> {
+pub(crate) async fn once(request: RequestBuilder) -> Result<Value, SdkError> {
     let response = request
         .send()
         .await
@@ -703,7 +737,7 @@ async fn once(request: RequestBuilder) -> Result<Value, SdkError> {
 /// Sends a request that is safe to repeat, retrying transport errors and 502, 503 and
 /// 504 a few times, each attempt within `attempts.timeout`; with a window, no attempt
 /// starts that could end after it.
-async fn retried(
+pub(crate) async fn retried(
     attempts: Attempts,
     request: impl Fn() -> RequestBuilder,
 ) -> Result<Value, SdkError> {

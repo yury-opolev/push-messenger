@@ -204,7 +204,12 @@ impl<M: Messenger> Bridge<M> {
             .direct(owner)
             .await
             .map_err(BridgeError::Messenger)?;
-        if let Some((display_name, handle)) = messenger.profile().await {
+        let agent_profile = messenger.profile().await;
+        let notice = contacts::notice(
+            agent_profile.as_ref().map(|(name, _)| name.as_str()),
+            messenger.owner_name().await,
+        );
+        if let Some((display_name, handle)) = agent_profile {
             control.update(|status| {
                 status.agent = Some(AgentInfo {
                     display_name,
@@ -223,6 +228,7 @@ impl<M: Messenger> Bridge<M> {
             conversation,
         );
         core.control = control;
+        core.contacts.notice = notice;
         core.voice = voice;
         core.call_flag = call_flag;
         tracing::info!(event = "bridge_started", backend = core.name.as_str());

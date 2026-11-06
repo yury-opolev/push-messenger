@@ -109,6 +109,9 @@ export interface Invite {
 export interface Profile {
   kind: 'user' | 'agent';
   ownerUserId: string | null;
+  /** An agent's owner, for the notice "Chats with <agent> are visible to its owner, <owner>". */
+  ownerDisplayName: string | null;
+  ownerHandle: string | null;
   userId: string;
   /** Empty for a deleted account. */
   handle: string;
@@ -171,6 +174,8 @@ export type PushEvent =
   | { type: 'contactChanged'; contact: Contact }
   | { type: 'activityChanged'; activity: Activity }
   | { type: 'presenceChanged'; presence: Presence }
+  | { type: 'agentRequestWaiting'; agentId: string; requesterId: string }
+  | { type: 'agentContactChanged'; agentId: string; userId: string; state: Contact['state'] }
   | { type: 'signedOut' | 'deviceRemoved' | 'openedElsewhere' | 'eventsLost' };
 
 /** A failed call; `code` is the SDK's stable error code, as in Rust and C. */

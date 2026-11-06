@@ -72,8 +72,17 @@ impl<M: Messenger> Core<M> {
         }
         match message.kind {
             MessageKind::Answer => self.on_answer(&message).await,
+            // Another bridge's refusal never gets one back.
+            MessageKind::Text
+                if message.sender_id != self.owner && message.body.as_deref() == Some(PRIVATE) =>
+            {
+                tracing::debug!(event = "private_notice_ignored");
+            }
             MessageKind::Text if message.sender_id != self.owner && self.accepts_contacts => {
                 self.contact_message(message).await;
+            }
+            MessageKind::Rich if message.sender_id != self.owner && self.accepts_contacts => {
+                self.contact_rich(message).await;
             }
             MessageKind::Text | MessageKind::Rich if message.sender_id != self.owner => {
                 self.stranger(message.sender_id, message.conversation_id);

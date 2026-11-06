@@ -161,7 +161,7 @@ impl<M: Messenger> Core<M> {
             Command::Status => self.status().await,
             Command::Help => {
                 let help = commands::help(|capability| self.has(capability));
-                self.reply(&help);
+                self.reply(&format!("{help}\n\n{}", commands::OWNER_NOTE));
             }
             Command::Mode(mode) if mode == "bypass" => {
                 if self.mode == PermissionMode::BypassPermissions {

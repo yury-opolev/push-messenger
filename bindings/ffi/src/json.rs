@@ -126,14 +126,17 @@ pub fn conversation(conversation: &Conversation) -> Value {
 }
 
 pub fn contact(contact: &Contact) -> Value {
-    let state = match contact.state {
+    json!({ "userId": contact.user_id.to_string(), "state": contact_state(contact.state) })
+}
+
+fn contact_state(state: ContactState) -> &'static str {
+    match state {
         ContactState::None => "none",
         ContactState::RequestedOut => "requestedOut",
         ContactState::RequestedIn => "requestedIn",
         ContactState::Accepted => "accepted",
         ContactState::Blocked => "blocked",
-    };
-    json!({ "userId": contact.user_id.to_string(), "state": state })
+    }
 }
 
 pub fn invite(invite: &Invite) -> Value {
@@ -152,6 +155,8 @@ pub fn profile(profile: &Profile) -> Value {
         "displayName": profile.display_name,
         "kind": profile.kind,
         "ownerUserId": profile.owner_user_id.map(|id| id.to_string()),
+        "ownerDisplayName": profile.owner_display_name,
+        "ownerHandle": profile.owner_handle,
         "deleted": profile.deleted,
     })
 }
@@ -378,6 +383,17 @@ pub fn event(event: &Event) -> Value {
             json!({"type": "presenceChanged", "presence": presence(changed)})
         }
         Event::Call(call) => json!({"type": "call", "call": call_event(call)}),
+        Event::AgentRequestWaiting { agent, requester } => json!({
+            "type": "agentRequestWaiting",
+            "agentId": agent.to_string(),
+            "requesterId": requester.to_string(),
+        }),
+        Event::AgentContactChanged { agent, user, state } => json!({
+            "type": "agentContactChanged",
+            "agentId": agent.to_string(),
+            "userId": user.to_string(),
+            "state": contact_state(*state),
+        }),
     }
 }
 
@@ -842,6 +858,15 @@ mod tests {
                 state: PresenceState::Online,
                 last_seen_ms: None,
             }),
+            Event::AgentRequestWaiting {
+                agent: user,
+                requester: user,
+            },
+            Event::AgentContactChanged {
+                agent: user,
+                user,
+                state: ContactState::Accepted,
+            },
         ];
         for shown in events.iter().map(event) {
             let row = format!("| `{}` |", shown["type"].as_str().unwrap());

@@ -24,6 +24,24 @@ pub const CONTACT_HELP: &str = "\
 /status: the agent's name and version
 /help: this list
 Anything else goes to the agent.";
+/// The notice every contact sees once per session and in `/help`, when the owner's name
+/// is not known (spec 2026-11-06 agent connections §7).
+pub const NOTICE: &str = "Chats with this agent are visible to its owner.";
+
+/// "Chats with <agent> are visible to its owner, <owner> (@<handle>)."
+pub fn notice(agent: Option<&str>, owner: Option<(String, String)>) -> String {
+    match (agent, owner) {
+        (Some(agent), Some((owner, handle))) => {
+            format!("Chats with {agent} are visible to its owner, {owner} (@{handle}).")
+        }
+        (None, Some((owner, handle))) => {
+            format!("Chats with this agent are visible to its owner, {owner} (@{handle}).")
+        }
+        (Some(agent), None) => format!("Chats with {agent} are visible to its owner."),
+        (None, None) => NOTICE.to_owned(),
+    }
+}
+
 /// A contact's command other than `/help` and `/status`.
 pub const OWNER_ONLY: &str = "Only the agent's owner can use this command.";
 
@@ -40,7 +58,6 @@ pub(super) struct ContactRequest {
 }
 
 /// What the core knows about the agent's contacts.
-#[derive(Default)]
 pub(super) struct Contacts {
     /// Each user's relationship and when it was learned.
     states: std::collections::HashMap<UserId, (ContactState, Instant)>,
@@ -50,6 +67,23 @@ pub(super) struct Contacts {
     pub(super) open: Vec<ContactRequest>,
     /// The activity shown in each contact's conversation (not idle), and when it was sent.
     activity: std::collections::HashMap<ConversationId, (ActivityState, Option<String>, Instant)>,
+    /// That chats are visible to the owner, with the owner's name.
+    pub(super) notice: String,
+    /// The contacts told the notice in this session.
+    noticed: std::collections::HashSet<UserId>,
+}
+
+impl Default for Contacts {
+    fn default() -> Self {
+        Self {
+            states: std::collections::HashMap::new(),
+            conversations: std::collections::HashMap::new(),
+            open: Vec::new(),
+            activity: std::collections::HashMap::new(),
+            notice: NOTICE.to_owned(),
+            noticed: std::collections::HashSet::new(),
+        }
+    }
 }
 
 impl<M: Messenger> Core<M> {
@@ -74,9 +108,21 @@ impl<M: Messenger> Core<M> {
         }
     }
 
+    /// A card or reply from someone other than the owner: another agent's bridge that is
+    /// an accepted contact talks in replies and cards, which never prompt the backend (so
+    /// two agents cannot loop); anyone else is a stranger.
+    pub(super) async fn contact_rich(&mut self, message: Message) {
+        let (user, conversation) = (message.sender_id, message.conversation_id);
+        if self.is_contact(user).await {
+            tracing::debug!(event = "contact_reply_ignored");
+            return;
+        }
+        self.stranger(user, conversation);
+    }
+
     /// The server's word on `user`: an accepted contact (blocked users, requests either
     /// way and strangers are not).
-    async fn is_contact(&mut self, user: UserId) -> bool {
+    pub(super) async fn is_contact(&mut self, user: UserId) -> bool {
         let now = Instant::now();
         if let Some((state, at)) = self.contacts.states.get(&user) {
             if now.saturating_duration_since(*at) < CONTACT_FRESH {
@@ -96,6 +142,11 @@ impl<M: Messenger> Core<M> {
 
     /// A relationship changed: what the server said is the latest word.
     pub(super) fn contact_changed(&mut self, user: UserId, state: ContactState) {
+        if state == ContactState::RequestedIn {
+            // The owner decides on requests to an agent (the server answers the agent
+            // OWNER_DECIDES): nothing to do here but note it.
+            tracing::info!(event = "contact_request_waiting");
+        }
         self.contacts.states.insert(user, (state, Instant::now()));
     }
 
@@ -118,12 +169,16 @@ impl<M: Messenger> Core<M> {
     /// A contact's text: `/help` and `/status` run, other commands are the owner's; with
     /// a question open the text answers it; else it goes to the backend.
     async fn contact_text(&mut self, user: UserId, conversation: ConversationId, text: String) {
+        if self.contacts.noticed.insert(user) {
+            let notice = self.contacts.notice.clone();
+            self.contact_reply(conversation, &notice);
+        }
         let text = match commands::parse(&text) {
             None | Some(Command::Passthrough(_)) => text,
             Some(command) => {
                 tracing::info!(event = "contact_command", name = command.name());
                 let reply = match command {
-                    Command::Help => CONTACT_HELP.to_owned(),
+                    Command::Help => format!("{CONTACT_HELP}\n\n{}", self.contacts.notice),
                     Command::Status => self.contact_status().await,
                     _ => OWNER_ONLY.to_owned(),
                 };

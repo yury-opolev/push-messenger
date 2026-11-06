@@ -480,6 +480,20 @@ pub enum Event {
     /// Something happened to a call (docs/calls.md). Only while connected with calls
     /// available; not stored.
     Call(CallEvent),
+    /// A request to one of the user's agents waits for the user's decision (approve,
+    /// decline or block through the owner methods). Only while connected; not stored:
+    /// list the waiting requests with `agent_requests`.
+    AgentRequestWaiting {
+        agent: UserId,
+        requester: UserId,
+    },
+    /// Another relationship of one of the user's agents changed, as the agent sees it
+    /// (accepted, ended, blocked, its own request). Only while connected; not stored.
+    AgentContactChanged {
+        agent: UserId,
+        user: UserId,
+        state: ContactState,
+    },
     /// Sign in again (a password reset, or the credentials were refused). Also reported
     /// as [`ConnectionState::SignedOut`].
     SignedOut,

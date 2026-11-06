@@ -69,6 +69,11 @@ const SCHEDULE_USAGE: &str =
     "/schedule list | /schedule add <every|at|cron> <when> <prompt> | /schedule rm <id>";
 
 /// The reply to `/help`: every command, one line each.
+/// Below the owner's `/help` (spec 2026-11-06 agent connections).
+pub const OWNER_NOTE: &str = "Contact requests to this agent wait for you: approve, decline or \
+block them in the app (the agent cannot). You can read all of its chats and calls there, \
+read only; its contacts are told that you can.";
+
 pub const HELP: &str = "\
 /new: start a new session in this folder (the permission mode returns to the default)
 /cd <path>: switch to a folder inside the allowed roots

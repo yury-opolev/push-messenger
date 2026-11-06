@@ -487,6 +487,7 @@ impl Engine {
             Body::ActivityEvent(event) => self.on_activity_event(&event, now_ms),
             Body::PresenceEvent(event) => self.on_presence_event(&event),
             Body::ConversationFlags(flags) => self.on_conversation_flags(&flags, out),
+            Body::AgentContactEvent(event) => self.on_agent_contact(&event),
             Body::CallIncoming(_)
             | Body::CallAccepted(_)
             | Body::CallTaken(_)
@@ -802,6 +803,26 @@ impl Engine {
             Ok(None) => self.relist(out),
             Err(error) => tracing::warn!(code = error.code(), "could not store conversation flags"),
         }
+    }
+
+    /// One of the user's agents' relationships changed: a waiting request, or another
+    /// change. Reported, not stored.
+    fn on_agent_contact(&self, event: &v1::AgentContactEvent) {
+        let (Ok(agent), Ok(user)) = (
+            Uuid::from_slice(&event.agent_user_id),
+            Uuid::from_slice(&event.user_id),
+        ) else {
+            return;
+        };
+        let (agent, user) = (UserId(agent), UserId(user));
+        self.shared
+            .emit(match ContactState::from_wire(event.state()) {
+                ContactState::RequestedIn => Event::AgentRequestWaiting {
+                    agent,
+                    requester: user,
+                },
+                state => Event::AgentContactChanged { agent, user, state },
+            });
     }
 
     /// Activity is reported, not stored: it expires `ttl_ms` after it arrived, on this
@@ -1414,6 +1435,37 @@ mod tests {
             body: Some(response::Body::Done(v1::Done {})),
         }));
         assert!(back.is_some());
+    }
+
+    #[test]
+    fn an_agents_waiting_request_and_other_changes_reach_the_owner_as_events() {
+        let mut f = fixture();
+        let (agent, user) = (UserId(Uuid::now_v7()), UserId(Uuid::now_v7()));
+        let event = |state: v1::ContactState| {
+            Body::AgentContactEvent(v1::AgentContactEvent {
+                agent_user_id: bytes(agent.0),
+                user_id: bytes(user.0),
+                state: state.into(),
+            })
+        };
+        let (back, out) = f.frame(event(v1::ContactState::RequestedIn));
+        assert_eq!((back, out), (None, Vec::new()));
+        assert_eq!(
+            f.events(),
+            [Event::AgentRequestWaiting {
+                agent,
+                requester: user
+            }]
+        );
+        f.frame(event(v1::ContactState::Accepted));
+        assert_eq!(
+            f.events(),
+            [Event::AgentContactChanged {
+                agent,
+                user,
+                state: ContactState::Accepted
+            }]
+        );
     }
 
     #[test]

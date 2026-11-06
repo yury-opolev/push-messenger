@@ -7,6 +7,7 @@
 //! at once. It is cheap to clone, and every clone is the same client.
 
 mod calls;
+mod owners;
 mod presence;
 mod requests;
 mod sending;
