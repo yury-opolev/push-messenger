@@ -57,6 +57,8 @@ pub enum ValidationError {
     ActivityState,
     #[error("a presence read names 1 to 100 users")]
     PresenceBatch,
+    #[error("only a direct conversation can be hidden")]
+    NotDirect,
 }
 
 /// Checks a text message body.

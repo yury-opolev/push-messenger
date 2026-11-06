@@ -30,6 +30,10 @@ pub enum AccountEvent {
     UserVerified {
         user: Uuid,
     },
+    /// The account was deleted (an owner deleted an agent).
+    UserDeleted {
+        user: Uuid,
+    },
     DeviceRegistered {
         user: Uuid,
         device: Uuid,
@@ -66,6 +70,7 @@ impl AccountEvent {
                 Ok(Self::AgentEnrolled { user, owner })
             }),
             "user.verified" => id("user_id").map(|user| Self::UserVerified { user }),
+            "user.deleted" => id("user_id").map(|user| Self::UserDeleted { user }),
             "user.password_reset" => {
                 let reset_at = match &payload["reset_at"] {
                     Value::Null => Ok(None),
@@ -141,6 +146,10 @@ impl Accounts {
                 .map(|_| ()),
             AccountEvent::UserVerified { user } => client
                 .user_verified(user_message(user, None))
+                .await
+                .map(|_| ()),
+            AccountEvent::UserDeleted { user } => client
+                .user_deleted(user_message(user, None))
                 .await
                 .map(|_| ()),
             AccountEvent::PasswordReset { user, reset_at } => client
@@ -250,6 +259,14 @@ mod tests {
                 Some(Err(_))
             ));
         }
+        assert_eq!(
+            AccountEvent::parse("user.deleted", &json!({"user_id": user})),
+            Some(Ok(AccountEvent::UserDeleted { user }))
+        );
+        assert!(matches!(
+            AccountEvent::parse("user.deleted", &json!({})),
+            Some(Err(_))
+        ));
         assert_eq!(AccountEvent::parse("email.send", &both), None);
         assert!(matches!(
             AccountEvent::parse("device.registered", &json!({"user_id": user})),

@@ -213,6 +213,19 @@ pub(crate) fn notifications(events: &[Event]) -> Vec<(String, Vec<u8>)> {
                     ));
                 }
             }
+            Event::ConversationFlags {
+                user,
+                conversation,
+                hidden,
+                peer_deleted,
+            } => {
+                let kind = Kind::ConversationFlags(push_proto::v1::ConversationFlags {
+                    conversation_id: id_bytes(conversation.0),
+                    hidden: *hidden,
+                    peer_deleted: *peer_deleted,
+                });
+                messages.push(message(user.0, kind));
+            }
             _ => {}
         }
     }
@@ -326,6 +339,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn conversation_flags_go_to_their_user_only() {
+        let alice = UserId::new();
+        let conversation = ConversationId::new();
+        let messages = notifications(&[Event::ConversationFlags {
+            user: alice,
+            conversation,
+            hidden: true,
+            peer_deleted: true,
+        }]);
+        assert_eq!(
+            decode(&messages),
+            vec![(
+                notify_channel(alice.0),
+                Kind::ConversationFlags(v1::ConversationFlags {
+                    conversation_id: id_bytes(conversation.0),
+                    hidden: true,
+                    peer_deleted: true,
+                })
+            )]
+        );
+    }
     #[test]
     fn contact_and_read_position_changes_go_to_their_user_only() {
         let (alice, bob) = (UserId::new(), UserId::new());

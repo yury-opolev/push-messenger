@@ -10,6 +10,7 @@ mod edit;
 mod group_receipts;
 mod group_settings;
 mod groups;
+mod hiding;
 mod history;
 mod invites;
 mod listings;
@@ -32,6 +33,7 @@ pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
         ("group_receipts", group_receipts::cases()),
         ("group_settings", group_settings::cases()),
         ("groups", groups::cases()),
+        ("hiding", hiding::cases()),
         ("history", history::cases()),
         ("invites", invites::cases()),
         ("listings", listings::cases()),

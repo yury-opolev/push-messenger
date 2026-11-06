@@ -5,10 +5,10 @@ use chrono::{DateTime, Utc};
 use push_domain::calls::{CallDirection, CallHistoryRow, EndReason, HistoryCursor};
 use push_domain::templates::TemplateRef;
 use push_domain::{
-    ClientMsgId, ContactState, Conversation, ConversationId, ConversationOverview, DeviceId,
-    DeviceState, DomainError, DomainResult, Entry, EntryKind, GroupPositions, InsertOutcome,
-    InviteRecord, Member, MessageId, PublisherOwner, Store, StoredTemplate, TemplateEvent,
-    TemplateStatus, Tx, UserId,
+    ClientMsgId, ContactState, Conversation, ConversationFlags, ConversationId,
+    ConversationOverview, DeviceId, DeviceState, DomainError, DomainResult, Entry, EntryKind,
+    GroupPositions, InsertOutcome, InviteRecord, Member, MessageId, PublisherOwner, Store,
+    StoredTemplate, TemplateEvent, TemplateStatus, Tx, UserId,
 };
 use sqlx::postgres::{PgPool, PgRow};
 use sqlx::{PgConnection, Postgres, Row, Transaction};
@@ -1135,6 +1135,146 @@ impl Tx for PgTx {
         .await
         .map_err(store_error)?;
         read_all(rows, overview)
+    }
+
+    async fn set_conversation_hidden(
+        &mut self,
+        conversation: ConversationId,
+        user: UserId,
+        hidden: bool,
+        at: DateTime<Utc>,
+    ) -> DomainResult<bool> {
+        // Showing a conversation without a row changes nothing: no row means shown.
+        let changed = sqlx::query(
+            "INSERT INTO messaging.conversation_view (conversation_id, user_id, hidden, changed_at) \
+             SELECT $1, $2, $3, $4 WHERE $3 \
+             ON CONFLICT (conversation_id, user_id) DO UPDATE \
+             SET hidden = EXCLUDED.hidden, changed_at = EXCLUDED.changed_at \
+             WHERE conversation_view.hidden <> EXCLUDED.hidden",
+        )
+        .bind(conversation.0)
+        .bind(user.0)
+        .bind(hidden)
+        .bind(at)
+        .execute(self.conn())
+        .await
+        .map_err(store_error)?
+        .rows_affected();
+        if changed > 0 {
+            return Ok(true);
+        }
+        if !hidden {
+            let updated = sqlx::query(
+                "UPDATE messaging.conversation_view SET hidden = false, changed_at = $3 \
+                 WHERE conversation_id = $1 AND user_id = $2 AND hidden",
+            )
+            .bind(conversation.0)
+            .bind(user.0)
+            .bind(at)
+            .execute(self.conn())
+            .await
+            .map_err(store_error)?
+            .rows_affected();
+            if updated > 0 {
+                return Ok(true);
+            }
+            let member: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM messaging.conversation_member \
+                 WHERE conversation_id = $1 AND user_id = $2)",
+            )
+            .bind(conversation.0)
+            .bind(user.0)
+            .fetch_one(self.conn())
+            .await
+            .map_err(store_error)?;
+            if !member {
+                return Err(DomainError::Store(
+                    "foreign key violation: member does not exist".to_owned(),
+                ));
+            }
+        }
+        Ok(false)
+    }
+
+    async fn unhide_conversation(
+        &mut self,
+        conversation: ConversationId,
+        at: DateTime<Utc>,
+    ) -> DomainResult<Vec<UserId>> {
+        let mut shown: Vec<Uuid> = sqlx::query_scalar(
+            "UPDATE messaging.conversation_view SET hidden = false, changed_at = $2 \
+             WHERE conversation_id = $1 AND hidden RETURNING user_id",
+        )
+        .bind(conversation.0)
+        .bind(at)
+        .fetch_all(self.conn())
+        .await
+        .map_err(store_error)?;
+        shown.sort();
+        Ok(shown.into_iter().map(UserId).collect())
+    }
+
+    async fn conversation_flags(&mut self, user: UserId) -> DomainResult<Vec<ConversationFlags>> {
+        let rows: Vec<(Uuid, bool, bool, DateTime<Utc>)> = sqlx::query_as(
+            "SELECT m.conversation_id, coalesce(v.hidden, false), d.user_id IS NOT NULL, \
+             greatest(v.changed_at, d.deleted_at) \
+             FROM messaging.conversation_member m \
+             JOIN messaging.conversation c ON c.conversation_id = m.conversation_id AND c.kind = 1 \
+             LEFT JOIN messaging.conversation_view v \
+                ON v.conversation_id = m.conversation_id AND v.user_id = m.user_id \
+             LEFT JOIN messaging.conversation_member p \
+                ON p.conversation_id = m.conversation_id AND p.user_id <> m.user_id \
+             LEFT JOIN messaging.deleted_user d ON d.user_id = p.user_id \
+             WHERE m.user_id = $1 AND (v.user_id IS NOT NULL OR d.user_id IS NOT NULL)",
+        )
+        .bind(user.0)
+        .fetch_all(self.conn())
+        .await
+        .map_err(store_error)?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(conversation, hidden, peer_deleted, changed_at)| ConversationFlags {
+                    conversation_id: ConversationId(conversation),
+                    hidden,
+                    peer_deleted,
+                    changed_at,
+                },
+            )
+            .collect())
+    }
+
+    async fn mark_user_deleted(&mut self, user: UserId, at: DateTime<Utc>) -> DomainResult<bool> {
+        let inserted = sqlx::query(
+            "INSERT INTO messaging.deleted_user (user_id, deleted_at) VALUES ($1, $2) \
+             ON CONFLICT (user_id) DO NOTHING",
+        )
+        .bind(user.0)
+        .bind(at)
+        .execute(self.conn())
+        .await
+        .map_err(store_error)?
+        .rows_affected();
+        Ok(inserted > 0)
+    }
+
+    async fn direct_peers(&mut self, user: UserId) -> DomainResult<Vec<(ConversationId, UserId)>> {
+        let rows: Vec<(Uuid, Uuid)> = sqlx::query_as(
+            "SELECT m.conversation_id, p.user_id \
+             FROM messaging.conversation_member m \
+             JOIN messaging.conversation c ON c.conversation_id = m.conversation_id AND c.kind = 1 \
+             JOIN messaging.conversation_member p \
+                ON p.conversation_id = m.conversation_id AND p.user_id <> m.user_id \
+             WHERE m.user_id = $1",
+        )
+        .bind(user.0)
+        .fetch_all(self.conn())
+        .await
+        .map_err(store_error)?;
+        Ok(rows
+            .into_iter()
+            .map(|(conversation, peer)| (ConversationId(conversation), UserId(peer)))
+            .collect())
     }
 
     async fn is_agent(&mut self, user: UserId) -> DomainResult<bool> {

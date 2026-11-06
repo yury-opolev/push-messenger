@@ -4,6 +4,7 @@ use crate::clock::Clock;
 use crate::contacts::are_contacts;
 use crate::conversations::require_conversation;
 use crate::error::{DomainError, DomainResult};
+use crate::hiding::peer_deleted;
 use crate::ids::{ClientMsgId, ConversationId, DeviceId, MessageId, UserId};
 use crate::model::{
     ContentType, Conversation, ConversationKind, Entry, EntryKind, GroupPositions, Member,
@@ -189,11 +190,25 @@ where
         )
         .await?;
         let group = group_receipt(&mut tx, &conversation, seq, group_before).await?;
+        // A new message shows a hidden direct conversation again to everyone who hid it.
+        let mut shown = Vec::new();
+        if conversation.kind == ConversationKind::Direct {
+            for user in tx.unhide_conversation(conversation.id, now).await? {
+                let peer_deleted = peer_deleted(&mut tx, user, conversation.id).await?;
+                shown.push(Event::ConversationFlags {
+                    user,
+                    conversation: conversation.id,
+                    hidden: false,
+                    peer_deleted,
+                });
+            }
+        }
         tx.commit().await?;
 
         let mut events = vec![Event::EntriesAvailable {
             users: current_member_ids(&members),
         }];
+        events.extend(shown);
         if read_moved {
             events.push(Event::ReadPositionChanged {
                 user: command.sender,

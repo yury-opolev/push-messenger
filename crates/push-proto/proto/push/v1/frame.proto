@@ -67,8 +67,12 @@ message Frame {
     CallRenegotiate peer_call_renegotiate = 51;
     // The user's call history changed (docs/calls.md, "Call history").
     CallHistoryChanged call_history_changed = 52;
+    // The user's view of a conversation changed without a new entry: hidden or unhidden
+    // (on any of the user's devices, or by a new message), or the other member of a direct
+    // conversation was deleted.
+    ConversationFlags conversation_flags = 53;
   }
-  // 18-31 are free for later client frames, 53-63 for later server frames.
+  // 18-31 are free for later client frames, 54-63 for later server frames.
 }
 
 // Must be the first frame, within 5 seconds of connecting. The gateway learns the user
@@ -349,6 +353,8 @@ message Request {
     SetRole set_role = 19;
     GetPresence get_presence = 20;
     SetPresenceSharing set_presence_sharing = 21;
+    HideConversation hide_conversation = 22;
+    UnhideConversation unhide_conversation = 23;
   }
 }
 
@@ -376,12 +382,15 @@ message Done {}
 
 // The caller's conversations, current and left, sorted by id, with positions, unread
 // counts and receipt positions. A direct conversation with a user the caller has blocked
-// is left out.
+// is left out, and so is one the caller hid, unless include_hidden is set.
 message ListConversations {
-  // Only conversations created or appended to after this time. Pass the time of the
-  // previous listing minus a safety window of a few seconds; leave it out to refresh every
-  // conversation's receipt positions, which do not count as changes.
+  // Only conversations created or appended to after this time, or whose flags (hidden,
+  // peer_deleted) changed after it. Pass the time of the previous listing minus a safety
+  // window of a few seconds; leave it out to refresh every conversation's receipt
+  // positions, which do not count as changes.
   optional int64 changed_since = 1;
+  // Also list the conversations the caller hid (with hidden set).
+  bool include_hidden = 2;
 }
 
 enum ConversationKind {
@@ -416,6 +425,32 @@ message ConversationSummary {
   repeated bytes members = 10;
   // Current admins of a group, sorted.
   repeated bytes admins = 11;
+  // The caller hid this direct conversation (only listed with include_hidden).
+  bool hidden = 12;
+  // Direct only: the other member's account was deleted. Their profile is a tombstone
+  // (GET /v1/users answers deleted: true) and they will not write again.
+  bool peer_deleted = 13;
+}
+
+// Hides a direct conversation from the caller's own listings, on all of the caller's
+// devices; the other member's view is unchanged. A new message in the conversation un-hides
+// it. Idempotent; answered with Done. A group is INVALID; also CONVERSATION_NOT_FOUND and
+// NOT_MEMBER.
+message HideConversation {
+  bytes conversation_id = 1;
+}
+
+// Shows a hidden direct conversation again. Idempotent; answered with Done; errors as for
+// HideConversation.
+message UnhideConversation {
+  bytes conversation_id = 1;
+}
+
+// The caller's current flags of a conversation (see ConversationSummary).
+message ConversationFlags {
+  bytes conversation_id = 1;
+  bool hidden = 2;
+  bool peer_deleted = 3;
 }
 
 // The other member's positions; delivered is never below read.

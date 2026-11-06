@@ -8,6 +8,8 @@
 //!
 //! - new entries through `sync`;
 //! - contact changes through `list_contacts`;
+//! - conversation flags (hidden, peer deleted) through `list_conversations`, where a
+//!   flag change counts as a change for `changed_since`;
 //! - receipt positions through `list_conversations` called without `changed_since`.
 //!   `changed_since` reflects content changes only (a conversation created or an entry
 //!   appended). Receipt positions do not move `updated_at`, so the busy conversation row
@@ -78,6 +80,15 @@ pub enum Event {
         to: Vec<UserId>,
         user: UserId,
         view: PresenceView,
+    },
+    /// `user`'s flags of a conversation changed: they hid or unhid it (on any device), a
+    /// new message un-hid it, or the other member of the direct conversation was deleted.
+    /// Published to `user` only, with the current flags.
+    ConversationFlags {
+        user: UserId,
+        conversation: ConversationId,
+        hidden: bool,
+        peer_deleted: bool,
     },
 }
 

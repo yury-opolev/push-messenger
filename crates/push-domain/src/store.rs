@@ -70,8 +70,9 @@ use crate::calls::{CallHistoryRow, HistoryCursor};
 use crate::error::DomainResult;
 use crate::ids::{ClientMsgId, ConversationId, DeviceId, MessageId, UserId};
 use crate::model::{
-    ContactState, Conversation, ConversationOverview, DeviceState, Entry, GroupPositions,
-    InviteRecord, Member, PublisherOwner, StoredTemplate, TemplateEvent, TemplateStatus,
+    ContactState, Conversation, ConversationFlags, ConversationOverview, DeviceState, Entry,
+    GroupPositions, InviteRecord, Member, PublisherOwner, StoredTemplate, TemplateEvent,
+    TemplateStatus,
 };
 use crate::templates::TemplateRef;
 
@@ -422,6 +423,38 @@ pub trait Tx: Send {
         changed_since: Option<DateTime<Utc>>,
         unread_cap: u32,
     ) -> DomainResult<Vec<ConversationOverview>>;
+
+    // --- Conversation flags --------------------------------------------------------------
+
+    /// Hides (`true`) or shows `user`'s view of `conversation`, stamping `at` as the time
+    /// of the change. Returns whether the state changed; an unchanged state writes nothing.
+    /// No stored row means shown. Fails with `DomainError::Store` when `user` has no member
+    /// row in `conversation`.
+    async fn set_conversation_hidden(
+        &mut self,
+        conversation: ConversationId,
+        user: UserId,
+        hidden: bool,
+        at: DateTime<Utc>,
+    ) -> DomainResult<bool>;
+    /// Shows `conversation` again to every member who hid it, stamping `at`. Returns those
+    /// members, sorted.
+    async fn unhide_conversation(
+        &mut self,
+        conversation: ConversationId,
+        at: DateTime<Utc>,
+    ) -> DomainResult<Vec<UserId>>;
+    /// `user`'s flags of each direct conversation `user` is a member of that `user` ever
+    /// hid or unhid, or whose other member is recorded deleted. `changed_at` is the later of
+    /// the last hide or unhide and the deletion. The order is unspecified.
+    async fn conversation_flags(&mut self, user: UserId) -> DomainResult<Vec<ConversationFlags>>;
+    /// Records that `user`'s account was deleted at `at`. Returns whether it was recorded
+    /// now: a repeated call keeps the first time and returns `false`. Fails with
+    /// `DomainError::Store` when `user` is not known.
+    async fn mark_user_deleted(&mut self, user: UserId, at: DateTime<Utc>) -> DomainResult<bool>;
+    /// The direct conversations `user` is a member of, each with its other member. The
+    /// order is unspecified.
+    async fn direct_peers(&mut self, user: UserId) -> DomainResult<Vec<(ConversationId, UserId)>>;
 
     // --- Templates ---------------------------------------------------------------------
 

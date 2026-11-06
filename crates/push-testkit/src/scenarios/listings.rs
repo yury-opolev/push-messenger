@@ -67,6 +67,8 @@ async fn a_new_direct_conversation_is_listed_for_both_members<B: Backend>(backen
                 updated_at: world.clock.now(),
                 members: sorted(vec![alice.user, bob.user]),
                 admins: vec![],
+                hidden: false,
+                peer_deleted: false,
             }]
         );
     }
@@ -256,6 +258,8 @@ async fn a_group_is_listed_with_its_admins_and_group_wide_positions<B: Backend>(
             updated_at: world.clock.now(),
             members: sorted(vec![alice.user, bob.user, carol.user]),
             admins: vec![alice.user],
+            hidden: false,
+            peer_deleted: false,
         }
     );
 

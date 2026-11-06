@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 
@@ -7,8 +7,8 @@ use crate::contacts::are_contacts;
 use crate::error::{DomainError, DomainResult};
 use crate::ids::{ConversationId, UserId};
 use crate::model::{
-    ContactState, Conversation, ConversationKind, ConversationOverview, ConversationSummary,
-    Member, Receipts, Role, direct_key,
+    ContactState, Conversation, ConversationFlags, ConversationKind, ConversationOverview,
+    ConversationSummary, Member, Receipts, Role, direct_key,
 };
 use crate::notify::Notifier;
 use crate::read::visible_group_positions;
@@ -108,14 +108,46 @@ where
     /// left, with its time as `updated_at`, and without members or admins. Its title and
     /// group-wide positions are current, the positions capped at where they left. Once no
     /// current members remain, the group-wide positions are reported as 0.
+    ///
+    /// A direct conversation `user` hid is left out; see
+    /// [`Self::list_conversations_with`] to list it too.
     pub async fn list_conversations(
         &self,
         user: UserId,
         changed_since: Option<DateTime<Utc>>,
     ) -> DomainResult<Vec<ConversationSummary>> {
+        self.list_conversations_with(user, changed_since, false)
+            .await
+    }
+
+    /// [`Self::list_conversations`], also listing the direct conversations `user` hid when
+    /// `include_hidden` is set. Every summary carries `hidden` and `peer_deleted`.
+    ///
+    /// A flag change (a hide or unhide, a new message un-hiding it, the peer's deletion)
+    /// counts as a change for `changed_since`, though it does not move `updated_at`.
+    pub async fn list_conversations_with(
+        &self,
+        user: UserId,
+        changed_since: Option<DateTime<Utc>>,
+        include_hidden: bool,
+    ) -> DomainResult<Vec<ConversationSummary>> {
         let mut tx = self.store.begin().await?;
+        let flags: HashMap<ConversationId, ConversationFlags> = tx
+            .conversation_flags(user)
+            .await?
+            .into_iter()
+            .map(|flags| (flags.conversation_id, flags))
+            .collect();
+        let flagged_since = |id: &ConversationId, since: DateTime<Utc>| {
+            flags.get(id).is_some_and(|flags| flags.changed_at > since)
+        };
+        // The store filters by content changes only; when a flag changed since, every
+        // overview is read and filtered here (rare: flags change seldom).
+        let flag_changed =
+            changed_since.is_some_and(|since| flags.keys().any(|id| flagged_since(id, since)));
+        let store_since = if flag_changed { None } else { changed_since };
         let mut overviews = tx
-            .conversation_overviews(user, changed_since, MAX_UNREAD)
+            .conversation_overviews(user, store_since, MAX_UNREAD)
             .await?;
         let blocked: HashSet<UserId> = tx
             .contacts_of(user)
@@ -136,6 +168,23 @@ where
                 .is_some_and(|(peer, _)| blocked.contains(&peer.user_id))
             {
                 continue;
+            }
+            let id = overview.conversation.id;
+            let (hidden, peer_deleted) = flags
+                .get(&id)
+                .map_or((false, false), |flags| (flags.hidden, flags.peer_deleted));
+            if hidden && !include_hidden {
+                continue;
+            }
+            if let Some(since) = changed_since.filter(|_| flag_changed) {
+                let changed = if overview.member.left_at_seq.is_some() {
+                    overview.left_at.unwrap_or(overview.conversation.created_at) > since
+                } else {
+                    overview.conversation.updated_at > since
+                };
+                if !changed && !flagged_since(&id, since) {
+                    continue;
+                }
             }
             let ConversationOverview {
                 conversation,
@@ -174,11 +223,13 @@ where
                 updated_at: conversation.updated_at,
                 members,
                 admins,
+                hidden,
+                peer_deleted,
             };
             if member.left_at_seq.is_some() {
                 // A former member sees the conversation as it was when they left.
                 summary.updated_at = left_at.unwrap_or(conversation.created_at);
-                if changed_since.is_some_and(|since| summary.updated_at <= since) {
+                if !flag_changed && changed_since.is_some_and(|since| summary.updated_at <= since) {
                     continue;
                 }
                 summary.members.clear();
