@@ -54,6 +54,54 @@ Notable changes for consumers of push-messenger. Newest first.
 
 ### Added
 
+- **Agent connections and a read-only owner view**
+  ([design](docs/superpowers/specs/2026-11-06-agent-connections-and-owner-view.md)).
+  - **Policy per agent**, set by its owner only: `ask` (the default, also for existing
+    agents), `auto_own`, `auto_owner_contacts`, `auto_any`, `refuse_all`. A request to an
+    agent is resolved at once: accepted, held for the owner (the owner's devices get the
+    new frame `AgentContactEvent`, 54) or refused. A refused requester sees an ordinary
+    pending request that ends like a decline, after a random delay (chart
+    `agents.refusalMinSeconds`/`refusalMaxSeconds`, message-svc
+    `PUSH_AGENT_REFUSAL_MIN_S`/`_MAX_S`/`PUSH_AGENT_SWEEP_SECONDS`).
+  - **Agents decide nothing themselves**: `ContactAccept`/`ContactDecline` by an agent,
+    and blocking a requester whose request waits, answer the new error code
+    `OWNER_DECIDES` (32); blocking its owner and `CreateInvite` answer `NOT_ALLOWED` (31);
+    invites agents created earlier are void (`INVITE_NOT_FOUND`).
+  - **Agents send requests** under limits: 20 an hour, 100 a day, 50 pending, 10
+    waiting at other owners (`RATE_LIMITED` with `retry_after_s`).
+  - **Owner routes** on auth-svc, owner only (`404 not_found` for everyone else, the
+    same as for an agent that does not exist): `GET|PUT /v1/agents/{agent_id}/policy`,
+    `GET /v1/agents/{agent_id}/requests`,
+    `POST /v1/agents/{agent_id}/requests/{user_id}/approve|decline|block`,
+    `GET /v1/agents/{agent_id}/contacts`, `DELETE /v1/agents/{agent_id}/contacts/{user_id}`,
+    and the read-only view `GET /v1/agents/{agent_id}/conversations`,
+    `GET /v1/agents/{agent_id}/conversations/{conversation_id}/messages` and
+    `GET /v1/agents/{agent_id}/calls`. The view never changes the agent's read state and
+    has no write route. Every owner action and read is in the security log
+    (`agent.policy.*`, `agent.request.*`, `agent.contact*`, `agent.view.*`,
+    `agent.owner.refused`) with ids and counts, never content. 600 calls an hour per owner.
+  - **Notice data**: agent profiles carry `owner_display_name` and `owner_handle` next to
+    `owner_user_id`. Clients must show "Chats with <agent> are visible to its owner,
+    <owner>" in chats with agents the viewer does not own and on the request screen.
+  - **Agents never call each other**: `CallError` `NOT_ALLOWED` (contacts; others stay
+    `NOT_CONTACT`).
+  - **Deleting an agent** ends its waiting requests, its own requests and its contacts
+    (peers hear `NONE`; their own blocks stay) and its owner view; chats stay with the
+    tombstone and `peer_deleted`.
+  - **push-sdk**: `Profile.owner_display_name`/`owner_handle`; `agent_policy`,
+    `set_agent_policy`, `agent_requests`, `approve_agent_request`,
+    `decline_agent_request`, `block_for_agent`, `agent_contacts`, `remove_agent_contact`,
+    `agent_conversations`, `agent_history`, `agent_calls`; `Event::AgentRequestWaiting`,
+    `Event::AgentContactChanged`; `CallErrorCode::NotAllowed`. Bindings: the profile
+    fields and the two events (`agentRequestWaiting`, `agentContactChanged`).
+  - **push-bridge**: tells each contact once per session (and in `/help`) that the owner
+    can read the chat; the owner's `/help` explains requests; never answers another
+    agent's reply, card or refusal, so bridges cannot loop.
+  - **Compatibility**: older clients ignore the new profile fields and frame 54 and see
+    unknown error codes as failures; older owner clients cannot approve requests, which
+    then wait. Messaging migration `0010_agent_connections.sql` only adds tables (reverse:
+    drop them).
+
 - **Deleted accounts as tombstones, `peer_deleted`, and hiding direct conversations**
   ([design](docs/superpowers/specs/2026-11-06-tombstones-hide-design.md)).
   - auth-svc `GET /v1/users?ids=…`: every profile now carries `deleted` and `state`

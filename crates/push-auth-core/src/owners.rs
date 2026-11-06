@@ -475,10 +475,11 @@ pub(crate) async fn owner_of(
         .check(Action::AgentOwner, ip, Some(&caller.user_id.to_string()))
         .await?;
     let agent: Uuid = agent_id.parse().map_err(|_| AuthError::NotFound)?;
+    // Logged on a refusal too, so probing shows which ids were tried.
+    audit.agent = Some(agent);
     if !api.auth.owns_agent(caller.user_id, agent).await? {
         return Err(AuthError::NotFound);
     }
-    audit.agent = Some(agent);
     Ok((caller.user_id, agent))
 }
 
@@ -494,16 +495,27 @@ pub(crate) fn finish(result: Result<Response, AuthError>, audit: OwnerAudit) -> 
     response
 }
 
-/// The profiles of `users` as the API shows them, in the order of `users`; a user without
-/// a verified account is shown as a deleted account.
-pub(crate) async fn profiles_of(api: &Api, users: &[Uuid]) -> Result<Vec<Value>, AuthError> {
+/// The profiles of `users` as `agent` may see them (message-svc's `Directory`, as for the
+/// agent's own `GET /v1/users`), in the order of `users`: the owner learns nothing about a
+/// user the agent itself could not see. A user the agent may not see is shown by id only
+/// (`state: "hidden"`); a visible user without a verified account as a deleted account.
+pub(crate) async fn profiles_of(
+    api: &Api,
+    agent: Uuid,
+    users: &[Uuid],
+) -> Result<Vec<Value>, AuthError> {
     let mut sorted = users.to_vec();
     sorted.sort();
     sorted.dedup();
-    let found = api.auth.profiles(&sorted).await?;
+    let mut visible = api.directory.visible_users(agent, &sorted).await?;
+    visible.retain(|user| sorted.binary_search(user).is_ok());
+    let found = api.auth.profiles(&visible).await?;
     Ok(users
         .iter()
         .map(|user| {
+            if !visible.contains(user) {
+                return hidden_profile(*user);
+            }
             let profile = found
                 .iter()
                 .find(|profile| profile.user_id == *user)
@@ -512,6 +524,39 @@ pub(crate) async fn profiles_of(api: &Api, users: &[Uuid]) -> Result<Vec<Value>,
             profile_json(&profile)
         })
         .collect())
+}
+
+/// A user the agent may not see: the id alone, in the profile's shape.
+fn hidden_profile(user: Uuid) -> Value {
+    json!({
+        "user_id": user,
+        "handle": "",
+        "display_name": "",
+        "kind": "user",
+        "owner_user_id": null,
+        "owner_display_name": null,
+        "owner_handle": null,
+        "deleted": false,
+        "state": "hidden",
+    })
+}
+
+/// A peer agent's owner as its profile names them (the notice data), or null.
+fn owner_of_peer(peer: &Value) -> Value {
+    if peer["owner_user_id"].is_null() {
+        return Value::Null;
+    }
+    json!({
+        "user_id": peer["owner_user_id"],
+        "handle": peer["owner_handle"].as_str().unwrap_or_default(),
+        "display_name": peer["owner_display_name"].as_str().unwrap_or_default(),
+        "kind": "user",
+        "owner_user_id": null,
+        "owner_display_name": null,
+        "owner_handle": null,
+        "deleted": false,
+        "state": "active",
+    })
 }
 
 /// `GET /v1/agents/{agent_id}/policy`: `{"policy": "ask"}`.
@@ -574,7 +619,7 @@ pub(crate) async fn list_requests(
         let (owner, agent) = owner_of(&api, &headers, ip, &agent_id, &mut audit).await?;
         let waiting = api.agent_owners.waiting(owner, agent).await?;
         let users: Vec<Uuid> = waiting.iter().map(|(user, _)| *user).collect();
-        let profiles = profiles_of(&api, &users).await?;
+        let profiles = profiles_of(&api, agent, &users).await?;
         audit.count = Some(waiting.len());
         let requests: Vec<Value> = waiting
             .iter()
@@ -649,7 +694,7 @@ pub(crate) async fn list_contacts(
         let (owner, agent) = owner_of(&api, &headers, ip, &agent_id, &mut audit).await?;
         let contacts = api.agent_owners.contacts(owner, agent).await?;
         let users: Vec<Uuid> = contacts.iter().map(|(user, _)| *user).collect();
-        let profiles = profiles_of(&api, &users).await?;
+        let profiles = profiles_of(&api, agent, &users).await?;
         audit.count = Some(contacts.len());
         let contacts: Vec<Value> = contacts
             .iter()
@@ -747,14 +792,11 @@ pub(crate) async fn conversations(
         let conversations = api.agent_owners.conversations(owner, agent).await?;
         let mut users = Vec::new();
         for conversation in &conversations {
-            for id in [&conversation.peer_user_id, &conversation.peer_owner_user_id]
-                .into_iter()
-                .flatten()
-            {
+            if let Some(id) = &conversation.peer_user_id {
                 users.push(user(id)?);
             }
         }
-        let profiles = profiles_of(&api, &users).await?;
+        let profiles = profiles_of(&api, agent, &users).await?;
         let profile = |id: &Option<Vec<u8>>| -> Result<Value, AuthError> {
             match id {
                 None => Ok(Value::Null),
@@ -772,12 +814,13 @@ pub(crate) async fn conversations(
                 ConversationKind::Group => "group",
                 ConversationKind::Unspecified => return Err(malformed("a conversation kind")),
             };
+            let peer = profile(&conversation.peer_user_id)?;
             listed.push(json!({
                 "conversation_id": user(&conversation.conversation_id)?,
                 "kind": kind,
                 "title": conversation.title,
-                "peer": profile(&conversation.peer_user_id)?,
-                "peer_owner": profile(&conversation.peer_owner_user_id)?,
+                "peer": peer,
+                "peer_owner": owner_of_peer(&peer),
                 "member_count": conversation.member_count,
                 "last_activity_at": time(conversation.last_activity_at)?,
                 "message_count": conversation.message_count,

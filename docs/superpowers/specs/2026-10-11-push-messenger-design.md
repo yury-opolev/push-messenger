@@ -672,7 +672,19 @@ relay nor a redelivered event closes a session that signed in after the reset.
   users who could see the account before get a tombstone. Deleting an account writes
   `user.deleted`, relayed to message-svc (`Accounts.UserDeleted`), which records it and
   flags the deleted user's direct conversations `peer_deleted` for their peers
-  ([design](2026-11-06-tombstones-hide-design.md)).
+  ([design](2026-11-06-tombstones-hide-design.md)). An agent's profile also names its
+  owner (`owner_display_name`, `owner_handle`, joined from the owner's account) for the
+  notice clients must show: "Chats with <agent> are visible to its owner, <owner>".
+- **Agent connections** ([design](2026-11-06-agent-connections-and-owner-view.md),
+  2026-11-06). A request to an owned agent is resolved at once by the policy its owner
+  chose (`ask` by default, `auto_own`, `auto_owner_contacts`, `auto_any`, `refuse_all`):
+  accepted, held for the owner (the agent's `requested_in` row; the owner hears
+  `AgentContactEvent`) or refused (the requester's row alone, released silently after a
+  random delay, as a decline looks). Agents get `OWNER_DECIDES` on accept and decline,
+  `NOT_ALLOWED` on blocking their owner, on invites and on calls between agents, and have
+  request limits (`RATE_LIMITED`). The owner acts and reads (read only) through
+  `/v1/agents/{agent_id}/…` on auth-svc; everyone else gets `not_found`. Deleting an agent
+  ends its relationships.
 
 ### 5.6 Passwords and rate limits
 
@@ -698,7 +710,9 @@ Implementation notes (push-auth, Plan 5A):
   `GET|PATCH /v1/users/me` and `GET /v1/users/lookup?handle=…`. Profiles include
   `kind:"user"|"agent"` and nullable `owner_user_id` (null for humans).
   The [owned-agent extension](2026-10-19-entra-sign-in-design.md#4-api) adds
-  `POST|GET /v1/agents`, `PATCH|DELETE /v1/agents/{id}` and opt-in
+  `POST|GET /v1/agents`, `PATCH|DELETE /v1/agents/{id}`, the owner routes
+  `/v1/agents/{id}/policy|requests|contacts|conversations|calls`
+  ([agent connections](2026-11-06-agent-connections-and-owner-view.md#51-http-auth-svc-owner-only)) and opt-in
   `POST /v1/auth/entra-app` with single-use owner-consent enrollment codes. Agents are
   separate authors with ordinary limits, never automatically provisioned by sign-in;
   deletion disables the agent, releases its app identity for a new enrollment and relays
@@ -880,6 +894,7 @@ Request frames carry a client-chosen `request_id`, echoed in the response:
 | ReadPosition | `conversation_id, read_seq` — the user's own read position moved |
 | ContactEvent | `user_id, state` |
 | ActivityEvent / PresenceEvent | another member's activity / a contact's presence ([activity-presence.md](../../activity-presence.md)) |
+| AgentContactEvent | `agent_user_id, user_id, state` — to an agent's owner: the agent's relationship with `user_id` changed; `REQUESTED_IN` = a request waits for the owner ([agent connections](2026-11-06-agent-connections-and-owner-view.md)) |
 | ConversationFlags | `conversation_id, hidden, peer_deleted` — the user's flags of a conversation changed (hidden or unhidden on any device, un-hidden by a new message, or the peer deleted); `ListConversations` gives the same flags (`ConversationSummary.hidden`, `peer_deleted`) |
 | Response | `request_id` and the request-specific result |
 | AuthExpiring | `expires_in_s` |

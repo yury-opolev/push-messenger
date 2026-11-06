@@ -5,6 +5,7 @@
 {{- include "push.checkIngress" . -}}
 {{- include "push.checkDatastores" . -}}
 {{- include "push.checkCalls" . -}}
+{{- include "push.checkAgents" . -}}
 {{- range $name := list "auth" "messageSvc" "gateway" "worker" "smoke" -}}
 {{- $_ := include "push.image" (index $.Values.images $name) -}}
 {{- end -}}

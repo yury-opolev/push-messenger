@@ -87,6 +87,11 @@ spec:
             # Call history retention, also with calls disabled.
             - name: PUSH_CALLS_HISTORY_DAYS
               value: {{ int .Values.calls.historyDays | quote }}
+            # How long a refused request to an agent stays pending (agent connections).
+            - name: PUSH_AGENT_REFUSAL_MIN_S
+              value: {{ int .Values.agents.refusalMinSeconds | quote }}
+            - name: PUSH_AGENT_REFUSAL_MAX_S
+              value: {{ int .Values.agents.refusalMaxSeconds | quote }}
           ports:
             - name: messaging
               containerPort: 50051

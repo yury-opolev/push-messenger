@@ -465,7 +465,13 @@ device stays enrolled: the next `run` signs in again with a fresh assertion.
 
 **Strangers.** Text and cards from anyone but the owner, in any conversation, get the plain
 text "This agent is private." at most once per sender per hour; nothing they send reaches
-Coda, and their answers to the owner's cards are ignored.
+Coda, and their answers to the owner's cards are ignored. Another bridge's "This agent is
+private." is never answered, so two agents cannot keep refusing each other.
+
+**Contact requests** ([agent connections](#20-agent-connections)): the bridge never accepts
+or declines a request; the server resolves it by the policy the owner chose, and a request
+that waits is the owner's to approve in the app (an agent that tries gets `owner_decides`).
+The bridge only logs `contact_request_waiting`.
 
 ## 7. Cards
 
@@ -562,6 +568,9 @@ restarts."
 | Secrets at rest | Tokens stay in memory; the SDK's database is in memory; `state.json` holds ids only |
 | Another local user drives the bridge | The [control channel](#access-rules) is a local pipe whose DACL admits only the user and SYSTEM, and each side checks the other's user SID (Unix: a 0600 socket in a 0700 folder and a peer uid check); it carries states, counts, names and error codes only, except the [chat peek](#chat-peek) (the owner conversation's last messages, masked, in memory only; `"peek": false` turns it off); `"control": false` turns the channel off |
 | Someone else talks to the agent by voice | Only the owner's calls are answered (the server refuses non-contacts first), one at a time; a transcript is never a `/` command |
+| Someone connects to the agent behind the owner's back | The agent cannot accept contact requests (`owner_decides`): the owner's policy and decisions do ([§20](#20-agent-connections)); an agent's invites count for nothing |
+| People chatting with the agent do not know the owner reads along | Each contact is told once per session, and in `/help`, that the owner can read the chat; clients show the same notice from the agent's profile |
+| Two agents talking in a loop | Replies, cards and refusals from other agents never prompt the backend; agents never call each other |
 
 **Voice calls.** The call's audio is encrypted end to end between the owner's app and the
 bridge. The call's audio and the text of each spoken sentence (masked) go to the
@@ -2237,14 +2246,20 @@ a folder of its own, and a `key.name` of its own, as for
 | `pick` | posts `agent.choose@1` "Pick any colours." (Red, Blue, Green; any number of them; typed answers separated by commas); "you chose: Red, Green" in option order |
 | anything else | replies `agent.reply@2` (Markdown) "echo: <text>", with activity `working` / `echoing`; a text over 4,000 characters continues in further replies, as every turn does |
 
+- **Notice:** each contact's first text in a session gets a reply "Chats with <agent> are
+  visible to its owner, <owner> (@<handle>)." (from the agent's own profile), and the
+  contacts' `/help` ends with it.
+- **Other agents:** an agent that is an accepted contact talks to it like anyone else, in
+  texts; its replies and cards (rich messages) never prompt the echo agent, so two echo
+  agents cannot loop. Agents never call each other (`NOT_ALLOWED`).
 - **Who may talk to it:** the owner, and the agent's **accepted contacts**, each in their
   own direct conversation with the agent, where its replies and cards go. The echo backend
   opts in with `Backend::accepts_contacts` (Coda does not: it stays owner-only). The
   relationship is the server's (`list_contacts`, kept for 60 s and updated by contact
   events): requests either way, blocked users and strangers get "This agent is private."
   and nothing reaches the backend. The agent never accepts a contact request by itself:
-  the owner adds contacts (for example by inviting the test user from the agent's
-  account in the app) as for any agent.
+  requests follow the owner's policy, and waiting ones are the owner's to approve
+  ([agent connections](#20-agent-connections)).
 - **Only the asker answers:** each open card belongs to whoever asked (the owner or that
   contact). Anyone else's answer to it is refused (`answer_refused`) and the card stays
   open; while a card is open, the asker's next text answers it, and other users' texts
@@ -2275,3 +2290,32 @@ a folder of its own, and a `key.name` of its own, as for
 
 `cargo test -p push-bridge --lib echo` runs its tests (the core with a `TestMessenger`,
 contacts, the asker-only rule across users, and a call through the testkit adapter).
+
+## 20. Agent connections
+
+An agent's contacts are its owner's decision
+([design](superpowers/specs/2026-11-06-agent-connections-and-owner-view.md)):
+
+- **Policy.** The owner sets, per agent, `ask` (the default), `auto_own` (the owner's own
+  agents are accepted), `auto_owner_contacts` (also the owner's accepted contacts and
+  their agents), `auto_any` or `refuse_all`, with `PUT /v1/agents/{agent_id}/policy` (the
+  SDK's `set_agent_policy`). A refused requester sees an ordinary pending request that
+  ends like a decline.
+- **Waiting requests** reach the owner as `AgentContactEvent` (SDK
+  `Event::AgentRequestWaiting`); the owner approves, declines or blocks them
+  (`/v1/agents/{agent_id}/requests/{user_id}/approve|decline|block`). The bridge never
+  does: the server answers an agent `owner_decides`.
+- **The agent asks too.** An agent may send contact requests (to people and to agents);
+  the receiving side's rules apply. Agents are limited to 20 requests an hour, 100 a day,
+  50 pending and 10 waiting at other owners (`rate_limited`).
+- **Agent to agent:** messages and cards only; calls between agents are refused
+  (`NOT_ALLOWED`). The bridge never answers another bridge's reply, card or refusal.
+- **The owner reads everything, read only:** `GET /v1/agents/{agent_id}/conversations`,
+  `…/conversations/{conversation_id}/messages` and `…/calls` (the SDK's
+  `agent_conversations`, `agent_history`, `agent_calls`). Reads never change the agent's
+  read state, and there is no way to write as the agent. Every read is in auth-svc's
+  security log (ids and counts, never content).
+- **Notice.** People and agents chatting with the agent are told that its owner can read
+  the chat: the bridge says it to each contact once per session and in their `/help`; the
+  owner's `/help` explains the above. Clients show the same notice from the agent's
+  profile (`owner_display_name`, `owner_handle`).

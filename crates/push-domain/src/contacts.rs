@@ -194,29 +194,37 @@ where
     /// An agent may not block its owner (`NotAllowed`) nor a user whose request waits for
     /// its owner (`OwnerDecides`: that would decline it).
     pub async fn contact_block(&self, me: UserId, peer: UserId) -> DomainResult<()> {
-        let mut tx = self.store.begin().await?;
-        let owner = tx.agent_owner(me).await?;
-        tx.rollback().await?;
-        if let Some(owner) = owner {
-            if owner == peer {
-                return Err(DomainError::NotAllowed);
-            }
-            let Some(mut tx) = self.begin_pair(me, peer).await? else {
-                return Ok(());
-            };
-            let waiting = tx.get_contact(me, peer).await? == Some(ContactState::RequestedIn);
-            tx.rollback().await?;
-            if waiting {
-                return Err(DomainError::OwnerDecides);
-            }
-        }
-        self.block_as(me, peer).await
+        self.block(me, peer, false).await
     }
 
+    /// The owner's block for its agent `me`: no agent rule applies.
     pub(crate) async fn block_as(&self, me: UserId, peer: UserId) -> DomainResult<()> {
+        self.block(me, peer, true).await
+    }
+
+    async fn block(&self, me: UserId, peer: UserId, by_owner: bool) -> DomainResult<()> {
         let Some(mut tx) = self.begin_pair(me, peer).await? else {
+            if !by_owner {
+                let mut tx = self.store.begin().await?;
+                let owner = tx.agent_owner(me).await?;
+                tx.rollback().await?;
+                if owner == Some(peer) {
+                    return Err(DomainError::NotAllowed);
+                }
+            }
             return Ok(());
         };
+        if !by_owner {
+            // Checked under the pair lock, so no request can arrive in between.
+            if let Some(owner) = tx.agent_owner(me).await? {
+                if owner == peer {
+                    return Err(DomainError::NotAllowed);
+                }
+                if tx.get_contact(me, peer).await? == Some(ContactState::RequestedIn) {
+                    return Err(DomainError::OwnerDecides);
+                }
+            }
+        }
         tx.lock_users(&[me, peer]).await?;
         let blocked = Some(ContactState::Blocked);
         let mut events = Vec::new();
@@ -236,17 +244,10 @@ where
             tx.put_block(me, peer, sees_peer).await?;
             events.push(contact_changed(me, peer, blocked));
         }
-        if theirs != blocked && set_contact(&mut tx, peer, me, None).await? {
-            if let Some(owner) = tx.agent_owner(peer).await? {
-                if owner != me {
-                    events.push(Event::AgentContact {
-                        owner,
-                        agent: peer,
-                        user: me,
-                        state: None,
-                    });
-                }
-            }
+        // The blocked side (and, for an agent, its owner) hears nothing: a block looks
+        // like a decline.
+        if theirs != blocked {
+            set_contact(&mut tx, peer, me, None).await?;
         }
         owner_events(&mut tx, &mut events).await?;
         tx.commit().await?;

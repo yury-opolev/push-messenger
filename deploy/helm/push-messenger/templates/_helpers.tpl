@@ -851,6 +851,23 @@ every identity that reaches it; password mode needs a consumer-managed Secret wi
 {{- end -}}
 
 {{/*
+Checks the agent connection settings: whole seconds from 0 to 604800, min not above max.
+*/}}
+{{- define "push.checkAgents" -}}
+{{- $agents := .Values.agents -}}
+{{- range $name := list "refusalMinSeconds" "refusalMaxSeconds" -}}
+{{- $value := index $agents $name -}}
+{{- $whole := int $value -}}
+{{- if or (not (or (kindIs "float64" $value) (kindIs "int64" $value) (kindIs "int" $value))) (ne (toString $whole) (toString $value)) (lt $whole 0) (gt $whole 604800) -}}
+{{- fail (printf "agents.%s must be an integer from 0 to 604800" $name) -}}
+{{- end -}}
+{{- end -}}
+{{- if gt (int $agents.refusalMinSeconds) (int $agents.refusalMaxSeconds) -}}
+{{- fail "agents.refusalMinSeconds must not be above agents.refusalMaxSeconds" -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
 Checks the voice call settings (docs/calls.md): a boolean switch and whole numbers in the
 ranges the services accept at start (strings and fractions are refused).
 */}}
