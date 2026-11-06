@@ -298,6 +298,7 @@ async fn enrollment_preserves_admission_and_management_is_rate_limited_without_e
         directory: Arc::new(NoDirectory),
         templates: Arc::new(crate::templates::NoTemplates),
         call_history: Arc::new(crate::calls::NoCalls),
+        agent_owners: Arc::new(crate::owners::NoAgentOwners),
         turn: Arc::new(crate::turn::Turn::disabled()),
     });
     let token = app_token(&world, TENANT, Uuid::new_v4());
@@ -362,6 +363,7 @@ pub(super) async fn setup_with(
         directory,
         templates: Arc::new(crate::templates::NoTemplates),
         call_history: Arc::new(crate::calls::NoCalls),
+        agent_owners: Arc::new(crate::owners::NoAgentOwners),
         turn: Arc::new(crate::turn::Turn::disabled()),
     });
     (world, auth, router, owner)
@@ -511,7 +513,7 @@ pub(super) async fn call_from(
     (status, body)
 }
 
-fn app_token(world: &World, tenant: &str, object: Uuid) -> String {
+pub(super) fn app_token(world: &World, tenant: &str, object: Uuid) -> String {
     let mut claims = world.stub.user_claims(tenant, &object.to_string());
     claims.as_object_mut().unwrap().remove("scp");
     claims["idtyp"] = json!("app");
@@ -1439,6 +1441,7 @@ fn setup_router(auth: Auth, directory: Arc<dyn crate::Directory>) -> Router {
         directory,
         templates: Arc::new(crate::templates::NoTemplates),
         call_history: Arc::new(crate::calls::NoCalls),
+        agent_owners: Arc::new(crate::owners::NoAgentOwners),
         turn: Arc::new(crate::turn::Turn::disabled()),
     })
 }

@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use prost::Message;
-use push_message_svc::{CallsConfig, Config, Listeners, serve};
+use push_message_svc::{AgentsConfig, CallsConfig, Config, Listeners, serve};
 use push_proto::internal::v1::accounts_client::AccountsClient;
 use push_proto::internal::v1::directory_client::DirectoryClient;
 use push_proto::internal::v1::messaging_client::MessagingClient;
@@ -106,6 +106,11 @@ async fn start() -> Running {
         calls: CallsConfig {
             enabled: true,
             ..CallsConfig::default()
+        },
+        agents: AgentsConfig {
+            refusal_min: Duration::ZERO,
+            refusal_max: Duration::from_secs(1),
+            sweep: Duration::from_secs(1),
         },
     };
     let shutdown = CancellationToken::new();
@@ -257,6 +262,7 @@ async fn shutdown_is_honoured_while_the_database_is_unreachable() {
         directory_token: None,
         messaging_token: None,
         calls: CallsConfig::default(),
+        agents: AgentsConfig::default(),
     };
     let shutdown = CancellationToken::new();
     let server = tokio::spawn(serve(

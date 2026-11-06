@@ -32,6 +32,8 @@ use push_store::{DatabaseTarget, DatabaseVars, StoreOptions, postgres_auth};
 /// | `PUSH_CALLS_RING_SECONDS` | how long a call rings, 10 to 120 | `45` |
 /// | `PUSH_CALLS_DISCONNECT_GRACE_SECONDS` | how long a party device may be gone before its call fails, 5 to 120 | `30` |
 /// | `PUSH_CALLS_HISTORY_DAYS` | how many days call history is kept, 1 to 3650; applies whether calls are enabled or not | `90` |
+/// | `PUSH_AGENT_REFUSAL_MIN_S`, `PUSH_AGENT_REFUSAL_MAX_S` | a request an agent's policy refused stays pending a random time between these, in seconds (0 to 604800, min ≤ max), then ends like a decline | `600`, `21600` |
+/// | `PUSH_AGENT_SWEEP_SECONDS` | how often due refusals are released, 1 to 300 | `30` |
 #[derive(Clone, PartialEq, Eq)]
 pub struct Config {
     pub database: DatabaseTarget,
@@ -49,6 +51,47 @@ pub struct Config {
     pub directory_token: Option<String>,
     pub messaging_token: Option<String>,
     pub calls: CallsConfig,
+    pub agents: AgentsConfig,
+}
+
+/// Agent connections (spec 2026-11-06 agent connections §3.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentsConfig {
+    /// The shortest time a refused request stays pending (`PUSH_AGENT_REFUSAL_MIN_S`).
+    pub refusal_min: Duration,
+    /// The longest (`PUSH_AGENT_REFUSAL_MAX_S`).
+    pub refusal_max: Duration,
+    /// How often due refusals are released (`PUSH_AGENT_SWEEP_SECONDS`).
+    pub sweep: Duration,
+}
+
+impl Default for AgentsConfig {
+    fn default() -> Self {
+        Self {
+            refusal_min: Duration::from_secs(600),
+            refusal_max: Duration::from_secs(21600),
+            sweep: Duration::from_secs(30),
+        }
+    }
+}
+
+impl AgentsConfig {
+    fn from_lookup(lookup: &impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
+        let refusal_min = seconds_in(lookup, "PUSH_AGENT_REFUSAL_MIN_S", 600, 0..=604_800)?;
+        let refusal_max = seconds_in(lookup, "PUSH_AGENT_REFUSAL_MAX_S", 21600, 0..=604_800)?;
+        if refusal_max < refusal_min {
+            return Err(ConfigError::Invalid {
+                name: "PUSH_AGENT_REFUSAL_MAX_S",
+                value: refusal_max.as_secs().to_string(),
+                reason: "must not be below PUSH_AGENT_REFUSAL_MIN_S".to_owned(),
+            });
+        }
+        Ok(Self {
+            refusal_min,
+            refusal_max,
+            sweep: seconds_in(lookup, "PUSH_AGENT_SWEEP_SECONDS", 30, 1..=300)?,
+        })
+    }
 }
 
 /// The call engine's settings (spec §12).
@@ -162,6 +205,7 @@ impl std::fmt::Debug for Config {
                 &self.messaging_token.as_ref().map(|_| "<redacted>"),
             )
             .field("calls", &self.calls)
+            .field("agents", &self.agents)
             .finish()
     }
 }
@@ -249,6 +293,7 @@ impl Config {
             directory_token,
             messaging_token,
             calls: CallsConfig::from_lookup(&lookup)?,
+            agents: AgentsConfig::from_lookup(&lookup)?,
         })
     }
 }

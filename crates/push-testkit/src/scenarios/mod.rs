@@ -2,6 +2,7 @@
 
 use crate::{Backend, Case};
 
+mod agents;
 mod contacts;
 mod delete;
 mod devices;
@@ -25,6 +26,7 @@ mod visibility;
 
 pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
     let modules: Vec<(&str, Vec<Case<B>>)> = vec![
+        ("agents", agents::cases()),
         ("contacts", contacts::cases()),
         ("delete", delete::cases()),
         ("devices", devices::cases()),

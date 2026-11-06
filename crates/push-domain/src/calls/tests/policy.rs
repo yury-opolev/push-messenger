@@ -99,7 +99,8 @@ async fn only_the_owner_calls_the_agent() {
     let (owner, agent) = (UserId::new(), UserId::new());
     service.enroll_agent(owner, agent).await.unwrap();
     let friend = user(&service).await;
-    befriend(&service, friend, agent).await;
+    // Agents do not accept requests themselves: the agent asks, the friend accepts.
+    befriend(&service, agent, friend).await;
     befriend(&service, friend, owner).await;
     assert!(may_call(&service, owner, agent).await);
     assert!(!may_call(&service, friend, agent).await);
@@ -120,8 +121,10 @@ async fn owner_and_agent_without_contact_rows_may_call() {
     assert_eq!(service.contact_state(agent, owner).await, Ok(None));
     assert!(may_call(&service, owner, agent).await);
     assert!(may_call(&service, agent, owner).await);
-    // The agent's own block refuses too.
-    service.contact_block(agent, owner).await.unwrap();
-    assert!(!may_call(&service, owner, agent).await);
-    assert!(!may_call(&service, agent, owner).await);
+    // An agent cannot block its owner (spec 2026-11-06 agent connections D4).
+    assert_eq!(
+        service.contact_block(agent, owner).await,
+        Err(DomainError::NotAllowed)
+    );
+    assert!(may_call(&service, agent, owner).await);
 }

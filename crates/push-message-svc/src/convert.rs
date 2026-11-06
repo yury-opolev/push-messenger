@@ -74,6 +74,10 @@ pub(crate) fn domain_error(error: DomainError) -> Status {
         DomainError::TemplateNotFound => (Code::NotFound, ErrorCode::Rejected),
         DomainError::TemplateExists => (Code::AlreadyExists, ErrorCode::Rejected),
         DomainError::TemplateConflict(_) => (Code::FailedPrecondition, ErrorCode::Rejected),
+        DomainError::NotAllowed => (Code::FailedPrecondition, ErrorCode::NotAllowed),
+        DomainError::OwnerDecides => (Code::FailedPrecondition, ErrorCode::OwnerDecides),
+        DomainError::RateLimited { .. } => (Code::ResourceExhausted, ErrorCode::RateLimited),
+        DomainError::AgentNotFound => (Code::NotFound, ErrorCode::UserNotFound),
         DomainError::Conflict => (Code::Aborted, ErrorCode::Unavailable),
         DomainError::KickFailed(_) => (Code::Unavailable, ErrorCode::Unavailable),
         DomainError::Store(_) => (Code::Unavailable, ErrorCode::Unavailable),
@@ -88,10 +92,17 @@ pub(crate) fn domain_error(error: DomainError) -> Status {
         v1::Error {
             code: error_code.into(),
             message,
-            retryable: error.is_retryable() || matches!(error, DomainError::Store(_)),
+            retryable: error.is_retryable()
+                || matches!(
+                    error,
+                    DomainError::Store(_) | DomainError::RateLimited { .. }
+                ),
             client_msg_id: None,
             request_id: None,
-            retry_after_s: None,
+            retry_after_s: match error {
+                DomainError::RateLimited { retry_after_s } => Some(retry_after_s),
+                _ => None,
+            },
         },
     )
 }
@@ -461,6 +472,26 @@ mod tests {
                 Code::FailedPrecondition,
                 ErrorCode::Rejected,
             ),
+            (
+                DomainError::NotAllowed,
+                Code::FailedPrecondition,
+                ErrorCode::NotAllowed,
+            ),
+            (
+                DomainError::OwnerDecides,
+                Code::FailedPrecondition,
+                ErrorCode::OwnerDecides,
+            ),
+            (
+                DomainError::RateLimited { retry_after_s: 42 },
+                Code::ResourceExhausted,
+                ErrorCode::RateLimited,
+            ),
+            (
+                DomainError::AgentNotFound,
+                Code::NotFound,
+                ErrorCode::UserNotFound,
+            ),
             (DomainError::Conflict, Code::Aborted, ErrorCode::Unavailable),
             (
                 DomainError::KickFailed("redis down".into()),
@@ -481,6 +512,7 @@ mod tests {
                     | DomainError::Conflict
                     | DomainError::KickFailed(_)
                     | DomainError::Store(_)
+                    | DomainError::RateLimited { .. }
             );
             let message = domain.to_string();
             let status = domain_error(domain);
@@ -490,8 +522,13 @@ mod tests {
             assert_eq!(error.retryable, retryable, "{message}");
             client_codes.insert(error_code);
         }
-        // Only the retryable errors and the template errors share a client code.
-        assert_eq!(client_codes.len(), 23);
+        // Only the retryable errors, the template errors and an unknown agent (as an
+        // unknown user) share a client code.
+        assert_eq!(client_codes.len(), 26);
+        let limited = error_from_status(&domain_error(DomainError::RateLimited {
+            retry_after_s: 42,
+        }));
+        assert_eq!(limited.retry_after_s, Some(42));
 
         let store = error_from_status(&domain_error(DomainError::Store("relation".into())));
         assert!(!store.message.contains("relation"), "{}", store.message);

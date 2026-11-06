@@ -1,0 +1,366 @@
+//! The owner routes of an agent (spec 2026-11-06 agent connections §5.1) over a stub of
+//! message-svc's `AgentOwners` API.
+
+use std::sync::{Arc, Mutex};
+
+use axum::Router;
+use axum::http::StatusCode;
+use chrono::{DateTime, Utc};
+use serde_json::{Value, json};
+use uuid::Uuid;
+
+use super::agents::{app_token, call, setup};
+use crate::AuthError;
+use crate::api::{Api, router};
+use crate::entra::testing::TENANT;
+use crate::limits::{Limits, MemoryCounter};
+use crate::owners::{AgentOwnerApi, Resolve};
+use crate::service::Auth;
+
+/// Records every call; answers from what it holds.
+#[derive(Debug, Default)]
+struct Stub {
+    calls: Mutex<Vec<String>>,
+    policy: Mutex<&'static str>,
+    waiting: Vec<(Uuid, DateTime<Utc>)>,
+    contacts: Vec<(Uuid, &'static str)>,
+    owner: Mutex<Option<Uuid>>,
+}
+
+impl Stub {
+    fn record(&self, call: String) {
+        self.calls.lock().unwrap().push(call);
+    }
+    fn calls(&self) -> Vec<String> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl AgentOwnerApi for Stub {
+    async fn policy(&self, _: Uuid, _: Uuid) -> Result<&'static str, AuthError> {
+        self.record("policy".into());
+        Ok(*self.policy.lock().unwrap())
+    }
+    async fn set_policy(&self, _: Uuid, _: Uuid, policy: &str) -> Result<&'static str, AuthError> {
+        self.record(format!("set_policy {policy}"));
+        let known = crate::owners::POLICIES
+            .into_iter()
+            .find(|known| *known == policy)
+            .ok_or(AuthError::Invalid(crate::rules::Invalid {
+                field: "policy",
+                reason: "unknown",
+            }))?;
+        *self.policy.lock().unwrap() = known;
+        Ok(known)
+    }
+    async fn waiting(&self, _: Uuid, _: Uuid) -> Result<Vec<(Uuid, DateTime<Utc>)>, AuthError> {
+        self.record("waiting".into());
+        Ok(self.waiting.clone())
+    }
+    async fn resolve(
+        &self,
+        _: Uuid,
+        _: Uuid,
+        user: Uuid,
+        action: Resolve,
+    ) -> Result<(), AuthError> {
+        self.record(format!("resolve {user} {action:?}"));
+        if Some(user) == *self.owner.lock().unwrap() {
+            return Err(AuthError::OwnerContact);
+        }
+        Ok(())
+    }
+    async fn contacts(&self, _: Uuid, _: Uuid) -> Result<Vec<(Uuid, &'static str)>, AuthError> {
+        self.record("contacts".into());
+        Ok(self.contacts.clone())
+    }
+    async fn remove(&self, _: Uuid, _: Uuid, user: Uuid) -> Result<(), AuthError> {
+        self.record(format!("remove {user}"));
+        if Some(user) == *self.owner.lock().unwrap() {
+            return Err(AuthError::OwnerContact);
+        }
+        Ok(())
+    }
+}
+
+fn with_owners(auth: Auth, owners: Arc<Stub>) -> Router {
+    router(Api {
+        auth,
+        limits: Limits::new(Arc::new(MemoryCounter::default())),
+        client_ip_header: None,
+        directory: Arc::new(crate::directory::NoDirectory),
+        templates: Arc::new(crate::templates::NoTemplates),
+        call_history: Arc::new(crate::calls::NoCalls),
+        agent_owners: owners,
+        turn: Arc::new(crate::turn::Turn::disabled()),
+    })
+}
+
+/// Every owner route of `agent`, with a method and a body.
+fn routes(agent: &str, user: &str) -> Vec<(&'static str, String, Value)> {
+    vec![
+        ("GET", format!("/v1/agents/{agent}/policy"), json!({})),
+        (
+            "PUT",
+            format!("/v1/agents/{agent}/policy"),
+            json!({"policy": "auto_any"}),
+        ),
+        ("GET", format!("/v1/agents/{agent}/requests"), json!({})),
+        (
+            "POST",
+            format!("/v1/agents/{agent}/requests/{user}/approve"),
+            json!({}),
+        ),
+        (
+            "POST",
+            format!("/v1/agents/{agent}/requests/{user}/decline"),
+            json!({}),
+        ),
+        (
+            "POST",
+            format!("/v1/agents/{agent}/requests/{user}/block"),
+            json!({}),
+        ),
+        ("GET", format!("/v1/agents/{agent}/contacts"), json!({})),
+        (
+            "DELETE",
+            format!("/v1/agents/{agent}/contacts/{user}"),
+            json!({}),
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn everyone_but_the_owner_finds_nothing_and_message_svc_is_never_asked() {
+    let (world, auth, plain, owner) = setup().await;
+    let stub = Arc::new(Stub::default());
+    let api = with_owners(auth.clone(), Arc::clone(&stub));
+    let (status, reservation) = call(
+        &plain,
+        "POST",
+        "/v1/agents",
+        &owner.access_token,
+        json!({"handle":"watched","display_name":"Watched"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{reservation}");
+    let token = app_token(&world, TENANT, Uuid::new_v4());
+    let (status, registered) = call(
+        &plain,
+        "POST",
+        "/v1/auth/entra-app",
+        "",
+        json!({"token":token,"enrollment_code":reservation["enrollment_code"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{registered}");
+    let agent = registered["user_id"].as_str().unwrap().to_owned();
+    let device = auth
+        .register_device(
+            registered["registration_token"].as_str().unwrap(),
+            Uuid::now_v7(),
+            "Agent",
+            "other",
+        )
+        .await
+        .unwrap();
+    let stranger = super::password_user(&auth, &world.pool, "stranger", 1)
+        .await
+        .remove(0);
+    let user = Uuid::now_v7().to_string();
+    let unknown = Uuid::now_v7().to_string();
+    let mut cases = Vec::new();
+    for (method, path, body) in routes(&agent, &user) {
+        cases.push((
+            stranger.access_token.clone(),
+            method,
+            path.clone(),
+            body.clone(),
+        ));
+        // The agent itself is not its owner.
+        cases.push((device.access_token.clone(), method, path, body));
+    }
+    for (method, path, body) in routes(&unknown, &user)
+        .into_iter()
+        .chain(routes("not-an-id", &user))
+    {
+        cases.push((owner.access_token.clone(), method, path, body));
+    }
+    for (token, method, path, body) in cases {
+        let (status, answer) = call(&api, method, &path, &token, body).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{method} {path}: {answer}");
+        assert_eq!(answer["error"]["code"], "not_found", "{method} {path}");
+    }
+    assert_eq!(stub.calls(), Vec::<String>::new());
+
+    // Deleting the agent ends its owner's routes too.
+    let (status, _) = call(
+        &api,
+        "GET",
+        &format!("/v1/agents/{agent}/policy"),
+        &owner.access_token,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = call(
+        &plain,
+        "DELETE",
+        &format!("/v1/agents/{agent}"),
+        &owner.access_token,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, answer) = call(
+        &api,
+        "GET",
+        &format!("/v1/agents/{agent}/policy"),
+        &owner.access_token,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{answer}");
+    // Without a token: 401, as everywhere.
+    let (status, _) = call(
+        &api,
+        "GET",
+        &format!("/v1/agents/{agent}/policy"),
+        "",
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn the_owner_reads_and_sets_the_policy_and_acts_on_requests() {
+    let (world, auth, plain, owner) = setup().await;
+    let (_, reservation) = call(
+        &plain,
+        "POST",
+        "/v1/agents",
+        &owner.access_token,
+        json!({"handle":"helper","display_name":"Helper"}),
+    )
+    .await;
+    let agent = reservation["user_id"].as_str().unwrap().to_owned();
+    let asking = super::password_user(&auth, &world.pool, "asking", 1)
+        .await
+        .remove(0);
+    let at = DateTime::from_timestamp(1_790_000_000, 0).unwrap();
+    let stub = Arc::new(Stub {
+        policy: Mutex::new("ask"),
+        waiting: vec![(asking.user_id, at)],
+        contacts: vec![
+            (owner.user_id, "accepted"),
+            (asking.user_id, "requested_in"),
+        ],
+        owner: Mutex::new(Some(owner.user_id)),
+        ..Stub::default()
+    });
+    let api = with_owners(auth.clone(), Arc::clone(&stub));
+    let token = owner.access_token.as_str();
+    let base = format!("/v1/agents/{agent}");
+
+    let (status, policy) = call(&api, "GET", &format!("{base}/policy"), token, json!({})).await;
+    assert_eq!((status, policy), (StatusCode::OK, json!({"policy": "ask"})));
+    let (status, policy) = call(
+        &api,
+        "PUT",
+        &format!("{base}/policy"),
+        token,
+        json!({"policy": "auto_owner_contacts"}),
+    )
+    .await;
+    assert_eq!(
+        (status, policy),
+        (StatusCode::OK, json!({"policy": "auto_owner_contacts"}))
+    );
+    let (status, bad) = call(
+        &api,
+        "PUT",
+        &format!("{base}/policy"),
+        token,
+        json!({"policy": "everyone"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
+    assert_eq!(bad["error"]["code"], "invalid");
+
+    let (status, requests) = call(&api, "GET", &format!("{base}/requests"), token, json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{requests}");
+    assert_eq!(requests["requests"][0]["user"]["handle"], "asking");
+    assert_eq!(
+        requests["requests"][0]["user"]["user_id"],
+        asking.user_id.to_string()
+    );
+    assert_eq!(
+        requests["requests"][0]["requested_at"],
+        "2026-09-21T14:13:20.000Z"
+    );
+
+    let (status, contacts) = call(&api, "GET", &format!("{base}/contacts"), token, json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{contacts}");
+    assert_eq!(contacts["contacts"][0]["owner"], true);
+    assert_eq!(contacts["contacts"][1]["owner"], false);
+    assert_eq!(contacts["contacts"][1]["state"], "requested_in");
+
+    let requester = asking.user_id;
+    for action in ["approve", "decline", "block"] {
+        let (status, _) = call(
+            &api,
+            "POST",
+            &format!("{base}/requests/{requester}/{action}"),
+            token,
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{action}");
+    }
+    let (status, _) = call(
+        &api,
+        "DELETE",
+        &format!("{base}/contacts/{requester}"),
+        token,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let me = owner.user_id;
+    let (status, refused) = call(
+        &api,
+        "DELETE",
+        &format!("{base}/contacts/{me}"),
+        token,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    assert_eq!(refused["error"]["code"], "owner_contact");
+    let (status, _) = call(
+        &api,
+        "POST",
+        &format!("{base}/requests/not-an-id/approve"),
+        token,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        stub.calls(),
+        [
+            "policy".to_owned(),
+            "set_policy auto_owner_contacts".to_owned(),
+            "set_policy everyone".to_owned(),
+            "waiting".to_owned(),
+            "contacts".to_owned(),
+            format!("resolve {requester} Approve"),
+            format!("resolve {requester} Decline"),
+            format!("resolve {requester} Block"),
+            format!("remove {requester}"),
+            format!("remove {me}"),
+        ]
+    );
+}

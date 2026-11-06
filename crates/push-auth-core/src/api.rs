@@ -40,6 +40,7 @@ use crate::directory::Directory;
 use crate::error::AuthError;
 use crate::identity::{IdentityState, Principal, identify};
 use crate::limits::{Action, Limits};
+use crate::owners::{self, AgentOwnerApi};
 use crate::rules::{self, Invalid};
 use crate::service::{Auth, Signup};
 use crate::templates::{TemplateRegistry, rfc3339};
@@ -65,6 +66,8 @@ pub struct Api {
     pub call_history: Arc<dyn CallLog>,
     /// TURN credentials for voice calls (`GET /v1/calls/ice-servers`).
     pub turn: Arc<Turn>,
+    /// Owners acting on their agents: message-svc's `AgentOwners` API.
+    pub agent_owners: Arc<dyn AgentOwnerApi>,
 }
 
 /// The router of the public API. Without email and password sign-in its routes do not
@@ -101,6 +104,28 @@ pub fn router(api: Api) -> Router {
         .route(
             "/v1/agents/{agent_id}",
             delete(delete_agent).patch(update_agent),
+        )
+        .route(
+            "/v1/agents/{agent_id}/policy",
+            get(owners::get_policy).put(owners::put_policy),
+        )
+        .route("/v1/agents/{agent_id}/requests", get(owners::list_requests))
+        .route(
+            "/v1/agents/{agent_id}/requests/{user_id}/approve",
+            post(owners::approve),
+        )
+        .route(
+            "/v1/agents/{agent_id}/requests/{user_id}/decline",
+            post(owners::decline),
+        )
+        .route(
+            "/v1/agents/{agent_id}/requests/{user_id}/block",
+            post(owners::block),
+        )
+        .route("/v1/agents/{agent_id}/contacts", get(owners::list_contacts))
+        .route(
+            "/v1/agents/{agent_id}/contacts/{user_id}",
+            delete(owners::remove_contact),
         )
         .route("/v1/users", get(profiles))
         .route("/v1/users/me", get(own_profile).patch(update_profile))
@@ -167,7 +192,7 @@ impl IntoResponse for AuthError {
 }
 
 /// A JSON body; anything else is an `invalid` error in the API's format.
-struct JsonBody<T>(T);
+pub(crate) struct JsonBody<T>(pub(crate) T);
 
 impl<S: Send + Sync, T: DeserializeOwned> FromRequest<S> for JsonBody<T> {
     type Rejection = AuthError;
@@ -216,7 +241,7 @@ impl<S: Send + Sync, T: DeserializeOwned> FromRequest<S> for Submitted<T> {
 }
 
 /// The client's IP: from the configured header, else the peer address.
-struct ClientIp(Option<IpAddr>);
+pub(crate) struct ClientIp(pub(crate) Option<IpAddr>);
 
 impl FromRequestParts<Api> for ClientIp {
     type Rejection = AuthError;
@@ -258,7 +283,7 @@ fn bearer(headers: &HeaderMap) -> Result<&str, AuthError> {
         .ok_or(AuthError::Unauthorized)
 }
 
-async fn caller(api: &Api, headers: &HeaderMap) -> Result<Caller, AuthError> {
+pub(crate) async fn caller(api: &Api, headers: &HeaderMap) -> Result<Caller, AuthError> {
     api.auth.authenticate(bearer(headers)?).await
 }
 
@@ -812,23 +837,23 @@ async fn profiles(
     // Defence in depth: never show a profile that was not asked for, whatever the answer.
     visible.retain(|user| ids.binary_search(user).is_ok());
     let profiles = api.auth.profiles(&visible).await?;
-    let users: Vec<Value> = profiles
-        .iter()
-        .map(|profile| {
-            json!({
-                "user_id": profile.user_id,
-                "handle": profile.handle,
-                "display_name": profile.display_name,
-                "kind": profile.kind,
-                "owner_user_id": profile.owner_user_id,
-                "owner_display_name": profile.owner_display_name,
-                "owner_handle": profile.owner_handle,
-                "deleted": profile.deleted,
-                "state": profile.state(),
-            })
-        })
-        .collect();
+    let users: Vec<Value> = profiles.iter().map(profile_json).collect();
     Ok(Json(json!({ "users": users })).into_response())
+}
+
+/// A profile as `GET /v1/users` shows it.
+pub(crate) fn profile_json(profile: &crate::profiles::PublicProfile) -> Value {
+    json!({
+        "user_id": profile.user_id,
+        "handle": profile.handle,
+        "display_name": profile.display_name,
+        "kind": profile.kind,
+        "owner_user_id": profile.owner_user_id,
+        "owner_display_name": profile.owner_display_name,
+        "owner_handle": profile.owner_handle,
+        "deleted": profile.deleted,
+        "state": profile.state(),
+    })
 }
 
 /// `GET /v1/calls/ice-servers` (spec 2026-11-03 voice calls §8): the caller's ICE servers

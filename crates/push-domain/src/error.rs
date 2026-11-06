@@ -67,6 +67,21 @@ pub enum DomainError {
     /// has too many pending submissions.
     #[error("{0}")]
     TemplateConflict(&'static str),
+    /// The rules of agents forbid it (spec 2026-11-06 agent connections): a call between
+    /// two agents, an invite created by an agent, an agent blocking its owner, the owner as
+    /// the target of an owner action.
+    #[error("agents may not do this")]
+    NotAllowed,
+    /// An agent tried to accept, decline or block a request that waits for its owner.
+    #[error("only the agent's owner decides on contact requests")]
+    OwnerDecides,
+    /// An agent's limits on contact requests (spec 2026-11-06 agent connections §4).
+    #[error("too many contact requests; retry in {retry_after_s} s")]
+    RateLimited { retry_after_s: u32 },
+    /// Not an agent of this owner (unknown, another owner's, not an agent, or deleted):
+    /// one answer for all, so it reveals nothing.
+    #[error("agent not found")]
+    AgentNotFound,
     #[error("a concurrent change conflicted; retry the operation")]
     Conflict,
     /// A revocation or password reset was stored, but its kick could not be delivered to

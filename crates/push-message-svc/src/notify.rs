@@ -226,6 +226,19 @@ pub(crate) fn notifications(events: &[Event]) -> Vec<(String, Vec<u8>)> {
                 });
                 messages.push(message(user.0, kind));
             }
+            Event::AgentContact {
+                owner,
+                agent,
+                user,
+                state,
+            } => {
+                let kind = Kind::AgentContactChanged(push_proto::v1::AgentContactEvent {
+                    agent_user_id: id_bytes(agent.0),
+                    user_id: id_bytes(user.0),
+                    state: contact_state(*state).into(),
+                });
+                messages.push(message(owner.0, kind));
+            }
             _ => {}
         }
     }
@@ -246,7 +259,9 @@ fn message(user: uuid::Uuid, kind: Kind) -> (String, Vec<u8>) {
 
 #[cfg(test)]
 mod tests {
-    use push_domain::{ActivityState, ConversationId, DeviceId, PresenceView, UserId};
+    use push_domain::{
+        ActivityState, ContactState, ConversationId, DeviceId, PresenceView, UserId,
+    };
     use push_proto::v1;
 
     use super::*;
@@ -336,6 +351,28 @@ mod tests {
                 (notify_channel(alice.0), group_receipt.clone()),
                 (notify_channel(bob.0), group_receipt),
             ]
+        );
+    }
+
+    #[test]
+    fn agent_contact_changes_go_to_the_owner_only() {
+        let (owner, agent, user) = (UserId::new(), UserId::new(), UserId::new());
+        let messages = notifications(&[Event::AgentContact {
+            owner,
+            agent,
+            user,
+            state: Some(ContactState::RequestedIn),
+        }]);
+        assert_eq!(
+            decode(&messages),
+            vec![(
+                notify_channel(owner.0),
+                Kind::AgentContactChanged(v1::AgentContactEvent {
+                    agent_user_id: id_bytes(agent.0),
+                    user_id: id_bytes(user.0),
+                    state: v1::ContactState::RequestedIn.into(),
+                })
+            )]
         );
     }
 

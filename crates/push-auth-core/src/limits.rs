@@ -60,6 +60,9 @@ pub enum Action {
     CallHistory,
     /// `GET /v1/calls/ice-servers`: per IP and per user.
     TurnCredentials,
+    /// The owner routes of an agent, `/v1/agents/{agent_id}/…` (spec 2026-11-06 agent
+    /// connections): per IP and per user.
+    AgentOwner,
 }
 
 /// Whom a limit counts.
@@ -115,6 +118,7 @@ impl Action {
             Self::TemplateCatalog => "template_catalog",
             Self::CallHistory => "call_history",
             Self::TurnCredentials => "turn",
+            Self::AgentOwner => "agent_owner",
         }
     }
 
@@ -164,6 +168,12 @@ impl Action {
         // call and when its credentials near expiry), more per IP for shared addresses.
         const TURN: &[(Scope, Limit)] =
             &[(Scope::Ip, per(600, HOUR)), (Scope::Account, per(60, HOUR))];
+        // An owner reads their agents' chats page by page; this bounds scraping with a
+        // stolen token (spec 2026-11-06 agent connections §5.3).
+        const AGENT_OWNER: &[(Scope, Limit)] = &[
+            (Scope::Ip, per(1200, HOUR)),
+            (Scope::Account, per(600, HOUR)),
+        ];
         match self {
             Self::Signup => SIGNUP,
             Self::Login => LOGIN,
@@ -180,6 +190,7 @@ impl Action {
             Self::TemplateCatalog => TEMPLATE_CATALOG,
             Self::CallHistory => CALL_HISTORY,
             Self::TurnCredentials => TURN,
+            Self::AgentOwner => AGENT_OWNER,
         }
     }
 }

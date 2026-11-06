@@ -67,6 +67,13 @@ pub enum AuthError {
     /// which.
     #[error("{0}")]
     TemplateConflict(String),
+    /// Not found, or not the caller's: the owner routes of an agent (spec 2026-11-06 agent
+    /// connections) answer this to everyone but the owner.
+    #[error("not found")]
+    NotFound,
+    /// The owner's own contact with their agent cannot be changed through the owner routes.
+    #[error("the owner's contact with the agent cannot be changed")]
+    OwnerContact,
     #[error("the service is unavailable; try again")]
     Unavailable,
     /// No usable TURN servers: none configured, or the provider failed (spec 2026-11-03
@@ -105,6 +112,8 @@ impl AuthError {
             Self::TemplateInvalid(_) => "invalid",
             Self::TemplateNotFound => "not_found",
             Self::TemplateConflict(_) => "conflict",
+            Self::NotFound => "not_found",
+            Self::OwnerContact => "owner_contact",
             Self::Unavailable => "unavailable",
             Self::TurnUnavailable => "turn_unavailable",
         }
@@ -117,6 +126,7 @@ impl AuthError {
             | Self::LinkInvalid
             | Self::LinkExpired
             | Self::EnrollmentInvalid
+            | Self::OwnerContact
             | Self::TemplateInvalid(_) => 400,
             Self::InvalidCredentials
             | Self::Unauthorized
@@ -128,6 +138,7 @@ impl AuthError {
             Self::DeviceNotFound
             | Self::UserNotFound
             | Self::AgentNotFound
+            | Self::NotFound
             | Self::TemplateNotFound => 404,
             Self::HandleTaken
             | Self::TooManyDevices

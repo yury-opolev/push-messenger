@@ -90,6 +90,14 @@ pub enum Event {
         hidden: bool,
         peer_deleted: bool,
     },
+    /// A relationship of `owner`'s agent with `user` changed, as the agent sees it
+    /// (`RequestedIn`: a request waits for the owner). Published to `owner` only.
+    AgentContact {
+        owner: UserId,
+        agent: UserId,
+        user: UserId,
+        state: Option<ContactState>,
+    },
 }
 
 /// Why devices are kicked.
