@@ -262,7 +262,7 @@ calls:
       # published by .github/workflows/coturn-image.yml). CI and a weekly rescan fail on a
       # fixable HIGH or CRITICAL finding (docs/calls.md, "Security updates of the chart's
       # images"). Mirror it by digest like any other image.
-      image: ghcr.io/yury-opolev/push-coturn:4.18.0-alpine-r1@sha256:11321d4e158ae05e75e5bff45c2fe999cc66607fd2b03ea30182abaa0619453f
+      image: coturn/coturn:4.18.0-alpine@sha256:c29135c08565810d37053f384584392b7c24b69570fc81a721b878d6fe63e04e
       # Peers allowed to scrape coturn's Prometheus port 9641, each with both non-empty
       # label maps, like networkPolicy.adminPeers. Empty: nobody.
       metricsPeers: []
