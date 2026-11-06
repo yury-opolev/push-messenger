@@ -370,6 +370,15 @@ at start-up.
 | `calls.attemptsPerHour` | `30` | "calls.attemptsPerHour must be an integer from 1 to 1000" | gateway `PUSH_CALLS_ATTEMPTS_PER_HOUR` |
 | `calls.historyDays` | `90` | "calls.historyDays must be an integer from 1 to 3650" | message-svc `PUSH_CALLS_HISTORY_DAYS`: call history retention, applied hourly whether calls are enabled or not |
 
+Agent connections ([design](superpowers/specs/2026-11-06-agent-connections-and-owner-view.md)):
+a request an agent's policy refuses stays pending for a random time in this range and then
+ends silently, as a decline does, so requesters cannot tell a refusal from a decline.
+
+| Value | Default | Validation | Renders |
+|---|---|---|---|
+| `agents.refusalMinSeconds` | `600` | "agents.refusalMinSeconds must be an integer from 0 to 604800" | message-svc `PUSH_AGENT_REFUSAL_MIN_S` |
+| `agents.refusalMaxSeconds` | `21600` | "agents.refusalMaxSeconds must be an integer from 0 to 604800"; not below the minimum | message-svc `PUSH_AGENT_REFUSAL_MAX_S` |
+
 Call state lives in the Redis the gateways and message-svc already share. message-svc
 serves the call metrics in the Prometheus text format at `GET /metrics` on its health port
 (8081, the `health` container port; only the call history families while calls are disabled); the chart adds no

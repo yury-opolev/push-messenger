@@ -259,6 +259,26 @@ Check 'default: calls are off on the gateway and message-svc, with the default l
         $messageSvc -match 'name: PUSH_CALLS_DISCONNECT_GRACE_SECONDS\s+value: "30"' -and
         $messageSvc -match 'name: PUSH_CALLS_HISTORY_DAYS\s+value: "90"'
 }
+Check 'agents: refused requests stay pending 10 minutes to 6 hours unless set' {
+    $messageSvc = Doc $default 'Deployment' 'push-message-svc'
+    $set = Doc (helm template push $chart --set agents.refusalMinSeconds=0 `
+        --set agents.refusalMaxSeconds=60 | Out-String) 'Deployment' 'push-message-svc'
+    $messageSvc -match 'name: PUSH_AGENT_REFUSAL_MIN_S\s+value: "600"' -and
+        $messageSvc -match 'name: PUSH_AGENT_REFUSAL_MAX_S\s+value: "21600"' -and
+        $set -match 'name: PUSH_AGENT_REFUSAL_MIN_S\s+value: "0"' -and
+        $set -match 'name: PUSH_AGENT_REFUSAL_MAX_S\s+value: "60"'
+}
+foreach ($invalid in @(
+    @('agents.refusalMinSeconds=-1', 'agents.refusalMinSeconds must be an integer from 0 to 604800'),
+    @('agents.refusalMaxSeconds=604801', 'agents.refusalMaxSeconds must be an integer from 0 to 604800'),
+    @('agents.refusalMinSeconds=1.5', 'agents.refusalMinSeconds must be an integer from 0 to 604800'),
+    @('agents.refusalMinSeconds=30000', 'agents.refusalMinSeconds must not be above agents.refusalMaxSeconds')
+)) {
+    Check "agents: $($invalid[0]) is refused" {
+        $errorText = helm template push $chart --set $invalid[0] 2>&1 | Out-String
+        $LASTEXITCODE -ne 0 -and $errorText.Contains($invalid[1])
+    }
+}
 $turnArgs = @('--set', 'calls.enabled=true', '--set', 'calls.turn.internal.publicHost=turn.example.com',
     '--set', 'calls.turn.internal.externalIp=203.0.113.10',
     '--set', 'calls.turn.internal.deniedPeerCidrs={10.244.0.0/14,fd12:3456:789a::/52}')

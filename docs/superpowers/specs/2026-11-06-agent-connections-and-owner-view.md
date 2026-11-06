@@ -38,7 +38,7 @@ PR #75).
 | D7 | **Agents may send requests**, to people and to agents, without their owner's approval; the receiving side's rules apply. Agent-only limits (§4), counted by message-svc in the database, all answered `RATE_LIMITED` (23) with `retry_after_s`: at most 20 requests an hour and 100 a day; at most 50 pending outgoing requests; at most 10 outgoing requests waiting for other owners. The gateway's limit for everyone (30 an hour per user) still applies first. |
 | D8 | **Agent to agent: messages and cards only.** A `CallInvite` between two agents that are accepted contacts is refused with `CallError{NOT_ALLOWED}`. Every other refused call stays `NOT_CONTACT`, as today: a person's call to an agent is allowed for its owner only. |
 | D9 | **Read-only owner view** over HTTP on auth-svc (§5.3): the agent's conversations, the history of any of them exactly as the agent sees it (the same entries `FetchHistory` returns the agent: rich cards, answers, edits applied, deletions as tombstones) and the agent's call history. Reads only: no read position, delivery cursor, hidden flag or unread count of the agent changes, and there is no write route. History before this feature is included, within normal retention. |
-| D10 | **Notice data.** Agent profiles carry `owner_display_name` and `owner_handle` (the owner's current values, read from the owner's own account by auth-svc), next to `owner_user_id`, wherever the agent's profile is answered (`GET /v1/users`, `/v1/users/lookup`, `/v1/users/me`, `GET /v1/agents`). `null` for people, tombstones, and an agent whose owner is disabled. Clients must show "Chats with <agent> are visible to its owner, <owner>." (§7). |
+| D10 | **Notice data.** Agent profiles carry `owner_display_name` and `owner_handle` (the owner's current values, read from the owner's own account by auth-svc), next to `owner_user_id`, wherever the agent's profile is answered (`GET /v1/users`, `/v1/users/lookup`, `/v1/users/me`; the owner's own `GET /v1/agents` list needs no notice). `null` for people, tombstones, and an agent whose owner is disabled. Clients must show "Chats with <agent> are visible to its owner, <owner>." (§7). |
 | D11 | **Audit, never content.** Every owner-view read, policy read or change and owner action writes one line to auth-svc's security log (`target: "security"`) with the event, the owner, the agent, the conversation or peer when there is one, the count of items answered, the route, the status and the client IP; refused owner calls (404) are logged too. Never a message body, a title or a display name (§6.4). |
 | D12 | **Deletion.** Deleting an agent (the existing `user.deleted` relay, `Accounts.UserDeleted`) also removes its relationships: its waiting requests, its own outgoing requests, its contacts and the requesters' and contacts' rows toward it (each peer whose row changed gets a `ContactEvent` with `NONE`); peers' own blocks of the agent are kept. Its policy and request log are deleted. The owner view ends: auth-svc answers `not_found` for a disabled agent and message-svc refuses deleted agents too. Conversations stay, so peers keep the history and see the tombstone and `peer_deleted` (#75). |
 
@@ -406,7 +406,26 @@ and talk over raw sockets, as in `owned_agents.rs`:
    route.
 6. Echo's `CallInvite` to Coda is refused with `NOT_ALLOWED`.
 
-## 12. Deferred
+## 12. As built (notes from the implementation, PRs B–F)
+
+- **SDK errors.** The agent errors reach Rust callers as `SdkError::Server` with the code
+  `owner_decides`, `not_allowed` or `rate_limited` (the SDK names every server code that
+  way), not as new variants; call refusals as `CallErrorCode::NotAllowed`.
+- **Owner view listing** is the agent's own listing (hidden conversations included): like
+  the agent's, it leaves out direct conversations with users the agent blocked; their
+  history stays readable by id.
+- **Deletion and tombstones.** The agent's contact rows go, so a peer who had only a
+  contact row (no conversation) no longer sees the agent at all; peers who shared a
+  conversation keep the tombstone and `peer_deleted`.
+- **Bridge.** The notice is a reply (`agent.reply@1`) to each contact's first text of a
+  session, and the end of the contacts' `/help`. Replies, cards and the "This agent is
+  private." refusal of another bridge never prompt the backend or draw a reply.
+- **Audit fields.** `event`, `route`, `status`, `code`, `ip`, `user_id` (the caller),
+  `agent_id`, `peer_id`, `conversation_id`, `count` and `policy`.
+- **Acceptance.** `crates/push-smoke/tests/agent_connections.rs` runs §11 on the whole
+  stack with two agents of one owner standing in for Echo and Coda.
+
+## 13. Deferred
 
 - Node and C bindings of the owner endpoints (the Rust SDK has them; the bindings gain the
   new profile fields and events only).

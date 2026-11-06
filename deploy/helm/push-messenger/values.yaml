@@ -197,6 +197,14 @@ messageSvc:
       cpu: 500m
       memory: 256Mi
 
+# Agent connections (docs/superpowers/specs/2026-11-06-agent-connections-and-owner-view.md):
+# a request an agent's policy refuses stays pending for a random time between these, then
+# ends like a decline, so the requester cannot tell a refusal from a decline. Whole seconds,
+# 0 to 604800, min not above max.
+agents:
+  refusalMinSeconds: 600
+  refusalMaxSeconds: 21600
+
 # Voice calls (docs/calls.md). Off by default; enable once every gateway and message-svc
 # replica runs a version with calls.
 calls:

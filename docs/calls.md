@@ -189,6 +189,7 @@ group calls) without breaking older clients.
 | `ERROR_CODE_IN_CALL` | 29 | the caller already has a call, ringing or active, on any of their devices | no |
 | `ERROR_CODE_CALL_LIMIT` | 30 | the call's cap of `CallIce` or `CallRenegotiate` frames is reached ([§8](#8-limits)) | no |
 | `ERROR_CODE_NOT_CONTACT` | 6 | not an accepted contact, a block either way, an agent rule, or no such user: indistinguishable | no |
+| `ERROR_CODE_NOT_ALLOWED` | 31 | a call between two agents that are accepted contacts: agents talk in messages and cards only ([agent connections](superpowers/specs/2026-11-06-agent-connections-and-owner-view.md), D8); agents that are not contacts get `NOT_CONTACT` like anyone else | no |
 | `ERROR_CODE_INVALID` | 2 | malformed ids, a `call_id` that is not a UUIDv7, calling oneself, a bad or oversize SDP, video, a bad candidate, a reason the frame does not allow, the same `call_id` invited by another device | no |
 | `ERROR_CODE_RATE_LIMITED` | 23 | too many `CallInvite` per hour, with `retry_after_s` | yes, after `retry_after_s` |
 | `ERROR_CODE_NOT_AVAILABLE` | 24 | calls are not offered on this connection (not calls-active) | no |
@@ -487,6 +488,11 @@ sequenceDiagram
 | `CallRenegotiate` per side per call | 20 | `CALL_LIMIT` |
 | `CallInvite` per user per hour, refused or not | `calls.attemptsPerHour` (30) | `RATE_LIMITED` with `retry_after_s` |
 | Calls per user | one, ringing or active, across all devices | `IN_CALL` (caller) or `CallEnded BUSY` (callee) |
+
+Who may call whom: accepted contacts, and an owned agent with its owner (an agent calls only
+its owner, and only its owner calls it). Two agents never call each other, even when they
+are contacts (`NOT_ALLOWED`). An agent's owner reads the agent's call history read only
+through `GET /v1/agents/{agent_id}/calls` ([agent connections](superpowers/specs/2026-11-06-agent-connections-and-owner-view.md#53-owner-view)).
 
 ## 9. Privacy
 
@@ -1262,6 +1268,7 @@ gathered, the pair selected, and bytes sent and received per direction.
 | No call button / `NOT_AVAILABLE` | the connection is not calls-active | `Identify` lists `CAPABILITY_CALLS`? `Ready` lists it? `calls.enabled` on, every gateway and message-svc replica upgraded ([§2](#2-enabling-calls)) |
 | Invite answered `UNREACHABLE` at once | the callee has no calls-active device online | the callee's app must advertise the capability and be connected |
 | Invite refused `NOT_CONTACT` | not accepted contacts, a block, or an agent rule | accept the contact request first |
+| Invite refused `NOT_ALLOWED` | caller and callee are both agents | agents never call each other; use messages and cards |
 | Rings, answered, **no audio either way** | ICE never connected | look for `failed` in `iceConnectionState`. With `relay: false` (stun-only), two symmetric NATs or a firewall cannot connect: configure TURN. With TURN: no `relay` candidates means coturn's ports are unreachable or the credentials are refused ([§13.8](#138-troubleshooting-turn)) |
 | **One-way audio** | one direction blocked or not sending | inbound bytes stay at 0 on one side: a firewall drops one direction (UDP to the relay range), a muted or ended local track (`track.enabled`, `track.readyState`), the microphone denied on that side, or `autoplay` blocked playback (bytes arrive but nothing plays: call `audio.play()` from a click) |
 | Works on the same Wi-Fi, fails across networks | no relay | **symmetric NAT** (mobile carriers, many corporate NATs) gives a different public port per destination, so the peer cannot reach the address STUN learned. Only a relay that both sides reach can connect them: TURN is needed, not just STUN |
