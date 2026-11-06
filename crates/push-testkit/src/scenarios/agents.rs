@@ -793,6 +793,101 @@ async fn the_owner_view_reads_what_the_agent_sees_and_changes_nothing<B: Backend
     );
 }
 
+async fn deleting_an_agent_ends_its_relationships_and_keeps_its_chats<B: Backend>(backend: &B) {
+    let (world, owner, agent) = owned(backend).await;
+    set_policy(&world, &owner, &agent, AgentPolicy::AutoAny).await;
+    let friend = world.person().await;
+    world
+        .svc
+        .contact_request(friend.user, agent.user)
+        .await
+        .unwrap();
+    let chat = world
+        .svc
+        .open_direct(friend.user, agent.user)
+        .await
+        .unwrap();
+    world.send(&friend, chat, "before the deletion").await;
+    set_policy(&world, &owner, &agent, AgentPolicy::Ask).await;
+    let asking = world.person().await;
+    world
+        .svc
+        .contact_request(asking.user, agent.user)
+        .await
+        .unwrap();
+    let asked = world.person().await;
+    world
+        .svc
+        .contact_request(agent.user, asked.user)
+        .await
+        .unwrap();
+    let blocker = world.person().await;
+    world
+        .svc
+        .contact_request(agent.user, blocker.user)
+        .await
+        .unwrap();
+    world
+        .svc
+        .contact_block(blocker.user, agent.user)
+        .await
+        .unwrap();
+    world.notifier.take();
+
+    world.svc.user_deleted(agent.user).await.unwrap();
+    for peer in [&friend, &asking, &asked, &owner] {
+        assert_eq!(state(&world, peer, &agent).await, None);
+        assert_eq!(state(&world, &agent, peer).await, None);
+    }
+    assert_eq!(
+        state(&world, &blocker, &agent).await,
+        Some(ContactState::Blocked),
+        "a peer's own block stays"
+    );
+    let events = world.notifier.take();
+    for peer in [&friend, &asking, &asked] {
+        assert!(
+            events.contains(&Event::ContactChanged {
+                user: peer.user,
+                peer: agent.user,
+                state: None,
+            }),
+            "{events:?}"
+        );
+    }
+    let mut tx = world.store.begin().await.unwrap();
+    assert_eq!(tx.agent_policy(agent.user).await, Ok(None));
+    tx.rollback().await.unwrap();
+    // The chat stays, flagged, for the peer; the owner's view has ended.
+    let listed = world
+        .svc
+        .list_conversations_with(friend.user, None, true)
+        .await
+        .unwrap();
+    assert!(
+        listed
+            .iter()
+            .any(|summary| summary.conversation_id == chat && summary.peer_deleted)
+    );
+    assert_eq!(
+        world
+            .svc
+            .history(friend.user, chat, None, 10)
+            .await
+            .unwrap()
+            .entries
+            .len(),
+        1
+    );
+    assert_eq!(
+        world.svc.owner_conversations(owner.user, agent.user).await,
+        Err(DomainError::AgentNotFound)
+    );
+    // A redelivered deletion changes nothing more.
+    world.svc.user_deleted(agent.user).await.unwrap();
+    assert_eq!(world.notifier.take(), []);
+}
+
 pub(super) fn cases<B: Backend>() -> Vec<Case<B>> {
     case_list![
         ask_holds_requests_from_people_and_agents_for_the_owner,
@@ -810,5 +905,6 @@ pub(super) fn cases<B: Backend>() -> Vec<Case<B>> {
         the_owner_lists_and_removes_contacts,
         only_the_owner_reaches_the_agent,
         the_owner_view_reads_what_the_agent_sees_and_changes_nothing,
+        deleting_an_agent_ends_its_relationships_and_keeps_its_chats,
     ]
 }

@@ -48,6 +48,11 @@ pub trait Messenger: Send + Sync + 'static {
     async fn profile(&self) -> Option<(String, String)> {
         None
     }
+    /// The agent's owner as people see it: their display name and handle, from the
+    /// agent's own profile (`owner_display_name`, `owner_handle`).
+    async fn owner_name(&self) -> Option<(String, String)> {
+        None
+    }
     /// The agent's relationship with `user`, as the server says (`None` when unknown).
     async fn contact_state(&self, _user: UserId) -> Result<ContactState, SdkError> {
         Ok(ContactState::None)
@@ -121,6 +126,14 @@ impl Messenger for SdkMessenger {
 
     async fn direct(&self, peer: UserId) -> Result<ConversationId, SdkError> {
         Ok(self.client.open_direct(peer).await?.id)
+    }
+
+    async fn owner_name(&self) -> Option<(String, String)> {
+        let profiles = self.client.profiles(vec![self.me]).await.ok()?;
+        let profile = profiles
+            .into_iter()
+            .find(|profile| profile.user_id == self.me)?;
+        Some((profile.owner_display_name?, profile.owner_handle?))
     }
 
     fn send_rich(&self, conversation: ConversationId, body: &str) -> Result<ClientMsgId, SdkError> {
@@ -539,6 +552,10 @@ impl Messenger for TestMessenger {
 
     async fn profile(&self) -> Option<(String, String)> {
         Some(("Coda on Devbox".into(), "coda-devbox".into()))
+    }
+
+    async fn owner_name(&self) -> Option<(String, String)> {
+        Some(("Test Owner".into(), "test-owner".into()))
     }
 
     async fn reconnect(&self) -> Result<(), SdkError> {

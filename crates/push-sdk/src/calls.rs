@@ -180,6 +180,8 @@ pub enum CallErrorCode {
     CallLimit,
     /// The callee is not an accepted contact (or is blocked either way).
     NotContact,
+    /// Two agents: they talk in messages and cards only.
+    NotAllowed,
     /// The frame broke a rule.
     Invalid,
     /// Too many invites: see the error's `retry_after_s`.
@@ -200,6 +202,7 @@ impl CallErrorCode {
             v1::ErrorCode::InCall => Self::InCall,
             v1::ErrorCode::CallLimit => Self::CallLimit,
             v1::ErrorCode::NotContact => Self::NotContact,
+            v1::ErrorCode::NotAllowed => Self::NotAllowed,
             v1::ErrorCode::Invalid => Self::Invalid,
             v1::ErrorCode::RateLimited => Self::RateLimited,
             v1::ErrorCode::NotAvailable => Self::NotAvailable,
