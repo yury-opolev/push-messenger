@@ -1,7 +1,10 @@
 # Weekly rescan of the images pinned on main with a current vulnerability database, so a
 # CVE published after an image was pinned raises an alert: every third-party image the
-# chart deploys (deploy/helm/chart-images.sh: coturn, PostgreSQL, Redis) and the runtime base
-# of this repository's own images (deploy/docker/Dockerfile). A fixable HIGH or CRITICAL
+# chart deploys (deploy/helm/chart-images.sh: coturn, PostgreSQL, Redis), the runtime base
+# of this repository's own images (deploy/docker/Dockerfile), and a fresh build of
+# deploy/docker/coturn.Dockerfile (what consumers build: its pinned upstream base plus the
+# Alpine updates available today; a finding there means upstream or Alpine has no fix yet,
+# or the base pin needs to move). A fixable HIGH or CRITICAL
 # finding (not accepted in deploy/helm/trivyignore/<name>.yaml) fails the run and opens, or
 # comments on, the issue labelled image-vulnerability; docs/calls.md, "Security updates of
 # the chart's images".
@@ -59,8 +62,23 @@ jobs:
           # A fresh database, not the day's cache.
           cache: false
 
+  coturn-dockerfile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - run: docker build --pull --no-cache -f deploy/docker/coturn.Dockerfile -t push-coturn:rescan deploy/docker
+      - uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: push-coturn:rescan
+          version: v0.76.1
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+          cache: false
+
   alert:
-    needs: scan
+    needs: [scan, coturn-dockerfile]
     if: failure() && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 5

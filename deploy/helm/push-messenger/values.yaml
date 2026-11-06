@@ -257,12 +257,17 @@ calls:
         total: 1200
         # Bytes per second per session: 8000 to 1000000000.
         maxBps: 512000
-      # Pinned by digest: the multi-arch index of this repository's coturn image, upstream
-      # coturn/coturn:4.18.0-alpine with the Alpine security updates (deploy/coturn/Dockerfile,
-      # published by .github/workflows/coturn-image.yml). CI and a weekly rescan fail on a
-      # fixable HIGH or CRITICAL finding (docs/calls.md, "Security updates of the chart's
-      # images"). Mirror it by digest like any other image.
-      image: ghcr.io/yury-opolev/push-coturn:4.18.0-alpine-r1@sha256:11321d4e158ae05e75e5bff45c2fe999cc66607fd2b03ea30182abaa0619453f
+      # coturn's image, <repository>:<tag>@sha256:<digest>. Production: build
+      # deploy/docker/coturn.Dockerfile into your own registry like the other images, rebuild
+      # it when Alpine ships fixes, and set this to its digest (docs/calls.md §13.7). The
+      # default is for quick starts only: the same Dockerfile built and published by this
+      # repository (ghcr.io/yury-opolev/push-coturn), scanned by CI and weekly.
+      image: ghcr.io/yury-opolev/push-coturn:4.18.0-alpine-r2@sha256:8e37911d206a3352c49dd6861ceb19e34af0cfc58043504c56403c7c21534971
+      # true: an init container copies /usr/bin/turnserver without its file capabilities into
+      # an emptyDir and coturn runs the copy (works with any coturn image, upstream's
+      # included). false: coturn runs /opt/coturn/bin/turnserver from the image, no init
+      # step; needs an image built from deploy/docker/coturn.Dockerfile (the default is).
+      copyBinary: true
       # Peers allowed to scrape coturn's Prometheus port 9641, each with both non-empty
       # label maps, like networkPolicy.adminPeers. Empty: nobody.
       metricsPeers: []

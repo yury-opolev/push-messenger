@@ -1,0 +1,8 @@
+# An ACR task building deploy/docker/coturn.Dockerfile (docs/calls.md, §13.7); the context is
+# deploy/docker:
+#   az acr run --registry <acr> --file coturn.acr.yaml deploy/docker
+# Tags the image with the run id; pin the digest the run reports.
+version: v1.1.0
+steps:
+  - build: -t $Registry/push-coturn:{{.Run.ID}} -f coturn.Dockerfile .
+  - push: ["$Registry/push-coturn:{{.Run.ID}}"]

@@ -833,7 +833,8 @@ field. Values under `calls.turn`:
 | `internal.externalIp` | `""` | the public IP coturn advertises as its relay address; empty: `service.loadBalancerIP`, else `publicHost` when it is an IP. One of them is required ("calls.turn.internal.externalIp must be set …") |
 | `internal.deniedPeerCidrs` | `[]` | required: the cluster's pod and service CIDRs (IPv4 and IPv6 network addresses, at least /8 and /16) ("calls.turn.internal.deniedPeerCidrs must list the cluster's pod and service CIDRs") |
 | `internal.quotas` | `{user: 12, total: 1200, maxBps: 512000}` | integers 1–1000, 1–100000, 8000–1000000000 |
-| `internal.image` | `ghcr.io/yury-opolev/push-coturn:4.18.0-alpine-r1@sha256:11321d4e…` (coturn 4.18.0 with the Alpine security updates, [§13.7](#137-upgrading-coturn)) | `<repository>:<tag>@sha256:<digest>` |
+| `internal.image` | `ghcr.io/yury-opolev/push-coturn:4.18.0-alpine-r2@sha256:8e37911d…`: quick starts only; production builds [`deploy/docker/coturn.Dockerfile`](../deploy/docker/coturn.Dockerfile) into its own registry ([§13.7](#137-building-and-upgrading-coturn)) | `<repository>:<tag>@sha256:<digest>` |
+| `internal.copyBinary` | `true` | `true`: an init container copies `/usr/bin/turnserver` without its file capabilities (any coturn image). `false`: no init step, coturn runs the image's `/opt/coturn/bin/turnserver` (images built from `coturn.Dockerfile`) |
 | `internal.metricsPeers` | `[]` | peers allowed to scrape coturn's port 9641 (both label maps, like `networkPolicy.adminPeers`) |
 | `external.provider` | `generic` | `generic`, `cloudflare` or `twilio` |
 | `external.urls` | `[]` | `generic`: required `turn:`/`turns:` URLs |
@@ -869,9 +870,10 @@ With `calls.enabled`, `mode: internal` and `internal.enabled`, the chart renders
   in one process), `Recreate` updates, the pinned image as user 65534 with a read-only
   root, no capabilities and no service account token. An init container writes the
   configuration with `static-auth-secret` into memory (`/run/coturn`), so the secret is
-  never in a ConfigMap or on a command line. A second one copies `/usr/bin/turnserver`
-  to an `emptyDir` (`/opt/coturn/bin`), and coturn runs that copy (see "Operating
-  internal TURN" below). TCP readiness and liveness probes on 3478.
+  never in a ConfigMap or on a command line. With `copyBinary` (the default) a second one
+  copies `/usr/bin/turnserver` to an `emptyDir` (`/opt/coturn/bin`), and coturn runs that
+  copy; with `copyBinary: false` coturn runs the image's own `/opt/coturn/bin/turnserver`
+  (see "Operating internal TURN" below). TCP readiness and liveness probes on 3478.
 - **ConfigMap**: [`files/coturn/turnserver.conf`](../deploy/helm/push-messenger/files/coturn/turnserver.conf)
   plus `realm`, `external-ip`, `min-port`/`max-port`, the quotas, TLS (`cert`/`pkey` or
   `no-tls`) and one `denied-peer-ip` range per denied CIDR.
@@ -896,8 +898,11 @@ With `calls.enabled`, `mode: internal` and `internal.enabled`, the chart renders
   a namespace enforcing the `restricted` Pod Security Standard, waits for the coturn pod
   to be Ready (`kubectl rollout status deploy/<release>-coturn`; the application pods are
   not waited for, CI does not build their images there) and runs one TURN allocation and
-  refresh against the Service with `turnutils_uclient` from the pinned image, with TURN
-  REST credentials minted from `turn-shared-secret`.
+  refresh against the Service with `turnutils_uclient` from the coturn image, with TURN
+  REST credentials minted from `turn-shared-secret`. CI runs it with coturn built from
+  `deploy/docker/coturn.Dockerfile` (pushed to kind's local registry, pinned by digest:
+  `-CoturnImage <ref> -CopyBinary $false`), installed without the copy init container;
+  the upgrade switches to the init container path.
 
 **Operating internal TURN.** The upstream image gives `/usr/bin/turnserver` the file
 capability `cap_net_bind_service=ep` (so it can bind ports below 1024 as a non-root
@@ -910,23 +915,31 @@ init container copies the binary with a plain `cp`, which does not carry the
 `/opt/coturn/bin`; the `coturn` container runs `/opt/coturn/bin/turnserver -c
 /run/coturn/turnserver.conf` from it (read-only), with the image's own libraries. coturn
 listens on 3478, 5349 and 9641 only, so it never needs the capability; the configuration
-path, ports and probes are unchanged. For operators:
+path, ports and probes are unchanged. Images built from
+[`deploy/docker/coturn.Dockerfile`](../deploy/docker/coturn.Dockerfile) make the same copy
+at build time (a plain `cp` as root, checked with `getcap` during the build) at
+`/opt/coturn/bin/turnserver`, next to the untouched `/usr/bin/turnserver`; with them set
+`calls.turn.internal.copyBinary: false` and the init step and its `emptyDir` go away. For
+operators:
 
-- The pod uses only the pinned image (both init containers and coturn):
-  `ghcr.io/yury-opolev/push-coturn`, upstream `coturn/coturn:<version>-alpine` with the
-  Alpine security updates applied and nothing else changed (same `turnserver`, user,
-  entrypoint and layout; [`deploy/coturn/Dockerfile`](../deploy/coturn/Dockerfile)). It
-  is public; import or mirror that one digest (`az acr import --name <registry> --source
-  ghcr.io/yury-opolev/push-coturn@sha256:<digest> --image push-coturn:<tag>`, or
-  `crane copy`/`oras copy` of the same reference) and point `calls.turn.internal.image`
-  at the mirror with the same digest. Mirror the multi-arch index digest (the one in
-  `values.yaml`); it keeps its provenance and SBOM attestations.
+- **Production: build the image yourself**, like the other images of the chart, from
+  `deploy/docker/coturn.Dockerfile` (upstream `coturn/coturn:<version>-alpine` pinned by
+  digest, the current Alpine security updates, the capability-free copy; same
+  `turnserver`, user, entrypoint and layout), push it to your registry, set
+  `calls.turn.internal.image` to its digest and rebuild it when Alpine ships fixes
+  ([§13.7](#137-building-and-upgrading-coturn)). The pod uses only that image (both init
+  containers and coturn).
+- The default `calls.turn.internal.image` is for quick starts only: the same Dockerfile
+  built and published (public) by this repository, `ghcr.io/yury-opolev/push-coturn`. To
+  run it anyway, mirror its multi-arch index digest (`az acr import --name <registry>
+  --source ghcr.io/yury-opolev/push-coturn@sha256:<digest> --image push-coturn:<tag>`)
+  and keep the digest.
 - The pod passes the `restricted` Pod Security Standard: non-root (65534), no
   capabilities, no privilege escalation, read-only root, `RuntimeDefault` seccomp. Do not
   add `NET_BIND_SERVICE` or allow privilege escalation for coturn; neither is needed.
 - A low public port such as 443 for `turns:` belongs on the Service (`ports.tls`); the
   container ports stay above 1024.
-- The copy is about 3 MB on the node's ephemeral storage (`emptyDir`, `sizeLimit:
+- With `copyBinary`, the copy is about 3 MB on the node's ephemeral storage (`emptyDir`, `sizeLimit:
   16Mi`), made at every pod start; a node mounting `emptyDir` volumes `noexec` would
   prevent it from running (not the case on AKS or kind).
 
@@ -935,25 +948,28 @@ path, ports and probes are unchanged. For operators:
 [`deploy/helm/chart-images.sh`](../deploy/helm/chart-images.sh)) is pinned by digest, and
 so is the runtime base of this repository's own images:
 
-- **Gate.** CI (`image-scan` in `.github/workflows/ci.yml`, one job per image, and the
-  `images` job for the images built here) runs Trivy with a current database and fails
+- **Gate.** CI (`image-scan` in `.github/workflows/ci.yml`, one job per image; the
+  `images` job for the images built here; `coturn-dockerfile` for a build of
+  `deploy/docker/coturn.Dockerfile`) runs Trivy with a current database and fails
   on any HIGH or CRITICAL vulnerability that has a fix (`--severity HIGH,CRITICAL
   --ignore-unfixed --exit-code 1`). A finding is accepted only in
   `deploy/helm/trivyignore/<image name>.yaml`, with a reason, limited to the affected
   file where possible, and an expiry, so it is reviewed again; an entry is not a way to
   wait for a fix.
-- **Rescan.** `.github/workflows/image-rescan.yml` scans the same pins on main every
-  Monday (and on demand, `gh workflow run image-rescan.yml`), so a CVE published after an
+- **Rescan.** `.github/workflows/image-rescan.yml` scans the same pins, and a fresh
+  build of `deploy/docker/coturn.Dockerfile`, on main every Monday (and on demand, `gh workflow run image-rescan.yml`), so a CVE published after an
   image was pinned fails the run and opens (or comments on) an issue labelled
   `image-vulnerability`.
-- **Delivery.** If upstream has published a fixed image, the fix is a new digest pin. If
-  not (coturn's Alpine image is rebuilt rarely), `.github/workflows/coturn-image.yml`
-  rebuilds `ghcr.io/yury-opolev/push-coturn` from the same upstream digest with the
-  current Alpine updates (run it by hand, or push a `coturn-<version>-alpine-r<n>` tag),
-  checks it (non-root, Trivy clean) and publishes it with provenance and an SBOM; a pull
-  request then pins the new digest in `values.yaml`. Consumers move their chart pin
-  (submodule) and redeploy; coturn restarts once (calls relayed at that moment recover
-  with an ICE restart).
+- **Delivery.** coturn: consumers who build `deploy/docker/coturn.Dockerfile` rebuild it
+  (`apk upgrade` picks up the Alpine fixes; no repository change needed) and set the new
+  digest; if the fix needs a newer upstream base, the Dockerfile's `COTURN_BASE` moves in
+  a pull request first. For the quick-start default, `.github/workflows/coturn-image.yml`
+  rebuilds `ghcr.io/yury-opolev/push-coturn` (by hand, or on a
+  `coturn-<version>-alpine-r<n>` tag), checks it (non-root, the copy runs without
+  capabilities, Trivy clean) and publishes it with provenance and an SBOM; a pull request
+  then pins the new digest in `values.yaml`. PostgreSQL and Redis: a new upstream digest
+  pin. Consumers move their chart pin (submodule) and redeploy; coturn restarts once
+  (calls relayed at that moment recover with an ICE restart).
 - **Turnaround.** A fixable CRITICAL, or an actively exploited HIGH, is patched and
   pinned on main within one business day of the alert (CI or the rescan); other fixable
   HIGH findings within five business days. Unfixed findings are tracked until a fix is
@@ -1009,38 +1025,71 @@ A minikube walk-through with the reference page:
 3. `node docs/examples/calls/serve.mjs --api http://<the ingress host>` and open
    `http://127.0.0.1:8080/` in both profiles ([§14](#14-browser-recipe)).
 
-### 13.7 Upgrading coturn
+### 13.7 Building and upgrading coturn
 
-The chart runs [`deploy/coturn/Dockerfile`](../deploy/coturn/Dockerfile): upstream
-`coturn/coturn:<version>-alpine`, pinned by digest, plus `apk upgrade`, published as
-`ghcr.io/yury-opolev/push-coturn:<version>-alpine-r<n>` by
-`.github/workflows/coturn-image.yml` and pinned by its multi-arch index digest; CI and the
-weekly rescan scan it ("Security updates of the chart's images" above). Upstream's
-`4.18.0-alpine` (`sha256:c29135c0…`, Alpine 3.24.1) carries brotli-libs 1.2.0-r1
-(CVE-2026-111497, through gnutls) and other fixable findings; the derived image has
-brotli-libs 1.2.1-r0 and no fixable HIGH or CRITICAL finding. To move:
+[`deploy/docker/coturn.Dockerfile`](../deploy/docker/coturn.Dockerfile) is upstream
+`coturn/coturn:<version>-alpine` (`COTURN_BASE`, pinned by its multi-arch index digest)
+plus `apk upgrade` (every Alpine security update available at build time) and the
+capability-free copy `/opt/coturn/bin/turnserver`. The build fails if brotli-libs is older
+than 1.2.1-r0 (CVE-2026-111497, which upstream's `4.18.0-alpine`, `sha256:c29135c0…`,
+still carries) or if the copy has file capabilities. It copies nothing from the
+repository, so any directory works as the context; `deploy/docker` keeps it small.
 
-1. A new coturn release: set `COTURN_BASE` in `deploy/coturn/Dockerfile` to
-   `coturn/coturn:<tag>@sha256:<digest>` (the multi-arch index digest, the `Digest:` line
-   of `docker buildx imagetools inspect coturn/coturn:<tag>`) and the base labels below
-   it. Only new Alpine updates: nothing to change.
-2. Publish: after the change is on main, `git tag coturn-<version>-alpine-r<n> && git
-   push origin coturn-<version>-alpine-r<n>` (or `gh workflow run coturn-image.yml`). The
-   run's summary prints the reference to pin.
-3. Set `calls.turn.internal.image` to
-   `ghcr.io/yury-opolev/push-coturn:<tag>@sha256:<digest>` (and the same reference in
-   `deploy/helm/test-chart.ps1` and `test-chart-cluster.ps1`).
-4. Run `cargo test -p push-auth-core --test turn` (Docker): it starts the new image with
-   the chart's configuration and fails on any option coturn no longer knows, a refused
-   credential or a private peer that is not denied.
-5. Scan: `docker run --rm -v /var/run/docker.sock:/var/run/docker.sock
+Build it into your registry:
+
+```sh
+# Docker (any registry); multi-arch with buildx: --platform linux/amd64,linux/arm64 --push
+docker build -f deploy/docker/coturn.Dockerfile -t <registry>/push-coturn:<tag> deploy/docker
+docker push <registry>/push-coturn:<tag>
+
+# Azure Container Registry, built in ACR (no local Docker)
+az acr build --registry <acr> --image push-coturn:<tag> \
+  --file deploy/docker/coturn.Dockerfile deploy/docker
+
+# Azure Container Registry, the task file deploy/docker/coturn.acr.yaml (the --file path
+# is relative to the context); tags the image with the run id
+az acr run --registry <acr> --file coturn.acr.yaml deploy/docker
+
+# ...or as a scheduled ACR task rebuilding weekly from the repository
+az acr task create --registry <acr> --name push-coturn \
+  --context https://github.com/yury-opolev/push-messenger.git#main:deploy/docker \
+  --file coturn.acr.yaml --schedule "0 5 * * 1" \
+  --commit-trigger-enabled false --pull-request-trigger-enabled false
+```
+
+Then pin the digest the push reported
+(`az acr repository show --name <acr> --image push-coturn:<tag> --query digest -o tsv`,
+or `docker buildx imagetools inspect <registry>/push-coturn:<tag>`):
+
+```yaml
+calls:
+  turn:
+    internal:
+      image: <registry>/push-coturn:<tag>@sha256:<digest>
+      copyBinary: false   # the image holds /opt/coturn/bin/turnserver; no init step
+```
+
+Rebuild and re-pin when Alpine ships a fix (the build picks it up with no repository
+change) or when the Dockerfile moves. To move to a new coturn release:
+
+1. Set `COTURN_BASE` in `deploy/docker/coturn.Dockerfile` to
+   `coturn/coturn:<tag>@sha256:<digest>` (the `Digest:` line of `docker buildx imagetools
+   inspect coturn/coturn:<tag>`) and the base labels below it.
+2. Run `cargo test -p push-auth-core --test turn` (Docker) against the new build (set it
+   as `calls.turn.internal.image` locally): it starts it with the chart's configuration
+   and fails on any option coturn no longer knows, a refused credential or a private peer
+   that is not denied.
+3. Scan: `docker run --rm -v /var/run/docker.sock:/var/run/docker.sock
    aquasec/trivy:0.76.1 image --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1
    <image>` (CI does the same).
-6. `pwsh deploy/helm/test-chart.ps1`, then release; the pod restarts once (calls in
-   progress over the relay drop and recover with an ICE restart).
-
-Once upstream publishes a rebuilt image that is clean, pinning upstream directly again is
-fine: the chart only needs `<repository>:<tag>@sha256:<digest>` with the same layout.
+4. `pwsh deploy/helm/test-chart.ps1`, and `test-chart-cluster.ps1 -CoturnImage <ref>
+   -CopyBinary $false` on a disposable cluster; then release. The pod restarts once (calls
+   in progress over the relay drop and recover with an ICE restart).
+5. For the quick-start default: after the change is on main, `git tag
+   coturn-<version>-alpine-r<n> && git push origin coturn-<version>-alpine-r<n>` (or `gh
+   workflow run coturn-image.yml`) publishes `ghcr.io/yury-opolev/push-coturn`; the run's
+   summary prints the reference to pin in `values.yaml`, `deploy/helm/test-chart.ps1` and
+   `test-chart-cluster.ps1`.
 
 ### 13.8 Troubleshooting TURN
 

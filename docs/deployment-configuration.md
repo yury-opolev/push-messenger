@@ -415,9 +415,11 @@ rendered as `repository@digest`. Use the digest your own publication returned fo
 **each** image; they differ. For example (synthetic, non-deployable):
 `digest: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`.
 `postgres.image` and `redis.image` are complete references and accept
-`repository@sha256:...` directly, as does `calls.turn.internal.image` (coturn: this
-repository's patched build `ghcr.io/yury-opolev/push-coturn`, pinned to the digest of
-its multi-arch index; see [calls.md](calls.md#137-upgrading-coturn)); by default they are `postgres:17-alpine` and
+`repository@sha256:...` directly, as does `calls.turn.internal.image` (coturn; its
+default, this repository's build `ghcr.io/yury-opolev/push-coturn`, is for quick starts:
+in production build `deploy/docker/coturn.Dockerfile` into your registry like the other
+images, set its digest and `calls.turn.internal.copyBinary: false`; see
+[calls.md](calls.md#137-building-and-upgrading-coturn)); by default they are `postgres:17-alpine` and
 `redis:7-alpine` pinned to the digest of their multi-arch index, as are the
 Dockerfile's base images. CI fails on a fixable HIGH or CRITICAL vulnerability in any of
 them and rescans them weekly ([calls.md §13.4](calls.md#134-coturn-in-the-chart),
@@ -426,6 +428,8 @@ the bundled PostgreSQL and Redis once (their pod spec changes). Valid syntax doe
 signed; registry authorization is supplied through your own workload mechanisms.
 Build images with `docker build -f deploy/docker/Dockerfile --target <name> .` for
 `auth`, `message-svc`, `gateway`, `worker` and `smoke`.
+Build coturn with `docker build -f deploy/docker/coturn.Dockerfile -t <registry>/push-coturn:<tag> deploy/docker`
+(or `az acr build --registry <acr> --image push-coturn:<tag> --file deploy/docker/coturn.Dockerfile deploy/docker`).
 
 ## A complete consumer values example
 

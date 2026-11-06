@@ -6,14 +6,33 @@ Notable changes for consumers of push-messenger. Newest first.
 
 ### Security
 
+- **coturn Dockerfile: build the TURN image yourself** —
+  [`deploy/docker/coturn.Dockerfile`](deploy/docker/coturn.Dockerfile) (moved from
+  `deploy/coturn/Dockerfile`) is the production path for `calls.turn.internal.image`, like
+  the other images: build it into your registry (`docker build -f
+  deploy/docker/coturn.Dockerfile -t <registry>/push-coturn:<tag> deploy/docker`, or `az acr
+  build` / `az acr run` with [`deploy/docker/coturn.acr.yaml`](deploy/docker/coturn.acr.yaml)),
+  pin its digest and rebuild it when Alpine ships fixes
+  ([calls.md §13.7](docs/calls.md#137-building-and-upgrading-coturn)). The default image is
+  for quick starts only. The image now also holds a turnserver copy without file
+  capabilities at `/opt/coturn/bin/turnserver` (checked with `getcap` during the build);
+  new value **`calls.turn.internal.copyBinary`** (default `true`, unchanged behaviour):
+  `false` drops the copy init container and its `emptyDir` and runs that copy, for images
+  built from the Dockerfile. The default image moves to
+  `ghcr.io/yury-opolev/push-coturn:4.18.0-alpine-r2@sha256:8e37911d206a3352c49dd6861ceb19e34af0cfc58043504c56403c7c21534971`
+  (with the copy; brotli-libs 1.2.1-r0, no fixable HIGH or CRITICAL
+  finding). CI builds the Dockerfile, scans it, and runs the kind clusters (1.34–1.37,
+  restricted PSS, TURN allocation) on the built image without the init step; the weekly
+  rescan also scans a fresh build.
 - **Patched internal TURN image (CVE-2026-111497, brotli)** — `calls.turn.internal.image`
-  is now `ghcr.io/yury-opolev/push-coturn:4.18.0-alpine-r1@sha256:11321d4e158ae05e75e5bff45c2fe999cc66607fd2b03ea30182abaa0619453f`:
+  was `ghcr.io/yury-opolev/push-coturn:4.18.0-alpine-r1@sha256:11321d4e158ae05e75e5bff45c2fe999cc66607fd2b03ea30182abaa0619453f`
+  (now r2, above):
   upstream `coturn/coturn:4.18.0-alpine` (pinned by digest; upstream has not rebuilt it)
   plus the Alpine 3.24 security updates, so brotli-libs 1.2.1-r0 (was 1.2.0-r1, pulled in
   by gnutls), and fixed bind, mongo-c-driver, OpenSSL, zlib and musl packages. Same
   `turnserver`, user (65534), entrypoint and layout: the chart's init containers and the
   restricted Pod Security profile are unchanged. Built by
-  [`deploy/coturn/Dockerfile`](deploy/coturn/Dockerfile) and published (public,
+  `deploy/coturn/Dockerfile` (now `deploy/docker/coturn.Dockerfile`) and published (public,
   multi-arch, provenance and SBOM) by `.github/workflows/coturn-image.yml`. **Mirroring:**
   mirror `ghcr.io/yury-opolev/push-coturn@sha256:11321d4e…` instead of
   `docker.io/coturn/coturn@sha256:c29135c0…` and keep the digest

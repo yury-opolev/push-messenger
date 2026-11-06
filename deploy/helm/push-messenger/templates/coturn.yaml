@@ -95,10 +95,12 @@ spec:
             limits:
               cpu: 100m
               memory: 32Mi
+        {{- if $internal.copyBinary }}
         # The image's /usr/bin/turnserver has file capabilities (cap_net_bind_service=ep):
         # with drop ALL and allowPrivilegeEscalation false (no_new_privs) execve refuses it
         # ("operation not permitted"). A plain cp leaves the security.capability xattr
-        # behind; coturn listens above 1024 only and runs the copy (docs/calls.md).
+        # behind; coturn listens above 1024 only and runs the copy (docs/calls.md). Images
+        # built from deploy/docker/coturn.Dockerfile already hold that copy (copyBinary false).
         - name: turnserver
           image: {{ $internal.image }}
           imagePullPolicy: {{ .Values.images.pullPolicy }}
@@ -114,6 +116,7 @@ spec:
             limits:
               cpu: 100m
               memory: 32Mi
+        {{- end }}
       containers:
         - name: coturn
           image: {{ $internal.image }}
@@ -149,9 +152,11 @@ spec:
             {{- toYaml . | nindent 12 }}
           {{- end }}
           volumeMounts:
+            {{- if $internal.copyBinary }}
             - name: bin
               mountPath: /opt/coturn/bin
               readOnly: true
+            {{- end }}
             - name: run
               mountPath: /run/coturn
               readOnly: true
@@ -168,9 +173,11 @@ spec:
         - name: config
           configMap:
             name: {{ $name }}
+        {{- if $internal.copyBinary }}
         - name: bin
           emptyDir:
             sizeLimit: 16Mi
+        {{- end }}
         - name: run
           emptyDir:
             medium: Memory

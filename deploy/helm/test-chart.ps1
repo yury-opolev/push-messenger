@@ -370,16 +370,21 @@ assert pod["automountServiceAccountToken"] is False
 security = {"runAsNonRoot": True, "runAsUser": 65534, "runAsGroup": 65534, "allowPrivilegeEscalation": False,
             "readOnlyRootFilesystem": True, "capabilities": {"drop": ["ALL"]},
             "seccompProfile": {"type": "RuntimeDefault"}}
-[init, binary] = pod["initContainers"]
+copy = case["copyBinary"]
 [main] = pod["containers"]
-image = "ghcr.io/yury-opolev/push-coturn:4.18.0-alpine-r1@sha256:11321d4e158ae05e75e5bff45c2fe999cc66607fd2b03ea30182abaa0619453f"
+image = case["image"]
+if copy:
+    [init, binary] = pod["initContainers"]
+    # The image's /usr/bin/turnserver carries file capabilities (cap_net_bind_service=ep), which
+    # execve refuses with drop ALL and no_new_privs: coturn runs a plain cp of it, without them.
+    assert binary["name"] == "turnserver" and binary["image"] == image
+    assert binary["command"] == ["cp", "/usr/bin/turnserver", "/opt/coturn/bin/turnserver"]
+    assert binary["securityContext"] == security and binary["resources"] == init["resources"]
+    assert binary["volumeMounts"] == [{"name": "bin", "mountPath": "/opt/coturn/bin"}]
+else:
+    # The image (deploy/docker/coturn.Dockerfile) holds the capability-free copy itself.
+    [init] = pod["initContainers"]
 assert init["name"] == "config" and init["image"] == image and main["image"] == image
-# The image's /usr/bin/turnserver carries file capabilities (cap_net_bind_service=ep), which
-# execve refuses with drop ALL and no_new_privs: coturn runs a plain cp of it, without them.
-assert binary["name"] == "turnserver" and binary["image"] == image
-assert binary["command"] == ["cp", "/usr/bin/turnserver", "/opt/coturn/bin/turnserver"]
-assert binary["securityContext"] == security and binary["resources"] == init["resources"]
-assert binary["volumeMounts"] == [{"name": "bin", "mountPath": "/opt/coturn/bin"}]
 assert init["command"][:2] == ["sh", "-c"] and len(init["command"]) == 3
 assert "umask 077" in init["command"][2] and "static-auth-secret=" in init["command"][2]
 assert "> /run/coturn/turnserver.conf" in init["command"][2]
@@ -413,8 +418,11 @@ assert mounts["/run/coturn"] == {"name": "run", "mountPath": "/run/coturn", "rea
 assert volumes["run"]["emptyDir"]["medium"] == "Memory"
 assert mounts["/var/tmp"]["name"] == "var-tmp" and "emptyDir" in volumes["var-tmp"]
 assert mounts["/var/lib/coturn"]["name"] == "var-lib" and "emptyDir" in volumes["var-lib"]
-assert mounts["/opt/coturn/bin"] == {"name": "bin", "mountPath": "/opt/coturn/bin", "readOnly": True}
-assert volumes["bin"] == {"name": "bin", "emptyDir": {"sizeLimit": "16Mi"}}
+if copy:
+    assert mounts["/opt/coturn/bin"] == {"name": "bin", "mountPath": "/opt/coturn/bin", "readOnly": True}
+    assert volumes["bin"] == {"name": "bin", "emptyDir": {"sizeLimit": "16Mi"}}
+else:
+    assert "/opt/coturn/bin" not in mounts and "bin" not in volumes
 assert not {"turn-secret", "application-keys", "config"} & {m["name"] for m in main["volumeMounts"]}
 assert ("/etc/coturn/tls" in mounts) == tls and ("tls" in volumes) == tls
 if tls:
@@ -464,6 +472,8 @@ assert sum(d["kind"] == "NetworkPolicy" for d in docs) == 7
         ports = @{ udp = 3478; tcp = 3478; tls = 5349 }; serviceType = 'LoadBalancer'; loadBalancerIP = $null
         annotations = $null; resources = @{}; metricsPeers = @(); volume = $null
         secretFile = '/etc/coturn/secret/turn-shared-secret'; secretName = 'push-secrets'
+        copyBinary = $true
+        image = 'ghcr.io/yury-opolev/push-coturn:4.18.0-alpine-r2@sha256:8e37911d206a3352c49dd6861ceb19e34af0cfc58043504c56403c7c21534971'
     }
     foreach ($key in $case.Keys) { $values[$key] = $case[$key] }
     $result = $values | ConvertTo-Json -Depth 10 -Compress | & $python.Source -c $validator 2>&1
@@ -539,6 +549,12 @@ Check 'turn: internal renders the TURN variables, a generated secret and coturn'
     }) -and
         (Doc $turnInternal 'Secret' 'push-secrets') -match '(?m)^  turn-shared-secret: "[A-Za-z0-9]{48}"\s*$' -and
         (CoturnMatrix $turnInternal @{})
+}
+Check 'turn: copyBinary false runs the image''s own capability-free copy, without the copy init container' {
+    $own = 'registry.example.com/push-coturn:4.18.0-alpine-r2@sha256:' + ('a' * 64)
+    $rendered = helm template push $chart @turnArgs --set calls.turn.internal.copyBinary=false `
+        --set calls.turn.internal.image=$own | Out-String
+    $LASTEXITCODE -eq 0 -and (CoturnMatrix $rendered @{ copyBinary = $false; image = $own })
 }
 $coturnPeers = '[{"namespaceSelector":{"kubernetes.io/metadata.name":"monitoring"},"podSelector":{"app":"prometheus"}}]'
 $turnTls = helm template push $chart @turnArgs --set calls.turn.internal.externalIp= `
@@ -721,6 +737,7 @@ foreach ($invalid in @(
     @{ args = $turnArgs + @('--set', 'calls.turn.internal.quotas.total=100001'); message = 'calls.turn.internal.quotas.total must be an integer from 1 to 100000' },
     @{ args = $turnArgs + @('--set', 'calls.turn.internal.quotas.maxBps=7999'); message = 'calls.turn.internal.quotas.maxBps must be an integer from 8000 to 1000000000' },
     @{ args = $turnArgs + @('--set', 'calls.turn.internal.image=coturn/coturn:4.18.0-alpine'); message = 'calls.turn.internal.image must be <repository>:<tag>@sha256:<64 hex digits>' },
+    @{ args = $turnArgs + @('--set-string', 'calls.turn.internal.copyBinary=false'); message = 'calls.turn.internal.copyBinary must be true or false' },
     @{ args = $turnArgs + @('--set-json', 'calls.turn.internal.metricsPeers=[{"podSelector":{"app":"prometheus"}}]'); message = 'calls.turn.internal.metricsPeers requires namespaceSelector and podSelector as non-empty label maps on every peer' },
     @{ args = $external + @('--set', 'calls.turn.external.provider=xirsys'); message = 'calls.turn.external.provider must be generic, cloudflare or twilio' },
     @{ args = $external; message = 'calls.turn.external.urls must be a non-empty list of turn: or turns: URLs' },
