@@ -2,7 +2,7 @@
 //! push-domain over compare-and-set Redis state, publishing, the sweeper, audit and
 //! metrics. Never logs SDP, candidates or addresses (spec D18, T10).
 
-mod history;
+pub(crate) mod history;
 mod redis;
 mod wire;
 

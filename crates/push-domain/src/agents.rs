@@ -5,11 +5,13 @@
 use chrono::{DateTime, TimeDelta, Utc};
 use uuid::Uuid;
 
+use crate::calls::{CallHistoryRow, HistoryCursor};
 use crate::clock::Clock;
 use crate::contacts::{are_contacts, contact_changed, set_contact};
 use crate::error::{DomainError, DomainResult};
-use crate::ids::UserId;
-use crate::model::{AgentPolicy, ContactState, ContactSummary};
+use crate::history::HistoryPage;
+use crate::ids::{ConversationId, UserId};
+use crate::model::{AgentPolicy, ContactState, ContactSummary, ConversationKind};
 use crate::notify::{Event, Notifier};
 use crate::service::Messaging;
 use crate::store::{Store, Tx};
@@ -74,6 +76,25 @@ pub(crate) enum Resolution {
     Hold,
     /// Only the requester's `RequestedOut` row, released later without an event.
     Refuse,
+}
+
+/// One of an agent's conversations in its owner's view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentConversation {
+    pub conversation_id: ConversationId,
+    pub kind: ConversationKind,
+    pub title: Option<String>,
+    /// Direct only: the other member.
+    pub peer: Option<UserId>,
+    /// Direct only, when the peer is an owned agent: its owner.
+    pub peer_owner: Option<UserId>,
+    pub member_count: u32,
+    /// Creation or the last entry.
+    pub last_activity_at: DateTime<Utc>,
+    /// Messages the agent can see that are not deleted.
+    pub message_count: i64,
+    pub hidden: bool,
+    pub peer_deleted: bool,
 }
 
 /// The owner's answer to a waiting request.
@@ -344,6 +365,82 @@ where
             tx.commit().await?;
         }
         Ok(released)
+    }
+
+    /// The agent's conversations for its owner's read-only view: the agent's own listing
+    /// (hidden ones included), each with its peer (direct), the peer's owner when the peer
+    /// is an agent, and the count of messages the agent can see that are not deleted;
+    /// newest activity first. Reads only: nothing of the agent's changes.
+    pub async fn owner_conversations(
+        &self,
+        owner: UserId,
+        agent: UserId,
+    ) -> DomainResult<Vec<AgentConversation>> {
+        self.require_owned(owner, agent).await?;
+        let summaries = self.list_conversations_with(agent, None, true).await?;
+        let mut tx = self.store.begin().await?;
+        let counts: std::collections::HashMap<ConversationId, i64> =
+            tx.message_counts(agent).await?.into_iter().collect();
+        let mut conversations = Vec::with_capacity(summaries.len());
+        for summary in summaries {
+            let peer = match summary.kind {
+                ConversationKind::Direct => summary
+                    .members
+                    .iter()
+                    .copied()
+                    .find(|member| *member != agent),
+                ConversationKind::Group => None,
+            };
+            let peer_owner = match peer {
+                Some(peer) => tx.agent_owner(peer).await?,
+                None => None,
+            };
+            conversations.push(AgentConversation {
+                conversation_id: summary.conversation_id,
+                kind: summary.kind,
+                title: summary.title,
+                peer,
+                peer_owner,
+                member_count: u32::try_from(summary.members.len()).unwrap_or(u32::MAX),
+                last_activity_at: summary.updated_at,
+                message_count: counts.get(&summary.conversation_id).copied().unwrap_or(0),
+                hidden: summary.hidden,
+                peer_deleted: summary.peer_deleted,
+            });
+        }
+        tx.rollback().await?;
+        conversations.sort_by(|a, b| {
+            b.last_activity_at
+                .cmp(&a.last_activity_at)
+                .then(a.conversation_id.cmp(&b.conversation_id))
+        });
+        Ok(conversations)
+    }
+
+    /// A page of one of the agent's conversations exactly as the agent's own history
+    /// request gets it, for its owner. Reads only.
+    pub async fn owner_history(
+        &self,
+        owner: UserId,
+        agent: UserId,
+        conversation: ConversationId,
+        before_seq: Option<i64>,
+        limit: u32,
+    ) -> DomainResult<HistoryPage> {
+        self.require_owned(owner, agent).await?;
+        self.history(agent, conversation, before_seq, limit).await
+    }
+
+    /// The agent's call history as the agent's own request gets it, for its owner.
+    pub async fn owner_call_history(
+        &self,
+        owner: UserId,
+        agent: UserId,
+        before: Option<HistoryCursor>,
+        limit: u32,
+    ) -> DomainResult<Vec<CallHistoryRow>> {
+        self.require_owned(owner, agent).await?;
+        self.call_history(agent, before, None, limit).await
     }
 
     /// When the next refusal is released, from now: a random delay.

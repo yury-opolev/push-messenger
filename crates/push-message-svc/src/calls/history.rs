@@ -223,14 +223,14 @@ where
     }
 }
 
-fn cursor(cursor: &CallHistoryCursor) -> Result<HistoryCursor, Status> {
+pub(crate) fn cursor(cursor: &CallHistoryCursor) -> Result<HistoryCursor, Status> {
     Ok(HistoryCursor {
         ended_at: from_micros(cursor.ended_at)?,
         call_id: parse_id(&cursor.call_id, "call_id", std::convert::identity)?,
     })
 }
 
-fn entry(row: &CallHistoryRow) -> CallHistoryEntry {
+pub(crate) fn entry(row: &CallHistoryRow) -> CallHistoryEntry {
     CallHistoryEntry {
         call_id: id_bytes(row.call_id),
         peer_user_id: id_bytes(row.peer.0),
