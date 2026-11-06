@@ -28,6 +28,7 @@ fn public(world: &World, turn: Turn) -> Router {
         directory: Arc::new(NoDirectory),
         templates: Arc::new(NoTemplates),
         call_history: Arc::new(crate::calls::NoCalls),
+        agent_owners: Arc::new(crate::owners::NoAgentOwners),
         turn: Arc::new(turn),
     })
 }

@@ -45,6 +45,11 @@ where
         if !tx.user_exists(user).await? {
             return Err(DomainError::UnknownUser);
         }
+        // An invite would make contacts past the owner's policy (spec 2026-11-06 agent
+        // connections D4).
+        if tx.agent_owner(user).await?.is_some() {
+            return Err(DomainError::NotAllowed);
+        }
         let record = InviteRecord {
             code: invite_code(Uuid::new_v4()),
             user_id: user,
@@ -114,6 +119,10 @@ where
             tx.rollback().await?;
             return Ok(creator);
         }
+        // An agent's invite from before agents' policies counts for nothing.
+        if tx.agent_owner(creator).await?.is_some() {
+            return Err(DomainError::InviteNotFound);
+        }
 
         let accepted = Some(ContactState::Accepted);
         let mut events = Vec::new();
@@ -124,6 +133,7 @@ where
         }
         invite.uses += 1;
         tx.update_invite(invite).await?;
+        crate::agents::owner_events(&mut tx, &mut events).await?;
         tx.commit().await?;
         self.publish(events).await;
         Ok(creator)

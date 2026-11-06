@@ -30,11 +30,20 @@ use crate::identity::{
 };
 use crate::limits::{Limits, RedisCounter};
 use crate::links::LinkSigner;
+use crate::owners::{AgentOwnerApi, GrpcAgentOwners, NoAgentOwners};
 use crate::password::Passwords;
 use crate::service::{Auth, Settings, SignIn};
 use crate::templates::{GrpcTemplates, NoTemplates, TemplateRegistry};
 use crate::tokens::AccessTokens;
 use crate::turn::Turn;
+
+/// The APIs auth-svc asks message-svc.
+type MessageSvcApis = (
+    Arc<dyn Directory>,
+    Arc<dyn TemplateRegistry>,
+    Arc<dyn CallLog>,
+    Arc<dyn AgentOwnerApi>,
+);
 
 /// How long to wait before trying an unreachable dependency again.
 const RETRY_DELAY: Duration = Duration::from_secs(2);
@@ -82,33 +91,32 @@ pub async fn serve_with(
     let tokens = AccessTokens::from_seed(&config.signing_key, config.token_audience.clone())
         .map_err(anyhow::Error::msg)?;
     let links = LinkSigner::new(config.link_key.clone()).map_err(anyhow::Error::msg)?;
-    let (directory, templates, call_history): (
-        Arc<dyn Directory>,
-        Arc<dyn TemplateRegistry>,
-        Arc<dyn CallLog>,
-    ) = match (&config.message_svc_url, &config.directory_token) {
-        (Some(url), Some(token)) => {
-            // One channel for every API: they are served on the same listener.
-            let channel = message_svc(url, token).map_err(anyhow::Error::msg)?;
-            (
-                Arc::new(GrpcDirectory::over(channel.clone())),
-                Arc::new(GrpcTemplates::over(channel.clone())),
-                Arc::new(GrpcCalls::over(channel)),
-            )
-        }
-        _ => {
-            tracing::warn!(
-                "PUSH_MESSAGE_SVC_URL is not set: GET /v1/users, the template routes and \
+    let (directory, templates, call_history, agent_owners): MessageSvcApis =
+        match (&config.message_svc_url, &config.directory_token) {
+            (Some(url), Some(token)) => {
+                // One channel for every API: they are served on the same listener.
+                let channel = message_svc(url, token).map_err(anyhow::Error::msg)?;
+                (
+                    Arc::new(GrpcDirectory::over(channel.clone())),
+                    Arc::new(GrpcTemplates::over(channel.clone())),
+                    Arc::new(GrpcCalls::over(channel.clone())),
+                    Arc::new(GrpcAgentOwners::over(channel)),
+                )
+            }
+            _ => {
+                tracing::warn!(
+                    "PUSH_MESSAGE_SVC_URL is not set: GET /v1/users, the template routes and \
                      the call history answer 503, since only message-svc knows whose profiles \
                      a user may see and keeps the templates and calls"
-            );
-            (
-                Arc::new(NoDirectory),
-                Arc::new(NoTemplates),
-                Arc::new(NoCalls),
-            )
-        }
-    };
+                );
+                (
+                    Arc::new(NoDirectory),
+                    Arc::new(NoTemplates),
+                    Arc::new(NoCalls),
+                    Arc::new(NoAgentOwners),
+                )
+            }
+        };
     let turn = Arc::new(Turn::new(config.turn.clone()).map_err(anyhow::Error::msg)?);
     match turn.mode() {
         Some(mode) => tracing::info!(
@@ -284,6 +292,7 @@ pub async fn serve_with(
         directory,
         templates: Arc::clone(&templates),
         call_history,
+        agent_owners,
         turn,
     });
     // The admin listener exists only with its token (spec D15).

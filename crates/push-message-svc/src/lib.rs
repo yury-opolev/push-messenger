@@ -16,17 +16,19 @@ mod grpc;
 mod listeners;
 mod metrics;
 mod notify;
+mod owners;
 mod presence;
 mod requests;
 mod server;
 mod templates;
 
 pub use calls::{CallHistory, CallHistoryApi, CallService, CallsApi, RedisCalls};
-pub use config::{CallsConfig, Config, ConfigError, MigrateConfig};
+pub use config::{AgentsConfig, CallsConfig, Config, ConfigError, MigrateConfig};
 pub use grpc::{AccountsApi, DirectoryApi, InternalToken, MAX_VISIBLE_USERS, MessagingApi};
 pub use listeners::Listeners;
 pub use metrics::{Metrics, SignalFrame};
 pub use notify::RedisNotifier;
+pub use owners::{AgentOwnersApi, run_refusal_sweeper};
 pub use presence::{
     FixedPresence, OfflinePresence, PresenceRead, PresenceStates, PresenceUnavailable,
     RedisPresence,

@@ -32,6 +32,24 @@ pub(crate) struct Subject {
     pub device: Option<Uuid>,
 }
 
+/// What an owner route of an agent concerned (spec 2026-11-06 agent connections D11),
+/// attached to its answer: ids, a count and the policy, never content.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct OwnerAudit {
+    /// The signed-in caller, the owner if the route succeeded.
+    pub owner: Option<Uuid>,
+    /// The agent, once the caller was found to own it.
+    pub agent: Option<Uuid>,
+    /// The user acted on (a requester or a contact).
+    pub peer: Option<Uuid>,
+    /// The conversation read.
+    pub conversation: Option<Uuid>,
+    /// How many items the answer held.
+    pub count: Option<usize>,
+    /// The policy read or set.
+    pub policy: Option<&'static str>,
+}
+
 /// Logs the security event of every answer that has one.
 pub(crate) async fn audit(State(api): State<Api>, request: Request, next: Next) -> Response {
     let method = request.method().clone();
@@ -57,12 +75,16 @@ pub(crate) async fn audit(State(api): State<Api>, request: Request, next: Next) 
         event(&method, &route, status, code)
     };
     if let Some(event) = event {
-        let subject = response
+        let owner = response.extensions().get::<OwnerAudit>().copied();
+        let mut subject = response
             .extensions()
             .get::<Subject>()
             .copied()
             .unwrap_or_default();
-        log(event, &route, status, code, ip, subject);
+        if let Some(owner) = owner {
+            subject.user = subject.user.or(owner.owner);
+        }
+        log(event, &route, status, code, ip, subject, owner);
     }
     response
 }
@@ -74,16 +96,45 @@ fn log(
     code: Option<&str>,
     ip: Option<IpAddr>,
     subject: Subject,
+    owner: Option<OwnerAudit>,
 ) {
     let status = status.as_u16();
     let ip = ip.map(tracing::field::display);
     let user_id = subject.user.map(tracing::field::display);
     let device_id = subject.device.map(tracing::field::display);
+    let owner = owner.unwrap_or_default();
+    let agent_id = owner.agent.map(tracing::field::display);
+    let peer_id = owner.peer.map(tracing::field::display);
+    let conversation_id = owner.conversation.map(tracing::field::display);
+    let count = owner.count;
+    let policy = owner.policy;
     if (200..300).contains(&status) {
-        tracing::info!(target: "security", event, route, status, code, ip, user_id, device_id, "security event");
+        tracing::info!(target: "security", event, route, status, code, ip, user_id, device_id, agent_id, peer_id, conversation_id, count, policy, "security event");
     } else {
-        tracing::warn!(target: "security", event, route, status, code, ip, user_id, device_id, "security event");
+        tracing::warn!(target: "security", event, route, status, code, ip, user_id, device_id, agent_id, peer_id, conversation_id, count, policy, "security event");
     }
+}
+
+/// The event of an answer of an agent's owner route, if `route` is one: what the owner did,
+/// or `agent.owner.refused` (a stranger probing, a missing request).
+fn owner_event(method: &Method, route: &str, ok: bool) -> Option<&'static str> {
+    let action = match (method.as_str(), route) {
+        ("GET", "/v1/agents/{agent_id}/policy") => "agent.policy.read",
+        ("PUT", "/v1/agents/{agent_id}/policy") => "agent.policy.changed",
+        ("GET", "/v1/agents/{agent_id}/requests") => "agent.requests.listed",
+        ("POST", "/v1/agents/{agent_id}/requests/{user_id}/approve") => "agent.request.approved",
+        ("POST", "/v1/agents/{agent_id}/requests/{user_id}/decline") => "agent.request.declined",
+        ("POST", "/v1/agents/{agent_id}/requests/{user_id}/block") => "agent.request.blocked",
+        ("GET", "/v1/agents/{agent_id}/contacts") => "agent.contacts.listed",
+        ("DELETE", "/v1/agents/{agent_id}/contacts/{user_id}") => "agent.contact.removed",
+        ("GET", "/v1/agents/{agent_id}/conversations") => "agent.view.conversations",
+        ("GET", "/v1/agents/{agent_id}/conversations/{conversation_id}/messages") => {
+            "agent.view.history"
+        }
+        ("GET", "/v1/agents/{agent_id}/calls") => "agent.view.calls",
+        _ => return None,
+    };
+    Some(if ok { action } else { "agent.owner.refused" })
 }
 
 /// The event of an answer, if it is security-relevant. Unavailable answers (503) are
@@ -101,6 +152,11 @@ pub(crate) fn event(
         return None;
     }
     let ok = status.is_success();
+    if status != StatusCode::UNAUTHORIZED {
+        if let Some(event) = owner_event(method, route, ok) {
+            return Some(event);
+        }
+    }
     let bad_link = matches!(code, Some("link_invalid" | "link_expired"));
     let event = match (method.as_str(), route) {
         ("POST", "/v1/auth/signup") if ok => "auth.signup",
@@ -185,6 +241,111 @@ mod tests {
             Some("auth.external.failure"),
             "bad, expired and spent codes share the actual EnrollmentInvalid response"
         );
+    }
+
+    #[test]
+    fn owner_routes_name_what_the_owner_did_and_refusals_are_one_event() {
+        let cases = [
+            (
+                Method::GET,
+                "/v1/agents/{agent_id}/policy",
+                200,
+                Some("agent.policy.read"),
+            ),
+            (
+                Method::PUT,
+                "/v1/agents/{agent_id}/policy",
+                200,
+                Some("agent.policy.changed"),
+            ),
+            (
+                Method::GET,
+                "/v1/agents/{agent_id}/requests",
+                200,
+                Some("agent.requests.listed"),
+            ),
+            (
+                Method::POST,
+                "/v1/agents/{agent_id}/requests/{user_id}/approve",
+                204,
+                Some("agent.request.approved"),
+            ),
+            (
+                Method::POST,
+                "/v1/agents/{agent_id}/requests/{user_id}/decline",
+                204,
+                Some("agent.request.declined"),
+            ),
+            (
+                Method::POST,
+                "/v1/agents/{agent_id}/requests/{user_id}/block",
+                204,
+                Some("agent.request.blocked"),
+            ),
+            (
+                Method::GET,
+                "/v1/agents/{agent_id}/contacts",
+                200,
+                Some("agent.contacts.listed"),
+            ),
+            (
+                Method::DELETE,
+                "/v1/agents/{agent_id}/contacts/{user_id}",
+                204,
+                Some("agent.contact.removed"),
+            ),
+            (
+                Method::GET,
+                "/v1/agents/{agent_id}/conversations",
+                200,
+                Some("agent.view.conversations"),
+            ),
+            (
+                Method::GET,
+                "/v1/agents/{agent_id}/conversations/{conversation_id}/messages",
+                200,
+                Some("agent.view.history"),
+            ),
+            (
+                Method::GET,
+                "/v1/agents/{agent_id}/calls",
+                200,
+                Some("agent.view.calls"),
+            ),
+            (
+                Method::GET,
+                "/v1/agents/{agent_id}/policy",
+                404,
+                Some("agent.owner.refused"),
+            ),
+            (
+                Method::PUT,
+                "/v1/agents/{agent_id}/policy",
+                400,
+                Some("agent.owner.refused"),
+            ),
+            (
+                Method::GET,
+                "/v1/agents/{agent_id}/policy",
+                401,
+                Some("auth.token.refused"),
+            ),
+            (
+                Method::GET,
+                "/v1/agents/{agent_id}/calls",
+                429,
+                Some("auth.rate_limited"),
+            ),
+            (Method::GET, "/v1/agents/{agent_id}/calls", 503, None),
+        ];
+        for (method, route, status, expected) in cases {
+            let status = StatusCode::from_u16(status).unwrap();
+            assert_eq!(
+                event(&method, route, status, None),
+                expected,
+                "{method} {route} {status}"
+            );
+        }
     }
 
     #[test]

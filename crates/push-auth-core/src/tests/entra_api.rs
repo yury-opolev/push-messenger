@@ -78,6 +78,7 @@ fn offer_app(world: &mut World) {
         directory: std::sync::Arc::new(crate::directory::NoDirectory),
         templates: std::sync::Arc::new(crate::templates::NoTemplates),
         call_history: std::sync::Arc::new(crate::calls::NoCalls),
+        agent_owners: std::sync::Arc::new(crate::owners::NoAgentOwners),
         turn: std::sync::Arc::new(crate::turn::Turn::disabled()),
     });
 }

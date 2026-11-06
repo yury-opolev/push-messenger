@@ -36,6 +36,8 @@ pub struct Messaging<S, C, N> {
     pub(crate) clock: C,
     pub(crate) notifier: N,
     pub(crate) policy: Policy,
+    /// How long a refused request to an agent stays pending before it disappears.
+    pub(crate) refusal_delay: crate::agents::RefusalDelay,
 }
 
 impl<S, C, N> Messaging<S, C, N>
@@ -55,7 +57,15 @@ where
             clock,
             notifier,
             policy,
+            refusal_delay: crate::agents::RefusalDelay::default(),
         }
+    }
+
+    /// The same service, releasing refused requests to agents after a uniformly random
+    /// delay between `min` and `max` (spec 2026-11-06 agent connections §3.2).
+    pub fn with_refusal_delay(mut self, min: TimeDelta, max: TimeDelta) -> Self {
+        self.refusal_delay = crate::agents::RefusalDelay::new(min, max);
+        self
     }
 
     /// Records a user whose email is verified. Idempotent.

@@ -13,6 +13,7 @@ use push_credentials::startup::{redis_permanent, retry};
 use push_credentials::{AuthMode, AzureConfig, RedisConnector};
 use push_domain::{DomainError, Messaging, SystemClock};
 use push_proto::internal::v1::accounts_server::AccountsServer;
+use push_proto::internal::v1::agent_owners_server::AgentOwnersServer;
 use push_proto::internal::v1::calls_server::CallsServer;
 use push_proto::internal::v1::directory_server::DirectoryServer;
 use push_proto::internal::v1::messaging_server::MessagingServer;
@@ -28,6 +29,7 @@ use crate::config::{Config, MigrateConfig};
 use crate::grpc::{AccountsApi, DirectoryApi, InternalToken, MessagingApi};
 use crate::metrics::Metrics;
 use crate::notify::RedisNotifier;
+use crate::owners::{AgentOwnersApi, run_refusal_sweeper};
 use crate::templates::{TemplatesApi, seed_builtins, seeding_is_permanent};
 
 /// How long to wait before trying an unreachable dependency again.
@@ -132,7 +134,12 @@ pub async fn serve(
     };
     let presence = Arc::new(notifier.presence());
     let call_notifier = notifier.clone();
-    let messaging = Arc::new(Messaging::new(store.clone(), SystemClock, notifier));
+    let messaging = Arc::new(
+        Messaging::new(store.clone(), SystemClock, notifier).with_refusal_delay(
+            delta(config.agents.refusal_min),
+            delta(config.agents.refusal_max),
+        ),
+    );
     // Before readiness and serving, so clients find the built-ins in the first catalog.
     let seeding_fatal = |error: &anyhow::Error| {
         error
@@ -208,7 +215,7 @@ pub async fn serve(
                 shutdown.clone().cancelled_owned(),
             ),
     );
-    tracing::info!(addr = %config.directory_grpc_addr, "serving Directory, Templates and Calls gRPC");
+    tracing::info!(addr = %config.directory_grpc_addr, "serving Directory, Templates, Calls and AgentOwners gRPC");
     let directory_token = InternalToken::directory(config.directory_token);
     servers.spawn(
         tonic::transport::Server::builder()
@@ -217,7 +224,11 @@ pub async fn serve(
                 directory_token.clone(),
             ))
             .add_service(TemplatesServer::with_interceptor(
-                TemplatesApi::new(messaging),
+                TemplatesApi::new(Arc::clone(&messaging)),
+                directory_token.clone(),
+            ))
+            .add_service(AgentOwnersServer::with_interceptor(
+                AgentOwnersApi::new(Arc::clone(&messaging)),
                 directory_token.clone(),
             ))
             .add_service(CallsServer::with_interceptor(
@@ -237,6 +248,14 @@ pub async fn serve(
             Ok(())
         });
     }
+    {
+        let shutdown = shutdown.clone();
+        let every = config.agents.sweep;
+        servers.spawn(async move {
+            run_refusal_sweeper(messaging, every, shutdown).await;
+            Ok(())
+        });
+    }
     if let Some(calls) = calls {
         let shutdown = shutdown.clone();
         servers.spawn(async move {
@@ -253,6 +272,11 @@ pub async fn serve(
     }
     result?;
     health_result
+}
+
+/// A configured duration as a domain time span.
+fn delta(duration: Duration) -> chrono::TimeDelta {
+    chrono::TimeDelta::from_std(duration).unwrap_or(chrono::TimeDelta::MAX)
 }
 
 /// Cancels and drains every API before the caller releases shared resources.

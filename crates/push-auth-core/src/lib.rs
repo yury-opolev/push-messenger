@@ -22,6 +22,7 @@ pub mod identity;
 pub mod limits;
 pub mod links;
 pub mod outbox;
+pub mod owners;
 pub mod password;
 mod profiles;
 pub mod rules;
@@ -49,6 +50,7 @@ pub use identity::{
     AGENT_KEY_PROVIDER, Admission, AdmissionDecision, AuthenticationError, Authenticator,
     ENTRA_PROVIDER, Principal,
 };
+pub use owners::{AgentOwnerApi, GrpcAgentOwners, NoAgentOwners};
 pub use profiles::{OwnProfile, PublicProfile};
 pub use server::{Overrides, init_logging, migrate, serve, serve_with, terminated};
 pub use service::{

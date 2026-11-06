@@ -5,6 +5,7 @@
 //! the `Store` and `Tx` traits.
 
 mod activity;
+mod agents;
 pub mod calls;
 pub mod clock;
 mod contacts;
@@ -34,6 +35,10 @@ mod testing;
 pub mod validation;
 
 pub use activity::{ACTIVITY_TTL, ActivityState, MAX_ACTIVITY_LABEL_CHARS, validate_label};
+pub use agents::{
+    AGENT_PENDING_OUT_MAX, AGENT_REQUESTS_PER_DAY, AGENT_REQUESTS_PER_HOUR, AGENT_WAITING_IN_MAX,
+    AGENT_WAITING_OUT_MAX, OwnerAction, RefusalDelay,
+};
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use edit::{DeleteMessage, EditText, MessageRef};
 pub use error::{DomainError, DomainResult};

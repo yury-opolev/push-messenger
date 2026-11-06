@@ -1,3 +1,4 @@
+use crate::agents::{Resolution, check_agent_limits, owner_events, resolve};
 use crate::clock::Clock;
 use crate::error::{DomainError, DomainResult};
 use crate::ids::UserId;
@@ -48,12 +49,35 @@ where
     /// Sends a contact request. Returns the requester's resulting state. A request to an
     /// id that is not a verified user looks like a request nobody answered yet: it stores
     /// nothing and answers `RequestedOut`, so requests never reveal which ids exist.
+    ///
+    /// A request to an owned agent is resolved at once by the agent's policy (spec
+    /// 2026-11-06 agent connections §3): accepted, held for the owner (the agent gets
+    /// `RequestedIn` and the owner an [`Event::AgentContact`]), or refused (the requester's
+    /// row alone, released later without an event, as a decline looks). A request from an
+    /// agent passes the agent's limits first (`RateLimited`).
     pub async fn contact_request(&self, from: UserId, to: UserId) -> DomainResult<ContactState> {
-        let Some(mut tx) = self.begin_pair(from, to).await? else {
+        if from == to {
+            return Err(ValidationError::SelfTarget.into());
+        }
+        let now = self.clock.now();
+        let mut tx = self.store.begin().await?;
+        if !tx.user_exists(from).await? {
+            return Err(DomainError::UnknownUser);
+        }
+        let known = tx.user_exists(to).await?;
+        if known {
+            tx.lock_contact_pair(from, to).await?;
+        }
+        if tx.agent_owner(from).await?.is_some() {
+            check_agent_limits(&mut tx, from, to, now).await?;
+        }
+        if !known {
+            tx.commit().await?;
             return Ok(ContactState::RequestedOut);
-        };
+        }
         let mine = tx.get_contact(from, to).await?;
         let theirs = tx.get_contact(to, from).await?;
+        let mut refuse = false;
         let (result, their_new) = match (mine, theirs) {
             (Some(ContactState::Blocked), _) => return Err(DomainError::Blocked),
             (Some(ContactState::Accepted), _) => (ContactState::Accepted, theirs),
@@ -63,7 +87,21 @@ where
             (_, Some(ContactState::RequestedOut)) => {
                 (ContactState::Accepted, Some(ContactState::Accepted))
             }
-            _ => (ContactState::RequestedOut, Some(ContactState::RequestedIn)),
+            // Already pending: a repeated request changes nothing.
+            (_, Some(ContactState::RequestedIn)) => (ContactState::RequestedOut, theirs),
+            _ => match tx.agent_owner(to).await? {
+                Some(owner) => match resolve(&mut tx, from, to, owner).await? {
+                    Resolution::Accept => (ContactState::Accepted, Some(ContactState::Accepted)),
+                    Resolution::Hold => {
+                        (ContactState::RequestedOut, Some(ContactState::RequestedIn))
+                    }
+                    Resolution::Refuse => {
+                        refuse = true;
+                        (ContactState::RequestedOut, theirs)
+                    }
+                },
+                None => (ContactState::RequestedOut, Some(ContactState::RequestedIn)),
+            },
         };
         let mut events = Vec::new();
         if set_contact(&mut tx, from, to, Some(result)).await? {
@@ -72,13 +110,31 @@ where
         if set_contact(&mut tx, to, from, their_new).await? {
             events.push(contact_changed(to, from, their_new));
         }
+        if refuse {
+            // The requester alone hears of its own request, as for any request; nothing
+            // reaches the agent or its owner.
+            let release_at = self.refusal_release_at();
+            tx.put_refusal(from, to, release_at).await?;
+        } else if result == ContactState::Accepted {
+            tx.delete_refusal(from, to).await?;
+            tx.delete_refusal(to, from).await?;
+        }
+        owner_events(&mut tx, &mut events).await?;
         tx.commit().await?;
         self.publish(events).await;
         Ok(result)
     }
 
-    /// Accepts a request that `peer` sent to `me`.
+    /// Accepts a request that `peer` sent to `me`. An agent's requests are its owner's to
+    /// decide: an agent gets `OwnerDecides`.
     pub async fn contact_accept(&self, me: UserId, peer: UserId) -> DomainResult<()> {
+        if self.is_owned_agent(me).await? {
+            return Err(DomainError::OwnerDecides);
+        }
+        self.accept_as(me, peer).await
+    }
+
+    pub(crate) async fn accept_as(&self, me: UserId, peer: UserId) -> DomainResult<()> {
         let Some(mut tx) = self.begin_pair(me, peer).await? else {
             return Err(DomainError::NoPendingRequest);
         };
@@ -92,6 +148,7 @@ where
                 events.push(contact_changed(owner, other, accepted));
             }
         }
+        owner_events(&mut tx, &mut events).await?;
         tx.commit().await?;
         self.publish(events).await;
         Ok(())
@@ -100,8 +157,15 @@ where
     /// Declines a request that `peer` sent to `me`.
     ///
     /// The requester's pending request disappears without an event: a decline must look
-    /// the same to them as a block.
+    /// the same to them as a block. An agent gets `OwnerDecides`.
     pub async fn contact_decline(&self, me: UserId, peer: UserId) -> DomainResult<()> {
+        if self.is_owned_agent(me).await? {
+            return Err(DomainError::OwnerDecides);
+        }
+        self.decline_as(me, peer).await
+    }
+
+    pub(crate) async fn decline_as(&self, me: UserId, peer: UserId) -> DomainResult<()> {
         let Some(mut tx) = self.begin_pair(me, peer).await? else {
             return Err(DomainError::NoPendingRequest);
         };
@@ -112,8 +176,10 @@ where
         if tx.get_contact(peer, me).await? == Some(ContactState::RequestedOut) {
             set_contact(&mut tx, peer, me, None).await?;
         }
+        let mut events = vec![contact_changed(me, peer, None)];
+        owner_events(&mut tx, &mut events).await?;
         tx.commit().await?;
-        self.publish(vec![contact_changed(me, peer, None)]).await;
+        self.publish(events).await;
         Ok(())
     }
 
@@ -124,7 +190,30 @@ where
     /// after it. Both users' locks are held until the commit, so no announcement can follow
     /// it with a stale state (see [`Self::announce_presence`]): one already under way
     /// published before the block took the lock, and a later one leaves the pair out.
+    ///
+    /// An agent may not block its owner (`NotAllowed`) nor a user whose request waits for
+    /// its owner (`OwnerDecides`: that would decline it).
     pub async fn contact_block(&self, me: UserId, peer: UserId) -> DomainResult<()> {
+        let mut tx = self.store.begin().await?;
+        let owner = tx.agent_owner(me).await?;
+        tx.rollback().await?;
+        if let Some(owner) = owner {
+            if owner == peer {
+                return Err(DomainError::NotAllowed);
+            }
+            let Some(mut tx) = self.begin_pair(me, peer).await? else {
+                return Ok(());
+            };
+            let waiting = tx.get_contact(me, peer).await? == Some(ContactState::RequestedIn);
+            tx.rollback().await?;
+            if waiting {
+                return Err(DomainError::OwnerDecides);
+            }
+        }
+        self.block_as(me, peer).await
+    }
+
+    pub(crate) async fn block_as(&self, me: UserId, peer: UserId) -> DomainResult<()> {
         let Some(mut tx) = self.begin_pair(me, peer).await? else {
             return Ok(());
         };
@@ -147,9 +236,19 @@ where
             tx.put_block(me, peer, sees_peer).await?;
             events.push(contact_changed(me, peer, blocked));
         }
-        if theirs != blocked {
-            set_contact(&mut tx, peer, me, None).await?;
+        if theirs != blocked && set_contact(&mut tx, peer, me, None).await? {
+            if let Some(owner) = tx.agent_owner(peer).await? {
+                if owner != me {
+                    events.push(Event::AgentContact {
+                        owner,
+                        agent: peer,
+                        user: me,
+                        state: None,
+                    });
+                }
+            }
         }
+        owner_events(&mut tx, &mut events).await?;
         tx.commit().await?;
         let mut published: Vec<Event> = Vec::new();
         if presence_ended {
@@ -180,6 +279,7 @@ where
             set_contact(&mut tx, me, peer, restored).await?;
             events.push(contact_changed(me, peer, restored));
         }
+        owner_events(&mut tx, &mut events).await?;
         tx.commit().await?;
         self.publish(events).await;
         Ok(())

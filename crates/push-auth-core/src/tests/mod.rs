@@ -14,6 +14,7 @@ mod identity;
 mod identity_accounts;
 mod identity_api;
 mod identity_server;
+mod owners;
 mod switch;
 mod templates;
 mod turn;
@@ -126,6 +127,7 @@ pub(crate) async fn world_with(
         directory: Arc::new(NoDirectory),
         templates: Arc::new(crate::templates::NoTemplates),
         call_history: Arc::new(crate::calls::NoCalls),
+        agent_owners: Arc::new(crate::owners::NoAgentOwners),
         turn: Arc::new(crate::turn::Turn::disabled()),
     });
     World {

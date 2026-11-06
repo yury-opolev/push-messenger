@@ -93,6 +93,7 @@ fn public(world: &World, call_history: Arc<dyn CallLog>) -> Router {
         directory: Arc::new(NoDirectory),
         templates: Arc::new(NoTemplates),
         call_history,
+        agent_owners: Arc::new(crate::owners::NoAgentOwners),
         turn: Arc::new(crate::turn::Turn::disabled()),
     })
 }
