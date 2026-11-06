@@ -1,0 +1,110 @@
+# Publishes the chart's internal TURN image (deploy/coturn/Dockerfile: upstream coturn with
+# the Alpine security updates applied) to ghcr.io/yury-opolev/push-coturn, multi-arch, with
+# provenance and an SBOM. The chart pins the published digest (calls.turn.internal.image);
+# docs/calls.md, "Security updates of the chart's images".
+#
+# Runs on a coturn-<tag> tag (image tag <tag>, e.g. coturn-4.18.0-alpine-r1 publishes
+# 4.18.0-alpine-r1), on main when the image's inputs change, and by hand (workflow_dispatch:
+# a rebuild picking up new Alpine security updates); the last two publish
+# <version>-alpine-<yyyymmdd>-<commit>. The image is scanned before it is pushed and fails
+# on a fixable HIGH or CRITICAL finding.
+name: coturn-image
+
+on:
+  push:
+    branches: [main]
+    tags: ["coturn-*"]
+    paths:
+      - deploy/coturn/**
+      - .github/workflows/coturn-image.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: coturn-image-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/yury-opolev/push-coturn
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: The tag
+        id: meta
+        run: |
+          version=$(sed -nE 's|^ARG COTURN_BASE=coturn/coturn:([^@]+)@sha256:[0-9a-f]{64}$|\1|p' deploy/coturn/Dockerfile)
+          if [ -z "$version" ]; then
+            echo "deploy/coturn/Dockerfile: COTURN_BASE is not coturn/coturn:<tag>@sha256:<digest>" >&2
+            exit 1
+          fi
+          if [[ "$GITHUB_REF" == refs/tags/coturn-* ]]; then
+            tag="${GITHUB_REF#refs/tags/coturn-}"
+          else
+            tag="$version-$(date -u +%Y%m%d)-${GITHUB_SHA::7}"
+          fi
+          if ! [[ "$tag" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+            echo "not an image tag: $tag" >&2
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "epoch=$(git log -1 --format=%ct)" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      # The amd64 image, loaded for the checks before anything is pushed.
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: deploy/coturn
+          platforms: linux/amd64
+          load: true
+          tags: push-coturn:check
+        env:
+          SOURCE_DATE_EPOCH: ${{ steps.meta.outputs.epoch }}
+      - name: The image runs as coturn's non-root user with the fixed brotli-libs
+        run: |
+          test "$(docker image inspect push-coturn:check --format '{{.Config.User}}')" = nobody:nogroup
+          docker run --rm --entrypoint sh push-coturn:check -c \
+            'set -e; id; apk list --installed brotli-libs; test -x /usr/bin/turnserver; turnserver --version 2>&1 | head -1 || true'
+      - uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: push-coturn:check
+          version: v0.76.1
+          vuln-type: os,library
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        id: push
+        with:
+          context: deploy/coturn
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: mode=max
+          sbom: true
+          tags: ${{ env.IMAGE }}:${{ steps.meta.outputs.tag }}
+        env:
+          SOURCE_DATE_EPOCH: ${{ steps.meta.outputs.epoch }}
+      - name: The reference to pin
+        run: |
+          ref="$IMAGE:${{ steps.meta.outputs.tag }}@${{ steps.push.outputs.digest }}"
+          docker buildx imagetools inspect "$ref"
+          {
+            echo "### Published"
+            echo
+            echo "\`$ref\`"
+            echo
+            echo "Pin it as calls.turn.internal.image (deploy/helm/push-messenger/values.yaml)."
+          } >> "$GITHUB_STEP_SUMMARY"
