@@ -258,6 +258,9 @@ jobs:
   # on kind, for the newest kindest/node image of each Kubernetes minor AKS supports. It
   # installs internal TURN in a namespace enforcing the restricted Pod Security Standard,
   # waits for coturn to be Ready (a crash loop once shipped) and runs a TURN allocation.
+  # coturn is the image built here from deploy/docker/coturn.Dockerfile (pushed to the kind
+  # registry and pinned by its digest), installed without the copy init container
+  # (copyBinary false); the upgrade switches to the init container path.
   chart-cluster:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -286,7 +289,42 @@ jobs:
           cluster_name: push-chart
           kubectl_version: ${{ matrix.kubernetes }}
           wait: 120s
-      - run: pwsh deploy/helm/test-chart-cluster.ps1 -Context kind-push-chart
+          registry: true
+      - name: Build coturn and push it to the kind registry
+        id: coturn
+        run: |
+          image=kind-registry:5000/push-coturn:ci
+          docker build -f deploy/docker/coturn.Dockerfile -t "$image" deploy/docker
+          docker push "$image"
+          repo_digest=$(docker image inspect "$image" --format '{{range .RepoDigests}}{{println .}}{{end}}' | grep -m1 '^kind-registry:5000/push-coturn@')
+          digest="${repo_digest#*@}"
+          test -n "$digest"
+          echo "ref=$image@$digest" >> "$GITHUB_OUTPUT"
+      - run: pwsh deploy/helm/test-chart-cluster.ps1 -Context kind-push-chart -CoturnImage '${{ steps.coturn.outputs.ref }}' -CopyBinary $false
+
+  # The coturn image consumers build from deploy/docker/coturn.Dockerfile: the build checks
+  # brotli-libs and the capability-free /opt/coturn/bin/turnserver; it runs as coturn's user
+  # under the chart's restrictions and has no HIGH or CRITICAL vulnerability with a fix.
+  coturn-dockerfile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - run: docker build -f deploy/docker/coturn.Dockerfile -t push-coturn:ci deploy/docker
+      - name: Non-root, brotli-libs, the copy runs without capabilities
+        run: |
+          test "$(docker image inspect push-coturn:ci --format '{{.Config.User}}')" = nobody:nogroup
+          docker run --rm --entrypoint sh push-coturn:ci -c \
+            'set -e; id; apk list --installed brotli-libs; cat /opt/coturn/verified'
+          docker run --rm --user 65534:65534 --cap-drop ALL --security-opt no-new-privileges --read-only \
+            --entrypoint /opt/coturn/bin/turnserver push-coturn:ci --version
+      - uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: push-coturn:ci
+          version: v0.76.1
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
 
   # Every third-party image the chart deploys (deploy/helm/chart-images.sh: coturn, PostgreSQL,
   # Redis) is pinned by digest and has no HIGH or CRITICAL vulnerability with a fix, unless

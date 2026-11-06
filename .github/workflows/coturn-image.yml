@@ -1,10 +1,11 @@
-# Publishes the chart's internal TURN image (deploy/docker/coturn.Dockerfile: upstream coturn with
-# the Alpine security updates applied and a capability-free turnserver copy) to ghcr.io/yury-opolev/push-coturn, multi-arch, with
-# provenance and an SBOM. The chart pins the published digest (calls.turn.internal.image);
-# docs/calls.md, "Security updates of the chart's images".
+# Publishes the quick-start default of the chart's internal TURN image (calls.turn.internal.image):
+# deploy/docker/coturn.Dockerfile (upstream coturn with the Alpine security updates applied and
+# a capability-free turnserver copy) built to ghcr.io/yury-opolev/push-coturn, multi-arch, with
+# provenance and an SBOM. Production deployments build the same Dockerfile into their own
+# registry (docs/calls.md, §13.7); the chart pins this one's digest for quick starts.
 #
-# Runs on a coturn-<tag> tag (image tag <tag>, e.g. coturn-4.18.0-alpine-r1 publishes
-# 4.18.0-alpine-r1), on main when the image's inputs change, and by hand (workflow_dispatch:
+# Runs on a coturn-<tag> tag (image tag <tag>, e.g. coturn-4.18.0-alpine-r2 publishes
+# 4.18.0-alpine-r2), on main when the image's inputs change, and by hand (workflow_dispatch:
 # a rebuild picking up new Alpine security updates); the last two publish
 # <version>-alpine-<yyyymmdd>-<commit>. The image is scanned before it is pushed and fails
 # on a fixable HIGH or CRITICAL finding.

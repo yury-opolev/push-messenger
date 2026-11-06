@@ -373,6 +373,9 @@ relay ports (advertised as external-ip:<port>) would be reachable at their numbe
 {{- if not (and (kindIs "string" $internal.image) (regexMatch `^[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:[0-9]+)?(/[a-z0-9]+([._-]+[a-z0-9]+)*)*:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}@sha256:[a-f0-9]{64}$` $internal.image)) -}}
 {{- fail "calls.turn.internal.image must be <repository>:<tag>@sha256:<64 hex digits>" -}}
 {{- end -}}
+{{- if not (kindIs "bool" $internal.copyBinary) -}}
+{{- fail "calls.turn.internal.copyBinary must be true or false" -}}
+{{- end -}}
 {{- $peerError := "calls.turn.internal.metricsPeers requires namespaceSelector and podSelector as non-empty label maps on every peer" -}}
 {{- if not (kindIs "slice" $internal.metricsPeers) -}}{{- fail $peerError -}}{{- end -}}
 {{- range $internal.metricsPeers -}}
