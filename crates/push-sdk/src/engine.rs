@@ -427,9 +427,11 @@ impl Engine {
         self.next_internal += 1;
         self.internal.insert(request_id, what);
         let body = match what {
-            Internal::Conversations => {
-                request::Body::ListConversations(ListConversations::default())
-            }
+            // Hidden ones too: the store keeps the flag, and the app decides.
+            Internal::Conversations => request::Body::ListConversations(ListConversations {
+                changed_since: None,
+                include_hidden: true,
+            }),
             Internal::Contacts => request::Body::ListContacts(ListContacts {}),
         };
         out.push(Body::Request(v1::Request {
@@ -484,6 +486,7 @@ impl Engine {
             Body::ContactEvent(event) => self.on_contact_event(&event, out),
             Body::ActivityEvent(event) => self.on_activity_event(&event, now_ms),
             Body::PresenceEvent(event) => self.on_presence_event(&event),
+            Body::ConversationFlags(flags) => self.on_conversation_flags(&flags, out),
             Body::CallIncoming(_)
             | Body::CallAccepted(_)
             | Body::CallTaken(_)
@@ -774,6 +777,31 @@ impl Engine {
             Err(error) => tracing::warn!(code = error.code(), "could not store a contact"),
         }
         self.relist(out);
+    }
+
+    /// The user hid or unhid a conversation (here or on another device), a message showed
+    /// it again, or its peer was deleted. A conversation not stored yet comes with a listing.
+    fn on_conversation_flags(&mut self, flags: &v1::ConversationFlags, out: &mut Vec<Body>) {
+        let Ok(conversation) = Uuid::from_slice(&flags.conversation_id).map(ConversationId) else {
+            return;
+        };
+        let applied = {
+            let mut store = self.shared.store();
+            store.conversation(conversation).and_then(|known| {
+                Ok(match known {
+                    Some(_) => {
+                        Some(store.apply_flags(conversation, flags.hidden, flags.peer_deleted)?)
+                    }
+                    None => None,
+                })
+            })
+        };
+        match applied {
+            Ok(Some(Some(changed))) => self.shared.emit(Event::ConversationChanged(changed)),
+            Ok(Some(None)) => {}
+            Ok(None) => self.relist(out),
+            Err(error) => tracing::warn!(code = error.code(), "could not store conversation flags"),
+        }
     }
 
     /// Activity is reported, not stored: it expires `ttl_ms` after it arrived, on this
@@ -1386,6 +1414,69 @@ mod tests {
             body: Some(response::Body::Done(v1::Done {})),
         }));
         assert!(back.is_some());
+    }
+
+    #[test]
+    fn conversation_flags_update_the_store_and_unknown_ones_are_listed() {
+        let mut f = fixture();
+        let flags = |conversation: ConversationId, hidden, peer_deleted| {
+            Body::ConversationFlags(v1::ConversationFlags {
+                conversation_id: bytes(conversation.0),
+                hidden,
+                peer_deleted,
+            })
+        };
+        let (back, out) = f.frame(flags(f.conversation, true, true));
+        assert_eq!((back, out), (None, Vec::new()));
+        let events = f.events();
+        assert!(
+            matches!(&events[..], [Event::ConversationChanged(conversation)]
+            if conversation.hidden && conversation.peer_deleted),
+            "{events:?}"
+        );
+        // The same flags again change nothing; a deleted peer stays deleted.
+        f.frame(flags(f.conversation, true, true));
+        assert_eq!(f.events(), []);
+        f.frame(flags(f.conversation, false, false));
+        let stored = f
+            .shared
+            .store()
+            .conversation(f.conversation)
+            .unwrap()
+            .unwrap();
+        assert!(!stored.hidden && stored.peer_deleted);
+
+        let (_, out) = f.frame(flags(ConversationId::new(), true, false));
+        assert!(matches!(&out[..], [Body::Request(request)]
+            if matches!(&request.body, Some(request::Body::ListConversations(list)) if list.include_hidden)));
+    }
+
+    #[test]
+    fn a_listing_brings_the_flags() {
+        let f = fixture();
+        let summary = v1::ConversationSummary {
+            conversation_id: bytes(f.conversation.0),
+            kind: v1::ConversationKind::Direct.into(),
+            members: vec![bytes(f.me.0), bytes(f.peer.0)],
+            hidden: true,
+            peer_deleted: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            f.shared
+                .store()
+                .apply_summary(&summary)
+                .unwrap()
+                .map(|c| (c.hidden, c.peer_deleted)),
+            Some((true, true))
+        );
+        let shown = v1::ConversationSummary {
+            hidden: false,
+            peer_deleted: false,
+            ..summary
+        };
+        let stored = f.shared.store().apply_summary(&shown).unwrap().unwrap();
+        assert!(!stored.hidden && stored.peer_deleted);
     }
 
     #[test]

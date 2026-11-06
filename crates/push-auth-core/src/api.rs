@@ -792,7 +792,10 @@ struct IdsQuery {
 
 /// `GET /v1/users?ids=…`: the profiles of the listed users that the caller shares a
 /// contact or a conversation with (message-svc decides), and the caller's own. Others are
-/// left out, as are unknown ids: the answer never tells which ids exist.
+/// left out, as are unknown ids: the answer never tells which ids exist. A deleted account
+/// the caller may see is a tombstone: `deleted: true`, `state: "deleted"`, its `kind`, a
+/// neutral `display_name`, an empty `handle` and a null `owner_user_id`; live profiles carry
+/// `deleted: false`, `state: "active"`.
 async fn profiles(
     State(api): State<Api>,
     headers: HeaderMap,
@@ -813,6 +816,8 @@ async fn profiles(
                 "display_name": profile.display_name,
                 "kind": profile.kind,
                 "owner_user_id": profile.owner_user_id,
+                "deleted": profile.deleted,
+                "state": profile.state(),
             })
         })
         .collect();

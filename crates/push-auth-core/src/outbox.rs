@@ -8,6 +8,7 @@
 //! |---|---|
 //! | `email.send` | `{user_id, to, template, params}` |
 //! | `user.verified` | `{user_id}` |
+//! | `user.deleted` | `{user_id}`: the account was deleted (an owner deleted an agent) |
 //! | `user.password_reset` | `{user_id, reset_at}`: every device of the user is to be kicked |
 //! | `device.registered` | `{user_id, device_id}` |
 //! | `device.revoked` | `{user_id, device_id}` |
@@ -66,6 +67,10 @@ pub enum Event {
     UserVerified {
         user_id: Uuid,
     },
+    /// A verified account was deleted (disabled): peers see it as a tombstone.
+    UserDeleted {
+        user_id: Uuid,
+    },
     AgentEnrolled {
         user_id: Uuid,
         owner_user_id: Uuid,
@@ -92,6 +97,7 @@ impl Event {
         match self {
             Self::EmailSend { .. } => "email.send",
             Self::UserVerified { .. } => "user.verified",
+            Self::UserDeleted { .. } => "user.deleted",
             Self::AgentEnrolled { .. } => "agent.enrolled",
             Self::UserPasswordReset { .. } => "user.password_reset",
             Self::DeviceRegistered { .. } => "device.registered",
@@ -108,7 +114,9 @@ impl Event {
                 "template": email.template(),
                 "params": email.params(),
             }),
-            Self::UserVerified { user_id } => json!({"user_id": user_id}),
+            Self::UserVerified { user_id } | Self::UserDeleted { user_id } => {
+                json!({"user_id": user_id})
+            }
             Self::AgentEnrolled {
                 user_id,
                 owner_user_id,
@@ -171,6 +179,7 @@ mod tests {
         let (user_id, device_id) = (Uuid::now_v7(), Uuid::now_v7());
         let cases = [
             (Event::UserVerified { user_id }, "user.verified"),
+            (Event::UserDeleted { user_id }, "user.deleted"),
             (
                 Event::UserPasswordReset {
                     user_id,

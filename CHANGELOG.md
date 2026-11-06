@@ -54,6 +54,38 @@ Notable changes for consumers of push-messenger. Newest first.
 
 ### Added
 
+- **Deleted accounts as tombstones, `peer_deleted`, and hiding direct conversations**
+  ([design](docs/superpowers/specs/2026-11-06-tombstones-hide-design.md)).
+  - auth-svc `GET /v1/users?ids=…`: every profile now carries `deleted` and `state`
+    (`"active"` / `"deleted"`). A deleted (disabled) account that the caller could already
+    see — a shared conversation or a contact row, the unchanged §5.5 rule decided by
+    message-svc — is answered as a tombstone: `deleted: true`, `state: "deleted"`, its
+    `kind`, `display_name` `"Deleted agent"` or `"Deleted account"`, `handle: ""` and
+    `owner_user_id: null`. Every other id stays omitted. `GET /v1/users/lookup` still finds
+    no deleted account.
+  - Deleting an agent writes a new outbox event `user.deleted`; the worker relays it to the
+    new `Accounts.UserDeleted` RPC, and message-svc records it (`messaging.deleted_user`).
+    Auth migration 0010 backfills one event per account deleted before.
+  - Gateway protocol: `ConversationSummary.hidden` (12) and `peer_deleted` (13);
+    `ListConversations.include_hidden` (2, hidden conversations are left out without it);
+    requests `HideConversation` (22) and `UnhideConversation` (23) for direct conversations,
+    per user, answered `Done` (a group is `INVALID`); server frame `ConversationFlags` (53,
+    `conversation_id, hidden, peer_deleted`) to every connection of the user when a flag
+    changes. A new message in a hidden direct conversation shows it again. Flag changes
+    count as changes for `changed_since`. Conversations with a deleted peer are **not**
+    hidden automatically; clients decide with `peer_deleted`.
+  - Messaging migration 0009 adds the tables `messaging.deleted_user` and
+    `messaging.conversation_view` (new tables only).
+  - push-sdk: `Profile.deleted`; `Conversation.hidden` / `peer_deleted` (local schema v3);
+    `Client::hide_conversation` / `unhide_conversation`; listings include hidden
+    conversations, and `ConversationFlags` updates the store and emits
+    `ConversationChanged`. Node `hideConversation` / `unhideConversation` and the fields
+    `hidden`, `peerDeleted`, `deleted`; C `push_client_hide_conversation` /
+    `push_client_unhide_conversation`.
+  - Upgrade: deploy auth-svc, the worker and message-svc together (one chart release, as
+    usual). An older worker parks `user.deleted` as poison; an older message-svc answers
+    it `UNIMPLEMENTED`, which the worker retries.
+
 - **Echo backend: accepted contacts** — the echo test agent now also answers the
   agent's accepted contacts (server-side relationship; requests, blocked users and
   strangers still get "This agent is private."), each in their own direct conversation.

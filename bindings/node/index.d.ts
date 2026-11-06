@@ -88,6 +88,10 @@ export interface Conversation {
   peerDeliveredSeq: number;
   peerReadSeq: number;
   updatedAt: number;
+  /** The user hid it (listings include hidden conversations; the app filters). */
+  hidden: boolean;
+  /** Direct only: the peer's account was deleted. */
+  peerDeleted: boolean;
 }
 
 export interface Contact {
@@ -106,8 +110,11 @@ export interface Profile {
   kind: 'user' | 'agent';
   ownerUserId: string | null;
   userId: string;
+  /** Empty for a deleted account. */
   handle: string;
   displayName: string;
+  /** A deleted account's tombstone: displayName "Deleted agent" or "Deleted account". */
+  deleted: boolean;
 }
 
 export interface Device {
@@ -240,6 +247,13 @@ export class Client {
   listConversations(): Promise<Conversation[]>;
   fetchHistory(conversationId: string, beforeSeq: number | null, limit: number): Promise<Message[]>;
   openDirect(userId: string): Promise<Conversation>;
+  /**
+   * Hides a direct conversation on all of the user's devices (the peer's view is unchanged); a
+   * new message shows it again. Rejects with `invalid` for a group.
+   */
+  hideConversation(conversationId: string): Promise<Conversation>;
+  /** Shows a hidden direct conversation again on all of the user's devices. */
+  unhideConversation(conversationId: string): Promise<Conversation>;
   listContacts(): Promise<Contact[]>;
   requestContact(userId: string): Promise<Contact>;
   acceptContact(userId: string): Promise<Contact>;

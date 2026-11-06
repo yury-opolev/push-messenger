@@ -459,6 +459,80 @@ async fn owner_and_agent_chat_as_distinct_users_and_deletion_kicks_the_live_agen
             .await
             .unwrap();
     assert!(messages > 0, "deletion preserves authored history");
+
+    // Peers who could see the agent get its tombstone; the chat says its peer is deleted
+    // once the worker relayed user.deleted, and the owner can hide it.
+    let profiles: Value = http
+        .get(format!("{}/v1/users?ids={agent_id}", stack.auth_url))
+        .bearer_auth(owner_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        profiles,
+        json!({"users": [{"user_id": agent_id, "handle": "", "display_name": "Deleted agent",
+               "kind": "agent", "owner_user_id": null, "deleted": true, "state": "deleted"}]})
+    );
+    request(
+        &mut owner_socket,
+        3,
+        request::Body::ContactUnblock(v1::ContactUnblock {
+            user_id: id_bytes(agent_id),
+        }),
+    )
+    .await;
+    let list = |include_hidden| {
+        request::Body::ListConversations(v1::ListConversations {
+            changed_since: None,
+            include_hidden,
+        })
+    };
+    let mut request_id = 4;
+    let flags = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            request_id += 1;
+            let response::Body::Conversations(listed) =
+                request(&mut owner_socket, request_id, list(true)).await
+            else {
+                panic!("a conversation list");
+            };
+            let summary = listed
+                .conversations
+                .iter()
+                .find(|summary| summary.conversation_id == chat.conversation_id)
+                .cloned()
+                .expect("the chat with the deleted agent is listed");
+            if summary.peer_deleted {
+                break (summary.hidden, summary.peer_deleted);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("user.deleted is relayed to message-svc");
+    assert_eq!(flags, (false, true));
+    let hidden = request(
+        &mut owner_socket,
+        90,
+        request::Body::HideConversation(v1::HideConversation {
+            conversation_id: chat.conversation_id.clone(),
+        }),
+    )
+    .await;
+    assert_eq!(hidden, response::Body::Done(v1::Done {}));
+    let response::Body::Conversations(listed) = request(&mut owner_socket, 91, list(false)).await
+    else {
+        panic!("a conversation list");
+    };
+    assert!(
+        listed
+            .conversations
+            .iter()
+            .all(|summary| summary.conversation_id != chat.conversation_id)
+    );
     owner_socket.close(None).await.unwrap();
     auth_db.close().await;
     message_db.close().await;

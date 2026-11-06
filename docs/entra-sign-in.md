@@ -167,7 +167,12 @@ and client app. The released app is then unenrolled: without a code it gets 403
 owner deletion disables an account; admin revoke-sessions is a sign-out and keeps the
 identity. Live sockets close **4003** after the durable revocation relay; no messages or
 account history are deleted. The disabled handle remains reserved, but disabled/pending
-accounts are absent from public lookups and batch profiles.
+accounts are absent from public lookups. In batch profiles (`GET /v1/users?ids=…`) a
+deleted agent that the caller could already see (a shared conversation or contact) is a
+**tombstone**: `{user_id, kind: "agent", display_name: "Deleted agent", handle: "",
+owner_user_id: null, deleted: true, state: "deleted"}`; to anyone else it stays absent. The
+deletion is relayed to message-svc (`user.deleted`), which marks the agent's direct
+conversations `peer_deleted` for their peers.
 Profile edits serialize with deletion: a `PATCH /v1/users/me` that loses to deletion
 returns 401 without changing the deleted agent's display name or reserved handle.
 

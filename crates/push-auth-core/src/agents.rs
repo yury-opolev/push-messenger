@@ -389,6 +389,8 @@ impl Auth {
                     .bind(agent)
                     .execute(&mut *tx)
                     .await?;
+                // Peers keep seeing it, as a tombstone; message-svc flags their chats.
+                outbox::write(&mut tx, &Event::UserDeleted { user_id: agent }).await?;
                 let devices: Vec<(Uuid, Uuid)> = sqlx::query_as(
                     "SELECT user_id, device_id FROM auth.device WHERE user_id = $1 \
                      AND revoked_at IS NULL ORDER BY device_id FOR UPDATE",

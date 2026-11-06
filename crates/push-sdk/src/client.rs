@@ -1481,6 +1481,17 @@ mod tests {
         }
         assert_eq!(stored, Some(1));
         assert_eq!(answered, Some((Some(2), Some("hello".to_owned()))));
+        let hidden = client.hide_conversation(conversation.id).await.unwrap();
+        assert!(hidden.hidden);
+        assert!(
+            client
+                .conversation(conversation.id)
+                .unwrap()
+                .unwrap()
+                .hidden
+        );
+        let shown = client.unhide_conversation(conversation.id).await.unwrap();
+        assert!(!shown.hidden);
         let unknown = client
             .redeem_invite(crate::testing::UNKNOWN_INVITE)
             .await

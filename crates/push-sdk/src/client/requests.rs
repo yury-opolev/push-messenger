@@ -7,8 +7,8 @@ use push_domain::{
 };
 use push_proto::v1::{
     ContactAccept, ContactBlock, ContactDecline, ContactRequest, ContactUnblock, CreateInvite,
-    FetchHistory, ListContacts, ListConversations, OpenDirect, RedeemInvite, RevokeInvite, request,
-    response,
+    FetchHistory, HideConversation, ListContacts, ListConversations, OpenDirect, RedeemInvite,
+    RevokeInvite, UnhideConversation, request, response,
 };
 use tokio::sync::oneshot;
 use uuid::Uuid;
@@ -62,9 +62,13 @@ impl Client {
         .await
     }
 
-    /// Lists the conversations from the server and stores what changed.
+    /// Lists the conversations from the server and stores what changed. Hidden ones are
+    /// listed too, with `hidden` set.
     pub async fn list_conversations(&self) -> Result<Vec<Conversation>, SdkError> {
-        let body = request::Body::ListConversations(ListConversations::default());
+        let body = request::Body::ListConversations(ListConversations {
+            changed_since: None,
+            include_hidden: true,
+        });
         let response::Body::Conversations(list) = self.request(body).await? else {
             return Err(unexpected());
         };
@@ -74,6 +78,54 @@ impl Client {
             }
         }
         self.conversations()
+    }
+
+    /// Hides a direct conversation from the user's own listings, on all of their devices;
+    /// the peer's view is unchanged. A new message in it shows it again. Idempotent.
+    /// `invalid` for a group.
+    pub async fn hide_conversation(&self, id: ConversationId) -> Result<Conversation, SdkError> {
+        self.set_hidden(id, true).await
+    }
+
+    /// Shows a hidden direct conversation again, on all of the user's devices. Idempotent.
+    pub async fn unhide_conversation(&self, id: ConversationId) -> Result<Conversation, SdkError> {
+        self.set_hidden(id, false).await
+    }
+
+    async fn set_hidden(&self, id: ConversationId, hidden: bool) -> Result<Conversation, SdkError> {
+        let conversation_id = bytes(id.0);
+        let body = if hidden {
+            request::Body::HideConversation(HideConversation { conversation_id })
+        } else {
+            request::Body::UnhideConversation(UnhideConversation { conversation_id })
+        };
+        let response::Body::Done(_) = self.request(body).await? else {
+            return Err(unexpected());
+        };
+        let stored = self.inner.shared.store().conversation(id)?;
+        let Some(stored) = stored else {
+            // Not stored yet: a listing brings it with its flags.
+            return self
+                .list_conversations()
+                .await?
+                .into_iter()
+                .find(|conversation| conversation.id == id)
+                .ok_or_else(unexpected);
+        };
+        let changed = self
+            .inner
+            .shared
+            .store()
+            .apply_flags(id, hidden, stored.peer_deleted)?;
+        match changed {
+            Some(changed) => {
+                self.inner
+                    .shared
+                    .emit(Event::ConversationChanged(changed.clone()));
+                Ok(changed)
+            }
+            None => Ok(stored),
+        }
     }
 
     /// Loads older messages from the server (spec §4.6: messages and system entries in

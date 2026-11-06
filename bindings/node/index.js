@@ -314,6 +314,14 @@ class Client {
     return settled(() => this.#native.openDirect(userId));
   }
 
+  hideConversation(conversationId) {
+    return settled(() => this.#native.hideConversation(conversationId));
+  }
+
+  unhideConversation(conversationId) {
+    return settled(() => this.#native.unhideConversation(conversationId));
+  }
+
   listContacts() {
     return settled(() => this.#native.listContacts());
   }

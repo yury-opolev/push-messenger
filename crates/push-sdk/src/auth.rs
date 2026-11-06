@@ -60,15 +60,21 @@ impl Platform {
     }
 }
 
-/// A user's public profile.
+/// A user's public profile. A deleted account the user could see before (a shared
+/// conversation or contact) is a tombstone: `deleted` is set, `display_name` is "Deleted
+/// agent" or "Deleted account", `handle` is empty, `owner_user_id` is `None` and `kind`
+/// is kept.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Profile {
     pub user_id: UserId,
+    /// Empty for a deleted account.
     pub handle: String,
     pub display_name: String,
     /// `user` or `agent`.
     pub kind: String,
     pub owner_user_id: Option<UserId>,
+    /// The account was deleted: this is its tombstone.
+    pub deleted: bool,
 }
 
 /// One of the user's devices.
@@ -135,6 +141,9 @@ struct ProfileBody {
     #[serde(default = "user_kind")]
     kind: String,
     owner_user_id: Option<Uuid>,
+    /// Absent from servers before tombstones.
+    #[serde(default)]
+    deleted: bool,
 }
 
 fn user_kind() -> String {
@@ -149,6 +158,7 @@ impl From<ProfileBody> for Profile {
             display_name: body.display_name,
             kind: body.kind,
             owner_user_id: body.owner_user_id.map(UserId),
+            deleted: body.deleted,
         }
     }
 }
@@ -168,6 +178,28 @@ mod profile_contract {
         let profile = Profile::from(body);
         assert_eq!(profile.kind, "agent");
         assert_eq!(profile.owner_user_id, Some(UserId(owner)));
+        assert!(!profile.deleted);
+    }
+
+    #[test]
+    fn a_tombstone_parses_with_an_empty_handle_and_no_owner() {
+        let user = Uuid::new_v4();
+        let body: ProfileBody = serde_json::from_value(json!({
+            "user_id": user, "handle": "", "display_name": "Deleted agent",
+            "kind": "agent", "owner_user_id": null, "deleted": true, "state": "deleted",
+        }))
+        .unwrap();
+        let profile = Profile::from(body);
+        assert!(profile.deleted);
+        assert_eq!(
+            (
+                profile.handle.as_str(),
+                profile.display_name.as_str(),
+                profile.kind.as_str()
+            ),
+            ("", "Deleted agent", "agent")
+        );
+        assert_eq!(profile.owner_user_id, None);
     }
 }
 

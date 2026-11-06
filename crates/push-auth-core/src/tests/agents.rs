@@ -337,6 +337,13 @@ async fn enrollment_preserves_admission_and_management_is_rate_limited_without_e
 }
 
 pub(super) async fn setup() -> (World, Auth, Router, Tokens) {
+    setup_with(Arc::new(NoDirectory)).await
+}
+
+/// [`setup`] with `directory` deciding whose profiles a caller may see.
+pub(super) async fn setup_with(
+    directory: Arc<dyn crate::Directory>,
+) -> (World, Auth, Router, Tokens) {
     let world = world(Offer::Both).await;
     let mut settings = world.stub.settings();
     settings.tenants = crate::entra::Tenants::Ids(vec![TENANT.parse().unwrap()]);
@@ -352,7 +359,7 @@ pub(super) async fn setup() -> (World, Auth, Router, Tokens) {
         auth: auth.clone(),
         limits: Limits::new(Arc::new(MemoryCounter::default())),
         client_ip_header: None,
-        directory: Arc::new(NoDirectory),
+        directory,
         templates: Arc::new(crate::templates::NoTemplates),
         call_history: Arc::new(crate::calls::NoCalls),
         turn: Arc::new(crate::turn::Turn::disabled()),
@@ -1287,4 +1294,123 @@ async fn deleting_an_agent_releases_its_app_for_a_new_enrollment() {
     .await;
     assert_eq!(status, StatusCode::CONFLICT, "{in_use}");
     assert_eq!(in_use["error"]["code"], "identity_in_use");
+}
+
+/// message-svc's answer, fixed: every caller may see the users in the list, and nobody
+/// else.
+#[derive(Debug)]
+struct Visible(Vec<Uuid>);
+
+#[async_trait::async_trait]
+impl crate::Directory for Visible {
+    async fn visible_users(
+        &self,
+        caller: Uuid,
+        candidates: &[Uuid],
+    ) -> Result<Vec<Uuid>, AuthError> {
+        Ok(candidates
+            .iter()
+            .copied()
+            .filter(|user| *user == caller || self.0.contains(user))
+            .collect())
+    }
+}
+
+#[tokio::test]
+async fn a_deleted_agent_is_a_tombstone_only_to_those_who_could_see_it() {
+    let (world, auth, router, owner) = setup().await;
+    let (_, reservation) = call(
+        &router,
+        "POST",
+        "/v1/agents",
+        &owner.access_token,
+        json!({"handle":"gone_agent","display_name":"Gone agent"}),
+    )
+    .await;
+    let token = app_token(&world, TENANT, Uuid::new_v4());
+    let (status, registered) = call(
+        &router,
+        "POST",
+        "/v1/auth/entra-app",
+        "",
+        json!({"token":token,"enrollment_code":reservation["enrollment_code"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{registered}");
+    let agent: Uuid = registered["user_id"].as_str().unwrap().parse().unwrap();
+    let seeing = setup_router(auth.clone(), Arc::new(Visible(vec![agent])));
+    let ask = format!("/v1/users?ids={agent}");
+
+    let (status, live) = call(&seeing, "GET", &ask, &owner.access_token, json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{live}");
+    assert_eq!(
+        live["users"][0],
+        json!({"user_id": agent, "handle": "gone_agent", "display_name": "Gone agent",
+               "kind": "agent", "owner_user_id": owner.user_id,
+               "deleted": false, "state": "active"})
+    );
+
+    let path = format!("/v1/agents/{agent}");
+    let (status, _) = call(&router, "DELETE", &path, &owner.access_token, json!({})).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, gone) = call(&seeing, "GET", &ask, &owner.access_token, json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{gone}");
+    assert_eq!(
+        gone,
+        json!({"users": [{"user_id": agent, "handle": "", "display_name": "Deleted agent",
+               "kind": "agent", "owner_user_id": null,
+               "deleted": true, "state": "deleted"}]})
+    );
+    let deleted: Vec<Value> = world
+        .outbox()
+        .await
+        .into_iter()
+        .filter(|(kind, _)| kind == "user.deleted")
+        .map(|(_, payload)| payload)
+        .collect();
+    assert_eq!(deleted, [json!({"user_id": agent})]);
+
+    // Someone message-svc does not let see the agent gets nothing, deleted or not.
+    let stranger = password_user(&auth, &world.pool, "stranger", 1)
+        .await
+        .remove(0);
+    let blind = setup_router(auth.clone(), Arc::new(Visible(Vec::new())));
+    let (status, nothing) = call(&blind, "GET", &ask, &stranger.access_token, json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{nothing}");
+    assert_eq!(nothing, json!({"users": []}));
+}
+
+#[test]
+fn a_tombstone_keeps_the_kind_and_names_it_neutrally() {
+    let id = Uuid::now_v7();
+    let agent = crate::PublicProfile::tombstone(id, "agent".into());
+    assert_eq!(
+        (
+            agent.display_name.as_str(),
+            agent.handle.as_str(),
+            agent.state()
+        ),
+        ("Deleted agent", "", "deleted")
+    );
+    let user = crate::PublicProfile::tombstone(id, "user".into());
+    assert_eq!(
+        (
+            user.display_name.as_str(),
+            user.kind.as_str(),
+            user.owner_user_id
+        ),
+        ("Deleted account", "user", None)
+    );
+}
+
+fn setup_router(auth: Auth, directory: Arc<dyn crate::Directory>) -> Router {
+    router(Api {
+        auth,
+        limits: Limits::new(Arc::new(MemoryCounter::default())),
+        client_ip_header: None,
+        directory,
+        templates: Arc::new(crate::templates::NoTemplates),
+        call_history: Arc::new(crate::calls::NoCalls),
+        turn: Arc::new(crate::turn::Turn::disabled()),
+    })
 }

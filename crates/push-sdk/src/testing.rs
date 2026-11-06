@@ -605,6 +605,9 @@ fn answer(request: Request, log: &Mutex<Log>) -> Body {
             response::Body::Conversations(ConversationList::default())
         }
         Some(request::Body::ListContacts(_)) => response::Body::Contacts(ContactList::default()),
+        Some(request::Body::HideConversation(_) | request::Body::UnhideConversation(_)) => {
+            response::Body::Done(push_proto::v1::Done {})
+        }
         Some(request::Body::CreateInvite(create)) => {
             response::Body::Invite(push_proto::v1::Invite {
                 code: "ABCDEFGHJK".to_owned(),

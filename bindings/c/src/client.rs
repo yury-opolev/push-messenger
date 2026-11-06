@@ -534,6 +534,43 @@ pub unsafe extern "C" fn push_client_open_direct(
     })
 }
 
+/// Hides a direct conversation from the user's own listings, on all of their devices (a
+/// new message shows it again); writes the conversation as JSON. `invalid` for a group.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn push_client_hide_conversation(
+    client: *const PushClient,
+    conversation_id_text: *const c_char,
+    conversation_json: *mut *mut c_char,
+    error: *mut *mut PushError,
+) -> i32 {
+    guard(error, || {
+        let out = place(conversation_json, "conversation_json")?;
+        let this = unsafe { handle(client) }?;
+        let id = unsafe { conversation_id(conversation_id_text) }?;
+        let conversation = wait(this.client.hide_conversation(id))?;
+        put_json(out, &json::conversation(&conversation));
+        Ok(())
+    })
+}
+
+/// Shows a hidden direct conversation again, on all of the user's devices; writes the
+/// conversation as JSON.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn push_client_unhide_conversation(
+    client: *const PushClient,
+    conversation_id_text: *const c_char,
+    conversation_json: *mut *mut c_char,
+    error: *mut *mut PushError,
+) -> i32 {
+    guard(error, || {
+        let out = place(conversation_json, "conversation_json")?;
+        let this = unsafe { handle(client) }?;
+        let id = unsafe { conversation_id(conversation_id_text) }?;
+        let conversation = wait(this.client.unhide_conversation(id))?;
+        put_json(out, &json::conversation(&conversation));
+        Ok(())
+    })
+}
 /// Lists the user's relationships from the server, as a JSON array.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn push_client_list_contacts(
