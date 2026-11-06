@@ -1,5 +1,5 @@
-# Publishes the chart's internal TURN image (deploy/coturn/Dockerfile: upstream coturn with
-# the Alpine security updates applied) to ghcr.io/yury-opolev/push-coturn, multi-arch, with
+# Publishes the chart's internal TURN image (deploy/docker/coturn.Dockerfile: upstream coturn with
+# the Alpine security updates applied and a capability-free turnserver copy) to ghcr.io/yury-opolev/push-coturn, multi-arch, with
 # provenance and an SBOM. The chart pins the published digest (calls.turn.internal.image);
 # docs/calls.md, "Security updates of the chart's images".
 #
@@ -15,7 +15,7 @@ on:
     branches: [main]
     tags: ["coturn-*"]
     paths:
-      - deploy/coturn/**
+      - deploy/docker/coturn.Dockerfile
       - .github/workflows/coturn-image.yml
   workflow_dispatch:
 
@@ -41,9 +41,9 @@ jobs:
       - name: The tag
         id: meta
         run: |
-          version=$(sed -nE 's|^ARG COTURN_BASE=coturn/coturn:([^@]+)@sha256:[0-9a-f]{64}$|\1|p' deploy/coturn/Dockerfile)
+          version=$(sed -nE 's|^ARG COTURN_BASE=coturn/coturn:([^@]+)@sha256:[0-9a-f]{64}$|\1|p' deploy/docker/coturn.Dockerfile)
           if [ -z "$version" ]; then
-            echo "deploy/coturn/Dockerfile: COTURN_BASE is not coturn/coturn:<tag>@sha256:<digest>" >&2
+            echo "deploy/docker/coturn.Dockerfile: COTURN_BASE is not coturn/coturn:<tag>@sha256:<digest>" >&2
             exit 1
           fi
           if [[ "$GITHUB_REF" == refs/tags/coturn-* ]]; then
@@ -62,7 +62,8 @@ jobs:
       # The amd64 image, loaded for the checks before anything is pushed.
       - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
-          context: deploy/coturn
+          context: deploy/docker
+          file: deploy/docker/coturn.Dockerfile
           platforms: linux/amd64
           load: true
           tags: push-coturn:check
@@ -72,7 +73,10 @@ jobs:
         run: |
           test "$(docker image inspect push-coturn:check --format '{{.Config.User}}')" = nobody:nogroup
           docker run --rm --entrypoint sh push-coturn:check -c \
-            'set -e; id; apk list --installed brotli-libs; test -x /usr/bin/turnserver; turnserver --version 2>&1 | head -1 || true'
+            'set -e; id; apk list --installed brotli-libs; test -x /usr/bin/turnserver; cat /opt/coturn/verified'
+          # The copy runs under the chart's restrictions (the original cannot).
+          docker run --rm --user 65534:65534 --cap-drop ALL --security-opt no-new-privileges --read-only \
+            --entrypoint /opt/coturn/bin/turnserver push-coturn:check --version
       - uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: push-coturn:check
@@ -88,7 +92,8 @@ jobs:
       - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         id: push
         with:
-          context: deploy/coturn
+          context: deploy/docker
+          file: deploy/docker/coturn.Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
           provenance: mode=max
