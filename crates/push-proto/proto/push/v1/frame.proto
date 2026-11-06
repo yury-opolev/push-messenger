@@ -71,8 +71,11 @@ message Frame {
     // (on any of the user's devices, or by a new message), or the other member of a direct
     // conversation was deleted.
     ConversationFlags conversation_flags = 53;
+    // Sent to an agent's owner: a relationship of one of the owner's agents changed
+    // (spec 2026-11-06 agent connections). REQUESTED_IN = a request waits for the owner.
+    AgentContactEvent agent_contact_event = 54;
   }
-  // 18-31 are free for later client frames, 54-63 for later server frames.
+  // 18-31 are free for later client frames, 55-63 for later server frames.
 }
 
 // Must be the first frame, within 5 seconds of connecting. The gateway learns the user
@@ -149,6 +152,16 @@ message ReadPosition {
 message ContactEvent {
   bytes user_id = 1;
   ContactState state = 2;
+}
+
+// To the owner of an agent: the agent's relationship with user_id changed, as the agent
+// sees it (spec 2026-11-06 agent connections and the owner view, D6). REQUESTED_IN means
+// a request waits for the owner's decision (approve, decline or block through
+// /v1/agents/{agent_id}/requests); NONE means it ended. Never carries content.
+message AgentContactEvent {
+  bytes agent_user_id = 1;
+  bytes user_id = 2;
+  ContactState state = 3;
 }
 
 // What the sender is doing in a conversation (docs/activity-presence.md). Not stored.
@@ -689,6 +702,12 @@ enum ErrorCode {
   // Calls: the call's cap of CallIce (200 per side, 32 before the answer) or
   // CallRenegotiate (20 per side) frames is reached.
   ERROR_CODE_CALL_LIMIT = 30;
+  // The rules of agents forbid it (spec 2026-11-06 agent connections): a call between
+  // two agents, an invite created by an agent, an agent blocking its owner.
+  ERROR_CODE_NOT_ALLOWED = 31;
+  // An agent tried to accept, decline or block a contact request that waits for its
+  // owner: only the owner decides.
+  ERROR_CODE_OWNER_DECIDES = 32;
 }
 
 message Error {

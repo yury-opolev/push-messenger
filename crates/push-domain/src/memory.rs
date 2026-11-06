@@ -16,7 +16,7 @@ use crate::calls::{CallHistoryRow, HistoryCursor};
 use crate::error::{DomainError, DomainResult};
 use crate::ids::{ClientMsgId, ConversationId, DeviceId, MessageId, UserId};
 use crate::model::{
-    ContactState, ContentType, Conversation, ConversationFlags, ConversationKind,
+    AgentPolicy, ContactState, ContentType, Conversation, ConversationFlags, ConversationKind,
     ConversationOverview, DeviceState, Entry, EntryKind, GroupPositions, InviteRecord, Member,
     PublisherOwner, Role, StoredTemplate, TemplateEvent, TemplateStatus,
 };
@@ -88,6 +88,13 @@ struct State {
     conversation_views: HashMap<(ConversationId, UserId), (bool, DateTime<Utc>)>,
     /// Users whose account was deleted, with when message-svc recorded it.
     deleted_users: HashMap<UserId, DateTime<Utc>>,
+    /// When each contact row was last written (Postgres: `contact.updated_at`).
+    contact_times: HashMap<(UserId, UserId), DateTime<Utc>>,
+    agent_policies: HashMap<UserId, (AgentPolicy, DateTime<Utc>)>,
+    /// Refused requests by `(requester, agent)`, with their release time.
+    refusals: HashMap<(UserId, UserId), DateTime<Utc>>,
+    /// Agents' outgoing requests: `(agent, peer, sent_at)`.
+    agent_requests: Vec<(UserId, UserId, DateTime<Utc>)>,
 }
 
 impl State {
@@ -427,6 +434,7 @@ impl Tx for InMemoryTx {
             return Err(missing("user"));
         }
         self.work.contacts.insert((owner, peer), state);
+        self.work.contact_times.insert((owner, peer), Utc::now());
         self.work.sighted_blocks.remove(&(owner, peer));
         Ok(())
     }
@@ -446,6 +454,7 @@ impl Tx for InMemoryTx {
 
     async fn delete_contact(&mut self, owner: UserId, peer: UserId) -> DomainResult<()> {
         self.work.contacts.remove(&(owner, peer));
+        self.work.contact_times.remove(&(owner, peer));
         self.work.sighted_blocks.remove(&(owner, peer));
         Ok(())
     }
@@ -1072,6 +1081,183 @@ impl Tx for InMemoryTx {
                     .keys()
                     .find(|(id, peer)| id == conversation && *peer != user)
                     .map(|(_, peer)| (*conversation, *peer))
+            })
+            .collect())
+    }
+
+    async fn is_user_deleted(&mut self, user: UserId) -> DomainResult<bool> {
+        Ok(self.work.deleted_users.contains_key(&user))
+    }
+
+    async fn agent_policy(&mut self, agent: UserId) -> DomainResult<Option<AgentPolicy>> {
+        Ok(self
+            .work
+            .agent_policies
+            .get(&agent)
+            .map(|(policy, _)| *policy))
+    }
+
+    async fn set_agent_policy(
+        &mut self,
+        agent: UserId,
+        policy: AgentPolicy,
+        at: DateTime<Utc>,
+    ) -> DomainResult<()> {
+        if !self.work.agent_owners.contains_key(&agent) {
+            return Err(missing("agent"));
+        }
+        self.work.agent_policies.insert(agent, (policy, at));
+        Ok(())
+    }
+
+    async fn forget_agent(&mut self, agent: UserId) -> DomainResult<()> {
+        self.work.agent_policies.remove(&agent);
+        self.work.agent_requests.retain(|(row, _, _)| *row != agent);
+        Ok(())
+    }
+
+    async fn waiting_requests(
+        &mut self,
+        agent: UserId,
+    ) -> DomainResult<Vec<(UserId, DateTime<Utc>)>> {
+        let state = &self.work;
+        let mut waiting: Vec<(UserId, DateTime<Utc>)> = state
+            .contacts
+            .iter()
+            .filter(|((owner, _), row)| *owner == agent && **row == ContactState::RequestedIn)
+            .map(|((owner, peer), _)| {
+                let at = state.contact_times.get(&(*owner, *peer)).copied();
+                (*peer, at.unwrap_or_default())
+            })
+            .collect();
+        waiting.sort_by_key(|(peer, at)| (*at, *peer));
+        Ok(waiting)
+    }
+
+    async fn waiting_in_count(&mut self, agent: UserId) -> DomainResult<u32> {
+        Ok(self
+            .work
+            .contacts
+            .iter()
+            .filter(|((owner, _), row)| *owner == agent && **row == ContactState::RequestedIn)
+            .count() as u32)
+    }
+
+    async fn outgoing_counts(&mut self, user: UserId) -> DomainResult<(u32, u32)> {
+        let state = &self.work;
+        let pending: Vec<UserId> = state
+            .contacts
+            .iter()
+            .filter(|((owner, _), row)| *owner == user && **row == ContactState::RequestedOut)
+            .map(|((_, peer), _)| *peer)
+            .collect();
+        let waiting = pending
+            .iter()
+            .filter(|peer| {
+                state.agent_owners.contains_key(peer)
+                    && state.contacts.get(&(**peer, user)) == Some(&ContactState::RequestedIn)
+            })
+            .count();
+        Ok((pending.len() as u32, waiting as u32))
+    }
+
+    async fn put_refusal(
+        &mut self,
+        requester: UserId,
+        agent: UserId,
+        release_at: DateTime<Utc>,
+    ) -> DomainResult<bool> {
+        if !self.work.users.contains(&requester) || !self.work.users.contains(&agent) {
+            return Err(missing("user"));
+        }
+        if self.work.refusals.contains_key(&(requester, agent)) {
+            return Ok(false);
+        }
+        self.work.refusals.insert((requester, agent), release_at);
+        Ok(true)
+    }
+
+    async fn delete_refusal(&mut self, requester: UserId, agent: UserId) -> DomainResult<bool> {
+        Ok(self.work.refusals.remove(&(requester, agent)).is_some())
+    }
+
+    async fn due_refusals(
+        &mut self,
+        now: DateTime<Utc>,
+        limit: u32,
+    ) -> DomainResult<Vec<(UserId, UserId)>> {
+        let mut due: Vec<(DateTime<Utc>, UserId, UserId)> = self
+            .work
+            .refusals
+            .iter()
+            .filter(|(_, release_at)| **release_at <= now)
+            .map(|((requester, agent), release_at)| (*release_at, *requester, *agent))
+            .collect();
+        due.sort();
+        Ok(due
+            .into_iter()
+            .take(limit as usize)
+            .map(|(_, requester, agent)| (requester, agent))
+            .collect())
+    }
+
+    async fn log_agent_request(
+        &mut self,
+        agent: UserId,
+        peer: UserId,
+        at: DateTime<Utc>,
+    ) -> DomainResult<()> {
+        if !self.work.users.contains(&agent) {
+            return Err(missing("user"));
+        }
+        self.work.agent_requests.push((agent, peer, at));
+        Ok(())
+    }
+
+    async fn agent_requests_since(
+        &mut self,
+        agent: UserId,
+        since: DateTime<Utc>,
+    ) -> DomainResult<(u32, Option<DateTime<Utc>>)> {
+        let times: Vec<DateTime<Utc>> = self
+            .work
+            .agent_requests
+            .iter()
+            .filter(|(row, _, at)| *row == agent && *at >= since)
+            .map(|(_, _, at)| *at)
+            .collect();
+        Ok((times.len() as u32, times.into_iter().min()))
+    }
+
+    async fn prune_agent_requests(&mut self, before: DateTime<Utc>) -> DomainResult<u64> {
+        let count = self.work.agent_requests.len();
+        self.work.agent_requests.retain(|(_, _, at)| *at >= before);
+        Ok((count - self.work.agent_requests.len()) as u64)
+    }
+
+    async fn message_counts(&mut self, user: UserId) -> DomainResult<Vec<(ConversationId, i64)>> {
+        let state = &self.work;
+        Ok(state
+            .members
+            .values()
+            .filter(|member| member.user_id == user)
+            .filter_map(|member| {
+                let conversation = state.conversations.get(&member.conversation_id)?;
+                let upper = member.visible_upper(conversation.last_seq);
+                if upper < member.visible_from_seq {
+                    return None;
+                }
+                let count = state
+                    .entries
+                    .range(
+                        (member.conversation_id, member.visible_from_seq)
+                            ..=(member.conversation_id, upper),
+                    )
+                    .filter(|(_, entry)| {
+                        entry.kind == EntryKind::Message && entry.deleted_at.is_none()
+                    })
+                    .count() as i64;
+                (count > 0).then_some((member.conversation_id, count))
             })
             .collect())
     }

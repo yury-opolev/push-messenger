@@ -70,8 +70,8 @@ use crate::calls::{CallHistoryRow, HistoryCursor};
 use crate::error::DomainResult;
 use crate::ids::{ClientMsgId, ConversationId, DeviceId, MessageId, UserId};
 use crate::model::{
-    ContactState, Conversation, ConversationFlags, ConversationOverview, DeviceState, Entry,
-    GroupPositions, InviteRecord, Member, PublisherOwner, StoredTemplate, TemplateEvent,
+    AgentPolicy, ContactState, Conversation, ConversationFlags, ConversationOverview, DeviceState,
+    Entry, GroupPositions, InviteRecord, Member, PublisherOwner, StoredTemplate, TemplateEvent,
     TemplateStatus,
 };
 use crate::templates::TemplateRef;
@@ -455,6 +455,73 @@ pub trait Tx: Send {
     /// The direct conversations `user` is a member of, each with its other member. The
     /// order is unspecified.
     async fn direct_peers(&mut self, user: UserId) -> DomainResult<Vec<(ConversationId, UserId)>>;
+
+    /// Whether `user` is recorded deleted ([`Tx::mark_user_deleted`]).
+    async fn is_user_deleted(&mut self, user: UserId) -> DomainResult<bool>;
+
+    // --- Agent connections (spec 2026-11-06 agent connections and the owner view) -------
+
+    /// The stored policy of `agent`; `None` when never set (the agent asks).
+    async fn agent_policy(&mut self, agent: UserId) -> DomainResult<Option<AgentPolicy>>;
+    /// Stores `agent`'s policy, replacing any earlier one. Fails with `DomainError::Store`
+    /// when `agent` is not a recorded agent ([`Tx::record_agent_owner`]).
+    async fn set_agent_policy(
+        &mut self,
+        agent: UserId,
+        policy: AgentPolicy,
+        at: DateTime<Utc>,
+    ) -> DomainResult<()>;
+    /// Removes `agent`'s policy and its request log (account deletion). Idempotent.
+    async fn forget_agent(&mut self, agent: UserId) -> DomainResult<()>;
+    /// The requests waiting at `agent`: its `RequestedIn` rows, with the time each row was
+    /// last written, oldest first (ties by user id).
+    async fn waiting_requests(
+        &mut self,
+        agent: UserId,
+    ) -> DomainResult<Vec<(UserId, DateTime<Utc>)>>;
+    /// How many `RequestedIn` rows `agent` has.
+    async fn waiting_in_count(&mut self, agent: UserId) -> DomainResult<u32>;
+    /// `user`'s pending outgoing requests (`RequestedOut` rows) and, among them, those
+    /// whose peer is a recorded agent holding a `RequestedIn` row back (waiting for
+    /// another owner).
+    async fn outgoing_counts(&mut self, user: UserId) -> DomainResult<(u32, u32)>;
+    /// Records a refused request, to be released at `release_at`. Returns whether it was
+    /// recorded now: an existing one keeps its first `release_at`. Fails with
+    /// `DomainError::Store` when either user is not known.
+    async fn put_refusal(
+        &mut self,
+        requester: UserId,
+        agent: UserId,
+        release_at: DateTime<Utc>,
+    ) -> DomainResult<bool>;
+    /// Removes a refused request. Returns whether there was one.
+    async fn delete_refusal(&mut self, requester: UserId, agent: UserId) -> DomainResult<bool>;
+    /// Up to `limit` refused requests due at `now` (`release_at <= now`), as
+    /// `(requester, agent)`, earliest first.
+    async fn due_refusals(
+        &mut self,
+        now: DateTime<Utc>,
+        limit: u32,
+    ) -> DomainResult<Vec<(UserId, UserId)>>;
+    /// Logs one outgoing request of `agent`.
+    async fn log_agent_request(
+        &mut self,
+        agent: UserId,
+        peer: UserId,
+        at: DateTime<Utc>,
+    ) -> DomainResult<()>;
+    /// How many requests `agent` logged at `since` or later, and the oldest of them.
+    async fn agent_requests_since(
+        &mut self,
+        agent: UserId,
+        since: DateTime<Utc>,
+    ) -> DomainResult<(u32, Option<DateTime<Utc>>)>;
+    /// Deletes logged requests older than `before`. Returns how many.
+    async fn prune_agent_requests(&mut self, before: DateTime<Utc>) -> DomainResult<u64>;
+    /// For each conversation `user` is or was a member of, the messages `user` can see
+    /// (`kind = Message`, within the visible range) that are not deleted. Conversations
+    /// without any are left out. The order is unspecified.
+    async fn message_counts(&mut self, user: UserId) -> DomainResult<Vec<(ConversationId, i64)>>;
 
     // --- Templates ---------------------------------------------------------------------
 
