@@ -112,11 +112,11 @@ pub(crate) async fn resolve<T: Tx>(
     agent: UserId,
     owner: UserId,
 ) -> DomainResult<Resolution> {
-    if from == owner {
-        return Ok(Resolution::Accept);
-    }
     if tx.is_user_deleted(agent).await? {
         return Ok(Resolution::Refuse);
+    }
+    if from == owner {
+        return Ok(Resolution::Accept);
     }
     let policy = tx.agent_policy(agent).await?.unwrap_or_default();
     let accepted = match policy {
@@ -133,6 +133,8 @@ pub(crate) async fn resolve<T: Tx>(
     if accepted {
         return Ok(Resolution::Accept);
     }
+    // Read under the requester's pair lock, not the agent's: concurrent requests from
+    // different users may pass the cap by a few, which is harmless.
     if tx.waiting_in_count(agent).await? >= AGENT_WAITING_IN_MAX {
         return Ok(Resolution::Refuse);
     }

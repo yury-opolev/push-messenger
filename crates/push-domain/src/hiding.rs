@@ -134,6 +134,7 @@ where
                     state: None,
                 });
             }
+            crate::agents::owner_events(&mut tx, &mut events).await?;
             tx.commit().await?;
             self.publish(events).await;
         }

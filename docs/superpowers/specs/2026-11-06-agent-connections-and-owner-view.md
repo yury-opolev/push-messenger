@@ -422,6 +422,18 @@ and talk over raw sockets, as in `owned_agents.rs`:
   private." refusal of another bridge never prompt the backend or draw a reply.
 - **Audit fields.** `event`, `route`, `status`, `code`, `ip`, `user_id` (the caller),
   `agent_id`, `peer_id`, `conversation_id`, `count` and `policy`.
+- **Review fixes.** Profiles in the owner routes go through the agent's own visibility
+  (message-svc's `Directory`): a user the agent cannot see (for example one it asked who
+  never answered) is shown by id only, `state: "hidden"`; a peer agent's owner comes from
+  the peer's notice data. A block of an agent tells its owner nothing (like a decline).
+  An agent's block checks run under the pair lock. A deleted agent refuses even its owner.
+- **Residual leaks and limits, accepted.** When an agent is deleted, requesters still
+  waiting hear `NONE` while refused ones were already released silently, which reveals
+  after the fact which was which (the agent is gone by then). Unanswered requests and
+  requests hidden by a block never expire, so an agent with 50 of them is `rate_limited`
+  until its owner withdraws some (`DELETE /v1/agents/{agent_id}/contacts/{user_id}`). The
+  waiting-queue cap (200) is read under the requester's pair lock, so concurrent requests
+  may pass it by a few. `message_count` is counted on each listing.
 - **Acceptance.** `crates/push-smoke/tests/agent_connections.rs` runs §11 on the whole
   stack with two agents of one owner standing in for Echo and Coda.
 

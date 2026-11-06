@@ -119,12 +119,31 @@ impl AgentOwnerApi for Stub {
     }
 }
 
+/// message-svc's answer: the agent sees everyone but `hidden`.
+#[derive(Debug)]
+struct AllBut(Vec<Uuid>);
+
+#[async_trait::async_trait]
+impl crate::Directory for AllBut {
+    async fn visible_users(&self, _: Uuid, candidates: &[Uuid]) -> Result<Vec<Uuid>, AuthError> {
+        Ok(candidates
+            .iter()
+            .copied()
+            .filter(|user| !self.0.contains(user))
+            .collect())
+    }
+}
+
 fn with_owners(auth: Auth, owners: Arc<Stub>) -> Router {
+    with_owners_hiding(auth, owners, Vec::new())
+}
+
+fn with_owners_hiding(auth: Auth, owners: Arc<Stub>, hidden: Vec<Uuid>) -> Router {
     router(Api {
         auth,
         limits: Limits::new(Arc::new(MemoryCounter::default())),
         client_ip_header: None,
-        directory: Arc::new(crate::directory::NoDirectory),
+        directory: Arc::new(AllBut(hidden)),
         templates: Arc::new(crate::templates::NoTemplates),
         call_history: Arc::new(crate::calls::NoCalls),
         agent_owners: owners,
@@ -295,6 +314,9 @@ async fn the_owner_reads_and_sets_the_policy_and_acts_on_requests() {
     let asking = super::password_user(&auth, &world.pool, "asking", 1)
         .await
         .remove(0);
+    let unseen = super::password_user(&auth, &world.pool, "unseen", 1)
+        .await
+        .remove(0);
     let at = DateTime::from_timestamp(1_790_000_000, 0).unwrap();
     let stub = Arc::new(Stub {
         policy: Mutex::new("ask"),
@@ -302,11 +324,14 @@ async fn the_owner_reads_and_sets_the_policy_and_acts_on_requests() {
         contacts: vec![
             (owner.user_id, "accepted"),
             (asking.user_id, "requested_in"),
+            (unseen.user_id, "requested_out"),
         ],
         owner: Mutex::new(Some(owner.user_id)),
         ..Stub::default()
     });
-    let api = with_owners(auth.clone(), Arc::clone(&stub));
+    // The agent asked `unseen`, who never answered: the agent may not see their profile,
+    // so neither may its owner.
+    let api = with_owners_hiding(auth.clone(), Arc::clone(&stub), vec![unseen.user_id]);
     let token = owner.access_token.as_str();
     let base = format!("/v1/agents/{agent}");
 
@@ -352,6 +377,13 @@ async fn the_owner_reads_and_sets_the_policy_and_acts_on_requests() {
     assert_eq!(contacts["contacts"][0]["owner"], true);
     assert_eq!(contacts["contacts"][1]["owner"], false);
     assert_eq!(contacts["contacts"][1]["state"], "requested_in");
+    assert_eq!(
+        contacts["contacts"][2]["user"],
+        json!({"user_id": unseen.user_id, "handle": "", "display_name": "", "kind": "user",
+               "owner_user_id": null, "owner_display_name": null, "owner_handle": null,
+               "deleted": false, "state": "hidden"})
+    );
+    assert_eq!(contacts["contacts"][2]["state"], "requested_out");
 
     let requester = asking.user_id;
     for action in ["approve", "decline", "block"] {

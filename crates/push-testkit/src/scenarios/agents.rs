@@ -888,6 +888,44 @@ async fn deleting_an_agent_ends_its_relationships_and_keeps_its_chats<B: Backend
     assert_eq!(world.notifier.take(), []);
 }
 
+async fn a_block_of_an_agent_looks_like_a_decline_to_its_owner<B: Backend>(backend: &B) {
+    let (world, _owner, agent) = owned(backend).await;
+    let [decliner, blocker] = [world.person().await, world.person().await];
+    for person in [&decliner, &blocker] {
+        world
+            .svc
+            .contact_request(agent.user, person.user)
+            .await
+            .unwrap();
+    }
+    world.notifier.take();
+    world
+        .svc
+        .contact_decline(decliner.user, agent.user)
+        .await
+        .unwrap();
+    let declined = world.notifier.take();
+    world
+        .svc
+        .contact_block(blocker.user, agent.user)
+        .await
+        .unwrap();
+    let blocked = world.notifier.take();
+    // Each is told to the person who acted only; the agent's owner hears neither.
+    for (events, person) in [(declined, &decliner), (blocked, &blocker)] {
+        assert!(
+            events.iter().all(|event| matches!(
+                event,
+                Event::ContactChanged { user, .. } if *user == person.user
+            )),
+            "{events:?}"
+        );
+    }
+    for person in [&decliner, &blocker] {
+        assert_eq!(state(&world, &agent, person).await, None);
+    }
+}
+
 pub(super) fn cases<B: Backend>() -> Vec<Case<B>> {
     case_list![
         ask_holds_requests_from_people_and_agents_for_the_owner,
@@ -906,5 +944,6 @@ pub(super) fn cases<B: Backend>() -> Vec<Case<B>> {
         only_the_owner_reaches_the_agent,
         the_owner_view_reads_what_the_agent_sees_and_changes_nothing,
         deleting_an_agent_ends_its_relationships_and_keeps_its_chats,
+        a_block_of_an_agent_looks_like_a_decline_to_its_owner,
     ]
 }
