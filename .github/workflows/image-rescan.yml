@@ -1,0 +1,86 @@
+# Weekly rescan of the images pinned on main with a current vulnerability database, so a
+# CVE published after an image was pinned raises an alert: every third-party image the
+# chart deploys (deploy/helm/chart-images.sh: coturn, PostgreSQL, Redis) and the runtime base
+# of this repository's own images (deploy/docker/Dockerfile). A fixable HIGH or CRITICAL
+# finding (not accepted in deploy/helm/trivyignore/<name>.yaml) fails the run and opens, or
+# comments on, the issue labelled image-vulnerability; docs/calls.md, "Security updates of
+# the chart's images".
+name: image-rescan
+
+on:
+  schedule:
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  images:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.images.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
+        with:
+          version: v3.16.3
+      - id: images
+        run: |
+          base=$(sed -nE 's/^FROM ([^ ]+@sha256:[0-9a-f]{64}) AS runtime$/\1/p' deploy/docker/Dockerfile)
+          if [ -z "$base" ]; then
+            echo "deploy/docker/Dockerfile: no runtime stage pinned by digest" >&2
+            exit 1
+          fi
+          matrix=$(bash deploy/helm/chart-images.sh --matrix |
+            jq -c --arg base "$base" '.include += [{"image": $base, "ignorefile": ""}]')
+          echo "$matrix" | jq .
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  scan:
+    needs: images
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.images.outputs.matrix) }}
+    name: scan (${{ matrix.image }})
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ matrix.image }}
+          version: v0.76.1
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          trivyignores: ${{ matrix.ignorefile }}
+          exit-code: "1"
+          # A fresh database, not the day's cache.
+          cache: false
+
+  alert:
+    needs: scan
+    if: failure() && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          label=image-vulnerability
+          gh label create "$label" --color B60205 \
+            --description "A pinned image has a fixable HIGH or CRITICAL vulnerability" 2>/dev/null || true
+          body="The weekly image rescan found a fixable HIGH or CRITICAL vulnerability in an image pinned on main: $RUN_URL (the failed scan jobs list the findings). Deliver the fix as described in docs/calls.md, \"Security updates of the chart's images\"."
+          issue=$(gh issue list --label "$label" --state open --limit 1 --json number --jq '.[0].number // empty')
+          if [ -n "$issue" ]; then
+            gh issue comment "$issue" --body "$body"
+          else
+            gh issue create --label "$label" \
+              --title "Pinned image has a fixable HIGH/CRITICAL vulnerability" --body "$body"
+          fi

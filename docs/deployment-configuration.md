@@ -415,11 +415,13 @@ rendered as `repository@digest`. Use the digest your own publication returned fo
 **each** image; they differ. For example (synthetic, non-deployable):
 `digest: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`.
 `postgres.image` and `redis.image` are complete references and accept
-`repository@sha256:...` directly, as does `calls.turn.internal.image` (coturn, pinned
-to the digest of its multi-arch index and scanned by CI; see
-[calls.md](calls.md#137-upgrading-coturn)); by default they are `postgres:17-alpine` and
+`repository@sha256:...` directly, as does `calls.turn.internal.image` (coturn: this
+repository's patched build `ghcr.io/yury-opolev/push-coturn`, pinned to the digest of
+its multi-arch index; see [calls.md](calls.md#137-upgrading-coturn)); by default they are `postgres:17-alpine` and
 `redis:7-alpine` pinned to the digest of their multi-arch index, as are the
-Dockerfile's base images. Upgrading from a chart that named them by tag alone restarts
+Dockerfile's base images. CI fails on a fixable HIGH or CRITICAL vulnerability in any of
+them and rescans them weekly ([calls.md §13.4](calls.md#134-coturn-in-the-chart),
+"Security updates of the chart's images"); mirror each by the same digest. Upgrading from a chart that named them by tag alone restarts
 the bundled PostgreSQL and Redis once (their pod spec changes). Valid syntax does not prove a digest exists or is
 signed; registry authorization is supplied through your own workload mechanisms.
 Build images with `docker build -f deploy/docker/Dockerfile --target <name> .` for

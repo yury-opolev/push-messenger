@@ -257,8 +257,12 @@ calls:
         total: 1200
         # Bytes per second per session: 8000 to 1000000000.
         maxBps: 512000
-      # Pinned by digest (coturn/coturn 4.18.0-alpine multi-arch index); CI scans it (Trivy).
-      image: coturn/coturn:4.18.0-alpine@sha256:c29135c08565810d37053f384584392b7c24b69570fc81a721b878d6fe63e04e
+      # Pinned by digest: the multi-arch index of this repository's coturn image, upstream
+      # coturn/coturn:4.18.0-alpine with the Alpine security updates (deploy/coturn/Dockerfile,
+      # published by .github/workflows/coturn-image.yml). CI and a weekly rescan fail on a
+      # fixable HIGH or CRITICAL finding (docs/calls.md, "Security updates of the chart's
+      # images"). Mirror it by digest like any other image.
+      image: ghcr.io/yury-opolev/push-coturn:4.18.0-alpine-r1@sha256:11321d4e158ae05e75e5bff45c2fe999cc66607fd2b03ea30182abaa0619453f
       # Peers allowed to scrape coturn's Prometheus port 9641, each with both non-empty
       # label maps, like networkPolicy.adminPeers. Empty: nobody.
       metricsPeers: []
@@ -290,7 +294,7 @@ postgres:
   enabled: true
   # Pinned by digest (the multi-arch index of postgres:17-alpine), so every install runs
   # the same bytes; set another tag@digest to move.
-  image: postgres:17-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24
+  image: postgres:17-alpine@sha256:3540c0362c809df084ffac0ae69fe794515f9de92692f02178bcdce0ef0302ac
   # Bootstrap administrator password, used only by bundled PostgreSQL.
   # Empty: generated on install and kept on upgrades. Use letters and digits only.
   password: ""
@@ -338,7 +342,7 @@ redis:
   # true: the bundled Redis below. false: an external one (redis.external).
   enabled: true
   # Pinned by digest (the multi-arch index of redis:7-alpine), like postgres.image.
-  image: redis:7-alpine@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499
+  image: redis:7-alpine@sha256:c5d34a98396a4775e223c74e929162c35c5a2182901ba26b50ade939941ce14b
   # Empty: generated on install and kept on upgrades. Letters and digits only.
   password: ""
   resources:

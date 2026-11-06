@@ -218,8 +218,10 @@ jobs:
       - run: "cargo test -p push-sdk --features calls-media --locked --lib -- media::"
       - run: "cargo test -p push-bridge --features voice --locked --lib -- voice::"
 
-  # The container images build (nothing is pushed). Deploying them is verified on
-  # minikube before merge: deploy/minikube/up.ps1 -Smoke.
+  # The container images build (nothing is pushed) and have no HIGH or CRITICAL
+  # vulnerability with a fix (Trivy, current database; their Rust dependencies are also
+  # checked by cargo-deny in supply-chain). Deploying them is verified on minikube before
+  # merge: deploy/minikube/up.ps1 -Smoke.
   images:
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -230,6 +232,14 @@ jobs:
           for target in auth message-svc gateway worker smoke load; do
             docker build -f deploy/docker/Dockerfile --target "$target" \
               -t "push-messenger/$target:ci" .
+          done
+      - name: Scan the images the chart deploys
+        run: |
+          for target in auth message-svc gateway worker smoke; do
+            docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v trivy-cache:/root/.cache \
+              aquasec/trivy:0.76.1@sha256:790fd66d1697395d8693d1acaa1ea702406a20f109b6fc7bac8db623eca6c06c \
+              image --quiet --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 \
+              "push-messenger/$target:ci"
           done
 
   chart:
@@ -278,30 +288,40 @@ jobs:
           wait: 120s
       - run: pwsh deploy/helm/test-chart-cluster.ps1 -Context kind-push-chart
 
-  # The chart's third-party coturn image (calls.turn.internal.image) is pinned by digest
-  # and has no HIGH or CRITICAL vulnerability with a fix, unless accepted with a reason in
-  # deploy/helm/coturn.trivyignore.yaml. Upgrade path: docs/calls.md, "Upgrading coturn".
-  coturn-image:
+  # Every third-party image the chart deploys (deploy/helm/chart-images.sh: coturn, PostgreSQL,
+  # Redis) is pinned by digest and has no HIGH or CRITICAL vulnerability with a fix, unless
+  # accepted with a reason, a path and an expiry in deploy/helm/trivyignore/<name>.yaml.
+  # Trivy downloads a current vulnerability database each run. The same scan runs weekly on
+  # main (.github/workflows/image-rescan.yml); docs/calls.md, "Security updates of the
+  # chart's images".
+  chart-images:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.images.outputs.matrix }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-      - name: The pinned image
-        id: image
-        run: |
-          image=$(grep -E '^\s+image: coturn/coturn:' deploy/helm/push-messenger/values.yaml | awk '{print $2}')
-          if ! echo "$image" | grep -Eq '^coturn/coturn:[^@]+@sha256:[0-9a-f]{64}$'; then
-            echo "calls.turn.internal.image is not pinned by digest: '$image'" >&2
-            exit 1
-          fi
-          echo "ref=$image" >> "$GITHUB_OUTPUT"
-      - run: docker pull "${{ steps.image.outputs.ref }}"
+      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
+        with:
+          version: v3.16.3
+      - id: images
+        run: echo "matrix=$(bash deploy/helm/chart-images.sh --matrix)" >> "$GITHUB_OUTPUT"
+
+  image-scan:
+    needs: chart-images
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.chart-images.outputs.matrix) }}
+    name: image-scan (${{ matrix.image }})
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          image-ref: ${{ steps.image.outputs.ref }}
+          image-ref: ${{ matrix.image }}
           version: v0.76.1
-          vuln-type: os,library
           severity: HIGH,CRITICAL
           ignore-unfixed: true
-          trivyignores: deploy/helm/coturn.trivyignore.yaml
+          trivyignores: ${{ matrix.ignorefile }}
           exit-code: "1"

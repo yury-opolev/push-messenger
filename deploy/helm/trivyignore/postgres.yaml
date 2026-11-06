@@ -1,0 +1,115 @@
+# Accepted findings of the Trivy scans of the chart's pinned PostgreSQL image (postgres.image;
+# chart-images in .github/workflows/ci.yml and .github/workflows/image-rescan.yml). Each entry
+# says why it does not apply to the image as the chart runs it, is limited to the affected
+# file (paths) and expires, so it is reviewed again. Prefer moving to a digest that fixes it;
+# add an entry only with a reason (docs/calls.md, "Security updates of the chart's images").
+#
+# gosu: the Go standard library gosu 1.19 was built with (go1.24.6). The entrypoint runs
+# gosu once, as root, to switch to the postgres user and exec postgres: it parses its argv
+# only, and uses none of the affected packages' network, TLS, certificate, archive or
+# template code. Upstream's position: https://github.com/tianon/gosu/blob/master/SECURITY.md.
+vulnerabilities:
+  - id: CVE-2025-61726
+    paths: ["usr/local/bin/gosu"]
+    statement: Go standard library in gosu; not reachable from gosu's privilege drop
+    expired_at: 2027-02-01
+  - id: CVE-2025-61729
+    paths: ["usr/local/bin/gosu"]
+    statement: Go standard library in gosu; not reachable from gosu's privilege drop
+    expired_at: 2027-02-01
+  - id: CVE-2025-68121
+    paths: ["usr/local/bin/gosu"]
+    statement: Go standard library in gosu; not reachable from gosu's privilege drop
+    expired_at: 2027-02-01
+  - id: CVE-2026-111943
+    paths: ["usr/local/bin/gosu"]
+    statement: Go standard library in gosu; not reachable from gosu's privilege drop
+    expired_at: 2027-02-01
+  - id: CVE-2026-25679
+    paths: ["usr/local/bin/gosu"]
+    statement: Go standard library in gosu; not reachable from gosu's privilege drop
+    expired_at: 2027-02-01
+  - id: CVE-2026-27145
+    paths: ["usr/local/bin/gosu"]
+    statement: Go standard library in gosu; not reachable from gosu's privilege drop
+    expired_at: 2027-02-01
+  - id: CVE-2026-32280
+    paths: ["usr/local/bin/gosu"]
+    statement: Go standard library in gosu; not reachable from gosu's privilege drop
+    expired_at: 2027-02-01
+  - id: CVE-2026-32281
+    paths: ["usr/local/bin/gosu"]
+    statement: Go standard library in gosu; not reachable from gosu's privilege drop
+    expired_at: 2027-02-01
+  - id: CVE-2026-32283
+    paths: ["usr/local/bin/gosu"]
+    statement: Go standard library in gosu; not reachable from gosu's privilege drop
+    expired_at: 2027-02-01
+  - id: CVE-2026-33811
+    paths: ["usr/local/bin/gosu"]
+    statement: Go standard library in gosu; not reachable from gosu's privilege drop
+    expired_at: 2027-02-01
+  - id: CVE-2026-33814
+    paths: ["usr/local/bin/gosu"]
+    statement: Go standard library in gosu; not reachable from gosu's privilege drop
+    expired_at: 2027-02-01
+  - id: CVE-2026-33818
+    paths: ["usr/local/bin/gosu"]
+    statement: Go standard library in gosu; not reachable from gosu's privilege drop
+    expired_at: 2027-02-01
+  - id: CVE-2026-39820
+    paths: ["usr/local/bin/gosu"]
+    statement: Go standard library in gosu; not reachable from gosu's privilege drop
+    expired_at: 2027-02-01
+  - id: CVE-2026-39821
+    paths: ["usr/local/bin/gosu"]
+    statement: Go standard library in gosu; not reachable from gosu's privilege drop
+    expired_at: 2027-02-01
+  - id: CVE-2026-39822
+    paths: ["usr/local/bin/gosu"]
+    statement: Go standard library in gosu; not reachable from gosu's privilege drop
+    expired_at: 2027-02-01
+  - id: CVE-2026-39836
+    paths: ["usr/local/bin/gosu"]
+    statement: Go standard library in gosu; not reachable from gosu's privilege drop
+    expired_at: 2027-02-01
+  - id: CVE-2026-42499
+    paths: ["usr/local/bin/gosu"]
+    statement: Go standard library in gosu; not reachable from gosu's privilege drop
+    expired_at: 2027-02-01
+  - id: CVE-2026-42504
+    paths: ["usr/local/bin/gosu"]
+    statement: Go standard library in gosu; not reachable from gosu's privilege drop
+    expired_at: 2027-02-01
+  - id: CVE-2026-56853
+    paths: ["usr/local/bin/gosu"]
+    statement: Go standard library in gosu; not reachable from gosu's privilege drop
+    expired_at: 2027-02-01
+  - id: CVE-2026-56858
+    paths: ["usr/local/bin/gosu"]
+    statement: Go standard library in gosu; not reachable from gosu's privilege drop
+    expired_at: 2027-02-01
+  - id: CVE-2026-56859
+    paths: ["usr/local/bin/gosu"]
+    statement: Go standard library in gosu; not reachable from gosu's privilege drop
+    expired_at: 2027-02-01
+  - id: CVE-2026-56860
+    paths: ["usr/local/bin/gosu"]
+    statement: Go standard library in gosu; not reachable from gosu's privilege drop
+    expired_at: 2027-02-01
+  - id: CVE-2026-56862
+    paths: ["usr/local/bin/gosu"]
+    statement: Go standard library in gosu; not reachable from gosu's privilege drop
+    expired_at: 2027-02-01
+  - id: CVE-2026-78667
+    paths: ["usr/local/bin/gosu"]
+    statement: Go standard library in gosu; not reachable from gosu's privilege drop
+    expired_at: 2027-02-01
+  - id: CVE-2026-78669
+    paths: ["usr/local/bin/gosu"]
+    statement: Go standard library in gosu; not reachable from gosu's privilege drop
+    expired_at: 2027-02-01
+  - id: CVE-2026-97031
+    paths: ["usr/local/bin/gosu"]
+    statement: Go standard library in gosu; not reachable from gosu's privilege drop
+    expired_at: 2027-02-01

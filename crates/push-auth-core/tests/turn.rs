@@ -48,16 +48,17 @@ fn chart_file(name: &str) -> String {
 /// The chart's pinned coturn image: `(repository, tag@digest)`.
 fn pinned_image() -> (String, String) {
     let values = chart_file("values.yaml");
-    let reference = values
+    let image = values
         .lines()
         .map(str::trim)
-        .find_map(|line| line.strip_prefix("image: coturn/coturn:"))
-        .expect("calls.turn.internal.image in values.yaml");
-    assert!(
-        reference.contains("@sha256:"),
-        "pinned by digest: {reference}"
-    );
-    ("coturn/coturn".to_owned(), reference.trim().to_owned())
+        .filter_map(|line| line.strip_prefix("image: "))
+        .find(|image| image.contains("coturn"))
+        .expect("calls.turn.internal.image in values.yaml")
+        .trim();
+    let (name, digest) = image.split_once('@').expect("pinned by digest");
+    assert!(digest.starts_with("sha256:"), "pinned by digest: {image}");
+    let (repository, tag) = name.rsplit_once(':').expect("<repository>:<tag>@<digest>");
+    (repository.to_owned(), format!("{tag}@{digest}"))
 }
 
 /// `first-last` of a CIDR, as coturn's denied-peer-ip wants it.

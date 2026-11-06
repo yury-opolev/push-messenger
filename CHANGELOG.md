@@ -4,6 +4,35 @@ Notable changes for consumers of push-messenger. Newest first.
 
 ## Unreleased
 
+### Security
+
+- **Patched internal TURN image (CVE-2026-111497, brotli)** — `calls.turn.internal.image`
+  is now `ghcr.io/yury-opolev/push-coturn:4.18.0-alpine-r1@sha256:11321d4e158ae05e75e5bff45c2fe999cc66607fd2b03ea30182abaa0619453f`:
+  upstream `coturn/coturn:4.18.0-alpine` (pinned by digest; upstream has not rebuilt it)
+  plus the Alpine 3.24 security updates, so brotli-libs 1.2.1-r0 (was 1.2.0-r1, pulled in
+  by gnutls), and fixed bind, mongo-c-driver, OpenSSL, zlib and musl packages. Same
+  `turnserver`, user (65534), entrypoint and layout: the chart's init containers and the
+  restricted Pod Security profile are unchanged. Built by
+  [`deploy/coturn/Dockerfile`](deploy/coturn/Dockerfile) and published (public,
+  multi-arch, provenance and SBOM) by `.github/workflows/coturn-image.yml`. **Mirroring:**
+  mirror `ghcr.io/yury-opolev/push-coturn@sha256:11321d4e…` instead of
+  `docker.io/coturn/coturn@sha256:c29135c0…` and keep the digest
+  ([calls.md §13.4](docs/calls.md#134-coturn-in-the-chart)).
+- **PostgreSQL and Redis pins moved** to current digests of `postgres:17-alpine`
+  (`sha256:3540c036…`) and `redis:7-alpine` (`sha256:c5d34a98…`), which fix zlib and
+  OpenSSL findings; the application images' runtime base moves to
+  `gcr.io/distroless/cc-debian13:nonroot` (cc-debian12 had a fixable OpenSSL finding).
+- **Image vulnerability gate** — CI scans every image the chart deploys (coturn,
+  PostgreSQL, Redis and the images built here) and fails on any fixable HIGH or CRITICAL
+  vulnerability. Accepted findings live in `deploy/helm/trivyignore/<image>.yaml` with a
+  reason, a path and an expiry: only gosu's Go standard library in the PostgreSQL image.
+  The old `deploy/helm/coturn.trivyignore.yaml` is gone: it had accepted
+  CVE-2026-111497 with a wrong reason (brotli is linked through gnutls, not an unused HTTP
+  client), which is why CI never flagged it. A weekly rescan
+  (`.github/workflows/image-rescan.yml`) opens an `image-vulnerability` issue when a CVE
+  published later affects a pinned image. Delivery and turnaround:
+  [calls.md, "Security updates of the chart's images"](docs/calls.md#134-coturn-in-the-chart).
+
 ### Added
 
 - **Echo backend: accepted contacts** — the echo test agent now also answers the
