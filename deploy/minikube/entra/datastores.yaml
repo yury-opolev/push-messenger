@@ -78,7 +78,7 @@ spec:
       containers:
         - name: postgres
           # The chart's image (postgres.image), pinned by digest.
-          image: postgres:17-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24
+          image: postgres:17-alpine@sha256:3540c0362c809df084ffac0ae69fe794515f9de92692f02178bcdce0ef0302ac
           # The key must belong to postgres with mode 0600: copy it into place, then hand
           # over to the image's entrypoint (as Plan 12A's TLS test container does).
           command: ["sh", "-c"]
@@ -208,7 +208,7 @@ spec:
       containers:
         - name: redis
           # The chart's image (redis.image), pinned by digest.
-          image: redis:7-alpine@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499
+          image: redis:7-alpine@sha256:c5d34a98396a4775e223c74e929162c35c5a2182901ba26b50ade939941ce14b
           # TLS only (no plain port); the default user is the administrator. The
           # principals' ACL users (their object ids) appear when the issuer sets a token.
           args:

@@ -78,14 +78,16 @@ fn config(secret: &str) -> String {
 /// published over TCP and UDP.
 pub async fn start(secret: &str) -> Coturn {
     let values = chart_file("values.yaml");
-    let tag = values
+    let image = values
         .lines()
         .map(str::trim)
-        .find_map(|line| line.strip_prefix("image: coturn/coturn:"))
+        .filter_map(|line| line.strip_prefix("image: "))
+        .find(|image| image.contains("coturn"))
         .expect("calls.turn.internal.image in values.yaml")
-        .trim()
-        .to_owned();
-    let container = GenericImage::new("coturn/coturn".to_owned(), tag)
+        .trim();
+    let (name, digest) = image.split_once('@').expect("pinned by digest");
+    let (repository, tag) = name.rsplit_once(':').expect("<repository>:<tag>@<digest>");
+    let container = GenericImage::new(repository.to_owned(), format!("{tag}@{digest}"))
         .with_exposed_port(ContainerPort::Tcp(3478))
         .with_exposed_port(ContainerPort::Udp(3478))
         .with_wait_for(WaitFor::Nothing)

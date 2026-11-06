@@ -39,7 +39,7 @@ kubectl --context $Context create namespace $Namespace --dry-run=client -o yaml 
     kubectl --context $Context apply -f - | Out-Null
 kubectl --context $Context label namespace $Namespace --overwrite `
     pod-security.kubernetes.io/enforce=restricted pod-security.kubernetes.io/enforce-version=latest | Out-Null
-$coturnImage = 'coturn/coturn:4.18.0-alpine@sha256:c29135c08565810d37053f384584392b7c24b69570fc81a721b878d6fe63e04e'
+$coturnImage = 'ghcr.io/yury-opolev/push-coturn:4.18.0-alpine-r1@sha256:11321d4e158ae05e75e5bff45c2fe999cc66607fd2b03ea30182abaa0619453f'
 
 # coturn's Deployment is rolled out and Ready (helm --wait would also wait for the
 # application images, which CI does not build here).

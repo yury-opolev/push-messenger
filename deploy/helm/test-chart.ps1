@@ -372,7 +372,7 @@ security = {"runAsNonRoot": True, "runAsUser": 65534, "runAsGroup": 65534, "allo
             "seccompProfile": {"type": "RuntimeDefault"}}
 [init, binary] = pod["initContainers"]
 [main] = pod["containers"]
-image = "coturn/coturn:4.18.0-alpine@sha256:c29135c08565810d37053f384584392b7c24b69570fc81a721b878d6fe63e04e"
+image = "ghcr.io/yury-opolev/push-coturn:4.18.0-alpine-r1@sha256:11321d4e158ae05e75e5bff45c2fe999cc66607fd2b03ea30182abaa0619453f"
 assert init["name"] == "config" and init["image"] == image and main["image"] == image
 # The image's /usr/bin/turnserver carries file capabilities (cap_net_bind_service=ep), which
 # execve refuses with drop ALL and no_new_privs: coturn runs a plain cp of it, without them.

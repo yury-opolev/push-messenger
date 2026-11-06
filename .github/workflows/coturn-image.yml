@@ -77,7 +77,6 @@ jobs:
         with:
           image-ref: push-coturn:check
           version: v0.76.1
-          vuln-type: os,library
           severity: HIGH,CRITICAL
           ignore-unfixed: true
           exit-code: "1"

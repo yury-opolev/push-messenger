@@ -833,7 +833,7 @@ field. Values under `calls.turn`:
 | `internal.externalIp` | `""` | the public IP coturn advertises as its relay address; empty: `service.loadBalancerIP`, else `publicHost` when it is an IP. One of them is required ("calls.turn.internal.externalIp must be set …") |
 | `internal.deniedPeerCidrs` | `[]` | required: the cluster's pod and service CIDRs (IPv4 and IPv6 network addresses, at least /8 and /16) ("calls.turn.internal.deniedPeerCidrs must list the cluster's pod and service CIDRs") |
 | `internal.quotas` | `{user: 12, total: 1200, maxBps: 512000}` | integers 1–1000, 1–100000, 8000–1000000000 |
-| `internal.image` | `coturn/coturn:4.18.0-alpine@sha256:c29135c0…` | `<repository>:<tag>@sha256:<digest>` |
+| `internal.image` | `ghcr.io/yury-opolev/push-coturn:4.18.0-alpine-r1@sha256:11321d4e…` (coturn 4.18.0 with the Alpine security updates, [§13.7](#137-upgrading-coturn)) | `<repository>:<tag>@sha256:<digest>` |
 | `internal.metricsPeers` | `[]` | peers allowed to scrape coturn's port 9641 (both label maps, like `networkPolicy.adminPeers`) |
 | `external.provider` | `generic` | `generic`, `cloudflare` or `twilio` |
 | `external.urls` | `[]` | `generic`: required `turn:`/`turns:` URLs |
@@ -912,11 +912,15 @@ init container copies the binary with a plain `cp`, which does not carry the
 listens on 3478, 5349 and 9641 only, so it never needs the capability; the configuration
 path, ports and probes are unchanged. For operators:
 
-- The pod still uses only the pinned upstream image (both init containers and coturn):
-  import or mirror that one digest (`az acr import --name <registry> --source
-  docker.io/coturn/coturn@sha256:<digest> --image coturn/coturn:<tag>`) and point
-  `calls.turn.internal.image` at the mirror with the same digest. There is no derived
-  image to build or mirror.
+- The pod uses only the pinned image (both init containers and coturn):
+  `ghcr.io/yury-opolev/push-coturn`, upstream `coturn/coturn:<version>-alpine` with the
+  Alpine security updates applied and nothing else changed (same `turnserver`, user,
+  entrypoint and layout; [`deploy/coturn/Dockerfile`](../deploy/coturn/Dockerfile)). It
+  is public; import or mirror that one digest (`az acr import --name <registry> --source
+  ghcr.io/yury-opolev/push-coturn@sha256:<digest> --image push-coturn:<tag>`, or
+  `crane copy`/`oras copy` of the same reference) and point `calls.turn.internal.image`
+  at the mirror with the same digest. Mirror the multi-arch index digest (the one in
+  `values.yaml`); it keeps its provenance and SBOM attestations.
 - The pod passes the `restricted` Pod Security Standard: non-root (65534), no
   capabilities, no privilege escalation, read-only root, `RuntimeDefault` seccomp. Do not
   add `NET_BIND_SERVICE` or allow privilege escalation for coturn; neither is needed.
@@ -925,6 +929,35 @@ path, ports and probes are unchanged. For operators:
 - The copy is about 3 MB on the node's ephemeral storage (`emptyDir`, `sizeLimit:
   16Mi`), made at every pod start; a node mounting `emptyDir` volumes `noexec` would
   prevent it from running (not the case on AKS or kind).
+
+**Security updates of the chart's images.** Every third-party image the chart deploys
+(coturn, PostgreSQL, Redis; listed by
+[`deploy/helm/chart-images.sh`](../deploy/helm/chart-images.sh)) is pinned by digest, and
+so is the runtime base of this repository's own images:
+
+- **Gate.** CI (`image-scan` in `.github/workflows/ci.yml`, one job per image, and the
+  `images` job for the images built here) runs Trivy with a current database and fails
+  on any HIGH or CRITICAL vulnerability that has a fix (`--severity HIGH,CRITICAL
+  --ignore-unfixed --exit-code 1`). A finding is accepted only in
+  `deploy/helm/trivyignore/<image name>.yaml`, with a reason, limited to the affected
+  file where possible, and an expiry, so it is reviewed again; an entry is not a way to
+  wait for a fix.
+- **Rescan.** `.github/workflows/image-rescan.yml` scans the same pins on main every
+  Monday (and on demand, `gh workflow run image-rescan.yml`), so a CVE published after an
+  image was pinned fails the run and opens (or comments on) an issue labelled
+  `image-vulnerability`.
+- **Delivery.** If upstream has published a fixed image, the fix is a new digest pin. If
+  not (coturn's Alpine image is rebuilt rarely), `.github/workflows/coturn-image.yml`
+  rebuilds `ghcr.io/yury-opolev/push-coturn` from the same upstream digest with the
+  current Alpine updates (run it by hand, or push a `coturn-<version>-alpine-r<n>` tag),
+  checks it (non-root, Trivy clean) and publishes it with provenance and an SBOM; a pull
+  request then pins the new digest in `values.yaml`. Consumers move their chart pin
+  (submodule) and redeploy; coturn restarts once (calls relayed at that moment recover
+  with an ICE restart).
+- **Turnaround.** A fixable CRITICAL, or an actively exploited HIGH, is patched and
+  pinned on main within one business day of the alert (CI or the rescan); other fixable
+  HIGH findings within five business days. Unfixed findings are tracked until a fix is
+  published, then follow the same path.
 
 ### 13.5 AKS
 
@@ -978,23 +1011,36 @@ A minikube walk-through with the reference page:
 
 ### 13.7 Upgrading coturn
 
-The image is pinned by digest, and CI (`coturn-image` in `.github/workflows/ci.yml`)
-scans it with Trivy, failing on HIGH or CRITICAL findings that have a fix unless
-[`deploy/helm/coturn.trivyignore.yaml`](../deploy/helm/coturn.trivyignore.yaml) accepts
-them with a reason and an expiry. To move:
+The chart runs [`deploy/coturn/Dockerfile`](../deploy/coturn/Dockerfile): upstream
+`coturn/coturn:<version>-alpine`, pinned by digest, plus `apk upgrade`, published as
+`ghcr.io/yury-opolev/push-coturn:<version>-alpine-r<n>` by
+`.github/workflows/coturn-image.yml` and pinned by its multi-arch index digest; CI and the
+weekly rescan scan it ("Security updates of the chart's images" above). Upstream's
+`4.18.0-alpine` (`sha256:c29135c0…`, Alpine 3.24.1) carries brotli-libs 1.2.0-r1
+(CVE-2026-111497, through gnutls) and other fixable findings; the derived image has
+brotli-libs 1.2.1-r0 and no fixable HIGH or CRITICAL finding. To move:
 
-1. Pick the release tag (`coturn/coturn:<version>-alpine`) and its multi-arch index
-   digest: `docker buildx imagetools inspect coturn/coturn:<tag>` (the `Digest:` line).
-2. Set `calls.turn.internal.image` to `coturn/coturn:<tag>@sha256:<digest>`.
-3. Run `cargo test -p push-auth-core --test turn` (Docker): it starts the new image with
+1. A new coturn release: set `COTURN_BASE` in `deploy/coturn/Dockerfile` to
+   `coturn/coturn:<tag>@sha256:<digest>` (the multi-arch index digest, the `Digest:` line
+   of `docker buildx imagetools inspect coturn/coturn:<tag>`) and the base labels below
+   it. Only new Alpine updates: nothing to change.
+2. Publish: after the change is on main, `git tag coturn-<version>-alpine-r<n> && git
+   push origin coturn-<version>-alpine-r<n>` (or `gh workflow run coturn-image.yml`). The
+   run's summary prints the reference to pin.
+3. Set `calls.turn.internal.image` to
+   `ghcr.io/yury-opolev/push-coturn:<tag>@sha256:<digest>` (and the same reference in
+   `deploy/helm/test-chart.ps1` and `test-chart-cluster.ps1`).
+4. Run `cargo test -p push-auth-core --test turn` (Docker): it starts the new image with
    the chart's configuration and fails on any option coturn no longer knows, a refused
    credential or a private peer that is not denied.
-4. Scan: `docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v
-   "$PWD/deploy/helm:/cfg:ro" aquasec/trivy:0.76.1 image --severity HIGH,CRITICAL
-   --ignore-unfixed --ignorefile /cfg/coturn.trivyignore.yaml <image>`; drop ignore
-   entries the new image fixed.
-5. `pwsh deploy/helm/test-chart.ps1`, then release; the pod restarts once (calls in
+5. Scan: `docker run --rm -v /var/run/docker.sock:/var/run/docker.sock
+   aquasec/trivy:0.76.1 image --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1
+   <image>` (CI does the same).
+6. `pwsh deploy/helm/test-chart.ps1`, then release; the pod restarts once (calls in
    progress over the relay drop and recover with an ICE restart).
+
+Once upstream publishes a rebuilt image that is clean, pinning upstream directly again is
+fine: the chart only needs `<repository>:<tag>@sha256:<digest>` with the same layout.
 
 ### 13.8 Troubleshooting TURN
 
