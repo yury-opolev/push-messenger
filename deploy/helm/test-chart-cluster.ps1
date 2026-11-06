@@ -185,6 +185,13 @@ try {
             'networkpolicy.networking.k8s.io/push-coturn'
     }
     Check 'the coturn pod becomes Ready in the restricted namespace' { CoturnReady }
+    Check "the coturn pod runs the chosen image with the expected init containers (copyBinary $($CopyBinary.ToString().ToLower()))" {
+        $spec = kubectl --context $Context --namespace $Namespace get pods -l app.kubernetes.io/name=coturn `
+            -o jsonpath='{.items[0].spec.initContainers[*].name}|{.items[0].spec.containers[0].image}'
+        $expected = "$(if ($CopyBinary) { 'config turnserver' } else { 'config' })|$coturnImage"
+        if ($spec -ne $expected) { Write-Host "got '$spec', expected '$expected'" }
+        $spec -eq $expected
+    }
     Check 'a TURN allocation and refresh against the coturn Service succeed with REST credentials' {
         # The Service's UDP forwarding can lag the pod's readiness by a few seconds
         # ("recv: Connection refused"): a bounded retry.
