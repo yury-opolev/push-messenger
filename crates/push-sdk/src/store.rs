@@ -29,7 +29,7 @@ pub(crate) mod outbox;
 
 /// The schema steps: `SCHEMA_STEPS[n]` brings a database from version `n` to `n + 1`.
 /// Each runs in one transaction with the version bump, so a crash leaves the old version.
-const SCHEMA_STEPS: &[&str] = &[SCHEMA_V1, SCHEMA_V2];
+const SCHEMA_STEPS: &[&str] = &[SCHEMA_V1, SCHEMA_V2, SCHEMA_V3];
 
 const SCHEMA_V1: &str = "
 CREATE TABLE meta (
@@ -99,6 +99,12 @@ const SCHEMA_V2: &str = "
 ALTER TABLE message ADD COLUMN answer_seq INTEGER;
 ALTER TABLE message ADD COLUMN card_seq INTEGER;
 CREATE INDEX message_by_id ON message (conversation_id, message_id);
+";
+
+/// A conversation's flags: the user hid it, and its peer's account was deleted.
+const SCHEMA_V3: &str = "
+ALTER TABLE conversation ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE conversation ADD COLUMN peer_deleted INTEGER NOT NULL DEFAULT 0;
 ";
 
 /// Refuses to go on with a key unless the linked SQLite is SQLite3 Multiple Ciphers: on a
@@ -364,8 +370,8 @@ impl Store {
         let kind = ConversationKind::from_wire(summary.kind());
         self.conn.execute(
             "INSERT INTO conversation (id, kind, peer_id, title, last_seq, read_seq, read_synced_seq,
-                 unread, peer_delivered_seq, peer_read_seq, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, ?8, ?9, ?10)
+                 unread, peer_delivered_seq, peer_read_seq, updated_at, hidden, peer_deleted)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
              ON CONFLICT (id) DO UPDATE SET
                  kind = excluded.kind,
                  peer_id = COALESCE(excluded.peer_id, peer_id),
@@ -376,7 +382,9 @@ impl Store {
                  unread = CASE WHEN excluded.read_seq >= read_seq THEN excluded.unread ELSE unread END,
                  peer_delivered_seq = MAX(peer_delivered_seq, excluded.peer_delivered_seq),
                  peer_read_seq = MAX(peer_read_seq, excluded.peer_read_seq),
-                 updated_at = MAX(updated_at, excluded.updated_at)",
+                 updated_at = MAX(updated_at, excluded.updated_at),
+                 hidden = excluded.hidden,
+                 peer_deleted = MAX(peer_deleted, excluded.peer_deleted)",
             params![
                 bytes(id.0),
                 kind.code(),
@@ -388,10 +396,32 @@ impl Store {
                 delivered,
                 read,
                 summary.updated_at,
+                summary.hidden,
+                summary.peer_deleted,
             ],
         )?;
         let after = self.conversation(id)?;
         Ok(if after == before { None } else { after })
+    }
+
+    /// A conversation's flags as the server last told them (`ConversationFlags`, or the
+    /// answer to a hide or unhide). A deleted peer stays deleted. `None` if nothing changed,
+    /// or if the conversation is not stored yet (the next listing brings it).
+    pub fn apply_flags(
+        &mut self,
+        id: ConversationId,
+        hidden: bool,
+        peer_deleted: bool,
+    ) -> Result<Option<Conversation>, SdkError> {
+        let changed = self.conn.execute(
+            "UPDATE conversation SET hidden = ?2, peer_deleted = MAX(peer_deleted, ?3)
+             WHERE id = ?1 AND (hidden <> ?2 OR peer_deleted < ?3)",
+            params![bytes(id.0), hidden, peer_deleted],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        self.conversation(id)
     }
 
     /// A receipt: the highest positions win. The conversation if they moved.
@@ -886,7 +916,7 @@ impl Store {
 }
 
 const CONVERSATION_COLUMNS: &str = "SELECT id, kind, peer_id, title, last_seq, read_seq, unread,
-    peer_delivered_seq, peer_read_seq, updated_at FROM conversation";
+    peer_delivered_seq, peer_read_seq, updated_at, hidden, peer_deleted FROM conversation";
 
 fn conversation_row(row: &Row<'_>) -> rusqlite::Result<Conversation> {
     let peer: Option<Vec<u8>> = row.get(2)?;
@@ -902,6 +932,8 @@ fn conversation_row(row: &Row<'_>) -> rusqlite::Result<Conversation> {
         peer_delivered_seq: row.get(7)?,
         peer_read_seq: row.get(8)?,
         updated_at: row.get(9)?,
+        hidden: row.get(10)?,
+        peer_deleted: row.get(11)?,
     })
 }
 
@@ -1512,6 +1544,8 @@ pub(crate) mod tests {
             .unwrap();
         let held = store.messages(conversation, None, 10).unwrap();
         assert_eq!(held[1].kind, MessageKind::Rich);
+        let upgraded = store.conversation(conversation).unwrap().unwrap();
+        assert!(!upgraded.hidden && !upgraded.peer_deleted);
     }
 
     #[test]

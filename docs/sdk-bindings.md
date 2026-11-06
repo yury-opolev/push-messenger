@@ -82,11 +82,20 @@ ending in `Ms`, which are milliseconds, and absent values are `null`.
   `answerSeq` (cards) is the `seq` of the answer that closed the card, once answered;
   `cardSeq` (answers) is the `seq` of the card answered. Both are `null` otherwise.
 - **Conversation:** `{id, kind, peer, title, lastSeq, readSeq, unread, peerDeliveredSeq,
-  peerReadSeq, updatedAt}`; `kind` is `direct`, `group` or `unknown`.
+  peerReadSeq, updatedAt, hidden, peerDeleted}`; `kind` is `direct`, `group` or `unknown`.
+  `hidden`: the user hid this direct conversation (on any of their devices; a new message
+  shows it again). The SDK keeps hidden conversations and leaves it to the app to filter
+  them. `peerDeleted`: the peer's account was deleted. Hide and unhide with
+  `hide_conversation(id)` / `unhide_conversation(id)` (`hideConversation`,
+  `unhideConversation`, `push_client_hide_conversation`, `push_client_unhide_conversation`),
+  which answer the conversation; `invalid` for a group. Changes from other devices come as
+  `conversationChanged`.
 - **Contact:** `{userId, state}`; `state` is `none`, `requestedOut`, `requestedIn`,
   `accepted` or `blocked`.
 - **Invite:** `{code, expiresAt, maxUses, uses}`. **Profile:** `{userId, handle,
-  displayName}`. **Device:** `{deviceId, name, platform, createdAt, lastSeenAt, current}`.
+  displayName, kind, ownerUserId, deleted}`; a deleted account the user could already see is a
+  tombstone: `deleted` true, `displayName` `Deleted agent` or `Deleted account`, `handle`
+  empty, `ownerUserId` null. **Device:** `{deviceId, name, platform, createdAt, lastSeenAt, current}`.
 - **Error** (inside `sendFailed`): `{code, message, retryable, retryAfterS}`.
 - **Activity:** `{conversationId, userId, state, label, expiresAtMs}`; `state` is
   `typing`, `working`, `waiting` or `idle`; `label` is plain text to show inert, or `null`;

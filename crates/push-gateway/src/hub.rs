@@ -404,6 +404,7 @@ fn server_frame(kind: Kind) -> Option<Body> {
         Kind::PresenceChanged(presence) => Body::PresenceEvent(PresenceEvent {
             presence: Some(presence),
         }),
+        Kind::ConversationFlags(flags) => Body::ConversationFlags(flags),
         // Call frames target devices, not every connection of the user: `forward_call`.
         Kind::Call(_) => return None,
     })
@@ -979,6 +980,28 @@ mod tests {
         for frame in frames {
             assert_eq!(pending(&mut session), Some(Signal::Frame(Box::new(frame))));
         }
+        assert_eq!(pending(&mut session), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn conversation_flags_become_their_server_frame() {
+        let (hub, _commands) = hub();
+        let user = Uuid::now_v7();
+        let (mut session, _, _) = connection(&hub, user).await;
+        let flags = v1::ConversationFlags {
+            conversation_id: id_bytes(Uuid::now_v7()),
+            hidden: true,
+            peer_deleted: true,
+        };
+        let payload = Notification {
+            kind: Some(Kind::ConversationFlags(flags.clone())),
+        }
+        .encode_to_vec();
+        hub.dispatch(&notify_channel(user), &payload);
+        assert_eq!(
+            pending(&mut session),
+            Some(Signal::Frame(Box::new(Body::ConversationFlags(flags))))
+        );
         assert_eq!(pending(&mut session), None);
     }
 

@@ -355,6 +355,18 @@ where
             .map_err(domain_error)?;
         Ok(Response::new(AccountsResponse {}))
     }
+
+    async fn user_deleted(
+        &self,
+        request: Request<AccountUser>,
+    ) -> Result<Response<AccountsResponse>, Status> {
+        let user = parse_id(&request.into_inner().user_id, "user_id", UserId)?;
+        self.messaging
+            .user_deleted(user)
+            .await
+            .map_err(domain_error)?;
+        Ok(Response::new(AccountsResponse {}))
+    }
 }
 
 /// The `Directory` service: whose profiles a user may see, for auth-svc's

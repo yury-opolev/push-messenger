@@ -664,7 +664,15 @@ relay nor a redelivered event closes a session that signed in after the reset.
   they can no longer chat with therefore stay visible next to old messages: after a block
   in either direction and after leaving a group (owner decision). 1 to 100 ids; other and
   unknown ids are left out; without message-svc's answer it fails closed with a retryable
-  503.
+  503. Every profile carries `deleted` and `state` (`active` or `deleted`). A deleted
+  (disabled) account among the visible ids is a **tombstone** (2026-11-06): `deleted: true`,
+  `state: "deleted"`, its `kind`, `display_name` `Deleted agent` or `Deleted account`,
+  `handle: ""` (a string, so older clients still parse it) and `owner_user_id: null`.
+  Visibility is unchanged: message-svc still holds the contact and membership rows, so only
+  users who could see the account before get a tombstone. Deleting an account writes
+  `user.deleted`, relayed to message-svc (`Accounts.UserDeleted`), which records it and
+  flags the deleted user's direct conversations `peer_deleted` for their peers
+  ([design](2026-11-06-tombstones-hide-design.md)).
 
 ### 5.6 Passwords and rate limits
 
@@ -695,7 +703,8 @@ Implementation notes (push-auth, Plan 5A):
   separate authors with ordinary limits, never automatically provisioned by sign-in;
   deletion disables the agent, releases its app identity for a new enrollment and relays
   socket close 4003 without deleting history.
-  Pending and disabled agents are not returned by public/batch profile lookup. Errors are
+  Pending and disabled agents are not returned by public lookup; batch profiles answer a
+  disabled agent the caller could see as a tombstone (§5.5). Errors are
   `{"error": {"code", "message", "retryable"}}`; 429 carries `Retry-After`; 503
   `unavailable` is retryable and carries `Retry-After: 1`. No answer may be cached except
   the JWKS.
@@ -847,7 +856,8 @@ Request frames carry a client-chosen `request_id`, echoed in the response:
 
 | Request | Fields |
 |---|---|
-| ListConversations | `changed_since` (optional) |
+| ListConversations | `changed_since` (optional), `include_hidden` |
+| HideConversation / UnhideConversation | `conversation_id` (direct only; per user, on all of the user's devices; a new message un-hides; [design](2026-11-06-tombstones-hide-design.md)) |
 | FetchHistory | `conversation_id, before_seq, limit` |
 | OpenDirect | `peer_user_id` |
 | ContactRequest / Accept / Decline / Block / Unblock | `user_id` |
@@ -870,6 +880,7 @@ Request frames carry a client-chosen `request_id`, echoed in the response:
 | ReadPosition | `conversation_id, read_seq` — the user's own read position moved |
 | ContactEvent | `user_id, state` |
 | ActivityEvent / PresenceEvent | another member's activity / a contact's presence ([activity-presence.md](../../activity-presence.md)) |
+| ConversationFlags | `conversation_id, hidden, peer_deleted` — the user's flags of a conversation changed (hidden or unhidden on any device, un-hidden by a new message, or the peer deleted); `ListConversations` gives the same flags (`ConversationSummary.hidden`, `peer_deleted`) |
 | Response | `request_id` and the request-specific result |
 | AuthExpiring | `expires_in_s` |
 | Error | `code, message, retryable`, plus `client_msg_id` or `request_id`, and `retry_after_s` when rate limited |
@@ -1086,7 +1097,8 @@ Implementation notes (push-proto, Plan 4A):
   registers the device, or signs the device it registered before in again), sign-out,
   connect, disconnect; `send`, `edit`, `delete`, `cancel`, `mark_read`, `fetch_history`,
   `list_conversations`, the local conversations, messages and contacts; contacts,
-  invites, `open_direct`; profiles, handle lookup, devices and revocation. Groups are
+  invites, `open_direct`, `hide_conversation` / `unhide_conversation` (conversations carry
+  `hidden` and `peer_deleted`); profiles (`deleted` marks a tombstone), handle lookup, devices and revocation. Groups are
   not offered in the first release (owner decision), so there are no group calls yet.
   Once connected it sends whatever the outbox holds, also after a restart.
 - `send` returns the local echo; its `client_msg_id` is the handle: `edit` and `delete`

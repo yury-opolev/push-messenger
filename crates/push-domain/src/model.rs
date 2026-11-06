@@ -223,6 +223,22 @@ pub struct ConversationSummary {
     pub members: Vec<UserId>,
     /// Current admins of a group, sorted. Empty for a direct conversation.
     pub admins: Vec<UserId>,
+    /// The user hid this direct conversation (listed only when hidden ones are asked for).
+    pub hidden: bool,
+    /// Direct only: the other member's account was deleted.
+    pub peer_deleted: bool,
+}
+
+/// A user's flags of one direct conversation, as the store keeps them: only conversations
+/// the user ever hid or unhid, or whose other member was deleted, have flags.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversationFlags {
+    pub conversation_id: ConversationId,
+    pub hidden: bool,
+    pub peer_deleted: bool,
+    /// When a flag last changed: the later of the last hide or unhide and the peer's
+    /// deletion.
+    pub changed_at: DateTime<Utc>,
 }
 
 /// Receipt positions in a conversation listing. Delivered is never below read.

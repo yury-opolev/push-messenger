@@ -15,10 +15,11 @@ use push_proto::internal::v1::{
 use push_proto::v1::{
     self, AddMembers, Contact, ContactAccept, ContactBlock, ContactRequest, ContactState,
     ContactUnblock, ContentType, ConversationKind, CreateGroup, CreateInvite, Delete, Deliver,
-    DirectReceipts, Done, Edit, EntryKind, ErrorCode, FetchHistory, GetPresence, InviteRedeemed,
-    LeaveGroup, ListContacts, ListConversations, OpenDirect, Presence, PresenceSharing,
-    PresenceState, ReadUpTo, RedeemInvite, RemoveMember, RenameGroup, RevokeInvite, Role, SendAck,
-    SetPresenceSharing, SetRole, conversation_summary, delete, edit, request, response,
+    DirectReceipts, Done, Edit, EntryKind, ErrorCode, FetchHistory, GetPresence, HideConversation,
+    InviteRedeemed, LeaveGroup, ListContacts, ListConversations, OpenDirect, Presence,
+    PresenceSharing, PresenceState, ReadUpTo, RedeemInvite, RemoveMember, RenameGroup,
+    RevokeInvite, Role, SendAck, SetPresenceSharing, SetRole, UnhideConversation,
+    conversation_summary, delete, edit, request, response,
 };
 use push_proto::{error_from_status, id_bytes};
 use tonic::{Code, Request, Status};
@@ -209,7 +210,10 @@ fn message_id(ack: &SendAck) -> edit::Target {
 }
 
 fn list_conversations(changed_since: Option<i64>) -> request::Body {
-    request::Body::ListConversations(ListConversations { changed_since })
+    request::Body::ListConversations(ListConversations {
+        changed_since,
+        include_hidden: false,
+    })
 }
 
 #[tokio::test]
@@ -1157,4 +1161,82 @@ async fn set_presence_sharing_without_a_value_reads_it() {
     assert!(!sharing(&world, &alice, Some(false)).await);
     assert!(sharing(&world, &alice, Some(true)).await);
     assert!(sharing(&world, &alice, None).await);
+}
+
+#[tokio::test]
+async fn hiding_a_direct_conversation_filters_the_listing_until_unhidden() {
+    let world = world();
+    let (alice, bob, chat) = world.chat().await;
+    let hide = || {
+        request::Body::HideConversation(HideConversation {
+            conversation_id: id_bytes(chat.0),
+        })
+    };
+    let listed = |include_hidden| {
+        request::Body::ListConversations(ListConversations {
+            changed_since: None,
+            include_hidden,
+        })
+    };
+    let flags = |body: response::Body| match body {
+        response::Body::Conversations(list) => list
+            .conversations
+            .iter()
+            .map(|summary| (summary.hidden, summary.peer_deleted))
+            .collect::<Vec<_>>(),
+        other => panic!("not a listing: {other:?}"),
+    };
+    assert_eq!(
+        world.request(&alice, hide()).await.unwrap(),
+        response::Body::Done(Done {})
+    );
+    assert_eq!(
+        flags(world.request(&alice, listed(false)).await.unwrap()),
+        []
+    );
+    assert_eq!(
+        flags(world.request(&alice, listed(true)).await.unwrap()),
+        [(true, false)]
+    );
+    assert_eq!(
+        flags(world.request(&bob, listed(false)).await.unwrap()),
+        [(false, false)]
+    );
+
+    // Bob's account is deleted: Alice's view says so.
+    world.svc.user_deleted(bob.user).await.unwrap();
+    assert_eq!(
+        flags(world.request(&alice, listed(true)).await.unwrap()),
+        [(true, true)]
+    );
+    let unhide = request::Body::UnhideConversation(UnhideConversation {
+        conversation_id: id_bytes(chat.0),
+    });
+    world.request(&alice, unhide).await.unwrap();
+    assert_eq!(
+        flags(world.request(&alice, listed(false)).await.unwrap()),
+        [(false, true)]
+    );
+
+    let group = world.svc.create_group(alice.user, "G", &[]).await.unwrap();
+    let status = world
+        .request(
+            &alice,
+            request::Body::HideConversation(HideConversation {
+                conversation_id: id_bytes(group.0),
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(failure(&status), (ErrorCode::Invalid, true));
+    let status = world
+        .request(
+            &alice,
+            request::Body::HideConversation(HideConversation {
+                conversation_id: vec![1, 2],
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), Code::InvalidArgument);
 }

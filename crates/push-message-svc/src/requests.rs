@@ -151,12 +151,21 @@ async fn answer<S: Store, C: Clock, N: Notifier>(
         request::Body::ListConversations(list) => {
             let since = list.changed_since.map(from_micros).transpose()?;
             let summaries = messaging
-                .list_conversations(user, since)
+                .list_conversations_with(user, since, list.include_hidden)
                 .await
                 .map_err(domain_error)?;
             response::Body::Conversations(ConversationList {
                 conversations: summaries.into_iter().map(summary).collect(),
             })
+        }
+        request::Body::HideConversation(hide) => {
+            let conversation = parse_id(&hide.conversation_id, "conversation_id", ConversationId)?;
+            done(messaging.hide_conversation(user, conversation).await)?
+        }
+        request::Body::UnhideConversation(unhide) => {
+            let conversation =
+                parse_id(&unhide.conversation_id, "conversation_id", ConversationId)?;
+            done(messaging.unhide_conversation(user, conversation).await)?
         }
         request::Body::FetchHistory(fetch) => {
             let conversation = parse_id(&fetch.conversation_id, "conversation_id", ConversationId)?;
@@ -449,6 +458,8 @@ fn summary(summary: ConversationSummary) -> v1::ConversationSummary {
         updated_at: micros(summary.updated_at),
         members: users(&summary.members),
         admins: users(&summary.admins),
+        hidden: summary.hidden,
+        peer_deleted: summary.peer_deleted,
     }
 }
 

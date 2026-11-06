@@ -93,6 +93,10 @@ service Accounts {
   // latest reset counts: a repeated or an older event moves nothing, except one without
   // `reset_at`, which takes message-svc's clock again on every delivery.
   rpc PasswordReset(AccountUser) returns (AccountsResponse);
+  // user.deleted: the account was deleted (an owner deleted an agent). Recorded once (the
+  // first time is kept, and an unknown user is recorded too); the other member of each of
+  // the user's direct conversations is sent ConversationFlags with peer_deleted.
+  rpc UserDeleted(AccountUser) returns (AccountsResponse);
 }
 
 message AccountAgent {
@@ -310,6 +314,9 @@ message Notification {
     // Call frames for some of the user's devices (only calls-active connections of
     // those devices get them). Never logged: it carries SDP and ICE candidates.
     CallSignal call = 7;
+    // The user's flags of a conversation changed (hidden, peer_deleted); sent to every
+    // connection of the user as conversation_flags.
+    push.v1.ConversationFlags conversation_flags = 8;
   }
 }
 

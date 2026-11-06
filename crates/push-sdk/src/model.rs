@@ -84,6 +84,11 @@ pub struct Conversation {
     pub peer_read_seq: i64,
     /// When it was created or last appended to.
     pub updated_at: i64,
+    /// The user hid this direct conversation (on any of their devices); a new message
+    /// shows it again. The app decides whether to show hidden conversations.
+    pub hidden: bool,
+    /// Direct only: the peer's account was deleted (their profile is a tombstone).
+    pub peer_deleted: bool,
 }
 
 impl std::fmt::Debug for Conversation {
@@ -100,6 +105,8 @@ impl std::fmt::Debug for Conversation {
             .field("peer_delivered_seq", &self.peer_delivered_seq)
             .field("peer_read_seq", &self.peer_read_seq)
             .field("updated_at", &self.updated_at)
+            .field("hidden", &self.hidden)
+            .field("peer_deleted", &self.peer_deleted)
             .finish()
     }
 }

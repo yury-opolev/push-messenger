@@ -16,9 +16,9 @@ use crate::calls::{CallHistoryRow, HistoryCursor};
 use crate::error::{DomainError, DomainResult};
 use crate::ids::{ClientMsgId, ConversationId, DeviceId, MessageId, UserId};
 use crate::model::{
-    ContactState, ContentType, Conversation, ConversationKind, ConversationOverview, DeviceState,
-    Entry, EntryKind, GroupPositions, InviteRecord, Member, PublisherOwner, Role, StoredTemplate,
-    TemplateEvent, TemplateStatus,
+    ContactState, ContentType, Conversation, ConversationFlags, ConversationKind,
+    ConversationOverview, DeviceState, Entry, EntryKind, GroupPositions, InviteRecord, Member,
+    PublisherOwner, Role, StoredTemplate, TemplateEvent, TemplateStatus,
 };
 use crate::store::{InsertOutcome, Store, Tx};
 use crate::templates::TemplateRef;
@@ -84,6 +84,10 @@ struct State {
     template_events: Vec<TemplateEvent>,
     /// Call history rows by `(user, call)`, with when the user hid them.
     call_history: BTreeMap<(UserId, Uuid), HistoryEntry>,
+    /// Hidden or not, and when that last changed, by `(conversation, user)`.
+    conversation_views: HashMap<(ConversationId, UserId), (bool, DateTime<Utc>)>,
+    /// Users whose account was deleted, with when message-svc recorded it.
+    deleted_users: HashMap<UserId, DateTime<Utc>>,
 }
 
 impl State {
@@ -963,6 +967,111 @@ impl Tx for InMemoryTx {
                     return None;
                 }
                 Some(state.overview(conversation, member, unread_cap))
+            })
+            .collect())
+    }
+
+    async fn set_conversation_hidden(
+        &mut self,
+        conversation: ConversationId,
+        user: UserId,
+        hidden: bool,
+        at: DateTime<Utc>,
+    ) -> DomainResult<bool> {
+        if !self.work.members.contains_key(&(conversation, user)) {
+            return Err(missing("member"));
+        }
+        let was = self
+            .work
+            .conversation_views
+            .get(&(conversation, user))
+            .is_some_and(|(hidden, _)| *hidden);
+        if was == hidden {
+            return Ok(false);
+        }
+        self.work
+            .conversation_views
+            .insert((conversation, user), (hidden, at));
+        Ok(true)
+    }
+
+    async fn unhide_conversation(
+        &mut self,
+        conversation: ConversationId,
+        at: DateTime<Utc>,
+    ) -> DomainResult<Vec<UserId>> {
+        let mut shown = Vec::new();
+        for ((id, user), view) in &mut self.work.conversation_views {
+            if *id == conversation && view.0 {
+                *view = (false, at);
+                shown.push(*user);
+            }
+        }
+        shown.sort();
+        Ok(shown)
+    }
+
+    async fn conversation_flags(&mut self, user: UserId) -> DomainResult<Vec<ConversationFlags>> {
+        let state = &self.work;
+        Ok(state
+            .members
+            .keys()
+            .filter(|(_, member)| *member == user)
+            .filter_map(|(conversation, _)| {
+                let found = state.conversations.get(conversation)?;
+                if found.kind != ConversationKind::Direct {
+                    return None;
+                }
+                let view = state.conversation_views.get(&(*conversation, user));
+                let deleted = state
+                    .members
+                    .keys()
+                    .filter(|(id, peer)| id == conversation && *peer != user)
+                    .find_map(|(_, peer)| state.deleted_users.get(peer));
+                let changed_at = match (view, deleted) {
+                    (None, None) => return None,
+                    (Some((_, at)), None) | (None, Some(at)) => *at,
+                    (Some((_, viewed)), Some(deleted)) => (*viewed).max(*deleted),
+                };
+                Some(ConversationFlags {
+                    conversation_id: *conversation,
+                    hidden: view.is_some_and(|(hidden, _)| *hidden),
+                    peer_deleted: deleted.is_some(),
+                    changed_at,
+                })
+            })
+            .collect())
+    }
+
+    async fn mark_user_deleted(&mut self, user: UserId, at: DateTime<Utc>) -> DomainResult<bool> {
+        if !self.work.users.contains(&user) {
+            return Err(missing("user"));
+        }
+        if self.work.deleted_users.contains_key(&user) {
+            return Ok(false);
+        }
+        self.work.deleted_users.insert(user, at);
+        Ok(true)
+    }
+
+    async fn direct_peers(&mut self, user: UserId) -> DomainResult<Vec<(ConversationId, UserId)>> {
+        let state = &self.work;
+        Ok(state
+            .members
+            .keys()
+            .filter(|(conversation, member)| {
+                *member == user
+                    && state
+                        .conversations
+                        .get(conversation)
+                        .is_some_and(|found| found.kind == ConversationKind::Direct)
+            })
+            .filter_map(|(conversation, _)| {
+                state
+                    .members
+                    .keys()
+                    .find(|(id, peer)| id == conversation && *peer != user)
+                    .map(|(_, peer)| (*conversation, *peer))
             })
             .collect())
     }

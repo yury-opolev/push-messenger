@@ -13,6 +13,7 @@ use crate::{Backend, Case};
 
 mod call_history;
 mod contacts;
+mod conversation_view;
 mod conversations;
 mod entries;
 mod overviews;
@@ -32,6 +33,7 @@ pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
         ("contract::overviews", overviews::cases()),
         ("contract::templates", templates::cases()),
         ("contract::call_history", call_history::cases()),
+        ("contract::conversation_view", conversation_view::cases()),
     ];
     modules
         .into_iter()

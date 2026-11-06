@@ -488,6 +488,32 @@ impl NativeClient {
         })
     }
 
+    /// Hides a direct conversation on all of the user's devices; resolves to it.
+    #[napi(catch_unwind)]
+    pub fn hide_conversation<'env>(
+        &self,
+        env: &'env Env,
+        id: String,
+    ) -> napi::Result<Object<'env>> {
+        self.promise(env, |client| async move {
+            let conversation = client.hide_conversation(conversation_id(&id)?).await?;
+            Ok(json::conversation(&conversation))
+        })
+    }
+
+    /// Shows a hidden direct conversation again; resolves to it.
+    #[napi(catch_unwind)]
+    pub fn unhide_conversation<'env>(
+        &self,
+        env: &'env Env,
+        id: String,
+    ) -> napi::Result<Object<'env>> {
+        self.promise(env, |client| async move {
+            let conversation = client.unhide_conversation(conversation_id(&id)?).await?;
+            Ok(json::conversation(&conversation))
+        })
+    }
+
     #[napi(catch_unwind)]
     pub fn list_contacts<'env>(&self, env: &'env Env) -> napi::Result<Object<'env>> {
         self.promise(env, |client| async move {

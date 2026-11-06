@@ -12,6 +12,7 @@ mod conversations;
 mod edit;
 pub mod error;
 mod groups;
+mod hiding;
 mod history;
 pub mod ids;
 mod invites;
@@ -40,7 +41,7 @@ pub use history::HistoryPage;
 pub use ids::{CallId, ClientMsgId, ConversationId, DeviceId, MessageId, UserId};
 pub use memory::InMemoryStore;
 pub use model::{
-    ContactState, ContactSummary, ContentType, Conversation, ConversationKind,
+    ContactState, ContactSummary, ContentType, Conversation, ConversationFlags, ConversationKind,
     ConversationOverview, ConversationState, ConversationSummary, DeviceState, Entry, EntryKind,
     GroupPositions, Invite, InviteRecord, Member, MemberState, Positions, PublisherOwner, Receipts,
     Role, SendReceipt, StoredTemplate, TemplateAction, TemplateEvent, TemplateStatus, direct_key,

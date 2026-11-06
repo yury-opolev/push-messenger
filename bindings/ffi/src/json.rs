@@ -120,6 +120,8 @@ pub fn conversation(conversation: &Conversation) -> Value {
         "peerDeliveredSeq": conversation.peer_delivered_seq,
         "peerReadSeq": conversation.peer_read_seq,
         "updatedAt": conversation.updated_at,
+        "hidden": conversation.hidden,
+        "peerDeleted": conversation.peer_deleted,
     })
 }
 
@@ -150,6 +152,7 @@ pub fn profile(profile: &Profile) -> Value {
         "displayName": profile.display_name,
         "kind": profile.kind,
         "ownerUserId": profile.owner_user_id.map(|id| id.to_string()),
+        "deleted": profile.deleted,
     })
 }
 
@@ -816,6 +819,8 @@ mod tests {
                 peer_delivered_seq: 0,
                 peer_read_seq: 0,
                 updated_at: 0,
+                hidden: false,
+                peer_deleted: false,
             }),
             Event::ContactChanged(Contact {
                 user_id: user,

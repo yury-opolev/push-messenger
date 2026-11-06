@@ -347,6 +347,20 @@ int32_t push_client_open_direct(const PushClient *client,
                                 char **conversation_json,
                                 PushError **error);
 
+// Hides a direct conversation from the user's own listings, on all of their devices (a
+// new message shows it again); writes the conversation as JSON. `invalid` for a group.
+int32_t push_client_hide_conversation(const PushClient *client,
+                                      const char *conversation_id_text,
+                                      char **conversation_json,
+                                      PushError **error);
+
+// Shows a hidden direct conversation again, on all of the user's devices; writes the
+// conversation as JSON.
+int32_t push_client_unhide_conversation(const PushClient *client,
+                                        const char *conversation_id_text,
+                                        char **conversation_json,
+                                        PushError **error);
+
 // Lists the user's relationships from the server, as a JSON array.
 int32_t push_client_list_contacts(const PushClient *client,
                                   char **contacts_json,

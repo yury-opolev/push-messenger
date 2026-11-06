@@ -18,6 +18,34 @@ pub struct PublicProfile {
     pub display_name: String,
     pub kind: String,
     pub owner_user_id: Option<Uuid>,
+    /// A deleted account: see [`Self::tombstone`].
+    pub deleted: bool,
+}
+
+impl PublicProfile {
+    /// What remains visible of a deleted account: its id and kind, a neutral name ("Deleted
+    /// agent" or "Deleted account"), an empty handle and no owner. Nothing a viewer could
+    /// not see before.
+    pub fn tombstone(user_id: Uuid, kind: String) -> Self {
+        let display_name = if kind == "agent" {
+            "Deleted agent"
+        } else {
+            "Deleted account"
+        };
+        Self {
+            user_id,
+            handle: String::new(),
+            display_name: display_name.to_owned(),
+            kind,
+            owner_user_id: None,
+            deleted: true,
+        }
+    }
+
+    /// `"deleted"` for a tombstone, else `"active"`.
+    pub fn state(&self) -> &'static str {
+        if self.deleted { "deleted" } else { "active" }
+    }
 }
 
 /// The caller's own profile, with their email.
@@ -142,27 +170,37 @@ impl Auth {
             display_name: row.get(2),
             kind: row.get(3),
             owner_user_id: row.get(4),
+            deleted: false,
         })
     }
 
-    /// The profiles of the verified users among `users`, sorted by user id. The caller
-    /// checks first that they may be shown (`GET /v1/users?ids=…` asks message-svc).
+    /// The profiles of the verified users among `users`, sorted by user id: a deleted
+    /// (disabled) account as a tombstone ([`PublicProfile::tombstone`]). The caller checks
+    /// first that they may be shown (`GET /v1/users?ids=…` asks message-svc), so a
+    /// tombstone only reaches someone who could see the account before it was deleted.
     pub async fn profiles(&self, users: &[Uuid]) -> Result<Vec<PublicProfile>, AuthError> {
         let rows = sqlx::query(
-            "SELECT user_id, handle::text, display_name, kind, owner_user_id FROM auth.user_account \
-             WHERE user_id = ANY($1) AND email_verified_at IS NOT NULL AND disabled_at IS NULL ORDER BY user_id",
+            "SELECT user_id, handle::text, display_name, kind, owner_user_id, \
+             disabled_at IS NOT NULL FROM auth.user_account \
+             WHERE user_id = ANY($1) AND email_verified_at IS NOT NULL ORDER BY user_id",
         )
         .bind(users)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows
             .iter()
-            .map(|row| PublicProfile {
-                user_id: row.get(0),
-                handle: row.get(1),
-                display_name: row.get(2),
-                kind: row.get(3),
-                owner_user_id: row.get(4),
+            .map(|row| {
+                if row.get::<bool, _>(5) {
+                    return PublicProfile::tombstone(row.get(0), row.get(3));
+                }
+                PublicProfile {
+                    user_id: row.get(0),
+                    handle: row.get(1),
+                    display_name: row.get(2),
+                    kind: row.get(3),
+                    owner_user_id: row.get(4),
+                    deleted: false,
+                }
             })
             .collect())
     }
