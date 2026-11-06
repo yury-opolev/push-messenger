@@ -292,7 +292,7 @@ async fn sign_up_verify_register_and_use_a_device() {
     .await;
     assert_eq!(
         found.json(),
-        json!({"user_id": tokens["user_id"], "handle": "alice", "display_name": "Alice A.", "kind":"user", "owner_user_id":null})
+        json!({"user_id": tokens["user_id"], "handle": "alice", "display_name": "Alice A.", "kind":"user", "owner_user_id":null, "owner_display_name":null, "owner_handle":null})
     );
     assert!(found.json().get("email").is_none());
 
@@ -646,8 +646,8 @@ async fn profiles_are_shown_only_to_related_users() {
     assert_eq!(answer.status, StatusCode::OK, "{}", answer.text);
     assert_eq!(answer.headers["cache-control"], "no-store");
     let mut expected = vec![
-        json!({"user_id": alice["user_id"], "handle": "alice", "display_name": "alice", "kind":"user", "owner_user_id":null, "deleted": false, "state": "active"}),
-        json!({"user_id": bob["user_id"], "handle": "bob", "display_name": "bob", "kind":"user", "owner_user_id":null, "deleted": false, "state": "active"}),
+        json!({"user_id": alice["user_id"], "handle": "alice", "display_name": "alice", "kind":"user", "owner_user_id":null, "owner_display_name":null, "owner_handle":null, "deleted": false, "state": "active"}),
+        json!({"user_id": bob["user_id"], "handle": "bob", "display_name": "bob", "kind":"user", "owner_user_id":null, "owner_display_name":null, "owner_handle":null, "deleted": false, "state": "active"}),
     ];
     expected.sort_by_key(|user| user["user_id"].as_str().unwrap().to_owned());
     assert_eq!(answer.json(), json!({ "users": expected }));

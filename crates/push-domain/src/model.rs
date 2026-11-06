@@ -15,6 +15,49 @@ pub enum ContactState {
     Blocked,
 }
 
+/// Who an agent accepts contact requests from (spec 2026-11-06 agent connections, D1).
+/// Set by the agent's owner only; an agent without a stored policy asks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AgentPolicy {
+    /// Every request waits for the owner.
+    #[default]
+    Ask,
+    /// Agents owned by the same owner are accepted; the rest wait.
+    AutoOwn,
+    /// The owner's accepted contacts, and agents owned by the owner or by those contacts,
+    /// are accepted; the rest wait.
+    AutoOwnerContacts,
+    /// Everyone is accepted.
+    AutoAny,
+    /// Everyone but the owner is refused, as a decline looks to the requester.
+    RefuseAll,
+}
+
+impl AgentPolicy {
+    /// The stored code, 1 to 5 in the order above.
+    pub fn code(self) -> i16 {
+        match self {
+            Self::Ask => 1,
+            Self::AutoOwn => 2,
+            Self::AutoOwnerContacts => 3,
+            Self::AutoAny => 4,
+            Self::RefuseAll => 5,
+        }
+    }
+
+    /// The policy of a stored code.
+    pub fn from_code(code: i16) -> Option<Self> {
+        Some(match code {
+            1 => Self::Ask,
+            2 => Self::AutoOwn,
+            3 => Self::AutoOwnerContacts,
+            4 => Self::AutoAny,
+            5 => Self::RefuseAll,
+            _ => return None,
+        })
+    }
+}
+
 /// One of a user's contact relationships, as that user sees it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ContactSummary {

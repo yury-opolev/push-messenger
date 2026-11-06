@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use push_domain::calls::{CallDirection, CallHistoryRow, EndReason, HistoryCursor};
 use push_domain::templates::TemplateRef;
 use push_domain::{
-    ClientMsgId, ContactState, Conversation, ConversationFlags, ConversationId,
+    AgentPolicy, ClientMsgId, ContactState, Conversation, ConversationFlags, ConversationId,
     ConversationOverview, DeviceId, DeviceState, DomainError, DomainResult, Entry, EntryKind,
     GroupPositions, InsertOutcome, InviteRecord, Member, MessageId, PublisherOwner, Store,
     StoredTemplate, TemplateEvent, TemplateStatus, Tx, UserId,
@@ -1277,6 +1277,231 @@ impl Tx for PgTx {
             .collect())
     }
 
+    async fn is_user_deleted(&mut self, user: UserId) -> DomainResult<bool> {
+        sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM messaging.deleted_user WHERE user_id = $1)",
+        )
+        .bind(user.0)
+        .fetch_one(self.conn())
+        .await
+        .map_err(store_error)
+    }
+
+    async fn agent_policy(&mut self, agent: UserId) -> DomainResult<Option<AgentPolicy>> {
+        let code: Option<i16> = sqlx::query_scalar(
+            "SELECT policy FROM messaging.agent_policy WHERE agent_user_id = $1",
+        )
+        .bind(agent.0)
+        .fetch_optional(self.conn())
+        .await
+        .map_err(store_error)?;
+        code.map(|code| {
+            AgentPolicy::from_code(code)
+                .ok_or_else(|| DomainError::Store(format!("unknown agent policy {code}")))
+        })
+        .transpose()
+    }
+
+    async fn set_agent_policy(
+        &mut self,
+        agent: UserId,
+        policy: AgentPolicy,
+        at: DateTime<Utc>,
+    ) -> DomainResult<()> {
+        sqlx::query(
+            "INSERT INTO messaging.agent_policy (agent_user_id, policy, changed_at) \
+             VALUES ($1, $2, $3) ON CONFLICT (agent_user_id) \
+             DO UPDATE SET policy = excluded.policy, changed_at = excluded.changed_at",
+        )
+        .bind(agent.0)
+        .bind(policy.code())
+        .bind(at)
+        .execute(self.conn())
+        .await
+        .map_err(store_error)?;
+        Ok(())
+    }
+
+    async fn forget_agent(&mut self, agent: UserId) -> DomainResult<()> {
+        sqlx::query(
+            "WITH policy AS (DELETE FROM messaging.agent_policy WHERE agent_user_id = $1) \
+             DELETE FROM messaging.agent_request_log WHERE agent_user_id = $1",
+        )
+        .bind(agent.0)
+        .execute(self.conn())
+        .await
+        .map_err(store_error)?;
+        Ok(())
+    }
+
+    async fn waiting_requests(
+        &mut self,
+        agent: UserId,
+    ) -> DomainResult<Vec<(UserId, DateTime<Utc>)>> {
+        let rows: Vec<(Uuid, DateTime<Utc>)> = sqlx::query_as(
+            "SELECT peer_id, updated_at FROM messaging.contact \
+             WHERE owner_id = $1 AND state = $2 ORDER BY updated_at, peer_id",
+        )
+        .bind(agent.0)
+        .bind(encode(ContactState::RequestedIn))
+        .fetch_all(self.conn())
+        .await
+        .map_err(store_error)?;
+        Ok(rows
+            .into_iter()
+            .map(|(peer, at)| (UserId(peer), at))
+            .collect())
+    }
+
+    async fn waiting_in_count(&mut self, agent: UserId) -> DomainResult<u32> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM messaging.contact WHERE owner_id = $1 AND state = $2",
+        )
+        .bind(agent.0)
+        .bind(encode(ContactState::RequestedIn))
+        .fetch_one(self.conn())
+        .await
+        .map_err(store_error)?;
+        count_u32(count)
+    }
+
+    async fn outgoing_counts(&mut self, user: UserId) -> DomainResult<(u32, u32)> {
+        let (pending, waiting): (i64, i64) = sqlx::query_as(
+            "SELECT count(*), count(*) FILTER (WHERE EXISTS ( \
+                 SELECT 1 FROM messaging.contact back \
+                 JOIN messaging.agent_owner agent ON agent.agent_user_id = back.owner_id \
+                 WHERE back.owner_id = mine.peer_id AND back.peer_id = mine.owner_id \
+                 AND back.state = $3)) \
+             FROM messaging.contact mine WHERE mine.owner_id = $1 AND mine.state = $2",
+        )
+        .bind(user.0)
+        .bind(encode(ContactState::RequestedOut))
+        .bind(encode(ContactState::RequestedIn))
+        .fetch_one(self.conn())
+        .await
+        .map_err(store_error)?;
+        Ok((count_u32(pending)?, count_u32(waiting)?))
+    }
+
+    async fn put_refusal(
+        &mut self,
+        requester: UserId,
+        agent: UserId,
+        release_at: DateTime<Utc>,
+    ) -> DomainResult<bool> {
+        let inserted = sqlx::query(
+            "INSERT INTO messaging.refused_request (requester_id, agent_user_id, release_at) \
+             VALUES ($1, $2, $3) ON CONFLICT (requester_id, agent_user_id) DO NOTHING",
+        )
+        .bind(requester.0)
+        .bind(agent.0)
+        .bind(release_at)
+        .execute(self.conn())
+        .await
+        .map_err(store_error)?
+        .rows_affected();
+        Ok(inserted > 0)
+    }
+
+    async fn delete_refusal(&mut self, requester: UserId, agent: UserId) -> DomainResult<bool> {
+        let deleted = sqlx::query(
+            "DELETE FROM messaging.refused_request WHERE requester_id = $1 AND agent_user_id = $2",
+        )
+        .bind(requester.0)
+        .bind(agent.0)
+        .execute(self.conn())
+        .await
+        .map_err(store_error)?
+        .rows_affected();
+        Ok(deleted > 0)
+    }
+
+    async fn due_refusals(
+        &mut self,
+        now: DateTime<Utc>,
+        limit: u32,
+    ) -> DomainResult<Vec<(UserId, UserId)>> {
+        let rows: Vec<(Uuid, Uuid)> = sqlx::query_as(
+            "SELECT requester_id, agent_user_id FROM messaging.refused_request \
+             WHERE release_at <= $1 ORDER BY release_at, requester_id, agent_user_id LIMIT $2",
+        )
+        .bind(now)
+        .bind(i64::from(limit))
+        .fetch_all(self.conn())
+        .await
+        .map_err(store_error)?;
+        Ok(rows
+            .into_iter()
+            .map(|(requester, agent)| (UserId(requester), UserId(agent)))
+            .collect())
+    }
+
+    async fn log_agent_request(
+        &mut self,
+        agent: UserId,
+        peer: UserId,
+        at: DateTime<Utc>,
+    ) -> DomainResult<()> {
+        sqlx::query(
+            "INSERT INTO messaging.agent_request_log (agent_user_id, peer_id, sent_at) \
+             VALUES ($1, $2, $3)",
+        )
+        .bind(agent.0)
+        .bind(peer.0)
+        .bind(at)
+        .execute(self.conn())
+        .await
+        .map_err(store_error)?;
+        Ok(())
+    }
+
+    async fn agent_requests_since(
+        &mut self,
+        agent: UserId,
+        since: DateTime<Utc>,
+    ) -> DomainResult<(u32, Option<DateTime<Utc>>)> {
+        let (count, oldest): (i64, Option<DateTime<Utc>>) = sqlx::query_as(
+            "SELECT count(*), min(sent_at) FROM messaging.agent_request_log \
+             WHERE agent_user_id = $1 AND sent_at >= $2",
+        )
+        .bind(agent.0)
+        .bind(since)
+        .fetch_one(self.conn())
+        .await
+        .map_err(store_error)?;
+        Ok((count_u32(count)?, oldest))
+    }
+
+    async fn prune_agent_requests(&mut self, before: DateTime<Utc>) -> DomainResult<u64> {
+        Ok(
+            sqlx::query("DELETE FROM messaging.agent_request_log WHERE sent_at < $1")
+                .bind(before)
+                .execute(self.conn())
+                .await
+                .map_err(store_error)?
+                .rows_affected(),
+        )
+    }
+
+    async fn message_counts(&mut self, user: UserId) -> DomainResult<Vec<(ConversationId, i64)>> {
+        let rows: Vec<(Uuid, i64)> = sqlx::query_as(
+            "SELECT m.conversation_id, count(*) FROM messaging.conversation_member m \
+             JOIN messaging.conversation c ON c.conversation_id = m.conversation_id \
+             JOIN messaging.message e ON e.conversation_id = m.conversation_id \
+              AND e.seq >= m.visible_from_seq AND e.seq <= coalesce(m.left_at_seq, c.last_seq) \
+             WHERE m.user_id = $1 AND e.kind = 1 AND e.deleted_at IS NULL \
+             GROUP BY m.conversation_id",
+        )
+        .bind(user.0)
+        .fetch_all(self.conn())
+        .await
+        .map_err(store_error)?;
+        Ok(rows
+            .into_iter()
+            .map(|(conversation, count)| (ConversationId(conversation), count))
+            .collect())
+    }
+
     async fn is_agent(&mut self, user: UserId) -> DomainResult<bool> {
         sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM messaging.agent_owner WHERE agent_user_id = $1)",
@@ -1730,4 +1955,9 @@ fn overview(row: &PgRow) -> Result<ConversationOverview, sqlx::Error> {
         left_at: row.try_get("left_at")?,
         conversation,
     })
+}
+
+/// A `count(*)` as `u32`.
+fn count_u32(count: i64) -> DomainResult<u32> {
+    u32::try_from(count).map_err(|_| DomainError::Store(format!("count {count} overflows")))
 }

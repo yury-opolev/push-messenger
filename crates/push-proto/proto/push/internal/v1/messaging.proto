@@ -155,6 +155,130 @@ service Calls {
   rpc Hide(HideCallRequest) returns (HideCallResponse);
 }
 
+// An agent's owner acting on the agent (spec 2026-11-06 agent connections and the owner
+// view), for auth-svc's /v1/agents/{agent_id}/... routes. Served on the Directory listener
+// with auth-svc's internal token; without it the call is UNAUTHENTICATED. auth-svc checks
+// the ownership first; message-svc checks it again: an agent that is not the owner's
+// (unknown, another owner's, not an agent) or that was deleted is NOT_FOUND
+// (push.v1.Error USER_NOT_FOUND). Malformed ids are INVALID_ARGUMENT.
+service AgentOwners {
+  // The agent's connection policy (ASK when never set).
+  rpc GetPolicy(AgentRef) returns (AgentPolicyReply);
+  // Sets the policy; requests already waiting keep waiting.
+  rpc SetPolicy(SetAgentPolicyRequest) returns (AgentPolicyReply);
+  // Requests waiting for the owner, oldest first.
+  rpc ListWaiting(AgentRef) returns (WaitingRequests);
+  // Approves, declines or blocks a requester as the agent. APPROVE and DECLINE without a
+  // waiting request are FAILED_PRECONDITION (NO_PENDING_REQUEST); the owner as user_id is
+  // FAILED_PRECONDITION (NOT_ALLOWED).
+  rpc Resolve(ResolveRequest) returns (AgentOwnersDone);
+  // The agent's relationships, as the agent sees them, sorted by user.
+  rpc ListContacts(AgentRef) returns (push.v1.ContactList);
+  // Ends any relationship of the agent with user_id (accepted, waiting, the agent's own
+  // request, the agent's block). Idempotent. The owner: FAILED_PRECONDITION (NOT_ALLOWED).
+  rpc RemoveContact(AgentPeerRequest) returns (AgentOwnersDone);
+  // The agent's conversations (read only).
+  rpc Conversations(AgentRef) returns (AgentConversations);
+  // One page of a conversation's history exactly as the agent sees it (read only).
+  rpc History(AgentHistoryRequest) returns (push.v1.HistoryPage);
+  // The agent's call history (read only).
+  rpc CallHistory(AgentCallHistoryRequest) returns (CallHistoryPage);
+}
+
+enum AgentPolicy {
+  AGENT_POLICY_UNSPECIFIED = 0;
+  // Every request waits for the owner (the default).
+  AGENT_POLICY_ASK = 1;
+  // The owner's own agents are accepted; the rest wait.
+  AGENT_POLICY_AUTO_OWN = 2;
+  // The owner's accepted contacts, and agents owned by the owner or by those contacts,
+  // are accepted; the rest wait.
+  AGENT_POLICY_AUTO_OWNER_CONTACTS = 3;
+  // Everyone is accepted.
+  AGENT_POLICY_AUTO_ANY = 4;
+  // Everyone but the owner is refused (as a decline looks).
+  AGENT_POLICY_REFUSE_ALL = 5;
+}
+
+message AgentRef {
+  bytes owner_user_id = 1;
+  bytes agent_user_id = 2;
+}
+
+message SetAgentPolicyRequest {
+  AgentRef agent = 1;
+  AgentPolicy policy = 2;
+}
+
+message AgentPolicyReply {
+  AgentPolicy policy = 1;
+}
+
+message WaitingRequest {
+  bytes user_id = 1;
+  // When the request arrived: microseconds since the Unix epoch.
+  int64 requested_at = 2;
+}
+
+message WaitingRequests {
+  repeated WaitingRequest requests = 1;
+}
+
+enum ResolveAction {
+  RESOLVE_ACTION_UNSPECIFIED = 0;
+  RESOLVE_ACTION_APPROVE = 1;
+  RESOLVE_ACTION_DECLINE = 2;
+  RESOLVE_ACTION_BLOCK = 3;
+}
+
+message ResolveRequest {
+  AgentRef agent = 1;
+  bytes user_id = 2;
+  ResolveAction action = 3;
+}
+
+message AgentPeerRequest {
+  AgentRef agent = 1;
+  bytes user_id = 2;
+}
+
+message AgentOwnersDone {}
+
+// One conversation of the agent, for the owner view.
+message AgentConversation {
+  bytes conversation_id = 1;
+  push.v1.ConversationKind kind = 2;
+  optional string title = 3;
+  // Direct only: the other member.
+  optional bytes peer_user_id = 4;
+  // Direct only, when the peer is an owned agent: its owner.
+  optional bytes peer_owner_user_id = 5;
+  uint32 member_count = 6;
+  // The conversation's last change (creation or last entry): microseconds since the epoch.
+  int64 last_activity_at = 7;
+  // Messages the agent can see that are not deleted.
+  int64 message_count = 8;
+  bool hidden = 9;
+  bool peer_deleted = 10;
+}
+
+message AgentConversations {
+  repeated AgentConversation conversations = 1;
+}
+
+message AgentHistoryRequest {
+  AgentRef agent = 1;
+  bytes conversation_id = 2;
+  optional int64 before_seq = 3;
+  uint32 limit = 4;
+}
+
+message AgentCallHistoryRequest {
+  AgentRef agent = 1;
+  optional CallHistoryCursor before = 2;
+  uint32 limit = 3;
+}
+
 message IdentifyRequest {
   bytes user_id = 1;
   bytes device_id = 2;
@@ -317,6 +441,9 @@ message Notification {
     // The user's flags of a conversation changed (hidden, peer_deleted); sent to every
     // connection of the user as conversation_flags.
     push.v1.ConversationFlags conversation_flags = 8;
+    // A relationship of one of the user's agents changed (the user is the owner); sent to
+    // every connection of the user as agent_contact_event.
+    push.v1.AgentContactEvent agent_contact_changed = 9;
   }
 }
 

@@ -601,6 +601,9 @@ async fn consent_binds_a_separate_account_and_deletion_disables_it() {
     .await;
     assert_eq!(own["kind"], "agent");
     assert_eq!(own["owner_user_id"], owner.user_id.to_string());
+    let me = auth.own_profile(caller(&owner)).await.unwrap();
+    assert_eq!(own["owner_display_name"], me.display_name);
+    assert_eq!(own["owner_handle"], me.handle);
     let (_, forbidden) = call(
         &router,
         "POST",
@@ -865,6 +868,29 @@ async fn management_is_owner_scoped_and_profiles_validate_names_and_hide_pending
     assert_eq!(profile.user_id, signed_in.user_id);
     assert_eq!(profile.kind, "agent");
     assert_eq!(profile.owner_user_id, Some(owner.user_id));
+    // The notice names the owner as the owner's account says now, never the agent.
+    let me = auth
+        .update_profile(caller(&owner), Some("Owner Renamed"), Some("owner-renamed"))
+        .await
+        .unwrap();
+    let profile = auth.lookup("renamed_agent").await.unwrap();
+    assert_eq!(
+        (
+            profile.owner_display_name.as_deref(),
+            profile.owner_handle.as_deref()
+        ),
+        (Some("Owner Renamed"), Some("owner-renamed"))
+    );
+    let listed = auth.profiles(&[signed_in.user_id]).await.unwrap();
+    assert_eq!(listed[0].owner_handle.as_deref(), Some(me.handle.as_str()));
+    let people = auth.profiles(&[owner.user_id]).await.unwrap();
+    assert_eq!(
+        (
+            people[0].owner_display_name.clone(),
+            people[0].owner_handle.clone()
+        ),
+        (None, None)
+    );
     assert_eq!(
         auth.profiles(&[owner.user_id, signed_in.user_id])
             .await
@@ -1341,12 +1367,14 @@ async fn a_deleted_agent_is_a_tombstone_only_to_those_who_could_see_it() {
     let seeing = setup_router(auth.clone(), Arc::new(Visible(vec![agent])));
     let ask = format!("/v1/users?ids={agent}");
 
+    let me = auth.own_profile(caller(&owner)).await.unwrap();
     let (status, live) = call(&seeing, "GET", &ask, &owner.access_token, json!({})).await;
     assert_eq!(status, StatusCode::OK, "{live}");
     assert_eq!(
         live["users"][0],
         json!({"user_id": agent, "handle": "gone_agent", "display_name": "Gone agent",
                "kind": "agent", "owner_user_id": owner.user_id,
+               "owner_display_name": me.display_name, "owner_handle": me.handle,
                "deleted": false, "state": "active"})
     );
 
@@ -1358,8 +1386,8 @@ async fn a_deleted_agent_is_a_tombstone_only_to_those_who_could_see_it() {
     assert_eq!(
         gone,
         json!({"users": [{"user_id": agent, "handle": "", "display_name": "Deleted agent",
-               "kind": "agent", "owner_user_id": null,
-               "deleted": true, "state": "deleted"}]})
+               "kind": "agent", "owner_user_id": null, "owner_display_name": null,
+               "owner_handle": null, "deleted": true, "state": "deleted"}]})
     );
     let deleted: Vec<Value> = world
         .outbox()

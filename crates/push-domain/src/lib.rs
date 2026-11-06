@@ -41,10 +41,11 @@ pub use history::HistoryPage;
 pub use ids::{CallId, ClientMsgId, ConversationId, DeviceId, MessageId, UserId};
 pub use memory::InMemoryStore;
 pub use model::{
-    ContactState, ContactSummary, ContentType, Conversation, ConversationFlags, ConversationKind,
-    ConversationOverview, ConversationState, ConversationSummary, DeviceState, Entry, EntryKind,
-    GroupPositions, Invite, InviteRecord, Member, MemberState, Positions, PublisherOwner, Receipts,
-    Role, SendReceipt, StoredTemplate, TemplateAction, TemplateEvent, TemplateStatus, direct_key,
+    AgentPolicy, ContactState, ContactSummary, ContentType, Conversation, ConversationFlags,
+    ConversationKind, ConversationOverview, ConversationState, ConversationSummary, DeviceState,
+    Entry, EntryKind, GroupPositions, Invite, InviteRecord, Member, MemberState, Positions,
+    PublisherOwner, Receipts, Role, SendReceipt, StoredTemplate, TemplateAction, TemplateEvent,
+    TemplateStatus, direct_key,
 };
 pub use notify::{Event, KickReason, NoopNotifier, Notifier, ReceiptUpdate, RecordingNotifier};
 pub use presence::{MAX_PRESENCE_BATCH, PresenceView};

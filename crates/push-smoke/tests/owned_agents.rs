@@ -315,6 +315,7 @@ async fn owner_and_agent_chat_as_distinct_users_and_deletion_kicks_the_live_agen
         .unwrap();
     assert_eq!(profile["kind"], "agent");
     assert_eq!(profile["owner_user_id"], owner_id.to_string());
+    assert_eq!(profile["owner_handle"], "agent_owner");
     let own: Value = http
         .get(format!("{}/v1/users/me", stack.auth_url))
         .bearer_auth(owner_token)
@@ -474,7 +475,8 @@ async fn owner_and_agent_chat_as_distinct_users_and_deletion_kicks_the_live_agen
     assert_eq!(
         profiles,
         json!({"users": [{"user_id": agent_id, "handle": "", "display_name": "Deleted agent",
-               "kind": "agent", "owner_user_id": null, "deleted": true, "state": "deleted"}]})
+               "kind": "agent", "owner_user_id": null, "owner_display_name": null,
+               "owner_handle": null, "deleted": true, "state": "deleted"}]})
     );
     request(
         &mut owner_socket,

@@ -405,6 +405,7 @@ fn server_frame(kind: Kind) -> Option<Body> {
             presence: Some(presence),
         }),
         Kind::ConversationFlags(flags) => Body::ConversationFlags(flags),
+        Kind::AgentContactChanged(event) => Body::AgentContactEvent(event),
         // Call frames target devices, not every connection of the user: `forward_call`.
         Kind::Call(_) => return None,
     })
@@ -1001,6 +1002,28 @@ mod tests {
         assert_eq!(
             pending(&mut session),
             Some(Signal::Frame(Box::new(Body::ConversationFlags(flags))))
+        );
+        assert_eq!(pending(&mut session), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn agent_contact_changes_reach_the_owner_as_their_server_frame() {
+        let (hub, _commands) = hub();
+        let owner = Uuid::now_v7();
+        let (mut session, _, _) = connection(&hub, owner).await;
+        let event = v1::AgentContactEvent {
+            agent_user_id: id_bytes(Uuid::now_v7()),
+            user_id: id_bytes(Uuid::now_v7()),
+            state: v1::ContactState::RequestedIn.into(),
+        };
+        let payload = Notification {
+            kind: Some(Kind::AgentContactChanged(event.clone())),
+        }
+        .encode_to_vec();
+        hub.dispatch(&notify_channel(owner), &payload);
+        assert_eq!(
+            pending(&mut session),
+            Some(Signal::Frame(Box::new(Body::AgentContactEvent(event))))
         );
         assert_eq!(pending(&mut session), None);
     }

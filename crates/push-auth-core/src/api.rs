@@ -712,6 +712,8 @@ fn own_profile_json(profile: &crate::profiles::OwnProfile) -> Value {
         "email": profile.email,
         "kind": profile.kind,
         "owner_user_id": profile.owner_user_id,
+        "owner_display_name": profile.owner_display_name,
+        "owner_handle": profile.owner_handle,
     })
 }
 
@@ -780,6 +782,8 @@ async fn lookup(
         "display_name": profile.display_name,
         "kind": profile.kind,
         "owner_user_id": profile.owner_user_id,
+        "owner_display_name": profile.owner_display_name,
+        "owner_handle": profile.owner_handle,
     }))
     .into_response())
 }
@@ -795,7 +799,8 @@ struct IdsQuery {
 /// left out, as are unknown ids: the answer never tells which ids exist. A deleted account
 /// the caller may see is a tombstone: `deleted: true`, `state: "deleted"`, its `kind`, a
 /// neutral `display_name`, an empty `handle` and a null `owner_user_id`; live profiles carry
-/// `deleted: false`, `state: "active"`.
+/// `deleted: false`, `state: "active"`. An agent's profile names its owner
+/// (`owner_display_name`, `owner_handle`) for the notice clients show.
 async fn profiles(
     State(api): State<Api>,
     headers: HeaderMap,
@@ -816,6 +821,8 @@ async fn profiles(
                 "display_name": profile.display_name,
                 "kind": profile.kind,
                 "owner_user_id": profile.owner_user_id,
+                "owner_display_name": profile.owner_display_name,
+                "owner_handle": profile.owner_handle,
                 "deleted": profile.deleted,
                 "state": profile.state(),
             })
