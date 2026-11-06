@@ -300,7 +300,8 @@ jobs:
           digest="${repo_digest#*@}"
           test -n "$digest"
           echo "ref=$image@$digest" >> "$GITHUB_OUTPUT"
-      - run: pwsh deploy/helm/test-chart-cluster.ps1 -Context kind-push-chart -CoturnImage '${{ steps.coturn.outputs.ref }}' -CopyBinary $false
+      - shell: pwsh
+        run: ./deploy/helm/test-chart-cluster.ps1 -Context kind-push-chart -CoturnImage '${{ steps.coturn.outputs.ref }}' -CopyBinary $false
 
   # The coturn image consumers build from deploy/docker/coturn.Dockerfile: the build checks
   # brotli-libs and the capability-free /opt/coturn/bin/turnserver; it runs as coturn's user
