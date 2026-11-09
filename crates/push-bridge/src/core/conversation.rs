@@ -36,6 +36,7 @@ impl<M: Messenger> Core<M> {
             Event::Call(event) => self.on_call(event).await,
             Event::ContactChanged(contact) => self.contact_changed(contact.user_id, contact.state),
             Event::OutgoingActionChanged(action) => self.outgoing_changed(action).await,
+            Event::AgentSettingsChanged(settings) => self.settings_changed(settings),
             _ => {}
         }
         Ok(())
@@ -56,6 +57,7 @@ impl<M: Messenger> Core<M> {
                     self.refresh_contact_activity(true).await;
                     self.fetch_pending().await;
                     self.reconcile_actions();
+                    self.refresh_settings();
                 }
                 Ok(())
             }

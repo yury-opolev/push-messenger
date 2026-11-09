@@ -1,6 +1,7 @@
 //! The agent's accepted contacts, for a backend that takes them
 //! ([`crate::backend::Backend::accepts_contacts`]): their texts in their direct
-//! conversation go to [`crate::backend::Backend::contact_prompt`], the backend's replies
+//! conversation go to [`crate::backend::Backend::contact_prompt`] when the owner's inbound
+//! policy lets them (see [`super::inbound`]), the backend's replies
 //! and questions come back into that conversation, and only the contact who was asked
 //! answers a question. Everything privileged stays the owner's: a contact may run only
 //! `/help` and `/status`, and calls are the owner's alone.
@@ -14,11 +15,11 @@ use super::{Core, Internal};
 use crate::backend::{Answer, BackendError, BackendRequest, ContactId, RequestKind, Responder};
 use crate::cards::{self, CardKind, TypedOutcome};
 use crate::commands::{self, Command};
-use crate::messenger::Messenger;
+use crate::messenger::{Messenger, Peer};
 use crate::render::{formatted_bodies, reply_bodies};
 
-/// How long the server's answer about a relationship is trusted.
-const CONTACT_FRESH: Duration = Duration::from_secs(60);
+/// How long the server's answer about a relationship (or a profile) is trusted.
+pub(super) const CONTACT_FRESH: Duration = Duration::from_secs(60);
 /// A contact's `/help`.
 pub const CONTACT_HELP: &str = "\
 /status: the agent's name and version
@@ -61,6 +62,8 @@ pub(super) struct ContactRequest {
 pub(super) struct Contacts {
     /// Each user's relationship and when it was learned.
     states: std::collections::HashMap<UserId, (ContactState, Instant)>,
+    /// Each user's profile (`None` when hidden) and when it was read.
+    pub(super) peers: std::collections::HashMap<UserId, (Option<Peer>, Instant)>,
     /// Each contact's direct conversation with the agent.
     conversations: std::collections::HashMap<UserId, ConversationId>,
     /// The contacts' open questions, oldest first.
@@ -77,6 +80,7 @@ impl Default for Contacts {
     fn default() -> Self {
         Self {
             states: std::collections::HashMap::new(),
+            peers: std::collections::HashMap::new(),
             conversations: std::collections::HashMap::new(),
             open: Vec::new(),
             activity: std::collections::HashMap::new(),
@@ -88,8 +92,8 @@ impl Default for Contacts {
 
 impl<M: Messenger> Core<M> {
     /// A text from someone other than the owner, with a backend that takes contacts:
-    /// an accepted contact's text in their direct conversation reaches the backend;
-    /// anyone else is a stranger.
+    /// an accepted contact's text in their direct conversation reaches the backend when
+    /// the inbound policy lets them; anyone else is a stranger.
     pub(super) async fn contact_message(&mut self, message: Message) {
         let (user, conversation) = (message.sender_id, message.conversation_id);
         if !self.is_contact(user).await {
@@ -103,8 +107,17 @@ impl<M: Messenger> Core<M> {
             tracing::info!(event = "old_text_skipped");
             return;
         }
+        let peer = self.peer(user).await;
+        if !self.inbound_allows(peer.as_ref()) {
+            tracing::info!(
+                event = "contact_not_allowed",
+                policy = self.inbound.as_str()
+            );
+            return self.stranger(user, conversation);
+        }
+        let agent = peer.is_some_and(|peer| peer.agent);
         if let Some(text) = message.body {
-            self.contact_text(user, conversation, text).await;
+            self.contact_text(user, conversation, text, agent).await;
         }
     }
 
@@ -167,9 +180,16 @@ impl<M: Messenger> Core<M> {
     }
 
     /// A contact's text: `/help` and `/status` run, other commands are the owner's; with
-    /// a question open the text answers it; else it goes to the backend.
-    async fn contact_text(&mut self, user: UserId, conversation: ConversationId, text: String) {
-        if self.contacts.noticed.insert(user) {
+    /// a question open the text answers it; else it goes to the backend. People (not
+    /// `agent`s) are told once that the owner reads along.
+    async fn contact_text(
+        &mut self,
+        user: UserId,
+        conversation: ConversationId,
+        text: String,
+        agent: bool,
+    ) {
+        if !agent && self.contacts.noticed.insert(user) {
             let notice = self.contacts.notice.clone();
             self.contact_reply(conversation, &notice);
         }
@@ -260,12 +280,19 @@ impl<M: Messenger> Core<M> {
             .map(|(user, conversation)| (*user, *conversation))
     }
 
-    /// The backend's reply to a contact, formatted as its turns are.
-    pub(super) fn contact_backend_reply(&self, contact: &ContactId, text: &str) {
-        let Some((_, conversation)) = self.contact_of(contact) else {
+    /// The backend's reply to a contact: plain text to an agent (a turn for its
+    /// backend), formatted as its turns are to a person.
+    pub(super) fn contact_backend_reply(&mut self, contact: &ContactId, text: &str) {
+        let Some((user, conversation)) = self.contact_of(contact) else {
             tracing::warn!(event = "contact_unknown");
             return;
         };
+        if self.is_agent(user) {
+            if let Err(error) = self.messenger.send_text(conversation, text) {
+                tracing::warn!(event = "send_failed", code = error.code());
+            }
+            return;
+        }
         for body in formatted_bodies(None, text, self.format) {
             self.send_to(conversation, &body);
         }

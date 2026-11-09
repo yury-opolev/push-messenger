@@ -7,6 +7,7 @@ mod calling;
 mod contacts;
 mod control;
 mod conversation;
+mod inbound;
 mod report;
 mod requests;
 mod turns;
@@ -17,6 +18,8 @@ mod voice;
 mod actions_tests;
 #[cfg(test)]
 mod echo_tests;
+#[cfg(test)]
+mod inbound_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
@@ -32,8 +35,8 @@ use push_bridge_control::{
     AgentInfo, BridgeState, CallDirection, CallInfo, CallPhase, CardState, PeekKind,
 };
 use push_sdk::{
-    ActivityState, CallEvent, CallId, CardBook, ClientMsgId, ConnectionState, ConversationId,
-    Event, OutgoingAction, SdkError, UserId,
+    ActivityState, AgentSettings, CallEvent, CallId, CardBook, ClientMsgId, ConnectionState,
+    ConversationId, Event, InboundPolicy, OutgoingAction, SdkError, UserId,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{Instant, MissedTickBehavior};
@@ -236,6 +239,7 @@ impl<M: Messenger> Bridge<M> {
         core.voice = voice;
         core.call_flag = call_flag;
         tracing::info!(event = "bridge_started", backend = core.name.as_str());
+        core.load_settings().await;
         core.boot().await;
         core.reconcile_actions();
         core.publish();
@@ -332,6 +336,10 @@ enum Internal {
     Reconciled {
         result: Result<Vec<OutgoingAction>, SdkError>,
     },
+    /// The agent's settings, read again after a reconnect.
+    Settings {
+        result: Result<AgentSettings, SdkError>,
+    },
 }
 
 /// The running turn's reply.
@@ -397,6 +405,8 @@ struct Core<M: Messenger> {
     skip_before_us: Option<i64>,
     /// The backend takes the agent's accepted contacts too.
     accepts_contacts: bool,
+    /// Which accepted contacts reach the backend (the owner's setting).
+    inbound: InboundPolicy,
     /// The accepted contacts' conversations and questions.
     contacts: contacts::Contacts,
     state: Arc<StateFile>,
@@ -517,6 +527,7 @@ impl<M: Messenger> Core<M> {
             answer_timeout,
             skip_before_us,
             accepts_contacts,
+            inbound: InboundPolicy::OwnerOnly,
             contacts: contacts::Contacts::default(),
             state,
             folder: options.default_folder.clone(),
@@ -696,6 +707,7 @@ impl<M: Messenger> Core<M> {
             Internal::Acted { kind, reply, acted } => self.acted(kind, reply, acted).await,
             Internal::ApprovedChat { kind, result } => self.approved_send(kind, result),
             Internal::Reconciled { result } => self.reconciled(result).await,
+            Internal::Settings { result } => self.settings_read(result),
         }
     }
 

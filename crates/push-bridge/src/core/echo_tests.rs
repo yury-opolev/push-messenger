@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-use push_sdk::{ActivityState, ContactState, Event, MessageKind, UserId};
+use push_sdk::{ActivityState, ContactState, Event, InboundPolicy, MessageKind, UserId};
 
 use super::tests::{Harness, settle};
 use crate::commands;
@@ -51,8 +51,10 @@ async fn reply(h: &Harness, text: &str) {
         .await;
 }
 
+/// The echo agent, open to every accepted contact (inbound `contacts`).
 async fn started(answer_timeout_s: u64) -> Harness {
     let mut h = Harness::echo(answer_timeout_s);
+    h.messenger.set_inbound(InboundPolicy::Contacts);
     h.start();
     settle().await;
     h
@@ -653,6 +655,7 @@ async fn contacts_may_run_only_help_and_status() {
 #[tokio::test(start_paused = true)]
 async fn coda_still_answers_only_its_owner() {
     let mut h = Harness::named("Coda");
+    h.messenger.set_inbound(InboundPolicy::Contacts);
     h.start();
     h.backend.wait_for("start", 1).await;
     settle().await;

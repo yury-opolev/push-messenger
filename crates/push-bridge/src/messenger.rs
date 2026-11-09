@@ -357,6 +357,11 @@ pub enum Call {
         users: Vec<UserId>,
     },
     OutgoingActions,
+    /// The profiles of `users` were read.
+    Peers {
+        users: Vec<UserId>,
+    },
+    AgentSettings,
 }
 
 #[derive(Default)]
@@ -379,6 +384,19 @@ struct Recorded {
     outgoing: Vec<OutgoingAction>,
     /// The next calls of a method (by its name) fail with these errors, in order.
     failures: HashMap<&'static str, VecDeque<SdkError>>,
+    /// The inbound policy `agent_settings` answers (`None`: the default, owner only).
+    inbound: Option<InboundPolicy>,
+}
+
+/// The agent's settings with `inbound`, the outgoing policies at the server's defaults.
+pub fn settings(inbound: InboundPolicy) -> AgentSettings {
+    AgentSettings {
+        inbound,
+        requests: OutgoingPolicy::Ask,
+        chats: OutgoingPolicy::Ask,
+        groups: OutgoingPolicy::Off,
+        calls: OutgoingPolicy::Off,
+    }
 }
 
 /// A [`Messenger`] for tests: records every call, plays the server (each send is stored
@@ -433,6 +451,32 @@ impl TestMessenger {
         user_id
     }
 
+    /// An agent the server knows by `handle` whose owner is `owner`; returns its id.
+    pub fn add_agent(&self, handle: &str, owner: UserId) -> UserId {
+        let user_id = UserId::new();
+        self.lock().users.insert(
+            handle.to_owned(),
+            Peer {
+                user_id,
+                handle: handle.to_owned(),
+                agent: true,
+                owner: Some(owner),
+            },
+        );
+        user_id
+    }
+
+    /// What `agent_settings` answers from now on: `inbound`.
+    pub fn set_inbound(&self, inbound: InboundPolicy) {
+        self.lock().inbound = Some(inbound);
+    }
+
+    /// The owner changes the inbound policy: stored, and reported to the core.
+    pub fn change_inbound(&self, inbound: InboundPolicy) {
+        self.set_inbound(inbound);
+        self.inject(Event::AgentSettingsChanged(settings(inbound)));
+    }
+
     /// A group the agent is a member of.
     pub fn add_group(&self) -> ConversationId {
         let group = ConversationId::new();
@@ -441,7 +485,8 @@ impl TestMessenger {
     }
 
     /// The next call of `method` (`lookup`, `request_contact`, `open_direct`,
-    /// `create_group`, `add_members`, `outgoing_actions`) fails with `error`.
+    /// `create_group`, `add_members`, `outgoing_actions`, `agent_settings`) fails with
+    /// `error`.
     pub fn fail_next(&self, method: &'static str, error: SdkError) {
         self.lock()
             .failures
@@ -791,6 +836,9 @@ impl Messenger for TestMessenger {
     }
 
     async fn peers(&self, users: Vec<UserId>) -> Result<Vec<Peer>, SdkError> {
+        self.record(Call::Peers {
+            users: users.clone(),
+        });
         let recorded = self.lock();
         Ok(recorded
             .users
@@ -849,13 +897,12 @@ impl Messenger for TestMessenger {
     }
 
     async fn agent_settings(&self) -> Result<AgentSettings, SdkError> {
-        Ok(AgentSettings {
-            inbound: InboundPolicy::OwnerOnly,
-            requests: OutgoingPolicy::Ask,
-            chats: OutgoingPolicy::Ask,
-            groups: OutgoingPolicy::Off,
-            calls: OutgoingPolicy::Off,
-        })
+        self.record(Call::AgentSettings);
+        if let Some(error) = self.failure("agent_settings") {
+            return Err(error);
+        }
+        let inbound = self.lock().inbound.unwrap_or(InboundPolicy::OwnerOnly);
+        Ok(settings(inbound))
     }
 
     async fn outgoing_actions(&self) -> Result<Vec<OutgoingAction>, SdkError> {
