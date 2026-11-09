@@ -10,8 +10,8 @@ use tokio::time::Instant;
 
 use crate::backend::{
     Answer, Backend, BackendCommand, BackendError, BackendEvent, BackendRequest, BackendStatus,
-    Capability, CommandReply, ErrorKind, PendingMessages, PrepareOptions, Prepared, RequestKind,
-    Responder, StartOptions, Started, SteerOutcome, TextFormat, TurnSource,
+    Capability, CommandReply, ContactId, ErrorKind, PendingMessages, PrepareOptions, Prepared,
+    RequestKind, Responder, StartOptions, Started, SteerOutcome, TextFormat, TurnSource,
 };
 use crate::messenger::wait;
 
@@ -53,6 +53,8 @@ struct Script {
     engine_instance: Option<String>,
     sessions: u64,
     text_format: TextFormat,
+    /// Takes the agent's contacts' texts too.
+    accepts_contacts: bool,
 }
 
 /// A [`Backend`] a test scripts.
@@ -86,6 +88,7 @@ impl TestBackend {
                 engine_instance: Some("engine-1".to_owned()),
                 sessions: 0,
                 text_format: TextFormat::Plain,
+                accepts_contacts: false,
             }),
             changed: Notify::new(),
         }
@@ -104,6 +107,12 @@ impl TestBackend {
     /// How the backend says it writes (plain unless set); the core reads it once.
     pub fn set_text_format(&self, format: TextFormat) {
         self.lock().text_format = format;
+    }
+
+    /// Takes contacts' texts (each recorded as `contact <id> <text>`); the core reads it
+    /// once, at its start.
+    pub fn set_accepts_contacts(&self, accepts: bool) {
+        self.lock().accepts_contacts = accepts;
     }
 
     /// The engine instance the next starts report.
@@ -305,6 +314,15 @@ impl Backend for TestBackend {
 
     async fn stop(&self) {
         self.record("stop".to_owned());
+    }
+
+    fn accepts_contacts(&self) -> bool {
+        self.lock().accepts_contacts
+    }
+
+    async fn contact_prompt(&self, contact: ContactId, text: &str) -> Result<(), BackendError> {
+        self.record(format!("contact {} {text}", contact.0));
+        Ok(())
     }
 
     async fn prompt(&self, text: &str) -> Result<(), BackendError> {

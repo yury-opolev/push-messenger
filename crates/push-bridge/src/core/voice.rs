@@ -1,5 +1,7 @@
 //! Voice calls with the owner: answering them, the call's pipeline events, transcripts as
-//! prompts, steers or card answers, and the agent's replies and cards spoken.
+//! prompts, steers or card answers, and the agent's replies and cards spoken. A call the
+//! agent placed to a contact uses the same pipeline, but talks with the backend as that
+//! contact (see [`super::contact_calls`]).
 //!
 //! Only the owner's calls are answered, one at a time; without anyone to listen (a voice
 //! adapter ready with `stt`) every call is declined.
@@ -89,9 +91,15 @@ impl ActiveCall {
         }
     }
 
+    /// The owner is on this call (not a contact the agent called): the owner's session
+    /// is heard and spoken.
+    fn with_owner(&self) -> bool {
+        !matches!(self.purpose, Some(Purpose::Contact { .. }))
+    }
+
     /// The reply is spoken again; after a barge-in, from a new sentence (an open code
     /// block or table stays silent).
-    fn unmute(&mut self) {
+    pub(super) fn unmute(&mut self) {
         if self.session.unmute() {
             self.speech.interrupt();
         }
@@ -129,6 +137,15 @@ impl<M: Messenger> Core<M> {
             ) {
                 dialing.buffered.push(event);
                 return;
+            }
+        }
+        if let CallEvent::Error { call_id, error, .. } = &event {
+            let ringing = self
+                .call
+                .as_ref()
+                .is_some_and(|call| call.session.call_id() == *call_id && !call.connected);
+            if ringing && self.contact_call_undecided() {
+                self.contact_call_refused(error);
             }
         }
         if self
@@ -284,7 +301,9 @@ impl<M: Messenger> Core<M> {
             SessionEvent::Connected => {
                 call.connected = true;
                 tracing::info!(event = "call_connected");
-                if call.direction == CallDirection::Outgoing {
+                if !call.with_owner() {
+                    self.greet_contact();
+                } else if call.direction == CallDirection::Outgoing {
                     self.greet_owner_called();
                 } else {
                     self.greet();
@@ -320,7 +339,11 @@ impl<M: Messenger> Core<M> {
                     duration_s = end.duration_s
                 );
                 if let Some(call) = call.filter(|call| !call.connected) {
-                    self.call_unanswered(call, end.reason);
+                    if self.contact_call_undecided() {
+                        self.contact_call_ended(end.reason);
+                    } else {
+                        self.call_unanswered(call, end.reason);
+                    }
                 }
             }
         }
@@ -356,6 +379,12 @@ impl<M: Messenger> Core<M> {
     /// meant for it: it goes to the agent and the card stays open.
     async fn on_transcript(&mut self, text: String, started: Instant) {
         tracing::info!(event = "voice_transcript", chars = text.chars().count());
+        if let Some(Purpose::Contact {
+            peer, conversation, ..
+        }) = self.call.as_ref().and_then(|call| call.purpose.clone())
+        {
+            return self.contact_said(peer, conversation, text).await;
+        }
         self.post_transcript(&text);
         if let Some(request) = self.open.first().filter(|request| started > request.opened) {
             match confirm::match_answer(&request.kind, &text) {
@@ -437,6 +466,16 @@ impl<M: Messenger> Core<M> {
         }
     }
 
+    /// Speaks the backend's reply to `user` when they are on the call the agent placed
+    /// (it is posted in their chat as well).
+    pub(super) fn speak_to_contact(&self, user: UserId, text: &str) {
+        if let Some(call) = self.call.as_ref().filter(|call| {
+            call.connected && call.purpose.as_ref().and_then(Purpose::contact) == Some(user)
+        }) {
+            call.say_reply(speech::sentences(text));
+        }
+    }
+
     /// Says `text` in the running call.
     fn say(&self, text: &str) {
         if let Some(call) = &self.call {
@@ -446,7 +485,7 @@ impl<M: Messenger> Core<M> {
 
     /// A turn starts: its reply is spoken from its start.
     pub(super) fn speech_turn_started(&mut self) {
-        if let Some(call) = &mut self.call {
+        if let Some(call) = self.call.as_mut().filter(|call| call.with_owner()) {
             call.speech = SpeechText::new();
             call.session.unmute();
         }
@@ -454,7 +493,11 @@ impl<M: Messenger> Core<M> {
 
     /// Speaks the sentences `delta` completes in the running reply.
     pub(super) fn speak_delta(&mut self, delta: &str) {
-        if let Some(call) = self.call.as_mut().filter(|call| call.connected) {
+        if let Some(call) = self
+            .call
+            .as_mut()
+            .filter(|call| call.connected && call.with_owner())
+        {
             let sentences = call.speech.push(delta);
             call.say_reply(sentences);
         }
@@ -462,7 +505,7 @@ impl<M: Messenger> Core<M> {
 
     /// The turn ended: the rest of its reply is spoken.
     pub(super) fn speech_turn_ended(&mut self) {
-        if let Some(call) = &mut self.call {
+        if let Some(call) = self.call.as_mut().filter(|call| call.with_owner()) {
             let sentences = call.speech.finish();
             if call.connected {
                 call.say_reply(sentences);
@@ -472,7 +515,11 @@ impl<M: Messenger> Core<M> {
 
     /// Speaks a background message: "<label>." then its text.
     pub(super) fn speak_agent_message(&self, label: &str, text: &str) {
-        if let Some(call) = self.call.as_ref().filter(|call| call.connected) {
+        if let Some(call) = self
+            .call
+            .as_ref()
+            .filter(|call| call.connected && call.with_owner())
+        {
             let label = speech::hide_secrets(label);
             call.session
                 .say_reply(format!("{}.", label.trim_end_matches('.')));
@@ -482,7 +529,11 @@ impl<M: Messenger> Core<M> {
 
     /// A card opened: the reply so far is spoken, then what the card asks.
     pub(super) fn speak_card(&mut self, spoken: &str) {
-        let Some(call) = self.call.as_mut().filter(|call| call.connected) else {
+        let Some(call) = self
+            .call
+            .as_mut()
+            .filter(|call| call.connected && call.with_owner())
+        else {
             return;
         };
         let sentences = call.speech.finish();
@@ -491,16 +542,20 @@ impl<M: Messenger> Core<M> {
     }
 
     /// The activity label during a call: "calling you" (the bridge's call rings),
-    /// "speaking", "listening", "thinking" (a turn runs) or "on a call"; `None` without
-    /// a call.
+    /// "calling a contact", "speaking", "listening", "thinking" (a turn runs) or "on a
+    /// call"; `None` without a call.
     pub(super) fn call_label(&self) -> Option<&'static str> {
-        if self.dialing.is_some() {
-            return Some("calling you");
+        let calling = |purpose: Option<&Purpose>| match purpose {
+            Some(Purpose::Contact { .. }) => "calling a contact",
+            _ => "calling you",
+        };
+        if let Some(dialing) = &self.dialing {
+            return Some(calling(Some(dialing.purpose())));
         }
         let call = self.call.as_ref()?;
         Some(
             if !call.connected && call.direction == CallDirection::Outgoing {
-                "calling you"
+                calling(call.purpose.as_ref())
             } else if call.speaking {
                 "speaking"
             } else if call.listening {
@@ -566,6 +621,7 @@ impl<M: Messenger> Core<M> {
     pub(super) fn end_call_at_close(&mut self) -> Option<ActiveCall> {
         self.answering = None;
         self.dialing = None;
+        self.drop_contact_call();
         self.decline_asking("📞 Declined: the bridge stopped.");
         let call = self.call.take();
         if call.is_some() {

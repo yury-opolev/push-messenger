@@ -4,7 +4,8 @@
 //! policy lets them (see [`super::inbound`]), the backend's replies
 //! and questions come back into that conversation, and only the contact who was asked
 //! answers a question. Everything privileged stays the owner's: a contact may run only
-//! `/help` and `/status`, and calls are the owner's alone.
+//! `/help` and `/status`, and only the owner's calls are answered (the agent may call a
+//! contact itself: [`super::contact_calls`]).
 
 use push_sdk::{
     ActivityState, ClientMsgId, ContactState, ConversationId, Message, OpenCard, UserId,
@@ -73,7 +74,7 @@ pub(super) struct Contacts {
     /// That chats are visible to the owner, with the owner's name.
     pub(super) notice: String,
     /// The contacts told the notice in this session.
-    noticed: std::collections::HashSet<UserId>,
+    pub(super) noticed: std::collections::HashSet<UserId>,
 }
 
 impl Default for Contacts {
@@ -170,7 +171,7 @@ impl<M: Messenger> Core<M> {
         self.contacts.states.insert(user, (state, Instant::now()));
     }
 
-    async fn contact_conversation(&mut self, user: UserId) -> Option<ConversationId> {
+    pub(super) async fn contact_conversation(&mut self, user: UserId) -> Option<ConversationId> {
         if let Some(conversation) = self.contacts.conversations.get(&user) {
             return Some(*conversation);
         }
@@ -229,6 +230,17 @@ impl<M: Messenger> Core<M> {
             return;
         }
         tracing::info!(event = "contact_prompt");
+        self.prompt_contact(user, conversation, text).await;
+    }
+
+    /// Gives a contact's `text` to the backend as their message, showing the agent at
+    /// work in their chat meanwhile.
+    pub(super) async fn prompt_contact(
+        &mut self,
+        user: UserId,
+        conversation: ConversationId,
+        text: String,
+    ) {
         let working = self.labels.working.clone();
         self.contact_activity(conversation, ActivityState::Working, Some(&working))
             .await;
@@ -294,6 +306,7 @@ impl<M: Messenger> Core<M> {
             tracing::warn!(event = "contact_unknown");
             return;
         };
+        self.speak_to_contact(user, text);
         if self.is_agent(user) {
             if self.loop_paused(conversation) {
                 tracing::info!(event = "loop_guard_reply_dropped");

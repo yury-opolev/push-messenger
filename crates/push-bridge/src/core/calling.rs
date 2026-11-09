@@ -7,12 +7,16 @@
 //! Logs carry event names, reasons and codes only: never a card's text or a message.
 
 use push_bridge_control::{CallDirection, CallInfo, CardState, NO_CALL};
-use push_sdk::{CallEndReason, CallEvent, CallId, ClientMsgId, ConnectionState, OpenCard};
+use push_sdk::{
+    CallEndReason, CallEvent, CallId, ClientMsgId, ConnectionState, ConversationId, OpenCard,
+    UserId,
+};
 use serde_json::{Map, json};
 use tokio::time::{Duration, Instant};
 
 use super::voice::ActiveCall;
 use super::{Core, Internal};
+use crate::actions::ActionResult;
 use crate::cards::CardKind;
 use crate::control::{Reply, error};
 use crate::messenger::Messenger;
@@ -42,6 +46,14 @@ pub(super) enum Purpose {
     Urgent { label: String, text: String },
     /// The backend's `call` action, with what to say on pickup.
     Agent { reason: Option<String> },
+    /// The backend's `call` action to a person who is the agent's contact (their direct
+    /// chat gets the call's transcript), with what to say on pickup.
+    Contact {
+        peer: UserId,
+        handle: String,
+        conversation: ConversationId,
+        reason: Option<String>,
+    },
 }
 
 impl Purpose {
@@ -50,6 +62,15 @@ impl Purpose {
             Purpose::Request => "request",
             Purpose::Urgent { .. } => "urgent",
             Purpose::Agent { .. } => "agent",
+            Purpose::Contact { .. } => "contact",
+        }
+    }
+
+    /// The person called, for a call to a contact.
+    pub(super) fn contact(&self) -> Option<UserId> {
+        match self {
+            Purpose::Contact { peer, .. } => Some(*peer),
+            _ => None,
         }
     }
 }
@@ -65,13 +86,19 @@ pub(super) struct Asking {
     deadline: Instant,
 }
 
-/// A call to the owner being placed.
+/// A call being placed: to the owner, or to a contact ([`Purpose::Contact`]).
 pub(super) struct Dialing {
     purpose: Purpose,
     /// Hung up from the tray before the phone returned.
     cancelled: bool,
     /// Call events that came meanwhile (the call's id is not known yet).
     pub(super) buffered: Vec<CallEvent>,
+}
+
+impl Dialing {
+    pub(super) fn purpose(&self) -> &Purpose {
+        &self.purpose
+    }
 }
 
 impl<M: Messenger> Core<M> {
@@ -323,15 +350,22 @@ impl<M: Messenger> Core<M> {
         verdict == Verdict::Call
     }
 
-    /// Places a call to the owner; the phone's answer comes as [`Internal::Dialed`].
+    /// Places a call to the owner (or, for [`Purpose::Contact`], to that contact); the
+    /// phone's answer comes as [`Internal::Dialed`]. Only calls to the owner count for
+    /// the owner's minimum interval between calls.
     pub(super) async fn dial(&mut self, purpose: Purpose) {
         let Some(voice) = &self.voice else {
             return;
         };
         tracing::info!(event = "call_dialing", reason = purpose.name());
-        self.last_dialed = Some(Instant::now());
+        let callee = match purpose.contact() {
+            Some(peer) => peer,
+            None => {
+                self.last_dialed = Some(Instant::now());
+                self.owner
+            }
+        };
         let phone = voice.phone.clone();
-        let owner = self.owner;
         let internal = self.internal.clone();
         self.dialing = Some(Dialing {
             purpose,
@@ -340,7 +374,7 @@ impl<M: Messenger> Core<M> {
         });
         self.sync_call_flag();
         tokio::spawn(async move {
-            let result = phone.call(owner).await;
+            let result = phone.call(callee).await;
             let _ = internal.send(Internal::Dialed { result });
         });
         self.update_activity(false).await;
@@ -360,11 +394,13 @@ impl<M: Messenger> Core<M> {
             Ok(line) => line,
             Err(error) => {
                 tracing::warn!(event = "call_dial_failed", code = error.code());
+                self.finish_contact_call(|_| ActionResult::from_sdk(&error));
                 self.update_activity(false).await;
                 return;
             }
         };
         let control = line.control.clone();
+        let call_id = line.call_id;
         let session = if dialing.cancelled || self.stopping {
             None
         } else {
@@ -372,12 +408,20 @@ impl<M: Messenger> Core<M> {
         };
         let Some(session) = session else {
             tracing::info!(event = "call_dial_cancelled");
+            self.finish_contact_call(|_| ActionResult::failed("the call was hung up"));
             tokio::spawn(async move {
                 control.hangup().await;
             });
             self.update_activity(false).await;
             return;
         };
+        // The server's refusal of the invite to a contact may have come meanwhile.
+        let refusal = dialing.buffered.iter().find_map(|event| match event {
+            CallEvent::Error {
+                call_id: id, error, ..
+            } if *id == call_id => Some(error.clone()),
+            _ => None,
+        });
         for event in &dialing.buffered {
             session.handle(event);
         }
@@ -387,6 +431,10 @@ impl<M: Messenger> Core<M> {
             CallDirection::Outgoing,
             Some(dialing.purpose),
         ));
+        match refusal {
+            Some(error) if self.contact_call.is_some() => self.contact_call_refused(&error),
+            _ => self.contact_call_placed(),
+        }
         self.update_activity(false).await;
     }
 
@@ -450,6 +498,17 @@ impl<M: Messenger> Core<M> {
         tracing::info!(event = "call_unanswered", reason = reason.as_str());
         if call.withdrawn {
             return;
+        }
+        if let Some(Purpose::Contact { handle, .. }) = &call.purpose {
+            let why = match reason {
+                CallEndReason::Missed => String::new(),
+                CallEndReason::Declined => " (declined)".to_owned(),
+                CallEndReason::Busy => " (busy)".to_owned(),
+                CallEndReason::Unreachable => " (could not be reached)".to_owned(),
+                CallEndReason::Cancelled => " (cancelled)".to_owned(),
+                _ => " (the call failed)".to_owned(),
+            };
+            return self.reply(&format!("📞 The call to @{handle} was not answered{why}."));
         }
         let why = match reason {
             CallEndReason::Missed => "no answer",

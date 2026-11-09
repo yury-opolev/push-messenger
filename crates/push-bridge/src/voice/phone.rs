@@ -539,6 +539,13 @@ impl LineControl for FakeControl {
                 duration_s: *duration_s,
             });
         }
+        // As the media helper: a refused invite was never a call.
+        if matches!(event, CallEvent::Error { .. }) && !*self.shared.picked_up.borrow() {
+            self.shared.finish_with(LineEnded {
+                reason: CallEndReason::Failed,
+                duration_s: None,
+            });
+        }
         true
     }
 

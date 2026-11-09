@@ -503,8 +503,10 @@ async fn calls_need_voice_and_never_reach_other_agents() {
     );
     assert_eq!(act(&h, call("@helper")).await.code, ActionCode::NotAllowed);
     let person = act(&h, call("@bob")).await;
-    assert_eq!(person.code, ActionCode::Failed);
-    assert!(person.detail.starts_with("not implemented"));
+    assert_eq!(
+        (person.code, person.detail.as_str()),
+        (ActionCode::Unavailable, "voice calls are not set up")
+    );
     assert_eq!(act(&h, call("nobody")).await.code, ActionCode::NotFound);
 }
 

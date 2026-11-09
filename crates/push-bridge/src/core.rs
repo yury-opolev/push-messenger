@@ -4,6 +4,7 @@
 
 mod acting;
 mod calling;
+mod contact_calls;
 mod contacts;
 mod control;
 mod conversation;
@@ -216,10 +217,10 @@ impl<M: Messenger> Bridge<M> {
             .await
             .map_err(BridgeError::Messenger)?;
         let agent_profile = messenger.profile().await;
-        let notice = contacts::notice(
-            agent_profile.as_ref().map(|(name, _)| name.as_str()),
-            messenger.owner_name().await,
-        );
+        let owner_name = messenger.owner_name().await;
+        let owner_display = owner_name.as_ref().map(|(name, _)| name.clone());
+        let agent_name = agent_profile.as_ref().map(|(name, _)| name.clone());
+        let notice = contacts::notice(agent_name.as_deref(), owner_name);
         if let Some((display_name, handle)) = agent_profile {
             control.update(|status| {
                 status.agent = Some(AgentInfo {
@@ -240,6 +241,8 @@ impl<M: Messenger> Bridge<M> {
         );
         core.control = control;
         core.contacts.notice = notice;
+        core.agent_name = agent_name;
+        core.owner_display = owner_display;
         core.voice = voice;
         core.call_flag = call_flag;
         tracing::info!(event = "bridge_started", backend = core.name.as_str());
@@ -484,8 +487,14 @@ struct Core<M: Messenger> {
     answering: Option<(CallId, Vec<CallEvent>)>,
     /// The owner's call waiting for the owner's answer on a card (`calls.answer` `ask`).
     asking: Option<calling::Asking>,
-    /// A call to the owner being placed.
+    /// A call to the owner (or a contact) being placed.
     dialing: Option<calling::Dialing>,
+    /// The call to a contact whose result the caller still waits for.
+    contact_call: Option<contact_calls::ContactCall>,
+    /// The agent's display name and its owner's, as people see them (a call to a
+    /// contact says them).
+    agent_name: Option<String>,
+    owner_display: Option<String>,
     /// When the bridge last called the owner (the rate limit).
     last_dialed: Option<Instant>,
     /// Why the last due call was held back (logged once per change).
@@ -577,6 +586,9 @@ impl<M: Messenger> Core<M> {
             answering: None,
             asking: None,
             dialing: None,
+            contact_call: None,
+            agent_name: None,
+            owner_display: None,
             last_dialed: None,
             held_by: None,
             held_no_tts: false,
@@ -724,6 +736,7 @@ impl<M: Messenger> Core<M> {
         self.expire_contact_requests();
         self.refresh_contact_activity(false).await;
         self.expire_asking();
+        self.confirm_contact_call();
         self.call_owner_if_due().await;
         self.watch_pause().await;
         self.update_activity(false).await;

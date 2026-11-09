@@ -17,6 +17,7 @@ use tokio::sync::oneshot;
 use tokio::time::Instant;
 
 use super::calling::Purpose;
+use super::contact_calls::Caller;
 use super::{Core, Internal};
 use crate::actions::{
     Action, ActionCode, ActionRequest, ActionResult, Target, group_name, handle, parse_group,
@@ -112,7 +113,11 @@ impl<M: Messenger> Core<M> {
             } => self.deliver_text(conversation, &to, agent, &text),
             Acted::ToOwner { text } => self.send_to_owner(&text),
             Acted::CallOwner { reason } => self.call_owner_for_agent(reason).await,
-            Acted::CallContact { peer, reason } => self.call_contact(&peer, reason).await,
+            Acted::CallContact { peer, reason } => {
+                // Answered once the server took or refused the invite.
+                let caller = Caller::Action { kind, reply };
+                return self.call_contact(peer, reason, caller).await;
+            }
         };
         tracing::info!(event = "agent_action", kind, code = result.code.as_str());
         let _ = reply.send(result);
@@ -213,17 +218,8 @@ impl<M: Messenger> Core<M> {
         ActionResult::done("calling the owner")
     }
 
-    /// `call` to someone other than the owner (spec §7.5). Agents never call agents;
-    /// calls to people are not carried out by this bridge.
-    async fn call_contact(&mut self, peer: &Peer, _reason: Option<String>) -> ActionResult {
-        if peer.agent {
-            return ActionResult::new(ActionCode::NotAllowed, "agents cannot call other agents");
-        }
-        ActionResult::failed("not implemented: this bridge calls only its owner")
-    }
-
     /// Keeps what the approval of action `id` still needs.
-    fn keep_pending(&self, id: &str, kind: PendingKind) {
+    pub(super) fn keep_pending(&self, id: &str, kind: PendingKind) {
         let pending = PendingAction {
             kind,
             created_at_ms: self.clock.now_ms(),
@@ -296,33 +292,21 @@ impl<M: Messenger> Core<M> {
                 target,
                 handle,
                 reason,
-            } => {
-                let result = match target.parse::<UserId>() {
-                    Ok(user_id) => {
-                        let peer = Peer {
-                            user_id,
-                            handle: handle.clone(),
-                            agent: false,
-                            owner: None,
-                        };
-                        self.call_contact(&peer, reason).await
-                    }
-                    Err(_) => ActionResult::failed("the kept call names no user"),
-                };
-                tracing::info!(
-                    event = "agent_action",
-                    kind = "call",
-                    code = result.code.as_str()
-                );
-                if result.code == ActionCode::Done {
-                    self.reply(&format!("Owner approved: calling @{handle}."));
-                } else {
-                    self.reply(&format!(
-                        "Owner approved the call to @{handle}, but it was not placed: {}.",
-                        result.summary()
-                    ));
+            } => match target.parse::<UserId>() {
+                // The approval lets the next invite to that person through (15 minutes).
+                Ok(user_id) => {
+                    let peer = Peer {
+                        user_id,
+                        handle,
+                        agent: false,
+                        owner: None,
+                    };
+                    self.call_contact(peer, reason, Caller::Approved).await;
                 }
-            }
+                Err(_) => self.reply(&format!(
+                    "Owner approved the call to @{handle}, but it was not placed: the kept call names no user."
+                )),
+            },
             PendingKind::Request { handle } => {
                 self.reply(&format!(
                     "Owner approved: contact request to @{handle} sent."
