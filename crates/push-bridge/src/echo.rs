@@ -7,7 +7,14 @@
 //! |---|---|
 //! | `ask` | a question (Red, Blue; free text allowed), then "you chose: <answer>" |
 //! | `pick` | a multi-select (Red, Blue, Green), then "you chose: <labels>" |
+//! | an action command | the bridge action's result, such as "done: sent to @bob" |
 //! | anything else | "echo: <text>" |
+//!
+//! The action commands, in the owner's chat only (spec 2026-11-09 proactive agents §7.6,
+//! [`crate::actions::parse_command`]): `request @h`, `send @h|owner|group:<id> <text>`,
+//! `notify <text>`, `group <name|"quoted name"> @a @b …`, `invite group:<id> @h`,
+//! `call @h|owner [reason]` and `outgoing`. A malformed one answers its usage. Contacts'
+//! texts are only echoed.
 //!
 //! The core does the rest: the answer checks, the card deadline (the backend's
 //! [`Backend::answer_timeout`], "No answer; skipped"), paging long replies, skipping texts
@@ -20,6 +27,7 @@ use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
 
+use crate::actions::{self, Action, ActionRequest};
 use crate::backend::{
     ActivityLabels, Answer, Backend, BackendCommand, BackendError, BackendEvent, BackendRequest,
     BackendStatus, Capability, CommandReply, ContactId, ErrorKind, PendingMessages, RequestKind,
@@ -110,7 +118,38 @@ impl EchoBackend {
             },
         }
     }
+
+    /// Asks the bridge to carry ction out and waits for its result or the turn's end;
+    /// the result as one line, or Err(interrupted) when the turn was ended early.
+    async fn act(
+        &self,
+        action: Action,
+        mut cancel: oneshot::Receiver<bool>,
+    ) -> Result<Option<String>, bool> {
+        let (request, result) = ActionRequest::new(action);
+        self.emit(BackendEvent::Action(request));
+        tokio::select! {
+            biased;
+            interrupted = &mut cancel => Err(interrupted.unwrap_or(false)),
+            result = result => Ok(Some(match result {
+                Ok(result) => result.summary(),
+                Err(_) => "failed: the bridge did not answer".to_owned(),
+            })),
+        }
+    }
 }
+
+/// Echo's lines in the owner's `/help`.
+pub const HELP: &str = concat!(
+    "Echo's action commands (no /):\n",
+    "request @handle: send a contact request\n",
+    "send @handle|owner|group:<id> <text>: send a message\n",
+    "notify <text>: a note in this chat\n",
+    "group <name|\"quoted name\"> @a @b …: create a group of contacts\n",
+    "invite group:<id> @handle: add a contact to a group\n",
+    "call @handle|owner [reason]: call someone\n",
+    "outgoing: the actions waiting for you"
+);
 
 /// A question with free text allowed.
 fn question_request(
@@ -161,6 +200,10 @@ impl Backend for EchoBackend {
 
     fn accepts_contacts(&self) -> bool {
         true
+    }
+
+    fn help(&self) -> Option<&str> {
+        Some(HELP)
     }
 
     async fn contact_prompt(&self, contact: ContactId, text: &str) -> Result<(), BackendError> {
@@ -239,7 +282,11 @@ impl Backend for EchoBackend {
         } else if command.eq_ignore_ascii_case("pick") {
             self.ask(PICK_QUESTION, &PICK_OPTIONS, true, cancel).await
         } else {
-            Ok(Some(format!("echo: {text}")))
+            match actions::parse_command(command) {
+                Some(Ok(action)) => self.act(action, cancel).await,
+                Some(Err(usage)) => Ok(Some(format!("usage: {usage}"))),
+                None => Ok(Some(format!("echo: {text}"))),
+            }
         };
         // Ends the turn under the lock, so a next prompt starts only after it.
         let mut inner = self.lock();

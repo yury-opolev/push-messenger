@@ -2,10 +2,14 @@
 //! the owner's commands, and the backend's lifecycle. It drives a [`Backend`] and talks
 //! to push-messenger through a [`Messenger`].
 
+mod acting;
 mod calling;
+mod contact_calls;
 mod contacts;
 mod control;
 mod conversation;
+mod inbound;
+mod loop_guard;
 mod report;
 mod requests;
 mod turns;
@@ -13,7 +17,11 @@ mod upgrade;
 mod voice;
 
 #[cfg(test)]
+mod actions_tests;
+#[cfg(test)]
 mod echo_tests;
+#[cfg(test)]
+mod inbound_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
@@ -29,12 +37,13 @@ use push_bridge_control::{
     AgentInfo, BridgeState, CallDirection, CallInfo, CallPhase, CardState, PeekKind,
 };
 use push_sdk::{
-    ActivityState, CallEvent, CallId, CardBook, ClientMsgId, ConnectionState, ConversationId,
-    Event, SdkError, UserId,
+    ActivityState, AgentSettings, CallEvent, CallId, CardBook, ClientMsgId, ConnectionState,
+    ConversationId, Event, InboundPolicy, OutgoingAction, SdkError, UserId,
 };
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{Instant, MissedTickBehavior};
 
+use crate::actions::ActionResult;
 use crate::backend::{
     ActivityLabels, Backend, BackendCommand, BackendError, BackendEvent, Capability, CommandReply,
     PermissionMode, Prepared, Responder, TextFormat,
@@ -44,7 +53,7 @@ use crate::cards::CardKind;
 use crate::control::{Calls, ControlCall, ControlHandle};
 use crate::messenger::Messenger;
 use crate::render::{TurnRenderer, reply_bodies};
-use crate::state::{State, StateFile};
+use crate::state::{PendingKind, State, StateFile};
 use crate::voice::VoiceSetup;
 use crate::voice::phone::Line;
 use crate::voice::policy::Verdict;
@@ -85,6 +94,9 @@ pub struct BridgeOptions {
     pub default_folder: PathBuf,
     /// The permission mode of a new session (and after `/new`).
     pub default_mode: PermissionMode,
+    /// Agent turns without a person after which a chat with another agent is paused
+    /// (the loop guard; at least 2).
+    pub loop_guard_turns: u32,
 }
 
 /// Why the bridge stopped.
@@ -205,10 +217,10 @@ impl<M: Messenger> Bridge<M> {
             .await
             .map_err(BridgeError::Messenger)?;
         let agent_profile = messenger.profile().await;
-        let notice = contacts::notice(
-            agent_profile.as_ref().map(|(name, _)| name.as_str()),
-            messenger.owner_name().await,
-        );
+        let owner_name = messenger.owner_name().await;
+        let owner_display = owner_name.as_ref().map(|(name, _)| name.clone());
+        let agent_name = agent_profile.as_ref().map(|(name, _)| name.clone());
+        let notice = contacts::notice(agent_name.as_deref(), owner_name);
         if let Some((display_name, handle)) = agent_profile {
             control.update(|status| {
                 status.agent = Some(AgentInfo {
@@ -229,10 +241,14 @@ impl<M: Messenger> Bridge<M> {
         );
         core.control = control;
         core.contacts.notice = notice;
+        core.agent_name = agent_name;
+        core.owner_display = owner_display;
         core.voice = voice;
         core.call_flag = call_flag;
         tracing::info!(event = "bridge_started", backend = core.name.as_str());
+        core.load_settings().await;
         core.boot().await;
+        core.reconcile_actions();
         core.publish();
         let mut ticker = tokio::time::interval(TICK);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -309,8 +325,27 @@ enum Internal {
     Dialed { result: Result<Line, SdkError> },
     /// The backend is done with a contact's text.
     ContactPrompted {
-        conversation: ConversationId,
+        chat: contacts::ContactChat,
         result: Result<(), BackendError>,
+    },
+    /// The server answered the backend's action `kind`; the core finishes it.
+    Acted {
+        kind: &'static str,
+        reply: oneshot::Sender<ActionResult>,
+        acted: acting::Acted,
+    },
+    /// The chat of an approved waiting message was opened (or not).
+    ApprovedChat {
+        kind: PendingKind,
+        result: Result<ConversationId, SdkError>,
+    },
+    /// The agent's actions, listed to settle those decided while the bridge was away.
+    Reconciled {
+        result: Result<Vec<OutgoingAction>, SdkError>,
+    },
+    /// The agent's settings, read again after a reconnect.
+    Settings {
+        result: Result<AgentSettings, SdkError>,
     },
 }
 
@@ -377,6 +412,10 @@ struct Core<M: Messenger> {
     skip_before_us: Option<i64>,
     /// The backend takes the agent's accepted contacts too.
     accepts_contacts: bool,
+    /// Which accepted contacts reach the backend (the owner's setting).
+    inbound: InboundPolicy,
+    /// Chats with other agents and their turns (see [`loop_guard`]).
+    loops: loop_guard::LoopGuard,
     /// The accepted contacts' conversations and questions.
     contacts: contacts::Contacts,
     state: Arc<StateFile>,
@@ -448,8 +487,14 @@ struct Core<M: Messenger> {
     answering: Option<(CallId, Vec<CallEvent>)>,
     /// The owner's call waiting for the owner's answer on a card (`calls.answer` `ask`).
     asking: Option<calling::Asking>,
-    /// A call to the owner being placed.
+    /// A call to the owner (or a contact) being placed.
     dialing: Option<calling::Dialing>,
+    /// The call to a contact whose result the caller still waits for.
+    contact_call: Option<contact_calls::ContactCall>,
+    /// The agent's display name and its owner's, as people see them (a call to a
+    /// contact says them).
+    agent_name: Option<String>,
+    owner_display: Option<String>,
     /// When the bridge last called the owner (the rate limit).
     last_dialed: Option<Instant>,
     /// Why the last due call was held back (logged once per change).
@@ -497,6 +542,8 @@ impl<M: Messenger> Core<M> {
             answer_timeout,
             skip_before_us,
             accepts_contacts,
+            inbound: InboundPolicy::OwnerOnly,
+            loops: loop_guard::LoopGuard::new(options.loop_guard_turns),
             contacts: contacts::Contacts::default(),
             state,
             folder: options.default_folder.clone(),
@@ -539,6 +586,9 @@ impl<M: Messenger> Core<M> {
             answering: None,
             asking: None,
             dialing: None,
+            contact_call: None,
+            agent_name: None,
+            owner_display: None,
             last_dialed: None,
             held_by: None,
             held_no_tts: false,
@@ -669,10 +719,11 @@ impl<M: Messenger> Core<M> {
             Internal::Answered { call_id, result } => self.answered(call_id, result).await,
             Internal::Voice { call_id, event } => self.on_voice(call_id, event).await,
             Internal::Dialed { result } => self.dialed(result).await,
-            Internal::ContactPrompted {
-                conversation,
-                result,
-            } => self.contact_prompted(conversation, result).await,
+            Internal::ContactPrompted { chat, result } => self.contact_prompted(chat, result).await,
+            Internal::Acted { kind, reply, acted } => self.acted(kind, reply, acted).await,
+            Internal::ApprovedChat { kind, result } => self.approved_send(kind, result),
+            Internal::Reconciled { result } => self.reconciled(result).await,
+            Internal::Settings { result } => self.settings_read(result),
         }
     }
 
@@ -682,6 +733,7 @@ impl<M: Messenger> Core<M> {
         self.expire_contact_requests();
         self.refresh_contact_activity(false).await;
         self.expire_asking();
+        self.confirm_contact_call();
         self.call_owner_if_due().await;
         self.watch_pause().await;
         self.update_activity(false).await;

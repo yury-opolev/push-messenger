@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-use push_sdk::{ActivityState, ContactState, Event, MessageKind, UserId};
+use push_sdk::{ActivityState, ContactState, Event, InboundPolicy, MessageKind, UserId};
 
 use super::tests::{Harness, settle};
 use crate::commands;
@@ -51,8 +51,10 @@ async fn reply(h: &Harness, text: &str) {
         .await;
 }
 
+/// The echo agent, open to every accepted contact (inbound `contacts`).
 async fn started(answer_timeout_s: u64) -> Harness {
     let mut h = Harness::echo(answer_timeout_s);
+    h.messenger.set_inbound(InboundPolicy::Contacts);
     h.start();
     settle().await;
     h
@@ -252,7 +254,12 @@ async fn only_help_and_status_are_offered() {
     let help = h.replies().last().unwrap().clone();
     assert_eq!(
         help,
-        format!("{}\n\n{}", commands::help(|_| false), commands::OWNER_NOTE)
+        format!(
+            "{}\n{}\n\n{}",
+            commands::help(|_| false),
+            crate::echo::HELP,
+            commands::OWNER_NOTE
+        )
     );
     assert!(!help.contains("/new") && !help.contains("/cd"));
 
@@ -648,6 +655,7 @@ async fn contacts_may_run_only_help_and_status() {
 #[tokio::test(start_paused = true)]
 async fn coda_still_answers_only_its_owner() {
     let mut h = Harness::named("Coda");
+    h.messenger.set_inbound(InboundPolicy::Contacts);
     h.start();
     h.backend.wait_for("start", 1).await;
     settle().await;
@@ -693,5 +701,113 @@ async fn a_contact_s_open_question_keeps_its_activity_fresh() {
         activities_in(&h, with_alice).len(),
         before,
         "idle is sent once"
+    );
+}
+
+/// A server refusal naming the waiting action `id`.
+fn waiting_for_owner(id: &str) -> push_sdk::SdkError {
+    push_sdk::SdkError::Server {
+        code: "waiting_for_owner".into(),
+        message: "waits".into(),
+        retryable: false,
+        retry_after_s: None,
+        action_id: Some(id.into()),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_owner_s_commands_run_bridge_actions_and_echo_their_result() {
+    let h = started(300).await;
+    let bob = h.messenger.add_user("bob", false);
+    h.messenger.owner_says("send @bob hi there");
+    reply(&h, "done: sent to @bob").await;
+    reply_in(&h, h.messenger.conversation_with(bob), "hi there").await;
+    h.idle().await;
+
+    h.messenger.owner_says("SEND owner hello me");
+    reply(&h, "done: sent to the owner").await;
+    assert!(texts(&h.messenger).contains(&"hello me".to_owned()));
+    h.idle().await;
+
+    h.messenger.owner_says("notify all green");
+    reply(&h, "done: the owner was notified").await;
+    h.idle().await;
+    assert!(h.messenger.texts().is_empty(), "people get rich replies");
+}
+
+#[tokio::test(start_paused = true)]
+async fn refusals_and_malformed_commands_are_echoed_as_one_line() {
+    let h = started(300).await;
+    h.messenger.add_user("bob", false);
+    let cases = [
+        (
+            "send @bob hi",
+            Some(("open_direct", waiting_for_owner("a-1"))),
+            "waiting for owner (action a-1)",
+        ),
+        (
+            "request @bob",
+            Some((
+                "request_contact",
+                crate::messenger::server_error("not_allowed_by_owner"),
+            )),
+            "not allowed by owner",
+        ),
+        (
+            "request @bob",
+            Some((
+                "request_contact",
+                push_sdk::SdkError::Server {
+                    code: "rate_limited".into(),
+                    message: "slow down".into(),
+                    retryable: true,
+                    retry_after_s: Some(30),
+                    action_id: None,
+                },
+            )),
+            "rate limited, retry in 30 s",
+        ),
+        ("request @nobody", None, "not found: no user @nobody"),
+        (
+            "send bob hi",
+            None,
+            "usage: send @handle|owner|group:<id> <text>",
+        ),
+        (
+            "call owner",
+            None,
+            "unavailable: voice calls are not set up",
+        ),
+    ];
+    for (command, failure, answer) in cases {
+        if let Some((method, error)) = failure {
+            h.messenger.fail_next(method, error);
+        }
+        h.messenger.owner_says(command);
+        reply(&h, answer).await;
+        h.idle().await;
+    }
+    let kept = h.state.get().pending_actions;
+    assert_eq!(kept.keys().collect::<Vec<_>>(), ["a-1"]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_contact_s_command_words_are_only_echoed() {
+    let h = started(300).await;
+    let alice = contact(&h);
+    h.messenger.add_user("bob", false);
+    h.messenger.says(alice, "send @bob hi");
+    reply_in(
+        &h,
+        h.messenger.conversation_with(alice),
+        "echo: send @bob hi",
+    )
+    .await;
+    settle().await;
+    assert!(
+        !h.messenger
+            .calls()
+            .iter()
+            .any(|call| matches!(call, Call::Lookup { .. }))
     );
 }

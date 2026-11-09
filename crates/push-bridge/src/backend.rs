@@ -13,6 +13,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
+pub use crate::actions::ActionRequest;
 pub use crate::commands::ScheduleWhen;
 
 /// How a backend writes the text of its turns and background messages.
@@ -369,6 +370,9 @@ pub enum BackendEvent {
         contact: ContactId,
         request: BackendRequest,
     },
+    /// An action the backend starts on its own (spec 2026-11-09 proactive agents §7.1),
+    /// inside or outside a turn; the core answers on the request's oneshot.
+    Action(ActionRequest),
 }
 
 /// An accepted contact the core passed to [`Backend::contact_prompt`]: an opaque id the
@@ -507,6 +511,10 @@ pub trait Backend: Send + Sync + 'static {
     fn executable(&self) -> Option<PathBuf> {
         None
     }
+    /// More lines for the owner's `/help` (the backend's own commands); `None` by default.
+    fn help(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// A [`ErrorKind::Unsupported`] error for `method`.
@@ -621,6 +629,7 @@ impl fmt::Debug for BackendEvent {
             Self::ContactRequest { request, .. } => {
                 write!(formatter, "ContactRequest({:?})", request.kind)
             }
+            Self::Action(request) => write!(formatter, "Action({})", request.action.kind()),
         }
     }
 }

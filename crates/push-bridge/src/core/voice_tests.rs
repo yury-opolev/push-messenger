@@ -8,7 +8,10 @@ use std::time::Duration;
 
 use chrono::NaiveDateTime;
 use push_bridge_control::{CallDirection, CallPhase, Event as ControlEvent, NO_CALL};
-use push_sdk::{ActivityState, CallEndReason, CallEvent, CallId, Event, UserId};
+use push_sdk::{
+    ActivityState, CallEndReason, CallErrorCode, CallEvent, CallId, ConnectionState, ContactState,
+    Event, OutgoingAction, OutgoingKind, OutgoingState, SdkError, UserId,
+};
 use push_voice_adapter_proto::BridgeHello;
 use push_voice_adapter_testkit::{
     Event as AdapterEvent, Fixture, Log, Script, Word, fixture as fixtures, tones,
@@ -19,10 +22,12 @@ use tokio::task::JoinHandle;
 use super::CallFlag;
 use super::tests::{Harness, peeked, permission, settle};
 use super::voice::{ADAPTER_BACK, ADAPTER_LOST};
-use crate::backend::{Answer, BackendEvent, RequestKind, TurnSource};
+use crate::actions::{Action as AgentAction, ActionCode, ActionRequest, ActionResult, Target};
+use crate::backend::{Answer, BackendEvent, ContactId, RequestKind, TurnSource};
 use crate::config::AnswerMode;
 use crate::control::Action;
-use crate::messenger::{param, template};
+use crate::messenger::{Messenger, param, template};
+use crate::state::PendingKind;
 use crate::voice::VoiceSetup;
 use crate::voice::adapter::advertise::advertise;
 use crate::voice::adapter::router::AdapterSetup;
@@ -1628,6 +1633,7 @@ impl IdleCore {
                 roots: vec![dir.path().to_path_buf()],
                 default_folder: dir.path().to_path_buf(),
                 default_mode: crate::backend::PermissionMode::Default,
+                loop_guard_turns: 20,
             },
             internal,
             owner,
@@ -1682,4 +1688,442 @@ async fn the_call_flag_holds_through_the_shutdown() {
         !flag.has_changed().unwrap(),
         "never lowered during the shutdown"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_backend_s_call_action_rings_the_owner_with_its_reason() {
+    // Notify-by-call is off (the default): the action still calls, within the interval.
+    let v = Voice::new().await;
+    let call = |reason: Option<&str>| {
+        let (request, result) = ActionRequest::new(AgentAction::Call {
+            to: Target::Owner,
+            reason: reason.map(str::to_owned),
+        });
+        v.h.backend.emit(BackendEvent::Action(request));
+        result
+    };
+    let first = call(Some("The nightly build failed.")).await.unwrap();
+    assert_eq!(first.code, ActionCode::Done, "{first:?}");
+    let ringing = v.dialed(1).await;
+    let busy = call(None).await.unwrap();
+    assert_eq!(
+        (busy.code, busy.detail.as_str()),
+        (ActionCode::Unavailable, "a call is already running")
+    );
+    ringing.pick_up();
+    v.until_said("The nightly build failed.").await;
+    assert_eq!(
+        v.spoken(),
+        ["Hi, it's Coda in work.", "The nightly build failed."]
+    );
+    ringing.end(CallEndReason::Completed);
+    settle().await;
+    let soon = call(None).await.unwrap();
+    assert_eq!(soon.code, ActionCode::Unavailable, "{soon:?}");
+    assert!(soon.retry_after_s.is_some_and(|after| after > 500));
+    assert_eq!(v.phone.dialed().len(), 1);
+}
+
+/// A bridge with voice whose backend takes contacts, and bob: a person who is the agent's
+/// accepted contact.
+async fn contact_voice() -> (Voice, UserId) {
+    let h = Harness::named("Coda");
+    h.backend.set_accepts_contacts(true);
+    let starter = then_not_found(vec![Plan::Adapter(voice_script())]);
+    let supervisor = Supervisor::with_starter(
+        starter.clone(),
+        BridgeHello::v1(env!("CARGO_PKG_VERSION"), "en-US"),
+    );
+    let a = Adapted::build_on(h, supervisor, Some(starter), CallPolicy::default()).await;
+    a.ready().await;
+    a.setup.set_advertised(true);
+    let bob = a.v.h.messenger.add_user("bob", false);
+    a.v.h.messenger.set_contact(bob, ContactState::Accepted);
+    (a.v, bob)
+}
+
+/// The backend's `call` action to `to`; its result, once answered.
+fn call_action(
+    v: &Voice,
+    to: &str,
+    reason: Option<&str>,
+) -> tokio::sync::oneshot::Receiver<ActionResult> {
+    let (request, result) = ActionRequest::new(AgentAction::Call {
+        to: to.parse::<Target>().unwrap(),
+        reason: reason.map(str::to_owned),
+    });
+    v.h.backend.emit(BackendEvent::Action(request));
+    result
+}
+
+/// The server refuses the invite of `call` with `code` and `error`.
+fn refuse(v: &Voice, call: &FakeCall, code: CallErrorCode, error: SdkError) {
+    v.h.messenger.inject(Event::Call(CallEvent::Error {
+        call_id: call.call_id,
+        code,
+        error,
+    }));
+}
+
+fn refusal(code: &str, action_id: Option<&str>, retry_after_s: Option<u32>) -> SdkError {
+    SdkError::Server {
+        code: code.into(),
+        message: code.into(),
+        retryable: false,
+        retry_after_s,
+        action_id: action_id.map(str::to_owned),
+    }
+}
+
+/// The RICH replies' `(title, text)` in `conversation`.
+fn replies_in(v: &Voice, conversation: push_sdk::ConversationId) -> Vec<(String, String)> {
+    v.h.messenger
+        .calls()
+        .into_iter()
+        .filter_map(|call| match call {
+            crate::messenger::Call::SendRich {
+                conversation: to,
+                body,
+                ..
+            } if to == conversation && template(&body).starts_with("agent.reply@") => Some((
+                param(&body, "title").unwrap_or_default(),
+                param(&body, "text").unwrap_or_default(),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_agent_calls_a_contact_who_talks_with_the_backend_as_that_contact() {
+    let (v, bob) = contact_voice().await;
+    // Bob and the agent have a chat; opening new ones waits for the owner.
+    let chat = v.h.messenger.conversation_with(bob);
+    v.h.messenger
+        .gate_chats(refusal("waiting_for_owner", Some("a-0"), None));
+    let result = call_action(&v, "@bob", Some("The deploy is stuck."));
+    let ringing = v.dialed(1).await;
+    assert_eq!(v.phone.dialed(), [bob]);
+    let result = result.await.unwrap();
+    assert_eq!(
+        (result.code, result.detail.as_str()),
+        (ActionCode::Done, "calling @bob")
+    );
+    assert_eq!(
+        v.call_info(),
+        Some((CallPhase::Ringing, CallDirection::Outgoing))
+    );
+
+    ringing.pick_up();
+    v.until_said("The deploy is stuck.").await;
+    assert_eq!(
+        v.spoken(),
+        [
+            "Hi, this is Coda on Devbox, Test Owner's agent.",
+            "The deploy is stuck."
+        ]
+    );
+    quiet().await;
+
+    say(&ringing, &fixture("prompt").audio()).await;
+    let contact = bob.to_string();
+    v.h.backend
+        .wait_for(&format!("contact {contact} run the tests"), 1)
+        .await;
+    assert_eq!(v.h.count("prompt"), 0, "never the owner's session");
+    assert_eq!(v.h.count("steer"), 0);
+    assert!(v.transcripts().is_empty(), "nothing in the owner's chat");
+    assert!(
+        replies_in(&v, chat).contains(&("🎤 voice".to_owned(), "run the tests".to_owned())),
+        "{:?}",
+        replies_in(&v, chat)
+    );
+
+    v.h.backend.emit(BackendEvent::ContactReply {
+        contact: ContactId(contact.clone()),
+        text: "Running them now.".into(),
+    });
+    v.until_said("Running them now.").await;
+    assert!(
+        replies_in(&v, chat)
+            .iter()
+            .any(|(_, text)| text == "Running them now."),
+        "posted in bob's chat too"
+    );
+
+    // The owner's session talks meanwhile: in the owner's chat, never on bob's call.
+    v.h.backend.turn_started(TurnSource::Prompt);
+    v.h.backend.text("Owner stuff only.\n");
+    v.h.backend.turn_ended(false);
+    v.until("the owner's reply", || {
+        v.posted()
+            .iter()
+            .any(|text| text.contains("Owner stuff only."))
+    })
+    .await;
+    quiet().await;
+    assert!(!v.spoken().iter().any(|said| said == "Owner stuff only."));
+
+    ringing.end(CallEndReason::Completed);
+    v.until("the end", || v.call_info().is_none()).await;
+    assert!(
+        !v.replies().iter().any(|note| note.contains("not answered")),
+        "{:?}",
+        v.replies()
+    );
+    assert!(v.h.messenger.opened_directs().is_empty(), "no chat opened");
+    assert!(v.h.state.get().pending_actions.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_call_to_a_contact_without_a_chat_opens_none_and_posts_in_the_owner_s_chat() {
+    let (v, bob) = contact_voice().await;
+    v.h.messenger
+        .gate_chats(refusal("waiting_for_owner", Some("a-0"), None));
+    let result = call_action(&v, "@bob", Some("The deploy is stuck."));
+    let ringing = v.dialed(1).await;
+    assert_eq!(v.phone.dialed(), [bob]);
+    assert_eq!(result.await.unwrap().code, ActionCode::Done);
+    ringing.pick_up();
+    v.until_said("The deploy is stuck.").await;
+    quiet().await;
+
+    say(&ringing, &fixture("prompt").audio()).await;
+    let contact = bob.to_string();
+    v.h.backend
+        .wait_for(&format!("contact {contact} run the tests"), 1)
+        .await;
+    let owner = v.h.messenger.conversation();
+    assert!(
+        replies_in(&v, owner)
+            .contains(&("📞 @bob 🎤 voice".to_owned(), "run the tests".to_owned())),
+        "{:?}",
+        replies_in(&v, owner)
+    );
+    v.h.backend.emit(BackendEvent::ContactReply {
+        contact: ContactId(contact.clone()),
+        text: "Running them now.".into(),
+    });
+    v.until_said("Running them now.").await;
+    assert!(
+        replies_in(&v, owner).contains(&("📞 to @bob".to_owned(), "Running them now.".to_owned())),
+        "{:?}",
+        replies_in(&v, owner)
+    );
+    ringing.end(CallEndReason::Completed);
+    v.until("the end", || v.call_info().is_none()).await;
+    assert!(v.h.messenger.opened_directs().is_empty(), "no chat opened");
+    assert!(!v.h.messenger.has_direct(bob));
+    assert!(v.h.state.get().pending_actions.is_empty());
+}
+
+/// The server reports the owner's approval of the call `id` to `peer`, resolved
+/// `ago_ms` before now.
+fn call_approved(v: &Voice, id: &str, peer: UserId, ago_ms: i64) -> OutgoingAction {
+    OutgoingAction {
+        action_id: id.into(),
+        agent: v.h.messenger.me(),
+        kind: OutgoingKind::Call,
+        target: Some(peer),
+        conversation: None,
+        title: None,
+        members: Vec::new(),
+        state: OutgoingState::Approved,
+        error: None,
+        created_at_ms: 0,
+        resolved_at_ms: Some(super::Clock::new().now_ms() - ago_ms),
+    }
+}
+
+/// Keeps a call to `peer` (`@bob`) waiting for the owner under `id`.
+fn keep_call(v: &Voice, id: &str, peer: UserId) {
+    v.h.state
+        .update(|state| {
+            state.pending_actions.insert(
+                id.into(),
+                crate::state::PendingAction {
+                    kind: PendingKind::Call {
+                        target: peer.to_string(),
+                        handle: "bob".into(),
+                        reason: Some("Lunch?".into()),
+                    },
+                    created_at_ms: super::Clock::new().now_ms(),
+                },
+            );
+        })
+        .unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_approval_settled_after_fifteen_minutes_does_not_call() {
+    let (v, bob) = contact_voice().await;
+    keep_call(&v, "a-4", bob);
+    v.h.messenger
+        .set_outgoing(vec![call_approved(&v, "a-4", bob, 16 * 60 * 1_000)]);
+    for state in [ConnectionState::Connecting, ConnectionState::Connected] {
+        v.h.messenger.inject(Event::ConnectionStateChanged(state));
+    }
+    v.h.reply_containing("The approval to call @bob has expired; the agent did not call.")
+        .await;
+    settle().await;
+    assert!(v.phone.dialed().is_empty());
+    assert!(v.h.state.get().pending_actions.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_approved_call_the_server_gates_again_stays_kept() {
+    let (v, bob) = contact_voice().await;
+    keep_call(&v, "a-5", bob);
+    v.h.messenger
+        .inject(Event::OutgoingActionChanged(call_approved(
+            &v, "a-5", bob, 0,
+        )));
+    let call = v.dialed(1).await;
+    refuse(
+        &v,
+        &call,
+        CallErrorCode::WaitingForOwner,
+        refusal("waiting_for_owner", Some("a-6"), None),
+    );
+    v.h.reply_containing("Owner approved the call to @bob, but it was not placed")
+        .await;
+    v.until("the refused call is over", || v.call_info().is_none())
+        .await;
+    let kept = v.h.state.get().pending_actions;
+    assert_eq!(
+        kept.get("a-6").map(|pending| &pending.kind),
+        Some(&PendingKind::Call {
+            target: bob.to_string(),
+            handle: "bob".into(),
+            reason: Some("Lunch?".into()),
+        })
+    );
+    assert!(!kept.contains_key("a-5"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_call_waiting_for_the_owner_is_kept_and_dialed_once_approved() {
+    let (v, bob) = contact_voice().await;
+    // No chat with bob, and the owner decides on new ones: a call opens none.
+    v.h.messenger
+        .gate_chats(refusal("waiting_for_owner", Some("a-0"), None));
+    let result = call_action(&v, "@bob", Some("Lunch at noon?"));
+    let first = v.dialed(1).await;
+    refuse(
+        &v,
+        &first,
+        CallErrorCode::WaitingForOwner,
+        refusal("waiting_for_owner", Some("a-9"), None),
+    );
+    let result = result.await.unwrap();
+    assert_eq!(result.code, ActionCode::WaitingForOwner, "{result:?}");
+    assert_eq!(result.action_id.as_deref(), Some("a-9"));
+    v.until("the refused call is over", || v.call_info().is_none())
+        .await;
+    let kept = v.h.state.get().pending_actions;
+    assert_eq!(
+        kept.get("a-9").map(|pending| &pending.kind),
+        Some(&PendingKind::Call {
+            target: bob.to_string(),
+            handle: "bob".into(),
+            reason: Some("Lunch at noon?".into()),
+        })
+    );
+
+    v.h.messenger
+        .inject(Event::OutgoingActionChanged(call_approved(
+            &v, "a-9", bob, 0,
+        )));
+    let second = v.dialed(2).await;
+    assert_eq!(v.phone.dialed(), [bob, bob]);
+    v.h.reply_containing("Owner approved: calling @bob.").await;
+    assert!(v.h.state.get().pending_actions.is_empty());
+    second.pick_up();
+    v.until_said("Lunch at noon?").await;
+    assert!(
+        !v.replies().iter().any(|note| note.contains("not answered")),
+        "the refused call is no missed call: {:?}",
+        v.replies()
+    );
+    assert!(v.h.messenger.opened_directs().is_empty(), "no chat opened");
+    assert!(!v.h.messenger.has_direct(bob));
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_approved_call_that_cannot_be_placed_now_is_told_to_the_owner() {
+    let (v, bob) = contact_voice().await;
+    let busy = v.call().await;
+    v.h.state
+        .update(|state| {
+            state.pending_actions.insert(
+                "a-3".into(),
+                crate::state::PendingAction {
+                    kind: PendingKind::Call {
+                        target: bob.to_string(),
+                        handle: "bob".into(),
+                        reason: None,
+                    },
+                    created_at_ms: super::Clock::new().now_ms(),
+                },
+            );
+        })
+        .unwrap();
+    v.h.messenger
+        .inject(Event::OutgoingActionChanged(call_approved(
+            &v, "a-3", bob, 0,
+        )));
+    v.h.reply_containing(
+        "Owner approved the call to @bob, but the agent cannot call now: a call is already running.",
+    )
+    .await;
+    assert!(v.phone.dialed().is_empty());
+    busy.end(CallEndReason::Completed);
+}
+
+#[tokio::test(start_paused = true)]
+async fn refused_calls_to_contacts_answer_stable_codes() {
+    let (v, _bob) = contact_voice().await;
+    let result = call_action(&v, "@bob", None);
+    let first = v.dialed(1).await;
+    refuse(
+        &v,
+        &first,
+        CallErrorCode::NotAllowedByOwner,
+        refusal("not_allowed_by_owner", None, None),
+    );
+    assert_eq!(result.await.unwrap().code, ActionCode::NotAllowedByOwner);
+    v.until("the refused call is over", || v.call_info().is_none())
+        .await;
+
+    v.phone
+        .fail_next_call(refusal("rate_limited", None, Some(3_600)));
+    let limited = call_action(&v, "@bob", None).await.unwrap();
+    assert_eq!(
+        (limited.code, limited.retry_after_s),
+        (ActionCode::RateLimited, Some(3_600))
+    );
+
+    let helper = v.h.messenger.add_user("helper", true);
+    v.h.messenger.set_contact(helper, ContactState::Accepted);
+    let agent = call_action(&v, "@helper", None).await.unwrap();
+    assert_eq!(agent.code, ActionCode::NotAllowed);
+    assert_eq!(v.phone.dialed().len(), 1, "the agent was never dialed");
+    v.until("nothing runs", || v.call_info().is_none()).await;
+    assert!(
+        !v.replies().iter().any(|note| note.contains("not answered")),
+        "{:?}",
+        v.replies()
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unanswered_call_to_a_contact_leaves_a_note_for_the_owner() {
+    let (v, _bob) = contact_voice().await;
+    let result = call_action(&v, "@bob", Some("Quick question."));
+    let ringing = v.dialed(1).await;
+    assert_eq!(result.await.unwrap().code, ActionCode::Done);
+    ringing.end(CallEndReason::Missed);
+    v.h.reply_containing("📞 The call to @bob was not answered.")
+        .await;
+    assert!(v.spoken().is_empty());
 }

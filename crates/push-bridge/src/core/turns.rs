@@ -91,6 +91,7 @@ impl<M: Messenger> Core<M> {
             BackendEvent::ContactRequest { contact, request } => {
                 self.open_contact_request(&contact, request).await;
             }
+            BackendEvent::Action(request) => self.start_action(request).await,
         }
     }
 

@@ -29,6 +29,10 @@ and the plan differ, this guide describes what the code does.
 - [17. Manual smoke test on Windows](#17-manual-smoke-test-on-windows)
 - [18. Voice calls](#18-voice-calls)
 - [19. Echo backend](#19-echo-backend)
+- [20. Agent connections](#20-agent-connections)
+- [21. Bridge actions](#21-bridge-actions)
+- [22. Inbound policy and agent turns](#22-inbound-policy-and-agent-turns)
+- [23. Loop guard](#23-loop-guard)
 
 Design of the tray, the control channel and upgrade mode: the plan
 [2026-11-02-agent-tray-upgrade-mode](superpowers/plans/2026-11-02-agent-tray-upgrade-mode.md);
@@ -41,7 +45,7 @@ here too, this guide describes what the code does.
 | What runs | one `push-agent-bridge.exe run` per agent, as the logged-on user, started at logon by a Scheduled Task or by the [tray app](#13-the-tray-app-push-agent-tray) (never both) |
 | Local control | each bridge serves a per-user [control channel](#14-control-channel-for-other-tools) (a named pipe): states and counts out, `restart_backend`, `reconnect`, `shutdown`, `pause_backend` and `resume_backend` in; never message content |
 | Identity | an owned agent signed in with [agent-key](agent-key-sign-in.md): a non-exportable P-256 key in the TPM (or the software key storage provider) |
-| Who may use it | only the agent's owner (`owner_user_id` of the agent's own profile); anyone else gets "This agent is private." (the [echo test agent](#19-echo-backend) also answers accepted contacts) |
+| Who may use it | only the agent's owner (`owner_user_id` of the agent's own profile); anyone else gets "This agent is private." (a backend that takes contacts, the [echo test agent](#19-echo-backend), also answers the accepted contacts the owner's [inbound policy](#22-inbound-policy-and-agent-turns) lets in) |
 | The agent | `coda serve` over stdio (JSON-RPC 2.0 with Content-Length framing), started and restarted by the bridge |
 | Replies | `agent.reply@2` cards (Coda writes Markdown; `agent.reply@1` for a plain-text backend): thinking, tool steps and text, edited as the turn runs |
 | Questions to the owner | `agent.approval@1`, `agent.question@1`, `agent.choose@1`, `agent.plan-approval@1` ([built-ins](rich-messages.md#6-built-in-templates)) |
@@ -86,7 +90,7 @@ backend with backoff. It talks to push-messenger through a small `Messenger` tra
 | `answer_timeout()` | how long a card waits for the owner (default 10 minutes) |
 | `activity_labels()` | the activity labels while working with no tool running (default `thinking`) and while a question is open (default `question`) |
 | `skip_texts_older_than()` | owner texts stored more than this before the bridge started are not delivered (default: all are) |
-| `accepts_contacts()`, `contact_prompt(contact, text)` | take accepted contacts' texts too (default: no, owner-only); replies come back as `ContactReply` and questions as `ContactRequest` events naming the contact, posted in that contact's conversation, answerable only by them. Commands (but `/help`, `/status`) and calls stay the owner's |
+| `accepts_contacts()`, `contact_prompt(contact, text)` | take accepted contacts' texts too (default: no, owner-only), as far as the owner's [inbound policy](#22-inbound-policy-and-agent-turns) lets them in; replies come back as `ContactReply` (plain text to an agent, a rich reply to a person) and questions as `ContactRequest` events naming the contact, posted in that contact's conversation, answerable only by them. Commands (but `/help`, `/status`) and incoming calls stay the owner's; a contact the agent [calls](#the-agent-calls-a-contact) talks to the backend through `contact_prompt` too |
 
 The backend reports through an unbounded channel of `BackendEvent`s: turn started (by a
 prompt or by the engine) and ended (interrupted or not), thinking and text deltas, tool
@@ -194,7 +198,8 @@ Create `%LOCALAPPDATA%\push-messenger\coda-bridge\config.json`. Every field:
   "backend": "coda",
   "coda": { "exe": "C:\\Tools\\coda\\coda.exe", "args": [] },
   "control": true,
-  "peek": true
+  "peek": true,
+  "loop_guard_turns": 20
 }
 ```
 
@@ -218,6 +223,7 @@ Create `%LOCALAPPDATA%\push-messenger\coda-bridge\config.json`. Every field:
 | `control` | no | serve the local [control channel](#14-control-channel-for-other-tools) (the tray's status and actions, `pause`, `resume`); `false` turns it off, and the bridge works as without it (the tray then cannot see or reach it) | `true` |
 | `peek` | no | keep the owner conversation's last 50 messages in memory, masked, for the tray's [chat peek](#chat-peek) (the control channel's `peek`); `false` keeps nothing and answers `peek_disabled` | `true` |
 | `calls` | no | voice calls with the owner: `answer` (`auto`), `language` (`en-US`), `adapter` (the [voice adapter](#voice-adapter) doing the speech: `{"spawn": {…}}` or `{"connect": {…}}`; without it no calls are advertised), `notify_by_call` ([every field](#the-calls-section)). `stt`, `tts` and `vad` are no longer accepted ([migrating](#migrating-from-callsstt-and-callstts)) | absent: no calls (not advertised) |
+| `loop_guard_turns` | no | agent turns (plain texts by either agent) in a chat with another agent, without a person's message, after which the [loop guard](#23-loop-guard) pauses that chat; at least 2 | `20` |
 
 Unknown fields are refused (a typo is an error, not ignored), and a UTF-8 byte order mark
 as Notepad writes it is fine. In JSON, double every backslash. `push-agent-bridge status`
@@ -466,7 +472,9 @@ device stays enrolled: the next `run` signs in again with a fresh assertion.
 **Strangers.** Text and cards from anyone but the owner, in any conversation, get the plain
 text "This agent is private." at most once per sender per hour; nothing they send reaches
 Coda, and their answers to the owner's cards are ignored. Another bridge's "This agent is
-private." is never answered, so two agents cannot keep refusing each other.
+private." is never answered, so two agents cannot keep refusing each other. Accepted
+contacts the owner's [inbound policy](#22-inbound-policy-and-agent-turns) keeps out are
+answered the same way.
 
 **Contact requests** ([agent connections](#20-agent-connections)): the bridge never accepts
 or declines a request; the server resolves it by the policy the owner chose, and a request
@@ -547,6 +555,8 @@ again when it is back."
 | `/schedule add <every\|at\|cron> <when> <prompt>` | `session/scheduleCreate`; `<when>` is one word or `"quoted"` (`every 1h`, `at 2026-10-29T09:00`, `at "tomorrow 9am"`); a cron spec is five fields or quoted |
 | `/schedule rm <id>` | `session/scheduleDelete` |
 | `/skills` | `skills/list` |
+| `/loop` | lists the chats with other agents the [loop guard](#23-loop-guard) paused ("No chat is paused." when none) |
+| `/loop resume [@handle]` | lets that chat (or every paused one) continue: its count starts again. An unknown handle answers "No paused chat with @handle." |
 | `/help` | lists the commands |
 | any other `/…` | sent to Coda as a prompt (Coda's own slash commands work) |
 
@@ -557,7 +567,8 @@ restarts."
 
 | Threat | Mitigation |
 |---|---|
-| Someone else controls the agent | Only text from `owner_user_id` (from the agent's own profile) in the owner's direct conversation reaches Coda (a backend that opts in with `accepts_contacts`, only the echo test agent, also gets accepted contacts' plain texts, never their commands or calls). Only the owner's card answers count, checked by the bridge with `CardBook` (sender, card, offered values, deadline), since the server does not check who answers |
+| Someone else controls the agent | Only text from `owner_user_id` (from the agent's own profile) in the owner's direct conversation reaches Coda (a backend that opts in with `accepts_contacts`, only the echo test agent, also gets the plain texts of the accepted contacts the owner's inbound policy lets in, never their commands or calls). Only the owner's card answers count, checked by the bridge with `CardBook` (sender, card, offered values, deadline), since the server does not check who answers |
+| Contacts reach the backend without the owner's consent | The owner's [inbound policy](#22-inbound-policy-and-agent-turns) decides, enforced by the bridge: `owner_only` (the default) lets nobody else in, `owner_agents` only the owner's own agents (by the sender's profile: `kind` agent, `owner_user_id` the owner), `contacts` every accepted contact. Without the settings (an older server) the bridge stays `owner_only` |
 | Key theft | A non-exportable P-256 key in the TPM (or the software provider, encrypted with the user's DPAPI keys); signing happens inside the provider and only the public key leaves it. Each assertion lives 120 s, has a new `jti` and is accepted once by auth-svc. `software-file` keys are plain files: development only |
 | Secrets leaving the machine | Everything sent is masked first (below) and capped. **Message history is stored on the server unencrypted**: bodies, cards and answers are plaintext to the server and its operators, and stay in the history |
 | Approval bypass from a stolen messenger session | `/mode bypass` (and `/yolo`) needs a confirmation card; `default_permission_mode` cannot be `bypassPermissions`; `/new`, `/cd` and a bridge restart reset it; `/status` shows it |
@@ -567,10 +578,10 @@ restarts."
 | Logs | Names, codes, counts and durations only: never message bodies, previews, plans, typed answers, tokens or assertions |
 | Secrets at rest | Tokens stay in memory; the SDK's database is in memory; `state.json` holds ids only |
 | Another local user drives the bridge | The [control channel](#access-rules) is a local pipe whose DACL admits only the user and SYSTEM, and each side checks the other's user SID (Unix: a 0600 socket in a 0700 folder and a peer uid check); it carries states, counts, names and error codes only, except the [chat peek](#chat-peek) (the owner conversation's last messages, masked, in memory only; `"peek": false` turns it off); `"control": false` turns the channel off |
-| Someone else talks to the agent by voice | Only the owner's calls are answered (the server refuses non-contacts first), one at a time; a transcript is never a `/` command |
+| Someone else talks to the agent by voice | Only the owner's calls are answered (the server refuses non-contacts first), one at a time; a transcript is never a `/` command. A contact the agent called itself (under the owner's `calls` policy) talks only to the backend as that contact, never to the owner's session or cards |
 | Someone connects to the agent behind the owner's back | The agent cannot accept contact requests (`owner_decides`): the owner's policy and decisions do ([§20](#20-agent-connections)); an agent's invites count for nothing |
 | People chatting with the agent do not know the owner reads along | Each contact is told once per session, and in `/help`, that the owner can read the chat; clients show the same notice from the agent's profile |
-| Two agents talking in a loop | Replies, cards and refusals from other agents never prompt the backend; agents never call each other |
+| Two agents talking in a loop | Replies, cards and refusals from other agents never prompt the backend (only plain text between agents is a turn); the [loop guard](#23-loop-guard) pauses a chat with another agent after `loop_guard_turns` agent turns without a person, until a person writes there or the owner sends `/loop resume`; agents never call each other |
 
 **Voice calls.** The call's audio is encrypted end to end between the owner's app and the
 bridge. The call's audio and the text of each spoken sentence (masked) go to the
@@ -1197,7 +1208,7 @@ Field names are camelCase; absent values are `null`.
 | `pause` | `{phase, reason, since}` while paused: `phase` is `draining`, `released`, `waiting_for_file` or `resuming`; `since` in Unix ms |
 | `lastError` | `{code, at}` of the last failed Coda call |
 | `startedAt` | when the bridge started, Unix ms |
-| `call` | the [voice call](#18-voice-calls) while one runs or rings, else `null` (absent from older bridges): `{phase, direction, speaking, listening, muted, since}`. `phase` is `ringing` (the owner's call waits for the owner's confirmation, or the bridge's call rings the owner), `connecting` or `in_call`; `direction` is `incoming` (the owner called the agent) or `outgoing` (the agent calls the owner, `notify_by_call`); `speaking`: the agent's voice plays; `listening`: the owner speaks; `muted`: the agent's voice is muted (`mute`); `since`: when the call entered its phase, Unix ms |
+| `call` | the [voice call](#18-voice-calls) while one runs or rings, else `null` (absent from older bridges): `{phase, direction, speaking, listening, muted, since}`. `phase` is `ringing` (the owner's call waits for the owner's confirmation, or the bridge's call rings the owner), `connecting` or `in_call`; `direction` is `incoming` (the owner called the agent) or `outgoing` (the agent calls the owner, `notify_by_call` or the `call` action, or a [contact](#the-agent-calls-a-contact)); `speaking`: the agent's voice plays; `listening`: the owner speaks; `muted`: the agent's voice is muted (`mute`); `since`: when the call entered its phase, Unix ms |
 | `adapter` | the voice adapter, only with `calls.adapter` (absent otherwise): `{state, name, version, capabilities, reason, retryAt, metrics}`. `state` is `off`, `starting`, `handshaking`, `ready` or `backoff`; while ready, `name`, `version` and `capabilities` (`stt`, `tts`, `vad`, `barge_in`, `partials`) from its hello; while backing off, `reason` (content-free) and `retryAt` (Unix ms); `metrics`: `{calls, framesToAdapter, framesFromAdapter, droppedToAdapter, droppedFromAdapter, restarts, speaks, finalToSpeak, speakToAudio}`, the latencies as `{lastMs, avgMs, maxMs}` (final transcript → `speak`, `speak` → its first audio) |
 
 ### Limits
@@ -1566,7 +1577,8 @@ this guide describes what the code does.
 
 One call at a time. The owner ends it by hanging up; stopping the bridge hangs it up, and
 so does the tray's **Hang up** ([call controls](#call-controls-in-the-tray)). The agent
-can also call its owner ([the agent calls you](#the-agent-calls-you)).
+can also call its owner ([the agent calls you](#the-agent-calls-you)) and, under the owner's
+`calls` policy, a person who is its contact ([the agent calls a contact](#the-agent-calls-a-contact)).
 
 ### Build with voice
 
@@ -2092,6 +2104,51 @@ the card on screen, and when the tray's **Hang up** cancels it. If the phone can
 the call at all (offline, calls not available on the server), the log says
 `call_dial_failed` with the code and the card stays as it is.
 
+### The agent calls a contact
+
+The backend's `call` action ([bridge actions](#21-bridge-actions)) may also name a person
+who is the agent's accepted contact ([design](superpowers/specs/2026-11-09-proactive-agents.md)
+§7.5). It needs what a call to the owner needs (a ready voice adapter that listens and
+speaks, calls advertised, connected, not paused, no other call: else `unavailable` with
+the reason) and a backend that takes contacts' messages (`accepts_contacts`, as Coda and
+the echo agent do). Other agents are never called (`not_allowed`). Calls to contacts do
+not count for `min_interval_minutes` and ignore `notify_by_call`.
+
+**The owner's policy.** The server gates every invite with the owner's `calls` policy:
+`off` refuses it (`not_allowed_by_owner`); `ask` holds it (`waiting_for_owner` with the
+action id; the bridge keeps the reason in `pending_actions`); `allowed` rings, at most 10
+calls a day to people (`rate_limited` with `retry_after_s`). When the owner approves a held
+call, the bridge dials the person at once with the same reason (the approval lets one
+invite through within 15 minutes) and says so: "Owner approved: calling @bob."; if it
+cannot call then: "Owner approved the call to @bob, but the agent cannot call now: a call
+is already running.".
+
+**The result.** The server answers an invite only when it refuses it, so the bridge
+answers the action when the phone fails, when the refusal comes, or, without one, 3
+seconds after the invite (`done`, "calling @bob"; also at pickup if that is sooner). A
+call that ends before that answers how it ended (busy or unreachable: `unavailable`). The
+core never waits for it: other events go on meanwhile.
+
+**The call.** The activity in the owner's chat says `calling a contact` while it rings;
+the tray shows an `outgoing` call; **Mute agent** and **Hang up** work as for the owner's
+calls. When the person picks up: "Hi, this is Coda on Devbox, Ann's agent." (the agent's
+and the owner's display names) and the reason, if any; their chat gets the notice that
+chats are visible to the owner (once per session). From then on:
+
+- what the person says is posted in **their** direct chat (a reply titled "🎤 voice") and
+  goes to the backend as that contact's message (`contact_prompt`), never to the owner's
+  session and never as a card answer. The inbound policy does not apply: the agent called
+  them;
+- the backend's replies to that contact (`ContactReply`) are spoken and posted in their
+  chat as usual;
+- the owner's session is not heard on this call: its turns, background messages and cards
+  stay in the owner's chat and are not spoken.
+
+**Not answered.** A call that ends before the person picks up leaves one note in the
+owner's chat: "📞 The call to @bob was not answered." (with "(declined)", "(busy)", "(could
+not be reached)", "(cancelled)" or "(the call failed)" when that is why). A refused invite
+leaves no such note (the result said why).
+
 ### Call controls in the tray
 
 The control channel reports the call ([§14](#14-control-channel-for-other-tools): `call`
@@ -2240,23 +2297,51 @@ a folder of its own, and a `key.name` of its own, as for
 
 **Behaviour.** Texts are matched after trimming, in any case.
 
-| The owner or an accepted contact sends | The echo agent |
+| The owner or an accepted contact the inbound policy lets in sends | The echo agent |
 |---|---|
 | `ask` | posts `agent.question@1` "Red or blue?" (Red, Blue); activity `waiting` / `question open`. The answer (a button, a label or number, or any other text, which is the free-text answer) gets "you chose: <answer>" |
 | `pick` | posts `agent.choose@1` "Pick any colours." (Red, Blue, Green; any number of them; typed answers separated by commas); "you chose: Red, Green" in option order |
+| an action command (the owner only; see below) | runs the [bridge action](#21-bridge-actions) and replies with its result in one line |
 | anything else | replies `agent.reply@2` (Markdown) "echo: <text>", with activity `working` / `echoing`; a text over 4,000 characters continues in further replies, as every turn does |
 
-- **Notice:** each contact's first text in a session gets a reply "Chats with <agent> are
+**Action commands** (the owner's chat only, bare words like `ask`; the keyword in any
+case; a contact's text is only echoed). The owner's `/help` lists them.
+
+| Command | Action |
+|---|---|
+| `request @h` | `request_contact` |
+| `send @h <text>`, `send owner <text>`, `send group:<id> <text>` | `send_message` |
+| `notify <text>` | `notify_owner` |
+| `group <name> @a @b …` (a one-word name, or "a quoted name") | `create_group` |
+| `invite group:<id> @h` | `invite` |
+| `call @h [reason]`, `call owner [reason]` | `call` |
+| `outgoing` | `outgoing` |
+
+The reply is the result: `done: <detail>` ("done: sent to @bob", "done: group "crew"
+created (group:<id>)"), `waiting for owner
+(action <id>)`, `not allowed by owner`, `rate limited, retry in N s`, `not found: no user
+@h`, `unavailable: voice calls are not set up`, …; a malformed command replies its usage
+("usage: send @handle|owner|group:<id> <text>").
+
+- **Notice:** each person's first text in a session gets a reply "Chats with <agent> are
   visible to its owner, <owner> (@<handle>)." (from the agent's own profile), and the
-  contacts' `/help` ends with it.
-- **Other agents:** an agent that is an accepted contact talks to it like anyone else, in
-  texts; its replies and cards (rich messages) never prompt the echo agent, so two echo
-  agents cannot loop. Agents never call each other (`NOT_ALLOWED`).
-- **Who may talk to it:** the owner, and the agent's **accepted contacts**, each in their
-  own direct conversation with the agent, where its replies and cards go. The echo backend
+  contacts' `/help` ends with it. Agents are not told (it would only be noise for them).
+- **Other agents:** an agent that is an accepted contact (and let in by the inbound
+  policy) talks to it in texts, and the echo agent answers it in **plain text** ("echo:
+  <text>"), a turn for the other agent's backend; its replies and cards (rich messages)
+  never prompt the echo agent. Two echo agents open to each other echo back and forth
+  until the [loop guard](#23-loop-guard) pauses their chat. Agents never call each other
+  (`NOT_ALLOWED`).
+- **Who may talk to it:** the owner, and the agent's **accepted contacts** that the
+  owner's [inbound policy](#22-inbound-policy-and-agent-turns) lets in, each in their
+  own direct conversation with the agent, where its replies and cards go. **Changed:** the
+  echo agent used to answer every accepted contact; it now follows the policy, whose
+  default is `owner_only`: set `contacts` to keep the old behaviour (`owner_agents` for
+  the owner's own agents only). The echo backend
   opts in with `Backend::accepts_contacts` (Coda does not: it stays owner-only). The
   relationship is the server's (`list_contacts`, kept for 60 s and updated by contact
-  events): requests either way, blocked users and strangers get "This agent is private."
+  events): requests either way, blocked users, strangers and contacts the policy keeps
+  out get "This agent is private."
   and nothing reaches the backend. The agent never accepts a contact request by itself:
   requests follow the owner's policy, and waiting ones are the owner's to approve
   ([agent connections](#20-agent-connections)).
@@ -2277,7 +2362,9 @@ a folder of its own, and a `key.name` of its own, as for
   `/help` (their short list) and `/status` (the agent's name and version only, nothing
   about the owner's folder or session); any other command answers "Only the agent's
   owner can use this command.". Any other `/text` is echoed.
-- **Calls** stay the owner's (contacts' calls are declined, as for every backend): with
+- **Calls** from others are declined (as for every backend); the echo agent's `call @h`
+  command calls a contact ([the agent calls a contact](#the-agent-calls-a-contact)) and
+  echoes what they say back to them. With
   `calls.adapter` configured (a build with `--features voice`), the owner's call is answered as for Coda and each final transcript is echoed and spoken back
   through the adapter as "echo: <text>". Without an adapter, calls are not advertised.
 - **Tray:** the tray shows "Echo" where it would show "Coda" ("Restart Echo", "Echo
@@ -2319,3 +2406,92 @@ An agent's contacts are its owner's decision
   the chat: the bridge says it to each contact once per session and in their `/help`; the
   owner's `/help` explains the above. Clients show the same notice from the agent's
   profile (`owner_display_name`, `owner_handle`).
+
+
+## 21. Bridge actions
+
+A backend may act on its own, at any time, inside or outside a turn
+([design](superpowers/specs/2026-11-09-proactive-agents.md) §7): it sends
+`BackendEvent::Action(ActionRequest{action, reply})` and the core answers an `ActionResult`
+on the oneshot. The echo agent offers them as [commands](#19-echo-backend).
+
+| Action | What the bridge does |
+|---|---|
+| `request_contact` (`handle`) | looks the handle up and sends a contact request |
+| `send_message` (`to`, `text`) | `owner` (or the owner's handle): a reply in the owner's chat; a handle: opens the direct chat (a `chats` action when it is new) and sends, **plain text to an agent** (a turn for its backend), a rich reply to a person; `group:<id>`: a rich reply in a group the agent is a member of |
+| `notify_owner` (`text`) | a note in the owner's chat titled with the backend's name |
+| `create_group` (`name`, member handles) | creates the group; the result names it `group:<id>` |
+| `invite` (`group:<id>`, `handle`) | adds the contact to the group |
+| `call` (`owner` or a handle, optional `reason`) | the owner: dialed as for a request, with the reason said on pickup; it ignores `calls.notify_by_call` and the quiet hours but not the minimum interval, one call at a time, or a missing voice adapter (`unavailable`). A person who is an accepted contact: dialed under the owner's `calls` policy ([the agent calls a contact](#the-agent-calls-a-contact)); the result comes once the server took the invite (`done`, "calling @bob") or refused it. Agents are never called (`not_allowed`) |
+| `outgoing` | the agent's actions waiting for the owner and those resolved lately, one line each |
+
+**Results** (stable codes): `done`, `waiting_for_owner` (with `action_id`),
+`not_allowed_by_owner`, `rate_limited` (with `retry_after_s`), `paused`, `not_found` (an
+unknown handle or a group the agent is not in), `not_contact`, `not_allowed`, `unavailable`
+(no voice, a call running, the server unreachable, or a server without groups: "groups are
+not enabled on this server") and `failed` (the detail says why). `conversation` names the
+chat or `group:<id>` used. Each action is logged as `agent_action` with its kind and code,
+never its text.
+
+**Waiting for the owner.** When the owner's outgoing policy is `ask`, the server holds the
+action and the bridge keeps what is left to do in `state.json` (`pending_actions`, by
+action id): the text of a message to a new chat, the reason of a call. When the owner
+decides (`OutgoingActionEvent`): approved, the held text goes into the chat the server
+opened; declined, expired or failed, it is dropped. Each outcome is a short note in the
+owner's chat ("Owner approved: message to @bob sent.", "Owner declined: message to
+@bob.", "Failed: message to @bob (not_contact)."). At start-up and after each reconnect
+the bridge lists its actions to settle those decided while it was away; kept items older
+than 48 hours are dropped.
+## 22. Inbound policy and agent turns
+
+Who besides the owner reaches the backend is the owner's choice, per agent
+([design](superpowers/specs/2026-11-09-proactive-agents.md) §4, §7.2). The owner sets it in
+the app (`PUT /v1/agents/{agent_id}/inbound-policy`); the bridge reads it at start-up and
+after each reconnect (`GetAgentSettings`) and is told of changes at once
+(`AgentSettingsEvent`). The server cannot enforce it (an accepted contact may always write
+to the agent): the bridge does.
+
+| Policy | Whose plain texts reach the backend |
+|---|---|
+| `owner_only` (the default) | the owner's only |
+| `owner_agents` | also accepted contacts that are agents of the same owner (the sender's profile: `kind` agent, `owner_user_id` the owner) |
+| `contacts` | also every accepted contact, people and agents |
+
+It applies only to a backend that takes contacts (`accepts_contacts`: the echo agent; Coda
+stays owner-only whatever the policy). Everyone else, the contacts the policy keeps out
+included, gets "This agent is private." at most once an hour, and nothing reaches the
+backend. Rich messages (replies, cards) from anyone never prompt the backend, and another
+bridge's "This agent is private." is never answered. When the settings cannot be read (an
+older server) the bridge logs `agent_settings_failed` and stays `owner_only`. Senders'
+profiles are kept for 60 s, as their relationship is.
+
+**Agent turns.** Plain text between agents is a turn; rich messages are not. What the
+backend says to another agent (its `ContactReply`, or a `send_message` action) goes as
+plain text, so the other agent's backend hears it; to a person it is a rich reply, as
+always. Agents are not sent the notice that the owner reads along; their `/help` and
+`/status` are answered as any contact's, in rich replies.
+## 23. Loop guard
+
+Two agents that answer each other's texts could talk for ever. In each direct chat with
+another agent the bridge counts the **agent turns**: the plain texts by either agent since
+the last message by a person there ([design](superpowers/specs/2026-11-09-proactive-agents.md)
+§7.4). The other agent's texts count when they arrive (passed to the backend or not); the
+agent's own when the bridge sends them (a `ContactReply`, or a `send_message` action).
+Rich messages (replies, cards, notices) are not turns.
+
+At `loop_guard_turns` (config, default 20, at least 2) the chat is **paused**:
+
+- the other agent's texts no longer reach the backend (logged `loop_guard_ignored`), the
+  backend's replies there are dropped (`loop_guard_reply_dropped`) and its `send_message`
+  to that chat answers `paused` ("the loop guard paused this chat; the owner can resume it
+  with /loop resume");
+- once, a rich note in the chat, which the other bridge never takes as a turn: "Paused
+  after 20 turns between agents without a person. An owner can resume.", and one in the
+  owner's chat: "Paused the chat with @peer after 20 agent turns without a person. Send
+  /loop resume to let it continue.".
+
+The other agent's bridge counts the same messages and stops at the same turn, telling its
+own owner. A person's message in the chat starts the count again, and so does the owner's
+`/loop resume @peer` (that chat) or `/loop resume` (every chat); `/loop` lists the paused
+chats. Only the owner may run `/loop` (a contact hears "Only the agent's owner can use this
+command."). The counts live in memory: **a restart of the bridge resets them**.

@@ -30,7 +30,7 @@ type Channels = (mpsc::UnboundedReceiver<BackendEvent>, mpsc::Receiver<Event>);
 pub(super) struct Harness {
     pub(super) messenger: Arc<TestMessenger>,
     pub(super) backend: Arc<TestBackend>,
-    state: Arc<StateFile>,
+    pub(super) state: Arc<StateFile>,
     root: PathBuf,
     pub(super) work: PathBuf,
     other: PathBuf,
@@ -43,6 +43,8 @@ pub(super) struct Harness {
     pub(super) voice: Option<crate::voice::VoiceSetup>,
     /// Set while a call is in progress (see `voice_tests`).
     pub(super) call_flag: Option<CallFlag>,
+    /// The loop guard's limit (`loop_guard_turns`).
+    pub(super) loop_guard_turns: u32,
     /// Runs instead of `backend` (see [`Harness::echo`]).
     custom: Option<Arc<dyn Backend>>,
     _dir: TestDir,
@@ -100,6 +102,7 @@ impl Harness {
             events,
             voice: None,
             call_flag: None,
+            loop_guard_turns: 20,
             custom: None,
             _dir: dir,
         }
@@ -121,6 +124,7 @@ impl Harness {
                 roots: vec![self.root.clone()],
                 default_folder: self.work.clone(),
                 default_mode: PermissionMode::Default,
+                loop_guard_turns: self.loop_guard_turns,
             },
         )
         .with_control(self.hub.handle(), self.hub.calls());
@@ -137,7 +141,7 @@ impl Harness {
         })));
     }
 
-    async fn started() -> Self {
+    pub(super) async fn started() -> Self {
         let mut harness = Self::new();
         harness.start();
         harness.backend.wait_for("start", 1).await;

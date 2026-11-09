@@ -1,9 +1,11 @@
 //! The agent's accepted contacts, for a backend that takes them
 //! ([`crate::backend::Backend::accepts_contacts`]): their texts in their direct
-//! conversation go to [`crate::backend::Backend::contact_prompt`], the backend's replies
+//! conversation go to [`crate::backend::Backend::contact_prompt`] when the owner's inbound
+//! policy lets them (see [`super::inbound`]), the backend's replies
 //! and questions come back into that conversation, and only the contact who was asked
 //! answers a question. Everything privileged stays the owner's: a contact may run only
-//! `/help` and `/status`, and calls are the owner's alone.
+//! `/help` and `/status`, and only the owner's calls are answered (the agent may call a
+//! contact itself: [`super::contact_calls`]).
 
 use push_sdk::{
     ActivityState, ClientMsgId, ContactState, ConversationId, Message, OpenCard, UserId,
@@ -14,11 +16,11 @@ use super::{Core, Internal};
 use crate::backend::{Answer, BackendError, BackendRequest, ContactId, RequestKind, Responder};
 use crate::cards::{self, CardKind, TypedOutcome};
 use crate::commands::{self, Command};
-use crate::messenger::Messenger;
+use crate::messenger::{Messenger, Peer};
 use crate::render::{formatted_bodies, reply_bodies};
 
-/// How long the server's answer about a relationship is trusted.
-const CONTACT_FRESH: Duration = Duration::from_secs(60);
+/// How long the server's answer about a relationship (or a profile) is trusted.
+pub(super) const CONTACT_FRESH: Duration = Duration::from_secs(60);
 /// A contact's `/help`.
 pub const CONTACT_HELP: &str = "\
 /status: the agent's name and version
@@ -45,6 +47,35 @@ pub fn notice(agent: Option<&str>, owner: Option<(String, String)>) -> String {
 /// A contact's command other than `/help` and `/status`.
 pub const OWNER_ONLY: &str = "Only the agent's owner can use this command.";
 
+/// Where the agent's exchange with a contact is posted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ContactChat {
+    /// Their direct chat with the agent.
+    Direct(ConversationId),
+    /// They have no direct chat with the agent (one the agent called; opening a chat is
+    /// a gated action of its own): the owner's chat, each post labelled with `handle`.
+    Owner { handle: String },
+}
+
+impl ContactChat {
+    pub(super) fn direct(&self) -> Option<ConversationId> {
+        match self {
+            Self::Direct(conversation) => Some(*conversation),
+            Self::Owner { .. } => None,
+        }
+    }
+}
+
+/// The title of a contact's words posted in the owner's chat: "📞 @bob 🎤 voice".
+fn heard_title(handle: &str, title: &str) -> String {
+    format!("📞 @{handle} {title}")
+}
+
+/// The title of the agent's words to a contact posted in the owner's chat.
+fn told_title(handle: &str) -> String {
+    format!("📞 to @{handle}")
+}
+
 /// A contact's open question.
 pub(super) struct ContactRequest {
     /// Who was asked: the only one whose answer counts.
@@ -61,6 +92,8 @@ pub(super) struct ContactRequest {
 pub(super) struct Contacts {
     /// Each user's relationship and when it was learned.
     states: std::collections::HashMap<UserId, (ContactState, Instant)>,
+    /// Each user's profile (`None` when hidden) and when it was read.
+    pub(super) peers: std::collections::HashMap<UserId, (Option<Peer>, Instant)>,
     /// Each contact's direct conversation with the agent.
     conversations: std::collections::HashMap<UserId, ConversationId>,
     /// The contacts' open questions, oldest first.
@@ -70,13 +103,14 @@ pub(super) struct Contacts {
     /// That chats are visible to the owner, with the owner's name.
     pub(super) notice: String,
     /// The contacts told the notice in this session.
-    noticed: std::collections::HashSet<UserId>,
+    pub(super) noticed: std::collections::HashSet<UserId>,
 }
 
 impl Default for Contacts {
     fn default() -> Self {
         Self {
             states: std::collections::HashMap::new(),
+            peers: std::collections::HashMap::new(),
             conversations: std::collections::HashMap::new(),
             open: Vec::new(),
             activity: std::collections::HashMap::new(),
@@ -88,14 +122,14 @@ impl Default for Contacts {
 
 impl<M: Messenger> Core<M> {
     /// A text from someone other than the owner, with a backend that takes contacts:
-    /// an accepted contact's text in their direct conversation reaches the backend;
-    /// anyone else is a stranger.
+    /// an accepted contact's text in their direct conversation reaches the backend when
+    /// the inbound policy lets them; anyone else is a stranger.
     pub(super) async fn contact_message(&mut self, message: Message) {
         let (user, conversation) = (message.sender_id, message.conversation_id);
         if !self.is_contact(user).await {
             return self.stranger(user, conversation);
         }
-        if self.contact_conversation(user).await != Some(conversation) {
+        if !self.is_direct_with(user, conversation).await {
             tracing::debug!(event = "contact_text_elsewhere");
             return;
         }
@@ -103,8 +137,24 @@ impl<M: Messenger> Core<M> {
             tracing::info!(event = "old_text_skipped");
             return;
         }
+        let peer = self.peer(user).await;
+        if let Some(agent) = peer.as_ref().filter(|peer| peer.agent) {
+            self.agent_turn(conversation, &agent.handle);
+            if self.loop_paused(conversation) {
+                tracing::debug!(event = "loop_guard_ignored");
+                return;
+            }
+        }
+        if !self.inbound_allows(peer.as_ref()) {
+            tracing::info!(
+                event = "contact_not_allowed",
+                policy = self.inbound.as_str()
+            );
+            return self.stranger(user, conversation);
+        }
+        let agent = peer.is_some_and(|peer| peer.agent);
         if let Some(text) = message.body {
-            self.contact_text(user, conversation, text).await;
+            self.contact_text(user, conversation, text, agent).await;
         }
     }
 
@@ -150,14 +200,18 @@ impl<M: Messenger> Core<M> {
         self.contacts.states.insert(user, (state, Instant::now()));
     }
 
-    async fn contact_conversation(&mut self, user: UserId) -> Option<ConversationId> {
+    /// The direct chat with `user` if there is one. Never opens one: that is a gated
+    /// action of the agent's own (`send_message`).
+    pub(super) async fn known_direct(&mut self, user: UserId) -> Option<ConversationId> {
         if let Some(conversation) = self.contacts.conversations.get(&user) {
             return Some(*conversation);
         }
-        match self.messenger.direct(user).await {
-            Ok(conversation) => {
-                self.contacts.conversations.insert(user, conversation);
-                Some(conversation)
+        match self.messenger.existing_direct(user).await {
+            Ok(found) => {
+                if let Some(conversation) = found {
+                    self.contacts.conversations.insert(user, conversation);
+                }
+                found
             }
             Err(error) => {
                 tracing::warn!(event = "contact_conversation_failed", code = error.code());
@@ -166,10 +220,36 @@ impl<M: Messenger> Core<M> {
         }
     }
 
+    /// Whether `conversation` is the direct chat with `user` (not a group); never opens
+    /// one.
+    async fn is_direct_with(&mut self, user: UserId, conversation: ConversationId) -> bool {
+        if let Some(known) = self.contacts.conversations.get(&user) {
+            return *known == conversation;
+        }
+        match self.messenger.is_direct(conversation, user).await {
+            Ok(true) => {
+                self.contacts.conversations.insert(user, conversation);
+                true
+            }
+            Ok(false) => false,
+            Err(error) => {
+                tracing::warn!(event = "contact_conversation_failed", code = error.code());
+                false
+            }
+        }
+    }
+
     /// A contact's text: `/help` and `/status` run, other commands are the owner's; with
-    /// a question open the text answers it; else it goes to the backend.
-    async fn contact_text(&mut self, user: UserId, conversation: ConversationId, text: String) {
-        if self.contacts.noticed.insert(user) {
+    /// a question open the text answers it; else it goes to the backend. People (not
+    /// `agent`s) are told once that the owner reads along.
+    async fn contact_text(
+        &mut self,
+        user: UserId,
+        conversation: ConversationId,
+        text: String,
+        agent: bool,
+    ) {
+        if !agent && self.contacts.noticed.insert(user) {
             let notice = self.contacts.notice.clone();
             self.contact_reply(conversation, &notice);
         }
@@ -202,19 +282,25 @@ impl<M: Messenger> Core<M> {
             return;
         }
         tracing::info!(event = "contact_prompt");
-        let working = self.labels.working.clone();
-        self.contact_activity(conversation, ActivityState::Working, Some(&working))
+        self.prompt_contact(user, ContactChat::Direct(conversation), text)
             .await;
+    }
+
+    /// Gives a contact's `text` to the backend as their message, showing the agent at
+    /// work in their chat meanwhile.
+    pub(super) async fn prompt_contact(&mut self, user: UserId, chat: ContactChat, text: String) {
+        if let Some(conversation) = chat.direct() {
+            let working = self.labels.working.clone();
+            self.contact_activity(conversation, ActivityState::Working, Some(&working))
+                .await;
+        }
         let backend = self.backend.clone();
         let internal = self.internal.clone();
         tokio::spawn(async move {
             let result = backend
                 .contact_prompt(ContactId(user.to_string()), &text)
                 .await;
-            let _ = internal.send(Internal::ContactPrompted {
-                conversation,
-                result,
-            });
+            let _ = internal.send(Internal::ContactPrompted { chat, result });
         });
     }
 
@@ -234,7 +320,7 @@ impl<M: Messenger> Core<M> {
     /// The backend is done with a contact's text.
     pub(super) async fn contact_prompted(
         &mut self,
-        conversation: ConversationId,
+        chat: ContactChat,
         result: Result<(), BackendError>,
     ) {
         if let Err(error) = result {
@@ -243,29 +329,72 @@ impl<M: Messenger> Core<M> {
                 method = error.method.as_str(),
                 code = error.code.as_str()
             );
-            self.contact_reply(conversation, &error.to_string());
+            self.contact_post(&chat, &error.to_string());
         }
+        let Some(conversation) = chat.direct() else {
+            return;
+        };
         if !self.contact_waiting(conversation) {
             self.contact_activity(conversation, ActivityState::Idle, None)
                 .await;
         }
     }
 
-    /// The contact the backend names, with their conversation.
-    fn contact_of(&self, contact: &ContactId) -> Option<(UserId, ConversationId)> {
-        self.contacts
+    /// The contact the backend names, with where to post to them: their direct chat, or
+    /// for the contact on a call the agent placed, the call's chat.
+    fn contact_of(&self, contact: &ContactId) -> Option<(UserId, ContactChat)> {
+        if let Some((user, conversation)) = self
+            .contacts
             .conversations
             .iter()
             .find(|(user, _)| user.to_string() == contact.0)
-            .map(|(user, conversation)| (*user, *conversation))
+        {
+            return Some((*user, ContactChat::Direct(*conversation)));
+        }
+        match self.call.as_ref().and_then(|call| call.purpose.as_ref()) {
+            Some(super::calling::Purpose::Contact { peer, chat, .. })
+                if peer.to_string() == contact.0 =>
+            {
+                Some((*peer, chat.clone()))
+            }
+            _ => None,
+        }
     }
 
-    /// The backend's reply to a contact, formatted as its turns are.
-    pub(super) fn contact_backend_reply(&self, contact: &ContactId, text: &str) {
-        let Some((_, conversation)) = self.contact_of(contact) else {
+    /// The backend's reply to a contact: plain text to an agent (a turn for its
+    /// backend), formatted as its turns are to a person.
+    pub(super) fn contact_backend_reply(&mut self, contact: &ContactId, text: &str) {
+        let Some((user, chat)) = self.contact_of(contact) else {
             tracing::warn!(event = "contact_unknown");
             return;
         };
+        self.speak_to_contact(user, text);
+        let conversation = match chat {
+            ContactChat::Direct(conversation) => conversation,
+            ContactChat::Owner { handle } => {
+                for body in formatted_bodies(Some(&told_title(&handle)), text, self.format) {
+                    self.send_to(self.conversation, &body);
+                }
+                return;
+            }
+        };
+        if self.is_agent(user) {
+            if self.loop_paused(conversation) {
+                tracing::info!(event = "loop_guard_reply_dropped");
+                return;
+            }
+            match self.messenger.send_text(conversation, text) {
+                Ok(_) => {
+                    let handle = self
+                        .known_peer(user)
+                        .map(|peer| peer.handle.clone())
+                        .unwrap_or_default();
+                    self.agent_turn(conversation, &handle);
+                }
+                Err(error) => tracing::warn!(event = "send_failed", code = error.code()),
+            }
+            return;
+        }
         for body in formatted_bodies(None, text, self.format) {
             self.send_to(conversation, &body);
         }
@@ -279,8 +408,13 @@ impl<M: Messenger> Core<M> {
         request: BackendRequest,
     ) {
         let BackendRequest { kind, responder } = request;
-        let Some((user, conversation)) = self.contact_of(contact) else {
+        let Some((user, chat)) = self.contact_of(contact) else {
             tracing::warn!(event = "contact_unknown");
+            return responder.answer(Answer::Decline);
+        };
+        // Without a chat of their own, the contact cannot answer a card.
+        let Some(conversation) = chat.direct() else {
+            tracing::info!(event = "contact_request_refused", kind = "no_chat");
             return responder.answer(Answer::Decline);
         };
         let RequestKind::Question {
@@ -448,8 +582,32 @@ impl<M: Messenger> Core<M> {
     }
 
     /// The bridge's own words to a contact (`agent.reply@1`, masked).
-    fn contact_reply(&self, conversation: ConversationId, text: &str) {
+    pub(super) fn contact_reply(&self, conversation: ConversationId, text: &str) {
         for body in reply_bodies(None, text) {
+            self.send_to(conversation, &body);
+        }
+    }
+
+    /// The bridge's own words to a contact in `chat`: in the owner's chat, labelled.
+    pub(super) fn contact_post(&self, chat: &ContactChat, text: &str) {
+        match chat {
+            ContactChat::Direct(conversation) => self.contact_reply(*conversation, text),
+            ContactChat::Owner { handle } => {
+                for body in reply_bodies(Some(&told_title(handle)), text) {
+                    self.send_to(self.conversation, &body);
+                }
+            }
+        }
+    }
+
+    /// What a contact said (titled `title`), posted in `chat`: in the owner's chat,
+    /// labelled with their handle.
+    pub(super) fn contact_heard(&self, chat: &ContactChat, title: &str, text: &str) {
+        let (conversation, title) = match chat {
+            ContactChat::Direct(conversation) => (*conversation, title.to_owned()),
+            ContactChat::Owner { handle } => (self.conversation, heard_title(handle, title)),
+        };
+        for body in reply_bodies(Some(&title), text) {
             self.send_to(conversation, &body);
         }
     }

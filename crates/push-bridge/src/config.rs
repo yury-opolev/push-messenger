@@ -65,10 +65,18 @@ pub struct Config {
     /// Voice calls with the owner; absent, calls are declined.
     #[serde(default)]
     pub calls: Option<CallsConfig>,
+    /// Agent turns (texts by either agent) in a chat with another agent, without a
+    /// person's message, after which the loop guard pauses the chat; at least 2.
+    #[serde(default = "default_loop_guard_turns")]
+    pub loop_guard_turns: u32,
 }
 
 fn yes() -> bool {
     true
+}
+
+fn default_loop_guard_turns() -> u32 {
+    20
 }
 
 /// Voice calls with the owner. Speech (listening, speaking, detecting the end of an
@@ -604,9 +612,13 @@ impl Config {
         Some((self.roots.clone(), folder))
     }
 
-    /// The checks after the folders': the calls section and the backend's section.
+    /// The checks after the folders': the loop guard, the calls section and the
+    /// backend's section.
     fn validate_rest(&self) -> Result<(), ConfigError> {
         let invalid = |message: &str| Err(ConfigError::Invalid(message.to_owned()));
+        if self.loop_guard_turns < 2 {
+            return invalid("loop_guard_turns must be at least 2");
+        }
         if let Some(calls) = &self.calls {
             calls.validate().map_err(ConfigError::Invalid)?;
         }
@@ -830,6 +842,28 @@ mod tests {
         }
         config["echo"] = json!({ "answerTimeout": 30 });
         assert!(load(&fixture, &config).is_err());
+    }
+
+    #[test]
+    fn the_loop_guard_takes_at_least_two_turns() {
+        let fixture = fixture();
+        let mut config = minimal(&fixture);
+        assert_eq!(load(&fixture, &config).unwrap().loop_guard_turns, 20);
+        for (turns, ok) in [(2, true), (100, true), (1, false), (0, false)] {
+            config["loop_guard_turns"] = json!(turns);
+            let loaded = load(&fixture, &config).unwrap();
+            assert_eq!(loaded.loop_guard_turns, turns);
+            match loaded.validate() {
+                Ok(()) => assert!(ok, "{turns}"),
+                Err(error) => {
+                    assert!(!ok, "{turns}: {error}");
+                    assert_eq!(
+                        error.to_string(),
+                        "invalid configuration: loop_guard_turns must be at least 2"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
