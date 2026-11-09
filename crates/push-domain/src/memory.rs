@@ -291,6 +291,8 @@ impl InMemoryStore {
 pub struct InMemoryTx {
     guard: OwnedMutexGuard<State>,
     work: State,
+    /// The state at [`Tx::savepoint`].
+    saved: Option<State>,
 }
 
 #[async_trait]
@@ -300,7 +302,11 @@ impl Store for InMemoryStore {
     async fn begin(&self) -> DomainResult<InMemoryTx> {
         let guard = Arc::clone(&self.state).lock_owned().await;
         let work = guard.clone();
-        Ok(InMemoryTx { guard, work })
+        Ok(InMemoryTx {
+            guard,
+            work,
+            saved: None,
+        })
     }
 }
 
@@ -323,12 +329,28 @@ impl Tx for InMemoryTx {
         }
     }
     async fn commit(self) -> DomainResult<()> {
-        let InMemoryTx { mut guard, work } = self;
+        let InMemoryTx {
+            mut guard, work, ..
+        } = self;
         *guard = work;
         Ok(())
     }
 
     async fn rollback(self) -> DomainResult<()> {
+        Ok(())
+    }
+
+    async fn savepoint(&mut self) -> DomainResult<()> {
+        self.saved = Some(self.work.clone());
+        Ok(())
+    }
+
+    async fn rollback_to_savepoint(&mut self) -> DomainResult<()> {
+        let saved = self
+            .saved
+            .clone()
+            .ok_or_else(|| DomainError::Store("no savepoint".into()))?;
+        self.work = saved;
         Ok(())
     }
 

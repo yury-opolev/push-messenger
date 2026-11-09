@@ -5,9 +5,11 @@
 use chrono::{DateTime, TimeDelta, Utc};
 use uuid::Uuid;
 
-use crate::agents::check_agent_limits;
+use crate::agents::{check_agent_limits, check_pending_caps};
 use crate::clock::Clock;
+use crate::conversations::{create_direct, existing_direct};
 use crate::error::{DomainError, DomainResult};
+use crate::groups::{approved_invite, create_group_on, group_parts};
 use crate::ids::{ConversationId, UserId};
 use crate::model::{
     AgentSettings, InboundPolicy, OutgoingAction, OutgoingError, OutgoingKind, OutgoingPolicy,
@@ -155,6 +157,14 @@ pub(crate) async fn gate<T: Tx>(
     now: DateTime<Utc>,
 ) -> DomainResult<Gate> {
     tx.lock_users(&[agent]).await?;
+    if tx.is_user_deleted(agent).await? {
+        // Deleted after the caller's check: answered as a deleted agent is, which passes
+        // no gate (its contact requests keep their limits).
+        if ask.kind == OutgoingKind::Request {
+            count(tx, agent, &ask, now).await?;
+        }
+        return Ok(Gate::Proceed);
+    }
     match tx.agent_settings(agent).await?.policy(ask.kind) {
         OutgoingPolicy::Off => Err(DomainError::NotAllowedByOwner),
         OutgoingPolicy::Allowed => {
@@ -229,9 +239,27 @@ pub(crate) async fn use_call_grant<T: Tx>(
     }
 }
 
-/// The failure an approved action ends with when the normal rules refuse it.
-fn failure(error: &DomainError) -> OutgoingError {
-    match error {
+/// `AgentNotFound` when `agent` is deleted; `OutgoingNotFound` unless `action_id` is a
+/// waiting action of `agent`. The caller holds the agent's user lock.
+pub(crate) async fn still_waiting<T: Tx>(
+    tx: &mut T,
+    agent: UserId,
+    action_id: Uuid,
+) -> DomainResult<()> {
+    if tx.is_user_deleted(agent).await? {
+        return Err(DomainError::AgentNotFound);
+    }
+    match tx.outgoing(action_id).await? {
+        Some(action) if action.agent == agent && action.state == OutgoingState::Waiting => Ok(()),
+        _ => Err(DomainError::OutgoingNotFound),
+    }
+}
+
+/// The failure an approved action ends with when the normal rules refuse it; `None` for
+/// an error that is no such answer (storage, conflicts, the action or the agent gone),
+/// which leaves the action waiting.
+fn failure(error: &DomainError) -> Option<OutgoingError> {
+    let code = match error {
         DomainError::NotContact => OutgoingError::NotContact,
         DomainError::Blocked => OutgoingError::Blocked,
         DomainError::NotAdmin => OutgoingError::NotAdmin,
@@ -242,8 +270,39 @@ fn failure(error: &DomainError) -> OutgoingError {
         DomainError::NotAllowed | DomainError::OwnerDecides => OutgoingError::NotAllowed,
         DomainError::RateLimited { .. } => OutgoingError::RateLimited,
         DomainError::Invalid(_) => OutgoingError::Invalid,
+        DomainError::Conflict
+        | DomainError::Store(_)
+        | DomainError::KickFailed(_)
+        | DomainError::DeviceNotKnownYet
+        | DomainError::AgentNotFound
+        | DomainError::OutgoingNotFound
+        | DomainError::WaitingForOwner { .. }
+        | DomainError::NotAllowedByOwner => return None,
         _ => OutgoingError::Failed,
-    }
+    };
+    Some(code)
+}
+
+/// What carrying out an approved action did.
+enum Carried {
+    /// Done, with the conversation it opened or created, if any.
+    Done(Option<ConversationId>),
+    /// Nothing to do (every member to add is one already); what it wrote is undone.
+    Unchanged,
+}
+
+/// The events telling the owner and the agent of a resolved action.
+fn resolved_events(owner: UserId, action: &OutgoingAction) -> Vec<Event> {
+    vec![
+        Event::Outgoing {
+            to: owner,
+            action: action.clone(),
+        },
+        Event::Outgoing {
+            to: action.agent,
+            action: action.clone(),
+        },
+    ]
 }
 
 impl<S, C, N> Messaging<S, C, N>
@@ -336,6 +395,10 @@ where
         let mut tx = self.store.begin().await?;
         // Serialises changes of one agent's settings, so none is lost.
         tx.lock_users(&[agent]).await?;
+        if tx.is_user_deleted(agent).await? {
+            tx.rollback().await?;
+            return Err(DomainError::AgentNotFound);
+        }
         let settings = change(tx.agent_settings(agent).await?);
         tx.set_agent_settings(agent, &settings, self.clock.now())
             .await?;
@@ -359,72 +422,146 @@ where
     }
 
     /// The owner approves a waiting action: it is carried out at once, as the agent, with
-    /// the gate skipped (it was counted when it was queued). A call is not placed: the
-    /// agent may ring that person once within [`CALL_GRANT`]. When the normal rules
-    /// refuse it, the action ends `Failed` with their error; that is still an answer, not
-    /// an error. The owner and the agent are told. Returns the action as now stored. An
-    /// action that is not waiting, or not this agent's, is `OutgoingNotFound`.
+    /// the gate and the rate limits skipped (it was counted when it was queued); a contact
+    /// request still keeps the caps on pending requests. A call is not placed: the agent
+    /// may ring that person once within [`CALL_GRANT`]. When the normal rules refuse it,
+    /// the action ends `Failed` with their error; that is still an answer, not an error.
+    /// The owner and the agent are told. Returns the action as now stored. An action that
+    /// is not waiting, or not this agent's, is `OutgoingNotFound`.
+    ///
+    /// One transaction: the action is carried out and resolved together, under the
+    /// agent's lock (taken after the locks carrying it out needs first, see
+    /// [`crate::store`]). An error that is no answer of the rules (a conflict, storage)
+    /// changes nothing: the action keeps waiting.
     pub async fn approve_outgoing(
         &self,
         owner: UserId,
         agent: UserId,
         action_id: Uuid,
     ) -> DomainResult<OutgoingAction> {
-        let approved = self
-            .resolve_waiting(owner, agent, action_id, OutgoingState::Approved)
-            .await?;
-        let outcome = match approved.kind {
-            OutgoingKind::Request => match approved.target {
-                Some(target) => self
-                    .contact_request_as(agent, target, false)
-                    .await
-                    .map(|_| None),
-                None => Err(DomainError::Store("a request without a target".into())),
-            },
-            OutgoingKind::Chat => match approved.target {
-                Some(target) => self.open_direct_as(agent, target, false).await.map(Some),
-                None => Err(DomainError::Store("a chat without a target".into())),
-            },
-            OutgoingKind::Group => {
-                let title = approved.title.clone().unwrap_or_default();
-                self.create_group_as(agent, &title, &approved.members, false)
-                    .await
-                    .map(Some)
-            }
-            OutgoingKind::Invite => match approved.conversation {
-                Some(group) => self
-                    .add_members_as(agent, group, &approved.members, false)
-                    .await
-                    .map(|()| None),
-                None => Err(DomainError::Store("an invite without a group".into())),
-            },
-            OutgoingKind::Call => Ok(None),
-        };
+        self.require_owned(owner, agent).await?;
         let now = self.clock.now();
-        let (to, error, conversation) = match outcome {
-            Ok(None) => {
-                self.tell_resolved(owner, approved.clone()).await;
-                return Ok(approved);
-            }
-            Ok(Some(conversation)) => (OutgoingState::Approved, None, Some(conversation)),
-            Err(error) => (OutgoingState::Failed, Some(failure(&error)), None),
-        };
         let mut tx = self.store.begin().await?;
-        let action = tx
+        // Read without a lock, to know which locks carrying it out takes; checked again
+        // under the agent's lock.
+        let action = match tx.outgoing(action_id).await? {
+            Some(action) if action.agent == agent && action.state == OutgoingState::Waiting => {
+                action
+            }
+            _ => {
+                tx.rollback().await?;
+                return Err(DomainError::OutgoingNotFound);
+            }
+        };
+        tx.savepoint().await?;
+        let mut events = Vec::new();
+        let carried = self.carry_out(&mut tx, &action, now, &mut events).await;
+        let undo = !matches!(carried, Ok(Carried::Done(_)));
+        let (to, error, conversation) = match carried {
+            Ok(Carried::Done(conversation)) => (OutgoingState::Approved, None, conversation),
+            Ok(Carried::Unchanged) => (OutgoingState::Approved, None, None),
+            Err(error) => match failure(&error) {
+                Some(code) => (OutgoingState::Failed, Some(code), None),
+                // Dropping `tx` rolls it back.
+                None => return Err(error),
+            },
+        };
+        if undo {
+            // Undo what was written, which also gives back the locks taken since; the
+            // agent's lock is taken again, and the action checked again under it.
+            tx.rollback_to_savepoint().await?;
+            events.clear();
+            tx.lock_users(&[agent]).await?;
+            still_waiting(&mut tx, agent, action_id).await?;
+        }
+        let resolved = tx
             .resolve_outgoing(
                 action_id,
-                OutgoingState::Approved,
+                OutgoingState::Waiting,
                 to,
                 error,
                 conversation,
                 now,
             )
-            .await?;
+            .await?
+            .ok_or(DomainError::OutgoingNotFound)?;
         tx.commit().await?;
-        // Gone only if the agent was deleted meanwhile.
-        let action = action.ok_or(DomainError::OutgoingNotFound)?;
-        self.tell_resolved(owner, action.clone()).await;
-        Ok(action)
+        events.extend(resolved_events(owner, &resolved));
+        self.publish(events).await;
+        Ok(resolved)
+    }
+
+    /// Carries out `action` (waiting, read without a lock) on `tx` as its agent: takes the
+    /// locks it needs in their order, the agent's among them, then checks
+    /// [`still_waiting`] under the agent's lock, then does it. Adds the events to publish
+    /// once `tx` commits to `events`.
+    async fn carry_out(
+        &self,
+        tx: &mut S::Tx,
+        action: &OutgoingAction,
+        now: DateTime<Utc>,
+        events: &mut Vec<Event>,
+    ) -> DomainResult<Carried> {
+        let agent = action.agent;
+        let missing = |what: &str| DomainError::Store(format!("{:?} without {what}", action.kind));
+        match action.kind {
+            OutgoingKind::Request => {
+                let target = action.target.ok_or_else(|| missing("a target"))?;
+                let known = tx.user_exists(target).await?;
+                if known {
+                    tx.lock_contact_pair(agent, target).await?;
+                }
+                tx.lock_users(&[agent]).await?;
+                still_waiting(tx, agent, action.action_id).await?;
+                check_pending_caps(tx, agent).await?;
+                self.request_on(tx, agent, target, known, events).await?;
+                Ok(Carried::Done(None))
+            }
+            OutgoingKind::Chat => {
+                let peer = action.target.ok_or_else(|| missing("a target"))?;
+                tx.lock_contact_pair(agent, peer).await?;
+                tx.lock_users(&[agent, peer]).await?;
+                still_waiting(tx, agent, action.action_id).await?;
+                if let Some(existing) = existing_direct(tx, agent, peer).await? {
+                    return Ok(Carried::Done(Some(existing)));
+                }
+                let by_agent = tx.agent_owner(agent).await? != Some(peer);
+                match create_direct(tx, agent, peer, by_agent, now).await? {
+                    Some(id) => Ok(Carried::Done(Some(id))),
+                    // Created concurrently, which the pair lock rules out: retry.
+                    None => Err(DomainError::Conflict),
+                }
+            }
+            OutgoingKind::Group => {
+                let title = action.title.as_deref().ok_or_else(|| missing("a title"))?;
+                let (title, others) = group_parts(agent, title, &action.members)?;
+                let mut users = others.clone();
+                users.push(agent);
+                tx.lock_users(&users).await?;
+                still_waiting(tx, agent, action.action_id).await?;
+                let (id, created) = create_group_on(tx, agent, title, &others, true, now).await?;
+                events.extend(created);
+                Ok(Carried::Done(Some(id)))
+            }
+            OutgoingKind::Invite => {
+                let group = action.conversation.ok_or_else(|| missing("a group"))?;
+                let added =
+                    approved_invite(tx, agent, action.action_id, group, &action.members, now)
+                        .await?;
+                match added {
+                    Some(added) => {
+                        events.extend(added);
+                        Ok(Carried::Done(None))
+                    }
+                    None => Ok(Carried::Unchanged),
+                }
+            }
+            OutgoingKind::Call => {
+                tx.lock_users(&[agent]).await?;
+                still_waiting(tx, agent, action.action_id).await?;
+                Ok(Carried::Done(None))
+            }
+        }
     }
 
     /// The owner declines a waiting action. The owner and the agent are told. Returns the
@@ -436,61 +573,24 @@ where
         agent: UserId,
         action_id: Uuid,
     ) -> DomainResult<OutgoingAction> {
-        let declined = self
-            .resolve_waiting(owner, agent, action_id, OutgoingState::Declined)
-            .await?;
-        self.tell_resolved(owner, declined.clone()).await;
-        Ok(declined)
-    }
-
-    /// Moves `agent`'s waiting action to `to`, under the agent's lock.
-    async fn resolve_waiting(
-        &self,
-        owner: UserId,
-        agent: UserId,
-        action_id: Uuid,
-        to: OutgoingState,
-    ) -> DomainResult<OutgoingAction> {
         self.require_owned(owner, agent).await?;
         let mut tx = self.store.begin().await?;
         tx.lock_users(&[agent]).await?;
-        let mine = tx
-            .outgoing(action_id)
+        still_waiting(&mut tx, agent, action_id).await?;
+        let declined = tx
+            .resolve_outgoing(
+                action_id,
+                OutgoingState::Waiting,
+                OutgoingState::Declined,
+                None,
+                None,
+                self.clock.now(),
+            )
             .await?
-            .is_some_and(|action| action.agent == agent);
-        let resolved = match mine {
-            true => {
-                tx.resolve_outgoing(
-                    action_id,
-                    OutgoingState::Waiting,
-                    to,
-                    None,
-                    None,
-                    self.clock.now(),
-                )
-                .await?
-            }
-            false => None,
-        };
-        let Some(resolved) = resolved else {
-            tx.rollback().await?;
-            return Err(DomainError::OutgoingNotFound);
-        };
+            .ok_or(DomainError::OutgoingNotFound)?;
         tx.commit().await?;
-        Ok(resolved)
-    }
-
-    /// Tells the owner and the agent of a resolved action.
-    async fn tell_resolved(&self, owner: UserId, action: OutgoingAction) {
-        let agent = action.agent;
-        self.publish(vec![
-            Event::Outgoing {
-                to: owner,
-                action: action.clone(),
-            },
-            Event::Outgoing { to: agent, action },
-        ])
-        .await;
+        self.publish(resolved_events(owner, &declined)).await;
+        Ok(declined)
     }
 
     /// An agent's own settings. People are `NotAllowed`.
@@ -548,5 +648,30 @@ where
         tx.commit().await?;
         self.publish(events).await;
         Ok(u32::try_from(expired.len()).unwrap_or(u32::MAX))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::{service, user};
+
+    /// An agent deleted after the caller's check and before the gate's lock is answered
+    /// as a deleted agent is: its action is not queued (nothing would tell the owner).
+    #[tokio::test]
+    async fn the_gate_queues_nothing_for_an_agent_deleted_before_its_lock() {
+        let (svc, _) = service();
+        let (owner, agent, peer) = (user(&svc).await, user(&svc).await, user(&svc).await);
+        svc.enroll_agent(owner, agent).await.unwrap();
+        let now = Utc::now();
+        let mut tx = svc.store.begin().await.unwrap();
+        tx.mark_user_deleted(agent, now).await.unwrap();
+        let answer = gate(&mut tx, agent, Ask::chat(peer), now).await.unwrap();
+        assert!(matches!(answer, Gate::Proceed), "{answer:?}");
+        assert_eq!(tx.waiting_outgoing_count(agent).await, Ok(0));
+        assert_eq!(
+            tx.agent_actions_since(agent, OutgoingKind::Chat, now).await,
+            Ok((0, None))
+        );
     }
 }

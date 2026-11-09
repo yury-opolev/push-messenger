@@ -164,6 +164,24 @@ impl Tx for PgTx {
         self.tx.rollback().await.map_err(store_error)
     }
 
+    async fn savepoint(&mut self) -> DomainResult<()> {
+        // A savepoint of the same name hides the earlier one; rolling back goes to the
+        // latest.
+        sqlx::query("SAVEPOINT push_domain")
+            .execute(self.conn())
+            .await
+            .map_err(store_error)?;
+        Ok(())
+    }
+
+    async fn rollback_to_savepoint(&mut self) -> DomainResult<()> {
+        sqlx::query("ROLLBACK TO SAVEPOINT push_domain")
+            .execute(self.conn())
+            .await
+            .map_err(store_error)?;
+        Ok(())
+    }
+
     async fn insert_user(&mut self, user: UserId) -> DomainResult<()> {
         sqlx::query(
             "INSERT INTO messaging.known_user (user_id) VALUES ($1) ON CONFLICT DO NOTHING",

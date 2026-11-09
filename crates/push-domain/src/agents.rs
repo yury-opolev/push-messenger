@@ -163,13 +163,20 @@ pub(crate) async fn check_agent_limits<T: Tx>(
             });
         }
     }
+    check_pending_caps(tx, agent).await?;
+    tx.log_agent_request(agent, peer, now).await
+}
+
+/// The caps on an agent's pending requests and on its requests waiting for other agents'
+/// owners (`RateLimited`). The caller holds the agent's user lock.
+pub(crate) async fn check_pending_caps<T: Tx>(tx: &mut T, agent: UserId) -> DomainResult<()> {
     let (pending, waiting) = tx.outgoing_counts(agent).await?;
     if pending >= AGENT_PENDING_OUT_MAX || waiting >= AGENT_WAITING_OUT_MAX {
         return Err(DomainError::RateLimited {
             retry_after_s: CAP_RETRY_S,
         });
     }
-    tx.log_agent_request(agent, peer, now).await
+    Ok(())
 }
 
 /// Adds an [`Event::AgentContact`] for the owner of every owned agent among the users of

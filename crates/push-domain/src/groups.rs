@@ -1,6 +1,7 @@
 //! Groups of up to 100 members with admin and member roles (spec §6).
 
 use chrono::{DateTime, Utc};
+use uuid::Uuid;
 
 use crate::clock::Clock;
 use crate::contacts::are_contacts;
@@ -11,7 +12,7 @@ use crate::model::{
     ContentType, Conversation, ConversationKind, Entry, EntryKind, GroupPositions, Member, Role,
 };
 use crate::notify::{Event, Notifier};
-use crate::outgoing::{Ask, Gate, acting_agent, gate};
+use crate::outgoing::{Ask, Gate, acting_agent, gate, still_waiting};
 use crate::read::{group_positions_before, group_receipt};
 use crate::service::{Messaging, current_member_ids};
 use crate::store::{Store, Tx};
@@ -41,42 +42,20 @@ where
         title: &str,
         members: &[UserId],
     ) -> DomainResult<ConversationId> {
-        self.create_group_as(creator, title, members, true).await
-    }
-
-    /// [`Self::create_group`]; `gated: false` (an approved action) skips the agent's gate.
-    pub(crate) async fn create_group_as(
-        &self,
-        creator: UserId,
-        title: &str,
-        members: &[UserId],
-        gated: bool,
-    ) -> DomainResult<ConversationId> {
-        let title = validate_title(title)?;
-        let mut others: Vec<UserId> = members
-            .iter()
-            .copied()
-            .filter(|member| *member != creator)
-            .collect();
-        others.sort();
-        others.dedup();
-        if others.len() + 1 > MAX_GROUP_MEMBERS {
-            return Err(DomainError::GroupFull);
-        }
-
+        let (title, others) = group_parts(creator, title, members)?;
         let mut tx = self.store.begin().await?;
         if !tx.user_exists(creator).await? {
             return Err(DomainError::UnknownUser);
         }
         let now = self.clock.now();
-        let mut users = others.clone();
-        users.push(creator);
         let by_agent = tx.agent_owner(creator).await?.is_some();
-        if gated && by_agent {
+        if by_agent {
             if let Some(owner) = acting_agent(&mut tx, creator).await? {
                 // Every user's lock in one call, before the gate takes the agent's again.
                 // Nobody else can know the new group yet, so taking them before its
                 // conversation lock cannot form a cycle.
+                let mut users = others.clone();
+                users.push(creator);
                 tx.lock_users(&users).await?;
                 let ask = Ask::group(title.clone(), others.clone());
                 if let Gate::Waiting { action, new } = gate(&mut tx, creator, ask, now).await? {
@@ -84,43 +63,9 @@ where
                 }
             }
         }
-        for other in &others {
-            if !are_contacts(&mut tx, creator, *other).await? {
-                return Err(DomainError::NotContact);
-            }
-        }
-        let conversation = Conversation {
-            id: ConversationId::new(),
-            kind: ConversationKind::Group,
-            direct_key: None,
-            title: Some(title.clone()),
-            created_by: creator,
-            last_seq: 0,
-            created_at: now,
-            updated_at: now,
-            started_by_agent: by_agent,
-        };
-        let id = conversation.id;
-        // A group has no direct key, so the insert cannot be a duplicate.
-        tx.insert_conversation(conversation).await?;
-        let seq = tx.next_seq(id, now).await?;
-        let created = SystemEvent::Created {
-            actor: creator,
-            title,
-            users: others.clone(),
-        };
-        tx.insert_entry(system_entry(id, seq, &created, now))
-            .await?;
-        // Taken already when the gate ran; taking them again changes nothing.
-        tx.lock_users(&users).await?;
-        join(&mut tx, id, creator, Role::Admin, seq).await?;
-        for other in &others {
-            join(&mut tx, id, *other, Role::Member, seq).await?;
-        }
+        let (id, events) = create_group_on(&mut tx, creator, title, &others, by_agent, now).await?;
         tx.commit().await?;
-
-        users.sort();
-        self.publish(vec![Event::EntriesAvailable { users }]).await;
+        self.publish(events).await;
         Ok(id)
     }
 
@@ -141,72 +86,36 @@ where
         conversation: ConversationId,
         users: &[UserId],
     ) -> DomainResult<()> {
-        self.add_members_as(admin, conversation, users, true).await
-    }
-
-    /// [`Self::add_members`]; `gated: false` (an approved action) skips the agent's gate.
-    pub(crate) async fn add_members_as(
-        &self,
-        admin: UserId,
-        conversation: ConversationId,
-        users: &[UserId],
-        gated: bool,
-    ) -> DomainResult<()> {
-        let mut change = self.begin_change(conversation).await?;
-        change.require_admin(admin)?;
-        let mut added: Vec<UserId> = users
-            .iter()
-            .copied()
-            .filter(|user| !change.is_current(*user))
-            .collect();
-        added.sort();
-        added.dedup();
-        if added.is_empty() {
-            return change.cancel().await;
-        }
-        if change.current_count() + added.len() > MAX_GROUP_MEMBERS {
-            return Err(DomainError::GroupFull);
-        }
-        let mut locked = added.clone();
-        if gated {
-            if let Some(owner) = acting_agent(&mut change.tx, admin).await? {
-                // Every user's lock in one call, before the gate takes the agent's again.
-                locked.push(admin);
-                change.tx.lock_users(&locked).await?;
-                let ask = Ask::invite(conversation, added.clone());
-                if let Gate::Waiting { action, new } =
-                    gate(&mut change.tx, admin, ask.clone(), change.now).await?
-                {
-                    // The change took the group's next `seq`, so it cannot commit: the
-                    // gate runs again on a transaction of its own (and stores a new
-                    // action there). Should the policy have changed meanwhile, retry.
-                    change.cancel().await?;
-                    if !new {
-                        return Err(DomainError::WaitingForOwner {
-                            action_id: action.action_id,
-                        });
-                    }
-                    self.gate_alone(admin, owner, ask).await?;
-                    return Err(DomainError::Conflict);
-                }
-            }
-        }
-        for user in &added {
-            if !are_contacts(&mut change.tx, admin, *user).await? {
-                return Err(DomainError::NotContact);
-            }
-        }
-        let event = SystemEvent::MembersAdded {
-            actor: admin,
-            users: added.clone(),
+        let mut tx = self.store.begin().await?;
+        let mut change = begin_change(&mut tx, conversation, self.clock.now()).await?;
+        let Some(added) = change.to_add(admin, users)? else {
+            return tx.rollback().await;
         };
-        // Taken already when the gate ran; taking them again changes nothing.
-        change.tx.lock_users(&locked).await?;
-        let seq = change.append(&event).await?;
-        for user in added {
-            join(&mut change.tx, conversation, user, Role::Member, seq).await?;
+        let mut locked = added.clone();
+        if let Some(owner) = acting_agent(&mut *change.tx, admin).await? {
+            // Every user's lock in one call, before the gate takes the agent's again.
+            locked.push(admin);
+            change.tx.lock_users(&locked).await?;
+            let ask = Ask::invite(conversation, added.clone());
+            if let Gate::Waiting { action, new } =
+                gate(&mut *change.tx, admin, ask.clone(), change.now).await?
+            {
+                // The change took the group's next `seq`, so it cannot commit: the gate
+                // runs again on a transaction of its own (and stores a new action there).
+                // Should the policy have changed meanwhile, retry.
+                tx.rollback().await?;
+                if !new {
+                    return Err(DomainError::WaitingForOwner {
+                        action_id: action.action_id,
+                    });
+                }
+                self.gate_alone(admin, owner, ask).await?;
+                return Err(DomainError::Conflict);
+            }
         }
+        add_on(&mut change, admin, added, &locked).await?;
         let events = change.finish(None).await?;
+        tx.commit().await?;
         self.publish(events).await;
         Ok(())
     }
@@ -224,16 +133,18 @@ where
         if admin == user {
             return Err(ValidationError::SelfTarget.into());
         }
-        let mut change = self.begin_change(conversation).await?;
+        let mut tx = self.store.begin().await?;
+        let mut change = begin_change(&mut tx, conversation, self.clock.now()).await?;
         change.require_admin(admin)?;
         let mut removed = change.member(user).cloned().ok_or(DomainError::NotMember)?;
         if !removed.is_current() {
-            return change.cancel().await;
+            return tx.rollback().await;
         }
         let event = SystemEvent::MemberRemoved { actor: admin, user };
         removed.left_at_seq = Some(change.append(&event).await?);
         change.put_member(removed).await?;
         let events = change.finish(Some(user)).await?;
+        tx.commit().await?;
         self.publish(events).await;
         Ok(())
     }
@@ -250,10 +161,11 @@ where
         user: UserId,
         conversation: ConversationId,
     ) -> DomainResult<()> {
-        let mut change = self.begin_change(conversation).await?;
+        let mut tx = self.store.begin().await?;
+        let mut change = begin_change(&mut tx, conversation, self.clock.now()).await?;
         let mut leaver = change.member(user).cloned().ok_or(DomainError::NotMember)?;
         if !leaver.is_current() {
-            return change.cancel().await;
+            return tx.rollback().await;
         }
         leaver.left_at_seq = Some(
             change
@@ -271,6 +183,7 @@ where
             change.put_member(heir).await?;
         }
         let events = change.finish(Some(user)).await?;
+        tx.commit().await?;
         self.publish(events).await;
         Ok(())
     }
@@ -285,10 +198,11 @@ where
         title: &str,
     ) -> DomainResult<()> {
         let title = validate_title(title)?;
-        let mut change = self.begin_change(conversation).await?;
+        let mut tx = self.store.begin().await?;
+        let mut change = begin_change(&mut tx, conversation, self.clock.now()).await?;
         change.require_admin(admin)?;
         if change.conversation.title.as_deref() == Some(title.as_str()) {
-            return change.cancel().await;
+            return tx.rollback().await;
         }
         let event = SystemEvent::Renamed {
             actor: admin,
@@ -297,6 +211,7 @@ where
         change.append(&event).await?;
         change.tx.set_title(conversation, title).await?;
         let events = change.finish(None).await?;
+        tx.commit().await?;
         self.publish(events).await;
         Ok(())
     }
@@ -311,7 +226,8 @@ where
         user: UserId,
         role: Role,
     ) -> DomainResult<()> {
-        let mut change = self.begin_change(conversation).await?;
+        let mut tx = self.store.begin().await?;
+        let mut change = begin_change(&mut tx, conversation, self.clock.now()).await?;
         change.require_admin(admin)?;
         let mut member = change
             .member(user)
@@ -319,7 +235,7 @@ where
             .cloned()
             .ok_or(DomainError::NotMember)?;
         if member.role == role {
-            return change.cancel().await;
+            return tx.rollback().await;
         }
         if role == Role::Member && change.admin_count() == 1 {
             return Err(DomainError::LastAdmin);
@@ -333,38 +249,173 @@ where
         member.role = role;
         change.put_member(member).await?;
         let events = change.finish(None).await?;
+        tx.commit().await?;
         self.publish(events).await;
         Ok(())
     }
-
-    /// Locks a group for a membership or settings change and takes the next `seq`.
-    async fn begin_change(&self, conversation: ConversationId) -> DomainResult<GroupChange<S::Tx>> {
-        let mut tx = self.store.begin().await?;
-        let now = self.clock.now();
-        let seq = tx.next_seq(conversation, now).await?;
-        // Read under the lock, so the title compared by a rename is the current one.
-        let conversation = require_conversation(&mut tx, conversation).await?;
-        if conversation.kind != ConversationKind::Group {
-            return Err(DomainError::NotAGroup);
-        }
-        let members = tx.members(conversation.id).await?;
-        let before = group_positions_before(&mut tx, &conversation, seq - 1).await?;
-        Ok(GroupChange {
-            tx,
-            conversation,
-            members,
-            next_seq: Some(seq),
-            last_seq: seq - 1,
-            now,
-            before,
-        })
-    }
 }
 
-/// An open transaction holding a group's lock, for one membership or settings change.
-/// Dropping it without `finish` rolls back, which also gives back the `seq` it took.
-struct GroupChange<T> {
-    tx: T,
+/// The validated title of a new group of `creator` and its other members, sorted and
+/// without duplicates or `creator`.
+pub(crate) fn group_parts(
+    creator: UserId,
+    title: &str,
+    members: &[UserId],
+) -> DomainResult<(String, Vec<UserId>)> {
+    let title = validate_title(title)?;
+    let mut others: Vec<UserId> = members
+        .iter()
+        .copied()
+        .filter(|member| *member != creator)
+        .collect();
+    others.sort();
+    others.dedup();
+    if others.len() + 1 > MAX_GROUP_MEMBERS {
+        return Err(DomainError::GroupFull);
+    }
+    Ok((title, others))
+}
+
+/// Creates the group of [`Messaging::create_group`] on `tx`, past the creator's gate:
+/// `NotContact` unless every one of `others` is an accepted contact of `creator`. Returns
+/// the group and the events to publish once `tx` commits.
+pub(crate) async fn create_group_on<T: Tx>(
+    tx: &mut T,
+    creator: UserId,
+    title: String,
+    others: &[UserId],
+    by_agent: bool,
+    now: DateTime<Utc>,
+) -> DomainResult<(ConversationId, Vec<Event>)> {
+    for other in others {
+        if !are_contacts(tx, creator, *other).await? {
+            return Err(DomainError::NotContact);
+        }
+    }
+    let conversation = Conversation {
+        id: ConversationId::new(),
+        kind: ConversationKind::Group,
+        direct_key: None,
+        title: Some(title.clone()),
+        created_by: creator,
+        last_seq: 0,
+        created_at: now,
+        updated_at: now,
+        started_by_agent: by_agent,
+    };
+    let id = conversation.id;
+    // A group has no direct key, so the insert cannot be a duplicate.
+    tx.insert_conversation(conversation).await?;
+    let seq = tx.next_seq(id, now).await?;
+    let created = SystemEvent::Created {
+        actor: creator,
+        title,
+        users: others.to_vec(),
+    };
+    tx.insert_entry(system_entry(id, seq, &created, now))
+        .await?;
+    let mut users = others.to_vec();
+    users.push(creator);
+    // Taken already when the gate ran; taking them again changes nothing.
+    tx.lock_users(&users).await?;
+    join(tx, id, creator, Role::Admin, seq).await?;
+    for other in others {
+        join(tx, id, *other, Role::Member, seq).await?;
+    }
+    users.sort();
+    Ok((id, vec![Event::EntriesAvailable { users }]))
+}
+
+/// Carries out `agent`'s approved invite `action_id` of `members` to `conversation` on
+/// `tx`: the group's lock, then the users' (the agent's included), then
+/// [`still_waiting`], then the change. Returns the events to publish once `tx` commits;
+/// `None` when nothing changes (every one of `members` is a current member), and then the
+/// caller must undo the `seq` the change took.
+pub(crate) async fn approved_invite<T: Tx>(
+    tx: &mut T,
+    agent: UserId,
+    action_id: Uuid,
+    conversation: ConversationId,
+    members: &[UserId],
+    now: DateTime<Utc>,
+) -> DomainResult<Option<Vec<Event>>> {
+    let mut change = begin_change(tx, conversation, now).await?;
+    let added = change.to_add(agent, members)?;
+    let mut locked = added.clone().unwrap_or_default();
+    locked.push(agent);
+    change.tx.lock_users(&locked).await?;
+    still_waiting(&mut *change.tx, agent, action_id).await?;
+    let Some(added) = added else {
+        return Ok(None);
+    };
+    add_on(&mut change, agent, added, &locked).await?;
+    Ok(Some(change.finish(None).await?))
+}
+
+/// Adds `added` (from [`GroupChange::to_add`]) to the group: `NotContact` unless each is
+/// an accepted contact of `admin`. Takes the locks of `locked` (`added`, and the agent
+/// when the gate ran) in one call.
+async fn add_on<T: Tx>(
+    change: &mut GroupChange<'_, T>,
+    admin: UserId,
+    added: Vec<UserId>,
+    locked: &[UserId],
+) -> DomainResult<()> {
+    for user in &added {
+        if !are_contacts(&mut *change.tx, admin, *user).await? {
+            return Err(DomainError::NotContact);
+        }
+    }
+    let event = SystemEvent::MembersAdded {
+        actor: admin,
+        users: added.clone(),
+    };
+    // Taken already when the gate ran; taking them again changes nothing.
+    change.tx.lock_users(locked).await?;
+    let seq = change.append(&event).await?;
+    for user in added {
+        join(
+            &mut *change.tx,
+            change.conversation.id,
+            user,
+            Role::Member,
+            seq,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Locks a group for a membership or settings change and takes the next `seq`. Rolling
+/// `tx` back without committing gives back the `seq`.
+async fn begin_change<T: Tx>(
+    tx: &mut T,
+    conversation: ConversationId,
+    now: DateTime<Utc>,
+) -> DomainResult<GroupChange<'_, T>> {
+    let seq = tx.next_seq(conversation, now).await?;
+    // Read under the lock, so the title compared by a rename is the current one.
+    let conversation = require_conversation(tx, conversation).await?;
+    if conversation.kind != ConversationKind::Group {
+        return Err(DomainError::NotAGroup);
+    }
+    let members = tx.members(conversation.id).await?;
+    let before = group_positions_before(tx, &conversation, seq - 1).await?;
+    Ok(GroupChange {
+        tx,
+        conversation,
+        members,
+        next_seq: Some(seq),
+        last_seq: seq - 1,
+        now,
+        before,
+    })
+}
+
+/// A transaction holding a group's lock, for one membership or settings change. Its
+/// caller commits after [`GroupChange::finish`], or rolls back when nothing changes.
+struct GroupChange<'t, T> {
+    tx: &'t mut T,
     conversation: Conversation,
     /// Every member row as it was when the lock was taken, current and former.
     members: Vec<Member>,
@@ -377,7 +428,7 @@ struct GroupChange<T> {
     before: Option<GroupPositions>,
 }
 
-impl<T: Tx> GroupChange<T> {
+impl<T: Tx> GroupChange<'_, T> {
     /// `NotMember` unless `actor` is a current member, `NotAdmin` unless also an admin.
     fn require_admin(&self, actor: UserId) -> DomainResult<()> {
         match self.member(actor) {
@@ -385,6 +436,27 @@ impl<T: Tx> GroupChange<T> {
             Some(member) if member.is_current() => Err(DomainError::NotAdmin),
             _ => Err(DomainError::NotMember),
         }
+    }
+
+    /// The users of `users` that `admin` would add (sorted, without duplicates or current
+    /// members), after the admin check; `None` when there are none. `GroupFull` when they
+    /// do not fit.
+    fn to_add(&self, admin: UserId, users: &[UserId]) -> DomainResult<Option<Vec<UserId>>> {
+        self.require_admin(admin)?;
+        let mut added: Vec<UserId> = users
+            .iter()
+            .copied()
+            .filter(|user| !self.is_current(*user))
+            .collect();
+        added.sort();
+        added.dedup();
+        if added.is_empty() {
+            return Ok(None);
+        }
+        if self.current_count() + added.len() > MAX_GROUP_MEMBERS {
+            return Err(DomainError::GroupFull);
+        }
+        Ok(Some(added))
     }
 
     fn is_current(&self, user: UserId) -> bool {
@@ -446,19 +518,18 @@ impl<T: Tx> GroupChange<T> {
         Ok(seq)
     }
 
-    /// Nothing to change: rolls back.
-    async fn cancel(self) -> DomainResult<()> {
-        self.tx.rollback().await
-    }
-
-    /// Commits, and returns the events to publish: new entries for the current members and
-    /// `also_tell` (a member who just left and may see their own departure), and the new
-    /// group-wide positions if they moved.
-    async fn finish(mut self, also_tell: Option<UserId>) -> DomainResult<Vec<Event>> {
-        let group =
-            group_receipt(&mut self.tx, &self.conversation, self.last_seq, self.before).await?;
+    /// The events to publish once the change commits: new entries for the current members
+    /// and `also_tell` (a member who just left and may see their own departure), and the
+    /// new group-wide positions if they moved.
+    async fn finish(self, also_tell: Option<UserId>) -> DomainResult<Vec<Event>> {
+        let group = group_receipt(
+            &mut *self.tx,
+            &self.conversation,
+            self.last_seq,
+            self.before,
+        )
+        .await?;
         let members = self.tx.members(self.conversation.id).await?;
-        self.tx.commit().await?;
 
         let mut users = current_member_ids(&members);
         users.extend(also_tell);

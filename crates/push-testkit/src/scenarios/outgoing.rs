@@ -4,11 +4,11 @@
 
 use chrono::TimeDelta;
 use push_domain::{
-    AGENT_REQUESTS_PER_DAY, AGENT_REQUESTS_PER_HOUR, AgentPolicy, AgentSettings, CHATS_PER_DAY,
-    Clock, ContactState, ConversationId, DomainError, DomainResult, Event, GROUPS_PER_DAY,
-    INVITES_PER_DAY, InboundPolicy, OUTGOING_EXPIRY, OutgoingAction, OutgoingError, OutgoingKind,
-    OutgoingPolicy, OutgoingPolicyChange, OutgoingState, OwnerAction, RESOLVED_KEPT, Store, Tx,
-    UserId, WAITING_ACTIONS_MAX,
+    AGENT_PENDING_OUT_MAX, AGENT_REQUESTS_PER_DAY, AGENT_REQUESTS_PER_HOUR, AgentPolicy,
+    AgentSettings, CHATS_PER_DAY, Clock, ContactState, ConversationId, DomainError, DomainResult,
+    Event, GROUPS_PER_DAY, INVITES_PER_DAY, InboundPolicy, OUTGOING_EXPIRY, OutgoingAction,
+    OutgoingError, OutgoingKind, OutgoingPolicy, OutgoingPolicyChange, OutgoingState, OwnerAction,
+    RESOLVED_KEPT, Store, Tx, UserId, WAITING_ACTIONS_MAX,
 };
 
 use uuid::Uuid;
@@ -607,6 +607,97 @@ async fn approval_failing_rules_ends_failed<B: Backend>(backend: &B) {
     );
 }
 
+/// An approved request was counted against the hourly and daily limits when it was
+/// queued, so its approval does not count it again; the caps on pending requests still
+/// hold when it is carried out.
+async fn approved_requests_keep_the_pending_caps<B: Backend>(backend: &B) {
+    let (world, owner, agent) = owned(backend).await;
+    let mut queued = Vec::new();
+    for _ in 0..AGENT_REQUESTS_PER_HOUR {
+        let person = world.person().await;
+        let id = waiting(world.svc.contact_request(agent.user, person.user).await);
+        queued.push((id, person));
+    }
+    let (last, rest) = queued.split_last().unwrap();
+    for (id, person) in rest {
+        let approved = world
+            .svc
+            .approve_outgoing(owner.user, agent.user, *id)
+            .await
+            .unwrap();
+        assert_eq!(approved.state, OutgoingState::Approved);
+        assert_eq!(
+            state(&world, &agent, person).await,
+            Some(ContactState::RequestedOut)
+        );
+    }
+
+    let mut tx = world.store.begin().await.unwrap();
+    for _ in 0..AGENT_PENDING_OUT_MAX {
+        let peer = UserId::new();
+        tx.insert_user(peer).await.unwrap();
+        tx.put_contact(agent.user, peer, ContactState::RequestedOut)
+            .await
+            .unwrap();
+    }
+    tx.commit().await.unwrap();
+    world.notifier.take();
+    let (id, person) = last;
+    let failed = world
+        .svc
+        .approve_outgoing(owner.user, agent.user, *id)
+        .await
+        .unwrap();
+    assert_eq!(failed.state, OutgoingState::Failed);
+    assert_eq!(failed.error, Some(OutgoingError::RateLimited));
+    assert_eq!(state(&world, &agent, person).await, None);
+    assert_eq!(state(&world, person, &agent).await, None);
+    assert_eq!(
+        outgoing(&world.notifier.take()),
+        [(owner.user, failed.clone()), (agent.user, failed)]
+    );
+}
+
+/// An invite the rules refuse on approval leaves the group as it was: no entry, no
+/// `seq` taken.
+async fn approval_failing_invite_leaves_the_group_unchanged<B: Backend>(backend: &B) {
+    let (world, owner, agent) = owned(backend).await;
+    set(&world, &owner, &agent, groups(OutgoingPolicy::Allowed)).await;
+    let [first, second] = [
+        contact(&world, &owner, &agent).await,
+        contact(&world, &owner, &agent).await,
+    ];
+    let group = world
+        .svc
+        .create_group(agent.user, "Team", &[first.user])
+        .await
+        .unwrap();
+    set(&world, &owner, &agent, groups(OutgoingPolicy::Ask)).await;
+    let id = waiting(
+        world
+            .svc
+            .add_members(agent.user, group, &[second.user])
+            .await,
+    );
+    world
+        .svc
+        .remove_agent_contact(owner.user, agent.user, second.user)
+        .await
+        .unwrap();
+    let before = world.conversation(group).await.last_seq;
+    let failed = world
+        .svc
+        .approve_outgoing(owner.user, agent.user, id)
+        .await
+        .unwrap();
+    assert_eq!(failed.state, OutgoingState::Failed);
+    assert_eq!(failed.error, Some(OutgoingError::NotContact));
+    assert_eq!(world.conversation(group).await.last_seq, before);
+    assert!(world.member(group, &second).await.is_none());
+    let sent = world.send(&agent, group, "still here").await;
+    assert_eq!(sent.seq, before + 1);
+}
+
 async fn decline_and_expiry_tell_agent_owner_declined<B: Backend>(backend: &B) {
     let (world, owner, agent) = owned(backend).await;
     let person = world.person().await;
@@ -1012,6 +1103,8 @@ pub(super) fn cases<B: Backend>() -> Vec<Case<B>> {
         group_ask_then_approve_creates_it,
         invite_ask_then_approve_adds_member,
         approval_failing_rules_ends_failed,
+        approved_requests_keep_the_pending_caps,
+        approval_failing_invite_leaves_the_group_unchanged,
         decline_and_expiry_tell_agent_owner_declined,
         limits_per_kind_and_waiting_cap,
         contact_request_limits_are_ten_an_hour_twenty_a_day,

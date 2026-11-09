@@ -29,26 +29,12 @@ where
     /// outgoing policy first (spec 2026-11-09 proactive agents §3): `NotAllowedByOwner`,
     /// or `WaitingForOwner` with the waiting action. Such a chat is `started_by_agent`.
     pub async fn open_direct(&self, me: UserId, peer: UserId) -> DomainResult<ConversationId> {
-        self.open_direct_as(me, peer, true).await
-    }
-
-    /// [`Self::open_direct`]; `gated: false` (an approved action) skips the agent's gate.
-    pub(crate) async fn open_direct_as(
-        &self,
-        me: UserId,
-        peer: UserId,
-        gated: bool,
-    ) -> DomainResult<ConversationId> {
         if me == peer {
             return Err(ValidationError::SelfTarget.into());
         }
-        let key = direct_key(me, peer);
         let mut tx = self.store.begin().await?;
         tx.lock_contact_pair(me, peer).await?;
-        if !are_contacts(&mut tx, me, peer).await? {
-            return Err(DomainError::NotContact);
-        }
-        if let Some(existing) = tx.find_direct(key).await? {
+        if let Some(existing) = existing_direct(&mut tx, me, peer).await? {
             tx.rollback().await?;
             return Ok(existing);
         }
@@ -57,7 +43,7 @@ where
         // Both users' locks in one call, before the gate takes the agent's again.
         tx.lock_users(&[me, peer]).await?;
         let by_agent = tx.agent_owner(me).await?.is_some_and(|owner| owner != peer);
-        if gated && by_agent {
+        if by_agent {
             if let Some(owner) = acting_agent(&mut tx, me).await? {
                 if let Gate::Waiting { action, new } =
                     gate(&mut tx, me, Ask::chat(peer), now).await?
@@ -66,47 +52,74 @@ where
                 }
             }
         }
-        let conversation = Conversation {
-            id: ConversationId::new(),
-            kind: ConversationKind::Direct,
-            direct_key: Some(key),
-            title: None,
-            created_by: me,
-            last_seq: 0,
-            created_at: now,
-            updated_at: now,
-            started_by_agent: by_agent,
-        };
-        let id = conversation.id;
-        if tx.insert_conversation(conversation).await? == InsertOutcome::Duplicate {
-            // Safety net: the pair lock already serialises callers, but if a concurrent
-            // request created it first, return that one.
-            tx.rollback().await?;
-            let mut tx = self.store.begin().await?;
-            let existing = tx.find_direct(key).await?.ok_or_else(|| {
-                DomainError::Store("direct conversation disappeared after a conflict".into())
-            })?;
-            tx.rollback().await?;
-            return Ok(existing);
+        if let Some(id) = create_direct(&mut tx, me, peer, by_agent, now).await? {
+            tx.commit().await?;
+            return Ok(id);
         }
-
-        for user in [me, peer] {
-            tx.insert_member(Member {
-                conversation_id: id,
-                user_id: user,
-                role: Role::Member,
-                visible_from_seq: 1,
-                left_at_seq: None,
-                read_seq: 0,
-            })
-            .await?;
-            for device in tx.devices_of_user(user).await? {
-                tx.create_cursor_if_absent(device, id, 0).await?;
-            }
-        }
-        tx.commit().await?;
-        Ok(id)
+        // Safety net: the pair lock already serialises callers, but if a concurrent
+        // request created it first, return that one.
+        tx.rollback().await?;
+        let mut tx = self.store.begin().await?;
+        let existing = tx.find_direct(direct_key(me, peer)).await?.ok_or_else(|| {
+            DomainError::Store("direct conversation disappeared after a conflict".into())
+        })?;
+        tx.rollback().await?;
+        Ok(existing)
     }
+}
+
+/// The direct conversation of `me` and `peer`, if there is one; `NotContact` unless they
+/// are accepted contacts. The caller holds their pair lock.
+pub(crate) async fn existing_direct<T: Tx>(
+    tx: &mut T,
+    me: UserId,
+    peer: UserId,
+) -> DomainResult<Option<ConversationId>> {
+    if !are_contacts(tx, me, peer).await? {
+        return Err(DomainError::NotContact);
+    }
+    tx.find_direct(direct_key(me, peer)).await
+}
+
+/// Creates the direct conversation of `me` and `peer`, whose locks (pair and users) the
+/// caller holds. `None` when one exists already (a concurrent insert won).
+pub(crate) async fn create_direct<T: Tx>(
+    tx: &mut T,
+    me: UserId,
+    peer: UserId,
+    by_agent: bool,
+    now: DateTime<Utc>,
+) -> DomainResult<Option<ConversationId>> {
+    let conversation = Conversation {
+        id: ConversationId::new(),
+        kind: ConversationKind::Direct,
+        direct_key: Some(direct_key(me, peer)),
+        title: None,
+        created_by: me,
+        last_seq: 0,
+        created_at: now,
+        updated_at: now,
+        started_by_agent: by_agent,
+    };
+    let id = conversation.id;
+    if tx.insert_conversation(conversation).await? == InsertOutcome::Duplicate {
+        return Ok(None);
+    }
+    for user in [me, peer] {
+        tx.insert_member(Member {
+            conversation_id: id,
+            user_id: user,
+            role: Role::Member,
+            visible_from_seq: 1,
+            left_at_seq: None,
+            read_seq: 0,
+        })
+        .await?;
+        for device in tx.devices_of_user(user).await? {
+            tx.create_cursor_if_absent(device, id, 0).await?;
+        }
+    }
+    Ok(Some(id))
 }
 
 impl<S, C, N> Messaging<S, C, N>

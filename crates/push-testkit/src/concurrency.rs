@@ -9,12 +9,14 @@ use std::time::Duration;
 use chrono::TimeDelta;
 use push_domain::templates::TemplateRef;
 use push_domain::{
-    ContactState, ContentType, DeviceId, DomainError, Event, MAX_PENDING_PER_USER, ReceiptUpdate,
-    ReviewAction, ReviewCommand, SendReceipt, Store, TemplateStatus, Tx, UserId,
+    AgentPolicy, Clock, ContactState, ContentType, DeviceId, DomainError, DomainResult, Event,
+    InboundPolicy, MAX_PENDING_PER_USER, OutgoingPolicy, OutgoingPolicyChange, OutgoingState,
+    ReceiptUpdate, ReviewAction, ReviewCommand, SendReceipt, Store, TemplateStatus, Tx, UserId,
 };
 use tokio::task::JoinSet;
+use uuid::Uuid;
 
-use crate::{Backend, Case, World, case_list, message, seqs, text};
+use crate::{Backend, Case, Person, World, case_list, message, seqs, text};
 
 /// Runs every future at the same time, each on its own task, and returns their results
 /// in the order given.
@@ -504,6 +506,176 @@ async fn a_revocation_waits_for_a_send_that_read_the_template<B: Backend>(backen
     tx.rollback().await.unwrap();
 }
 
+/// The id of the action a result waits for.
+fn waiting_for_owner<T: std::fmt::Debug>(result: DomainResult<T>) -> Uuid {
+    match result {
+        Err(DomainError::WaitingForOwner { action_id }) => action_id,
+        other => panic!("expected to wait for the owner, got {other:?}"),
+    }
+}
+
+/// A new person whose request the agent's owner lets through at once.
+async fn agent_contact<S: Store + Clone>(world: &World<S>, agent: &Person) -> Person {
+    let person = world.person().await;
+    let state = world
+        .svc
+        .contact_request(person.user, agent.user)
+        .await
+        .unwrap();
+    assert_eq!(state, ContactState::Accepted);
+    person
+}
+
+/// An approval is one transaction: when carrying the action out fails for a reason that
+/// may pass on a retry (here a deadlock), nothing is kept and the action still waits.
+async fn an_approval_that_conflicts_leaves_the_action_waiting<B: Backend>(backend: &B) {
+    let world = Arc::new(World::new(backend).await);
+    let owner = world.person().await;
+    let agent = world.agent(&owner).await;
+    world
+        .svc
+        .set_agent_policy(owner.user, agent.user, AgentPolicy::AutoAny)
+        .await
+        .unwrap();
+    let allowed = OutgoingPolicyChange {
+        groups: Some(OutgoingPolicy::Allowed),
+        ..OutgoingPolicyChange::default()
+    };
+    world
+        .svc
+        .set_outgoing_policy(owner.user, agent.user, allowed)
+        .await
+        .unwrap();
+    let (first, second) = (
+        agent_contact(&world, &agent).await,
+        agent_contact(&world, &agent).await,
+    );
+    let group = world
+        .svc
+        .create_group(agent.user, "Team", &[first.user])
+        .await
+        .unwrap();
+    let ask = OutgoingPolicyChange {
+        groups: Some(OutgoingPolicy::Ask),
+        ..OutgoingPolicyChange::default()
+    };
+    world
+        .svc
+        .set_outgoing_policy(owner.user, agent.user, ask)
+        .await
+        .unwrap();
+    let id = waiting_for_owner(
+        world
+            .svc
+            .add_members(agent.user, group, &[second.user])
+            .await,
+    );
+
+    // The approval takes the group's lock and waits for the member's; the holder then
+    // waits for the group's. The approval waited first, so it finds the deadlock.
+    let mut holder = world.store.begin().await.unwrap();
+    holder.lock_users(&[second.user]).await.unwrap();
+    let approval = {
+        let world = Arc::clone(&world);
+        tokio::spawn(async move { world.svc.approve_outgoing(owner.user, agent.user, id).await })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    holder.next_seq(group, world.clock.now()).await.unwrap();
+    holder.rollback().await.unwrap();
+    assert_eq!(approval.await.unwrap(), Err(DomainError::Conflict));
+
+    let waiting = world
+        .svc
+        .waiting_outgoing(owner.user, agent.user)
+        .await
+        .unwrap();
+    assert_eq!(waiting.len(), 1);
+    assert_eq!(waiting[0].action_id, id);
+    assert_eq!(waiting[0].state, OutgoingState::Waiting);
+    assert!(world.member(group, &second).await.is_none());
+}
+
+/// An agent deleted while an operation waits for its lock is answered as a deleted agent
+/// is, though the operation saw it alive before it took the lock: its owner's changes and
+/// approvals are `AgentNotFound`, and its own action is not queued.
+async fn an_agent_deleted_while_waiting_for_its_lock_is_deleted<B: Backend>(backend: &B) {
+    let world = Arc::new(World::new(backend).await);
+    let owner = world.person().await;
+    let person = world.person().await;
+    let [settings, approval, gated] = [
+        world.agent(&owner).await,
+        world.agent(&owner).await,
+        world.agent(&owner).await,
+    ];
+    let queued = waiting_for_owner(world.svc.contact_request(approval.user, person.user).await);
+
+    // The holder deletes each agent while it holds the agent's lock; the operation checks
+    // the agent before it waits for that lock.
+    let mut holder = world.store.begin().await.unwrap();
+    holder.lock_users(&[settings.user]).await.unwrap();
+    holder
+        .mark_user_deleted(settings.user, world.clock.now())
+        .await
+        .unwrap();
+    let change = {
+        let world = Arc::clone(&world);
+        tokio::spawn(async move {
+            world
+                .svc
+                .set_inbound_policy(owner.user, settings.user, InboundPolicy::Contacts)
+                .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    holder.commit().await.unwrap();
+    assert_eq!(change.await.unwrap(), Err(DomainError::AgentNotFound));
+
+    let mut holder = world.store.begin().await.unwrap();
+    holder.lock_users(&[approval.user]).await.unwrap();
+    holder
+        .mark_user_deleted(approval.user, world.clock.now())
+        .await
+        .unwrap();
+    let approve = {
+        let world = Arc::clone(&world);
+        tokio::spawn(async move {
+            world
+                .svc
+                .approve_outgoing(owner.user, approval.user, queued)
+                .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    holder.commit().await.unwrap();
+    assert_eq!(approve.await.unwrap(), Err(DomainError::AgentNotFound));
+    assert_eq!(
+        world.svc.contact_state(person.user, approval.user).await,
+        Ok(None),
+        "nothing was carried out"
+    );
+
+    let mut holder = world.store.begin().await.unwrap();
+    holder.lock_users(&[gated.user]).await.unwrap();
+    holder
+        .mark_user_deleted(gated.user, world.clock.now())
+        .await
+        .unwrap();
+    let request = {
+        let world = Arc::clone(&world);
+        tokio::spawn(async move { world.svc.contact_request(gated.user, person.user).await })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    holder.commit().await.unwrap();
+    let answer = request.await.unwrap();
+    assert!(
+        !matches!(answer, Err(DomainError::WaitingForOwner { .. })),
+        "{answer:?}"
+    );
+    let mut tx = world.store.begin().await.unwrap();
+    assert_eq!(tx.waiting_outgoing_count(gated.user).await, Ok(0));
+    tx.rollback().await.unwrap();
+}
+
 /// The scenarios that need a store with concurrent transactions.
 pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
     case_list![
@@ -520,6 +692,8 @@ pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
         concurrent_seeders_store_each_builtin_once,
         concurrent_answers_to_a_card_answer_it_once,
         a_revocation_waits_for_a_send_that_read_the_template,
+        an_approval_that_conflicts_leaves_the_action_waiting,
+        an_agent_deleted_while_waiting_for_its_lock_is_deleted,
     ]
     .into_iter()
     .map(|case| case.within("concurrency"))

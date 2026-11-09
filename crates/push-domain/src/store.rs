@@ -49,6 +49,14 @@
 //! after the positions lock, as before. Postgres advisory locks are re-entrant, so taking
 //! a held user lock again never waits.
 //!
+//! Approving an agent's action carries it out and resolves it in one transaction, taking
+//! the locks of the operation in the order above with the agent's user lock among the
+//! user locks (a contact request: pair → agent; a chat: pair → agent and peer; a group:
+//! every user; an invite: conversation → positions → added users and agent), and checks
+//! the action under the agent's lock. Deciding an action, changing an agent's settings
+//! and forgetting a deleted agent's actions take the agent's user lock alone, so each
+//! sees whether the agent is deleted ([`Tx::mark_user_deleted`], under the same lock).
+//!
 //! Template operations lock in the order publisher ([`Tx::claim_publisher`]) → version
 //! ([`Tx::lock_template`]) → change counter ([`Tx::next_template_change`]). A submission
 //! first takes its submitter's lock ([`Tx::lock_users`]), before the publisher, so one
@@ -105,6 +113,14 @@ pub trait Store: Send + Sync {
 pub trait Tx: Send {
     async fn commit(self) -> DomainResult<()>;
     async fn rollback(self) -> DomainResult<()>;
+    /// Marks a point that [`Tx::rollback_to_savepoint`] goes back to; it goes back to the
+    /// latest one marked.
+    async fn savepoint(&mut self) -> DomainResult<()>;
+    /// Undoes everything written since [`Tx::savepoint`] and gives back the locks taken
+    /// since (Postgres; the in-memory store holds one lock for everything). The
+    /// transaction is usable again, even after a method failed. Fails with
+    /// `DomainError::Store` when there is no savepoint.
+    async fn rollback_to_savepoint(&mut self) -> DomainResult<()>;
 
     // --- Users and devices -------------------------------------------------------------
 

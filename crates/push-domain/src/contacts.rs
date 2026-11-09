@@ -62,17 +62,6 @@ where
     /// agents §3): `NotAllowedByOwner`, or `WaitingForOwner` with the waiting action,
     /// before anything that depends on `to`.
     pub async fn contact_request(&self, from: UserId, to: UserId) -> DomainResult<ContactState> {
-        self.contact_request_as(from, to, true).await
-    }
-
-    /// [`Self::contact_request`]; `gated: false` (an approved action) skips the agent's
-    /// gate and limits.
-    pub(crate) async fn contact_request_as(
-        &self,
-        from: UserId,
-        to: UserId,
-        gated: bool,
-    ) -> DomainResult<ContactState> {
         if from == to {
             return Err(ValidationError::SelfTarget.into());
         }
@@ -85,10 +74,7 @@ where
         if known {
             tx.lock_contact_pair(from, to).await?;
         }
-        let owner = match gated {
-            true => tx.agent_owner(from).await?,
-            false => None,
-        };
+        let owner = tx.agent_owner(from).await?;
         if let Some(owner) = owner.filter(|owner| *owner != to) {
             // The agent's own row only: nothing here depends on `to`.
             let mine = match known {
@@ -106,8 +92,27 @@ where
                 check_agent_limits(&mut tx, from, to, now).await?;
             }
         }
+        let mut events = Vec::new();
+        let result = self
+            .request_on(&mut tx, from, to, known, &mut events)
+            .await?;
+        tx.commit().await?;
+        self.publish(events).await;
+        Ok(result)
+    }
+
+    /// The request of [`Self::contact_request`] past the requester's gate and limits, on
+    /// `tx`, which holds the pair lock when `to` is `known` (a verified user). Adds the
+    /// events to publish once `tx` commits to `events`.
+    pub(crate) async fn request_on(
+        &self,
+        tx: &mut S::Tx,
+        from: UserId,
+        to: UserId,
+        known: bool,
+        events: &mut Vec<Event>,
+    ) -> DomainResult<ContactState> {
         if !known {
-            tx.commit().await?;
             return Ok(ContactState::RequestedOut);
         }
         let mine = tx.get_contact(from, to).await?;
@@ -125,7 +130,7 @@ where
             // Already pending: a repeated request changes nothing.
             (_, Some(ContactState::RequestedIn)) => (ContactState::RequestedOut, theirs),
             _ => match tx.agent_owner(to).await? {
-                Some(owner) => match resolve(&mut tx, from, to, owner).await? {
+                Some(owner) => match resolve(tx, from, to, owner).await? {
                     Resolution::Accept => (ContactState::Accepted, Some(ContactState::Accepted)),
                     Resolution::Hold => {
                         (ContactState::RequestedOut, Some(ContactState::RequestedIn))
@@ -138,12 +143,12 @@ where
                 None => (ContactState::RequestedOut, Some(ContactState::RequestedIn)),
             },
         };
-        let mut events = Vec::new();
-        if set_contact(&mut tx, from, to, Some(result)).await? {
-            events.push(contact_changed(from, to, Some(result)));
+        let mut changed = Vec::new();
+        if set_contact(tx, from, to, Some(result)).await? {
+            changed.push(contact_changed(from, to, Some(result)));
         }
-        if set_contact(&mut tx, to, from, their_new).await? {
-            events.push(contact_changed(to, from, their_new));
+        if set_contact(tx, to, from, their_new).await? {
+            changed.push(contact_changed(to, from, their_new));
         }
         if refuse {
             // The requester alone hears of its own request, as for any request; nothing
@@ -154,9 +159,8 @@ where
             tx.delete_refusal(from, to).await?;
             tx.delete_refusal(to, from).await?;
         }
-        owner_events(&mut tx, &mut events).await?;
-        tx.commit().await?;
-        self.publish(events).await;
+        owner_events(tx, &mut changed).await?;
+        events.extend(changed);
         Ok(result)
     }
 
