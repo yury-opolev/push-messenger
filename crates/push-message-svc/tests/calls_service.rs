@@ -1007,6 +1007,99 @@ async fn calls_an_agent_starts_are_marked_in_both_histories() {
 }
 
 #[tokio::test]
+async fn an_agents_call_to_a_contact_follows_its_owners_call_policy() {
+    let env = env(Timing::default()).await;
+    let (owner, friend) = (env.user().await, env.user().await);
+    let agent = Party {
+        user: UserId::new(),
+        device: DeviceId::new(),
+    };
+    env.messaging
+        .enroll_agent(owner.user, agent.user)
+        .await
+        .unwrap();
+    env.messaging
+        .device_registered(agent.device, agent.user)
+        .await
+        .unwrap();
+    let policy = |calls| OutgoingPolicyChange {
+        requests: Some(OutgoingPolicy::Allowed),
+        calls: Some(calls),
+        ..OutgoingPolicyChange::default()
+    };
+    env.messaging
+        .set_outgoing_policy(owner.user, agent.user, policy(OutgoingPolicy::Off))
+        .await
+        .unwrap();
+    env.contacts(agent, friend).await;
+
+    let status = env
+        .invite(agent, friend.user, Uuid::now_v7())
+        .await
+        .unwrap_err();
+    let error = error_from_status(&status);
+    assert_eq!(
+        (status.code(), error.code(), error.action_id),
+        (Code::FailedPrecondition, ErrorCode::NotAllowedByOwner, None)
+    );
+
+    env.messaging
+        .set_outgoing_policy(owner.user, agent.user, policy(OutgoingPolicy::Ask))
+        .await
+        .unwrap();
+    let status = env
+        .invite(agent, friend.user, Uuid::now_v7())
+        .await
+        .unwrap_err();
+    let error = error_from_status(&status);
+    assert_eq!(
+        (status.code(), error.code()),
+        (Code::FailedPrecondition, ErrorCode::WaitingForOwner)
+    );
+    let waiting = env
+        .messaging
+        .waiting_outgoing(owner.user, agent.user)
+        .await
+        .unwrap();
+    assert_eq!(error.action_id, Some(id_bytes(waiting[0].action_id)));
+    // Approved: the agent may ring that person once.
+    env.messaging
+        .approve_outgoing(owner.user, agent.user, waiting[0].action_id)
+        .await
+        .unwrap();
+    let call = Uuid::now_v7();
+    assert_eq!(
+        env.invite(agent, friend.user, call).await.unwrap().ended,
+        Some(ended(call, CallEndReason::Unreachable))
+    );
+    let status = env
+        .invite(agent, friend.user, Uuid::now_v7())
+        .await
+        .unwrap_err();
+    assert_eq!(code(&status), ErrorCode::WaitingForOwner);
+
+    env.messaging
+        .set_outgoing_policy(owner.user, agent.user, policy(OutgoingPolicy::Allowed))
+        .await
+        .unwrap();
+    // Ten calls a day; the approved one and the queued one counted already.
+    let mut refused = None;
+    for _ in 0..10 {
+        if let Err(status) = env.invite(agent, friend.user, Uuid::now_v7()).await {
+            refused = Some(status);
+            break;
+        }
+    }
+    let status = refused.expect("the eleventh call of the day is refused");
+    let error = error_from_status(&status);
+    assert_eq!(
+        (status.code(), error.code()),
+        (Code::ResourceExhausted, ErrorCode::RateLimited)
+    );
+    assert!(error.retry_after_s.is_some_and(|seconds| seconds > 0));
+}
+
+#[tokio::test]
 async fn the_history_api_shows_own_calls_only_and_hides_per_side() {
     let env = env(Timing::default()).await;
     let (alice, bob, carol) = (env.user().await, env.user().await, env.user().await);
@@ -1023,7 +1116,7 @@ async fn the_history_api_shows_own_calls_only_and_hides_per_side() {
             Some(ended_ms - offset - 10_000),
             ended_ms - offset,
             EndReason::Completed,
-            false,
+            offset == 1_000,
         );
         env.messaging.record_call(&rows).await.unwrap();
         calls.push(call);
@@ -1058,6 +1151,8 @@ async fn the_history_api_shows_own_calls_only_and_hides_per_side() {
     assert_eq!(newest.duration_s, 10);
     assert_eq!(newest.ended_at, (ended_ms - 1_000) * 1000);
     assert_eq!(newest.answered_at, Some((ended_ms - 11_000) * 1000));
+    assert!(newest.started_by_agent);
+    assert!(!page.calls[1].started_by_agent);
     assert_eq!(newest.started_at, (ended_ms - 21_000) * 1000);
     let cursor = |entry: &CallHistoryEntry| CallHistoryCursor {
         ended_at: entry.ended_at,

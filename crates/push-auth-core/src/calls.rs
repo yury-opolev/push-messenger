@@ -328,6 +328,7 @@ mod tests {
                     ended_at: before.ended_at,
                     duration_s: 0,
                     outcome: CallEndReason::Missed.into(),
+                    started_by_agent: false,
                 }],
             }))
         }

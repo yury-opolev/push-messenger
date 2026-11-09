@@ -95,6 +95,8 @@ pub struct AgentConversation {
     pub message_count: i64,
     pub hidden: bool,
     pub peer_deleted: bool,
+    /// The agent started it on its own (see [`crate::Conversation::started_by_agent`]).
+    pub started_by_agent: bool,
 }
 
 /// The owner's answer to a waiting request.
@@ -417,6 +419,7 @@ where
                 message_count: counts.get(&summary.conversation_id).copied().unwrap_or(0),
                 hidden: summary.hidden,
                 peer_deleted: summary.peer_deleted,
+                started_by_agent: summary.started_by_agent,
             });
         }
         tx.rollback().await?;

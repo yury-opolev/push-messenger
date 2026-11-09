@@ -1849,6 +1849,7 @@ mod tests {
                     message: "refused".to_owned(),
                     retryable: retry_after_s.is_some(),
                     retry_after_s,
+                    action_id: None,
                 }),
                 0,
             );

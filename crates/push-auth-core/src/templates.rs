@@ -533,6 +533,7 @@ mod tests {
                 client_msg_id: None,
                 request_id: None,
                 retry_after_s: None,
+                action_id: None,
             },
         )
     }

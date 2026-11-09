@@ -716,6 +716,7 @@ fn limited(refused: Refused, request_id: u64) -> Error {
         client_msg_id: None,
         request_id: Some(request_id),
         retry_after_s: Some(retry_after_s),
+        action_id: None,
     }
 }
 
@@ -1073,6 +1074,7 @@ impl Connected {
                     message: message.to_owned(),
                     retryable: true,
                     retry_after_s: Some(retry_after_s),
+                    action_id: None,
                 };
                 return send(&mut self.socket, Body::CallError(error)).await;
             }
@@ -1176,6 +1178,7 @@ impl Connected {
             client_msg_id: Some(client_msg_id.to_vec()),
             request_id: None,
             retry_after_s: Some(retry_after_s),
+            action_id: None,
         };
         send(&mut self.socket, Body::Error(error)).await?;
         Ok(false)
@@ -1327,6 +1330,7 @@ impl Connected {
             client_msg_id: None,
             request_id: None,
             retry_after_s: Some(1),
+            action_id: None,
         };
         send(&mut self.socket, Body::Error(error)).await
     }
@@ -1383,6 +1387,7 @@ fn call_error(call_id: Vec<u8>, status: &tonic::Status) -> CallError {
             client_msg_id: None,
             request_id: None,
             retry_after_s: Some(1),
+            action_id: None,
         }
     } else {
         error_from_status(status)
@@ -1393,6 +1398,7 @@ fn call_error(call_id: Vec<u8>, status: &tonic::Status) -> CallError {
         message: error.message,
         retryable: error.retryable,
         retry_after_s: error.retry_after_s,
+        action_id: error.action_id,
     }
 }
 

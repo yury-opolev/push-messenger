@@ -250,6 +250,7 @@ impl Session {
                         client_msg_id: None,
                         request_id: Some(request.request_id),
                         retry_after_s: None,
+                        action_id: None,
                     }));
                 }
                 Step::Request(request)
@@ -264,6 +265,7 @@ impl Session {
                     message: "calls are not available on this connection".to_owned(),
                     retryable: false,
                     retry_after_s: None,
+                    action_id: None,
                 })),
                 None => reply_error(ErrorCode::BadFrame, "not a client frame"),
             },
@@ -395,6 +397,7 @@ pub(crate) fn error_frame(code: ErrorCode, message: &str) -> Body {
         client_msg_id: None,
         request_id: None,
         retry_after_s: None,
+        action_id: None,
     })
 }
 
@@ -820,6 +823,7 @@ mod tests {
                         message: "calls are not available on this connection".to_owned(),
                         retryable: false,
                         retry_after_s: None,
+                        action_id: None,
                     }))
                 );
             }

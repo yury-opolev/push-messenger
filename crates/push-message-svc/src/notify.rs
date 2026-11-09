@@ -12,7 +12,9 @@ use push_proto::{id_bytes, kick_channel, notify_channel};
 use redis::aio::ConnectionManager;
 
 use crate::calls::RedisCalls;
-use crate::convert::{activity_state_to_wire, contact_state, presence};
+use crate::convert::{
+    Viewer, activity_state_to_wire, agent_settings, contact_state, outgoing_action, presence,
+};
 use crate::presence::RedisPresence;
 
 /// Publishes each event as small [`Notification`]s on the Redis channels of the users it
@@ -239,6 +241,24 @@ pub(crate) fn notifications(events: &[Event]) -> Vec<(String, Vec<u8>)> {
                 });
                 messages.push(message(owner.0, kind));
             }
+            Event::AgentSettings { agent, settings } => {
+                let kind = Kind::AgentSettingsChanged(push_proto::v1::AgentSettingsEvent {
+                    settings: Some(agent_settings(settings)),
+                });
+                messages.push(message(agent.0, kind));
+            }
+            Event::Outgoing { to, action } => {
+                // The agent cannot tell an expired action from a declined one.
+                let viewer = if *to == action.agent {
+                    Viewer::Agent
+                } else {
+                    Viewer::Owner
+                };
+                let kind = Kind::OutgoingActionChanged(push_proto::v1::OutgoingActionEvent {
+                    action: Some(outgoing_action(action, viewer)),
+                });
+                messages.push(message(to.0, kind));
+            }
             _ => {}
         }
     }
@@ -260,7 +280,9 @@ fn message(user: uuid::Uuid, kind: Kind) -> (String, Vec<u8>) {
 #[cfg(test)]
 mod tests {
     use push_domain::{
-        ActivityState, ContactState, ConversationId, DeviceId, PresenceView, UserId,
+        ActivityState, AgentSettings, ContactState, ConversationId, DeviceId, InboundPolicy,
+        OutgoingAction, OutgoingError, OutgoingKind, OutgoingPolicy, OutgoingState, PresenceView,
+        UserId,
     };
     use push_proto::v1;
 
@@ -374,6 +396,95 @@ mod tests {
                 })
             )]
         );
+    }
+
+    #[test]
+    fn settings_changes_go_to_the_agent_only() {
+        let agent = UserId::new();
+        let settings = AgentSettings {
+            calls: OutgoingPolicy::Allowed,
+            inbound: InboundPolicy::Contacts,
+            ..AgentSettings::default()
+        };
+        let messages = notifications(&[Event::AgentSettings { agent, settings }]);
+        assert_eq!(
+            decode(&messages),
+            vec![(
+                notify_channel(agent.0),
+                Kind::AgentSettingsChanged(v1::AgentSettingsEvent {
+                    settings: Some(v1::AgentSettings {
+                        inbound: v1::InboundPolicy::Contacts.into(),
+                        requests: v1::OutgoingPolicy::Ask.into(),
+                        chats: v1::OutgoingPolicy::Ask.into(),
+                        groups: v1::OutgoingPolicy::Off.into(),
+                        calls: v1::OutgoingPolicy::Allowed.into(),
+                    }),
+                })
+            )]
+        );
+    }
+
+    #[test]
+    fn outgoing_actions_go_to_their_recipient_and_the_agent_never_sees_expired() {
+        let (owner, agent, peer) = (UserId::new(), UserId::new(), UserId::new());
+        let at = chrono::Utc::now();
+        let action = |state, error| OutgoingAction {
+            action_id: uuid::Uuid::now_v7(),
+            agent,
+            kind: OutgoingKind::Chat,
+            target: Some(peer),
+            conversation: None,
+            title: None,
+            members: Vec::new(),
+            state,
+            error,
+            created_at: at,
+            resolved_at: Some(at),
+            used_at: None,
+        };
+        let state_of = |to: UserId, action: &OutgoingAction| {
+            let messages = notifications(&[Event::Outgoing {
+                to,
+                action: action.clone(),
+            }]);
+            let decoded = decode(&messages);
+            assert_eq!(decoded.len(), 1);
+            assert_eq!(decoded[0].0, notify_channel(to.0));
+            let Kind::OutgoingActionChanged(v1::OutgoingActionEvent { action: Some(wire) }) =
+                &decoded[0].1
+            else {
+                panic!("not an outgoing action: {decoded:?}");
+            };
+            assert_eq!(wire.action_id, id_bytes(action.action_id));
+            assert_eq!(wire.agent_user_id, id_bytes(agent.0));
+            assert_eq!(wire.target_user_id, id_bytes(peer.0));
+            assert_eq!(wire.kind(), v1::OutgoingKind::Chat);
+            (wire.state(), wire.error())
+        };
+        let expired = action(OutgoingState::Expired, None);
+        assert_eq!(
+            state_of(owner, &expired),
+            (v1::OutgoingState::Expired, v1::ErrorCode::Unspecified)
+        );
+        assert_eq!(
+            state_of(agent, &expired).0,
+            v1::OutgoingState::OwnerDeclined
+        );
+        let declined = action(OutgoingState::Declined, None);
+        for to in [owner, agent] {
+            assert_eq!(state_of(to, &declined).0, v1::OutgoingState::OwnerDeclined);
+        }
+        let waiting = action(OutgoingState::Waiting, None);
+        assert_eq!(state_of(owner, &waiting).0, v1::OutgoingState::Waiting);
+        let failed = action(OutgoingState::Failed, Some(OutgoingError::NotContact));
+        for to in [owner, agent] {
+            assert_eq!(
+                state_of(to, &failed),
+                (v1::OutgoingState::Failed, v1::ErrorCode::NotContact)
+            );
+        }
+        let failed = action(OutgoingState::Failed, Some(OutgoingError::Failed));
+        assert_eq!(state_of(agent, &failed).1, v1::ErrorCode::Rejected);
     }
 
     #[test]

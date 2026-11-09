@@ -473,6 +473,7 @@ async fn the_owner_view_shows_the_agents_chats_and_has_no_write_path() {
             message_count: 7,
             hidden: false,
             peer_deleted: false,
+            started_by_agent: false,
         }],
         page: HistoryPage {
             entries: vec![Deliver {

@@ -762,6 +762,92 @@ async fn request(socket: &mut Socket, request_id: u64, body: request::Body) -> B
     .await
 }
 
+/// An agent's contact request under its owner's default `ask` policy waits for the owner:
+/// the agent's socket gets `Error{WAITING_FOR_OWNER}` naming the action, and the owner's
+/// socket the action as `OutgoingActionEvent`; the agent reads its own settings and
+/// actions (spec 2026-11-09 proactive agents).
+#[tokio::test]
+async fn an_agents_action_waits_for_its_owner_end_to_end() {
+    let stack = stack().await;
+    let (owner, owner_device) = person(&stack).await;
+    let (agent, agent_device) = (Uuid::now_v7(), Uuid::now_v7());
+    stack
+        .messaging
+        .enroll_agent(UserId(owner), UserId(agent))
+        .await
+        .unwrap();
+    stack
+        .messaging
+        .device_registered(DeviceId(agent_device), UserId(agent))
+        .await
+        .unwrap();
+    let (peer, _) = person(&stack).await;
+    let mut owner_socket = ready(&stack, owner, owner_device).await;
+    let mut agent_socket = ready(&stack, agent, agent_device).await;
+
+    let ask = request::Body::ContactRequest(ContactRequest {
+        user_id: id_bytes(peer),
+    });
+    let Body::Error(error) = request(&mut agent_socket, 7, ask).await else {
+        panic!("the request did not wait");
+    };
+    assert_eq!(error.code(), ErrorCode::WaitingForOwner);
+    assert_eq!(error.request_id, Some(7));
+    let action_id = error.action_id.expect("the waiting action's id");
+    assert_eq!(action_id.len(), 16);
+
+    let Body::OutgoingActionEvent(event) = wait_for(&mut owner_socket, |frame| {
+        matches!(frame, Body::OutgoingActionEvent(_))
+    })
+    .await
+    else {
+        unreachable!();
+    };
+    let action = event.action.unwrap();
+    assert_eq!(action.action_id, action_id);
+    assert_eq!(action.agent_user_id, id_bytes(agent));
+    assert_eq!(action.target_user_id, id_bytes(peer));
+    assert_eq!(action.state(), v1::OutgoingState::Waiting);
+
+    let list = request::Body::ListOutgoingActions(v1::ListOutgoingActions {});
+    let Body::Response(v1::Response {
+        body: Some(response::Body::OutgoingActions(listed)),
+        ..
+    }) = request(&mut agent_socket, 8, list).await
+    else {
+        panic!("the agent could not list its actions");
+    };
+    assert_eq!(listed.actions, [action]);
+
+    // The owner declines: the agent hears of it.
+    stack
+        .messaging
+        .decline_outgoing(UserId(owner), UserId(agent), id(&action_id).unwrap())
+        .await
+        .unwrap();
+    let Body::OutgoingActionEvent(event) = wait_for(&mut agent_socket, |frame| {
+        matches!(frame, Body::OutgoingActionEvent(_))
+    })
+    .await
+    else {
+        unreachable!();
+    };
+    assert_eq!(
+        event.action.unwrap().state(),
+        v1::OutgoingState::OwnerDeclined
+    );
+
+    let settings = request::Body::GetAgentSettings(v1::GetAgentSettings {});
+    let Body::Response(v1::Response {
+        body: Some(response::Body::AgentSettings(settings)),
+        ..
+    }) = request(&mut agent_socket, 9, settings).await
+    else {
+        panic!("the agent could not read its settings");
+    };
+    assert_eq!(settings.requests(), v1::OutgoingPolicy::Ask);
+}
+
 /// Every client frame of spec §7.1 travels to message-svc and back; group requests are
 /// refused (groups are not offered to apps in the first release).
 #[tokio::test]

@@ -14,15 +14,17 @@ use push_proto::internal::v1::{
     DeleteRequest, EditRequest, ReadUpToRequest, ReadUpToResponse, RequestCall,
 };
 use push_proto::v1::{
-    self, Contact, ContactList, ConversationList, DirectOpened, DirectReceipts, Done, GroupCreated,
-    GroupReceipts, HistoryPage, Invite, InviteRedeemed, ListContacts, PresenceList,
-    PresenceSharing, SendAck, conversation_summary, delete, edit, request, response,
+    self, Contact, ContactList, ConversationList, DirectOpened, DirectReceipts, Done,
+    GetAgentSettings, GroupCreated, GroupReceipts, HistoryPage, Invite, InviteRedeemed,
+    ListContacts, ListOutgoingActions, OutgoingActionList, PresenceList, PresenceSharing, SendAck,
+    conversation_summary, delete, edit, request, response,
 };
 use push_proto::{error_from_status, error_status, id_bytes};
 use tonic::Status;
 
 use crate::convert::{
-    self, contact_state, deliver, domain_error, from_micros, invalid, micros, parse_id, send_ack,
+    self, Viewer, contact_state, deliver, domain_error, from_micros, invalid, micros, parse_id,
+    send_ack,
 };
 use crate::presence::{self, PresenceRead, PresenceStates, PresenceUnavailable};
 
@@ -316,6 +318,25 @@ async fn answer<S: Store, C: Clock, N: Notifier>(
                 share: share.map_err(domain_error)?,
             })
         }
+        request::Body::GetAgentSettings(GetAgentSettings {}) => {
+            let settings = messaging
+                .own_agent_settings(user)
+                .await
+                .map_err(domain_error)?;
+            response::Body::AgentSettings(convert::agent_settings(&settings))
+        }
+        request::Body::ListOutgoingActions(ListOutgoingActions {}) => {
+            let actions = messaging
+                .own_outgoing_actions(user)
+                .await
+                .map_err(domain_error)?;
+            response::Body::OutgoingActions(OutgoingActionList {
+                actions: actions
+                    .iter()
+                    .map(|action| convert::outgoing_action(action, Viewer::Agent))
+                    .collect(),
+            })
+        }
     })
 }
 
@@ -460,6 +481,7 @@ fn summary(summary: ConversationSummary) -> v1::ConversationSummary {
         admins: users(&summary.admins),
         hidden: summary.hidden,
         peer_deleted: summary.peer_deleted,
+        started_by_agent: summary.started_by_agent,
     }
 }
 

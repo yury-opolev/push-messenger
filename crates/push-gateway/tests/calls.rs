@@ -1004,7 +1004,23 @@ async fn agent_calls_only_its_owner() {
     // The agent calls a contact that is not its owner (its owner's call policy is off by
     // default), and that contact calls the agent.
     let call = invite(&mut agent_socket, friend).await;
-    expect_error(&mut agent_socket, &call, ErrorCode::NotAllowed).await;
+    expect_error(&mut agent_socket, &call, ErrorCode::NotAllowedByOwner).await;
+    // Under `ask` the call waits for the owner, named in the error.
+    stack
+        .messaging
+        .set_outgoing_policy(
+            UserId(owner),
+            UserId(agent),
+            OutgoingPolicyChange {
+                calls: Some(OutgoingPolicy::Ask),
+                ..OutgoingPolicyChange::default()
+            },
+        )
+        .await
+        .unwrap();
+    let call = invite(&mut agent_socket, friend).await;
+    let error = expect_error(&mut agent_socket, &call, ErrorCode::WaitingForOwner).await;
+    assert_eq!(error.action_id.map(|id| id.len()), Some(16));
     let call = invite(&mut friend_socket, agent).await;
     expect_error(&mut friend_socket, &call, ErrorCode::NotContact).await;
     quiet(&mut agent_socket).await;

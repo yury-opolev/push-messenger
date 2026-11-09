@@ -74,8 +74,14 @@ message Frame {
     // Sent to an agent's owner: a relationship of one of the owner's agents changed
     // (spec 2026-11-06 agent connections). REQUESTED_IN = a request waits for the owner.
     AgentContactEvent agent_contact_event = 54;
+    // Sent to an agent: its owner changed its settings (spec 2026-11-09 proactive agents).
+    AgentSettingsEvent agent_settings_event = 55;
+    // Sent to an agent's owner when one of the agent's actions starts waiting for the
+    // owner and when one is resolved, and to the agent when one of its actions is
+    // resolved (spec 2026-11-09 proactive agents).
+    OutgoingActionEvent outgoing_action_event = 56;
   }
-  // 18-31 are free for later client frames, 55-63 for later server frames.
+  // 18-31 are free for later client frames, 57-63 for later server frames.
 }
 
 // Must be the first frame, within 5 seconds of connecting. The gateway learns the user
@@ -368,6 +374,10 @@ message Request {
     SetPresenceSharing set_presence_sharing = 21;
     HideConversation hide_conversation = 22;
     UnhideConversation unhide_conversation = 23;
+    // An agent's own settings; NOT_ALLOWED for people.
+    GetAgentSettings get_agent_settings = 24;
+    // An agent's own actions; NOT_ALLOWED for people.
+    ListOutgoingActions list_outgoing_actions = 25;
   }
 }
 
@@ -388,10 +398,114 @@ message Response {
     GroupCreated group_created = 10;
     PresenceList presences = 11;
     PresenceSharing presence_sharing = 12;
+    // GetAgentSettings.
+    AgentSettings agent_settings = 13;
+    // ListOutgoingActions.
+    OutgoingActionList outgoing_actions = 14;
   }
 }
 
 message Done {}
+
+// Proactive agents (spec 2026-11-09 proactive agents): what an agent starts on its own (a
+// contact request, a new direct chat, a group or an invite to one, a call to someone other
+// than its owner) passes its owner's outgoing policy. ALLOWED: carried out at once (within
+// the agent's limits); ASK: it waits for the owner (WAITING_FOR_OWNER with the action's
+// id); OFF: refused (NOT_ALLOWED_BY_OWNER).
+enum OutgoingPolicy {
+  OUTGOING_POLICY_UNSPECIFIED = 0;
+  OUTGOING_POLICY_ALLOWED = 1;
+  OUTGOING_POLICY_ASK = 2;
+  OUTGOING_POLICY_OFF = 3;
+}
+
+// Who reaches an agent's backend (the bridge enforces it): the owner only, the owner and
+// the owner's other agents, or every accepted contact.
+enum InboundPolicy {
+  INBOUND_POLICY_UNSPECIFIED = 0;
+  INBOUND_POLICY_OWNER_ONLY = 1;
+  INBOUND_POLICY_OWNER_AGENTS = 2;
+  INBOUND_POLICY_CONTACTS = 3;
+}
+
+// An agent's settings, set by its owner.
+message AgentSettings {
+  InboundPolicy inbound = 1;
+  // Contact requests.
+  OutgoingPolicy requests = 2;
+  // New direct chats with someone other than the owner.
+  OutgoingPolicy chats = 3;
+  // Creating groups and adding members to them.
+  OutgoingPolicy groups = 4;
+  // Calls to someone other than the owner.
+  OutgoingPolicy calls = 5;
+}
+
+enum OutgoingKind {
+  OUTGOING_KIND_UNSPECIFIED = 0;
+  OUTGOING_KIND_REQUEST = 1;
+  OUTGOING_KIND_CHAT = 2;
+  OUTGOING_KIND_GROUP = 3;
+  OUTGOING_KIND_INVITE = 4;
+  OUTGOING_KIND_CALL = 5;
+}
+
+enum OutgoingState {
+  OUTGOING_STATE_UNSPECIFIED = 0;
+  // Waits for the owner.
+  OUTGOING_STATE_WAITING = 1;
+  // The owner approved it and it was carried out (an approved call may ring that person
+  // once within 15 minutes).
+  OUTGOING_STATE_APPROVED = 2;
+  // The owner declined it; agents also get it for an action that expired.
+  OUTGOING_STATE_OWNER_DECLINED = 3;
+  // Nobody decided it within 24 hours. Sent to owners only.
+  OUTGOING_STATE_EXPIRED = 4;
+  // Approved, but the normal rules refused it: error says why.
+  OUTGOING_STATE_FAILED = 5;
+}
+
+// An action an agent started. Times are microseconds since the Unix epoch; empty bytes
+// and 0 mean none.
+message OutgoingAction {
+  bytes action_id = 1;
+  bytes agent_user_id = 2;
+  OutgoingKind kind = 3;
+  // Request, chat and call: the other user.
+  bytes target_user_id = 4;
+  // Invite: the group; once approved, the chat or group it opened or created.
+  bytes conversation_id = 5;
+  // Group: its title.
+  string title = 6;
+  // Group and invite: the members, sorted.
+  repeated bytes member_ids = 7;
+  OutgoingState state = 8;
+  // FAILED: why (REJECTED for a refusal without a code of its own).
+  ErrorCode error = 9;
+  int64 created_at = 10;
+  int64 resolved_at = 11;
+}
+
+// An agent's own settings (GetAgentSettings).
+message GetAgentSettings {}
+
+// An agent's own actions: those waiting, and those resolved in the last 24 hours, oldest
+// first (ListOutgoingActions).
+message ListOutgoingActions {}
+
+message OutgoingActionList {
+  repeated OutgoingAction actions = 1;
+}
+
+// To an agent: its settings now.
+message AgentSettingsEvent {
+  AgentSettings settings = 1;
+}
+
+// One of an agent's actions changed (see Frame.outgoing_action_event).
+message OutgoingActionEvent {
+  OutgoingAction action = 1;
+}
 
 // The caller's conversations, current and left, sorted by id, with positions, unread
 // counts and receipt positions. A direct conversation with a user the caller has blocked
@@ -443,6 +557,9 @@ message ConversationSummary {
   // Direct only: the other member's account was deleted. Their profile is a tombstone
   // (GET /v1/users answers deleted: true) and they will not write again.
   bool peer_deleted = 13;
+  // A direct chat an agent opened with someone other than its owner, or a group an agent
+  // created (spec 2026-11-09 proactive agents D13).
+  bool started_by_agent = 14;
 }
 
 // Hides a direct conversation from the caller's own listings, on all of the caller's
@@ -708,6 +825,11 @@ enum ErrorCode {
   // An agent tried to accept, decline or block a contact request that waits for its
   // owner: only the owner decides.
   ERROR_CODE_OWNER_DECIDES = 32;
+  // An agent's action waits for its owner's approval (spec 2026-11-09 proactive agents):
+  // action_id names it.
+  ERROR_CODE_WAITING_FOR_OWNER = 33;
+  // An agent's owner turned this kind of action off.
+  ERROR_CODE_NOT_ALLOWED_BY_OWNER = 34;
 }
 
 message Error {
@@ -721,6 +843,8 @@ message Error {
   optional uint64 request_id = 5;
   // RATE_LIMITED: when the same frame may succeed again.
   optional uint32 retry_after_s = 6;
+  // WAITING_FOR_OWNER: the waiting action (16 bytes).
+  optional bytes action_id = 7;
 }
 
 // Calls (docs/calls.md: the guide for client developers, with a browser recipe).
@@ -799,6 +923,8 @@ enum CallStatus {
 // UNREACHABLE when it cannot ring, or by CallError: NOT_CONTACT (not an accepted contact,
 // a block either way, an agent rule, or no such user, indistinguishable), INVALID,
 // IN_CALL, RATE_LIMITED (too many invites per hour, with retry_after_s) or UNAVAILABLE.
+// An agent calling a person other than its owner passes its owner's call policy first:
+// WAITING_FOR_OWNER (with action_id) or NOT_ALLOWED_BY_OWNER.
 message CallInvite {
   // A new UUIDv7 chosen by the caller (16 bytes).
   bytes call_id = 1;
@@ -926,7 +1052,7 @@ message CallEnded {
 message CallError {
   bytes call_id = 1;
   // ALREADY_ANSWERED, CALL_NOT_FOUND, IN_CALL, CALL_LIMIT, NOT_CONTACT, INVALID,
-  // RATE_LIMITED, NOT_AVAILABLE or UNAVAILABLE.
+  // RATE_LIMITED, NOT_AVAILABLE, UNAVAILABLE, WAITING_FOR_OWNER or NOT_ALLOWED_BY_OWNER.
   ErrorCode code = 2;
   // A human-readable explanation, never shown verbatim as the only information.
   string message = 3;
@@ -935,6 +1061,9 @@ message CallError {
   bool retryable = 4;
   // RATE_LIMITED: when another CallInvite may succeed.
   optional uint32 retry_after_s = 5;
+  // WAITING_FOR_OWNER: the waiting action (16 bytes). Once the owner approves it, the
+  // agent may call that person once within 15 minutes.
+  optional bytes action_id = 6;
 }
 
 // The user's calls as this device sees them. Sent once after Ready to every calls-active
