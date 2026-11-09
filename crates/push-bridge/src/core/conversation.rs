@@ -84,10 +84,14 @@ impl<M: Messenger> Core<M> {
             {
                 tracing::debug!(event = "private_notice_ignored");
             }
-            MessageKind::Text if message.sender_id != self.owner && self.accepts_contacts => {
+            MessageKind::Text
+                if message.sender_id != self.owner && self.backend.accepts_contacts() =>
+            {
                 self.contact_message(message).await;
             }
-            MessageKind::Rich if message.sender_id != self.owner && self.accepts_contacts => {
+            MessageKind::Rich
+                if message.sender_id != self.owner && self.backend.accepts_contacts() =>
+            {
                 self.contact_rich(message).await;
             }
             MessageKind::Text | MessageKind::Rich if message.sender_id != self.owner => {

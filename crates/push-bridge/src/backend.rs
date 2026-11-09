@@ -482,7 +482,8 @@ pub trait Backend: Send + Sync + 'static {
     }
     /// Takes texts from the agent's accepted contacts too (through
     /// [`Backend::contact_prompt`]), not only from its owner. `false` (the default): only
-    /// the owner reaches the backend.
+    /// the owner reaches the backend. Asked for each text, so it may change while the
+    /// bridge runs (Coda takes contacts only while its process has the tools).
     fn accepts_contacts(&self) -> bool {
         false
     }

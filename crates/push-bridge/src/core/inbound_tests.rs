@@ -177,6 +177,18 @@ async fn the_backend_learns_the_contact_s_handle_and_kind() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_backend_that_takes_contacts_only_after_its_start_gets_them() {
+    let mut h = Harness::named("Test");
+    h.messenger.set_inbound(InboundPolicy::Contacts);
+    h.start();
+    settle().await;
+    h.backend.set_accepts_contacts(true);
+    let alice = person(&h, "alice");
+    h.messenger.says(alice, "hello");
+    h.backend.wait_for("contact", 1).await;
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_contact_s_group_text_opens_no_chat_and_reaches_nobody() {
     let h = started(Some(InboundPolicy::Contacts)).await;
     h.messenger.gate_chats(server_error("waiting_for_owner"));

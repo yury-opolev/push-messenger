@@ -73,7 +73,7 @@ impl<M: Messenger> Core<M> {
             ))
         } else if let Some(why) = self.dial_blocker() {
             Some(ActionResult::new(ActionCode::Unavailable, why))
-        } else if !self.accepts_contacts {
+        } else if !self.backend.accepts_contacts() {
             Some(ActionResult::new(
                 ActionCode::Unavailable,
                 "the backend does not talk with contacts",

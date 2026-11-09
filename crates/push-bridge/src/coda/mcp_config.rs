@@ -108,7 +108,8 @@ fn read_user(file: Option<&Path>) -> Option<Value> {
             return None;
         }
     };
-    match serde_json::from_str::<Value>(&text) {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    match serde_json::from_str::<Value>(text) {
         Ok(document)
             if document.is_object() && document.get("mcpServers").is_none_or(Value::is_object) =>
         {
@@ -251,6 +252,22 @@ mod tests {
             })
         );
         assert!(!folder.join(".mcp.json.tmp").exists());
+    }
+
+    #[test]
+    fn a_user_file_with_a_bom_is_kept() {
+        let dir = TestDir::new();
+        let user = dir.path().join("bom.json");
+        std::fs::write(
+            &user,
+            "\u{feff}{\"mcpServers\": {\"files\": {\"command\": \"files-mcp\"}}}",
+        )
+        .unwrap();
+        let folder = write_mcp_config(&link(&dir), Some(&user)).unwrap();
+        assert_eq!(
+            written(&folder)["mcpServers"]["files"],
+            json!({"command": "files-mcp"})
+        );
     }
 
     #[test]
