@@ -40,6 +40,15 @@
 //! its user locks in one call, so no two transactions wait for each other's user locks in
 //! a cycle.
 //!
+//! The outgoing-policy gate of an agent's action (spec 2026-11-09 proactive agents) takes
+//! the agent's user lock. A contact request takes it after the pair lock and takes no
+//! other user lock. `open_direct` and `create_group` lock every user they will lock, the
+//! agent included, in one call before the gate (so the gate's own call only takes a lock
+//! already held); `create_group` does so before it inserts the group, whose conversation
+//! lock nobody else can wait for yet. `add_members` locks the agent with the users it adds,
+//! after the positions lock, as before. Postgres advisory locks are re-entrant, so taking
+//! a held user lock again never waits.
+//!
 //! Template operations lock in the order publisher ([`Tx::claim_publisher`]) → version
 //! ([`Tx::lock_template`]) → change counter ([`Tx::next_template_change`]). A submission
 //! first takes its submitter's lock ([`Tx::lock_users`]), before the publisher, so one

@@ -369,6 +369,17 @@ async fn agents_connect_under_their_owners_policy_and_the_owner_reads_their_chat
     })
     .await
     .expect("both agents enrolled in message-svc");
+    // An agent's contact requests and new chats wait for its owner by default (spec
+    // 2026-11-09 proactive agents); this owner lets Echo's go at once.
+    sqlx::query(
+        "INSERT INTO messaging.agent_settings \
+         (agent_user_id, inbound, requests, chats, groups, calls, changed_at) \
+         VALUES ($1, 1, 1, 1, 3, 3, now())",
+    )
+    .bind(echo.user)
+    .execute(&message_db)
+    .await
+    .unwrap();
 
     let url = stack.socket_url.clone();
     let mut owner_socket = ready(&url, &owner.token).await;

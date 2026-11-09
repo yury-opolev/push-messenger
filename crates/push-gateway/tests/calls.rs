@@ -10,7 +10,9 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use push_auth_core::tokens::AccessTokens;
 use push_domain::calls::Timing;
-use push_domain::{DeviceId, InMemoryStore, Messaging, SystemClock, UserId};
+use push_domain::{
+    DeviceId, InMemoryStore, Messaging, OutgoingPolicy, OutgoingPolicyChange, SystemClock, UserId,
+};
 use push_gateway::{Config, serve};
 use push_message_svc::{
     CallService, CallsApi, InternalToken, MessagingApi, Metrics, RedisCalls, RedisNotifier,
@@ -975,6 +977,19 @@ async fn agent_calls_only_its_owner() {
     stack
         .messaging
         .enroll_agent(UserId(owner), UserId(agent))
+        .await
+        .unwrap();
+    // By default an agent's requests wait for its owner.
+    stack
+        .messaging
+        .set_outgoing_policy(
+            UserId(owner),
+            UserId(agent),
+            OutgoingPolicyChange {
+                requests: Some(OutgoingPolicy::Allowed),
+                ..OutgoingPolicyChange::default()
+            },
+        )
         .await
         .unwrap();
     contacts(&stack, agent, friend).await;

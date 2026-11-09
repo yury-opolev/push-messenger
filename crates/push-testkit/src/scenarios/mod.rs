@@ -16,6 +16,7 @@ mod history;
 mod invites;
 mod listings;
 mod membership;
+mod outgoing;
 mod read_state;
 mod receipts;
 mod rich;
@@ -40,6 +41,7 @@ pub(crate) fn cases<B: Backend>() -> Vec<Case<B>> {
         ("invites", invites::cases()),
         ("listings", listings::cases()),
         ("membership", membership::cases()),
+        ("outgoing", outgoing::cases()),
         ("read_state", read_state::cases()),
         ("receipts", receipts::cases()),
         ("rich", rich::cases()),

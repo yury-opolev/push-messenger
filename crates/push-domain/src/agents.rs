@@ -18,9 +18,9 @@ use crate::store::{Store, Tx};
 use crate::validation::ValidationError;
 
 /// Contact requests an agent may send per hour.
-pub const AGENT_REQUESTS_PER_HOUR: u32 = 20;
+pub const AGENT_REQUESTS_PER_HOUR: u32 = 10;
 /// Contact requests an agent may send per 24 hours.
-pub const AGENT_REQUESTS_PER_DAY: u32 = 100;
+pub const AGENT_REQUESTS_PER_DAY: u32 = 20;
 /// Pending outgoing requests an agent may have.
 pub const AGENT_PENDING_OUT_MAX: u32 = 50;
 /// Outgoing requests of an agent that may wait for other agents' owners at once.
@@ -346,7 +346,8 @@ where
 
     /// Releases the refused requests that are due: each requester's pending request
     /// disappears without an event, as a decline looks to them. Also forgets agents'
-    /// request log entries older than a day. Returns how many requests were released.
+    /// request log entries older than a day, and sweeps outgoing actions (expiry and
+    /// pruning, see `Self::sweep_outgoing`). Returns how many requests were released.
     pub async fn release_refusals(&self) -> DomainResult<u32> {
         let now = self.clock.now();
         let mut tx = self.store.begin().await?;
@@ -366,6 +367,7 @@ where
             }
             tx.commit().await?;
         }
+        self.sweep_outgoing().await?;
         Ok(released)
     }
 

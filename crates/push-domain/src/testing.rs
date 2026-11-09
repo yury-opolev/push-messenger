@@ -5,6 +5,7 @@ use std::sync::Arc;
 use crate::clock::SystemClock;
 use crate::ids::UserId;
 use crate::memory::InMemoryStore;
+use crate::model::{OutgoingPolicy, OutgoingPolicyChange};
 use crate::notify::RecordingNotifier;
 use crate::service::Messaging;
 
@@ -28,4 +29,16 @@ pub(crate) async fn user(service: &TestService) -> UserId {
 pub(crate) async fn befriend(service: &TestService, a: UserId, b: UserId) {
     service.contact_request(a, b).await.unwrap();
     service.contact_accept(b, a).await.unwrap();
+}
+
+/// Lets `owner`'s agent send contact requests at once (by default they wait for the owner).
+pub(crate) async fn allow_requests(service: &TestService, owner: UserId, agent: UserId) {
+    let change = OutgoingPolicyChange {
+        requests: Some(OutgoingPolicy::Allowed),
+        ..OutgoingPolicyChange::default()
+    };
+    service
+        .set_outgoing_policy(owner, agent, change)
+        .await
+        .unwrap();
 }

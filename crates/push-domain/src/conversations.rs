@@ -11,6 +11,7 @@ use crate::model::{
     ConversationSummary, Member, Receipts, Role, direct_key,
 };
 use crate::notify::Notifier;
+use crate::outgoing::{Ask, Gate, acting_agent, gate};
 use crate::read::visible_group_positions;
 use crate::service::Messaging;
 use crate::store::{InsertOutcome, Store, Tx};
@@ -23,7 +24,21 @@ where
     N: Notifier,
 {
     /// Returns the direct conversation between two accepted contacts, creating it if needed.
+    ///
+    /// An agent opening a new one with someone other than its owner passes its owner's
+    /// outgoing policy first (spec 2026-11-09 proactive agents §3): `NotAllowedByOwner`,
+    /// or `WaitingForOwner` with the waiting action. Such a chat is `started_by_agent`.
     pub async fn open_direct(&self, me: UserId, peer: UserId) -> DomainResult<ConversationId> {
+        self.open_direct_as(me, peer, true).await
+    }
+
+    /// [`Self::open_direct`]; `gated: false` (an approved action) skips the agent's gate.
+    pub(crate) async fn open_direct_as(
+        &self,
+        me: UserId,
+        peer: UserId,
+        gated: bool,
+    ) -> DomainResult<ConversationId> {
         if me == peer {
             return Err(ValidationError::SelfTarget.into());
         }
@@ -39,6 +54,18 @@ where
         }
 
         let now = self.clock.now();
+        // Both users' locks in one call, before the gate takes the agent's again.
+        tx.lock_users(&[me, peer]).await?;
+        let by_agent = tx.agent_owner(me).await?.is_some_and(|owner| owner != peer);
+        if gated && by_agent {
+            if let Some(owner) = acting_agent(&mut tx, me).await? {
+                if let Gate::Waiting { action, new } =
+                    gate(&mut tx, me, Ask::chat(peer), now).await?
+                {
+                    return self.wait_for_owner(tx, owner, action, new).await;
+                }
+            }
+        }
         let conversation = Conversation {
             id: ConversationId::new(),
             kind: ConversationKind::Direct,
@@ -48,7 +75,7 @@ where
             last_seq: 0,
             created_at: now,
             updated_at: now,
-            started_by_agent: false,
+            started_by_agent: by_agent,
         };
         let id = conversation.id;
         if tx.insert_conversation(conversation).await? == InsertOutcome::Duplicate {
@@ -63,7 +90,6 @@ where
             return Ok(existing);
         }
 
-        tx.lock_users(&[me, peer]).await?;
         for user in [me, peer] {
             tx.insert_member(Member {
                 conversation_id: id,

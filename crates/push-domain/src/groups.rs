@@ -11,6 +11,7 @@ use crate::model::{
     ContentType, Conversation, ConversationKind, Entry, EntryKind, GroupPositions, Member, Role,
 };
 use crate::notify::{Event, Notifier};
+use crate::outgoing::{Ask, Gate, acting_agent, gate};
 use crate::read::{group_positions_before, group_receipt};
 use crate::service::{Messaging, current_member_ids};
 use crate::store::{Store, Tx};
@@ -30,11 +31,26 @@ where
     ///
     /// The log starts with a `Created` system entry at `seq` 1. Every member sees the group
     /// from there, and every active device of every member starts just before it.
+    ///
+    /// An agent's group passes its owner's outgoing policy first (spec 2026-11-09
+    /// proactive agents §3), before the members are checked: `NotAllowedByOwner`, or
+    /// `WaitingForOwner` with the waiting action. Its group is `started_by_agent`.
     pub async fn create_group(
         &self,
         creator: UserId,
         title: &str,
         members: &[UserId],
+    ) -> DomainResult<ConversationId> {
+        self.create_group_as(creator, title, members, true).await
+    }
+
+    /// [`Self::create_group`]; `gated: false` (an approved action) skips the agent's gate.
+    pub(crate) async fn create_group_as(
+        &self,
+        creator: UserId,
+        title: &str,
+        members: &[UserId],
+        gated: bool,
     ) -> DomainResult<ConversationId> {
         let title = validate_title(title)?;
         let mut others: Vec<UserId> = members
@@ -52,12 +68,27 @@ where
         if !tx.user_exists(creator).await? {
             return Err(DomainError::UnknownUser);
         }
+        let now = self.clock.now();
+        let mut users = others.clone();
+        users.push(creator);
+        let by_agent = tx.agent_owner(creator).await?.is_some();
+        if gated && by_agent {
+            if let Some(owner) = acting_agent(&mut tx, creator).await? {
+                // Every user's lock in one call, before the gate takes the agent's again.
+                // Nobody else can know the new group yet, so taking them before its
+                // conversation lock cannot form a cycle.
+                tx.lock_users(&users).await?;
+                let ask = Ask::group(title.clone(), others.clone());
+                if let Gate::Waiting { action, new } = gate(&mut tx, creator, ask, now).await? {
+                    return self.wait_for_owner(tx, owner, action, new).await;
+                }
+            }
+        }
         for other in &others {
             if !are_contacts(&mut tx, creator, *other).await? {
                 return Err(DomainError::NotContact);
             }
         }
-        let now = self.clock.now();
         let conversation = Conversation {
             id: ConversationId::new(),
             kind: ConversationKind::Group,
@@ -67,7 +98,7 @@ where
             last_seq: 0,
             created_at: now,
             updated_at: now,
-            started_by_agent: false,
+            started_by_agent: by_agent,
         };
         let id = conversation.id;
         // A group has no direct key, so the insert cannot be a duplicate.
@@ -80,8 +111,7 @@ where
         };
         tx.insert_entry(system_entry(id, seq, &created, now))
             .await?;
-        let mut users = others.clone();
-        users.push(creator);
+        // Taken already when the gate ran; taking them again changes nothing.
         tx.lock_users(&users).await?;
         join(&mut tx, id, creator, Role::Admin, seq).await?;
         for other in &others {
@@ -101,11 +131,26 @@ where
     /// A `MembersAdded` entry records the change. The added members see the log from that
     /// entry on, with nothing before it unread, and every active device of theirs starts
     /// just before it.
+    ///
+    /// An agent adding members passes its owner's outgoing policy first (spec 2026-11-09
+    /// proactive agents §3), after the admin check and before the new members are
+    /// checked: `NotAllowedByOwner`, or `WaitingForOwner` with the waiting action.
     pub async fn add_members(
         &self,
         admin: UserId,
         conversation: ConversationId,
         users: &[UserId],
+    ) -> DomainResult<()> {
+        self.add_members_as(admin, conversation, users, true).await
+    }
+
+    /// [`Self::add_members`]; `gated: false` (an approved action) skips the agent's gate.
+    pub(crate) async fn add_members_as(
+        &self,
+        admin: UserId,
+        conversation: ConversationId,
+        users: &[UserId],
+        gated: bool,
     ) -> DomainResult<()> {
         let mut change = self.begin_change(conversation).await?;
         change.require_admin(admin)?;
@@ -122,6 +167,30 @@ where
         if change.current_count() + added.len() > MAX_GROUP_MEMBERS {
             return Err(DomainError::GroupFull);
         }
+        let mut locked = added.clone();
+        if gated {
+            if let Some(owner) = acting_agent(&mut change.tx, admin).await? {
+                // Every user's lock in one call, before the gate takes the agent's again.
+                locked.push(admin);
+                change.tx.lock_users(&locked).await?;
+                let ask = Ask::invite(conversation, added.clone());
+                if let Gate::Waiting { action, new } =
+                    gate(&mut change.tx, admin, ask.clone(), change.now).await?
+                {
+                    // The change took the group's next `seq`, so it cannot commit: the
+                    // gate runs again on a transaction of its own (and stores a new
+                    // action there). Should the policy have changed meanwhile, retry.
+                    change.cancel().await?;
+                    if !new {
+                        return Err(DomainError::WaitingForOwner {
+                            action_id: action.action_id,
+                        });
+                    }
+                    self.gate_alone(admin, owner, ask).await?;
+                    return Err(DomainError::Conflict);
+                }
+            }
+        }
         for user in &added {
             if !are_contacts(&mut change.tx, admin, *user).await? {
                 return Err(DomainError::NotContact);
@@ -131,7 +200,8 @@ where
             actor: admin,
             users: added.clone(),
         };
-        change.tx.lock_users(&added).await?;
+        // Taken already when the gate ran; taking them again changes nothing.
+        change.tx.lock_users(&locked).await?;
         let seq = change.append(&event).await?;
         for user in added {
             join(&mut change.tx, conversation, user, Role::Member, seq).await?;

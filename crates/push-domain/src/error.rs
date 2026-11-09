@@ -1,3 +1,5 @@
+use uuid::Uuid;
+
 use crate::templates::TemplateError;
 use crate::validation::ValidationError;
 
@@ -75,13 +77,25 @@ pub enum DomainError {
     /// An agent tried to accept, decline or block a request that waits for its owner.
     #[error("only the agent's owner decides on contact requests")]
     OwnerDecides,
-    /// An agent's limits on contact requests (spec 2026-11-06 agent connections §4).
-    #[error("too many contact requests; retry in {retry_after_s} s")]
+    /// An agent's limits on contact requests (spec 2026-11-06 agent connections §4) and
+    /// on its other actions (spec 2026-11-09 proactive agents §5).
+    #[error("too many requests; retry in {retry_after_s} s")]
     RateLimited { retry_after_s: u32 },
     /// Not an agent of this owner (unknown, another owner's, not an agent, or deleted):
     /// one answer for all, so it reveals nothing.
     #[error("agent not found")]
     AgentNotFound,
+    /// The action waits for the agent's owner (spec 2026-11-09 proactive agents, D4): the
+    /// owner's outgoing policy for it is `ask`. Asked again while it waits, the same id.
+    #[error("the action waits for the owner's approval")]
+    WaitingForOwner { action_id: Uuid },
+    /// The owner's outgoing policy for the action is `off` (D3).
+    #[error("the owner does not allow this action")]
+    NotAllowedByOwner,
+    /// No waiting action of this agent with this id: unknown, another agent's, or
+    /// already decided.
+    #[error("outgoing action not found")]
+    OutgoingNotFound,
     #[error("a concurrent change conflicted; retry the operation")]
     Conflict,
     /// A revocation or password reset was stored, but its kick could not be delivered to

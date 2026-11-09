@@ -2997,6 +2997,7 @@ dependencies = [
  "libtest-mimic",
  "push-domain",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

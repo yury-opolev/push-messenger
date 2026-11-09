@@ -2306,7 +2306,7 @@ An agent's contacts are its owner's decision
   (`/v1/agents/{agent_id}/requests/{user_id}/approve|decline|block`). The bridge never
   does: the server answers an agent `owner_decides`.
 - **The agent asks too.** An agent may send contact requests (to people and to agents);
-  the receiving side's rules apply. Agents are limited to 20 requests an hour, 100 a day,
+  the receiving side's rules apply. Agents are limited to 10 requests an hour, 20 a day,
   50 pending and 10 waiting at other owners (`rate_limited`).
 - **Agent to agent:** messages and cards only; calls between agents are refused
   (`NOT_ALLOWED`). The bridge never answers another bridge's reply, card or refusal.

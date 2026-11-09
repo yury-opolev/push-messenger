@@ -4,6 +4,7 @@ use crate::error::{DomainError, DomainResult};
 use crate::ids::UserId;
 use crate::model::{ContactState, ContactSummary};
 use crate::notify::{Event, Notifier};
+use crate::outgoing::{Ask, Gate, acting_agent, gate};
 use crate::presence::PresenceView;
 use crate::service::Messaging;
 use crate::store::{Store, Tx};
@@ -55,7 +56,23 @@ where
     /// `RequestedIn` and the owner an [`Event::AgentContact`]), or refused (the requester's
     /// row alone, released later without an event, as a decline looks). A request from an
     /// agent passes the agent's limits first (`RateLimited`).
+    ///
+    /// An agent's new request (its row toward `to` is absent or `RequestedIn`; `to` is not
+    /// its owner) passes its owner's outgoing policy first (spec 2026-11-09 proactive
+    /// agents §3): `NotAllowedByOwner`, or `WaitingForOwner` with the waiting action,
+    /// before anything that depends on `to`.
     pub async fn contact_request(&self, from: UserId, to: UserId) -> DomainResult<ContactState> {
+        self.contact_request_as(from, to, true).await
+    }
+
+    /// [`Self::contact_request`]; `gated: false` (an approved action) skips the agent's
+    /// gate and limits.
+    pub(crate) async fn contact_request_as(
+        &self,
+        from: UserId,
+        to: UserId,
+        gated: bool,
+    ) -> DomainResult<ContactState> {
         if from == to {
             return Err(ValidationError::SelfTarget.into());
         }
@@ -68,8 +85,26 @@ where
         if known {
             tx.lock_contact_pair(from, to).await?;
         }
-        if tx.agent_owner(from).await?.is_some() {
-            check_agent_limits(&mut tx, from, to, now).await?;
+        let owner = match gated {
+            true => tx.agent_owner(from).await?,
+            false => None,
+        };
+        if let Some(owner) = owner.filter(|owner| *owner != to) {
+            // The agent's own row only: nothing here depends on `to`.
+            let mine = match known {
+                true => tx.get_contact(from, to).await?,
+                false => None,
+            };
+            let new = matches!(mine, None | Some(ContactState::RequestedIn));
+            if new && acting_agent(&mut tx, from).await?.is_some() {
+                if let Gate::Waiting { action, new } =
+                    gate(&mut tx, from, Ask::request(to), now).await?
+                {
+                    return self.wait_for_owner(tx, owner, action, new).await;
+                }
+            } else {
+                check_agent_limits(&mut tx, from, to, now).await?;
+            }
         }
         if !known {
             tx.commit().await?;

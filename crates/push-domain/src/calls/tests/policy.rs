@@ -2,7 +2,7 @@
 
 use crate::error::DomainError;
 use crate::ids::UserId;
-use crate::testing::{TestService, befriend, service, user};
+use crate::testing::{TestService, allow_requests, befriend, service, user};
 use crate::validation::ValidationError;
 
 async fn may_call(service: &TestService, caller: UserId, callee: UserId) -> bool {
@@ -79,6 +79,7 @@ async fn agent_calls_only_its_owner() {
     let (service, _) = service();
     let (owner, agent) = (UserId::new(), UserId::new());
     service.enroll_agent(owner, agent).await.unwrap();
+    allow_requests(&service, owner, agent).await;
     let friend = user(&service).await;
     befriend(&service, agent, friend).await;
     let other_owner = user(&service).await;
@@ -98,6 +99,7 @@ async fn only_the_owner_calls_the_agent() {
     let (service, _) = service();
     let (owner, agent) = (UserId::new(), UserId::new());
     service.enroll_agent(owner, agent).await.unwrap();
+    allow_requests(&service, owner, agent).await;
     let friend = user(&service).await;
     // Agents do not accept requests themselves: the agent asks, the friend accepts.
     befriend(&service, agent, friend).await;
@@ -135,6 +137,7 @@ async fn agents_never_call_each_other() {
     let (owner, agent, sibling) = (UserId::new(), UserId::new(), UserId::new());
     service.enroll_agent(owner, agent).await.unwrap();
     service.enroll_agent(owner, sibling).await.unwrap();
+    allow_requests(&service, owner, agent).await;
     let other_owner = user(&service).await;
     let stranger_agent = UserId::new();
     service

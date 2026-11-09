@@ -78,6 +78,11 @@ pub(crate) fn domain_error(error: DomainError) -> Status {
         DomainError::OwnerDecides => (Code::FailedPrecondition, ErrorCode::OwnerDecides),
         DomainError::RateLimited { .. } => (Code::ResourceExhausted, ErrorCode::RateLimited),
         DomainError::AgentNotFound => (Code::NotFound, ErrorCode::UserNotFound),
+        // Interim mapping until the protocol has WAITING_FOR_OWNER (33) and
+        // NOT_ALLOWED_BY_OWNER (34) (spec 2026-11-09 proactive agents §6.2).
+        DomainError::WaitingForOwner { .. } => (Code::FailedPrecondition, ErrorCode::NotAllowed),
+        DomainError::NotAllowedByOwner => (Code::FailedPrecondition, ErrorCode::NotAllowed),
+        DomainError::OutgoingNotFound => (Code::NotFound, ErrorCode::UserNotFound),
         DomainError::Conflict => (Code::Aborted, ErrorCode::Unavailable),
         DomainError::KickFailed(_) => (Code::Unavailable, ErrorCode::Unavailable),
         DomainError::Store(_) => (Code::Unavailable, ErrorCode::Unavailable),
