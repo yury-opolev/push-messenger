@@ -12,7 +12,15 @@ all-features = false
 # and cargo-deny checks the crates actually built.)
 unmaintained = "workspace"
 yanked = "deny"
-ignore = []
+ignore = [
+    # SQLite before 3.54.0 can return stale page-cache bytes when it opens a database
+    # together with a crafted `-wal` file of another page size. push-sdk's bundled SQLite
+    # (rusqlite 0.32) opens only its own store in the app's private data folder, which a
+    # less trusted party cannot write. The fixed libsqlite3-sys 0.39 needs Rust 1.88
+    # (rusqlite 0.41: 1.89), above this workspace's MSRV 1.85; drop this entry when the
+    # MSRV moves.
+    { id = "RUSTSEC-2026-0459", reason = "push-sdk opens only its own private database; the fix needs Rust 1.89 (MSRV 1.85)" },
+]
 
 [licenses]
 # The workspace is MIT; dependencies must be under a permissive licence.
