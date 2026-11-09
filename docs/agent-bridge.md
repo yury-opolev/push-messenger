@@ -2310,7 +2310,9 @@ a folder of its own, and a `key.name` of its own, as for
 | anything else | replies `agent.reply@2` (Markdown) "echo: <text>", with activity `working` / `echoing`; a text over 4,000 characters continues in further replies, as every turn does |
 
 **Action commands** (the owner's chat only, bare words like `ask`; the keyword in any
-case; a contact's text is only echoed). The owner's `/help` lists them.
+case; a contact's text is only echoed). An owner's text whose first word is a keyword is
+always a command: a malformed one answers its usage instead of being echoed. The owner's
+`/help` lists them.
 
 | Command | Action |
 |---|---|
@@ -2343,7 +2345,8 @@ created (group:<id>)"), `waiting for owner
   echo agent used to answer every accepted contact; it now follows the policy, whose
   default is `owner_only`: set `contacts` to keep the old behaviour (`owner_agents` for
   the owner's own agents only). The echo backend
-  opts in with `Backend::accepts_contacts` (Coda does not: it stays owner-only). The
+  opts in with `Backend::accepts_contacts` (Coda does too while its
+  [tools](#24-coda-tools) are on; without them it stays owner-only). The
   relationship is the server's (`list_contacts`, kept for 60 s and updated by contact
   events): requests either way, blocked users, strangers and contacts the policy keeps
   out get "This agent is private."
@@ -2411,6 +2414,21 @@ An agent's contacts are its owner's decision
   the chat: the bridge says it to each contact once per session and in their `/help`; the
   owner's `/help` explains the above. Clients show the same notice from the agent's
   profile (`owner_display_name`, `owner_handle`).
+- **What the agent starts** is its owner's decision too
+  ([design](superpowers/specs/2026-11-09-proactive-agents.md) §3): the **outgoing
+  policy**, per kind, `allowed`, `ask` or `off` (`GET|PUT
+  /v1/agents/{agent_id}/outgoing-policy`; defaults `requests` `ask`, `chats` `ask`,
+  `groups` `off`, `calls` `off`), enforced by the server whoever drives the agent. `off`
+  answers `not_allowed_by_owner`; `ask` holds the action for the owner
+  (`waiting_for_owner` with its id; `GET /v1/agents/{agent_id}/outgoing`,
+  `POST …/outgoing/{action_id}/approve|decline`; an approval carries it out as the agent,
+  an action not decided in 24 hours expires). Messages and calls to the owner and messages
+  in conversations that already exist are never actions. Limits per agent: 10 contact
+  requests an hour and 20 a day, 50 new chats, 10 calls, 5 groups and 20 added members a
+  day, 20 waiting actions. **Groups** also need the gateway to serve them: the chart's
+  `gateway.groups` is `false` by default (`PUSH_GROUPS=0`), and then `create_group` and
+  `invite` answer `unavailable` ("groups are not enabled on this server") whatever the
+  policy.
 
 
 ## 21. Bridge actions

@@ -487,9 +487,14 @@ The call's `started_by_agent` travels in the Redis call record (`by_agent`, serd
 - Agent-to-agent calls; timers or triggers for agents to wake themselves; group policies
   beyond "invite accepted contacts" (out of scope by request).
 - Node and C bindings of the new owner endpoints and agent requests (the Rust SDK has them;
-  the bindings gain the new fields only where they share types).
+  the bindings gain the two events only: `agentSettingsChanged`, `outgoingActionChanged`).
+  The bindings' JSON does not carry `actionId` on errors nor `startedByAgent` on
+  conversations and call history yet.
 - Persisting the loop guard across bridge restarts.
 - Per-owner configurable limits.
+- Group conversations in apps: the gateway serves groups only with `PUSH_GROUPS=1` (chart
+  `gateway.groups`, `false` by default); until then agents' `create_group` and `invite`
+  answer `unavailable`.
 
 ## 14. Acceptance
 
@@ -506,3 +511,70 @@ Two Echo bridges, Alpha and Beta, of one owner, on the whole stack:
 5. With chats `off`, `send @someone` answers `not allowed by owner`; with groups `off`,
    `group` likewise; a declined action reaches Alpha as `owner_declined`.
 6. The security log has the policy changes and approve/decline lines without content.
+
+## 15. As built
+
+Deviations from the design and details settled during the implementation (PRs #85–#87 and
+the bridge, Coda tools and acceptance PRs):
+
+- **Server.** Approving an action runs in one transaction: the operation's locks in the
+  documented order with the agent's user lock among them, a re-check that the agent is not
+  deleted and the action still waits, then `approved` (with its conversation) or `failed`
+  with the rules' code. A refusal rolls back to a savepoint, so nothing it wrote is kept
+  (not even an invite's seq); conflicts and storage errors roll everything back and leave
+  the action waiting. An approved contact request still meets the caps on pending requests
+  (`failed` with `RATE_LIMITED`) without counting against the hourly and daily limits again.
+  The gate, the approval, the decline and settings changes re-check the agent's deletion
+  under its user lock.
+- **Calls.** A resent agent `CallInvite` (the same `call_id`) is not gated twice. The call
+  record's `by_agent` marks both history rows `started_by_agent`.
+- **Owner routes.** Profiles in an action go through the agent's visibility: a target the
+  agent cannot see yet (a contact request to someone who is not its contact) is answered
+  by id only (`state: "hidden"`), as in the other owner routes. An approval whose profiles
+  cannot be read is still answered (`200`, users by id only) and audited: the action is
+  carried out already. `GET …/outgoing` lists the waiting actions only; the agent's
+  `ListOutgoingActions` also lists those resolved in the last 24 hours. Audit lines carry
+  `action_id`, `kind` and, for the outgoing policy, `policy` as
+  `requests:ask chats:ask groups:off calls:off`.
+- **push-sdk.** The owner's list of an agent's waiting actions is `agent_outgoing` (the
+  design's `outgoing_actions(agent)`; the agent's own list is `outgoing_actions()`).
+  `CallErrorCode::WaitingForOwner`
+  is a plain variant; the action id comes with the call error (`SdkError::action_id()`).
+  `create_group` answers the group's id, never an error once the group exists.
+- **Groups at the gateway.** The gateway refuses group-management requests with
+  `NOT_AVAILABLE` unless `PUSH_GROUPS=1` (chart `gateway.groups`, `false` by default), before
+  message-svc's gate: with groups off, agents' `create_group` and `invite` answer
+  `unavailable` ("groups are not enabled on this server") whatever the policy.
+- **Bridge config.** The loop guard's key is `loop_guard_turns` (snake case, like every
+  bridge key; not `loopGuardTurns`); `tools` (default `true`) turns the Coda tools off.
+- **Bridge actions.** Bridge actions never open chats as a side effect: only `send_message`
+  to a handle sends `OpenDirect` (the gated `chats` action), and calls never open chats.
+  Texts held for a waiting chat are a list (`texts`, every `send_message` to the same
+  waiting chat is kept and sent in order on approval; older `state.json` files with `text`
+  still load). An approved call is dialed only within 15 minutes of the approval (the
+  server's grant), else dropped with a note. Every outcome (approved, declined, expired,
+  failed, and an approved call that cannot be placed) leaves a note in the owner's chat.
+  Waiting actions are reconciled with `ListOutgoingActions` at start-up and after every
+  reconnect; kept items older than 48 hours are dropped.
+- **Calls to contacts.** The action answers `done` 3 seconds after the invite when the
+  server did not refuse it (or at pickup, if sooner): the server answers invites only when
+  it refuses them. The contact's words are posted as agent replies titled "🎤 voice" (the
+  `agent.reply` template allows only owner and agent speakers, so not as the contact), in
+  their direct chat, or in the owner's chat ("📞 @bob 🎤 voice") when there is no direct
+  chat with them.
+- **Echo.** An owner's text whose first word is a command keyword is always a command (a
+  malformed one answers its usage, it is not echoed).
+- **Coda.** Coda takes contacts' texts only while the running Coda was started with the
+  tools (its `coda-mcp/.mcp.json` was written for this start). A contact's text is fenced
+  between per-message nonce markers (`<<<message-<nonce>` … `message-<nonce>>>>`) after a
+  header naming the sender, so a text cannot imitate the frame. A user `.mcp.json` with a
+  UTF-8 byte order mark is read as Coda reads it.
+- **Acceptance.** `crates/push-smoke/tests/proactive_agents.rs` runs §14 on the whole
+  stack with two agents of one owner (and a person who is Alpha's contact) as raw socket
+  clients: the request and chat waiting, approved and carried out, `started_by_agent` in
+  the owner view, `ListConversations` and call history, the inbound policy reaching the
+  agent (frame 55, `GetAgentSettings`), `off` for chats and groups (`PUSH_GROUPS=1` there),
+  a declined group, a call approved once and rung, `not_found` for every non-owner, and the
+  security log without content. The bridge's side (Echo commands, held texts, the inbound
+  policy, the loop guard between two Echo bridges, calls to contacts, the Coda tools) is
+  covered by push-bridge's tests, not by two bridge processes on the whole stack.

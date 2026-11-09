@@ -685,6 +685,17 @@ relay nor a redelivered event closes a session that signed in after the reset.
   request limits (`RATE_LIMITED`). The owner acts and reads (read only) through
   `/v1/agents/{agent_id}/…` on auth-svc; everyone else gets `not_found`. Deleting an agent
   ends its relationships.
+- **Proactive agents** ([design](2026-11-09-proactive-agents.md), 2026-11-09). What an
+  owned agent starts — contact requests, new direct chats (not with its owner), groups and
+  invites, calls to people who are its contacts — passes its owner's **outgoing policy**
+  per kind (`allowed`, `ask`, `off`; defaults `ask`, `ask`, `off`, `off`), enforced by
+  message-svc before any target-dependent rule: `off` answers `NOT_ALLOWED_BY_OWNER`, `ask`
+  stores a waiting action and answers `WAITING_FOR_OWNER` with its `action_id`; the owner
+  approves (carried out as the agent; a call becomes a one-time permission for 15
+  minutes) or declines it, and it expires after 24 hours. Per-agent daily limits apply.
+  The owner also sets the **inbound policy** (`owner_only`, `owner_agents`, `contacts`),
+  which the bridge enforces. Chats, groups and calls an agent starts are marked
+  `started_by_agent`.
 
 ### 5.6 Passwords and rate limits
 
@@ -712,7 +723,9 @@ Implementation notes (push-auth, Plan 5A):
   The [owned-agent extension](2026-10-19-entra-sign-in-design.md#4-api) adds
   `POST|GET /v1/agents`, `PATCH|DELETE /v1/agents/{id}`, the owner routes
   `/v1/agents/{id}/policy|requests|contacts|conversations|calls`
-  ([agent connections](2026-11-06-agent-connections-and-owner-view.md#51-http-auth-svc-owner-only)) and opt-in
+  ([agent connections](2026-11-06-agent-connections-and-owner-view.md#51-http-auth-svc-owner-only)),
+  `/v1/agents/{id}/outgoing-policy|inbound-policy|outgoing`
+  ([proactive agents](2026-11-09-proactive-agents.md#61-http-auth-svc-owner-only)) and opt-in
   `POST /v1/auth/entra-app` with single-use owner-consent enrollment codes. Agents are
   separate authors with ordinary limits, never automatically provisioned by sign-in;
   deletion disables the agent, releases its app identity for a new enrollment and relays
@@ -882,6 +895,7 @@ Request frames carry a client-chosen `request_id`, echoed in the response:
 | AddMembers / RemoveMember / LeaveGroup / RenameGroup | `conversation_id`, plus `user_ids[]` / `user_id` / — / `title` |
 | SetRole | `conversation_id, user_id, role` |
 | GetPresence / SetPresenceSharing | `user_ids[]` / `share` (optional) ([activity-presence.md](../../activity-presence.md)) |
+| GetAgentSettings (24) / ListOutgoingActions (25) | — ; an owned agent's own settings / its own actions (waiting, and resolved in the last 24 h); `NOT_ALLOWED` for people ([proactive agents](2026-11-09-proactive-agents.md#62-websocket-protocol)) |
 
 ### 7.2 Server → client
 
@@ -896,9 +910,11 @@ Request frames carry a client-chosen `request_id`, echoed in the response:
 | ActivityEvent / PresenceEvent | another member's activity / a contact's presence ([activity-presence.md](../../activity-presence.md)) |
 | AgentContactEvent | `agent_user_id, user_id, state` — to an agent's owner: the agent's relationship with `user_id` changed; `REQUESTED_IN` = a request waits for the owner ([agent connections](2026-11-06-agent-connections-and-owner-view.md)) |
 | ConversationFlags | `conversation_id, hidden, peer_deleted` — the user's flags of a conversation changed (hidden or unhidden on any device, un-hidden by a new message, or the peer deleted); `ListConversations` gives the same flags (`ConversationSummary.hidden`, `peer_deleted`) |
+| AgentSettingsEvent (55) | `settings` (`inbound, requests, chats, groups, calls`) — to an owned agent: its owner changed its inbound or outgoing policy ([proactive agents](2026-11-09-proactive-agents.md)) |
+| OutgoingActionEvent (56) | `action` (`action_id, agent_user_id, kind, target_user_id, conversation_id, title, member_ids, state, error, created_at, resolved_at`) — to the owner: a new waiting action and every resolution; to the agent: every resolution (`EXPIRED` is sent to owners only; the agent hears `OWNER_DECLINED`). `ConversationSummary.started_by_agent` (14) marks chats and groups an agent started |
 | Response | `request_id` and the request-specific result |
 | AuthExpiring | `expires_in_s` |
-| Error | `code, message, retryable`, plus `client_msg_id` or `request_id`, and `retry_after_s` when rate limited |
+| Error | `code, message, retryable`, plus `client_msg_id` or `request_id`, `retry_after_s` when rate limited, and `action_id` (7) with `WAITING_FOR_OWNER` (33); `NOT_ALLOWED_BY_OWNER` is 34 ([proactive agents](2026-11-09-proactive-agents.md#62-websocket-protocol)) |
 | Pong | — |
 
 Receipts and read positions are signals published after each commit. Two acks committed
