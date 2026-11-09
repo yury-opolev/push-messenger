@@ -315,8 +315,9 @@ impl Client {
     }
 
     /// Creates a group with the user as its admin and `members` (accepted contacts, at
-    /// most 99) in it; `title` is 1 to 100 characters after trimming. Then lists the
-    /// conversations: the group as the server lists it.
+    /// most 99) in it; `title` is 1 to 100 characters after trimming. Answers the group's
+    /// id ([`Client::list_conversations`] gives the rest). Only [`SdkError::Timeout`] may
+    /// mean the group exists: creating again makes another group.
     ///
     /// An agent passes its owner's outgoing policy for groups first:
     /// `waiting_for_owner` (the error's [`SdkError::action_id`] names the action; once the
@@ -326,7 +327,7 @@ impl Client {
         &self,
         title: &str,
         members: Vec<UserId>,
-    ) -> Result<Conversation, SdkError> {
+    ) -> Result<ConversationId, SdkError> {
         let body = request::Body::CreateGroup(CreateGroup {
             title: title.to_owned(),
             member_ids: members.iter().map(|member| bytes(member.0)).collect(),
@@ -334,13 +335,9 @@ impl Client {
         let response::Body::GroupCreated(created) = self.request(body).await? else {
             return Err(unexpected());
         };
-        let id =
-            ConversationId(Uuid::from_slice(&created.conversation_id).map_err(|_| unexpected())?);
-        self.list_conversations()
-            .await?
-            .into_iter()
-            .find(|conversation| conversation.id == id)
-            .ok_or_else(unexpected)
+        Uuid::from_slice(&created.conversation_id)
+            .map(ConversationId)
+            .map_err(|_| unexpected())
     }
 
     /// Adds `users` (accepted contacts of the user) to a group the user is an admin of;
@@ -594,7 +591,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_group_is_created_then_listed_and_members_are_added() {
+    async fn a_group_is_created_and_members_are_added() {
         let mut f = Fixture::new().await;
         f.client.connect().unwrap();
         let mut socket = f.ready().await;
@@ -617,32 +614,7 @@ mod tests {
             }),
         )
         .await;
-        let listing = next_request(&mut socket).await;
-        assert!(matches!(
-            listing.body,
-            Some(request::Body::ListConversations(_))
-        ));
-        let summary = v1::ConversationSummary {
-            conversation_id: bytes(group.0),
-            kind: v1::ConversationKind::Group.into(),
-            title: Some("plans".to_owned()),
-            members: vec![bytes(f.auth.user.0), bytes(one.0), bytes(two.0)],
-            started_by_agent: true,
-            ..Default::default()
-        };
-        answer(
-            &mut socket,
-            listing.request_id,
-            response::Body::Conversations(v1::ConversationList {
-                conversations: vec![summary],
-            }),
-        )
-        .await;
-        let created = creating.await.unwrap().unwrap();
-        assert_eq!(created.id, group);
-        assert_eq!(created.kind, crate::ConversationKind::Group);
-        assert_eq!(created.title.as_deref(), Some("plans"));
-        assert!(created.started_by_agent);
+        assert_eq!(creating.await.unwrap().unwrap(), group);
 
         let client = f.client.clone();
         let adding = tokio::spawn(async move { client.add_members(group, vec![two]).await });
