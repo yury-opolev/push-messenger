@@ -379,11 +379,10 @@ impl<M: Messenger> Core<M> {
     /// meant for it: it goes to the agent and the card stays open.
     async fn on_transcript(&mut self, text: String, started: Instant) {
         tracing::info!(event = "voice_transcript", chars = text.chars().count());
-        if let Some(Purpose::Contact {
-            peer, conversation, ..
-        }) = self.call.as_ref().and_then(|call| call.purpose.clone())
+        if let Some(Purpose::Contact { peer, chat, .. }) =
+            self.call.as_ref().and_then(|call| call.purpose.clone())
         {
-            return self.contact_said(peer, conversation, text).await;
+            return self.contact_said(peer, chat, text).await;
         }
         self.post_transcript(&text);
         if let Some(request) = self.open.first().filter(|request| started > request.opened) {

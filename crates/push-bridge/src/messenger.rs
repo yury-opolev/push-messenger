@@ -26,7 +26,8 @@ pub trait Messenger: Send + Sync + 'static {
     fn me(&self) -> UserId;
     /// The agent's owner, from its own profile (`owner_user_id`).
     async fn owner(&self) -> Result<UserId, SdkError>;
-    /// The direct conversation with `peer`.
+    /// The direct conversation with `peer`, opened (OpenDirect) when new: the bridge
+    /// asks it for the owner only (never gated); see [`Messenger::open_direct`].
     async fn direct(&self, peer: UserId) -> Result<ConversationId, SdkError>;
     /// Queues a RICH body; the server may still refuse it (`Event::SendFailed`).
     fn send_rich(&self, conversation: ConversationId, body: &str) -> Result<ClientMsgId, SdkError>;
@@ -78,6 +79,19 @@ pub trait Messenger: Send + Sync + 'static {
     /// outgoing policy for chats applies when it is new).
     async fn open_direct(&self, peer: UserId) -> Result<ConversationId, SdkError> {
         self.direct(peer).await
+    }
+    /// The direct conversation with `peer` if there is one; never opens it (opening a
+    /// chat is a gated action, only `send_message` does that).
+    async fn existing_direct(&self, _peer: UserId) -> Result<Option<ConversationId>, SdkError> {
+        Err(not_available("conversations"))
+    }
+    /// Whether `conversation` is the direct conversation with `peer`; never opens one.
+    async fn is_direct(
+        &self,
+        conversation: ConversationId,
+        peer: UserId,
+    ) -> Result<bool, SdkError> {
+        Ok(self.existing_direct(peer).await? == Some(conversation))
     }
     /// Whether the agent is a member of the group `group` (`false` when unknown).
     async fn is_group_member(&self, _group: ConversationId) -> Result<bool, SdkError> {
@@ -293,6 +307,39 @@ impl Messenger for SdkMessenger {
         ))
     }
 
+    async fn existing_direct(&self, peer: UserId) -> Result<Option<ConversationId>, SdkError> {
+        let find = |conversations: Vec<push_sdk::Conversation>| {
+            conversations
+                .into_iter()
+                .find(|conversation| {
+                    conversation.kind == ConversationKind::Direct && conversation.peer == Some(peer)
+                })
+                .map(|conversation| conversation.id)
+        };
+        if let Some(found) = find(self.client.conversations()?) {
+            return Ok(Some(found));
+        }
+        // Not known on this device yet (opened since the last listing).
+        Ok(find(self.client.list_conversations().await?))
+    }
+
+    async fn is_direct(
+        &self,
+        conversation: ConversationId,
+        peer: UserId,
+    ) -> Result<bool, SdkError> {
+        let with_peer = |conversation: &push_sdk::Conversation| {
+            conversation.kind == ConversationKind::Direct && conversation.peer == Some(peer)
+        };
+        if let Some(known) = self.client.conversation(conversation)? {
+            return Ok(with_peer(&known));
+        }
+        let listed = self.client.list_conversations().await?;
+        Ok(listed
+            .iter()
+            .any(|known| known.id == conversation && with_peer(known)))
+    }
+
     async fn create_group(
         &self,
         title: &str,
@@ -386,6 +433,9 @@ struct Recorded {
     failures: HashMap<&'static str, VecDeque<SdkError>>,
     /// The inbound policy `agent_settings` answers (`None`: the default, owner only).
     inbound: Option<InboundPolicy>,
+    /// The owner's `chats` policy is not `allowed`: opening a direct chat that does not
+    /// exist yet (with anyone but the owner) fails with this error.
+    chats_gate: Option<SdkError>,
 }
 
 /// The agent's settings with `inbound`, the outgoing policies at the server's defaults.
@@ -493,6 +543,29 @@ impl TestMessenger {
             .entry(method)
             .or_default()
             .push_back(error);
+    }
+
+    /// As the server with the owner's `chats` policy at `ask` or `off`: from now on,
+    /// opening a direct chat that does not exist yet fails with `error` (e.g.
+    /// `waiting_for_owner`, which also leaves a waiting action for the owner).
+    pub fn gate_chats(&self, error: SdkError) {
+        self.lock().chats_gate = Some(error);
+    }
+
+    /// Whether a direct chat with `peer` exists (without creating it).
+    pub fn has_direct(&self, peer: UserId) -> bool {
+        self.lock().conversations.contains_key(&peer)
+    }
+
+    /// The peers the agent asked the server to open a direct chat with, in order.
+    pub fn opened_directs(&self) -> Vec<UserId> {
+        self.calls()
+            .into_iter()
+            .filter_map(|call| match call {
+                Call::OpenDirect { peer } => Some(peer),
+                _ => None,
+            })
+            .collect()
     }
 
     /// What `outgoing_actions` answers from now on.
@@ -740,7 +813,23 @@ impl Messenger for TestMessenger {
     }
 
     async fn direct(&self, peer: UserId) -> Result<ConversationId, SdkError> {
-        Ok(self.conversation_with(peer))
+        // The same OpenDirect as the agent's actions: only the owner is never gated.
+        if peer == self.owner {
+            return Ok(self.conversation_with(peer));
+        }
+        self.open_direct(peer).await
+    }
+
+    async fn existing_direct(&self, peer: UserId) -> Result<Option<ConversationId>, SdkError> {
+        Ok(self.lock().conversations.get(&peer).copied())
+    }
+
+    async fn is_direct(
+        &self,
+        conversation: ConversationId,
+        peer: UserId,
+    ) -> Result<bool, SdkError> {
+        Ok(self.lock().conversations.get(&peer) == Some(&conversation))
     }
 
     fn send_rich(&self, conversation: ConversationId, body: &str) -> Result<ClientMsgId, SdkError> {
@@ -865,6 +954,16 @@ impl Messenger for TestMessenger {
         self.record(Call::OpenDirect { peer });
         if let Some(error) = self.failure("open_direct") {
             return Err(error);
+        }
+        {
+            let recorded = self.lock();
+            if let Some(error) = recorded
+                .chats_gate
+                .as_ref()
+                .filter(|_| !recorded.conversations.contains_key(&peer))
+            {
+                return Err(error.clone());
+            }
         }
         Ok(self.conversation_with(peer))
     }

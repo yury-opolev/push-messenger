@@ -7,13 +7,11 @@
 //! Logs carry event names, reasons and codes only: never a card's text or a message.
 
 use push_bridge_control::{CallDirection, CallInfo, CardState, NO_CALL};
-use push_sdk::{
-    CallEndReason, CallEvent, CallId, ClientMsgId, ConnectionState, ConversationId, OpenCard,
-    UserId,
-};
+use push_sdk::{CallEndReason, CallEvent, CallId, ClientMsgId, ConnectionState, OpenCard, UserId};
 use serde_json::{Map, json};
 use tokio::time::{Duration, Instant};
 
+use super::contacts::ContactChat;
 use super::voice::ActiveCall;
 use super::{Core, Internal};
 use crate::actions::ActionResult;
@@ -46,12 +44,12 @@ pub(super) enum Purpose {
     Urgent { label: String, text: String },
     /// The backend's `call` action, with what to say on pickup.
     Agent { reason: Option<String> },
-    /// The backend's `call` action to a person who is the agent's contact (their direct
-    /// chat gets the call's transcript), with what to say on pickup.
+    /// The backend's `call` action to a person who is the agent's contact (`chat` gets
+    /// the call's transcript), with what to say on pickup.
     Contact {
         peer: UserId,
         handle: String,
-        conversation: ConversationId,
+        chat: ContactChat,
         reason: Option<String>,
     },
 }

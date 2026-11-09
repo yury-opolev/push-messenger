@@ -325,7 +325,7 @@ enum Internal {
     Dialed { result: Result<Line, SdkError> },
     /// The backend is done with a contact's text.
     ContactPrompted {
-        conversation: ConversationId,
+        chat: contacts::ContactChat,
         result: Result<(), BackendError>,
     },
     /// The server answered the backend's action `kind`; the core finishes it.
@@ -719,10 +719,7 @@ impl<M: Messenger> Core<M> {
             Internal::Answered { call_id, result } => self.answered(call_id, result).await,
             Internal::Voice { call_id, event } => self.on_voice(call_id, event).await,
             Internal::Dialed { result } => self.dialed(result).await,
-            Internal::ContactPrompted {
-                conversation,
-                result,
-            } => self.contact_prompted(conversation, result).await,
+            Internal::ContactPrompted { chat, result } => self.contact_prompted(chat, result).await,
             Internal::Acted { kind, reply, acted } => self.acted(kind, reply, acted).await,
             Internal::ApprovedChat { kind, result } => self.approved_send(kind, result),
             Internal::Reconciled { result } => self.reconciled(result).await,

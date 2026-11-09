@@ -11,20 +11,23 @@
 //!
 //! During the call the person's speech goes to the backend as that contact's message
 //! (`contact_prompt`) and is posted in their direct chat; the backend's replies to them are
-//! spoken and posted. The inbound policy does not apply: the agent itself called them.
+//! spoken and posted. A call never opens a chat (that is a gated action of its own): with
+//! no direct chat yet, both are posted in the owner's chat, labelled with their handle.
+//! An approval lets one call through within 15 minutes; one settled later is not dialed.
+//! The inbound policy does not apply: the agent itself called them.
 //! The owner's session is never prompted from this call and its turns are not spoken.
 //!
 //! Logs carry the action's kind and result code only: never a handle or a reason.
 
-use push_sdk::{CallEndReason, ConversationId, SdkError, UserId};
+use push_sdk::{CallEndReason, SdkError, UserId};
 use tokio::sync::oneshot;
 use tokio::time::{Duration, Instant};
 
 use super::Core;
 use super::calling::Purpose;
+use super::contacts::ContactChat;
 use crate::actions::{ActionCode, ActionResult};
 use crate::messenger::{Messenger, Peer};
-use crate::render::reply_bodies;
 use crate::state::PendingKind;
 use crate::voice::speech;
 
@@ -88,17 +91,18 @@ impl<M: Messenger> Core<M> {
         if let Some(result) = refused {
             return self.tell_caller(call, result);
         }
-        let Some(conversation) = self.contact_conversation(call.peer).await else {
-            let result = ActionResult::failed(format!(
-                "the chat with @{} could not be opened",
-                call.handle
-            ));
-            return self.tell_caller(call, result);
+        // Never opened for a call: without a chat of their own, the call is posted in
+        // the owner's chat.
+        let chat = match self.known_direct(call.peer).await {
+            Some(conversation) => ContactChat::Direct(conversation),
+            None => ContactChat::Owner {
+                handle: call.handle.clone(),
+            },
         };
         let purpose = Purpose::Contact {
             peer: call.peer,
             handle: call.handle.clone(),
-            conversation,
+            chat,
             reason: call.reason.clone(),
         };
         self.contact_call = Some(call);
@@ -120,6 +124,20 @@ impl<M: Messenger> Core<M> {
             Caller::Approved => ("call", None),
         };
         tracing::info!(event = "agent_action", kind, code = result.code.as_str());
+        // Waiting for the owner (again, even after an approval): kept, so the owner's
+        // approval dials.
+        if result.code == ActionCode::WaitingForOwner {
+            if let Some(id) = &result.action_id {
+                self.keep_pending(
+                    id,
+                    PendingKind::Call {
+                        target: peer.to_string(),
+                        handle: handle.clone(),
+                        reason,
+                    },
+                );
+            }
+        }
         let Some(reply) = reply else {
             return self.reply(&match result.code {
                 ActionCode::Done => format!("Owner approved: calling @{handle}."),
@@ -133,18 +151,6 @@ impl<M: Messenger> Core<M> {
                 ),
             });
         };
-        if result.code == ActionCode::WaitingForOwner {
-            if let Some(id) = &result.action_id {
-                self.keep_pending(
-                    id,
-                    PendingKind::Call {
-                        target: peer.to_string(),
-                        handle,
-                        reason,
-                    },
-                );
-            }
-        }
         let _ = reply.send(result);
     }
 
@@ -205,10 +211,7 @@ impl<M: Messenger> Core<M> {
             return;
         };
         let Some(Purpose::Contact {
-            peer,
-            conversation,
-            reason,
-            ..
+            peer, chat, reason, ..
         }) = &call.purpose
         else {
             return;
@@ -224,31 +227,25 @@ impl<M: Messenger> Core<M> {
                 call.session.say(sentence);
             }
         }
-        let (peer, conversation) = (*peer, *conversation);
-        if self.contacts.noticed.insert(peer) {
-            let notice = self.contacts.notice.clone();
-            self.contact_reply(conversation, &notice);
+        // The notice is for the contact's chat; the owner's chat needs none.
+        let (peer, conversation) = (*peer, chat.direct());
+        if let Some(conversation) = conversation {
+            if self.contacts.noticed.insert(peer) {
+                let notice = self.contacts.notice.clone();
+                self.contact_reply(conversation, &notice);
+            }
         }
     }
 
-    /// The contact on the call said `text`: posted in their chat, then to the backend as
-    /// their message.
-    pub(super) async fn contact_said(
-        &mut self,
-        peer: UserId,
-        conversation: ConversationId,
-        text: String,
-    ) {
-        for body in reply_bodies(Some(TRANSCRIPT_TITLE), &text) {
-            if let Err(error) = self.messenger.send_rich(conversation, &body) {
-                tracing::warn!(event = "send_failed", code = error.code());
-            }
-        }
+    /// The contact on the call said `text`: posted in the call's chat, then to the
+    /// backend as their message.
+    pub(super) async fn contact_said(&mut self, peer: UserId, chat: ContactChat, text: String) {
+        self.contact_heard(&chat, TRANSCRIPT_TITLE, &text);
         if let Some(call) = &mut self.call {
             call.unmute();
         }
         tracing::info!(event = "contact_prompt", call = true);
-        self.prompt_contact(peer, conversation, text).await;
+        self.prompt_contact(peer, chat, text).await;
     }
 
     /// The bridge stops: a call to a contact still undecided fails.

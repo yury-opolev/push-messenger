@@ -28,6 +28,8 @@ use crate::state::{PendingAction, PendingKind};
 
 /// Kept waiting actions older than this are dropped (spec §7.3).
 const PENDING_KEPT_MS: i64 = 48 * 3_600 * 1_000;
+/// An approved call may ring that person once within this long after the approval.
+const CALL_APPROVAL_MS: i64 = 15 * 60 * 1_000;
 
 /// What a backend's action came to once the server answered.
 pub(super) enum Acted {
@@ -218,14 +220,37 @@ impl<M: Messenger> Core<M> {
         ActionResult::done("calling the owner")
     }
 
-    /// Keeps what the approval of action `id` still needs.
+    /// Keeps what the approval of action `id` still needs: a text for a chat already
+    /// waiting under `id` (the server answers the same action while it waits) joins the
+    /// texts held for it.
     pub(super) fn keep_pending(&self, id: &str, kind: PendingKind) {
-        let pending = PendingAction {
-            kind,
-            created_at_ms: self.clock.now_ms(),
-        };
+        let created_at_ms = self.clock.now_ms();
         self.save(|state| {
-            state.pending_actions.insert(id.to_owned(), pending);
+            if let (
+                Some(PendingAction {
+                    kind:
+                        PendingKind::Send {
+                            target: held_for,
+                            texts: held,
+                            ..
+                        },
+                    ..
+                }),
+                PendingKind::Send { target, texts, .. },
+            ) = (state.pending_actions.get_mut(id), &kind)
+            {
+                if *held_for == *target {
+                    held.extend(texts.iter().cloned());
+                    return;
+                }
+            }
+            state.pending_actions.insert(
+                id.to_owned(),
+                PendingAction {
+                    kind,
+                    created_at_ms,
+                },
+            );
         });
     }
 
@@ -250,7 +275,10 @@ impl<M: Messenger> Core<M> {
         );
         let what = pending.kind.describe();
         match action.state {
-            OutgoingState::Approved => self.approved(pending.kind, action.conversation).await,
+            OutgoingState::Approved => {
+                self.approved(pending.kind, action.conversation, action.resolved_at_ms)
+                    .await;
+            }
             OutgoingState::OwnerDeclined | OutgoingState::Expired => {
                 self.reply(&format!("Owner declined: {what}."));
             }
@@ -268,8 +296,13 @@ impl<M: Messenger> Core<M> {
         taken
     }
 
-    /// The owner approved: what was held is done now.
-    async fn approved(&mut self, kind: PendingKind, conversation: Option<ConversationId>) {
+    /// The owner approved (at `resolved_at_ms`, when known): what was held is done now.
+    async fn approved(
+        &mut self,
+        kind: PendingKind,
+        conversation: Option<ConversationId>,
+        resolved_at_ms: Option<i64>,
+    ) {
         match kind {
             PendingKind::Send { .. } => match conversation {
                 Some(conversation) => self.approved_send(kind, Ok(conversation)),
@@ -293,7 +326,18 @@ impl<M: Messenger> Core<M> {
                 handle,
                 reason,
             } => match target.parse::<UserId>() {
-                // The approval lets the next invite to that person through (15 minutes).
+                // The approval lets one invite to that person through, for 15 minutes:
+                // past that, dialing would only ask the owner again.
+                Ok(_)
+                    if resolved_at_ms.is_some_and(|at| {
+                        self.clock.now_ms().saturating_sub(at) > CALL_APPROVAL_MS
+                    }) =>
+                {
+                    tracing::info!(event = "agent_action", kind = "call", code = "expired");
+                    self.reply(&format!(
+                        "The approval to call @{handle} has expired; the agent did not call."
+                    ));
+                }
                 Ok(user_id) => {
                     let peer = Peer {
                         user_id,
@@ -333,17 +377,20 @@ impl<M: Messenger> Core<M> {
     ) {
         let PendingKind::Send {
             handle,
-            text,
+            texts,
             agent,
             ..
         } = kind
         else {
             return;
         };
+        let to = format!("@{handle}");
         let result = match conversation {
-            Ok(conversation) => {
-                self.deliver_text(conversation, &format!("@{handle}"), agent, &text)
-            }
+            Ok(conversation) => texts
+                .iter()
+                .map(|text| self.deliver_text(conversation, &to, agent, text))
+                .find(|result| result.code != ActionCode::Done)
+                .unwrap_or_else(|| ActionResult::done(format!("sent to {to}"))),
             Err(error) => ActionResult::from_sdk(&error),
         };
         tracing::info!(
@@ -351,8 +398,12 @@ impl<M: Messenger> Core<M> {
             kind = "send_message",
             code = result.code.as_str()
         );
+        let what = match texts.len() {
+            1 => "message".to_owned(),
+            count => format!("{count} messages"),
+        };
         if result.code == ActionCode::Done {
-            self.reply(&format!("Owner approved: message to @{handle} sent."));
+            self.reply(&format!("Owner approved: {what} to @{handle} sent."));
         } else {
             self.reply(&format!(
                 "Owner approved the chat with @{handle}, but the message was not sent: {}.",
@@ -448,7 +499,7 @@ async fn run_checked<M: Messenger + ?Sized>(
                     PendingKind::Send {
                         target: peer.user_id.to_string(),
                         handle: peer.handle,
-                        text,
+                        texts: vec![text],
                         agent: peer.agent,
                     },
                 ),

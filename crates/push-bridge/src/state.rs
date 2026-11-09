@@ -56,11 +56,13 @@ pub struct PendingAction {
 pub enum PendingKind {
     /// A contact request to `handle`.
     Request { handle: String },
-    /// A new direct chat with `target` (a user id) and the text to send in it.
+    /// A new direct chat with `target` (a user id) and the texts to send in it, in order.
     Send {
         target: String,
         handle: String,
-        text: String,
+        /// `text` (one text) in files of older bridges.
+        #[serde(alias = "text", deserialize_with = "one_or_more")]
+        texts: Vec<String>,
         /// The peer is an agent: plain text, not a rich reply.
         agent: bool,
     },
@@ -87,6 +89,20 @@ impl PendingKind {
             Self::Call { handle, .. } => format!("call to @{handle}"),
         }
     }
+}
+
+/// A list of texts, or one text alone.
+fn one_or_more<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMore {
+        One(String),
+        More(Vec<String>),
+    }
+    Ok(match OneOrMore::deserialize(deserializer)? {
+        OneOrMore::One(text) => vec![text],
+        OneOrMore::More(texts) => texts,
+    })
 }
 
 /// A state file that cannot be read or written.
@@ -322,7 +338,7 @@ mod tests {
             kind: PendingKind::Send {
                 target: "user-1".into(),
                 handle: "bob".into(),
-                text: "hi".into(),
+                texts: vec!["hi".into(), "there".into()],
                 agent: true,
             },
             created_at_ms: 7,
@@ -337,6 +353,28 @@ mod tests {
         let reloaded = StateFile::load(&path).unwrap().get();
         assert_eq!(reloaded.pending_actions["a-1"], pending);
         assert_eq!(pending.kind.describe(), "message to @bob");
+    }
+
+    #[test]
+    fn a_held_text_kept_by_an_older_bridge_loads() {
+        let dir = TestDir::new();
+        let path = state_path(&dir);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"pending_actions":{"a-1":{"kind":"send","target":"user-1","handle":"bob","text":"hi","agent":false,"created_at_ms":7}}}"#,
+        )
+        .unwrap();
+        let loaded = StateFile::load(&path).unwrap().get();
+        assert_eq!(
+            loaded.pending_actions["a-1"].kind,
+            PendingKind::Send {
+                target: "user-1".into(),
+                handle: "bob".into(),
+                texts: vec!["hi".into()],
+                agent: false,
+            }
+        );
     }
 
     #[test]

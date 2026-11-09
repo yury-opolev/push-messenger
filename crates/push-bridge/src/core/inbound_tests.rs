@@ -149,6 +149,33 @@ async fn contacts_lets_in_every_accepted_contact() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_contact_s_group_text_opens_no_chat_and_reaches_nobody() {
+    let h = started(Some(InboundPolicy::Contacts)).await;
+    h.messenger.gate_chats(server_error("waiting_for_owner"));
+    let (alice, carol) = (person(&h, "alice"), person(&h, "carol"));
+    let group = h.messenger.add_group();
+    for sender in [alice, carol] {
+        let text = h
+            .messenger
+            .message(group, sender, push_sdk::MessageKind::Text, "hi all");
+        h.messenger.inject(Event::MessageAdded(text));
+    }
+    settle().await;
+    assert!(replies_to(&h, group).is_empty());
+    assert!(plain_to(&h, group).is_empty());
+    assert!(!h.messenger.has_direct(carol));
+    // Alice's own chat still reaches the backend.
+    let with_alice = h.messenger.conversation_with(alice);
+    h.messenger.says(alice, "hi");
+    h.messenger
+        .wait_until("the echo", |_| {
+            replies_to(&h, with_alice).contains(&"echo: hi".to_owned())
+        })
+        .await;
+    assert!(h.messenger.opened_directs().is_empty(), "no chat opened");
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_settings_change_applies_at_once() {
     let h = started(None).await;
     let alice = person(&h, "alice");

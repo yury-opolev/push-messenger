@@ -284,7 +284,7 @@ async fn a_held_message_is_sent_once_the_owner_approves_the_chat() {
             PendingKind::Send {
                 target: bob.to_string(),
                 handle: "bob".into(),
-                text: "shall we meet?".into(),
+                texts: vec!["shall we meet?".into()],
                 agent: false,
             }
         )]
@@ -313,6 +313,42 @@ async fn a_held_message_is_sent_once_the_owner_approves_the_chat() {
     h.reply_containing("Owner approved: message to @bob sent.")
         .await;
     assert_eq!(rich_in(&h, chat), ["shall we meet?"]);
+    assert!(pending(&h).is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn texts_held_for_the_same_waiting_chat_are_all_sent_in_order() {
+    let h = Harness::started().await;
+    let bob = h.messenger.add_user("bob", false);
+    // The owner decides on new chats; asking again answers the same waiting action.
+    h.messenger.gate_chats(waiting("a-2"));
+    for text in ["first", "second"] {
+        let result = act(&h, send("@bob", text)).await;
+        assert_eq!(result.action_id.as_deref(), Some("a-2"));
+    }
+    assert_eq!(
+        pending(&h),
+        [(
+            "a-2".to_owned(),
+            PendingKind::Send {
+                target: bob.to_string(),
+                handle: "bob".into(),
+                texts: vec!["first".into(), "second".into()],
+                agent: false,
+            }
+        )]
+    );
+    let chat = ConversationId::new();
+    h.messenger.inject(Event::OutgoingActionChanged(decided(
+        &h,
+        "a-2",
+        OutgoingKind::Chat,
+        OutgoingState::Approved,
+        Some(chat),
+    )));
+    h.reply_containing("Owner approved: 2 messages to @bob sent.")
+        .await;
+    assert_eq!(rich_in(&h, chat), ["first", "second"]);
     assert!(pending(&h).is_empty());
 }
 
@@ -542,7 +578,7 @@ async fn actions_decided_while_away_are_settled_at_start_and_after_a_reconnect()
     let send = |handle: &str| PendingKind::Send {
         target: UserId::new().to_string(),
         handle: handle.into(),
-        text: format!("hi {handle}"),
+        texts: vec![format!("hi {handle}")],
         agent: false,
     };
     h.state
