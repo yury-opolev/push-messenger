@@ -1,6 +1,7 @@
 //! An agent's owner acting on the agent and reading its chats (spec 2026-11-06 agent
-//! connections and the owner view): auth-svc's `/v1/agents/{agent_id}/…` routes. Everyone
-//! but the owner gets `not_found` from every one of them.
+//! connections and the owner view, spec 2026-11-09 proactive agents): auth-svc's
+//! `/v1/agents/{agent_id}/…` routes. Everyone but the owner gets `not_found` from every
+//! one of them.
 
 use reqwest::Method;
 use serde::Deserialize;
@@ -9,7 +10,8 @@ use uuid::Uuid;
 
 use crate::auth::{AuthApi, ProfileBody, millis, once, retried, unreadable};
 use crate::calls::CallPage;
-use crate::model::ContactState;
+use crate::model::{ContactState, redacted};
+use crate::outgoing::{InboundPolicy, OutgoingKind, OutgoingPolicy, OutgoingState};
 use crate::{ClientMsgId, ConversationId, MessageId, Profile, SdkError, UserId};
 
 /// Who an agent accepts contact requests from. Set by its owner; `Ask` by default.
@@ -88,6 +90,9 @@ pub struct AgentConversation {
     pub message_count: i64,
     pub hidden: bool,
     pub peer_deleted: bool,
+    /// A direct chat the agent opened with someone other than the owner, or a group it
+    /// created.
+    pub started_by_agent: bool,
 }
 
 /// One entry of an agent's conversation, as the agent's own client gets it.
@@ -115,6 +120,111 @@ pub struct AgentHistoryPage {
     pub entries: Vec<AgentHistoryEntry>,
     /// Older entries exist: ask again with the first entry's `seq` as `before_seq`.
     pub has_more: bool,
+}
+
+/// An agent's outgoing policy, one per kind of action (spec 2026-11-09 proactive agents).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct OutgoingPolicies {
+    /// Contact requests.
+    pub requests: OutgoingPolicy,
+    /// New direct chats with someone other than the owner.
+    pub chats: OutgoingPolicy,
+    /// Creating groups and adding members to them.
+    pub groups: OutgoingPolicy,
+    /// Calls to someone other than the owner.
+    pub calls: OutgoingPolicy,
+}
+
+/// A change of an agent's outgoing policy: the kinds given change, the others stay.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct OutgoingPolicyUpdate {
+    pub requests: Option<OutgoingPolicy>,
+    pub chats: Option<OutgoingPolicy>,
+    pub groups: Option<OutgoingPolicy>,
+    pub calls: Option<OutgoingPolicy>,
+}
+
+/// One of an agent's actions in its owner's view. `Debug` shows a group's title as its
+/// length only.
+#[derive(Clone, PartialEq, Eq)]
+pub struct OwnerOutgoingAction {
+    /// The action's id (a UUID).
+    pub action_id: String,
+    pub kind: OutgoingKind,
+    /// Request, chat and call: the other user, as the agent may see them.
+    pub target: Option<Profile>,
+    /// Invite: the group; once approved, the chat or group it opened or created.
+    pub conversation: Option<ConversationId>,
+    /// Group: its title.
+    pub title: Option<String>,
+    /// Group and invite: the members, as the agent may see them.
+    pub members: Vec<Profile>,
+    pub state: OutgoingState,
+    /// Failed: why, as an error code (`not_contact`, `blocked`, …).
+    pub error: Option<String>,
+    /// Milliseconds since the Unix epoch.
+    pub created_at_ms: i64,
+    /// When it expires unless the owner decides it first.
+    pub expires_at_ms: i64,
+    pub resolved_at_ms: Option<i64>,
+}
+
+impl std::fmt::Debug for OwnerOutgoingAction {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OwnerOutgoingAction")
+            .field("action_id", &self.action_id)
+            .field("kind", &self.kind)
+            .field("target", &self.target)
+            .field("conversation", &self.conversation)
+            .field("title", &redacted(&self.title))
+            .field("members", &self.members)
+            .field("state", &self.state)
+            .field("error", &self.error)
+            .field("created_at_ms", &self.created_at_ms)
+            .field("expires_at_ms", &self.expires_at_ms)
+            .field("resolved_at_ms", &self.resolved_at_ms)
+            .finish()
+    }
+}
+
+/// An action as auth-svc answers it.
+#[derive(Deserialize)]
+struct ActionBody {
+    action_id: Uuid,
+    kind: String,
+    target: Option<ProfileBody>,
+    conversation_id: Option<Uuid>,
+    title: Option<String>,
+    #[serde(default)]
+    members: Vec<ProfileBody>,
+    state: String,
+    error: Option<String>,
+    created_at: String,
+    expires_at: String,
+    resolved_at: Option<String>,
+}
+
+impl ActionBody {
+    fn read(self) -> Result<OwnerOutgoingAction, SdkError> {
+        let broken = || unreadable("the agent's actions");
+        Ok(OwnerOutgoingAction {
+            action_id: self.action_id.to_string(),
+            kind: OutgoingKind::from_name(&self.kind).ok_or_else(broken)?,
+            target: self.target.map(Profile::from),
+            conversation: self.conversation_id.map(ConversationId),
+            title: self.title,
+            members: self.members.into_iter().map(Profile::from).collect(),
+            state: OutgoingState::from_name(&self.state).ok_or_else(broken)?,
+            error: self.error,
+            created_at_ms: millis(&self.created_at).ok_or_else(broken)?,
+            expires_at_ms: millis(&self.expires_at).ok_or_else(broken)?,
+            resolved_at_ms: match self.resolved_at {
+                Some(time) => Some(millis(&time).ok_or_else(broken)?),
+                None => None,
+            },
+        })
+    }
 }
 
 /// What the owner does with a waiting request.
@@ -304,6 +414,8 @@ impl AuthApi {
             hidden: bool,
             #[serde(default)]
             peer_deleted: bool,
+            #[serde(default)]
+            started_by_agent: bool,
         }
         #[derive(Deserialize)]
         struct Body {
@@ -333,6 +445,7 @@ impl AuthApi {
                     message_count: conversation.message_count,
                     hidden: conversation.hidden,
                     peer_deleted: conversation.peer_deleted,
+                    started_by_agent: conversation.started_by_agent,
                 })
             })
             .collect()
@@ -426,6 +539,166 @@ impl AuthApi {
             .await?;
         crate::auth::call_page(answer)
     }
+
+    /// `GET /v1/agents/{agent}/outgoing-policy`.
+    pub async fn outgoing_policy(
+        &self,
+        access_token: &str,
+        agent: UserId,
+    ) -> Result<OutgoingPolicies, SdkError> {
+        let answer = self
+            .agent_get(
+                access_token,
+                &Self::agent_path(agent, "/outgoing-policy"),
+                &[],
+            )
+            .await?;
+        outgoing_policies(&answer)
+    }
+
+    /// `PUT /v1/agents/{agent}/outgoing-policy` with the kinds `update` gives.
+    pub async fn set_outgoing_policy(
+        &self,
+        access_token: &str,
+        agent: UserId,
+        update: OutgoingPolicyUpdate,
+    ) -> Result<OutgoingPolicies, SdkError> {
+        let mut body = serde_json::Map::new();
+        for (kind, policy) in [
+            ("requests", update.requests),
+            ("chats", update.chats),
+            ("groups", update.groups),
+            ("calls", update.calls),
+        ] {
+            if let Some(policy) = policy {
+                body.insert(kind.to_owned(), json!(policy.as_str()));
+            }
+        }
+        let path = Self::agent_path(agent, "/outgoing-policy");
+        let answer = retried(crate::auth::ORDINARY, || {
+            self.request(Method::PUT, &path)
+                .bearer_auth(access_token)
+                .json(&body)
+        })
+        .await?;
+        outgoing_policies(&answer)
+    }
+
+    /// `GET /v1/agents/{agent}/inbound-policy`.
+    pub async fn inbound_policy(
+        &self,
+        access_token: &str,
+        agent: UserId,
+    ) -> Result<InboundPolicy, SdkError> {
+        let answer = self
+            .agent_get(
+                access_token,
+                &Self::agent_path(agent, "/inbound-policy"),
+                &[],
+            )
+            .await?;
+        inbound_policy(&answer)
+    }
+
+    /// `PUT /v1/agents/{agent}/inbound-policy`.
+    pub async fn set_inbound_policy(
+        &self,
+        access_token: &str,
+        agent: UserId,
+        policy_now: InboundPolicy,
+    ) -> Result<InboundPolicy, SdkError> {
+        let path = Self::agent_path(agent, "/inbound-policy");
+        let answer = retried(crate::auth::ORDINARY, || {
+            self.request(Method::PUT, &path)
+                .bearer_auth(access_token)
+                .json(&json!({ "policy": policy_now.as_str() }))
+        })
+        .await?;
+        inbound_policy(&answer)
+    }
+
+    /// `GET /v1/agents/{agent}/outgoing`: the actions waiting for the owner.
+    pub async fn agent_outgoing(
+        &self,
+        access_token: &str,
+        agent: UserId,
+    ) -> Result<Vec<OwnerOutgoingAction>, SdkError> {
+        #[derive(Deserialize)]
+        struct Body {
+            actions: Vec<ActionBody>,
+        }
+        let answer = self
+            .agent_get(access_token, &Self::agent_path(agent, "/outgoing"), &[])
+            .await?;
+        let body: Body =
+            serde_json::from_value(answer).map_err(|_| unreadable("the agent's actions"))?;
+        body.actions.into_iter().map(ActionBody::read).collect()
+    }
+
+    /// `POST /v1/agents/{agent}/outgoing/{action_id}/approve`: the action, approved or
+    /// failed. Sent once: a repeat is `not_found`.
+    pub async fn approve_outgoing(
+        &self,
+        access_token: &str,
+        agent: UserId,
+        action_id: &str,
+    ) -> Result<OwnerOutgoingAction, SdkError> {
+        #[derive(Deserialize)]
+        struct Body {
+            action: ActionBody,
+        }
+        let path = Self::outgoing_path(agent, action_id, "approve")?;
+        let answer = once(self.request(Method::POST, &path).bearer_auth(access_token)).await?;
+        let body: Body =
+            serde_json::from_value(answer).map_err(|_| unreadable("the agent's actions"))?;
+        body.action.read()
+    }
+
+    /// `POST /v1/agents/{agent}/outgoing/{action_id}/decline`. Sent once: a repeat is
+    /// `not_found`.
+    pub async fn decline_outgoing(
+        &self,
+        access_token: &str,
+        agent: UserId,
+        action_id: &str,
+    ) -> Result<(), SdkError> {
+        let path = Self::outgoing_path(agent, action_id, "decline")?;
+        once(self.request(Method::POST, &path).bearer_auth(access_token)).await?;
+        Ok(())
+    }
+
+    /// The path of a decision on an action; `invalid` unless `action_id` is a UUID.
+    fn outgoing_path(agent: UserId, action_id: &str, decision: &str) -> Result<String, SdkError> {
+        let action: Uuid = action_id
+            .parse()
+            .map_err(|_| SdkError::Invalid("the action id is not an id".to_owned()))?;
+        Ok(Self::agent_path(
+            agent,
+            &format!("/outgoing/{action}/{decision}"),
+        ))
+    }
+}
+
+fn outgoing_policies(answer: &serde_json::Value) -> Result<OutgoingPolicies, SdkError> {
+    let read = |kind: &str| {
+        answer[kind]
+            .as_str()
+            .and_then(OutgoingPolicy::from_name)
+            .ok_or_else(|| unreadable("the agent's outgoing policy"))
+    };
+    Ok(OutgoingPolicies {
+        requests: read("requests")?,
+        chats: read("chats")?,
+        groups: read("groups")?,
+        calls: read("calls")?,
+    })
+}
+
+fn inbound_policy(answer: &serde_json::Value) -> Result<InboundPolicy, SdkError> {
+    answer["policy"]
+        .as_str()
+        .and_then(InboundPolicy::from_name)
+        .ok_or_else(|| unreadable("the agent's inbound policy"))
 }
 
 fn policy(answer: &serde_json::Value) -> Result<AgentPolicy, SdkError> {

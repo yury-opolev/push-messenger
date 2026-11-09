@@ -16,10 +16,11 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use push_sdk::{
-    Account, Activity, ActivityState, CallDirection, CallEvent, CallState, CallStatus,
-    ConnectionState, Contact, ContactState, Conversation, ConversationKind, DatabaseKey, Device,
-    Event, IceCandidate, Invite, Message, MessageKind, MessageStatus, OutboxKind, Platform,
-    Presence, PresenceState, Profile, SdkError, SdpKind,
+    Account, Activity, ActivityState, AgentSettings, CallDirection, CallEvent, CallState,
+    CallStatus, ConnectionState, Contact, ContactState, Conversation, ConversationKind,
+    DatabaseKey, Device, Event, IceCandidate, InboundPolicy, Invite, Message, MessageKind,
+    MessageStatus, OutboxKind, OutgoingAction, OutgoingKind, OutgoingPolicy, OutgoingState,
+    Platform, Presence, PresenceState, Profile, SdkError, SdpKind,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -394,7 +395,72 @@ pub fn event(event: &Event) -> Value {
             "userId": user.to_string(),
             "state": contact_state(*state),
         }),
+        Event::AgentSettingsChanged(settings) => json!({
+            "type": "agentSettingsChanged",
+            "settings": agent_settings(settings),
+        }),
+        Event::OutgoingActionChanged(action) => json!({
+            "type": "outgoingActionChanged",
+            "action": outgoing_action(action),
+        }),
     }
+}
+
+fn outgoing_policy(policy: OutgoingPolicy) -> &'static str {
+    match policy {
+        OutgoingPolicy::Allowed => "allowed",
+        OutgoingPolicy::Ask => "ask",
+        OutgoingPolicy::Off => "off",
+    }
+}
+
+/// `{"inbound": "ownerOnly" | "ownerAgents" | "contacts", "requests", "chats", "groups",
+/// "calls"}`, each of the last four `"allowed"`, `"ask"` or `"off"`.
+pub fn agent_settings(settings: &AgentSettings) -> Value {
+    let inbound = match settings.inbound {
+        InboundPolicy::OwnerOnly => "ownerOnly",
+        InboundPolicy::OwnerAgents => "ownerAgents",
+        InboundPolicy::Contacts => "contacts",
+    };
+    json!({
+        "inbound": inbound,
+        "requests": outgoing_policy(settings.requests),
+        "chats": outgoing_policy(settings.chats),
+        "groups": outgoing_policy(settings.groups),
+        "calls": outgoing_policy(settings.calls),
+    })
+}
+
+/// `{"actionId", "agentId", "kind", "targetId", "conversationId", "title", "memberIds",
+/// "state", "error", "createdAtMs", "resolvedAtMs"}`.
+pub fn outgoing_action(action: &OutgoingAction) -> Value {
+    let kind = match action.kind {
+        OutgoingKind::Request => "request",
+        OutgoingKind::Chat => "chat",
+        OutgoingKind::Group => "group",
+        OutgoingKind::Invite => "invite",
+        OutgoingKind::Call => "call",
+    };
+    let state = match action.state {
+        OutgoingState::Waiting => "waiting",
+        OutgoingState::Approved => "approved",
+        OutgoingState::OwnerDeclined => "ownerDeclined",
+        OutgoingState::Expired => "expired",
+        OutgoingState::Failed => "failed",
+    };
+    json!({
+        "actionId": action.action_id,
+        "agentId": action.agent.to_string(),
+        "kind": kind,
+        "targetId": action.target.map(|target| target.to_string()),
+        "conversationId": action.conversation.map(|conversation| conversation.to_string()),
+        "title": action.title,
+        "memberIds": action.members.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        "state": state,
+        "error": action.error,
+        "createdAtMs": action.created_at_ms,
+        "resolvedAtMs": action.resolved_at_ms,
+    })
 }
 
 /// The settings an app opens a client with, as the bindings receive them.
@@ -484,6 +550,7 @@ mod tests {
                 message: "slow down".to_owned(),
                 retryable: true,
                 retry_after_s: Some(7),
+                action_id: None,
             },
         ];
         for case in &cases {
@@ -523,6 +590,7 @@ mod tests {
                 message: "not a contact".to_owned(),
                 retryable: false,
                 retry_after_s: None,
+                action_id: None,
             },
         });
         assert_eq!(failed["type"], "sendFailed");
@@ -688,6 +756,7 @@ mod tests {
                 message: "answered".to_owned(),
                 retryable: false,
                 retry_after_s: None,
+                action_id: None,
             },
         });
         assert_eq!(refused["type"], "error");
@@ -727,6 +796,51 @@ mod tests {
         assert_eq!(
             (&ended["reason"], &ended["durationS"]),
             (&json!("missed"), &Value::Null)
+        );
+    }
+
+    fn settings() -> AgentSettings {
+        AgentSettings {
+            inbound: InboundPolicy::OwnerAgents,
+            requests: OutgoingPolicy::Ask,
+            chats: OutgoingPolicy::Allowed,
+            groups: OutgoingPolicy::Off,
+            calls: OutgoingPolicy::Ask,
+        }
+    }
+
+    fn action(agent: UserId) -> OutgoingAction {
+        OutgoingAction {
+            action_id: "0190f5c4-0000-7000-8000-0000000000aa".to_owned(),
+            agent,
+            kind: OutgoingKind::Request,
+            target: Some(agent),
+            conversation: None,
+            title: None,
+            members: Vec::new(),
+            state: OutgoingState::OwnerDeclined,
+            error: None,
+            created_at_ms: 1,
+            resolved_at_ms: Some(2),
+        }
+    }
+
+    #[test]
+    fn agent_settings_and_actions_are_camel_case() {
+        let agent = UserId::new();
+        assert_eq!(
+            event(&Event::AgentSettingsChanged(settings())),
+            json!({"type": "agentSettingsChanged", "settings": {"inbound": "ownerAgents",
+                   "requests": "ask", "chats": "allowed", "groups": "off", "calls": "ask"}})
+        );
+        assert_eq!(
+            event(&Event::OutgoingActionChanged(action(agent))),
+            json!({"type": "outgoingActionChanged", "action": {
+                "actionId": "0190f5c4-0000-7000-8000-0000000000aa",
+                "agentId": agent.to_string(), "kind": "request",
+                "targetId": agent.to_string(), "conversationId": null, "title": null,
+                "memberIds": [], "state": "ownerDeclined", "error": null,
+                "createdAtMs": 1, "resolvedAtMs": 2}})
         );
     }
 
@@ -837,6 +951,7 @@ mod tests {
                 updated_at: 0,
                 hidden: false,
                 peer_deleted: false,
+                started_by_agent: false,
             }),
             Event::ContactChanged(Contact {
                 user_id: user,
@@ -867,6 +982,8 @@ mod tests {
                 user,
                 state: ContactState::Accepted,
             },
+            Event::AgentSettingsChanged(settings()),
+            Event::OutgoingActionChanged(action(user)),
         ];
         for shown in events.iter().map(event) {
             let row = format!("| `{}` |", shown["type"].as_str().unwrap());

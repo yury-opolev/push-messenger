@@ -29,7 +29,7 @@ pub(crate) mod outbox;
 
 /// The schema steps: `SCHEMA_STEPS[n]` brings a database from version `n` to `n + 1`.
 /// Each runs in one transaction with the version bump, so a crash leaves the old version.
-const SCHEMA_STEPS: &[&str] = &[SCHEMA_V1, SCHEMA_V2, SCHEMA_V3];
+const SCHEMA_STEPS: &[&str] = &[SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4];
 
 const SCHEMA_V1: &str = "
 CREATE TABLE meta (
@@ -105,6 +105,12 @@ CREATE INDEX message_by_id ON message (conversation_id, message_id);
 const SCHEMA_V3: &str = "
 ALTER TABLE conversation ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE conversation ADD COLUMN peer_deleted INTEGER NOT NULL DEFAULT 0;
+";
+
+/// A direct chat an agent opened with someone other than its owner, or a group an agent
+/// created (as the server lists it).
+const SCHEMA_V4: &str = "
+ALTER TABLE conversation ADD COLUMN started_by_agent INTEGER NOT NULL DEFAULT 0;
 ";
 
 /// Refuses to go on with a key unless the linked SQLite is SQLite3 Multiple Ciphers: on a
@@ -370,8 +376,9 @@ impl Store {
         let kind = ConversationKind::from_wire(summary.kind());
         self.conn.execute(
             "INSERT INTO conversation (id, kind, peer_id, title, last_seq, read_seq, read_synced_seq,
-                 unread, peer_delivered_seq, peer_read_seq, updated_at, hidden, peer_deleted)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                 unread, peer_delivered_seq, peer_read_seq, updated_at, hidden, peer_deleted,
+                 started_by_agent)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
              ON CONFLICT (id) DO UPDATE SET
                  kind = excluded.kind,
                  peer_id = COALESCE(excluded.peer_id, peer_id),
@@ -384,7 +391,8 @@ impl Store {
                  peer_read_seq = MAX(peer_read_seq, excluded.peer_read_seq),
                  updated_at = MAX(updated_at, excluded.updated_at),
                  hidden = excluded.hidden,
-                 peer_deleted = MAX(peer_deleted, excluded.peer_deleted)",
+                 peer_deleted = MAX(peer_deleted, excluded.peer_deleted),
+                 started_by_agent = excluded.started_by_agent",
             params![
                 bytes(id.0),
                 kind.code(),
@@ -398,6 +406,7 @@ impl Store {
                 summary.updated_at,
                 summary.hidden,
                 summary.peer_deleted,
+                summary.started_by_agent,
             ],
         )?;
         let after = self.conversation(id)?;
@@ -916,7 +925,8 @@ impl Store {
 }
 
 const CONVERSATION_COLUMNS: &str = "SELECT id, kind, peer_id, title, last_seq, read_seq, unread,
-    peer_delivered_seq, peer_read_seq, updated_at, hidden, peer_deleted FROM conversation";
+    peer_delivered_seq, peer_read_seq, updated_at, hidden, peer_deleted, started_by_agent
+    FROM conversation";
 
 fn conversation_row(row: &Row<'_>) -> rusqlite::Result<Conversation> {
     let peer: Option<Vec<u8>> = row.get(2)?;
@@ -934,6 +944,7 @@ fn conversation_row(row: &Row<'_>) -> rusqlite::Result<Conversation> {
         updated_at: row.get(9)?,
         hidden: row.get(10)?,
         peer_deleted: row.get(11)?,
+        started_by_agent: row.get(12)?,
     })
 }
 
@@ -1545,7 +1556,33 @@ pub(crate) mod tests {
         let held = store.messages(conversation, None, 10).unwrap();
         assert_eq!(held[1].kind, MessageKind::Rich);
         let upgraded = store.conversation(conversation).unwrap().unwrap();
-        assert!(!upgraded.hidden && !upgraded.peer_deleted);
+        assert!(!upgraded.hidden && !upgraded.peer_deleted && !upgraded.started_by_agent);
+    }
+
+    #[test]
+    fn a_listing_says_who_started_a_conversation() {
+        let mut f = fixture();
+        let group = ConversationId::new();
+        let summary = |started_by_agent| v1::ConversationSummary {
+            conversation_id: bytes(group.0),
+            kind: v1::ConversationKind::Group.into(),
+            title: Some("plans".to_owned()),
+            members: vec![bytes(f.me.0), bytes(f.peer.0)],
+            started_by_agent,
+            ..Default::default()
+        };
+        let listed = f.store.apply_summary(&summary(true)).unwrap().unwrap();
+        assert!(listed.started_by_agent);
+        assert_eq!(listed.kind, ConversationKind::Group);
+        assert_eq!(f.store.apply_summary(&summary(true)).unwrap(), None);
+        assert!(
+            f.store
+                .conversation(group)
+                .unwrap()
+                .unwrap()
+                .started_by_agent,
+            "read back"
+        );
     }
 
     #[test]

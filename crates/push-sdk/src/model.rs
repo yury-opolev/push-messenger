@@ -12,13 +12,15 @@ use push_proto::v1;
 
 use crate::SdkError;
 use crate::calls::CallEvent;
+use crate::outgoing::{AgentSettings, OutgoingAction};
 
 /// What kind of conversation it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ConversationKind {
     /// Two users who are accepted contacts.
     Direct,
-    /// A group. Not offered to apps in the first release: no operation creates one.
+    /// A group. Agents create them and add members (`create_group`, `add_members`); an
+    /// app sees the groups its user is a member of.
     Group,
     /// Learned from a delivery before any listing; the next listing tells.
     Unknown,
@@ -89,6 +91,9 @@ pub struct Conversation {
     pub hidden: bool,
     /// Direct only: the peer's account was deleted (their profile is a tombstone).
     pub peer_deleted: bool,
+    /// A direct chat an agent opened with someone other than its owner, or a group an
+    /// agent created.
+    pub started_by_agent: bool,
 }
 
 impl std::fmt::Debug for Conversation {
@@ -107,6 +112,7 @@ impl std::fmt::Debug for Conversation {
             .field("updated_at", &self.updated_at)
             .field("hidden", &self.hidden)
             .field("peer_deleted", &self.peer_deleted)
+            .field("started_by_agent", &self.started_by_agent)
             .finish()
     }
 }
@@ -494,6 +500,14 @@ pub enum Event {
         user: UserId,
         state: ContactState,
     },
+    /// The user is an agent and its owner changed its settings. Only while connected; not
+    /// stored: read them with `agent_settings` after connecting.
+    AgentSettingsChanged(AgentSettings),
+    /// One of the user's agents' actions started waiting for the user's decision
+    /// (approve or decline through the owner methods), or one was resolved; or the user
+    /// is an agent and one of its own actions was resolved. Only while connected; not
+    /// stored: list them with `agent_outgoing` (owners) or `outgoing_actions` (agents).
+    OutgoingActionChanged(OutgoingAction),
     /// Sign in again (a password reset, or the credentials were refused). Also reported
     /// as [`ConnectionState::SignedOut`].
     SignedOut,

@@ -476,6 +476,7 @@ mod tests {
             message: "the session has reached its maximum age; sign in again".to_owned(),
             retryable: false,
             retry_after_s: None,
+            action_id: None,
         };
         assert!(is_refused(&ended));
     }

@@ -159,6 +159,33 @@ export interface Presence {
   lastSeenMs: number | null;
 }
 
+export type OutgoingPolicy = 'allowed' | 'ask' | 'off';
+
+/** An agent's settings, set by its owner (proactive agents). */
+export interface AgentSettings {
+  inbound: 'ownerOnly' | 'ownerAgents' | 'contacts';
+  requests: OutgoingPolicy;
+  chats: OutgoingPolicy;
+  groups: OutgoingPolicy;
+  calls: OutgoingPolicy;
+}
+
+/** An action an agent started on its own. Times are milliseconds since the Unix epoch. */
+export interface OutgoingAction {
+  actionId: string;
+  agentId: string;
+  kind: 'request' | 'chat' | 'group' | 'invite' | 'call';
+  targetId: string | null;
+  conversationId: string | null;
+  title: string | null;
+  memberIds: string[];
+  state: 'waiting' | 'approved' | 'ownerDeclined' | 'expired' | 'failed';
+  /** `failed`: why, as an error code. */
+  error: string | null;
+  createdAtMs: number;
+  resolvedAtMs: number | null;
+}
+
 export type PushEvent =
   | ({ type: 'connectionStateChanged' } & ConnectionState)
   | { type: 'messageAdded' | 'messageSent' | 'messageEdited' | 'messageDeleted'; message: Message }
@@ -176,6 +203,8 @@ export type PushEvent =
   | { type: 'presenceChanged'; presence: Presence }
   | { type: 'agentRequestWaiting'; agentId: string; requesterId: string }
   | { type: 'agentContactChanged'; agentId: string; userId: string; state: Contact['state'] }
+  | { type: 'agentSettingsChanged'; settings: AgentSettings }
+  | { type: 'outgoingActionChanged'; action: OutgoingAction }
   | { type: 'signedOut' | 'deviceRemoved' | 'openedElsewhere' | 'eventsLost' };
 
 /** A failed call; `code` is the SDK's stable error code, as in Rust and C. */

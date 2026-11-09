@@ -611,6 +611,8 @@ impl<S: Signalling> Driver<S> {
                     | CallErrorCode::InCall
                     | CallErrorCode::RateLimited
                     | CallErrorCode::NotAvailable
+                    | CallErrorCode::WaitingForOwner
+                    | CallErrorCode::NotAllowedByOwner
                         if !established =>
                     {
                         self.end(CallEndReason::Failed, None, EndCause::Refused(code));

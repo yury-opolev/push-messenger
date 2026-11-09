@@ -649,6 +649,8 @@ pub(crate) fn call_page(answer: Value) -> Result<CallPage, SdkError> {
         ended_at: String,
         duration_s: u32,
         outcome: String,
+        #[serde(default)]
+        started_by_agent: bool,
         cursor: String,
     }
     #[derive(Deserialize)]
@@ -677,6 +679,7 @@ pub(crate) fn call_page(answer: Value) -> Result<CallPage, SdkError> {
             ended_at_ms: millis(&entry.ended_at)?,
             duration_s: entry.duration_s,
             outcome: CallEndReason::from_name(&entry.outcome),
+            started_by_agent: entry.started_by_agent,
             cursor: entry.cursor,
         })
     };
@@ -794,12 +797,14 @@ fn refusal(status: StatusCode, body: &[u8], retry_after_s: Option<u32>) -> SdkEr
             message: error.message,
             retryable: error.retryable,
             retry_after_s,
+            action_id: None,
         },
         Err(_) => SdkError::Server {
             code: format!("http_{}", status.as_u16()),
             message: format!("auth-svc answered {status}"),
             retryable: matches!(status.as_u16(), 502..=504),
             retry_after_s,
+            action_id: None,
         },
     }
 }
@@ -917,6 +922,7 @@ mod tests {
                 message: "busy".to_owned(),
                 retryable: true,
                 retry_after_s: Some(1),
+                action_id: None,
             }
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -1057,6 +1063,7 @@ mod tests {
                 message: "no relay".to_owned(),
                 retryable: true,
                 retry_after_s: Some(30),
+                action_id: None,
             }
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -1104,6 +1111,7 @@ mod tests {
                                 "ended_at": "2026-11-03T17:43:10.877Z",
                                 "duration_s": 121,
                                 "outcome": "completed",
+                                "started_by_agent": true,
                                 "cursor": "c1"
                             },
                             {
@@ -1140,12 +1148,14 @@ mod tests {
                 ended_at_ms: 1_793_727_790_877,
                 duration_s: 121,
                 outcome: CallEndReason::Completed,
+                started_by_agent: true,
                 cursor: "c1".to_owned(),
             }
         );
         assert_eq!(page.calls[1].direction, CallDirection::Outgoing);
         assert_eq!(page.calls[1].answered_at_ms, None);
         assert_eq!(page.calls[1].outcome, CallEndReason::Failed);
+        assert!(!page.calls[1].started_by_agent);
     }
 
     #[tokio::test]

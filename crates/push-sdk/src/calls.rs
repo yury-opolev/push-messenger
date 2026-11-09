@@ -186,6 +186,13 @@ pub enum CallErrorCode {
     Invalid,
     /// Too many invites: see the error's `retry_after_s`.
     RateLimited,
+    /// An agent's call to someone other than its owner waits for the owner's approval:
+    /// the error's [`SdkError::action_id`] names the action. Once approved
+    /// ([`crate::Event::OutgoingActionChanged`]), the agent may call that person once
+    /// within 15 minutes, with a new invite.
+    WaitingForOwner,
+    /// The agent's owner turned calls to others off.
+    NotAllowedByOwner,
     /// Calls are not offered on this connection.
     NotAvailable,
     /// The server could not handle it now: the same frame may succeed later.
@@ -205,6 +212,8 @@ impl CallErrorCode {
             v1::ErrorCode::NotAllowed => Self::NotAllowed,
             v1::ErrorCode::Invalid => Self::Invalid,
             v1::ErrorCode::RateLimited => Self::RateLimited,
+            v1::ErrorCode::WaitingForOwner => Self::WaitingForOwner,
+            v1::ErrorCode::NotAllowedByOwner => Self::NotAllowedByOwner,
             v1::ErrorCode::NotAvailable => Self::NotAvailable,
             v1::ErrorCode::Unavailable => Self::Unavailable,
             _ => Self::Other,
@@ -335,6 +344,9 @@ pub struct CallLogEntry {
     pub duration_s: u32,
     /// How it ended. A reason this client does not know is `Failed`.
     pub outcome: CallEndReason,
+    /// The caller was an agent (an agent calling its owner or, under its owner's call
+    /// policy, someone else).
+    pub started_by_agent: bool,
     /// This call's position, for `before` and `since`: an opaque string, passed back
     /// unchanged.
     pub cursor: String,
@@ -386,7 +398,9 @@ pub enum CallEvent {
         kind: SdpKind,
     },
     /// The server refused a call frame this device sent. `error` is an
-    /// [`SdkError::Server`] with the server's code (`already_answered`, `in_call`, …).
+    /// [`SdkError::Server`] with the server's code (`already_answered`, `in_call`, …) and,
+    /// for [`CallErrorCode::WaitingForOwner`], the waiting action's id
+    /// ([`SdkError::action_id`]).
     Error {
         call_id: CallId,
         code: CallErrorCode,

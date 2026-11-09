@@ -43,6 +43,9 @@ pub enum SdkError {
         retryable: bool,
         /// Rate limited: when the same request may succeed.
         retry_after_s: Option<u32>,
+        /// `waiting_for_owner`: the id (a UUID) of the agent's action that waits for its
+        /// owner ([`crate::OutgoingAction::action_id`]).
+        action_id: Option<String>,
     },
     /// The request was sent and no answer came in time: it may or may not have been
     /// carried out, so repeating it unchanged could do it twice. Not retryable; check
@@ -120,6 +123,14 @@ impl SdkError {
         }
     }
 
+    /// `waiting_for_owner`: the id of the agent's action that waits for its owner.
+    pub fn action_id(&self) -> Option<&str> {
+        match self {
+            Self::Server { action_id, .. } => action_id.as_deref(),
+            _ => None,
+        }
+    }
+
     /// A gateway `Error` frame.
     pub(crate) fn from_frame(error: &push_proto::v1::Error) -> Self {
         Self::Server {
@@ -127,8 +138,16 @@ impl SdkError {
             message: error.message.clone(),
             retryable: error.retryable,
             retry_after_s: error.retry_after_s,
+            action_id: action_id(error.action_id.as_deref()),
         }
     }
+}
+
+/// An action id from the wire's 16 bytes, as a UUID string; `None` when absent or broken.
+pub(crate) fn action_id(bytes: Option<&[u8]>) -> Option<String> {
+    bytes
+        .and_then(|bytes| uuid::Uuid::from_slice(bytes).ok())
+        .map(|id| id.to_string())
 }
 
 impl From<rusqlite::Error> for SdkError {
@@ -167,9 +186,35 @@ mod tests {
                 message: "slow down".to_owned(),
                 retryable: true,
                 retry_after_s: Some(7),
+                action_id: None,
             }
         );
+        assert_eq!(error.action_id(), None);
         assert_eq!(error_code_name(ErrorCode::NotContact), "not_contact");
+    }
+
+    #[test]
+    fn a_waiting_action_is_named_by_its_id() {
+        let action = uuid::Uuid::now_v7();
+        let frame = push_proto::v1::Error {
+            code: ErrorCode::WaitingForOwner.into(),
+            message: "waits for the owner".to_owned(),
+            action_id: Some(action.as_bytes().to_vec()),
+            ..Default::default()
+        };
+        let error = SdkError::from_frame(&frame);
+        assert_eq!(error.code(), "waiting_for_owner");
+        assert!(!error.is_retryable());
+        assert_eq!(error.action_id(), Some(action.to_string().as_str()));
+        let broken = push_proto::v1::Error {
+            action_id: Some(vec![1, 2, 3]),
+            ..frame
+        };
+        assert_eq!(SdkError::from_frame(&broken).action_id(), None);
+        assert_eq!(
+            error_code_name(ErrorCode::NotAllowedByOwner),
+            "not_allowed_by_owner"
+        );
     }
 
     #[test]

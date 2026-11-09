@@ -19,8 +19,9 @@ use uuid::Uuid;
 
 use crate::SdkError;
 use crate::calls::{CallEndReason, CallErrorCode, CallEvent, CallState, IceCandidate, SdpKind};
-use crate::error::error_code_name;
+use crate::error::{action_id, error_code_name};
 use crate::model::{Activity, ActivityState, Contact, ContactState, Event, OutboxKind, Presence};
+use crate::outgoing::{AgentSettings, OutgoingAction};
 use crate::policy::{Acks, Backoff};
 use crate::store::{Applied, Store, bytes};
 
@@ -178,7 +179,11 @@ impl Shared {
     fn call_refused(&self, call: CallId, code: CallErrorCode) {
         if !matches!(
             code,
-            CallErrorCode::InCall | CallErrorCode::NotContact | CallErrorCode::RateLimited
+            CallErrorCode::InCall
+                | CallErrorCode::NotContact
+                | CallErrorCode::RateLimited
+                | CallErrorCode::WaitingForOwner
+                | CallErrorCode::NotAllowedByOwner
         ) {
             return;
         }
@@ -488,6 +493,8 @@ impl Engine {
             Body::PresenceEvent(event) => self.on_presence_event(&event),
             Body::ConversationFlags(flags) => self.on_conversation_flags(&flags, out),
             Body::AgentContactEvent(event) => self.on_agent_contact(&event),
+            Body::AgentSettingsEvent(event) => self.on_agent_settings(&event),
+            Body::OutgoingActionEvent(event) => self.on_outgoing_action(&event),
             Body::CallIncoming(_)
             | Body::CallAccepted(_)
             | Body::CallTaken(_)
@@ -825,6 +832,23 @@ impl Engine {
             });
     }
 
+    /// The agent's owner changed its settings. Reported, not stored.
+    fn on_agent_settings(&self, event: &v1::AgentSettingsEvent) {
+        match event.settings.as_ref().and_then(AgentSettings::from_wire) {
+            Some(settings) => self.shared.emit(Event::AgentSettingsChanged(settings)),
+            None => tracing::debug!("dropped agent settings with a missing policy"),
+        }
+    }
+
+    /// One of an agent's actions started waiting (to the owner) or was resolved (to the
+    /// owner and the agent). Reported, not stored.
+    fn on_outgoing_action(&self, event: &v1::OutgoingActionEvent) {
+        match event.action.as_ref().and_then(OutgoingAction::from_wire) {
+            Some(action) => self.shared.emit(Event::OutgoingActionChanged(action)),
+            None => tracing::debug!("dropped an outgoing action with an unreadable id or kind"),
+        }
+    }
+
     /// Activity is reported, not stored: it expires `ttl_ms` after it arrived, on this
     /// device's clock.
     fn on_activity_event(&mut self, event: &v1::ActivityEvent, now_ms: i64) {
@@ -887,6 +911,7 @@ impl Engine {
                     message: error.message,
                     retryable: error.retryable,
                     retry_after_s: error.retry_after_s,
+                    action_id: action_id(error.action_id.as_deref()),
                 },
             },
             Body::CallSync(sync) => {
@@ -1469,6 +1494,72 @@ mod tests {
     }
 
     #[test]
+    fn agent_settings_and_outgoing_actions_become_events() {
+        let mut f = fixture();
+        let wire = v1::AgentSettings {
+            inbound: v1::InboundPolicy::Contacts.into(),
+            requests: v1::OutgoingPolicy::Ask.into(),
+            chats: v1::OutgoingPolicy::Allowed.into(),
+            groups: v1::OutgoingPolicy::Off.into(),
+            calls: v1::OutgoingPolicy::Ask.into(),
+        };
+        let (back, out) = f.frame(Body::AgentSettingsEvent(v1::AgentSettingsEvent {
+            settings: Some(wire),
+        }));
+        assert_eq!((back, out), (None, Vec::new()));
+        assert_eq!(
+            f.events(),
+            [Event::AgentSettingsChanged(AgentSettings {
+                inbound: crate::InboundPolicy::Contacts,
+                requests: crate::OutgoingPolicy::Ask,
+                chats: crate::OutgoingPolicy::Allowed,
+                groups: crate::OutgoingPolicy::Off,
+                calls: crate::OutgoingPolicy::Ask,
+            })]
+        );
+        let (agent, target, action) = (UserId::new(), UserId::new(), Uuid::now_v7());
+        let (back, _) = f.frame(Body::OutgoingActionEvent(v1::OutgoingActionEvent {
+            action: Some(v1::OutgoingAction {
+                action_id: bytes(action),
+                agent_user_id: bytes(agent.0),
+                kind: v1::OutgoingKind::Call.into(),
+                target_user_id: bytes(target.0),
+                state: v1::OutgoingState::Approved.into(),
+                created_at: 2_000_000,
+                resolved_at: 3_000_000,
+                ..Default::default()
+            }),
+        }));
+        assert_eq!(back, None);
+        let events = f.events();
+        let [Event::OutgoingActionChanged(changed)] = &events[..] else {
+            panic!("{events:?}");
+        };
+        assert_eq!(changed.action_id, action.to_string());
+        assert_eq!(
+            (changed.agent, changed.target, changed.kind, changed.state),
+            (
+                agent,
+                Some(target),
+                crate::OutgoingKind::Call,
+                crate::OutgoingState::Approved
+            )
+        );
+        assert_eq!(
+            (changed.created_at_ms, changed.resolved_at_ms),
+            (2_000, Some(3_000))
+        );
+        // Unreadable ones are dropped.
+        f.frame(Body::AgentSettingsEvent(v1::AgentSettingsEvent {
+            settings: Some(v1::AgentSettings::default()),
+        }));
+        f.frame(Body::OutgoingActionEvent(v1::OutgoingActionEvent {
+            action: None,
+        }));
+        assert_eq!(f.events(), []);
+    }
+
+    #[test]
     fn conversation_flags_update_the_store_and_unknown_ones_are_listed() {
         let mut f = fixture();
         let flags = |conversation: ConversationId, hidden, peer_deleted| {
@@ -1865,11 +1956,54 @@ mod tests {
                         message: "refused".to_owned(),
                         retryable: retry_after_s.is_some(),
                         retry_after_s: *retry_after_s,
+                        action_id: None,
                     },
                 })
             })
             .collect();
         assert_eq!(f.events(), expected);
+    }
+
+    #[test]
+    fn a_call_waiting_for_the_owner_names_the_action() {
+        let mut f = fixture();
+        let (call, action) = (CallId::new(), Uuid::now_v7());
+        call_frame(
+            &mut f,
+            Body::CallError(v1::CallError {
+                call_id: bytes(call.0),
+                code: v1::ErrorCode::WaitingForOwner.into(),
+                message: "waits for the owner".to_owned(),
+                action_id: Some(bytes(action)),
+                ..Default::default()
+            }),
+            0,
+        );
+        call_frame(
+            &mut f,
+            Body::CallError(v1::CallError {
+                call_id: bytes(call.0),
+                code: v1::ErrorCode::NotAllowedByOwner.into(),
+                ..Default::default()
+            }),
+            0,
+        );
+        let events = f.events();
+        let [
+            Event::Call(CallEvent::Error {
+                code: waiting,
+                error,
+                ..
+            }),
+            Event::Call(CallEvent::Error { code: off, .. }),
+        ] = &events[..]
+        else {
+            panic!("{events:?}");
+        };
+        assert_eq!(*waiting, CallErrorCode::WaitingForOwner);
+        assert_eq!(error.code(), "waiting_for_owner");
+        assert_eq!(error.action_id(), Some(action.to_string().as_str()));
+        assert_eq!(*off, CallErrorCode::NotAllowedByOwner);
     }
 
     #[test]
@@ -2178,6 +2312,8 @@ mod tests {
             v1::ErrorCode::InCall,
             v1::ErrorCode::NotContact,
             v1::ErrorCode::RateLimited,
+            v1::ErrorCode::WaitingForOwner,
+            v1::ErrorCode::NotAllowedByOwner,
         ] {
             let call = CallId::new();
             f.shared.call_invited(call);
