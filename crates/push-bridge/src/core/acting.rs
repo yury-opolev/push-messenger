@@ -140,9 +140,9 @@ impl<M: Messenger> Core<M> {
     }
 
     /// Sends the backend's `text` into `conversation`: plain text to an agent (a turn
-    /// for its backend), a rich reply to a person or a group.
+    /// for its backend, counted by the loop guard), a rich reply to a person or a group.
     fn deliver_text(
-        &self,
+        &mut self,
         conversation: ConversationId,
         to: &str,
         agent: bool,
@@ -154,7 +154,7 @@ impl<M: Messenger> Core<M> {
         let sent = if agent {
             self.messenger
                 .send_text(conversation, text)
-                .map(drop)
+                .map(|_| self.agent_turn(conversation, to.trim_start_matches('@')))
                 .map_err(|error| error.code().to_owned())
         } else {
             formatted_bodies(None, text, self.format)
@@ -179,10 +179,10 @@ impl<M: Messenger> Core<M> {
         }
     }
 
-    /// Whether the backend may send into `conversation` now; `Some` refuses it. The loop
-    /// guard (spec §7.4) answers `paused` here for a conversation it paused.
-    fn guard_delivery(&self, _conversation: ConversationId) -> Option<ActionResult> {
-        None
+    /// Whether the backend may send into `conversation` now; `Some` refuses it: the loop
+    /// guard answers `paused` for a chat it paused.
+    fn guard_delivery(&self, conversation: ConversationId) -> Option<ActionResult> {
+        self.loop_refusal(conversation)
     }
 
     /// `call` to the owner: dialed as for a request (one call at a time, voice ready, the

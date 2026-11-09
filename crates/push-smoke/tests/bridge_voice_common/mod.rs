@@ -520,6 +520,7 @@ impl Agent {
                 roots: vec![root],
                 default_folder: work,
                 default_mode: push_bridge::backend::PermissionMode::Default,
+                loop_guard_turns: 20,
             },
         );
         let (bridge, adapter, advertiser) = match speech {

@@ -1628,6 +1628,7 @@ impl IdleCore {
                 roots: vec![dir.path().to_path_buf()],
                 default_folder: dir.path().to_path_buf(),
                 default_mode: crate::backend::PermissionMode::Default,
+                loop_guard_turns: 20,
             },
             internal,
             owner,

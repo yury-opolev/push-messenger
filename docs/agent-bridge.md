@@ -32,6 +32,7 @@ and the plan differ, this guide describes what the code does.
 - [20. Agent connections](#20-agent-connections)
 - [21. Bridge actions](#21-bridge-actions)
 - [22. Inbound policy and agent turns](#22-inbound-policy-and-agent-turns)
+- [23. Loop guard](#23-loop-guard)
 
 Design of the tray, the control channel and upgrade mode: the plan
 [2026-11-02-agent-tray-upgrade-mode](superpowers/plans/2026-11-02-agent-tray-upgrade-mode.md);
@@ -197,7 +198,8 @@ Create `%LOCALAPPDATA%\push-messenger\coda-bridge\config.json`. Every field:
   "backend": "coda",
   "coda": { "exe": "C:\\Tools\\coda\\coda.exe", "args": [] },
   "control": true,
-  "peek": true
+  "peek": true,
+  "loop_guard_turns": 20
 }
 ```
 
@@ -221,6 +223,7 @@ Create `%LOCALAPPDATA%\push-messenger\coda-bridge\config.json`. Every field:
 | `control` | no | serve the local [control channel](#14-control-channel-for-other-tools) (the tray's status and actions, `pause`, `resume`); `false` turns it off, and the bridge works as without it (the tray then cannot see or reach it) | `true` |
 | `peek` | no | keep the owner conversation's last 50 messages in memory, masked, for the tray's [chat peek](#chat-peek) (the control channel's `peek`); `false` keeps nothing and answers `peek_disabled` | `true` |
 | `calls` | no | voice calls with the owner: `answer` (`auto`), `language` (`en-US`), `adapter` (the [voice adapter](#voice-adapter) doing the speech: `{"spawn": {…}}` or `{"connect": {…}}`; without it no calls are advertised), `notify_by_call` ([every field](#the-calls-section)). `stt`, `tts` and `vad` are no longer accepted ([migrating](#migrating-from-callsstt-and-callstts)) | absent: no calls (not advertised) |
+| `loop_guard_turns` | no | agent turns (plain texts by either agent) in a chat with another agent, without a person's message, after which the [loop guard](#23-loop-guard) pauses that chat; at least 2 | `20` |
 
 Unknown fields are refused (a typo is an error, not ignored), and a UTF-8 byte order mark
 as Notepad writes it is fine. In JSON, double every backslash. `push-agent-bridge status`
@@ -552,6 +555,8 @@ again when it is back."
 | `/schedule add <every\|at\|cron> <when> <prompt>` | `session/scheduleCreate`; `<when>` is one word or `"quoted"` (`every 1h`, `at 2026-10-29T09:00`, `at "tomorrow 9am"`); a cron spec is five fields or quoted |
 | `/schedule rm <id>` | `session/scheduleDelete` |
 | `/skills` | `skills/list` |
+| `/loop` | lists the chats with other agents the [loop guard](#23-loop-guard) paused ("No chat is paused." when none) |
+| `/loop resume [@handle]` | lets that chat (or every paused one) continue: its count starts again. An unknown handle answers "No paused chat with @handle." |
 | `/help` | lists the commands |
 | any other `/…` | sent to Coda as a prompt (Coda's own slash commands work) |
 
@@ -576,7 +581,7 @@ restarts."
 | Someone else talks to the agent by voice | Only the owner's calls are answered (the server refuses non-contacts first), one at a time; a transcript is never a `/` command |
 | Someone connects to the agent behind the owner's back | The agent cannot accept contact requests (`owner_decides`): the owner's policy and decisions do ([§20](#20-agent-connections)); an agent's invites count for nothing |
 | People chatting with the agent do not know the owner reads along | Each contact is told once per session, and in `/help`, that the owner can read the chat; clients show the same notice from the agent's profile |
-| Two agents talking in a loop | Replies, cards and refusals from other agents never prompt the backend (only plain text between agents is a turn); agents never call each other |
+| Two agents talking in a loop | Replies, cards and refusals from other agents never prompt the backend (only plain text between agents is a turn); the [loop guard](#23-loop-guard) pauses a chat with another agent after `loop_guard_turns` agent turns without a person, until a person writes there or the owner sends `/loop resume`; agents never call each other |
 
 **Voice calls.** The call's audio is encrypted end to end between the owner's app and the
 bridge. The call's audio and the text of each spoken sentence (masked) go to the
@@ -2278,7 +2283,9 @@ created (group:<id>)"), `waiting for owner
 - **Other agents:** an agent that is an accepted contact (and let in by the inbound
   policy) talks to it in texts, and the echo agent answers it in **plain text** ("echo:
   <text>"), a turn for the other agent's backend; its replies and cards (rich messages)
-  never prompt the echo agent. Agents never call each other (`NOT_ALLOWED`).
+  never prompt the echo agent. Two echo agents open to each other echo back and forth
+  until the [loop guard](#23-loop-guard) pauses their chat. Agents never call each other
+  (`NOT_ALLOWED`).
 - **Who may talk to it:** the owner, and the agent's **accepted contacts** that the
   owner's [inbound policy](#22-inbound-policy-and-agent-turns) lets in, each in their
   own direct conversation with the agent, where its replies and cards go. **Changed:** the
@@ -2415,3 +2422,28 @@ backend says to another agent (its `ContactReply`, or a `send_message` action) g
 plain text, so the other agent's backend hears it; to a person it is a rich reply, as
 always. Agents are not sent the notice that the owner reads along; their `/help` and
 `/status` are answered as any contact's, in rich replies.
+## 23. Loop guard
+
+Two agents that answer each other's texts could talk for ever. In each direct chat with
+another agent the bridge counts the **agent turns**: the plain texts by either agent since
+the last message by a person there ([design](superpowers/specs/2026-11-09-proactive-agents.md)
+§7.4). The other agent's texts count when they arrive (passed to the backend or not); the
+agent's own when the bridge sends them (a `ContactReply`, or a `send_message` action).
+Rich messages (replies, cards, notices) are not turns.
+
+At `loop_guard_turns` (config, default 20, at least 2) the chat is **paused**:
+
+- the other agent's texts no longer reach the backend (logged `loop_guard_ignored`), the
+  backend's replies there are dropped (`loop_guard_reply_dropped`) and its `send_message`
+  to that chat answers `paused` ("the loop guard paused this chat; the owner can resume it
+  with /loop resume");
+- once, a rich note in the chat, which the other bridge never takes as a turn: "Paused
+  after 20 turns between agents without a person. An owner can resume.", and one in the
+  owner's chat: "Paused the chat with @peer after 20 agent turns without a person. Send
+  /loop resume to let it continue.".
+
+The other agent's bridge counts the same messages and stops at the same turn, telling its
+own owner. A person's message in the chat starts the count again, and so does the owner's
+`/loop resume @peer` (that chat) or `/loop resume` (every chat); `/loop` lists the paused
+chats. Only the owner may run `/loop` (a contact hears "Only the agent's owner can use this
+command."). The counts live in memory: **a restart of the bridge resets them**.

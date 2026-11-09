@@ -35,6 +35,10 @@ pub enum Command {
     },
     ScheduleRemove(String),
     Skills,
+    /// `/loop`: the chats with other agents the loop guard paused.
+    LoopList,
+    /// `/loop resume [@handle]`: that chat (its handle without the `@`), or every one.
+    LoopResume(Option<String>),
     /// Any other `/…`: sent to the backend as a prompt.
     Passthrough(String),
     /// A known command with bad arguments: the usage line to reply with.
@@ -67,6 +71,7 @@ const TASK_USAGE: &str = "/task stop <id>";
 const BTW_USAGE: &str = "/btw <question>";
 const SCHEDULE_USAGE: &str =
     "/schedule list | /schedule add <every|at|cron> <when> <prompt> | /schedule rm <id>";
+const LOOP_USAGE: &str = "/loop | /loop resume [@handle]";
 
 /// The reply to `/help`: every command, one line each.
 /// Below the owner's `/help` (spec 2026-11-06 agent connections).
@@ -94,6 +99,7 @@ pub const HELP: &str = "\
 /btw <question>: ask aside; the answer stays out of the conversation
 /schedule list | add <every|at|cron> <when> <prompt> | rm <id>: scheduled prompts (lost when the agent restarts)
 /skills: list the skills
+/loop [resume [@handle]]: list the chats with other agents the loop guard paused, or let them (or one) continue
 /help: this list
 Any other /command goes to the agent as a prompt.";
 
@@ -184,6 +190,18 @@ pub fn parse(text: &str) -> Option<Command> {
         "btw" if arguments.is_empty() => Command::Usage(BTW_USAGE),
         "btw" => Command::Btw(arguments.to_owned()),
         "schedule" => schedule(arguments).unwrap_or(Command::Usage(SCHEDULE_USAGE)),
+        "loop" => match split_word(arguments) {
+            ("", _) => Command::LoopList,
+            ("resume", rest) => match one_word(rest) {
+                Some("") => Command::LoopResume(None),
+                Some(handle) => match handle.strip_prefix('@').unwrap_or(handle) {
+                    "" => Command::Usage(LOOP_USAGE),
+                    handle => Command::LoopResume(Some(handle.to_owned())),
+                },
+                None => Command::Usage(LOOP_USAGE),
+            },
+            _ => Command::Usage(LOOP_USAGE),
+        },
         _ => Command::Passthrough(text.to_owned()),
     };
     Some(command)
@@ -299,6 +317,8 @@ impl Command {
             Self::ScheduleAdd { .. } => "schedule add",
             Self::ScheduleRemove(_) => "schedule rm",
             Self::Skills => "skills",
+            Self::LoopList => "loop",
+            Self::LoopResume(_) => "loop resume",
             Self::Passthrough(_) => "passthrough",
             Self::Usage(_) => "usage",
         }
@@ -421,6 +441,23 @@ mod tests {
     }
 
     #[test]
+    fn loop_lists_or_resumes_one_or_all() {
+        assert_eq!(parsed("/loop"), Command::LoopList);
+        assert_eq!(parsed("/loop resume"), Command::LoopResume(None));
+        assert_eq!(
+            parsed("/loop resume @bob"),
+            Command::LoopResume(Some("bob".into()))
+        );
+        assert_eq!(
+            parsed("/loop resume bob"),
+            Command::LoopResume(Some("bob".into()))
+        );
+        for bad in ["/loop stop", "/loop resume @a @b", "/loop resume @"] {
+            assert_eq!(parsed(bad), Command::Usage(LOOP_USAGE), "{bad}");
+        }
+    }
+
+    #[test]
     fn task_stop_needs_an_id() {
         assert_eq!(parsed("/task stop t1"), Command::TaskStop("t1".into()));
         assert_eq!(parsed("/task stop"), Command::Usage(TASK_USAGE));
@@ -533,6 +570,7 @@ mod tests {
             "/btw",
             "/schedule",
             "/skills",
+            "/loop",
             "/help",
         ] {
             assert!(
@@ -555,6 +593,7 @@ mod tests {
             [
                 "/stop",
                 "/status",
+                "/loop [resume [@handle]]",
                 "/help",
                 "Any other /command goes to the agent as a prompt."
             ]

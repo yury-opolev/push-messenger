@@ -207,6 +207,8 @@ impl<M: Messenger> Core<M> {
                 self.command_in_background(BackendCommand::ScheduleRemove(id));
             }
             Command::Skills => self.command_in_background(BackendCommand::Skills),
+            Command::LoopList => self.loop_list(),
+            Command::LoopResume(handle) => self.loop_resume(handle.as_deref()),
         }
     }
 

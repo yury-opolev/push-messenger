@@ -74,6 +74,8 @@ impl<M: Messenger> Core<M> {
                 return;
             }
         }
+        self.loop_message(message.conversation_id, message.sender_id)
+            .await;
         match message.kind {
             MessageKind::Answer => self.on_answer(&message).await,
             // Another bridge's refusal never gets one back.

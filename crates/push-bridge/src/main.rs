@@ -536,6 +536,7 @@ async fn run(dir: &Path) -> Result<(), Failure> {
         roots,
         default_folder,
         default_mode: config.default_permission_mode,
+        loop_guard_turns: config.loop_guard_turns,
     };
     let (client, events) = open_client(&config, &state)?;
     let voice = voice_setup(&config, &client, dir);

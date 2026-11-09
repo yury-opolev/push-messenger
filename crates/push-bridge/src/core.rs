@@ -8,6 +8,7 @@ mod contacts;
 mod control;
 mod conversation;
 mod inbound;
+mod loop_guard;
 mod report;
 mod requests;
 mod turns;
@@ -92,6 +93,9 @@ pub struct BridgeOptions {
     pub default_folder: PathBuf,
     /// The permission mode of a new session (and after `/new`).
     pub default_mode: PermissionMode,
+    /// Agent turns without a person after which a chat with another agent is paused
+    /// (the loop guard; at least 2).
+    pub loop_guard_turns: u32,
 }
 
 /// Why the bridge stopped.
@@ -407,6 +411,8 @@ struct Core<M: Messenger> {
     accepts_contacts: bool,
     /// Which accepted contacts reach the backend (the owner's setting).
     inbound: InboundPolicy,
+    /// Chats with other agents and their turns (see [`loop_guard`]).
+    loops: loop_guard::LoopGuard,
     /// The accepted contacts' conversations and questions.
     contacts: contacts::Contacts,
     state: Arc<StateFile>,
@@ -528,6 +534,7 @@ impl<M: Messenger> Core<M> {
             skip_before_us,
             accepts_contacts,
             inbound: InboundPolicy::OwnerOnly,
+            loops: loop_guard::LoopGuard::new(options.loop_guard_turns),
             contacts: contacts::Contacts::default(),
             state,
             folder: options.default_folder.clone(),

@@ -1,5 +1,6 @@
-//! The inbound policy and agent turns (spec 2026-11-09 proactive agents §4, §7.2) with the
-//! echo backend: who besides the owner reaches it, and how it answers agents and people.
+//! The inbound policy, agent turns and the loop guard (spec 2026-11-09 proactive agents
+//! §4, §7.2, §7.4) with the echo backend: who besides the owner reaches it, how it answers
+//! agents and people, and how a chat between agents is paused.
 
 use push_sdk::{ConnectionState, ContactState, ConversationId, Event, InboundPolicy};
 
@@ -253,4 +254,224 @@ async fn agents_get_plain_text_without_the_notice_and_people_rich_replies() {
         .filter(|call| matches!(call, Call::Peers { users } if users.contains(&other)))
         .count();
     assert_eq!(reads, 1);
+}
+
+// The loop guard (spec §7.4).
+
+/// The echo agent open to contacts, pausing a chat with an agent after `turns`.
+async fn guarded(turns: u32) -> Harness {
+    let mut h = Harness::echo(300);
+    h.loop_guard_turns = turns;
+    h.messenger.set_inbound(InboundPolicy::Contacts);
+    h.start();
+    settle().await;
+    h
+}
+
+/// The rich replies' latest texts in the owner's chat (sends and their edits).
+fn owner_texts(h: &Harness) -> Vec<String> {
+    let owner = h.messenger.conversation();
+    let mut shown: Vec<(push_sdk::ClientMsgId, String)> = Vec::new();
+    for call in h.messenger.calls() {
+        match call {
+            Call::SendRich {
+                conversation,
+                id,
+                body,
+            } if conversation == owner && template(&body).starts_with("agent.reply@") => {
+                shown.push((id, param(&body, "text").unwrap_or_default()));
+            }
+            Call::EditRich { id, body, .. } => {
+                if let Some(entry) = shown.iter_mut().find(|(sent, _)| *sent == id) {
+                    entry.1 = param(&body, "text").unwrap_or_default();
+                }
+            }
+            _ => {}
+        }
+    }
+    shown.into_iter().map(|(_, text)| text).collect()
+}
+
+/// Waits for an owner's-chat reply containing `text`.
+async fn owner_saw(h: &Harness, text: &str) {
+    h.messenger
+        .wait_until(text, |_| {
+            owner_texts(h).iter().any(|shown| shown.contains(text))
+        })
+        .await;
+}
+
+/// The echo agent's echoes (plain texts other than the private notice) in `conversation`.
+fn echoes(h: &Harness, conversation: ConversationId) -> Vec<String> {
+    plain_to(h, conversation)
+        .into_iter()
+        .filter(|text| text != super::PRIVATE)
+        .collect()
+}
+
+/// `peer` writes `text`, and the echo agent's answer (its `count`th echo) is awaited.
+async fn turn(h: &Harness, peer: push_sdk::UserId, text: &str, count: usize) {
+    let conversation = h.messenger.conversation_with(peer);
+    h.messenger.says(peer, text);
+    h.messenger
+        .wait_until("the echo", |_| echoes(h, conversation).len() >= count)
+        .await;
+}
+
+const NOTE_4: &str = "Paused after 4 turns between agents without a person. An owner can resume.";
+const OWNER_NOTE_4: &str = "Paused the chat with @peer after 4 agent turns without a person. \
+Send /loop resume to let it continue.";
+
+#[tokio::test(start_paused = true)]
+async fn two_agents_stop_at_the_limit_and_say_so_once() {
+    let h = guarded(4).await;
+    let peer = foreign_agent(&h, "peer");
+    let with_peer = h.messenger.conversation_with(peer);
+    // The other agent answers each echo, as another echo agent would: turns 1 to 4.
+    turn(&h, peer, "hi", 1).await;
+    turn(&h, peer, "echo: hi", 2).await;
+    owner_saw(&h, OWNER_NOTE_4).await;
+    assert_eq!(replies_to(&h, with_peer), [NOTE_4]);
+    // Turn 5 and on are not passed on.
+    h.messenger.says(peer, "echo: echo: echo: hi");
+    h.messenger.says(peer, "anyone?");
+    settle().await;
+    assert_eq!(echoes(&h, with_peer), ["echo: hi", "echo: echo: hi"]);
+    assert_eq!(replies_to(&h, with_peer), [NOTE_4]);
+    let owner_notes = owner_texts(&h)
+        .iter()
+        .filter(|text| *text == OWNER_NOTE_4)
+        .count();
+    assert_eq!(owner_notes, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn send_message_counts_and_is_refused_in_a_paused_chat() {
+    let h = guarded(4).await;
+    let peer = foreign_agent(&h, "peer");
+    let with_peer = h.messenger.conversation_with(peer);
+    h.messenger.owner_says("send @peer one");
+    owner_saw(&h, "done: sent to @peer").await;
+    turn(&h, peer, "two", 2).await;
+    h.messenger.owner_says("send @peer four");
+    owner_saw(&h, OWNER_NOTE_4).await;
+    h.messenger.owner_says("send @peer five");
+    owner_saw(
+        &h,
+        "paused: the loop guard paused this chat; the owner can resume it with /loop resume",
+    )
+    .await;
+    assert_eq!(echoes(&h, with_peer), ["one", "echo: two", "four"]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_late_reply_to_a_paused_agent_is_dropped() {
+    let h = guarded(2).await;
+    let peer = foreign_agent(&h, "peer");
+    let with_peer = h.messenger.conversation_with(peer);
+    h.messenger.says(peer, "ask");
+    h.messenger
+        .wait_until("the card", |calls| {
+            calls.iter().any(|call| {
+                matches!(call,
+                Call::SendRich { conversation, body, .. }
+                    if *conversation == with_peer && template(body) == "agent.question@1")
+            })
+        })
+        .await;
+    let card = h
+        .messenger
+        .sent_rich()
+        .into_iter()
+        .find(|(_, body)| template(body) == "agent.question@1")
+        .unwrap()
+        .0;
+    h.messenger.says(peer, "hello");
+    h.messenger
+        .wait_until("paused", |_| {
+            replies_to(&h, with_peer).contains(
+                &"Paused after 2 turns between agents without a person. An owner can resume."
+                    .to_owned(),
+            )
+        })
+        .await;
+    h.messenger.answer_in(with_peer, peer, card, &["o1"]);
+    settle().await;
+    assert!(
+        echoes(&h, with_peer).is_empty(),
+        "{:?}",
+        echoes(&h, with_peer)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_owner_lists_and_resumes_paused_chats() {
+    let h = guarded(4).await;
+    let peer = foreign_agent(&h, "peer");
+    let with_peer = h.messenger.conversation_with(peer);
+    h.messenger.owner_says("/loop");
+    owner_saw(&h, "No chat is paused.").await;
+    turn(&h, peer, "hi", 1).await;
+    turn(&h, peer, "echo: hi", 2).await;
+    owner_saw(&h, OWNER_NOTE_4).await;
+
+    h.messenger.owner_says("/loop");
+    owner_saw(&h, "Paused chats with other agents:\n@peer").await;
+    h.messenger.owner_says("/loop resume @nobody");
+    owner_saw(&h, "No paused chat with @nobody.").await;
+    h.messenger.owner_says("/loop resume @peer");
+    owner_saw(&h, "Resumed the chat with @peer.").await;
+    turn(&h, peer, "again", 3).await;
+    assert_eq!(echoes(&h, with_peer)[2], "echo: again");
+
+    // Paused again after four more turns; `/loop resume` resumes every chat.
+    turn(&h, peer, "and again", 4).await;
+    h.messenger.says(peer, "and again and again");
+    h.messenger
+        .wait_until("paused again", |_| replies_to(&h, with_peer).len() == 2)
+        .await;
+    h.messenger.owner_says("/loop resume");
+    h.messenger
+        .wait_until("resumed again", |_| {
+            owner_texts(&h)
+                .iter()
+                .filter(|text| *text == "Resumed the chat with @peer.")
+                .count()
+                == 2
+        })
+        .await;
+    turn(&h, peer, "last", 5).await;
+
+    // A contact may not.
+    let alice = person(&h, "alice");
+    h.messenger.says(alice, "/loop resume");
+    h.messenger
+        .wait_until("refused", |_| {
+            replies_to(&h, h.messenger.conversation_with(alice))
+                .contains(&super::contacts::OWNER_ONLY.to_owned())
+        })
+        .await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_person_s_message_in_the_chat_resets_the_count() {
+    let h = guarded(4).await;
+    let peer = foreign_agent(&h, "peer");
+    let carol = person(&h, "carol");
+    let with_peer = h.messenger.conversation_with(peer);
+    turn(&h, peer, "one", 1).await;
+    h.messenger.inject(Event::MessageAdded(h.messenger.message(
+        with_peer,
+        carol,
+        push_sdk::MessageKind::Text,
+        "carry on",
+    )));
+    // Without Carol's message, this echo would be the fourth turn.
+    turn(&h, peer, "two", 2).await;
+    settle().await;
+    assert!(replies_to(&h, with_peer).is_empty(), "not paused yet");
+    turn(&h, peer, "three", 3).await;
+    h.messenger
+        .wait_until("paused", |_| replies_to(&h, with_peer) == [NOTE_4])
+        .await;
 }

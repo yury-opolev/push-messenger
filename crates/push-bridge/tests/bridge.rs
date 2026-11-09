@@ -106,6 +106,7 @@ impl Harness {
                 roots: vec![root.clone()],
                 default_folder: work.clone(),
                 default_mode: PermissionMode::Default,
+                loop_guard_turns: 20,
             },
         );
         if let Some(hub) = hub {

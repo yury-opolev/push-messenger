@@ -108,6 +108,13 @@ impl<M: Messenger> Core<M> {
             return;
         }
         let peer = self.peer(user).await;
+        if let Some(agent) = peer.as_ref().filter(|peer| peer.agent) {
+            self.agent_turn(conversation, &agent.handle);
+            if self.loop_paused(conversation) {
+                tracing::debug!(event = "loop_guard_ignored");
+                return;
+            }
+        }
         if !self.inbound_allows(peer.as_ref()) {
             tracing::info!(
                 event = "contact_not_allowed",
@@ -288,8 +295,19 @@ impl<M: Messenger> Core<M> {
             return;
         };
         if self.is_agent(user) {
-            if let Err(error) = self.messenger.send_text(conversation, text) {
-                tracing::warn!(event = "send_failed", code = error.code());
+            if self.loop_paused(conversation) {
+                tracing::info!(event = "loop_guard_reply_dropped");
+                return;
+            }
+            match self.messenger.send_text(conversation, text) {
+                Ok(_) => {
+                    let handle = self
+                        .known_peer(user)
+                        .map(|peer| peer.handle.clone())
+                        .unwrap_or_default();
+                    self.agent_turn(conversation, &handle);
+                }
+                Err(error) => tracing::warn!(event = "send_failed", code = error.code()),
             }
             return;
         }
@@ -475,7 +493,7 @@ impl<M: Messenger> Core<M> {
     }
 
     /// The bridge's own words to a contact (`agent.reply@1`, masked).
-    fn contact_reply(&self, conversation: ConversationId, text: &str) {
+    pub(super) fn contact_reply(&self, conversation: ConversationId, text: &str) {
         for body in reply_bodies(None, text) {
             self.send_to(conversation, &body);
         }
