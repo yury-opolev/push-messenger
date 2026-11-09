@@ -57,7 +57,9 @@ pub struct HistoryCursor {
 
 /// The history rows of a call that ended: the caller's always, the callee's unless the
 /// call was `Unreachable` (the callee never saw it). Times are Redis-clock milliseconds;
-/// `answered_ms` is set for calls that were answered.
+/// `answered_ms` is set for calls that were answered. `by_agent`: the caller is an agent
+/// (both rows are marked `started_by_agent`).
+#[allow(clippy::too_many_arguments)]
 pub fn ended_rows(
     call_id: Uuid,
     caller: UserId,
@@ -66,6 +68,7 @@ pub fn ended_rows(
     answered_ms: Option<i64>,
     ended_ms: i64,
     outcome: EndReason,
+    by_agent: bool,
 ) -> Vec<CallHistoryRow> {
     let duration_s = answered_ms.map_or(0, |answered| {
         u32::try_from((ended_ms - answered).max(0) / 1000).unwrap_or(u32::MAX)
@@ -80,7 +83,7 @@ pub fn ended_rows(
         ended_at: from_millis(ended_ms),
         duration_s,
         outcome,
-        started_by_agent: false,
+        started_by_agent: by_agent,
     };
     let mut rows = vec![row(caller, callee, CallDirection::Out)];
     if outcome != EndReason::Unreachable {
@@ -163,6 +166,7 @@ mod tests {
             Some(4_000),
             65_999,
             EndReason::Completed,
+            true,
         );
         assert_eq!(rows.len(), 2);
         assert_eq!(
@@ -179,20 +183,39 @@ mod tests {
             assert_eq!(row.answered_at, Some(from_millis(4_000)));
             assert_eq!(row.ended_at, from_millis(65_999));
             assert_eq!(row.outcome, EndReason::Completed);
+            assert!(row.started_by_agent, "both sides see who started it");
         }
     }
 
     #[test]
     fn an_unanswered_call_has_no_duration_and_unreachable_only_a_caller_row() {
         let (call, alice, bob) = (Uuid::now_v7(), UserId::new(), UserId::new());
-        let missed = ended_rows(call, alice, bob, 1_000, None, 46_000, EndReason::Missed);
+        let missed = ended_rows(
+            call,
+            alice,
+            bob,
+            1_000,
+            None,
+            46_000,
+            EndReason::Missed,
+            false,
+        );
         assert_eq!(missed.len(), 2);
         assert!(
-            missed
-                .iter()
-                .all(|row| row.duration_s == 0 && row.answered_at.is_none())
+            missed.iter().all(|row| row.duration_s == 0
+                && row.answered_at.is_none()
+                && !row.started_by_agent)
         );
-        let unreachable = ended_rows(call, alice, bob, 1_000, None, 1_000, EndReason::Unreachable);
+        let unreachable = ended_rows(
+            call,
+            alice,
+            bob,
+            1_000,
+            None,
+            1_000,
+            EndReason::Unreachable,
+            false,
+        );
         assert_eq!(unreachable.len(), 1);
         assert_eq!(unreachable[0].user, alice);
         assert_eq!(unreachable[0].direction, CallDirection::Out);

@@ -824,13 +824,8 @@ async fn started_by_agent_is_stored_with_conversations_and_calls<B: Backend>(bac
         None,
         start().timestamp_millis() + 30_000,
         EndReason::Missed,
-    )
-    .into_iter()
-    .map(|row| CallHistoryRow {
-        started_by_agent: true,
-        ..row
-    })
-    .collect();
+        true,
+    );
     let mut tx = store.begin().await.unwrap();
     tx.insert_conversation(marked.clone()).await.unwrap();
     tx.insert_conversation(plain.clone()).await.unwrap();

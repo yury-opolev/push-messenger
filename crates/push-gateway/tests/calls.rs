@@ -1001,9 +1001,10 @@ async fn agent_calls_only_its_owner() {
         wait_online(&stack, user, 1).await;
     }
 
-    // The agent calls a contact that is not its owner, and that contact calls the agent.
+    // The agent calls a contact that is not its owner (its owner's call policy is off by
+    // default), and that contact calls the agent.
     let call = invite(&mut agent_socket, friend).await;
-    expect_error(&mut agent_socket, &call, ErrorCode::NotContact).await;
+    expect_error(&mut agent_socket, &call, ErrorCode::NotAllowed).await;
     let call = invite(&mut friend_socket, agent).await;
     expect_error(&mut friend_socket, &call, ErrorCode::NotContact).await;
     quiet(&mut agent_socket).await;

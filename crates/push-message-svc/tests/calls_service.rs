@@ -5,7 +5,10 @@ use std::time::Duration;
 
 use prost::Message;
 use push_domain::calls::{CallDirection, CallHistoryRow, EndReason, Timing, ended_rows};
-use push_domain::{DeviceId, InMemoryStore, Messaging, RecordingNotifier, SystemClock, UserId};
+use push_domain::{
+    DeviceId, InMemoryStore, Messaging, OutgoingPolicy, OutgoingPolicyChange, RecordingNotifier,
+    SystemClock, UserId,
+};
 use push_message_svc::{
     CallHistory, CallHistoryApi, CallService, CallsApi, MessagingApi, Metrics, RedisCalls,
     RedisNotifier,
@@ -932,6 +935,78 @@ async fn calls_that_never_rang_are_in_the_history() {
 }
 
 #[tokio::test]
+async fn calls_an_agent_starts_are_marked_in_both_histories() {
+    let mut env = env(Timing::default()).await;
+    let (owner, friend) = (env.user().await, env.user().await);
+    let agent = Party {
+        user: UserId::new(),
+        device: DeviceId::new(),
+    };
+    env.messaging
+        .enroll_agent(owner.user, agent.user)
+        .await
+        .unwrap();
+    env.messaging
+        .device_registered(agent.device, agent.user)
+        .await
+        .unwrap();
+    env.online(agent.user, agent.device).await;
+    env.online(owner.user, owner.device).await;
+
+    // To the owner: always allowed, marked on both rows.
+    let call = Uuid::now_v7();
+    assert_eq!(
+        env.invite(agent, owner.user, call).await.unwrap().ended,
+        None
+    );
+    let cancel = v1::CallCancel {
+        call_id: id_bytes(call),
+    };
+    env.send(agent, call_request::Frame::Cancel(cancel))
+        .await
+        .unwrap();
+    let mine = history_with(&env, agent.user, 1).await;
+    let theirs = history_with(&env, owner.user, 1).await;
+    assert!(mine[0].started_by_agent && theirs[0].started_by_agent);
+
+    // The owner's call to the agent is not.
+    let call = Uuid::now_v7();
+    env.invite(owner, agent.user, call).await.unwrap();
+    let cancel = v1::CallCancel {
+        call_id: id_bytes(call),
+    };
+    env.send(owner, call_request::Frame::Cancel(cancel))
+        .await
+        .unwrap();
+    let theirs = history_with(&env, owner.user, 2).await;
+    assert_eq!(theirs[0].call_id, call);
+    assert!(!theirs[0].started_by_agent);
+
+    // To a contact under `allowed`, not reachable: the caller's row is marked.
+    env.messaging
+        .set_outgoing_policy(
+            owner.user,
+            agent.user,
+            OutgoingPolicyChange {
+                requests: Some(OutgoingPolicy::Allowed),
+                calls: Some(OutgoingPolicy::Allowed),
+                ..OutgoingPolicyChange::default()
+            },
+        )
+        .await
+        .unwrap();
+    env.contacts(agent, friend).await;
+    let call = Uuid::now_v7();
+    assert_eq!(
+        env.invite(agent, friend.user, call).await.unwrap().ended,
+        Some(ended(call, CallEndReason::Unreachable))
+    );
+    let mine = history_with(&env, agent.user, 3).await;
+    assert_eq!(mine[0].call_id, call);
+    assert!(mine[0].started_by_agent);
+}
+
+#[tokio::test]
 async fn the_history_api_shows_own_calls_only_and_hides_per_side() {
     let env = env(Timing::default()).await;
     let (alice, bob, carol) = (env.user().await, env.user().await, env.user().await);
@@ -948,6 +1023,7 @@ async fn the_history_api_shows_own_calls_only_and_hides_per_side() {
             Some(ended_ms - offset - 10_000),
             ended_ms - offset,
             EndReason::Completed,
+            false,
         );
         env.messaging.record_call(&rows).await.unwrap();
         calls.push(call);
@@ -1073,6 +1149,7 @@ async fn the_purge_deletes_only_rows_past_the_retention() {
             None,
             ended,
             EndReason::Missed,
+            false,
         );
         env.messaging.record_call(&rows).await.unwrap();
     }

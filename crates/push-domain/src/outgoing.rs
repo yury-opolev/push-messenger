@@ -62,8 +62,6 @@ impl Ask {
         Self::to(OutgoingKind::Chat, target)
     }
 
-    // Used by the calls gate (spec 2026-11-09 proactive agents §3.1, `CallInvite`).
-    #[allow(dead_code)]
     pub(crate) fn call(target: UserId) -> Self {
         Self::to(OutgoingKind::Call, target)
     }
@@ -222,8 +220,6 @@ async fn count<T: Tx>(
 
 /// Uses an approved call of `agent` to `callee` approved within [`CALL_GRANT`] before
 /// `now`, if there is one: the call passes the gate once. Returns whether one was used.
-// Used by the calls gate (spec 2026-11-09 proactive agents §3.3).
-#[allow(dead_code)]
 pub(crate) async fn use_call_grant<T: Tx>(
     tx: &mut T,
     agent: UserId,
