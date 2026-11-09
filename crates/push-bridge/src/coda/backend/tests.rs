@@ -680,6 +680,7 @@ fn the_serve_command_passes_arguments_as_a_list_and_drops_the_api_key() {
         &config,
         Path::new("/work/my folder"),
         PermissionMode::BypassPermissions,
+        &[("CODA_USER_MCP_DIR".into(), "/state/coda-mcp".into())],
     );
     let command = command.as_std();
     assert_eq!(command.get_program(), "coda");
@@ -702,6 +703,12 @@ fn the_serve_command_passes_arguments_as_a_list_and_drops_the_api_key() {
         command
             .get_envs()
             .any(|(name, value)| name == "CODA_SERVE_API_KEY" && value.is_none())
+    );
+    assert!(
+        command
+            .get_envs()
+            .any(|(name, value)| name == "CODA_USER_MCP_DIR"
+                && value == Some(std::ffi::OsStr::new("/state/coda-mcp")))
     );
 }
 
@@ -1281,4 +1288,108 @@ fn a_notification_is_urgent_by_flag_priority_or_label() {
     assert!(!urgent(
         serde_json::json!({"label": "Nightly", "priority": "low", "urgent": false})
     ));
+}
+
+/// A backend with the bridge's tools, its `.mcp.json` written into `dir`.
+fn tools_harness(dir: &crate::test_dir::TestDir) -> (Harness, ToolsLink) {
+    let link = ToolsLink {
+        endpoint: "the-endpoint".into(),
+        token: "the-token".into(),
+        exe: PathBuf::from("/bin/push-agent-bridge"),
+        dir: dir.path().join("coda-mcp"),
+    };
+    let (launcher, fakes) = FakeLauncher::new();
+    let (sender, events) = mpsc::unbounded_channel();
+    let backend = CodaBackend::with_launcher(launcher.clone(), sender).with_tools(
+        link.clone(),
+        Some(dir.path().join("missing").join(".mcp.json")),
+    );
+    let harness = Harness {
+        backend: Arc::new(backend),
+        events,
+        launcher,
+        fakes,
+    };
+    (harness, link)
+}
+
+#[tokio::test]
+async fn with_tools_coda_gets_its_mcp_folder_and_takes_contacts() {
+    let dir = crate::test_dir::TestDir::new();
+    let (mut h, link) = tools_harness(&dir);
+    assert!(h.backend.accepts_contacts());
+    let _fake = h.running().await;
+    assert_eq!(
+        h.launcher.envs(),
+        [vec![(
+            std::ffi::OsString::from("CODA_USER_MCP_DIR"),
+            link.dir.clone().into_os_string()
+        )]]
+    );
+    let written: Value =
+        serde_json::from_slice(&std::fs::read(link.dir.join(".mcp.json")).unwrap()).unwrap();
+    assert_eq!(written["mcpServers"]["push"]["args"], json!(["tools-mcp"]));
+    assert_eq!(
+        written["mcpServers"]["push"]["env"]["PUSH_BRIDGE_TOOLS_TOKEN"],
+        "the-token"
+    );
+}
+
+#[tokio::test]
+async fn without_tools_coda_gets_no_mcp_folder_and_no_contacts() {
+    let mut h = harness();
+    assert!(!h.backend.accepts_contacts());
+    let _fake = h.running().await;
+    assert_eq!(h.launcher.envs(), [Vec::new()]);
+}
+
+#[test]
+fn a_contact_s_text_is_framed_with_who_sent_it() {
+    let agent = ContactInfo {
+        handle: Some("bob".into()),
+        agent: true,
+    };
+    assert_eq!(
+        contact_frame(&agent, "hi\nthere"),
+        "[message from @bob (agent) — answer with send_message to \"@bob\"]\nhi\nthere"
+    );
+    let person = ContactInfo {
+        handle: Some("al".into()),
+        agent: false,
+    };
+    assert!(contact_frame(&person, "x").starts_with("[message from @al (person) — "));
+}
+
+#[tokio::test]
+async fn a_contact_s_text_is_a_prompt_and_a_steer_while_busy() {
+    let dir = crate::test_dir::TestDir::new();
+    let (mut h, _link) = tools_harness(&dir);
+    let mut fake = h.running().await;
+    let framed = "[message from @bob (agent) — answer with send_message to \"@bob\"]\nhi";
+    let contact = |backend: Arc<CodaBackend>| {
+        tokio::spawn(async move {
+            let info = ContactInfo {
+                handle: Some("bob".into()),
+                agent: true,
+            };
+            backend
+                .contact_prompt(ContactId("u-1".into()), info, "hi")
+                .await
+        })
+    };
+
+    let prompt = contact(Arc::clone(&h.backend));
+    let (id, params) = within(fake.expect("session/prompt")).await;
+    assert_eq!(params, json!({ "text": framed }));
+    fake.respond(&id, json!({})).await;
+    within(prompt).await.unwrap().unwrap();
+
+    let steered = contact(Arc::clone(&h.backend));
+    let (id, _) = within(fake.expect("session/prompt")).await;
+    fake.respond_error(&id, -32603, "busy: a turn is already running")
+        .await;
+    let (id, params) = within(fake.expect("session/steer")).await;
+    assert_eq!(params, json!({ "text": framed }));
+    fake.respond(&id, json!({"ok": true})).await;
+    within(steered).await.unwrap().unwrap();
 }

@@ -380,6 +380,16 @@ pub enum BackendEvent {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ContactId(pub String);
 
+/// Who an accepted contact is, as far as the core knows: for a backend that tells its
+/// agent whom to answer (Coda frames the text with it).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContactInfo {
+    /// Their handle without the `@`; `None` when their profile could not be read.
+    pub handle: Option<String>,
+    /// An agent (not a person).
+    pub agent: bool,
+}
+
 /// A backend command, from the owner's `/…` commands.
 #[derive(Clone, PartialEq, Eq)]
 pub enum BackendCommand {
@@ -476,11 +486,17 @@ pub trait Backend: Send + Sync + 'static {
     fn accepts_contacts(&self) -> bool {
         false
     }
-    /// An accepted contact's text, in their direct conversation with the agent. The
-    /// backend answers with [`BackendEvent::ContactReply`] and
-    /// [`BackendEvent::ContactRequest`] naming `contact`; it resolves when it is done with
-    /// the text. Called only when [`Backend::accepts_contacts`].
-    async fn contact_prompt(&self, _contact: ContactId, _text: &str) -> Result<(), BackendError> {
+    /// An accepted contact's text, in their direct conversation with the agent; `info`
+    /// says who they are. The backend answers with [`BackendEvent::ContactReply`] and
+    /// [`BackendEvent::ContactRequest`] naming `contact` (or with a `send_message`
+    /// action); it resolves when it is done with the text. Called only when
+    /// [`Backend::accepts_contacts`].
+    async fn contact_prompt(
+        &self,
+        _contact: ContactId,
+        _info: ContactInfo,
+        _text: &str,
+    ) -> Result<(), BackendError> {
         Err(unsupported("contact/prompt"))
     }
     /// Starts the agent in `options.folder` (restarting its process when the folder

@@ -30,8 +30,9 @@ use tokio::sync::{mpsc, oneshot};
 use crate::actions::{self, Action, ActionRequest};
 use crate::backend::{
     ActivityLabels, Answer, Backend, BackendCommand, BackendError, BackendEvent, BackendRequest,
-    BackendStatus, Capability, CommandReply, ContactId, ErrorKind, PendingMessages, RequestKind,
-    Responder, StartOptions, Started, SteerOutcome, TextFormat, TurnSource, unsupported,
+    BackendStatus, Capability, CommandReply, ContactId, ContactInfo, ErrorKind, PendingMessages,
+    RequestKind, Responder, StartOptions, Started, SteerOutcome, TextFormat, TurnSource,
+    unsupported,
 };
 use crate::config::EchoConfig;
 
@@ -206,7 +207,12 @@ impl Backend for EchoBackend {
         Some(HELP)
     }
 
-    async fn contact_prompt(&self, contact: ContactId, text: &str) -> Result<(), BackendError> {
+    async fn contact_prompt(
+        &self,
+        contact: ContactId,
+        _info: ContactInfo,
+        text: &str,
+    ) -> Result<(), BackendError> {
         let command = text.trim();
         let question = if command.eq_ignore_ascii_case("ask") {
             Some((ASK_QUESTION, &ASK_OPTIONS[..], false))

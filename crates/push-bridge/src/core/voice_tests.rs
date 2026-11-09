@@ -1831,6 +1831,13 @@ async fn the_agent_calls_a_contact_who_talks_with_the_backend_as_that_contact() 
         .wait_for(&format!("contact {contact} run the tests"), 1)
         .await;
     assert_eq!(v.h.count("prompt"), 0, "never the owner's session");
+    assert_eq!(
+        v.h.backend.contact_infos(),
+        [crate::backend::ContactInfo {
+            handle: Some("bob".into()),
+            agent: false
+        }]
+    );
     assert_eq!(v.h.count("steer"), 0);
     assert!(v.transcripts().is_empty(), "nothing in the owner's chat");
     assert!(

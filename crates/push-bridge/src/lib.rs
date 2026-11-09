@@ -21,6 +21,7 @@ pub mod peek;
 pub mod render;
 pub mod state;
 pub mod test_backend;
+pub mod tools;
 pub mod voice;
 
 #[cfg(test)]

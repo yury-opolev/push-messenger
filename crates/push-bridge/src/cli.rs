@@ -46,6 +46,9 @@ pub enum Command {
     },
     /// Starts the running bridge's paused backend again.
     Resume,
+    /// Serves the bridge's tools to Coda over stdio (MCP); Coda starts it, people do not,
+    /// so the help does not list it.
+    ToolsMcp,
     Help,
 }
 
@@ -164,6 +167,7 @@ pub fn parse(
                 drain_timeout: drain_timeout.take(),
             },
             "resume" => Command::Resume,
+            "tools-mcp" => Command::ToolsMcp,
             "help" => Command::Help,
             other => return Err(format!("unknown command {other}")),
         },
@@ -257,6 +261,12 @@ mod tests {
             }
         );
         assert_eq!(command(&["resume"]), Command::Resume);
+    }
+
+    #[test]
+    fn tools_mcp_parses_but_is_not_in_the_help() {
+        assert_eq!(command(&["tools-mcp"]), Command::ToolsMcp);
+        assert!(!USAGE.contains("tools-mcp"));
     }
 
     #[test]

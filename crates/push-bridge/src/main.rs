@@ -12,7 +12,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use push_bridge::backend::Backend;
-use push_bridge::coda::CodaBackend;
+use push_bridge::coda::mcp_config::{MCP_DIR, current_user_mcp_file};
+use push_bridge::coda::{CodaBackend, ToolsLink};
 use push_bridge::config::{self, BackendKind, CallsConfig, Config};
 use push_bridge::control::{Action, Calls, ControlCall, ControlHandle, ControlHub, error};
 use push_bridge::core::{Bridge, BridgeError, BridgeOptions, CallFlag};
@@ -20,6 +21,8 @@ use push_bridge::echo::EchoBackend;
 use push_bridge::logging;
 use push_bridge::messenger::{EVENT_QUEUE, Reconnect, SdkMessenger};
 use push_bridge::state::{self, BridgeSecretStore, StateFile};
+use push_bridge::tools::endpoint::{ActionSink, ToolsServer};
+use push_bridge::tools::{self, endpoint_text, new_token, tools_endpoint};
 use push_bridge::voice::VoiceSetup;
 use push_bridge::voice::adapter::advertise::advertise;
 use push_bridge::voice::adapter::report::log_totals;
@@ -133,6 +136,9 @@ async fn main() -> ExitCode {
             drain_timeout,
         } => pause(&dir, reason, drain_timeout).await,
         Command::Resume => resume(&dir).await,
+        Command::ToolsMcp => tools::mcp::run_stdio()
+            .await
+            .map_err(|error| Failure::general(format!("tools-mcp failed: {error}"))),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -530,6 +536,14 @@ async fn run(dir: &Path) -> Result<(), Failure> {
         BackendKind::Echo => None,
     };
     let echo = config.echo.unwrap_or_default();
+    let tools = match (&coda, config.tools) {
+        (Some(_), true) => serve_tools(dir),
+        (Some(_), false) => {
+            tracing::info!(event = "tools_unavailable", reason = "off");
+            None
+        }
+        (None, _) => None,
+    };
     let (roots, default_folder) =
         folders_of(&config, dir).ok_or_else(|| Failure::general("default_folder is not usable"))?;
     let options = BridgeOptions {
@@ -621,7 +635,16 @@ async fn run(dir: &Path) -> Result<(), Failure> {
         };
         let (backend_sender, backend_events) = mpsc::unbounded_channel();
         let backend: Arc<dyn Backend> = match &coda {
-            Some(coda) => Arc::new(CodaBackend::new(coda.clone(), backend_sender)),
+            Some(coda) => {
+                let backend = CodaBackend::new(coda.clone(), backend_sender.clone());
+                Arc::new(match &tools {
+                    Some(tools) => {
+                        tools.sink.attach(backend_sender);
+                        backend.with_tools(tools.link.clone(), current_user_mcp_file())
+                    }
+                    None => backend,
+                })
+            }
             None => Arc::new(EchoBackend::new(echo, backend_sender)),
         };
         let mut bridge = Bridge::new(
@@ -669,6 +692,9 @@ async fn run(dir: &Path) -> Result<(), Failure> {
     if let Some(serving) = serving {
         serving.abort();
     }
+    if let Some(tools) = tools {
+        tools.serving.abort();
+    }
     tracing::info!(event = "stopped", ok = result.is_ok());
     result
 }
@@ -691,6 +717,52 @@ fn serve_control(hub: &ControlHub) -> Option<tokio::task::JoinHandle<()>> {
             None
         }
     }
+}
+
+/// The tools endpoint while it serves (spec 2026-11-09 proactive agents §8).
+struct Tools {
+    /// What Coda's `.mcp.json` gets.
+    link: ToolsLink,
+    /// Where its actions go: each bridge run attaches its backend events.
+    sink: ActionSink,
+    serving: tokio::task::JoinHandle<()>,
+}
+
+/// Binds the tools endpoint with a fresh token and serves it; without it (no endpoint,
+/// or it is taken) Coda gets no tools and stays owner-only.
+fn serve_tools(dir: &Path) -> Option<Tools> {
+    let Some(endpoint) = tools_endpoint(&instance_id(dir)) else {
+        tracing::warn!(event = "tools_unavailable", reason = "no_runtime_dir");
+        return None;
+    };
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(error) => {
+            tracing::warn!(event = "tools_unavailable", reason = "no_exe", kind = ?error.kind());
+            return None;
+        }
+    };
+    let listener = match Listener::bind(&endpoint) {
+        Ok(listener) => listener,
+        Err(error) => {
+            tracing::warn!(event = "tools_unavailable", kind = ?error.kind());
+            return None;
+        }
+    };
+    let token = new_token();
+    let sink = ActionSink::new();
+    let serving = ToolsServer::new(&token, sink.clone()).serve(listener);
+    tracing::info!(event = "tools_listening");
+    Some(Tools {
+        link: ToolsLink {
+            endpoint: endpoint_text(&endpoint),
+            token,
+            exe,
+            dir: dir.join(MCP_DIR),
+        },
+        sink,
+        serving,
+    })
 }
 
 /// Sets the state shown on the control channel while no bridge runs.

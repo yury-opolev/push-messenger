@@ -149,6 +149,34 @@ async fn contacts_lets_in_every_accepted_contact() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn the_backend_learns_the_contact_s_handle_and_kind() {
+    let mut h = Harness::named("Test");
+    h.backend.set_accepts_contacts(true);
+    h.messenger.set_inbound(InboundPolicy::Contacts);
+    h.start();
+    settle().await;
+    let other = foreign_agent(&h, "other");
+    let alice = person(&h, "alice");
+    h.messenger.says(other, "hi");
+    h.backend.wait_for("contact", 1).await;
+    h.messenger.says(alice, "hello");
+    h.backend.wait_for("contact", 2).await;
+    assert_eq!(
+        h.backend.contact_infos(),
+        [
+            crate::backend::ContactInfo {
+                handle: Some("other".into()),
+                agent: true
+            },
+            crate::backend::ContactInfo {
+                handle: Some("alice".into()),
+                agent: false
+            }
+        ]
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_contact_s_group_text_opens_no_chat_and_reaches_nobody() {
     let h = started(Some(InboundPolicy::Contacts)).await;
     h.messenger.gate_chats(server_error("waiting_for_owner"));
