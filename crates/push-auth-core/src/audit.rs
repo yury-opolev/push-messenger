@@ -32,8 +32,9 @@ pub(crate) struct Subject {
     pub device: Option<Uuid>,
 }
 
-/// What an owner route of an agent concerned (spec 2026-11-06 agent connections D11),
-/// attached to its answer: ids, a count and the policy, never content.
+/// What an owner route of an agent concerned (spec 2026-11-06 agent connections D11; spec
+/// 2026-11-09 proactive agents D14), attached to its answer: ids, a kind, a count and the
+/// policy, never content.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct OwnerAudit {
     /// The signed-in caller, the owner if the route succeeded.
@@ -46,8 +47,33 @@ pub(crate) struct OwnerAudit {
     pub conversation: Option<Uuid>,
     /// How many items the answer held.
     pub count: Option<usize>,
-    /// The policy read or set.
+    /// The policy read or set (the connection or the inbound policy).
     pub policy: Option<&'static str>,
+    /// The outgoing policies read or set, in the order of
+    /// [`crate::owners::OUTGOING_KINDS`]; logged as `policy`.
+    pub outgoing: Option<[&'static str; 4]>,
+    /// The waiting action decided.
+    pub action: Option<Uuid>,
+    /// Its kind (`request`, `chat`, `group`, `invite`, `call`).
+    pub kind: Option<&'static str>,
+}
+
+impl OwnerAudit {
+    /// The policy as logged: `requests:ask chats:ask groups:off calls:off` for the outgoing
+    /// policies.
+    fn policy(&self) -> Option<String> {
+        match self.outgoing {
+            Some(outgoing) => Some(
+                crate::owners::OUTGOING_KINDS
+                    .iter()
+                    .zip(outgoing)
+                    .map(|(kind, policy)| format!("{kind}:{policy}"))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            ),
+            None => self.policy.map(str::to_owned),
+        }
+    }
 }
 
 /// Logs the security event of every answer that has one.
@@ -107,11 +133,14 @@ fn log(
     let peer_id = owner.peer.map(tracing::field::display);
     let conversation_id = owner.conversation.map(tracing::field::display);
     let count = owner.count;
-    let policy = owner.policy;
+    let policy = owner.policy();
+    let policy = policy.as_deref();
+    let action_id = owner.action.map(tracing::field::display);
+    let kind = owner.kind;
     if (200..300).contains(&status) {
-        tracing::info!(target: "security", event, route, status, code, ip, user_id, device_id, agent_id, peer_id, conversation_id, count, policy, "security event");
+        tracing::info!(target: "security", event, route, status, code, ip, user_id, device_id, agent_id, peer_id, conversation_id, count, policy, action_id, kind, "security event");
     } else {
-        tracing::warn!(target: "security", event, route, status, code, ip, user_id, device_id, agent_id, peer_id, conversation_id, count, policy, "security event");
+        tracing::warn!(target: "security", event, route, status, code, ip, user_id, device_id, agent_id, peer_id, conversation_id, count, policy, action_id, kind, "security event");
     }
 }
 
@@ -132,6 +161,13 @@ fn owner_event(method: &Method, route: &str, ok: bool) -> Option<&'static str> {
             "agent.view.history"
         }
         ("GET", "/v1/agents/{agent_id}/calls") => "agent.view.calls",
+        ("GET", "/v1/agents/{agent_id}/outgoing-policy") => "agent.outgoing_policy.read",
+        ("PUT", "/v1/agents/{agent_id}/outgoing-policy") => "agent.outgoing_policy.changed",
+        ("GET", "/v1/agents/{agent_id}/inbound-policy") => "agent.inbound_policy.read",
+        ("PUT", "/v1/agents/{agent_id}/inbound-policy") => "agent.inbound_policy.changed",
+        ("GET", "/v1/agents/{agent_id}/outgoing") => "agent.outgoing.listed",
+        ("POST", "/v1/agents/{agent_id}/outgoing/{action_id}/approve") => "agent.outgoing.approved",
+        ("POST", "/v1/agents/{agent_id}/outgoing/{action_id}/decline") => "agent.outgoing.declined",
         _ => return None,
     };
     Some(if ok { action } else { "agent.owner.refused" })
@@ -312,6 +348,61 @@ mod tests {
                 200,
                 Some("agent.view.calls"),
             ),
+            (
+                Method::GET,
+                "/v1/agents/{agent_id}/outgoing-policy",
+                200,
+                Some("agent.outgoing_policy.read"),
+            ),
+            (
+                Method::PUT,
+                "/v1/agents/{agent_id}/outgoing-policy",
+                200,
+                Some("agent.outgoing_policy.changed"),
+            ),
+            (
+                Method::GET,
+                "/v1/agents/{agent_id}/inbound-policy",
+                200,
+                Some("agent.inbound_policy.read"),
+            ),
+            (
+                Method::PUT,
+                "/v1/agents/{agent_id}/inbound-policy",
+                200,
+                Some("agent.inbound_policy.changed"),
+            ),
+            (
+                Method::GET,
+                "/v1/agents/{agent_id}/outgoing",
+                200,
+                Some("agent.outgoing.listed"),
+            ),
+            (
+                Method::POST,
+                "/v1/agents/{agent_id}/outgoing/{action_id}/approve",
+                200,
+                Some("agent.outgoing.approved"),
+            ),
+            (
+                Method::POST,
+                "/v1/agents/{agent_id}/outgoing/{action_id}/decline",
+                204,
+                Some("agent.outgoing.declined"),
+            ),
+            (
+                Method::POST,
+                "/v1/agents/{agent_id}/outgoing/{action_id}/approve",
+                404,
+                Some("agent.owner.refused"),
+            ),
+            (
+                Method::PUT,
+                "/v1/agents/{agent_id}/outgoing-policy",
+                400,
+                Some("agent.owner.refused"),
+            ),
+            (Method::GET, "/v1/agents/{agent_id}/outgoing", 503, None),
             (
                 Method::GET,
                 "/v1/agents/{agent_id}/policy",

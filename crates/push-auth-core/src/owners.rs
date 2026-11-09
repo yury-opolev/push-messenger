@@ -11,14 +11,16 @@ use axum::extract::rejection::QueryRejection;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use push_proto::internal::v1::agent_owners_client::AgentOwnersClient;
 use push_proto::internal::v1::{
     self as internal, AgentCallHistoryRequest, AgentHistoryRequest, AgentPeerRequest, AgentRef,
-    ResolveAction, ResolveRequest, SetAgentPolicyRequest,
+    ResolveAction, ResolveOutgoingRequest, ResolveRequest, SetAgentPolicyRequest,
+    SetInboundRequest, SetOutgoingRequest,
 };
 use push_proto::v1::{
-    ContactState, ContentType, ConversationKind, Deliver, EntryKind, ErrorCode, HistoryPage,
+    self as v1, ContactState, ContentType, ConversationKind, Deliver, EntryKind, ErrorCode,
+    HistoryPage, InboundPolicy, OutgoingKind, OutgoingPolicy, OutgoingState,
 };
 use push_proto::{error_from_status, id, id_bytes};
 use serde::Deserialize;
@@ -52,6 +54,60 @@ pub enum Resolve {
     Decline,
     Block,
 }
+
+/// The outgoing kinds of the API (spec 2026-11-09 proactive agents, D1), in the order of
+/// [`AgentSettings::outgoing`].
+pub const OUTGOING_KINDS: [&str; 4] = ["requests", "chats", "groups", "calls"];
+
+/// The values of an outgoing policy.
+pub const OUTGOING_POLICIES: [&str; 3] = ["allowed", "ask", "off"];
+
+/// The values of the inbound policy (D8).
+pub const INBOUND_POLICIES: [&str; 3] = ["owner_only", "owner_agents", "contacts"];
+
+/// An agent's settings as the API names them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentSettings {
+    /// One of [`INBOUND_POLICIES`].
+    pub inbound: &'static str,
+    /// One of [`OUTGOING_POLICIES`] per kind of [`OUTGOING_KINDS`].
+    pub outgoing: [&'static str; 4],
+}
+
+impl Default for AgentSettings {
+    /// What an agent whose owner never changed anything has.
+    fn default() -> Self {
+        Self {
+            inbound: "owner_only",
+            outgoing: ["ask", "ask", "off", "off"],
+        }
+    }
+}
+
+/// An action an agent started (D4), as the owner sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutgoingAction {
+    pub action_id: Uuid,
+    /// `request`, `chat`, `group`, `invite` or `call`.
+    pub kind: &'static str,
+    /// Request, chat and call: the other user.
+    pub target: Option<Uuid>,
+    /// Invite: the group; once approved, the chat or group it opened or created.
+    pub conversation: Option<Uuid>,
+    /// Group: its title.
+    pub title: Option<String>,
+    /// Group and invite: the members.
+    pub members: Vec<Uuid>,
+    /// `waiting`, `approved`, `declined`, `expired` or `failed`.
+    pub state: &'static str,
+    /// Failed: why, as the snake case name of the error code (`not_contact`).
+    pub error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub resolved_at: Option<DateTime<Utc>>,
+}
+
+/// A waiting action ends `expired` this long after it was created.
+const ACTION_EXPIRY: TimeDelta = TimeDelta::hours(24);
 
 /// message-svc's `AgentOwners` API. Every method is for `owner`'s `agent`; message-svc
 /// answers `NotFound` for any other pair.
@@ -114,6 +170,34 @@ pub trait AgentOwnerApi: Send + Sync + std::fmt::Debug {
         before: Option<CallCursor>,
         limit: u32,
     ) -> Result<Vec<CallEntry>, AuthError>;
+    /// The agent's settings.
+    async fn settings(&self, owner: Uuid, agent: Uuid) -> Result<AgentSettings, AuthError>;
+    /// Changes the outgoing policies given (each one of [`OUTGOING_POLICIES`], in the order
+    /// of [`OUTGOING_KINDS`]); the settings now.
+    async fn set_outgoing(
+        &self,
+        owner: Uuid,
+        agent: Uuid,
+        change: [Option<&'static str>; 4],
+    ) -> Result<AgentSettings, AuthError>;
+    /// Sets the inbound policy (one of [`INBOUND_POLICIES`]); the settings now.
+    async fn set_inbound(
+        &self,
+        owner: Uuid,
+        agent: Uuid,
+        policy: &'static str,
+    ) -> Result<AgentSettings, AuthError>;
+    /// The agent's waiting actions, oldest first.
+    async fn outgoing(&self, owner: Uuid, agent: Uuid) -> Result<Vec<OutgoingAction>, AuthError>;
+    /// Approves (carries out as the agent) or declines a waiting action; the action now. One
+    /// that is not waiting is `NotFound`.
+    async fn resolve_outgoing(
+        &self,
+        owner: Uuid,
+        agent: Uuid,
+        action: Uuid,
+        approve: bool,
+    ) -> Result<OutgoingAction, AuthError>;
 }
 
 /// message-svc's `AgentOwners` API over gRPC.
@@ -216,6 +300,118 @@ fn malformed(what: &str) -> AuthError {
 
 pub(crate) fn user(bytes: &[u8]) -> Result<Uuid, AuthError> {
     id(bytes).map_err(|_| malformed("a user id"))
+}
+
+/// An optional id: empty bytes are none.
+fn optional_id(bytes: &[u8]) -> Result<Option<Uuid>, AuthError> {
+    if bytes.is_empty() {
+        Ok(None)
+    } else {
+        user(bytes).map(Some)
+    }
+}
+
+fn outgoing_name(policy: OutgoingPolicy) -> Result<&'static str, AuthError> {
+    Ok(match policy {
+        OutgoingPolicy::Allowed => "allowed",
+        OutgoingPolicy::Ask => "ask",
+        OutgoingPolicy::Off => "off",
+        OutgoingPolicy::Unspecified => return Err(malformed("an outgoing policy")),
+    })
+}
+
+fn outgoing_code(name: &str) -> Option<OutgoingPolicy> {
+    Some(match name {
+        "allowed" => OutgoingPolicy::Allowed,
+        "ask" => OutgoingPolicy::Ask,
+        "off" => OutgoingPolicy::Off,
+        _ => return None,
+    })
+}
+
+fn inbound_name(policy: InboundPolicy) -> Result<&'static str, AuthError> {
+    Ok(match policy {
+        InboundPolicy::OwnerOnly => "owner_only",
+        InboundPolicy::OwnerAgents => "owner_agents",
+        InboundPolicy::Contacts => "contacts",
+        InboundPolicy::Unspecified => return Err(malformed("an inbound policy")),
+    })
+}
+
+fn inbound_code(name: &str) -> Option<InboundPolicy> {
+    Some(match name {
+        "owner_only" => InboundPolicy::OwnerOnly,
+        "owner_agents" => InboundPolicy::OwnerAgents,
+        "contacts" => InboundPolicy::Contacts,
+        _ => return None,
+    })
+}
+
+fn settings_of(reply: internal::AgentSettingsReply) -> Result<AgentSettings, AuthError> {
+    let settings = reply
+        .settings
+        .ok_or_else(|| malformed("missing settings"))?;
+    Ok(AgentSettings {
+        inbound: inbound_name(settings.inbound())?,
+        outgoing: [
+            outgoing_name(settings.requests())?,
+            outgoing_name(settings.chats())?,
+            outgoing_name(settings.groups())?,
+            outgoing_name(settings.calls())?,
+        ],
+    })
+}
+
+/// An error code as the API names it: `ERROR_CODE_NOT_CONTACT` is `not_contact`.
+fn error_name(code: ErrorCode) -> Option<String> {
+    if code == ErrorCode::Unspecified {
+        return None;
+    }
+    let name = code.as_str_name();
+    Some(
+        name.strip_prefix("ERROR_CODE_")
+            .unwrap_or(name)
+            .to_ascii_lowercase(),
+    )
+}
+
+fn action_of(action: &v1::OutgoingAction) -> Result<OutgoingAction, AuthError> {
+    let time =
+        |micros: i64| DateTime::from_timestamp_micros(micros).ok_or_else(|| malformed("a time"));
+    let kind = match action.kind() {
+        OutgoingKind::Request => "request",
+        OutgoingKind::Chat => "chat",
+        OutgoingKind::Group => "group",
+        OutgoingKind::Invite => "invite",
+        OutgoingKind::Call => "call",
+        OutgoingKind::Unspecified => return Err(malformed("an action kind")),
+    };
+    let state = match action.state() {
+        OutgoingState::Waiting => "waiting",
+        OutgoingState::Approved => "approved",
+        OutgoingState::OwnerDeclined => "declined",
+        OutgoingState::Expired => "expired",
+        OutgoingState::Failed => "failed",
+        OutgoingState::Unspecified => return Err(malformed("an action state")),
+    };
+    Ok(OutgoingAction {
+        action_id: id(&action.action_id).map_err(|_| malformed("an action id"))?,
+        kind,
+        target: optional_id(&action.target_user_id)?,
+        conversation: optional_id(&action.conversation_id)?,
+        title: (!action.title.is_empty()).then(|| action.title.clone()),
+        members: action
+            .member_ids
+            .iter()
+            .map(|member| user(member))
+            .collect::<Result<_, _>>()?,
+        state,
+        error: error_name(action.error()),
+        created_at: time(action.created_at)?,
+        resolved_at: (action.resolved_at != 0)
+            .then(|| time(action.resolved_at))
+            .transpose()?,
+    })
 }
 
 #[async_trait]
@@ -390,6 +586,104 @@ impl AgentOwnerApi for GrpcAgentOwners {
             .map(crate::calls::entry)
             .collect()
     }
+
+    async fn settings(&self, owner: Uuid, agent: Uuid) -> Result<AgentSettings, AuthError> {
+        let reply = self
+            .client
+            .clone()
+            .get_settings(of(owner, agent))
+            .await
+            .map_err(|status| refused("GetSettings", &status))?;
+        settings_of(reply.into_inner())
+    }
+
+    async fn set_outgoing(
+        &self,
+        owner: Uuid,
+        agent: Uuid,
+        change: [Option<&'static str>; 4],
+    ) -> Result<AgentSettings, AuthError> {
+        let mut codes = [None; 4];
+        for ((code, name), kind) in codes.iter_mut().zip(change).zip(OUTGOING_KINDS) {
+            if let Some(name) = name {
+                let policy = outgoing_code(name).ok_or(AuthError::Invalid(Invalid {
+                    field: kind,
+                    reason: "expected allowed, ask or off",
+                }))?;
+                *code = Some(i32::from(policy));
+            }
+        }
+        let [requests, chats, groups, calls] = codes;
+        let reply = self
+            .client
+            .clone()
+            .set_outgoing(SetOutgoingRequest {
+                agent: Some(of(owner, agent)),
+                requests,
+                chats,
+                groups,
+                calls,
+            })
+            .await
+            .map_err(|status| refused("SetOutgoing", &status))?;
+        settings_of(reply.into_inner())
+    }
+
+    async fn set_inbound(
+        &self,
+        owner: Uuid,
+        agent: Uuid,
+        policy: &'static str,
+    ) -> Result<AgentSettings, AuthError> {
+        let code = inbound_code(policy).ok_or(AuthError::Invalid(Invalid {
+            field: "policy",
+            reason: "expected owner_only, owner_agents or contacts",
+        }))?;
+        let reply = self
+            .client
+            .clone()
+            .set_inbound(SetInboundRequest {
+                agent: Some(of(owner, agent)),
+                policy: code.into(),
+            })
+            .await
+            .map_err(|status| refused("SetInbound", &status))?;
+        settings_of(reply.into_inner())
+    }
+
+    async fn outgoing(&self, owner: Uuid, agent: Uuid) -> Result<Vec<OutgoingAction>, AuthError> {
+        let reply = self
+            .client
+            .clone()
+            .list_outgoing(of(owner, agent))
+            .await
+            .map_err(|status| refused("ListOutgoing", &status))?;
+        reply.into_inner().actions.iter().map(action_of).collect()
+    }
+
+    async fn resolve_outgoing(
+        &self,
+        owner: Uuid,
+        agent: Uuid,
+        action: Uuid,
+        approve: bool,
+    ) -> Result<OutgoingAction, AuthError> {
+        let reply = self
+            .client
+            .clone()
+            .resolve_outgoing(ResolveOutgoingRequest {
+                agent: Some(of(owner, agent)),
+                action_id: id_bytes(action),
+                approve,
+            })
+            .await
+            .map_err(|status| refused("ResolveOutgoing", &status))?;
+        let action = reply
+            .into_inner()
+            .action
+            .ok_or_else(|| malformed("missing action"))?;
+        action_of(&action)
+    }
 }
 
 /// Without message-svc: every call is `Unavailable`.
@@ -440,6 +734,37 @@ impl AgentOwnerApi for NoAgentOwners {
         _: Option<CallCursor>,
         _: u32,
     ) -> Result<Vec<CallEntry>, AuthError> {
+        Err(AuthError::Unavailable)
+    }
+    async fn settings(&self, _: Uuid, _: Uuid) -> Result<AgentSettings, AuthError> {
+        Err(AuthError::Unavailable)
+    }
+    async fn set_outgoing(
+        &self,
+        _: Uuid,
+        _: Uuid,
+        _: [Option<&'static str>; 4],
+    ) -> Result<AgentSettings, AuthError> {
+        Err(AuthError::Unavailable)
+    }
+    async fn set_inbound(
+        &self,
+        _: Uuid,
+        _: Uuid,
+        _: &'static str,
+    ) -> Result<AgentSettings, AuthError> {
+        Err(AuthError::Unavailable)
+    }
+    async fn outgoing(&self, _: Uuid, _: Uuid) -> Result<Vec<OutgoingAction>, AuthError> {
+        Err(AuthError::Unavailable)
+    }
+    async fn resolve_outgoing(
+        &self,
+        _: Uuid,
+        _: Uuid,
+        _: Uuid,
+        _: bool,
+    ) -> Result<OutgoingAction, AuthError> {
         Err(AuthError::Unavailable)
     }
 }
@@ -826,6 +1151,7 @@ pub(crate) async fn conversations(
                 "message_count": conversation.message_count,
                 "hidden": conversation.hidden,
                 "peer_deleted": conversation.peer_deleted,
+                "started_by_agent": conversation.started_by_agent,
             }));
         }
         audit.count = Some(listed.len());
@@ -959,4 +1285,319 @@ pub(crate) async fn calls(
     }
     .await;
     finish(result, audit)
+}
+
+/// `name` if it is one of `known`.
+fn known(known: &[&'static str], name: &str) -> Option<&'static str> {
+    known.iter().copied().find(|known| *known == name)
+}
+
+fn outgoing_json(settings: AgentSettings) -> Value {
+    let [requests, chats, groups, calls] = settings.outgoing;
+    json!({ "requests": requests, "chats": chats, "groups": groups, "calls": calls })
+}
+
+/// `GET /v1/agents/{agent_id}/outgoing-policy`: `{"requests", "chats", "groups", "calls"}`,
+/// each `allowed`, `ask` or `off` (spec 2026-11-09 proactive agents, §6.1).
+pub(crate) async fn get_outgoing_policy(
+    State(api): State<Api>,
+    headers: HeaderMap,
+    ClientIp(ip): ClientIp,
+    Path(agent_id): Path<String>,
+) -> Response {
+    let mut audit = OwnerAudit::default();
+    let result = async {
+        let (owner, agent) = owner_of(&api, &headers, ip, &agent_id, &mut audit).await?;
+        let settings = api.agent_owners.settings(owner, agent).await?;
+        audit.outgoing = Some(settings.outgoing);
+        Ok(Json(outgoing_json(settings)).into_response())
+    }
+    .await;
+    finish(result, audit)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OutgoingBody {
+    #[serde(default)]
+    requests: Option<String>,
+    #[serde(default)]
+    chats: Option<String>,
+    #[serde(default)]
+    groups: Option<String>,
+    #[serde(default)]
+    calls: Option<String>,
+}
+
+/// `PUT /v1/agents/{agent_id}/outgoing-policy` with any of the four kinds: all four now.
+/// Actions already waiting keep waiting.
+pub(crate) async fn put_outgoing_policy(
+    State(api): State<Api>,
+    headers: HeaderMap,
+    ClientIp(ip): ClientIp,
+    Path(agent_id): Path<String>,
+    body: Result<JsonBody<OutgoingBody>, AuthError>,
+) -> Response {
+    let mut audit = OwnerAudit::default();
+    let result = async {
+        let (owner, agent) = owner_of(&api, &headers, ip, &agent_id, &mut audit).await?;
+        let JsonBody(body) = body?;
+        let mut change = [None; 4];
+        let given = [body.requests, body.chats, body.groups, body.calls];
+        for ((slot, value), kind) in change.iter_mut().zip(given).zip(OUTGOING_KINDS) {
+            if let Some(value) = value {
+                *slot = Some(known(&OUTGOING_POLICIES, &value).ok_or(AuthError::Invalid(
+                    Invalid {
+                        field: kind,
+                        reason: "expected allowed, ask or off",
+                    },
+                ))?);
+            }
+        }
+        let settings = api.agent_owners.set_outgoing(owner, agent, change).await?;
+        audit.outgoing = Some(settings.outgoing);
+        Ok(Json(outgoing_json(settings)).into_response())
+    }
+    .await;
+    finish(result, audit)
+}
+
+/// `GET /v1/agents/{agent_id}/inbound-policy`: `{"policy": "owner_only"}`.
+pub(crate) async fn get_inbound_policy(
+    State(api): State<Api>,
+    headers: HeaderMap,
+    ClientIp(ip): ClientIp,
+    Path(agent_id): Path<String>,
+) -> Response {
+    let mut audit = OwnerAudit::default();
+    let result = async {
+        let (owner, agent) = owner_of(&api, &headers, ip, &agent_id, &mut audit).await?;
+        let settings = api.agent_owners.settings(owner, agent).await?;
+        audit.policy = Some(settings.inbound);
+        Ok(Json(json!({ "policy": settings.inbound })).into_response())
+    }
+    .await;
+    finish(result, audit)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct InboundBody {
+    policy: String,
+}
+
+/// `PUT /v1/agents/{agent_id}/inbound-policy {"policy"}`: the policy now.
+pub(crate) async fn put_inbound_policy(
+    State(api): State<Api>,
+    headers: HeaderMap,
+    ClientIp(ip): ClientIp,
+    Path(agent_id): Path<String>,
+    body: Result<JsonBody<InboundBody>, AuthError>,
+) -> Response {
+    let mut audit = OwnerAudit::default();
+    let result = async {
+        let (owner, agent) = owner_of(&api, &headers, ip, &agent_id, &mut audit).await?;
+        let JsonBody(body) = body?;
+        let policy = known(&INBOUND_POLICIES, &body.policy).ok_or(AuthError::Invalid(Invalid {
+            field: "policy",
+            reason: "expected owner_only, owner_agents or contacts",
+        }))?;
+        let settings = api.agent_owners.set_inbound(owner, agent, policy).await?;
+        audit.policy = Some(settings.inbound);
+        Ok(Json(json!({ "policy": settings.inbound })).into_response())
+    }
+    .await;
+    finish(result, audit)
+}
+
+/// The profiles of everyone `actions` name, as `agent` may see them, by user.
+async fn action_profiles(
+    api: &Api,
+    agent: Uuid,
+    actions: &[OutgoingAction],
+) -> Result<std::collections::HashMap<Uuid, Value>, AuthError> {
+    let users: Vec<Uuid> = actions
+        .iter()
+        .flat_map(|action| action.target.iter().chain(&action.members).copied())
+        .collect();
+    let profiles = profiles_of(api, agent, &users).await?;
+    Ok(users.into_iter().zip(profiles).collect())
+}
+
+/// One action as the API answers it.
+fn action_json(
+    action: &OutgoingAction,
+    profiles: &std::collections::HashMap<Uuid, Value>,
+) -> Value {
+    let profile = |user: &Uuid| profiles.get(user).cloned().unwrap_or(Value::Null);
+    json!({
+        "action_id": action.action_id,
+        "kind": action.kind,
+        "target": action.target.as_ref().map_or(Value::Null, profile),
+        "conversation_id": action.conversation,
+        "title": action.title,
+        "members": action.members.iter().map(profile).collect::<Vec<_>>(),
+        "state": action.state,
+        "error": action.error,
+        "created_at": rfc3339(action.created_at),
+        "expires_at": rfc3339(action.created_at + ACTION_EXPIRY),
+        "resolved_at": action.resolved_at.map(rfc3339),
+    })
+}
+
+/// `GET /v1/agents/{agent_id}/outgoing`: `{"actions": [<action>]}`, the actions waiting for
+/// the owner, oldest first.
+pub(crate) async fn list_outgoing(
+    State(api): State<Api>,
+    headers: HeaderMap,
+    ClientIp(ip): ClientIp,
+    Path(agent_id): Path<String>,
+) -> Response {
+    let mut audit = OwnerAudit::default();
+    let result = async {
+        let (owner, agent) = owner_of(&api, &headers, ip, &agent_id, &mut audit).await?;
+        let actions = api.agent_owners.outgoing(owner, agent).await?;
+        let profiles = action_profiles(&api, agent, &actions).await?;
+        audit.count = Some(actions.len());
+        let actions: Vec<Value> = actions
+            .iter()
+            .map(|action| action_json(action, &profiles))
+            .collect();
+        Ok(Json(json!({ "actions": actions })).into_response())
+    }
+    .await;
+    finish(result, audit)
+}
+
+async fn resolve_outgoing(
+    api: Api,
+    headers: HeaderMap,
+    ip: Option<std::net::IpAddr>,
+    (agent_id, action_id): (String, String),
+    approve: bool,
+) -> Response {
+    let mut audit = OwnerAudit::default();
+    let result = async {
+        let (owner, agent) = owner_of(&api, &headers, ip, &agent_id, &mut audit).await?;
+        let action_id = path_user(&action_id)?;
+        audit.action = Some(action_id);
+        let action = api
+            .agent_owners
+            .resolve_outgoing(owner, agent, action_id, approve)
+            .await?;
+        audit.kind = Some(action.kind);
+        if !approve {
+            return Ok(StatusCode::NO_CONTENT.into_response());
+        }
+        // The action is carried out already: a failed profile lookup must not turn it into
+        // an error (a retry would be `not_found`), so the users are answered by id only.
+        let profiles = match action_profiles(&api, agent, std::slice::from_ref(&action)).await {
+            Ok(profiles) => profiles,
+            Err(_) => action
+                .target
+                .iter()
+                .chain(&action.members)
+                .map(|user| (*user, hidden_profile(*user)))
+                .collect(),
+        };
+        Ok(Json(json!({ "action": action_json(&action, &profiles) })).into_response())
+    }
+    .await;
+    finish(result, audit)
+}
+
+/// `POST /v1/agents/{agent_id}/outgoing/{action_id}/approve`: `{"action": <action>}`,
+/// `approved` or `failed` (with the error); an action that is not waiting is `not_found`.
+pub(crate) async fn approve_outgoing(
+    State(api): State<Api>,
+    headers: HeaderMap,
+    ClientIp(ip): ClientIp,
+    Path(ids): Path<(String, String)>,
+) -> Response {
+    resolve_outgoing(api, headers, ip, ids, true).await
+}
+
+/// `POST /v1/agents/{agent_id}/outgoing/{action_id}/decline`: 204; an action that is not
+/// waiting is `not_found`.
+pub(crate) async fn decline_outgoing(
+    State(api): State<Api>,
+    headers: HeaderMap,
+    ClientIp(ip): ClientIp,
+    Path(ids): Path<(String, String)>,
+) -> Response {
+    resolve_outgoing(api, headers, ip, ids, false).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn message_svc_actions_read_as_the_api_names_them() {
+        let (action, group, member) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+        let wire = v1::OutgoingAction {
+            action_id: id_bytes(action),
+            agent_user_id: id_bytes(Uuid::now_v7()),
+            kind: OutgoingKind::Invite.into(),
+            target_user_id: Vec::new(),
+            conversation_id: id_bytes(group),
+            title: String::new(),
+            member_ids: vec![id_bytes(member)],
+            state: OutgoingState::Failed.into(),
+            error: ErrorCode::NotContact.into(),
+            created_at: 1_790_000_000_000_000,
+            resolved_at: 1_790_000_060_000_000,
+        };
+        let read = action_of(&wire).unwrap();
+        assert_eq!(
+            read,
+            OutgoingAction {
+                action_id: action,
+                kind: "invite",
+                target: None,
+                conversation: Some(group),
+                title: None,
+                members: vec![member],
+                state: "failed",
+                error: Some("not_contact".to_owned()),
+                created_at: DateTime::from_timestamp(1_790_000_000, 0).unwrap(),
+                resolved_at: DateTime::from_timestamp(1_790_000_060, 0),
+            }
+        );
+        let waiting = v1::OutgoingAction {
+            state: OutgoingState::OwnerDeclined.into(),
+            error: ErrorCode::Unspecified.into(),
+            resolved_at: 0,
+            title: "Plans".to_owned(),
+            ..wire.clone()
+        };
+        let read = action_of(&waiting).unwrap();
+        assert_eq!(
+            (
+                read.state,
+                read.error,
+                read.resolved_at,
+                read.title.as_deref()
+            ),
+            ("declined", None, None, Some("Plans"))
+        );
+        let unknown = v1::OutgoingAction {
+            kind: OutgoingKind::Unspecified.into(),
+            ..wire
+        };
+        assert_eq!(action_of(&unknown), Err(AuthError::Unavailable));
+    }
+
+    #[test]
+    fn an_action_that_is_not_waiting_is_not_found() {
+        let status = push_proto::error_status(
+            tonic::Code::NotFound,
+            v1::Error {
+                code: ErrorCode::TargetNotFound.into(),
+                message: "no such waiting action".to_owned(),
+                ..v1::Error::default()
+            },
+        );
+        assert_eq!(refused("ResolveOutgoing", &status), AuthError::NotFound);
+    }
 }

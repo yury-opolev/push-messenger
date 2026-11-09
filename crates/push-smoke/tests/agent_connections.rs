@@ -312,6 +312,19 @@ fn owner_routes(agent: Uuid, user: Uuid, conversation: &str) -> Vec<(reqwest::Me
             format!("{base}/conversations/{conversation}/messages"),
         ),
         (reqwest::Method::GET, format!("{base}/calls")),
+        (reqwest::Method::GET, format!("{base}/outgoing-policy")),
+        (reqwest::Method::PUT, format!("{base}/outgoing-policy")),
+        (reqwest::Method::GET, format!("{base}/inbound-policy")),
+        (reqwest::Method::PUT, format!("{base}/inbound-policy")),
+        (reqwest::Method::GET, format!("{base}/outgoing")),
+        (
+            reqwest::Method::POST,
+            format!("{base}/outgoing/{conversation}/approve"),
+        ),
+        (
+            reqwest::Method::POST,
+            format!("{base}/outgoing/{conversation}/decline"),
+        ),
     ]
 }
 
@@ -371,15 +384,22 @@ async fn agents_connect_under_their_owners_policy_and_the_owner_reads_their_chat
     .expect("both agents enrolled in message-svc");
     // An agent's contact requests and new chats wait for its owner by default (spec
     // 2026-11-09 proactive agents); this owner lets Echo's go at once.
-    sqlx::query(
-        "INSERT INTO messaging.agent_settings \
-         (agent_user_id, inbound, requests, chats, groups, calls, changed_at) \
-         VALUES ($1, 1, 1, 1, 3, 3, now())",
+    let (status, policy) = owner_call(
+        &http,
+        &base,
+        reqwest::Method::PUT,
+        &format!("/v1/agents/{}/outgoing-policy", echo.user),
+        &owner.token,
+        Some(json!({"requests": "allowed", "chats": "allowed"})),
     )
-    .bind(echo.user)
-    .execute(&message_db)
-    .await
-    .unwrap();
+    .await;
+    assert_eq!(
+        (status, policy),
+        (
+            200,
+            json!({"requests": "allowed", "chats": "allowed", "groups": "off", "calls": "off"})
+        )
+    );
 
     let url = stack.socket_url.clone();
     let mut owner_socket = ready(&url, &owner.token).await;

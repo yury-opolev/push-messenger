@@ -136,6 +136,23 @@ pub fn router(api: Api) -> Router {
             "/v1/agents/{agent_id}/contacts/{user_id}",
             delete(owners::remove_contact),
         )
+        .route(
+            "/v1/agents/{agent_id}/outgoing-policy",
+            get(owners::get_outgoing_policy).put(owners::put_outgoing_policy),
+        )
+        .route(
+            "/v1/agents/{agent_id}/inbound-policy",
+            get(owners::get_inbound_policy).put(owners::put_inbound_policy),
+        )
+        .route("/v1/agents/{agent_id}/outgoing", get(owners::list_outgoing))
+        .route(
+            "/v1/agents/{agent_id}/outgoing/{action_id}/approve",
+            post(owners::approve_outgoing),
+        )
+        .route(
+            "/v1/agents/{agent_id}/outgoing/{action_id}/decline",
+            post(owners::decline_outgoing),
+        )
         .route("/v1/users", get(profiles))
         .route("/v1/users/me", get(own_profile).patch(update_profile))
         .route("/v1/users/lookup", get(lookup))
