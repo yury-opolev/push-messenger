@@ -201,6 +201,11 @@ where
         if callee == caller {
             return Err(invalid("callee_user_id: a user cannot call themselves"));
         }
+        // Before the permission: an agent's permission is stateful (a call grant or the
+        // outgoing gate), so a resend must not be gated again.
+        if self.repeated_invite(invite.call_id, caller, device).await? {
+            return Ok(CallReply::default());
+        }
         let by_agent = self
             .messaging
             .call_permission(caller, callee)

@@ -41,6 +41,7 @@ struct Env {
     _container: ContainerAsync<Redis>,
     url: String,
     messaging: Arc<Messaging<InMemoryStore, SystemClock, Arc<RecordingNotifier>>>,
+    notifier: Arc<RecordingNotifier>,
     service: Arc<Service>,
     metrics: Arc<Metrics>,
     admin: MultiplexedConnection,
@@ -64,10 +65,11 @@ async fn env(timing: Timing) -> Env {
         .await
         .expect("the Redis port");
     let url = format!("redis://127.0.0.1:{port}");
+    let notifier = Arc::new(RecordingNotifier::default());
     let messaging = Arc::new(Messaging::new(
         InMemoryStore::default(),
         SystemClock,
-        Arc::new(RecordingNotifier::default()),
+        Arc::clone(&notifier),
     ));
     let metrics = Arc::new(Metrics::new());
     let service = Arc::new(CallService::new(
@@ -86,6 +88,7 @@ async fn env(timing: Timing) -> Env {
         _container: container,
         url,
         messaging,
+        notifier,
         service,
         metrics,
         admin,
@@ -1097,6 +1100,121 @@ async fn an_agents_call_to_a_contact_follows_its_owners_call_policy() {
         (Code::ResourceExhausted, ErrorCode::RateLimited)
     );
     assert!(error.retry_after_s.is_some_and(|seconds| seconds > 0));
+}
+
+/// An agent of a new owner, enrolled with one device, a contact of `friend`.
+async fn agent_of(env: &Env, owner: Party, friend: Party, calls: OutgoingPolicy) -> Party {
+    let agent = Party {
+        user: UserId::new(),
+        device: DeviceId::new(),
+    };
+    env.messaging
+        .enroll_agent(owner.user, agent.user)
+        .await
+        .unwrap();
+    env.messaging
+        .device_registered(agent.device, agent.user)
+        .await
+        .unwrap();
+    env.messaging
+        .set_outgoing_policy(
+            owner.user,
+            agent.user,
+            OutgoingPolicyChange {
+                requests: Some(OutgoingPolicy::Allowed),
+                calls: Some(calls),
+                ..OutgoingPolicyChange::default()
+            },
+        )
+        .await
+        .unwrap();
+    env.contacts(agent, friend).await;
+    agent
+}
+
+#[tokio::test]
+async fn a_resent_invite_of_an_approved_agent_call_is_not_gated_again() {
+    let mut env = env(Timing::default()).await;
+    let (owner, friend) = (env.user().await, env.user().await);
+    let agent = agent_of(&env, owner, friend, OutgoingPolicy::Ask).await;
+    env.online(agent.user, agent.device).await;
+    env.online(friend.user, friend.device).await;
+    let status = env
+        .invite(agent, friend.user, Uuid::now_v7())
+        .await
+        .unwrap_err();
+    assert_eq!(code(&status), ErrorCode::WaitingForOwner);
+    let waiting = env
+        .messaging
+        .waiting_outgoing(owner.user, agent.user)
+        .await
+        .unwrap();
+    env.messaging
+        .approve_outgoing(owner.user, agent.user, waiting[0].action_id)
+        .await
+        .unwrap();
+    let call = Uuid::now_v7();
+    assert_eq!(
+        env.invite(agent, friend.user, call).await.unwrap().ended,
+        None
+    );
+    env.notifier.take();
+
+    // Its reply was lost: the same invite again is accepted without effect.
+    assert_eq!(
+        env.invite(agent, friend.user, call).await.unwrap(),
+        CallReply::default()
+    );
+    assert!(
+        env.messaging
+            .waiting_outgoing(owner.user, agent.user)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(env.notifier.take().is_empty(), "the owner hears nothing");
+}
+
+#[tokio::test]
+async fn a_resent_invite_of_an_allowed_agent_call_counts_once() {
+    let mut env = env(Timing::default()).await;
+    let (owner, friend) = (env.user().await, env.user().await);
+    let agent = agent_of(&env, owner, friend, OutgoingPolicy::Allowed).await;
+    env.online(agent.user, agent.device).await;
+    env.online(friend.user, friend.device).await;
+    let cancel = |call| {
+        call_request::Frame::Cancel(v1::CallCancel {
+            call_id: id_bytes(call),
+        })
+    };
+
+    let call = Uuid::now_v7();
+    assert_eq!(
+        env.invite(agent, friend.user, call).await.unwrap().ended,
+        None
+    );
+    for _ in 0..3 {
+        assert_eq!(
+            env.invite(agent, friend.user, call).await.unwrap(),
+            CallReply::default()
+        );
+    }
+    env.send(agent, cancel(call)).await.unwrap();
+
+    // Ten calls a day: the resent one counted once, nine more ring.
+    for _ in 0..9 {
+        let call = Uuid::now_v7();
+        assert_eq!(
+            env.invite(agent, friend.user, call).await.unwrap().ended,
+            None
+        );
+        env.send(agent, cancel(call)).await.unwrap();
+    }
+    let status = env
+        .invite(agent, friend.user, Uuid::now_v7())
+        .await
+        .unwrap_err();
+    assert_eq!(code(&status), ErrorCode::RateLimited);
 }
 
 #[tokio::test]
