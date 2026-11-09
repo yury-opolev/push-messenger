@@ -1489,7 +1489,17 @@ async fn resolve_outgoing(
         if !approve {
             return Ok(StatusCode::NO_CONTENT.into_response());
         }
-        let profiles = action_profiles(&api, agent, std::slice::from_ref(&action)).await?;
+        // The action is carried out already: a failed profile lookup must not turn it into
+        // an error (a retry would be `not_found`), so the users are answered by id only.
+        let profiles = match action_profiles(&api, agent, std::slice::from_ref(&action)).await {
+            Ok(profiles) => profiles,
+            Err(_) => action
+                .target
+                .iter()
+                .chain(&action.members)
+                .map(|user| (*user, hidden_profile(*user)))
+                .collect(),
+        };
         Ok(Json(json!({ "action": action_json(&action, &profiles) })).into_response())
     }
     .await;

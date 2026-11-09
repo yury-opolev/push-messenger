@@ -983,6 +983,66 @@ async fn the_owner_lists_approves_and_declines_the_agents_waiting_actions() {
 }
 
 #[tokio::test]
+async fn an_approval_answers_even_when_profiles_cannot_be_read() {
+    super::capture_logs();
+    let created = DateTime::from_timestamp(1_790_000_000, 0).unwrap();
+    let request = Uuid::now_v7();
+    let stub = Arc::new(Stub::default());
+    let (_world, auth, _, token, agent) = owned("blindapprove", Arc::clone(&stub)).await;
+    let target = Uuid::now_v7();
+    *stub.outgoing.lock().unwrap() = vec![OutgoingAction {
+        action_id: request,
+        kind: "request",
+        target: Some(target),
+        conversation: None,
+        title: None,
+        members: Vec::new(),
+        state: "waiting",
+        error: None,
+        created_at: created,
+        resolved_at: None,
+    }];
+    let api = router(Api {
+        auth,
+        limits: Limits::new(Arc::new(MemoryCounter::default())),
+        client_ip_header: None,
+        directory: Arc::new(Down),
+        templates: Arc::new(crate::templates::NoTemplates),
+        call_history: Arc::new(crate::calls::NoCalls),
+        agent_owners: stub,
+        turn: Arc::new(crate::turn::Turn::disabled()),
+    });
+    let (status, approved) = call(
+        &api,
+        "POST",
+        &format!("/v1/agents/{agent}/outgoing/{request}/approve"),
+        &token,
+        json!({}),
+    )
+    .await;
+    // Carried out already: answered (users by id only) and audited, never 503.
+    assert_eq!(status, StatusCode::OK, "{approved}");
+    assert_eq!(approved["action"]["state"], "approved");
+    assert_eq!(approved["action"]["target"]["user_id"], target.to_string());
+    assert_eq!(approved["action"]["target"]["state"], "hidden");
+    let audited = super::security_events().into_iter().any(|event| {
+        event["event"] == "agent.outgoing.approved" && event["agent_id"] == agent.as_str()
+    });
+    assert!(audited);
+}
+
+/// message-svc's Directory cannot be reached.
+#[derive(Debug)]
+struct Down;
+
+#[async_trait::async_trait]
+impl crate::Directory for Down {
+    async fn visible_users(&self, _: Uuid, _: &[Uuid]) -> Result<Vec<Uuid>, AuthError> {
+        Err(AuthError::Unavailable)
+    }
+}
+
+#[tokio::test]
 async fn the_new_owner_routes_are_unavailable_without_message_svc() {
     let (_world, auth, plain, owner) = setup().await;
     let (_, reservation) = call(
