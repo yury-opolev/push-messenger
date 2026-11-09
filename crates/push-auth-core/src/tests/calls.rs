@@ -81,6 +81,7 @@ fn call(peer: Uuid, ended_at: i64, answered: bool) -> CallEntry {
         ended_at: at(ended_at),
         duration_s: if answered { 61 } else { 0 },
         outcome: if answered { "completed" } else { "missed" },
+        started_by_agent: answered,
         cursor: CallCursor { ended_at, call_id },
     }
 }
@@ -138,10 +139,12 @@ async fn the_history_lists_the_callers_own_calls_page_by_page() {
             "ended_at": "2026-09-21T14:18:20.000Z",
             "duration_s": 61,
             "outcome": "completed",
+            "started_by_agent": true,
             "cursor": newest.cursor.encode(),
         })
     );
     assert!(page["calls"][1].get("answered_at").is_none());
+    assert_eq!(page["calls"][1]["started_by_agent"], false);
     assert_eq!(page["calls"][1]["outcome"], "missed");
     assert!(page.get("next").is_none(), "the page is not full");
     assert_eq!(

@@ -15,7 +15,7 @@ use crate::api::{Api, router};
 use crate::calls::{CallCursor, CallEntry};
 use crate::entra::testing::TENANT;
 use crate::limits::{Limits, MemoryCounter};
-use crate::owners::{AgentOwnerApi, Resolve};
+use crate::owners::{AgentOwnerApi, AgentSettings, OutgoingAction, Resolve};
 use crate::service::Auth;
 use push_proto::id_bytes;
 use push_proto::internal::v1 as internal;
@@ -31,6 +31,12 @@ struct Stub {
     owner: Mutex<Option<Uuid>>,
     conversations: Vec<internal::AgentConversation>,
     page: HistoryPage,
+    call_log: Vec<CallEntry>,
+    settings: Mutex<AgentSettings>,
+    /// The waiting actions; a resolved one leaves.
+    outgoing: Mutex<Vec<OutgoingAction>>,
+    /// The action whose approval the normal rules refuse (`not_contact`).
+    failing: Option<Uuid>,
 }
 
 impl Stub {
@@ -115,7 +121,66 @@ impl AgentOwnerApi for Stub {
         limit: u32,
     ) -> Result<Vec<CallEntry>, AuthError> {
         self.record(format!("calls {} {limit}", before.is_some()));
-        Ok(Vec::new())
+        Ok(self.call_log.clone())
+    }
+    async fn settings(&self, _: Uuid, _: Uuid) -> Result<AgentSettings, AuthError> {
+        self.record("settings".into());
+        Ok(*self.settings.lock().unwrap())
+    }
+    async fn set_outgoing(
+        &self,
+        _: Uuid,
+        _: Uuid,
+        change: [Option<&'static str>; 4],
+    ) -> Result<AgentSettings, AuthError> {
+        self.record(format!("set_outgoing {change:?}"));
+        let mut settings = self.settings.lock().unwrap();
+        for (now, new) in settings.outgoing.iter_mut().zip(change) {
+            if let Some(new) = new {
+                *now = new;
+            }
+        }
+        Ok(*settings)
+    }
+    async fn set_inbound(
+        &self,
+        _: Uuid,
+        _: Uuid,
+        policy: &'static str,
+    ) -> Result<AgentSettings, AuthError> {
+        self.record(format!("set_inbound {policy}"));
+        let mut settings = self.settings.lock().unwrap();
+        settings.inbound = policy;
+        Ok(*settings)
+    }
+    async fn outgoing(&self, _: Uuid, _: Uuid) -> Result<Vec<OutgoingAction>, AuthError> {
+        self.record("outgoing".into());
+        Ok(self.outgoing.lock().unwrap().clone())
+    }
+    async fn resolve_outgoing(
+        &self,
+        _: Uuid,
+        _: Uuid,
+        action: Uuid,
+        approve: bool,
+    ) -> Result<OutgoingAction, AuthError> {
+        self.record(format!("resolve_outgoing {action} {approve}"));
+        let mut waiting = self.outgoing.lock().unwrap();
+        let at = waiting
+            .iter()
+            .position(|waiting| waiting.action_id == action)
+            .ok_or(AuthError::NotFound)?;
+        let mut resolved = waiting.remove(at);
+        resolved.resolved_at = Some(resolved.created_at + chrono::TimeDelta::minutes(5));
+        resolved.state = match (approve, self.failing == Some(action)) {
+            (false, _) => "declined",
+            (true, false) => "approved",
+            (true, true) => {
+                resolved.error = Some("not_contact".to_owned());
+                "failed"
+            }
+        };
+        Ok(resolved)
     }
 }
 
@@ -191,6 +256,37 @@ fn routes(agent: &str, user: &str) -> Vec<(&'static str, String, Value)> {
         (
             "DELETE",
             format!("/v1/agents/{agent}/contacts/{user}"),
+            json!({}),
+        ),
+        (
+            "GET",
+            format!("/v1/agents/{agent}/outgoing-policy"),
+            json!({}),
+        ),
+        (
+            "PUT",
+            format!("/v1/agents/{agent}/outgoing-policy"),
+            json!({"chats": "allowed"}),
+        ),
+        (
+            "GET",
+            format!("/v1/agents/{agent}/inbound-policy"),
+            json!({}),
+        ),
+        (
+            "PUT",
+            format!("/v1/agents/{agent}/inbound-policy"),
+            json!({"policy": "contacts"}),
+        ),
+        ("GET", format!("/v1/agents/{agent}/outgoing"), json!({})),
+        (
+            "POST",
+            format!("/v1/agents/{agent}/outgoing/{user}/approve"),
+            json!({}),
+        ),
+        (
+            "POST",
+            format!("/v1/agents/{agent}/outgoing/{user}/decline"),
             json!({}),
         ),
     ]
@@ -287,6 +383,11 @@ async fn everyone_but_the_owner_finds_nothing_and_message_svc_is_never_asked() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{answer}");
+    for (method, path, body) in routes(&agent, &user) {
+        let (status, answer) = call(&api, method, &path, &owner.access_token, body).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{method} {path}: {answer}");
+    }
+    assert_eq!(stub.calls(), ["policy".to_owned()]);
     // Without a token: 401, as everywhere.
     let (status, _) = call(
         &api,
@@ -473,7 +574,22 @@ async fn the_owner_view_shows_the_agents_chats_and_has_no_write_path() {
             message_count: 7,
             hidden: false,
             peer_deleted: false,
-            started_by_agent: false,
+            started_by_agent: true,
+        }],
+        call_log: vec![CallEntry {
+            call_id: chat,
+            peer_user_id: peer.user_id,
+            direction: "out",
+            started_at: DateTime::from_timestamp(1_790_000_000, 0).unwrap(),
+            answered_at: None,
+            ended_at: DateTime::from_timestamp(1_790_000_030, 0).unwrap(),
+            duration_s: 0,
+            outcome: "missed",
+            started_by_agent: true,
+            cursor: CallCursor {
+                ended_at: 1_790_000_030_000_000,
+                call_id: chat,
+            },
         }],
         page: HistoryPage {
             entries: vec![Deliver {
@@ -512,6 +628,7 @@ async fn the_owner_view_shows_the_agents_chats_and_has_no_write_path() {
     assert_eq!(first["peer_owner"], Value::Null);
     assert_eq!(first["message_count"], 7);
     assert_eq!(first["last_activity_at"], "2026-09-21T14:13:20.000Z");
+    assert_eq!(first["started_by_agent"], true);
 
     let path = format!("{base}/conversations/{chat}/messages?before_seq=9&limit=20");
     let (status, page) = call(&api, "GET", &path, token, json!({})).await;
@@ -532,7 +649,9 @@ async fn the_owner_view_shows_the_agents_chats_and_has_no_write_path() {
         json!({}),
     )
     .await;
-    assert_eq!((status, calls), (StatusCode::OK, json!({"calls": []})));
+    assert_eq!(status, StatusCode::OK, "{calls}");
+    assert_eq!(calls["calls"][0]["call_id"], chat.to_string());
+    assert_eq!(calls["calls"][0]["started_by_agent"], true);
     let (status, _) = call(
         &api,
         "GET",
@@ -572,7 +691,7 @@ async fn the_owner_view_shows_the_agents_chats_and_has_no_write_path() {
     assert_eq!(read["count"], 1);
     assert_eq!(read["user_id"], owner.user_id.to_string());
     assert_eq!(named("agent.view.conversations")["count"], 1);
-    assert_eq!(named("agent.view.calls")["count"], 0);
+    assert_eq!(named("agent.view.calls")["count"], 1);
     assert!(!super::captured_logs().contains("secret words"));
     assert_eq!(
         stub.calls(),
@@ -582,4 +701,317 @@ async fn the_owner_view_shows_the_agents_chats_and_has_no_write_path() {
             "calls false 10".to_owned(),
         ]
     );
+}
+
+/// An owner and their agent, with a router over `stub`.
+async fn owned(handle: &str, stub: Arc<Stub>) -> (super::World, Auth, Router, String, String) {
+    let (world, auth, plain, owner) = setup().await;
+    let (status, reservation) = call(
+        &plain,
+        "POST",
+        "/v1/agents",
+        &owner.access_token,
+        json!({"handle": handle, "display_name": handle}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{reservation}");
+    let agent = reservation["user_id"].as_str().unwrap().to_owned();
+    let api = with_owners(auth.clone(), stub);
+    (world, auth, api, owner.access_token, agent)
+}
+
+#[tokio::test]
+async fn the_owner_reads_and_sets_the_outgoing_and_inbound_policies() {
+    super::capture_logs();
+    let stub = Arc::new(Stub::default());
+    let (_world, _auth, api, token, agent) = owned("governed", Arc::clone(&stub)).await;
+    let token = token.as_str();
+    let outgoing = format!("/v1/agents/{agent}/outgoing-policy");
+    let inbound = format!("/v1/agents/{agent}/inbound-policy");
+
+    let (status, policy) = call(&api, "GET", &outgoing, token, json!({})).await;
+    assert_eq!(
+        (status, policy),
+        (
+            StatusCode::OK,
+            json!({"requests": "ask", "chats": "ask", "groups": "off", "calls": "off"})
+        )
+    );
+    // A subset changes those given and keeps the others.
+    let (status, policy) = call(
+        &api,
+        "PUT",
+        &outgoing,
+        token,
+        json!({"chats": "allowed", "calls": "ask"}),
+    )
+    .await;
+    assert_eq!(
+        (status, policy),
+        (
+            StatusCode::OK,
+            json!({"requests": "ask", "chats": "allowed", "groups": "off", "calls": "ask"})
+        )
+    );
+    // Nothing given changes nothing.
+    let (status, policy) = call(&api, "PUT", &outgoing, token, json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(policy["chats"], "allowed");
+    for bad in [
+        json!({"chats": "maybe"}),
+        json!({"messages": "allowed"}),
+        json!({"chats": 1}),
+        json!(["chats"]),
+    ] {
+        let (status, refused) = call(&api, "PUT", &outgoing, token, bad.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {refused}");
+        assert_eq!(refused["error"]["code"], "invalid", "{bad}");
+    }
+
+    let (status, policy) = call(&api, "GET", &inbound, token, json!({})).await;
+    assert_eq!(
+        (status, policy),
+        (StatusCode::OK, json!({"policy": "owner_only"}))
+    );
+    let (status, policy) = call(
+        &api,
+        "PUT",
+        &inbound,
+        token,
+        json!({"policy": "owner_agents"}),
+    )
+    .await;
+    assert_eq!(
+        (status, policy),
+        (StatusCode::OK, json!({"policy": "owner_agents"}))
+    );
+    for bad in [
+        json!({"policy": "everyone"}),
+        json!({}),
+        json!({"policy": "contacts", "chats": "allowed"}),
+    ] {
+        let (status, refused) = call(&api, "PUT", &inbound, token, bad.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {refused}");
+        assert_eq!(refused["error"]["code"], "invalid", "{bad}");
+    }
+    // Invalid bodies never reach message-svc.
+    assert_eq!(
+        stub.calls(),
+        [
+            "settings".to_owned(),
+            r#"set_outgoing [None, Some("allowed"), None, Some("ask")]"#.to_owned(),
+            "set_outgoing [None, None, None, None]".to_owned(),
+            "settings".to_owned(),
+            "set_inbound owner_agents".to_owned(),
+        ]
+    );
+
+    let events: Vec<Value> = super::security_events()
+        .into_iter()
+        .filter(|event| event["agent_id"] == agent.as_str())
+        .collect();
+    let named = |name: &str| -> Vec<Value> {
+        events
+            .iter()
+            .filter(|event| event["event"] == name)
+            .cloned()
+            .collect()
+    };
+    assert_eq!(
+        named("agent.outgoing_policy.read")[0]["policy"],
+        "requests:ask chats:ask groups:off calls:off"
+    );
+    assert_eq!(
+        named("agent.outgoing_policy.changed")[0]["policy"],
+        "requests:ask chats:allowed groups:off calls:ask"
+    );
+    assert_eq!(
+        named("agent.inbound_policy.read")[0]["policy"],
+        "owner_only"
+    );
+    assert_eq!(
+        named("agent.inbound_policy.changed")[0]["policy"],
+        "owner_agents"
+    );
+    assert_eq!(named("agent.owner.refused").len(), 7);
+}
+
+#[tokio::test]
+async fn the_owner_lists_approves_and_declines_the_agents_waiting_actions() {
+    super::capture_logs();
+    let created = DateTime::from_timestamp(1_790_000_000, 0).unwrap();
+    let (request, group, call_action) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+    let stub = Arc::new(Stub {
+        failing: Some(group),
+        ..Stub::default()
+    });
+    let (world, auth, _, token, agent) = owned("proactive", Arc::clone(&stub)).await;
+    let friend = super::password_user(&auth, &world.pool, "friend", 1)
+        .await
+        .remove(0);
+    let unseen = super::password_user(&auth, &world.pool, "unseen", 1)
+        .await
+        .remove(0);
+    let api = with_owners_hiding(auth.clone(), Arc::clone(&stub), vec![unseen.user_id]);
+    let waiting =
+        |action_id, kind, target: Option<Uuid>, title: Option<&str>, members| OutgoingAction {
+            action_id,
+            kind,
+            target,
+            conversation: None,
+            title: title.map(str::to_owned),
+            members,
+            state: "waiting",
+            error: None,
+            created_at: created,
+            resolved_at: None,
+        };
+    *stub.outgoing.lock().unwrap() = vec![
+        waiting(request, "request", Some(friend.user_id), None, Vec::new()),
+        waiting(
+            group,
+            "group",
+            None,
+            Some("Secret plans"),
+            vec![friend.user_id, unseen.user_id],
+        ),
+        waiting(call_action, "call", Some(friend.user_id), None, Vec::new()),
+    ];
+    let token = token.as_str();
+    let base = format!("/v1/agents/{agent}/outgoing");
+
+    let (status, listed) = call(&api, "GET", &base, token, json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    let actions = listed["actions"].as_array().unwrap();
+    assert_eq!(actions.len(), 3);
+    assert_eq!(
+        actions[0],
+        json!({"action_id": request, "kind": "request", "target": actions[0]["target"],
+               "conversation_id": null, "title": null, "members": [], "state": "waiting",
+               "error": null, "created_at": "2026-09-21T14:13:20.000Z",
+               "expires_at": "2026-09-22T14:13:20.000Z", "resolved_at": null})
+    );
+    assert_eq!(actions[0]["target"]["handle"], "friend");
+    assert_eq!(actions[1]["kind"], "group");
+    assert_eq!(actions[1]["target"], Value::Null);
+    assert_eq!(actions[1]["title"], "Secret plans");
+    assert_eq!(actions[1]["members"][0]["handle"], "friend");
+    // Members the agent may not see are shown by id only.
+    assert_eq!(actions[1]["members"][1]["state"], "hidden");
+    assert_eq!(actions[1]["members"][1]["handle"], "");
+    assert_eq!(actions[2]["kind"], "call");
+
+    let (status, approved) = call(
+        &api,
+        "POST",
+        &format!("{base}/{request}/approve"),
+        token,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{approved}");
+    assert_eq!(approved["action"]["state"], "approved");
+    assert_eq!(approved["action"]["error"], Value::Null);
+    assert_eq!(
+        approved["action"]["resolved_at"],
+        "2026-09-21T14:18:20.000Z"
+    );
+    assert_eq!(approved["action"]["target"]["handle"], "friend");
+    // The normal rules refused it: still 200, with the reason.
+    let (status, failed) = call(
+        &api,
+        "POST",
+        &format!("{base}/{group}/approve"),
+        token,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{failed}");
+    assert_eq!(failed["action"]["state"], "failed");
+    assert_eq!(failed["action"]["error"], "not_contact");
+    let (status, declined) = call(
+        &api,
+        "POST",
+        &format!("{base}/{call_action}/decline"),
+        token,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{declined}");
+    // Not waiting any more, unknown or not an id: 404.
+    for path in [
+        format!("{base}/{request}/approve"),
+        format!("{base}/{call_action}/decline"),
+        format!("{base}/{}/approve", Uuid::now_v7()),
+        format!("{base}/not-an-id/decline"),
+    ] {
+        let (status, refused) = call(&api, "POST", &path, token, json!({})).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{path}: {refused}");
+        assert_eq!(refused["error"]["code"], "not_found", "{path}");
+    }
+    let (status, listed) = call(&api, "GET", &base, token, json!({})).await;
+    assert_eq!((status, listed), (StatusCode::OK, json!({"actions": []})));
+
+    // Audited with ids, kinds and counts; never a title.
+    let events: Vec<Value> = super::security_events()
+        .into_iter()
+        .filter(|event| event["agent_id"] == agent.as_str())
+        .collect();
+    let named = |name: &str| -> Vec<Value> {
+        events
+            .iter()
+            .filter(|event| event["event"] == name)
+            .cloned()
+            .collect()
+    };
+    let listed = named("agent.outgoing.listed");
+    assert_eq!(listed[0]["count"], 3);
+    assert_eq!(listed[1]["count"], 0);
+    let approved = named("agent.outgoing.approved");
+    assert_eq!(approved[0]["action_id"], request.to_string());
+    assert_eq!(approved[0]["kind"], "request");
+    assert_eq!(approved[1]["action_id"], group.to_string());
+    assert_eq!(approved[1]["kind"], "group");
+    let declined = named("agent.outgoing.declined");
+    assert_eq!(declined[0]["action_id"], call_action.to_string());
+    assert_eq!(declined[0]["kind"], "call");
+    let refused = named("agent.owner.refused");
+    assert_eq!(refused.len(), 4);
+    assert_eq!(refused[0]["action_id"], request.to_string());
+    assert_eq!(refused[0]["status"], 404);
+    assert!(!super::captured_logs().contains("Secret plans"));
+}
+
+#[tokio::test]
+async fn the_new_owner_routes_are_unavailable_without_message_svc() {
+    let (_world, auth, plain, owner) = setup().await;
+    let (_, reservation) = call(
+        &plain,
+        "POST",
+        "/v1/agents",
+        &owner.access_token,
+        json!({"handle":"offline","display_name":"Offline"}),
+    )
+    .await;
+    let agent = reservation["user_id"].as_str().unwrap().to_owned();
+    let api = router(Api {
+        auth,
+        limits: Limits::new(Arc::new(MemoryCounter::default())),
+        client_ip_header: None,
+        directory: Arc::new(AllBut(Vec::new())),
+        templates: Arc::new(crate::templates::NoTemplates),
+        call_history: Arc::new(crate::calls::NoCalls),
+        agent_owners: Arc::new(crate::owners::NoAgentOwners),
+        turn: Arc::new(crate::turn::Turn::disabled()),
+    });
+    let action = Uuid::now_v7().to_string();
+    for (method, path, body) in routes(&agent, &action).into_iter().skip(11) {
+        let (status, answer) = call(&api, method, &path, &owner.access_token, body).await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{method} {path}: {answer}"
+        );
+        assert_eq!(answer["error"]["code"], "unavailable", "{method} {path}");
+    }
 }

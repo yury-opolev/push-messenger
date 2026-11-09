@@ -73,6 +73,8 @@ pub struct CallEntry {
     /// As `CallEnded.reason`: completed, missed, declined, cancelled, busy, failed or
     /// unreachable.
     pub outcome: &'static str,
+    /// The caller was an agent (spec 2026-11-09 proactive agents, D13).
+    pub started_by_agent: bool,
     pub cursor: CallCursor,
 }
 
@@ -87,6 +89,7 @@ impl CallEntry {
             "ended_at": rfc3339(self.ended_at),
             "duration_s": self.duration_s,
             "outcome": self.outcome,
+            "started_by_agent": self.started_by_agent,
             "cursor": self.cursor.encode(),
         });
         if let (Some(answered_at), Value::Object(fields)) = (self.answered_at, &mut answer) {
@@ -242,6 +245,7 @@ pub(crate) fn entry(entry: &internal::CallHistoryEntry) -> Result<CallEntry, Aut
         ended_at: time(entry.ended_at)?,
         duration_s: entry.duration_s,
         outcome,
+        started_by_agent: entry.started_by_agent,
         cursor: CallCursor {
             ended_at: entry.ended_at,
             call_id,
@@ -328,7 +332,7 @@ mod tests {
                     ended_at: before.ended_at,
                     duration_s: 0,
                     outcome: CallEndReason::Missed.into(),
-                    started_by_agent: false,
+                    started_by_agent: true,
                 }],
             }))
         }
@@ -369,6 +373,7 @@ mod tests {
                 ended_at: DateTime::from_timestamp_micros(1_790_000_300_000_000).unwrap(),
                 duration_s: 0,
                 outcome: "missed",
+                started_by_agent: true,
                 cursor: before,
             }]
         );
