@@ -67,6 +67,7 @@ where
             last_seq: 0,
             created_at: now,
             updated_at: now,
+            started_by_agent: false,
         };
         let id = conversation.id;
         // A group has no direct key, so the insert cannot be a duplicate.

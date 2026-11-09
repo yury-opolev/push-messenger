@@ -48,6 +48,7 @@ where
             last_seq: 0,
             created_at: now,
             updated_at: now,
+            started_by_agent: false,
         };
         let id = conversation.id;
         if tx.insert_conversation(conversation).await? == InsertOutcome::Duplicate {
@@ -225,6 +226,7 @@ where
                 admins,
                 hidden,
                 peer_deleted,
+                started_by_agent: conversation.started_by_agent,
             };
             if member.left_at_seq.is_some() {
                 // A former member sees the conversation as it was when they left.

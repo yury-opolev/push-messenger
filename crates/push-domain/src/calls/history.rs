@@ -33,6 +33,8 @@ pub struct CallHistoryRow {
     /// Whole seconds from the answer to the end; 0 for calls never answered.
     pub duration_s: u32,
     pub outcome: EndReason,
+    /// The caller was an agent (spec 2026-11-09 proactive agents, D13).
+    pub started_by_agent: bool,
 }
 
 impl CallHistoryRow {
@@ -78,6 +80,7 @@ pub fn ended_rows(
         ended_at: from_millis(ended_ms),
         duration_s,
         outcome,
+        started_by_agent: false,
     };
     let mut rows = vec![row(caller, callee, CallDirection::Out)];
     if outcome != EndReason::Unreachable {

@@ -58,6 +58,361 @@ impl AgentPolicy {
     }
 }
 
+/// What an agent may do of one kind of action on its own (spec 2026-11-09 proactive
+/// agents, D1). Set by the agent's owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutgoingPolicy {
+    /// Carried out at once, within the agent's limits.
+    Allowed,
+    /// Waits for the owner's approval.
+    Ask,
+    /// Refused (`NotAllowedByOwner`).
+    Off,
+}
+
+impl OutgoingPolicy {
+    /// The stored code, 1 to 3 in the order above.
+    pub fn code(self) -> i16 {
+        match self {
+            Self::Allowed => 1,
+            Self::Ask => 2,
+            Self::Off => 3,
+        }
+    }
+
+    /// The policy of a stored code.
+    pub fn from_code(code: i16) -> Option<Self> {
+        Some(match code {
+            1 => Self::Allowed,
+            2 => Self::Ask,
+            3 => Self::Off,
+            _ => return None,
+        })
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Allowed => "allowed",
+            Self::Ask => "ask",
+            Self::Off => "off",
+        }
+    }
+}
+
+/// Who reaches an agent's backend (spec 2026-11-09 proactive agents, D8); enforced by
+/// the bridge, stored by message-svc.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InboundPolicy {
+    /// The owner only.
+    OwnerOnly,
+    /// The owner and the owner's other agents.
+    OwnerAgents,
+    /// Every accepted contact.
+    Contacts,
+}
+
+impl InboundPolicy {
+    /// The stored code, 1 to 3 in the order above.
+    pub fn code(self) -> i16 {
+        match self {
+            Self::OwnerOnly => 1,
+            Self::OwnerAgents => 2,
+            Self::Contacts => 3,
+        }
+    }
+
+    /// The policy of a stored code.
+    pub fn from_code(code: i16) -> Option<Self> {
+        Some(match code {
+            1 => Self::OwnerOnly,
+            2 => Self::OwnerAgents,
+            3 => Self::Contacts,
+            _ => return None,
+        })
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OwnerOnly => "owner_only",
+            Self::OwnerAgents => "owner_agents",
+            Self::Contacts => "contacts",
+        }
+    }
+}
+
+/// An agent's settings, set by its owner. An agent without stored settings has the
+/// defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentSettings {
+    pub inbound: InboundPolicy,
+    /// Contact requests.
+    pub requests: OutgoingPolicy,
+    /// New direct chats with someone other than the owner.
+    pub chats: OutgoingPolicy,
+    /// Creating groups and adding members.
+    pub groups: OutgoingPolicy,
+    /// Calls to someone other than the owner.
+    pub calls: OutgoingPolicy,
+}
+
+impl Default for AgentSettings {
+    /// Inbound `owner_only`; requests and chats `ask`; groups and calls `off`.
+    fn default() -> Self {
+        Self {
+            inbound: InboundPolicy::OwnerOnly,
+            requests: OutgoingPolicy::Ask,
+            chats: OutgoingPolicy::Ask,
+            groups: OutgoingPolicy::Off,
+            calls: OutgoingPolicy::Off,
+        }
+    }
+}
+
+impl AgentSettings {
+    /// The policy that applies to actions of `kind`.
+    pub fn policy(&self, kind: OutgoingKind) -> OutgoingPolicy {
+        match kind {
+            OutgoingKind::Request => self.requests,
+            OutgoingKind::Chat => self.chats,
+            OutgoingKind::Group | OutgoingKind::Invite => self.groups,
+            OutgoingKind::Call => self.calls,
+        }
+    }
+}
+
+/// A change of some of an agent's outgoing policies; `None` keeps the current one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct OutgoingPolicyChange {
+    pub requests: Option<OutgoingPolicy>,
+    pub chats: Option<OutgoingPolicy>,
+    pub groups: Option<OutgoingPolicy>,
+    pub calls: Option<OutgoingPolicy>,
+}
+
+impl OutgoingPolicyChange {
+    /// `settings` with this change applied.
+    pub fn apply(self, settings: AgentSettings) -> AgentSettings {
+        AgentSettings {
+            inbound: settings.inbound,
+            requests: self.requests.unwrap_or(settings.requests),
+            chats: self.chats.unwrap_or(settings.chats),
+            groups: self.groups.unwrap_or(settings.groups),
+            calls: self.calls.unwrap_or(settings.calls),
+        }
+    }
+}
+
+/// What an agent starts on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum OutgoingKind {
+    /// A contact request (`target`).
+    Request,
+    /// A new direct chat with `target`.
+    Chat,
+    /// A new group (`title`, `members`).
+    Group,
+    /// Members added to a group (`conversation`, `members`).
+    Invite,
+    /// A call to `target`.
+    Call,
+}
+
+impl OutgoingKind {
+    pub const ALL: [OutgoingKind; 5] = [
+        Self::Request,
+        Self::Chat,
+        Self::Group,
+        Self::Invite,
+        Self::Call,
+    ];
+
+    /// The stored code, 1 to 5 in the order above.
+    pub fn code(self) -> i16 {
+        match self {
+            Self::Request => 1,
+            Self::Chat => 2,
+            Self::Group => 3,
+            Self::Invite => 4,
+            Self::Call => 5,
+        }
+    }
+
+    /// The kind of a stored code.
+    pub fn from_code(code: i16) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.code() == code)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Request => "request",
+            Self::Chat => "chat",
+            Self::Group => "group",
+            Self::Invite => "invite",
+            Self::Call => "call",
+        }
+    }
+}
+
+/// Where an outgoing action stands. `Waiting` becomes one of the others once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OutgoingState {
+    Waiting,
+    /// The owner approved it and it was carried out (a call: may ring once).
+    Approved,
+    Declined,
+    /// Not decided within 24 hours.
+    Expired,
+    /// The owner approved it, but the normal rules refused it (`error`).
+    Failed,
+}
+
+impl OutgoingState {
+    pub const ALL: [OutgoingState; 5] = [
+        Self::Waiting,
+        Self::Approved,
+        Self::Declined,
+        Self::Expired,
+        Self::Failed,
+    ];
+
+    /// The stored code, 1 to 5 in the order above.
+    pub fn code(self) -> i16 {
+        match self {
+            Self::Waiting => 1,
+            Self::Approved => 2,
+            Self::Declined => 3,
+            Self::Expired => 4,
+            Self::Failed => 5,
+        }
+    }
+
+    /// The state of a stored code.
+    pub fn from_code(code: i16) -> Option<Self> {
+        Self::ALL.into_iter().find(|state| state.code() == code)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Waiting => "waiting",
+            Self::Approved => "approved",
+            Self::Declined => "declined",
+            Self::Expired => "expired",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// Why an approved action failed: the error the normal rules answered when it was carried
+/// out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OutgoingError {
+    NotContact,
+    Blocked,
+    NotAdmin,
+    NotMember,
+    GroupFull,
+    NotAGroup,
+    ConversationNotFound,
+    NotAllowed,
+    RateLimited,
+    Invalid,
+    /// Anything else.
+    Failed,
+}
+
+impl OutgoingError {
+    pub const ALL: [OutgoingError; 11] = [
+        Self::NotContact,
+        Self::Blocked,
+        Self::NotAdmin,
+        Self::NotMember,
+        Self::GroupFull,
+        Self::NotAGroup,
+        Self::ConversationNotFound,
+        Self::NotAllowed,
+        Self::RateLimited,
+        Self::Invalid,
+        Self::Failed,
+    ];
+
+    /// The stored code, 1 to 11 in the order above.
+    pub fn code(self) -> i16 {
+        match self {
+            Self::NotContact => 1,
+            Self::Blocked => 2,
+            Self::NotAdmin => 3,
+            Self::NotMember => 4,
+            Self::GroupFull => 5,
+            Self::NotAGroup => 6,
+            Self::ConversationNotFound => 7,
+            Self::NotAllowed => 8,
+            Self::RateLimited => 9,
+            Self::Invalid => 10,
+            Self::Failed => 11,
+        }
+    }
+
+    /// The error of a stored code.
+    pub fn from_code(code: i16) -> Option<Self> {
+        Self::ALL.into_iter().find(|error| error.code() == code)
+    }
+
+    /// The name used in owner routes: the wire error code's name in snake case.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotContact => "not_contact",
+            Self::Blocked => "blocked",
+            Self::NotAdmin => "not_admin",
+            Self::NotMember => "not_member",
+            Self::GroupFull => "group_full",
+            Self::NotAGroup => "not_a_group",
+            Self::ConversationNotFound => "conversation_not_found",
+            Self::NotAllowed => "not_allowed",
+            Self::RateLimited => "rate_limited",
+            Self::Invalid => "invalid",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// Something an agent started on its own that its owner decides on (spec 2026-11-09
+/// proactive agents §3), or decided.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutgoingAction {
+    pub action_id: uuid::Uuid,
+    pub agent: UserId,
+    pub kind: OutgoingKind,
+    /// Request, chat and call: the other user.
+    pub target: Option<UserId>,
+    /// Invite: the group. Chat and group once approved: the conversation opened or
+    /// created.
+    pub conversation: Option<ConversationId>,
+    /// Group: its title.
+    pub title: Option<String>,
+    /// Group and invite: the members, sorted, without duplicates.
+    pub members: Vec<UserId>,
+    pub state: OutgoingState,
+    /// `Failed` only.
+    pub error: Option<OutgoingError>,
+    pub created_at: DateTime<Utc>,
+    pub resolved_at: Option<DateTime<Utc>>,
+    /// An approved call: when the agent used it to ring.
+    pub used_at: Option<DateTime<Utc>>,
+}
+
+impl OutgoingAction {
+    /// Whether `other` is the same action asked again: same agent, kind, target,
+    /// conversation, title and members.
+    pub fn same_as(&self, other: &OutgoingAction) -> bool {
+        self.agent == other.agent
+            && self.kind == other.kind
+            && self.target == other.target
+            && self.conversation == other.conversation
+            && self.title == other.title
+            && self.members == other.members
+    }
+}
+
 /// One of a user's contact relationships, as that user sees it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ContactSummary {
@@ -163,6 +518,9 @@ pub struct Conversation {
     pub created_at: DateTime<Utc>,
     /// When the conversation was created or last had an entry appended.
     pub updated_at: DateTime<Utc>,
+    /// An agent started it on its own: a direct chat with someone other than its owner,
+    /// or a group it created.
+    pub started_by_agent: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -270,6 +628,8 @@ pub struct ConversationSummary {
     pub hidden: bool,
     /// Direct only: the other member's account was deleted.
     pub peer_deleted: bool,
+    /// An agent started it on its own (see [`Conversation::started_by_agent`]).
+    pub started_by_agent: bool,
 }
 
 /// A user's flags of one direct conversation, as the store keeps them: only conversations

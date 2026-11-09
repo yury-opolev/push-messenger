@@ -3,7 +3,8 @@
 use push_domain::templates::TemplateRef;
 use push_domain::{
     ClientMsgId, Conversation, ConversationId, DeviceId, Entry, InviteRecord, Member, MessageId,
-    StoredTemplate, TemplateAction, TemplateEvent, UserId,
+    OutgoingAction, OutgoingError, OutgoingKind, OutgoingState, StoredTemplate, TemplateAction,
+    TemplateEvent, UserId,
 };
 use sqlx::Row;
 use sqlx::postgres::PgRow;
@@ -14,7 +15,7 @@ use crate::codes::decode;
 macro_rules! conversation_columns {
     () => {
         "c.conversation_id, c.kind, c.direct_key, c.title, c.created_by, c.last_seq, \
-         c.created_at, c.updated_at"
+         c.created_at, c.updated_at, c.started_by_agent"
     };
 }
 pub(crate) use conversation_columns;
@@ -46,8 +47,47 @@ macro_rules! template_columns {
 }
 pub(crate) use template_columns;
 
+/// The columns [`outgoing`] reads, from `messaging.outgoing_action`.
+macro_rules! outgoing_columns {
+    () => {
+        "action_id, agent_user_id, kind, target_user_id, conversation_id, title, member_ids, \
+         state, error_code, created_at, resolved_at, used_at"
+    };
+}
+pub(crate) use outgoing_columns;
+
 fn decode_error(message: String) -> sqlx::Error {
     sqlx::Error::Decode(message.into())
+}
+
+pub(crate) fn outgoing(row: &PgRow) -> Result<OutgoingAction, sqlx::Error> {
+    let kind: i16 = row.try_get("kind")?;
+    let state: i16 = row.try_get("state")?;
+    let error: Option<i16> = row.try_get("error_code")?;
+    let target: Option<uuid::Uuid> = row.try_get("target_user_id")?;
+    let conversation: Option<uuid::Uuid> = row.try_get("conversation_id")?;
+    let members: Vec<uuid::Uuid> = row.try_get("member_ids")?;
+    Ok(OutgoingAction {
+        action_id: row.try_get("action_id")?,
+        agent: UserId(row.try_get("agent_user_id")?),
+        kind: OutgoingKind::from_code(kind)
+            .ok_or_else(|| decode_error(format!("outgoing_action.kind is {kind}")))?,
+        target: target.map(UserId),
+        conversation: conversation.map(ConversationId),
+        title: row.try_get("title")?,
+        members: members.into_iter().map(UserId).collect(),
+        state: OutgoingState::from_code(state)
+            .ok_or_else(|| decode_error(format!("outgoing_action.state is {state}")))?,
+        error: error
+            .map(|code| {
+                OutgoingError::from_code(code)
+                    .ok_or_else(|| decode_error(format!("outgoing_action.error_code is {code}")))
+            })
+            .transpose()?,
+        created_at: row.try_get("created_at")?,
+        resolved_at: row.try_get("resolved_at")?,
+        used_at: row.try_get("used_at")?,
+    })
 }
 
 pub(crate) fn conversation(row: &PgRow) -> Result<Conversation, sqlx::Error> {
@@ -67,6 +107,7 @@ pub(crate) fn conversation(row: &PgRow) -> Result<Conversation, sqlx::Error> {
         last_seq: row.try_get("last_seq")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
+        started_by_agent: row.try_get("started_by_agent")?,
     })
 }
 

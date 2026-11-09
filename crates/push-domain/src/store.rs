@@ -70,8 +70,9 @@ use crate::calls::{CallHistoryRow, HistoryCursor};
 use crate::error::DomainResult;
 use crate::ids::{ClientMsgId, ConversationId, DeviceId, MessageId, UserId};
 use crate::model::{
-    AgentPolicy, ContactState, Conversation, ConversationFlags, ConversationOverview, DeviceState,
-    Entry, GroupPositions, InviteRecord, Member, PublisherOwner, StoredTemplate, TemplateEvent,
+    AgentPolicy, AgentSettings, ContactState, Conversation, ConversationFlags,
+    ConversationOverview, DeviceState, Entry, GroupPositions, InviteRecord, Member, OutgoingAction,
+    OutgoingError, OutgoingKind, OutgoingState, PublisherOwner, StoredTemplate, TemplateEvent,
     TemplateStatus,
 };
 use crate::templates::TemplateRef;
@@ -471,7 +472,8 @@ pub trait Tx: Send {
         policy: AgentPolicy,
         at: DateTime<Utc>,
     ) -> DomainResult<()>;
-    /// Removes `agent`'s policy and its request log (account deletion). Idempotent.
+    /// Removes `agent`'s policy, its request log, its settings, its outgoing actions and
+    /// its action log (account deletion). Idempotent.
     async fn forget_agent(&mut self, agent: UserId) -> DomainResult<()>;
     /// The requests waiting at `agent`: its `RequestedIn` rows, with the time each row was
     /// last written, oldest first (ties by user id).
@@ -518,6 +520,89 @@ pub trait Tx: Send {
     ) -> DomainResult<(u32, Option<DateTime<Utc>>)>;
     /// Deletes logged requests older than `before`. Returns how many.
     async fn prune_agent_requests(&mut self, before: DateTime<Utc>) -> DomainResult<u64>;
+
+    // --- Proactive agents (spec 2026-11-09 proactive agents) ----------------------------
+
+    /// `agent`'s settings; the defaults when never set.
+    async fn agent_settings(&mut self, agent: UserId) -> DomainResult<AgentSettings>;
+    /// Stores `agent`'s settings, replacing any earlier ones. Fails with
+    /// `DomainError::Store` when `agent` is not a recorded agent.
+    async fn set_agent_settings(
+        &mut self,
+        agent: UserId,
+        settings: &AgentSettings,
+        at: DateTime<Utc>,
+    ) -> DomainResult<()>;
+    /// Stores a new action. Fails with `DomainError::Store` when its id exists or its
+    /// agent is not a known user.
+    async fn insert_outgoing(&mut self, action: &OutgoingAction) -> DomainResult<()>;
+    /// The waiting action that `action` asks again ([`OutgoingAction::same_as`]), if any.
+    async fn find_waiting_outgoing(
+        &mut self,
+        action: &OutgoingAction,
+    ) -> DomainResult<Option<OutgoingAction>>;
+    /// The action with this id, in any state.
+    async fn outgoing(&mut self, action_id: Uuid) -> DomainResult<Option<OutgoingAction>>;
+    /// How many of `agent`'s actions wait.
+    async fn waiting_outgoing_count(&mut self, agent: UserId) -> DomainResult<u32>;
+    /// `agent`'s waiting actions and, with `resolved_since`, those resolved at that time or
+    /// later; oldest first (ties by id).
+    async fn list_outgoing(
+        &mut self,
+        agent: UserId,
+        resolved_since: Option<DateTime<Utc>>,
+    ) -> DomainResult<Vec<OutgoingAction>>;
+    /// Moves the action from `from` to `to`, stamping `resolved_at` with `at`, setting
+    /// `error` and, when given, `conversation`. Returns the action as now stored; `None`,
+    /// changing nothing, when there is no such action or it is not in state `from`. On
+    /// Postgres one conditional `UPDATE`, so two resolutions cannot both succeed.
+    async fn resolve_outgoing(
+        &mut self,
+        action_id: Uuid,
+        from: OutgoingState,
+        to: OutgoingState,
+        error: Option<OutgoingError>,
+        conversation: Option<ConversationId>,
+        at: DateTime<Utc>,
+    ) -> DomainResult<Option<OutgoingAction>>;
+    /// An approved, unused call of `agent` to `callee` resolved at `since` or later; the
+    /// earliest resolved.
+    async fn approved_call_grant(
+        &mut self,
+        agent: UserId,
+        callee: UserId,
+        since: DateTime<Utc>,
+    ) -> DomainResult<Option<Uuid>>;
+    /// Marks an approved call used at `at`. Returns whether it was unused until now.
+    async fn use_outgoing(&mut self, action_id: Uuid, at: DateTime<Utc>) -> DomainResult<bool>;
+    /// Ends up to `limit` actions waiting since `before` or earlier as `Expired` at `at`,
+    /// oldest first, and returns them as now stored.
+    async fn expire_outgoing(
+        &mut self,
+        before: DateTime<Utc>,
+        at: DateTime<Utc>,
+        limit: u32,
+    ) -> DomainResult<Vec<OutgoingAction>>;
+    /// Deletes the resolved actions resolved before `before`. Returns how many.
+    async fn prune_outgoing(&mut self, before: DateTime<Utc>) -> DomainResult<u64>;
+    /// Logs `count` actions of `kind` that `agent` carried out or queued at `at`.
+    async fn log_agent_action(
+        &mut self,
+        agent: UserId,
+        kind: OutgoingKind,
+        count: u32,
+        at: DateTime<Utc>,
+    ) -> DomainResult<()>;
+    /// The sum of the counts `agent` logged for `kind` at `since` or later, and the oldest
+    /// of those log rows.
+    async fn agent_actions_since(
+        &mut self,
+        agent: UserId,
+        kind: OutgoingKind,
+        since: DateTime<Utc>,
+    ) -> DomainResult<(u32, Option<DateTime<Utc>>)>;
+    /// Deletes action log rows older than `before`. Returns how many.
+    async fn prune_agent_actions(&mut self, before: DateTime<Utc>) -> DomainResult<u64>;
     /// For each conversation `user` is or was a member of, the messages `user` can see
     /// (`kind = Message`, within the visible range) that are not deleted. Conversations
     /// without any are left out. The order is unspecified.
