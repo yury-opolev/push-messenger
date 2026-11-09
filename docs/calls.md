@@ -190,6 +190,8 @@ group calls) without breaking older clients.
 | `ERROR_CODE_CALL_LIMIT` | 30 | the call's cap of `CallIce` or `CallRenegotiate` frames is reached ([§8](#8-limits)) | no |
 | `ERROR_CODE_NOT_CONTACT` | 6 | not an accepted contact, a block either way, an agent rule, or no such user: indistinguishable | no |
 | `ERROR_CODE_NOT_ALLOWED` | 31 | a call between two agents that are accepted contacts: agents talk in messages and cards only ([agent connections](superpowers/specs/2026-11-06-agent-connections-and-owner-view.md), D8); agents that are not contacts get `NOT_CONTACT` like anyone else | no |
+| `ERROR_CODE_NOT_ALLOWED_BY_OWNER` | 34 | an owned agent's call to a person who is its accepted contact while its owner's call policy is `off` (the default) ([proactive agents](superpowers/specs/2026-11-09-proactive-agents.md)) | no: the owner changes the policy |
+| `ERROR_CODE_WAITING_FOR_OWNER` | 33 | the same under the `ask` policy: a waiting action is stored and `CallError.action_id` names it | once the owner approves it: the agent may ring that person once within 15 minutes |
 | `ERROR_CODE_INVALID` | 2 | malformed ids, a `call_id` that is not a UUIDv7, calling oneself, a bad or oversize SDP, video, a bad candidate, a reason the frame does not allow, the same `call_id` invited by another device | no |
 | `ERROR_CODE_RATE_LIMITED` | 23 | too many `CallInvite` per hour, with `retry_after_s` | yes, after `retry_after_s` |
 | `ERROR_CODE_NOT_AVAILABLE` | 24 | calls are not offered on this connection (not calls-active) | no |
@@ -643,6 +645,7 @@ hide, **newest first** (by end time, then call id):
       "ended_at": "2026-11-03T17:43:10.877Z",
       "duration_s": 121,
       "outcome": "completed",
+      "started_by_agent": false,
       "cursor": "MTc2MjE5MTc5MDg3NzAwMDowMTkzN2E0ZS0…"
     }
   ],
@@ -660,6 +663,7 @@ hide, **newest first** (by end time, then call id):
 | `ended_at` | when it ended |
 | `duration_s` | whole seconds from the answer to the end; `0` for calls never answered |
 | `outcome` | `completed`, `missed`, `declined`, `cancelled`, `busy`, `failed` or `unreachable` (as `CallEnded.reason`) |
+| `started_by_agent` | `true` when the caller was an owned agent ([proactive agents](superpowers/specs/2026-11-09-proactive-agents.md)) |
 | `cursor` | this call's position, for `before` and `since` |
 | `next` | present only when the page is full (`limit` calls): the last call's cursor; ask again with `before=<next>` for older calls |
 

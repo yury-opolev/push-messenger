@@ -6,6 +6,17 @@ Notable changes for consumers of push-messenger. Newest first.
 
 ### Security
 
+- **Proactive agents are audited and held by their owner**
+  ([design](docs/superpowers/specs/2026-11-09-proactive-agents.md) §9). Every read and
+  change of an agent's outgoing and inbound policy, every listing and every approve and
+  decline of its waiting actions writes one auth-svc security line
+  (`agent.outgoing_policy.read|changed`, `agent.inbound_policy.read|changed`,
+  `agent.outgoing.listed|approved|declined`) with the owner, agent, action id and kind,
+  policy values, count, route, status and IP, never a title or message text. The policy
+  gate runs before any rule that depends on the target, so an agent learns nothing about
+  a target from it. Coda's tools endpoint admits only the same user and the run's 256-bit
+  token; contacts' texts reach Coda fenced with per-message nonce markers.
+
 - **coturn Dockerfile: build the TURN image yourself** —
   [`deploy/docker/coturn.Dockerfile`](deploy/docker/coturn.Dockerfile) (moved from
   `deploy/coturn/Dockerfile`) is the production path for `calls.turn.internal.image`, like
@@ -53,6 +64,74 @@ Notable changes for consumers of push-messenger. Newest first.
   [calls.md, "Security updates of the chart's images"](docs/calls.md#134-coturn-in-the-chart).
 
 ### Added
+
+- **Proactive agents**
+  ([design](docs/superpowers/specs/2026-11-09-proactive-agents.md)): an owned agent may
+  start actions on its own, under its owner's control.
+  - **Outgoing policy** per agent and kind, enforced by message-svc on the existing
+    requests (so also for an agent key used outside the bridge): `requests`
+    (`ContactRequest`), `chats` (`OpenDirect` that creates a chat with someone other than
+    the owner), `groups` (`CreateGroup`, `AddMembers`) and `calls` (`CallInvite` to a
+    person who is an accepted contact), each `allowed`, `ask` or `off`; defaults `ask`,
+    `ask`, `off`, `off`. Messages and calls to the owner, and messages in conversations
+    that exist, are never actions. `off` answers the new error code
+    `NOT_ALLOWED_BY_OWNER` (34).
+  - **Ask queue**: under `ask` the action waits for the owner and the agent gets
+    `WAITING_FOR_OWNER` (33) with `Error.action_id` (field 7; `CallError.action_id`,
+    field 6); the same action asked again answers the same id. The owner approves it
+    (carried out at once as the agent, under the normal rules: a refusal ends it `failed`
+    with the error; an approved call lets one `CallInvite` to that person through within
+    15 minutes) or declines it; undecided actions expire after 24 hours. The new frame
+    `OutgoingActionEvent` (56) tells the owner of each new waiting action and every
+    resolution, and the agent of every resolution (declined and expired both as
+    `OWNER_DECLINED`).
+  - **Owner routes** on auth-svc (owner only, `404 not_found` for everyone else, the shared
+    600/h owner limit): `GET|PUT /v1/agents/{agent_id}/outgoing-policy`,
+    `GET|PUT /v1/agents/{agent_id}/inbound-policy`, `GET /v1/agents/{agent_id}/outgoing`,
+    `POST /v1/agents/{agent_id}/outgoing/{action_id}/approve|decline`.
+  - **Inbound policy** per agent (`owner_only` by default, `owner_agents`, `contacts`):
+    who besides the owner reaches the agent's backend, enforced by the bridge. Agents read
+    their settings with the new request `GetAgentSettings` (24) and their actions with
+    `ListOutgoingActions` (25); `AgentSettingsEvent` (frame 55) tells them of changes.
+  - **Limits per agent** (rolling 24 hours, `RATE_LIMITED` with `retry_after_s`): 50 new
+    chats, 10 calls, 5 groups created and 20 members added a day; at most 20 waiting
+    actions (`retry_after_s` 600).
+  - **`started_by_agent`** on `ConversationSummary` (14), `CallHistoryEntry` (9), the
+    owner view's conversations and calls and `GET /v1/calls`: chats and groups an agent
+    started (approved ones included, existing ones backfilled) and calls an agent placed.
+  - **Calls to contacts**: an agent may call a person who is its accepted contact, per its
+    owner's `calls` policy; agents still never call each other (`NOT_ALLOWED`).
+  - **push-sdk**: `agent_settings`, `outgoing_actions`, `create_group` (answers the
+    group's id), `add_members`; owner side `outgoing_policy`, `set_outgoing_policy`,
+    `inbound_policy`, `set_inbound_policy`, `agent_outgoing`, `approve_outgoing`,
+    `decline_outgoing`; `Event::AgentSettingsChanged`, `Event::OutgoingActionChanged`;
+    `SdkError::action_id()`; `CallErrorCode::WaitingForOwner`, `NotAllowedByOwner`;
+    `started_by_agent` on conversations, call history and the owner view. Bindings: the
+    two events (`agentSettingsChanged`, `outgoingActionChanged`).
+  - **push-bridge actions** for every backend, with stable result codes (`done`,
+    `waiting_for_owner`, `not_allowed_by_owner`, `rate_limited`, `paused`, `not_found`,
+    `not_contact`, `not_allowed`, `unavailable`, `failed`): `request_contact`,
+    `send_message`, `notify_owner`, `create_group`, `invite`, `call`, `outgoing`. What is
+    left after the owner approves (a held text, a call's reason) is kept in `state.json`
+    and finished on the decision, at start-up and after a reconnect; each outcome is a note
+    in the owner's chat. Plain text between agents is a turn; replies and cards are not.
+    Calls to contacts go through the voice adapter (transcripts in the contact's chat).
+  - **Echo commands** in the owner's chat: `request`, `send`, `notify`, `group`,
+    `invite`, `call`, `outgoing`.
+  - **Coda MCP tools**: the bridge serves its actions to Coda as `mcp__push__*` tools
+    over a private tools endpoint (`push-agent-bridge tools-mcp`), without changing Coda;
+    with them Coda takes contacts' texts. Bridge config `tools` (default `true`).
+  - **Loop guard**: a chat between two agents pauses after `loop_guard_turns` (bridge
+    config, default 20) agent turns without a person's message; `/loop` and
+    `/loop resume [@handle]` in the owner's chat.
+  - **Compatibility**: older clients ignore frames 55/56 and the new fields and see the
+    new error codes as failures; owners need an updated client (or the HTTP API) to
+    approve actions, which otherwise expire. Messaging migration
+    `0011_proactive_agents.sql` adds tables and two columns (with a backfill). No new
+    chart values. Groups need the gateway to serve them (`gateway.groups`, off by
+    default): with it off, agents' `create_group` and `invite` answer `unavailable`.
+    Not yet: Node and C bindings of the new owner endpoints and agent requests, and
+    `actionId`/`startedByAgent` in the bindings' error and conversation JSON.
 
 - **Agent connections and a read-only owner view**
   ([design](docs/superpowers/specs/2026-11-06-agent-connections-and-owner-view.md)).
@@ -626,6 +705,14 @@ Notable changes for consumers of push-messenger. Newest first.
   makes.
 
 ### Changed
+
+- **Proactive agents** ([design](docs/superpowers/specs/2026-11-09-proactive-agents.md)
+  §11): an owned agent's contact request now **waits for its owner** by default
+  (outgoing `requests` is `ask`; set `allowed` for the old behaviour); agents' contact
+  requests are limited to **10 an hour and 20 a day** (were 20 and 100); the **echo
+  agent answers only its owner** by default (inbound `owner_only`; set `contacts` to
+  answer every accepted contact again); an agent may **call a person who is its contact**
+  per its owner's `calls` policy (`off` by default; was always `NOT_CONTACT`).
 
 - **Agent bridge commands:** `/new` and `/cd` now need the backend's `Sessions`
   capability like `/sessions` and `/resume`, and `/help` lists only the commands the
