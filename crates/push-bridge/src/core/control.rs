@@ -160,7 +160,11 @@ impl<M: Messenger> Core<M> {
             Command::Stop => self.reply("Nothing is running."),
             Command::Status => self.status().await,
             Command::Help => {
-                let help = commands::help(|capability| self.has(capability));
+                let mut help = commands::help(|capability| self.has(capability));
+                if let Some(more) = self.backend.help() {
+                    help.push('\n');
+                    help.push_str(more);
+                }
                 self.reply(&format!("{help}\n\n{}", commands::OWNER_NOTE));
             }
             Command::Mode(mode) if mode == "bypass" => {

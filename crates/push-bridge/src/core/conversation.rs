@@ -35,6 +35,7 @@ impl<M: Messenger> Core<M> {
             Event::EventsLost => tracing::warn!(event = "messenger_events_lost"),
             Event::Call(event) => self.on_call(event).await,
             Event::ContactChanged(contact) => self.contact_changed(contact.user_id, contact.state),
+            Event::OutgoingActionChanged(action) => self.outgoing_changed(action).await,
             _ => {}
         }
         Ok(())
@@ -54,6 +55,7 @@ impl<M: Messenger> Core<M> {
                     self.update_activity(true).await;
                     self.refresh_contact_activity(true).await;
                     self.fetch_pending().await;
+                    self.reconcile_actions();
                 }
                 Ok(())
             }

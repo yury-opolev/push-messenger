@@ -2,6 +2,7 @@
 //! the owner's commands, and the backend's lifecycle. It drives a [`Backend`] and talks
 //! to push-messenger through a [`Messenger`].
 
+mod acting;
 mod calling;
 mod contacts;
 mod control;
@@ -12,6 +13,8 @@ mod turns;
 mod upgrade;
 mod voice;
 
+#[cfg(test)]
+mod actions_tests;
 #[cfg(test)]
 mod echo_tests;
 #[cfg(test)]
@@ -30,11 +33,12 @@ use push_bridge_control::{
 };
 use push_sdk::{
     ActivityState, CallEvent, CallId, CardBook, ClientMsgId, ConnectionState, ConversationId,
-    Event, SdkError, UserId,
+    Event, OutgoingAction, SdkError, UserId,
 };
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{Instant, MissedTickBehavior};
 
+use crate::actions::ActionResult;
 use crate::backend::{
     ActivityLabels, Backend, BackendCommand, BackendError, BackendEvent, Capability, CommandReply,
     PermissionMode, Prepared, Responder, TextFormat,
@@ -44,7 +48,7 @@ use crate::cards::CardKind;
 use crate::control::{Calls, ControlCall, ControlHandle};
 use crate::messenger::Messenger;
 use crate::render::{TurnRenderer, reply_bodies};
-use crate::state::{State, StateFile};
+use crate::state::{PendingKind, State, StateFile};
 use crate::voice::VoiceSetup;
 use crate::voice::phone::Line;
 use crate::voice::policy::Verdict;
@@ -233,6 +237,7 @@ impl<M: Messenger> Bridge<M> {
         core.call_flag = call_flag;
         tracing::info!(event = "bridge_started", backend = core.name.as_str());
         core.boot().await;
+        core.reconcile_actions();
         core.publish();
         let mut ticker = tokio::time::interval(TICK);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -311,6 +316,21 @@ enum Internal {
     ContactPrompted {
         conversation: ConversationId,
         result: Result<(), BackendError>,
+    },
+    /// The server answered the backend's action `kind`; the core finishes it.
+    Acted {
+        kind: &'static str,
+        reply: oneshot::Sender<ActionResult>,
+        acted: acting::Acted,
+    },
+    /// The chat of an approved waiting message was opened (or not).
+    ApprovedChat {
+        kind: PendingKind,
+        result: Result<ConversationId, SdkError>,
+    },
+    /// The agent's actions, listed to settle those decided while the bridge was away.
+    Reconciled {
+        result: Result<Vec<OutgoingAction>, SdkError>,
     },
 }
 
@@ -673,6 +693,9 @@ impl<M: Messenger> Core<M> {
                 conversation,
                 result,
             } => self.contact_prompted(conversation, result).await,
+            Internal::Acted { kind, reply, acted } => self.acted(kind, reply, acted).await,
+            Internal::ApprovedChat { kind, result } => self.approved_send(kind, result),
+            Internal::Reconciled { result } => self.reconciled(result).await,
         }
     }
 

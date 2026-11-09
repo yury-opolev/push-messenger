@@ -1,7 +1,7 @@
 //! The core's way to push-messenger: a small [`Messenger`] trait, the [`SdkMessenger`]
 //! over a signed-in `push_sdk::Client`, and the [`TestMessenger`] tests drive the core with.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -9,8 +9,9 @@ use std::time::Duration;
 
 use push_domain::templates::{RichBody, builtins};
 use push_sdk::{
-    ActivityState, Client, ClientMsgId, ContactState, ConversationId, Event, Events, Message,
-    MessageId, MessageKind, MessageStatus, OutboxKind, SdkError, UserId,
+    ActivityState, AgentSettings, Client, ClientMsgId, ContactState, ConversationId,
+    ConversationKind, Event, Events, InboundPolicy, Message, MessageId, MessageKind, MessageStatus,
+    OutboxKind, OutgoingAction, OutgoingPolicy, Profile, SdkError, UserId,
 };
 use serde_json::{Value, json};
 use tokio::sync::{Notify, mpsc};
@@ -61,6 +62,78 @@ pub trait Messenger: Send + Sync + 'static {
     async fn reconnect(&self) -> Result<(), SdkError> {
         Err(SdkError::Invalid("reconnect is not available".into()))
     }
+    /// The verified user with `handle` (without the `@`).
+    async fn lookup(&self, _handle: &str) -> Result<Peer, SdkError> {
+        Err(not_available("lookup"))
+    }
+    /// The profiles among `users` the agent may see.
+    async fn peers(&self, _users: Vec<UserId>) -> Result<Vec<Peer>, SdkError> {
+        Err(not_available("profiles"))
+    }
+    /// Asks `user` to become a contact; the relationship now.
+    async fn request_contact(&self, _user: UserId) -> Result<ContactState, SdkError> {
+        Err(not_available("request_contact"))
+    }
+    /// The direct conversation with `peer`, opened as an agent action (the owner's
+    /// outgoing policy for chats applies when it is new).
+    async fn open_direct(&self, peer: UserId) -> Result<ConversationId, SdkError> {
+        self.direct(peer).await
+    }
+    /// Whether the agent is a member of the group `group` (`false` when unknown).
+    async fn is_group_member(&self, _group: ConversationId) -> Result<bool, SdkError> {
+        Err(not_available("conversations"))
+    }
+    /// Creates a group of `members`; its id.
+    async fn create_group(
+        &self,
+        _title: &str,
+        _members: Vec<UserId>,
+    ) -> Result<ConversationId, SdkError> {
+        Err(not_available("create_group"))
+    }
+    /// Adds `users` to the group `group`.
+    async fn add_members(
+        &self,
+        _group: ConversationId,
+        _users: Vec<UserId>,
+    ) -> Result<(), SdkError> {
+        Err(not_available("add_members"))
+    }
+    /// The agent's settings, as its owner set them.
+    async fn agent_settings(&self) -> Result<AgentSettings, SdkError> {
+        Err(not_available("agent_settings"))
+    }
+    /// The agent's actions waiting for its owner and those resolved lately, oldest first.
+    async fn outgoing_actions(&self) -> Result<Vec<OutgoingAction>, SdkError> {
+        Err(not_available("outgoing_actions"))
+    }
+}
+
+/// Another user, as the agent sees them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Peer {
+    pub user_id: UserId,
+    /// Without the `@`; empty for a deleted account.
+    pub handle: String,
+    /// An agent (not a person).
+    pub agent: bool,
+    /// An agent's owner.
+    pub owner: Option<UserId>,
+}
+
+impl From<Profile> for Peer {
+    fn from(profile: Profile) -> Self {
+        Self {
+            user_id: profile.user_id,
+            handle: profile.handle,
+            agent: profile.kind == "agent",
+            owner: profile.owner_user_id,
+        }
+    }
+}
+
+fn not_available(what: &str) -> SdkError {
+    SdkError::Invalid(format!("{what} is not available"))
 }
 
 /// Signs the client in again and connects it (see [`Messenger::reconnect`]).
@@ -190,6 +263,55 @@ impl Messenger for SdkMessenger {
             .find(|contact| contact.user_id == user)
             .map_or(ContactState::None, |contact| contact.state))
     }
+
+    async fn lookup(&self, handle: &str) -> Result<Peer, SdkError> {
+        self.client.lookup(handle).await.map(Peer::from)
+    }
+
+    async fn peers(&self, users: Vec<UserId>) -> Result<Vec<Peer>, SdkError> {
+        let profiles = self.client.profiles(users).await?;
+        Ok(profiles.into_iter().map(Peer::from).collect())
+    }
+
+    async fn request_contact(&self, user: UserId) -> Result<ContactState, SdkError> {
+        Ok(self.client.request_contact(user).await?.state)
+    }
+
+    async fn is_group_member(&self, group: ConversationId) -> Result<bool, SdkError> {
+        let is_group = |conversation: Option<push_sdk::Conversation>| {
+            conversation.is_some_and(|conversation| conversation.kind == ConversationKind::Group)
+        };
+        if is_group(self.client.conversation(group)?) {
+            return Ok(true);
+        }
+        // Not known on this device yet (created or joined since the last listing).
+        let listed = self.client.list_conversations().await?;
+        Ok(is_group(
+            listed
+                .into_iter()
+                .find(|conversation| conversation.id == group),
+        ))
+    }
+
+    async fn create_group(
+        &self,
+        title: &str,
+        members: Vec<UserId>,
+    ) -> Result<ConversationId, SdkError> {
+        self.client.create_group(title, members).await
+    }
+
+    async fn add_members(&self, group: ConversationId, users: Vec<UserId>) -> Result<(), SdkError> {
+        self.client.add_members(group, users).await
+    }
+
+    async fn agent_settings(&self) -> Result<AgentSettings, SdkError> {
+        self.client.agent_settings().await
+    }
+
+    async fn outgoing_actions(&self) -> Result<Vec<OutgoingAction>, SdkError> {
+        self.client.outgoing_actions().await
+    }
 }
 
 /// One call the core made on a [`TestMessenger`].
@@ -217,6 +339,24 @@ pub enum Call {
     },
     /// Signed in again and connected.
     Reconnect,
+    Lookup {
+        handle: String,
+    },
+    RequestContact {
+        user: UserId,
+    },
+    OpenDirect {
+        peer: UserId,
+    },
+    CreateGroup {
+        title: String,
+        members: Vec<UserId>,
+    },
+    AddMembers {
+        group: ConversationId,
+        users: Vec<UserId>,
+    },
+    OutgoingActions,
 }
 
 #[derive(Default)]
@@ -231,6 +371,14 @@ struct Recorded {
     refusals: Vec<SdkError>,
     /// The agent's relationships (None for anyone else).
     contacts: HashMap<UserId, ContactState>,
+    /// The users the server knows, by handle.
+    users: HashMap<String, Peer>,
+    /// The groups the agent is a member of.
+    groups: HashSet<ConversationId>,
+    /// What `outgoing_actions` answers.
+    outgoing: Vec<OutgoingAction>,
+    /// The next calls of a method (by its name) fail with these errors, in order.
+    failures: HashMap<&'static str, VecDeque<SdkError>>,
 }
 
 /// A [`Messenger`] for tests: records every call, plays the server (each send is stored
@@ -248,14 +396,70 @@ impl TestMessenger {
     /// The messenger and the event channel to hand to the core.
     pub fn new() -> (Arc<Self>, mpsc::Receiver<Event>) {
         let (events, receiver) = mpsc::channel(EVENT_QUEUE);
+        let owner = UserId::new();
+        let mut recorded = Recorded::default();
+        recorded.users.insert(
+            "test-owner".to_owned(),
+            Peer {
+                user_id: owner,
+                handle: "test-owner".to_owned(),
+                agent: false,
+                owner: None,
+            },
+        );
         let messenger = Self {
             me: UserId::new(),
-            owner: UserId::new(),
+            owner,
             events,
-            recorded: Mutex::new(Recorded::default()),
+            recorded: Mutex::new(recorded),
             changed: Notify::new(),
         };
         (Arc::new(messenger), receiver)
+    }
+
+    /// A user the server knows by `handle` (a person, or an agent of another owner);
+    /// returns their id.
+    pub fn add_user(&self, handle: &str, agent: bool) -> UserId {
+        let user_id = UserId::new();
+        self.lock().users.insert(
+            handle.to_owned(),
+            Peer {
+                user_id,
+                handle: handle.to_owned(),
+                agent,
+                owner: agent.then(UserId::new),
+            },
+        );
+        user_id
+    }
+
+    /// A group the agent is a member of.
+    pub fn add_group(&self) -> ConversationId {
+        let group = ConversationId::new();
+        self.lock().groups.insert(group);
+        group
+    }
+
+    /// The next call of `method` (`lookup`, `request_contact`, `open_direct`,
+    /// `create_group`, `add_members`, `outgoing_actions`) fails with `error`.
+    pub fn fail_next(&self, method: &'static str, error: SdkError) {
+        self.lock()
+            .failures
+            .entry(method)
+            .or_default()
+            .push_back(error);
+    }
+
+    /// What `outgoing_actions` answers from now on.
+    pub fn set_outgoing(&self, actions: Vec<OutgoingAction>) {
+        self.lock().outgoing = actions;
+    }
+
+    fn failure(&self, method: &'static str) -> Option<SdkError> {
+        self.lock()
+            .failures
+            .get_mut(method)
+            .and_then(VecDeque::pop_front)
     }
 
     pub fn owner_id(&self) -> UserId {
@@ -570,6 +774,107 @@ impl Messenger for TestMessenger {
             .get(&user)
             .copied()
             .unwrap_or(ContactState::None))
+    }
+
+    async fn lookup(&self, handle: &str) -> Result<Peer, SdkError> {
+        self.record(Call::Lookup {
+            handle: handle.to_owned(),
+        });
+        if let Some(error) = self.failure("lookup") {
+            return Err(error);
+        }
+        self.lock()
+            .users
+            .get(handle)
+            .cloned()
+            .ok_or_else(|| server_error("not_found"))
+    }
+
+    async fn peers(&self, users: Vec<UserId>) -> Result<Vec<Peer>, SdkError> {
+        let recorded = self.lock();
+        Ok(recorded
+            .users
+            .values()
+            .filter(|peer| users.contains(&peer.user_id))
+            .cloned()
+            .collect())
+    }
+
+    async fn request_contact(&self, user: UserId) -> Result<ContactState, SdkError> {
+        self.record(Call::RequestContact { user });
+        if let Some(error) = self.failure("request_contact") {
+            return Err(error);
+        }
+        let mut recorded = self.lock();
+        let state = recorded
+            .contacts
+            .entry(user)
+            .or_insert(ContactState::RequestedOut);
+        Ok(*state)
+    }
+
+    async fn open_direct(&self, peer: UserId) -> Result<ConversationId, SdkError> {
+        self.record(Call::OpenDirect { peer });
+        if let Some(error) = self.failure("open_direct") {
+            return Err(error);
+        }
+        Ok(self.conversation_with(peer))
+    }
+
+    async fn is_group_member(&self, group: ConversationId) -> Result<bool, SdkError> {
+        Ok(self.lock().groups.contains(&group))
+    }
+
+    async fn create_group(
+        &self,
+        title: &str,
+        members: Vec<UserId>,
+    ) -> Result<ConversationId, SdkError> {
+        self.record(Call::CreateGroup {
+            title: title.to_owned(),
+            members,
+        });
+        if let Some(error) = self.failure("create_group") {
+            return Err(error);
+        }
+        Ok(self.add_group())
+    }
+
+    async fn add_members(&self, group: ConversationId, users: Vec<UserId>) -> Result<(), SdkError> {
+        self.record(Call::AddMembers { group, users });
+        match self.failure("add_members") {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    async fn agent_settings(&self) -> Result<AgentSettings, SdkError> {
+        Ok(AgentSettings {
+            inbound: InboundPolicy::OwnerOnly,
+            requests: OutgoingPolicy::Ask,
+            chats: OutgoingPolicy::Ask,
+            groups: OutgoingPolicy::Off,
+            calls: OutgoingPolicy::Off,
+        })
+    }
+
+    async fn outgoing_actions(&self) -> Result<Vec<OutgoingAction>, SdkError> {
+        self.record(Call::OutgoingActions);
+        if let Some(error) = self.failure("outgoing_actions") {
+            return Err(error);
+        }
+        Ok(self.lock().outgoing.clone())
+    }
+}
+
+/// A server refusal with `code`, as the gateway or auth-svc sends it.
+pub fn server_error(code: &str) -> SdkError {
+    SdkError::Server {
+        code: code.to_owned(),
+        message: code.replace('_', " "),
+        retryable: false,
+        retry_after_s: None,
+        action_id: None,
     }
 }
 

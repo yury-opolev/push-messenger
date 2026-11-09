@@ -29,6 +29,8 @@ and the plan differ, this guide describes what the code does.
 - [17. Manual smoke test on Windows](#17-manual-smoke-test-on-windows)
 - [18. Voice calls](#18-voice-calls)
 - [19. Echo backend](#19-echo-backend)
+- [20. Agent connections](#20-agent-connections)
+- [21. Bridge actions](#21-bridge-actions)
 
 Design of the tray, the control channel and upgrade mode: the plan
 [2026-11-02-agent-tray-upgrade-mode](superpowers/plans/2026-11-02-agent-tray-upgrade-mode.md);
@@ -2244,7 +2246,27 @@ a folder of its own, and a `key.name` of its own, as for
 |---|---|
 | `ask` | posts `agent.question@1` "Red or blue?" (Red, Blue); activity `waiting` / `question open`. The answer (a button, a label or number, or any other text, which is the free-text answer) gets "you chose: <answer>" |
 | `pick` | posts `agent.choose@1` "Pick any colours." (Red, Blue, Green; any number of them; typed answers separated by commas); "you chose: Red, Green" in option order |
+| an action command (the owner only; see below) | runs the [bridge action](#21-bridge-actions) and replies with its result in one line |
 | anything else | replies `agent.reply@2` (Markdown) "echo: <text>", with activity `working` / `echoing`; a text over 4,000 characters continues in further replies, as every turn does |
+
+**Action commands** (the owner's chat only, bare words like `ask`; the keyword in any
+case; a contact's text is only echoed). The owner's `/help` lists them.
+
+| Command | Action |
+|---|---|
+| `request @h` | `request_contact` |
+| `send @h <text>`, `send owner <text>`, `send group:<id> <text>` | `send_message` |
+| `notify <text>` | `notify_owner` |
+| `group <name> @a @b …` (a one-word name, or "a quoted name") | `create_group` |
+| `invite group:<id> @h` | `invite` |
+| `call @h [reason]`, `call owner [reason]` | `call` |
+| `outgoing` | `outgoing` |
+
+The reply is the result: `done: <detail>` ("done: sent to @bob", "done: group "crew"
+created (group:<id>)"), `waiting for owner
+(action <id>)`, `not allowed by owner`, `rate limited, retry in N s`, `not found: no user
+@h`, `unavailable: voice calls are not set up`, …; a malformed command replies its usage
+("usage: send @handle|owner|group:<id> <text>").
 
 - **Notice:** each contact's first text in a session gets a reply "Chats with <agent> are
   visible to its owner, <owner> (@<handle>)." (from the agent's own profile), and the
@@ -2319,3 +2341,39 @@ An agent's contacts are its owner's decision
   the chat: the bridge says it to each contact once per session and in their `/help`; the
   owner's `/help` explains the above. Clients show the same notice from the agent's
   profile (`owner_display_name`, `owner_handle`).
+
+
+## 21. Bridge actions
+
+A backend may act on its own, at any time, inside or outside a turn
+([design](superpowers/specs/2026-11-09-proactive-agents.md) §7): it sends
+`BackendEvent::Action(ActionRequest{action, reply})` and the core answers an `ActionResult`
+on the oneshot. The echo agent offers them as [commands](#19-echo-backend).
+
+| Action | What the bridge does |
+|---|---|
+| `request_contact` (`handle`) | looks the handle up and sends a contact request |
+| `send_message` (`to`, `text`) | `owner` (or the owner's handle): a reply in the owner's chat; a handle: opens the direct chat (a `chats` action when it is new) and sends, **plain text to an agent** (a turn for its backend), a rich reply to a person; `group:<id>`: a rich reply in a group the agent is a member of |
+| `notify_owner` (`text`) | a note in the owner's chat titled with the backend's name |
+| `create_group` (`name`, member handles) | creates the group; the result names it `group:<id>` |
+| `invite` (`group:<id>`, `handle`) | adds the contact to the group |
+| `call` (`owner` or a handle, optional `reason`) | the owner: dialed as for a request, with the reason said on pickup; it ignores `calls.notify_by_call` and the quiet hours but not the minimum interval, one call at a time, or a missing voice adapter (`unavailable`). Agents are never called (`not_allowed`); calls to people are not placed by the bridge yet (`failed`) |
+| `outgoing` | the agent's actions waiting for the owner and those resolved lately, one line each |
+
+**Results** (stable codes): `done`, `waiting_for_owner` (with `action_id`),
+`not_allowed_by_owner`, `rate_limited` (with `retry_after_s`), `paused`, `not_found` (an
+unknown handle or a group the agent is not in), `not_contact`, `not_allowed`, `unavailable`
+(no voice, a call running, the server unreachable, or a server without groups: "groups are
+not enabled on this server") and `failed` (the detail says why). `conversation` names the
+chat or `group:<id>` used. Each action is logged as `agent_action` with its kind and code,
+never its text.
+
+**Waiting for the owner.** When the owner's outgoing policy is `ask`, the server holds the
+action and the bridge keeps what is left to do in `state.json` (`pending_actions`, by
+action id): the text of a message to a new chat, the reason of a call. When the owner
+decides (`OutgoingActionEvent`): approved, the held text goes into the chat the server
+opened; declined, expired or failed, it is dropped. Each outcome is a short note in the
+owner's chat ("Owner approved: message to @bob sent.", "Owner declined: message to
+@bob.", "Failed: message to @bob (not_contact)."). At start-up and after each reconnect
+the bridge lists its actions to settle those decided while it was away; kept items older
+than 48 hours are dropped.

@@ -36,6 +36,57 @@ pub struct State {
     pub agent_message_cursor: Option<u64>,
     /// The engine instance the cursor belongs to.
     pub engine_instance: Option<String>,
+    /// The agent's actions waiting for its owner, by action id: what the bridge still
+    /// has to do once the owner approves (spec 2026-11-09 proactive agents §7.3).
+    pub pending_actions: BTreeMap<String, PendingAction>,
+}
+
+/// An action of the agent that waits for its owner.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingAction {
+    #[serde(flatten)]
+    pub kind: PendingKind,
+    /// When it was asked (Unix ms).
+    pub created_at_ms: i64,
+}
+
+/// What a waiting action is, and what is left to do after the approval.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PendingKind {
+    /// A contact request to `handle`.
+    Request { handle: String },
+    /// A new direct chat with `target` (a user id) and the text to send in it.
+    Send {
+        target: String,
+        handle: String,
+        text: String,
+        /// The peer is an agent: plain text, not a rich reply.
+        agent: bool,
+    },
+    /// A group called `name`.
+    Group { name: String },
+    /// Adding `handle` to `group` (`group:<id>`).
+    Invite { group: String, handle: String },
+    /// A call to `target` (a user id), with what to say when they pick up.
+    Call {
+        target: String,
+        handle: String,
+        reason: Option<String>,
+    },
+}
+
+impl PendingKind {
+    /// What it is, for the owner: "message to @bob".
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Request { handle } => format!("contact request to @{handle}"),
+            Self::Send { handle, .. } => format!("message to @{handle}"),
+            Self::Group { name } => format!("group \"{name}\""),
+            Self::Invite { group, handle } => format!("adding @{handle} to {group}"),
+            Self::Call { handle, .. } => format!("call to @{handle}"),
+        }
+    }
 }
 
 /// A state file that cannot be read or written.
@@ -257,6 +308,35 @@ mod tests {
             .map(|entry| entry.unwrap().file_name().into_string().unwrap())
             .collect();
         assert_eq!(names, [FILE_NAME]);
+    }
+
+    #[test]
+    fn pending_actions_survive_a_restart_and_older_files_load() {
+        let dir = TestDir::new();
+        let path = state_path(&dir);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"{"folder":"/work/app"}"#).unwrap();
+        let file = StateFile::load(&path).unwrap();
+        assert!(file.get().pending_actions.is_empty());
+        let pending = PendingAction {
+            kind: PendingKind::Send {
+                target: "user-1".into(),
+                handle: "bob".into(),
+                text: "hi".into(),
+                agent: true,
+            },
+            created_at_ms: 7,
+        };
+        file.update(|state| {
+            state.pending_actions.insert("a-1".into(), pending.clone());
+        })
+        .unwrap();
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(written["pending_actions"]["a-1"]["kind"], "send");
+        let reloaded = StateFile::load(&path).unwrap().get();
+        assert_eq!(reloaded.pending_actions["a-1"], pending);
+        assert_eq!(pending.kind.describe(), "message to @bob");
     }
 
     #[test]

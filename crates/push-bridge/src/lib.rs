@@ -2,6 +2,7 @@
 //! agent contact. A backend-independent core drives a small [`backend::Backend`] trait;
 //! Coda is the first backend; [`echo`] is a deterministic test agent.
 
+pub mod actions;
 pub mod backend;
 pub mod backoff;
 pub mod cards;

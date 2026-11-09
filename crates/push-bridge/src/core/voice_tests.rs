@@ -1683,3 +1683,38 @@ async fn the_call_flag_holds_through_the_shutdown() {
         "never lowered during the shutdown"
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn the_backend_s_call_action_rings_the_owner_with_its_reason() {
+    use crate::actions::{Action, ActionCode, ActionRequest, Target};
+    // Notify-by-call is off (the default): the action still calls, within the interval.
+    let v = Voice::new().await;
+    let call = |reason: Option<&str>| {
+        let (request, result) = ActionRequest::new(Action::Call {
+            to: Target::Owner,
+            reason: reason.map(str::to_owned),
+        });
+        v.h.backend.emit(BackendEvent::Action(request));
+        result
+    };
+    let first = call(Some("The nightly build failed.")).await.unwrap();
+    assert_eq!(first.code, ActionCode::Done, "{first:?}");
+    let ringing = v.dialed(1).await;
+    let busy = call(None).await.unwrap();
+    assert_eq!(
+        (busy.code, busy.detail.as_str()),
+        (ActionCode::Unavailable, "a call is already running")
+    );
+    ringing.pick_up();
+    v.until_said("The nightly build failed.").await;
+    assert_eq!(
+        v.spoken(),
+        ["Hi, it's Coda in work.", "The nightly build failed."]
+    );
+    ringing.end(CallEndReason::Completed);
+    settle().await;
+    let soon = call(None).await.unwrap();
+    assert_eq!(soon.code, ActionCode::Unavailable, "{soon:?}");
+    assert!(soon.retry_after_s.is_some_and(|after| after > 500));
+    assert_eq!(v.phone.dialed().len(), 1);
+}

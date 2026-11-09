@@ -30,7 +30,7 @@ type Channels = (mpsc::UnboundedReceiver<BackendEvent>, mpsc::Receiver<Event>);
 pub(super) struct Harness {
     pub(super) messenger: Arc<TestMessenger>,
     pub(super) backend: Arc<TestBackend>,
-    state: Arc<StateFile>,
+    pub(super) state: Arc<StateFile>,
     root: PathBuf,
     pub(super) work: PathBuf,
     other: PathBuf,
@@ -137,7 +137,7 @@ impl Harness {
         })));
     }
 
-    async fn started() -> Self {
+    pub(super) async fn started() -> Self {
         let mut harness = Self::new();
         harness.start();
         harness.backend.wait_for("start", 1).await;

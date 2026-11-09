@@ -40,6 +40,8 @@ pub(super) enum Purpose {
     Request,
     /// An urgent background message.
     Urgent { label: String, text: String },
+    /// The backend's `call` action, with what to say on pickup.
+    Agent { reason: Option<String> },
 }
 
 impl Purpose {
@@ -47,6 +49,7 @@ impl Purpose {
         match self {
             Purpose::Request => "request",
             Purpose::Urgent { .. } => "urgent",
+            Purpose::Agent { .. } => "agent",
         }
     }
 }
@@ -266,25 +269,41 @@ impl<M: Messenger> Core<M> {
     /// but cannot speak holds calls back (`call_held` `no_tts`, logged once per change):
     /// the owner would pick up a silent call.
     fn can_dial(&mut self) -> bool {
+        self.dial_blocker().is_none()
+    }
+
+    /// Why the bridge cannot call now (see [`Self::can_dial`]); `None` when it can.
+    pub(super) fn dial_blocker(&mut self) -> Option<&'static str> {
         let Some(voice) = &self.voice else {
-            return false;
+            return Some("voice calls are not set up");
         };
         if !voice.can_listen() {
-            return false;
+            return Some("the voice adapter is not ready");
         }
         let speaks = voice.can_speak();
         if !speaks && !self.held_no_tts {
             tracing::info!(event = "call_held", reason = "no_tts");
         }
         self.held_no_tts = !speaks;
-        let advertised = voice.adapter.advertised();
-        speaks
-            && advertised
-            && !self
-                .connection
-                .is_some_and(|state| state != ConnectionState::Connected)
-            && !self.call_busy()
-            && self.pause.is_none()
+        if !speaks {
+            return Some("the voice adapter cannot speak");
+        }
+        if !voice.adapter.advertised() {
+            return Some("calls are not available yet");
+        }
+        if self
+            .connection
+            .is_some_and(|state| state != ConnectionState::Connected)
+        {
+            return Some("the messenger is not connected");
+        }
+        if self.call_busy() {
+            return Some("a call is already running");
+        }
+        if self.pause.is_some() {
+            return Some("the bridge is paused");
+        }
+        None
     }
 
     /// The rate limit and the do-not-disturb hours; logs a refusal when it changes.
@@ -388,6 +407,14 @@ impl<M: Messenger> Core<M> {
                     call.session.say(sentence);
                 }
             }
+            Some(Purpose::Agent {
+                reason: Some(reason),
+            }) => {
+                call.session.say(hello);
+                for sentence in speech::sentences(reason) {
+                    call.session.say(sentence);
+                }
+            }
             _ => call.session.say(hello),
         }
         match self.open.first() {
@@ -444,6 +471,13 @@ impl<M: Messenger> Core<M> {
                     shown_line(&label, NOTE_LABEL)
                 ));
             }
+            Some(Purpose::Agent { reason }) => match reason {
+                Some(reason) => self.reply(&format!(
+                    "📞 I called about \"{}\" ({why}).",
+                    shown_line(&reason, NOTE_LABEL)
+                )),
+                None => self.reply(&format!("📞 I called you ({why}).")),
+            },
             _ => {}
         }
     }
