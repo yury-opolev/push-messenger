@@ -13,7 +13,9 @@ use push_sdk::{
 use tokio::time::{Duration, Instant};
 
 use super::{Core, Internal};
-use crate::backend::{Answer, BackendError, BackendRequest, ContactId, RequestKind, Responder};
+use crate::backend::{
+    Answer, BackendError, BackendRequest, ContactId, ContactInfo, RequestKind, Responder,
+};
 use crate::cards::{self, CardKind, TypedOutcome};
 use crate::commands::{self, Command};
 use crate::messenger::{Messenger, Peer};
@@ -294,11 +296,19 @@ impl<M: Messenger> Core<M> {
             self.contact_activity(conversation, ActivityState::Working, Some(&working))
                 .await;
         }
+        let peer = self.peer(user).await;
+        let info = ContactInfo {
+            handle: peer
+                .as_ref()
+                .map(|peer| peer.handle.clone())
+                .filter(|handle| !handle.is_empty()),
+            agent: peer.is_some_and(|peer| peer.agent),
+        };
         let backend = self.backend.clone();
         let internal = self.internal.clone();
         tokio::spawn(async move {
             let result = backend
-                .contact_prompt(ContactId(user.to_string()), &text)
+                .contact_prompt(ContactId(user.to_string()), info, &text)
                 .await;
             let _ = internal.send(Internal::ContactPrompted { chat, result });
         });

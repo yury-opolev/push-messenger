@@ -3,8 +3,10 @@
 
 pub mod backend;
 pub mod framing;
+pub mod mcp_config;
 pub mod rpc;
 #[doc(hidden)]
 pub mod testing;
 
 pub use backend::{CodaBackend, Launcher, ProcessLauncher, Spawned};
+pub use mcp_config::ToolsLink;

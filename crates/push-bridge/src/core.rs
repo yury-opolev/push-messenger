@@ -410,8 +410,6 @@ struct Core<M: Messenger> {
     answer_timeout: Duration,
     /// The owner's texts stored before this (server time, µs) are not delivered.
     skip_before_us: Option<i64>,
-    /// The backend takes the agent's accepted contacts too.
-    accepts_contacts: bool,
     /// Which accepted contacts reach the backend (the owner's setting).
     inbound: InboundPolicy,
     /// Chats with other agents and their turns (see [`loop_guard`]).
@@ -527,7 +525,6 @@ impl<M: Messenger> Core<M> {
         let format = backend.text_format();
         let labels = backend.activity_labels();
         let answer_timeout = backend.answer_timeout();
-        let accepts_contacts = backend.accepts_contacts();
         let clock = Clock::new();
         let skip_before_us = backend.skip_texts_older_than().map(|age| {
             let age_ms = i64::try_from(age.as_millis()).unwrap_or(i64::MAX);
@@ -541,7 +538,6 @@ impl<M: Messenger> Core<M> {
             labels,
             answer_timeout,
             skip_before_us,
-            accepts_contacts,
             inbound: InboundPolicy::OwnerOnly,
             loops: loop_guard::LoopGuard::new(options.loop_guard_turns),
             contacts: contacts::Contacts::default(),

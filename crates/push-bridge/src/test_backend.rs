@@ -10,8 +10,8 @@ use tokio::time::Instant;
 
 use crate::backend::{
     Answer, Backend, BackendCommand, BackendError, BackendEvent, BackendRequest, BackendStatus,
-    Capability, CommandReply, ContactId, ErrorKind, PendingMessages, PrepareOptions, Prepared,
-    RequestKind, Responder, StartOptions, Started, SteerOutcome, TextFormat, TurnSource,
+    Capability, CommandReply, ContactId, ContactInfo, ErrorKind, PendingMessages, PrepareOptions,
+    Prepared, RequestKind, Responder, StartOptions, Started, SteerOutcome, TextFormat, TurnSource,
 };
 use crate::messenger::wait;
 
@@ -55,6 +55,8 @@ struct Script {
     text_format: TextFormat,
     /// Takes the agent's contacts' texts too.
     accepts_contacts: bool,
+    /// Who each contact prompt was from, in order.
+    contact_infos: Vec<ContactInfo>,
 }
 
 /// A [`Backend`] a test scripts.
@@ -89,6 +91,7 @@ impl TestBackend {
                 sessions: 0,
                 text_format: TextFormat::Plain,
                 accepts_contacts: false,
+                contact_infos: Vec::new(),
             }),
             changed: Notify::new(),
         }
@@ -220,6 +223,11 @@ impl TestBackend {
             .collect()
     }
 
+    /// Who each contact prompt so far was from, in order.
+    pub fn contact_infos(&self) -> Vec<ContactInfo> {
+        self.lock().contact_infos.clone()
+    }
+
     /// Every call with the (tokio) time it was made.
     pub fn timed_calls(&self) -> Vec<(Instant, String)> {
         self.lock().calls.clone()
@@ -320,7 +328,13 @@ impl Backend for TestBackend {
         self.lock().accepts_contacts
     }
 
-    async fn contact_prompt(&self, contact: ContactId, text: &str) -> Result<(), BackendError> {
+    async fn contact_prompt(
+        &self,
+        contact: ContactId,
+        info: ContactInfo,
+        text: &str,
+    ) -> Result<(), BackendError> {
+        self.lock().contact_infos.push(info);
         self.record(format!("contact {} {text}", contact.0));
         Ok(())
     }

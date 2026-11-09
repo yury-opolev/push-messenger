@@ -2688,6 +2688,7 @@ dependencies = [
  "push-sdk",
  "push-voice-adapter-proto",
  "push-voice-adapter-testkit",
+ "rand 0.9.5",
  "regex",
  "serde",
  "serde_json",

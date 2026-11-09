@@ -2,6 +2,7 @@
 //! [`FakeCoda`] the test scripts over in-memory pipes.
 
 use std::collections::{HashMap, VecDeque};
+use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,7 +12,7 @@ use serde_json::{Value, json};
 use tokio::io::{DuplexStream, duplex};
 use tokio::sync::{mpsc, oneshot};
 
-use super::backend::{Launcher, Spawned};
+use super::backend::{Env, Launcher, Spawned};
 use super::framing::{FrameReader, write_frame};
 use crate::backend::PermissionMode;
 
@@ -23,6 +24,7 @@ type ExitSender = Arc<Mutex<Option<oneshot::Sender<String>>>>;
 /// A [`Launcher`] that records each spawn and hands the test a [`FakeCoda`] for it.
 pub struct FakeLauncher {
     spawns: Mutex<Vec<(PathBuf, PermissionMode)>>,
+    envs: Mutex<Vec<Vec<(OsString, OsString)>>>,
     failures: Mutex<usize>,
     fakes: mpsc::UnboundedSender<FakeCoda>,
 }
@@ -33,6 +35,7 @@ impl FakeLauncher {
         let (fakes, receiver) = mpsc::unbounded_channel();
         let launcher = Self {
             spawns: Mutex::new(Vec::new()),
+            envs: Mutex::new(Vec::new()),
             failures: Mutex::new(0),
             fakes,
         };
@@ -47,6 +50,14 @@ impl FakeLauncher {
             .clone()
     }
 
+    /// The environment each spawn so far set, in order.
+    pub fn envs(&self) -> Vec<Vec<(OsString, OsString)>> {
+        self.envs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
     /// The next `count` spawns fail.
     pub fn fail_spawns(&self, count: usize) {
         *self.failures.lock().unwrap_or_else(PoisonError::into_inner) = count;
@@ -55,7 +66,7 @@ impl FakeLauncher {
 
 #[async_trait::async_trait]
 impl Launcher for FakeLauncher {
-    async fn spawn(&self, folder: &Path, mode: PermissionMode) -> io::Result<Spawned> {
+    async fn spawn(&self, folder: &Path, mode: PermissionMode, env: &Env) -> io::Result<Spawned> {
         let failing = {
             let mut left = self.failures.lock().unwrap_or_else(PoisonError::into_inner);
             let failing = *left > 0;
@@ -69,6 +80,10 @@ impl Launcher for FakeLauncher {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push((folder.to_owned(), mode));
+        self.envs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(env.to_vec());
         let (backend_writer, fake_reader) = duplex(PIPE);
         let (fake_writer, backend_reader) = duplex(PIPE);
         let (exit_sender, exited) = oneshot::channel();

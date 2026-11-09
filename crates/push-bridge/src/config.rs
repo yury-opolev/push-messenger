@@ -69,6 +69,11 @@ pub struct Config {
     /// person's message, after which the loop guard pauses the chat; at least 2.
     #[serde(default = "default_loop_guard_turns")]
     pub loop_guard_turns: u32,
+    /// With the Coda backend, serves the bridge's actions to Coda as MCP tools through a
+    /// private tools endpoint, and lets Coda take texts from the agent's contacts;
+    /// `false` turns both off.
+    #[serde(default = "yes")]
+    pub tools: bool,
 }
 
 fn yes() -> bool {
@@ -842,6 +847,15 @@ mod tests {
         }
         config["echo"] = json!({ "answerTimeout": 30 });
         assert!(load(&fixture, &config).is_err());
+    }
+
+    #[test]
+    fn the_tools_are_on_unless_turned_off() {
+        let fixture = fixture();
+        let mut config = minimal(&fixture);
+        assert!(load(&fixture, &config).unwrap().tools);
+        config["tools"] = json!(false);
+        assert!(!load(&fixture, &config).unwrap().tools);
     }
 
     #[test]
