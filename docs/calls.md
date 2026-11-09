@@ -1389,7 +1389,7 @@ not offer calls) and return once the frame is queued. A refusal arrives later as
 | `Ended` | `CallEnded` | `call_id`, `reason` (`CallEndReason`), `duration_s` |
 | `PeerIce` | `peer_call_ice` | `call_id`, `candidate` (`IceCandidate`) |
 | `PeerRenegotiate` | `peer_call_renegotiate` | `call_id`, `sdp`, `kind` (`SdpKind`) |
-| `Error` | `CallError` | `call_id`, `code` (`CallErrorCode`: `AlreadyAnswered`, `CallNotFound`, `InCall`, `CallLimit`, `NotContact`, `Invalid`, `RateLimited`, `NotAvailable`, `Unavailable`, `Other`), `error` (`SdkError::Server` with the code in snake case, `retryable` and `retry_after_s`) |
+| `Error` | `CallError` | `call_id`, `code` (`CallErrorCode`: `AlreadyAnswered`, `CallNotFound`, `InCall`, `CallLimit`, `NotContact`, `Invalid`, `RateLimited`, `NotAvailable`, `Unavailable`, `WaitingForOwner`, `NotAllowedByOwner`, `Other`), `error` (`SdkError::Server` with the code in snake case, `retryable`, `retry_after_s` and, for `WaitingForOwner`, `action_id`) |
 | `Synced` | `CallSync` | `calls` (`CallState`: id, peer, direction, status, offer, expiry, `answered_at_ms`, `this_device`), `gone` |
 | `HistoryChanged` | `CallHistoryChanged` | `latest_ended_at_ms` |
 
@@ -1478,7 +1478,7 @@ busy, unreachable, with the server's reason and duration), `Local` (`hangup` or 
 `disconnect_timeout`: the helper hung up with `FAILED`), `Gone` (a `CallSync` after a
 reconnect no longer lists the call) and `Refused(CallErrorCode)` (the server refused the
 invite or the answer for good: `NOT_CONTACT`, `IN_CALL`, `RATE_LIMITED`,
-`NOT_AVAILABLE`, `ALREADY_ANSWERED`, `CALL_NOT_FOUND` while the call is being set up; a refused
+`NOT_AVAILABLE`, `WAITING_FOR_OWNER`, `NOT_ALLOWED_BY_OWNER`, `ALREADY_ANSWERED`, `CALL_NOT_FOUND` while the call is being set up; a refused
 candidate or renegotiation later leaves the call running, and `CALL_NOT_FOUND` for an
 established call ends it as `Gone`).
 

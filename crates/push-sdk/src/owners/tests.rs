@@ -81,7 +81,7 @@ fn owner_answers(method: &str, path: &str) -> (StatusCode, Value) {
             json!({"conversations": [{"conversation_id": PEER, "kind": "direct", "title": null,
                    "peer": profile(PEER, "peer"), "peer_owner": null, "member_count": 2,
                    "last_activity_at": "2026-11-06T10:00:00.000Z", "message_count": 4,
-                   "hidden": false, "peer_deleted": false}]}),
+                   "hidden": false, "peer_deleted": false, "started_by_agent": true}]}),
         ),
         ("GET", rest) if rest.ends_with("/messages") => (
             StatusCode::OK,
@@ -124,6 +124,7 @@ async fn the_owner_routes_are_called_and_read() {
     let conversations = api.agent_conversations(token, agent).await.unwrap();
     assert_eq!(conversations[0].message_count, 4);
     assert_eq!(conversations[0].peer.as_ref().unwrap().user_id, peer);
+    assert!(conversations[0].started_by_agent);
     let page = api
         .agent_history(token, agent, ConversationId(peer.0), Some(9), Some(20))
         .await
@@ -167,5 +168,157 @@ async fn a_non_owner_gets_not_found() {
         .agent_conversations("owner-token", UserId(AGENT.parse().unwrap()))
         .await
         .unwrap_err();
+    assert_eq!(error.code(), "not_found");
+}
+
+const ACTION: &str = "0190f5c4-0000-7000-8000-0000000000aa";
+const GROUP: &str = "0190f5c4-0000-7000-8000-0000000000bb";
+
+fn action(state: &str, error: Option<&str>, resolved_at: Option<&str>) -> Value {
+    json!({"action_id": ACTION, "kind": "group", "target": null, "conversation_id": GROUP,
+           "title": "plans", "members": [profile(PEER, "peer")], "state": state,
+           "error": error, "created_at": "2026-11-09T10:00:00.000Z",
+           "expires_at": "2026-11-10T10:00:00.000Z", "resolved_at": resolved_at})
+}
+
+fn outgoing_answers(method: &str, path: &str) -> (StatusCode, Value) {
+    let rest = path.trim_start_matches(&format!("v1/agents/{AGENT}"));
+    match (method, rest) {
+        ("GET", "/outgoing-policy") => (
+            StatusCode::OK,
+            json!({"requests": "ask", "chats": "ask", "groups": "off", "calls": "off"}),
+        ),
+        ("PUT", "/outgoing-policy") => (
+            StatusCode::OK,
+            json!({"requests": "ask", "chats": "allowed", "groups": "off", "calls": "ask"}),
+        ),
+        ("GET", "/inbound-policy") => (StatusCode::OK, json!({"policy": "owner_only"})),
+        ("PUT", "/inbound-policy") => (StatusCode::OK, json!({"policy": "owner_agents"})),
+        ("GET", "/outgoing") => (
+            StatusCode::OK,
+            json!({"actions": [
+                action("waiting", None, None),
+                {"action_id": ACTION, "kind": "request", "target": profile(PEER, "peer"),
+                 "conversation_id": null, "title": null, "members": [], "state": "declined",
+                 "error": null, "created_at": "2026-11-09T10:00:00.000Z",
+                 "expires_at": "2026-11-10T10:00:00.000Z",
+                 "resolved_at": "2026-11-09T11:00:00.000Z"},
+                action("expired", None, Some("2026-11-10T10:00:00.000Z")),
+            ]}),
+        ),
+        ("POST", rest) if rest.ends_with("/approve") => (
+            StatusCode::OK,
+            json!({"action": action("failed", Some("not_contact"), Some("2026-11-09T11:00:00.000Z"))}),
+        ),
+        _ => (StatusCode::NO_CONTENT, Value::Null),
+    }
+}
+
+#[tokio::test]
+async fn the_outgoing_and_inbound_routes_are_called_and_read() {
+    let (api, seen) = serve(outgoing_answers).await;
+    let token = "owner-token";
+    let agent = UserId(AGENT.parse().unwrap());
+    let peer = UserId(PEER.parse().unwrap());
+    assert_eq!(
+        api.outgoing_policy(token, agent).await.unwrap(),
+        OutgoingPolicies {
+            requests: OutgoingPolicy::Ask,
+            chats: OutgoingPolicy::Ask,
+            groups: OutgoingPolicy::Off,
+            calls: OutgoingPolicy::Off,
+        }
+    );
+    let update = OutgoingPolicyUpdate {
+        chats: Some(OutgoingPolicy::Allowed),
+        calls: Some(OutgoingPolicy::Ask),
+        ..OutgoingPolicyUpdate::default()
+    };
+    let now = api.set_outgoing_policy(token, agent, update).await.unwrap();
+    assert_eq!(
+        (now.chats, now.calls),
+        (OutgoingPolicy::Allowed, OutgoingPolicy::Ask)
+    );
+    assert_eq!(
+        api.inbound_policy(token, agent).await.unwrap(),
+        InboundPolicy::OwnerOnly
+    );
+    assert_eq!(
+        api.set_inbound_policy(token, agent, InboundPolicy::OwnerAgents)
+            .await
+            .unwrap(),
+        InboundPolicy::OwnerAgents
+    );
+    let actions = api.agent_outgoing(token, agent).await.unwrap();
+    assert_eq!(
+        actions[0],
+        OwnerOutgoingAction {
+            action_id: ACTION.to_owned(),
+            kind: OutgoingKind::Group,
+            target: None,
+            conversation: Some(ConversationId(GROUP.parse().unwrap())),
+            title: Some("plans".to_owned()),
+            members: actions[0].members.clone(),
+            state: OutgoingState::Waiting,
+            error: None,
+            created_at_ms: 1_794_218_400_000,
+            expires_at_ms: 1_794_304_800_000,
+            resolved_at_ms: None,
+        }
+    );
+    assert_eq!(actions[0].members[0].user_id, peer);
+    assert!(!format!("{:?}", actions[0]).contains("plans"));
+    assert_eq!(actions[1].kind, OutgoingKind::Request);
+    assert_eq!(actions[1].target.as_ref().unwrap().user_id, peer);
+    assert_eq!(actions[1].state, OutgoingState::OwnerDeclined);
+    assert_eq!(actions[1].resolved_at_ms, Some(1_794_222_000_000));
+    assert_eq!(actions[2].state, OutgoingState::Expired);
+    let approved = api.approve_outgoing(token, agent, ACTION).await.unwrap();
+    assert_eq!(approved.state, OutgoingState::Failed);
+    assert_eq!(approved.error.as_deref(), Some("not_contact"));
+    api.decline_outgoing(token, agent, ACTION).await.unwrap();
+    let base = format!("/v1/agents/{AGENT}");
+    assert_eq!(
+        *seen.lock().unwrap(),
+        [
+            format!("GET {base}/outgoing-policy"),
+            format!("PUT {base}/outgoing-policy {{\"calls\":\"ask\",\"chats\":\"allowed\"}}"),
+            format!("GET {base}/inbound-policy"),
+            format!("PUT {base}/inbound-policy {{\"policy\":\"owner_agents\"}}"),
+            format!("GET {base}/outgoing"),
+            format!("POST {base}/outgoing/{ACTION}/approve"),
+            format!("POST {base}/outgoing/{ACTION}/decline"),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_broken_action_id_is_refused_before_anything_is_sent() {
+    let (api, seen) = serve(outgoing_answers).await;
+    let agent = UserId(AGENT.parse().unwrap());
+    let error = api
+        .decline_outgoing("owner-token", agent, "../../policy")
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), "invalid");
+    assert!(seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn an_action_that_no_longer_waits_is_not_found() {
+    let (api, _) = serve(|_, _| {
+        (
+            StatusCode::NOT_FOUND,
+            json!({"error": {"code": "not_found", "message": "not found", "retryable": false}}),
+        )
+    })
+    .await;
+    let agent = UserId(AGENT.parse().unwrap());
+    let error = api
+        .approve_outgoing("owner-token", agent, ACTION)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), "not_found");
+    let error = api.outgoing_policy("owner-token", agent).await.unwrap_err();
     assert_eq!(error.code(), "not_found");
 }

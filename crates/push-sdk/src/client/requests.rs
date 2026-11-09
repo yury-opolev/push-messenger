@@ -6,9 +6,10 @@ use push_domain::{
     UserId,
 };
 use push_proto::v1::{
-    ContactAccept, ContactBlock, ContactDecline, ContactRequest, ContactUnblock, CreateInvite,
-    FetchHistory, HideConversation, ListContacts, ListConversations, OpenDirect, RedeemInvite,
-    RevokeInvite, UnhideConversation, request, response,
+    AddMembers, ContactAccept, ContactBlock, ContactDecline, ContactRequest, ContactUnblock,
+    CreateGroup, CreateInvite, FetchHistory, GetAgentSettings, HideConversation, ListContacts,
+    ListConversations, ListOutgoingActions, OpenDirect, RedeemInvite, RevokeInvite,
+    UnhideConversation, request, response,
 };
 use tokio::sync::oneshot;
 use uuid::Uuid;
@@ -18,6 +19,7 @@ use crate::SdkError;
 use crate::auth::{Device, Profile};
 use crate::connection::Command;
 use crate::model::{ConnectionState, Contact, ContactState, Conversation, Event, Invite, Message};
+use crate::outgoing::{AgentSettings, OutgoingAction};
 use crate::store::bytes;
 
 impl Client {
@@ -312,6 +314,75 @@ impl Client {
         Ok(())
     }
 
+    /// Creates a group with the user as its admin and `members` (accepted contacts, at
+    /// most 99) in it; `title` is 1 to 100 characters after trimming. Answers the group's
+    /// id ([`Client::list_conversations`] gives the rest). Only [`SdkError::Timeout`] may
+    /// mean the group exists: creating again makes another group.
+    ///
+    /// An agent passes its owner's outgoing policy for groups first:
+    /// `waiting_for_owner` (the error's [`SdkError::action_id`] names the action; once the
+    /// owner approves it the group is created, [`Event::OutgoingActionChanged`]) or
+    /// `not_allowed_by_owner`.
+    pub async fn create_group(
+        &self,
+        title: &str,
+        members: Vec<UserId>,
+    ) -> Result<ConversationId, SdkError> {
+        let body = request::Body::CreateGroup(CreateGroup {
+            title: title.to_owned(),
+            member_ids: members.iter().map(|member| bytes(member.0)).collect(),
+        });
+        let response::Body::GroupCreated(created) = self.request(body).await? else {
+            return Err(unexpected());
+        };
+        Uuid::from_slice(&created.conversation_id)
+            .map(ConversationId)
+            .map_err(|_| unexpected())
+    }
+
+    /// Adds `users` (accepted contacts of the user) to a group the user is an admin of;
+    /// they see the log from the entry that adds them. An agent passes its owner's
+    /// outgoing policy for groups first, as [`Client::create_group`] does.
+    pub async fn add_members(
+        &self,
+        group: ConversationId,
+        users: Vec<UserId>,
+    ) -> Result<(), SdkError> {
+        let body = request::Body::AddMembers(AddMembers {
+            conversation_id: bytes(group.0),
+            user_ids: users.iter().map(|user| bytes(user.0)).collect(),
+        });
+        let response::Body::Done(_) = self.request(body).await? else {
+            return Err(unexpected());
+        };
+        Ok(())
+    }
+
+    /// The user is an agent: its settings, as its owner set them. `not_allowed` for
+    /// people.
+    pub async fn agent_settings(&self) -> Result<AgentSettings, SdkError> {
+        let body = request::Body::GetAgentSettings(GetAgentSettings {});
+        let response::Body::AgentSettings(settings) = self.request(body).await? else {
+            return Err(unexpected());
+        };
+        AgentSettings::from_wire(&settings).ok_or_else(unexpected)
+    }
+
+    /// The user is an agent: its actions waiting for its owner and those resolved in the
+    /// last 24 hours, oldest first. `not_allowed` for people. (An owner lists an agent's
+    /// waiting actions with [`Client::agent_outgoing`].)
+    pub async fn outgoing_actions(&self) -> Result<Vec<OutgoingAction>, SdkError> {
+        let body = request::Body::ListOutgoingActions(ListOutgoingActions {});
+        let response::Body::OutgoingActions(list) = self.request(body).await? else {
+            return Err(unexpected());
+        };
+        list.actions
+            .iter()
+            .map(OutgoingAction::from_wire)
+            .collect::<Option<_>>()
+            .ok_or_else(unexpected)
+    }
+
     // ----- auth-svc, signed in -----
 
     /// The profiles among `ids` the user may see: themselves, contacts, and anyone they
@@ -496,5 +567,167 @@ mod tests {
             |result: Result<Invite, SdkError>| matches!(result, Err(SdkError::Invalid(_)));
         assert!(invalid(f.client.create_invite(30, 1).await));
         assert!(invalid(f.client.create_invite(600, 0).await));
+    }
+
+    /// The next request the app made (not the engine's own listings).
+    async fn next_request(socket: &mut crate::testing::Server) -> v1::Request {
+        let Body::Request(request) = recv_until(socket, |body| {
+            matches!(body, Body::Request(request)
+                if request.request_id < crate::engine::INTERNAL_REQUESTS)
+        })
+        .await
+        else {
+            unreachable!();
+        };
+        request
+    }
+
+    async fn answer(socket: &mut crate::testing::Server, request_id: u64, body: response::Body) {
+        let answer = v1::Response {
+            request_id,
+            body: Some(body),
+        };
+        send(socket, Body::Response(answer)).await;
+    }
+
+    #[tokio::test]
+    async fn a_group_is_created_and_members_are_added() {
+        let mut f = Fixture::new().await;
+        f.client.connect().unwrap();
+        let mut socket = f.ready().await;
+        let (one, two) = (UserId::new(), UserId::new());
+        let client = f.client.clone();
+        let creating =
+            tokio::spawn(async move { client.create_group("plans", vec![one, two]).await });
+        let request = next_request(&mut socket).await;
+        let Some(request::Body::CreateGroup(create)) = &request.body else {
+            panic!("{request:?}");
+        };
+        assert_eq!(create.title, "plans");
+        assert_eq!(create.member_ids, [bytes(one.0), bytes(two.0)]);
+        let group = ConversationId::new();
+        answer(
+            &mut socket,
+            request.request_id,
+            response::Body::GroupCreated(v1::GroupCreated {
+                conversation_id: bytes(group.0),
+            }),
+        )
+        .await;
+        assert_eq!(creating.await.unwrap().unwrap(), group);
+
+        let client = f.client.clone();
+        let adding = tokio::spawn(async move { client.add_members(group, vec![two]).await });
+        let request = next_request(&mut socket).await;
+        let Some(request::Body::AddMembers(add)) = &request.body else {
+            panic!("{request:?}");
+        };
+        assert_eq!(
+            (&add.conversation_id, &add.user_ids),
+            (&bytes(group.0), &vec![bytes(two.0)])
+        );
+        answer(
+            &mut socket,
+            request.request_id,
+            response::Body::Done(v1::Done {}),
+        )
+        .await;
+        adding.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_action_waiting_for_the_owner_is_an_error_naming_it() {
+        let mut f = Fixture::new().await;
+        f.client.connect().unwrap();
+        let mut socket = f.ready().await;
+        let client = f.client.clone();
+        let peer = UserId::new();
+        let opening = tokio::spawn(async move { client.open_direct(peer).await });
+        let request = next_request(&mut socket).await;
+        let action = Uuid::now_v7();
+        let refusal = v1::Error {
+            code: v1::ErrorCode::WaitingForOwner.into(),
+            message: "waits for the owner".to_owned(),
+            request_id: Some(request.request_id),
+            action_id: Some(bytes(action)),
+            ..Default::default()
+        };
+        send(&mut socket, Body::Error(refusal)).await;
+        let error = opening.await.unwrap().unwrap_err();
+        assert_eq!(
+            error,
+            SdkError::Server {
+                code: "waiting_for_owner".to_owned(),
+                message: "waits for the owner".to_owned(),
+                retryable: false,
+                retry_after_s: None,
+                action_id: Some(action.to_string()),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn an_agent_reads_its_settings_and_actions() {
+        let mut f = Fixture::new().await;
+        f.client.connect().unwrap();
+        let mut socket = f.ready().await;
+        let client = f.client.clone();
+        let reading = tokio::spawn(async move { client.agent_settings().await });
+        let request = next_request(&mut socket).await;
+        assert!(matches!(
+            request.body,
+            Some(request::Body::GetAgentSettings(_))
+        ));
+        let settings = v1::AgentSettings {
+            inbound: v1::InboundPolicy::OwnerOnly.into(),
+            requests: v1::OutgoingPolicy::Ask.into(),
+            chats: v1::OutgoingPolicy::Ask.into(),
+            groups: v1::OutgoingPolicy::Off.into(),
+            calls: v1::OutgoingPolicy::Allowed.into(),
+        };
+        answer(
+            &mut socket,
+            request.request_id,
+            response::Body::AgentSettings(settings),
+        )
+        .await;
+        let settings = reading.await.unwrap().unwrap();
+        assert_eq!(settings.inbound, crate::InboundPolicy::OwnerOnly);
+        assert_eq!(settings.calls, crate::OutgoingPolicy::Allowed);
+
+        let client = f.client.clone();
+        let listing = tokio::spawn(async move { client.outgoing_actions().await });
+        let request = next_request(&mut socket).await;
+        assert!(matches!(
+            request.body,
+            Some(request::Body::ListOutgoingActions(_))
+        ));
+        let (action, group) = (Uuid::now_v7(), ConversationId::new());
+        let actions = vec![v1::OutgoingAction {
+            action_id: bytes(action),
+            agent_user_id: bytes(f.auth.user.0),
+            kind: v1::OutgoingKind::Invite.into(),
+            conversation_id: bytes(group.0),
+            member_ids: vec![bytes(Uuid::now_v7())],
+            state: v1::OutgoingState::Waiting.into(),
+            created_at: 5_000,
+            ..Default::default()
+        }];
+        answer(
+            &mut socket,
+            request.request_id,
+            response::Body::OutgoingActions(v1::OutgoingActionList { actions }),
+        )
+        .await;
+        let listed = listing.await.unwrap().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].action_id, action.to_string());
+        assert_eq!(listed[0].kind, crate::OutgoingKind::Invite);
+        assert_eq!(listed[0].conversation, Some(group));
+        assert_eq!(listed[0].state, crate::OutgoingState::Waiting);
+        assert_eq!(
+            (listed[0].created_at_ms, listed[0].resolved_at_ms),
+            (5, None)
+        );
     }
 }

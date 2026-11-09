@@ -279,6 +279,7 @@ impl Calls {
                 message: "calls are not offered on this connection".to_owned(),
                 retryable: false,
                 retry_after_s: None,
+                action_id: None,
             });
         }
         Ok(())

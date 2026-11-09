@@ -126,6 +126,8 @@ One ordered stream per client, each event an object with a `type`:
 | `presenceChanged` | `presence`: a contact's presence changed |
 | `agentRequestWaiting` | `agentId`, `requesterId`: a request to one of the user's agents waits for the user's decision (owner methods: Rust SDK) |
 | `agentContactChanged` | `agentId`, `userId`, `state` (as a contact's): another relationship of one of the user's agents changed |
+| `agentSettingsChanged` | `settings`: `{inbound, requests, chats, groups, calls}`; the user is an agent and its owner changed its settings ([proactive agents](superpowers/specs/2026-11-09-proactive-agents.md)); `inbound` is `ownerOnly`, `ownerAgents` or `contacts`, the others `allowed`, `ask` or `off` |
+| `outgoingActionChanged` | `action`: `{actionId, agentId, kind, targetId, conversationId, title, memberIds, state, error, createdAtMs, resolvedAtMs}`; one of the user's agents' actions waits for the user or was resolved, or the user is an agent and one of its actions was resolved; `kind` is `request`, `chat`, `group`, `invite` or `call`, `state` `waiting`, `approved`, `ownerDeclined`, `expired` or `failed` (with `error`, an error code) |
 | `call` | `call`: something happened to a call ([below](#calls)); not emitted through the bindings yet |
 | `signedOut` | sign in again |
 | `deviceRemoved` | the device was revoked |
