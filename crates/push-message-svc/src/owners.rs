@@ -1,26 +1,31 @@
-//! The `AgentOwners` API (spec 2026-11-06 agent connections and the owner view): an
-//! agent's owner, through auth-svc, reads and sets the agent's policy and acts on its
-//! relationships. Also the sweeper that releases refused requests.
+//! The `AgentOwners` API (spec 2026-11-06 agent connections and the owner view; spec
+//! 2026-11-09 proactive agents): an agent's owner, through auth-svc, reads and sets the
+//! agent's policies, acts on its relationships and decides its waiting actions. Also the
+//! sweeper that releases refused requests.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use push_domain::{
-    AgentPolicy, Clock, ConversationId, ConversationKind, MAX_HISTORY_PAGE, Messaging, Notifier,
-    OwnerAction, Store, UserId,
+    AgentPolicy, AgentSettings, Clock, ConversationId, ConversationKind, MAX_HISTORY_PAGE,
+    Messaging, Notifier, OutgoingPolicyChange, OwnerAction, Store, UserId,
 };
 use push_proto::id_bytes;
 use push_proto::internal::v1::{
     self as internal, AgentConversations, AgentHistoryRequest, AgentOwnersDone, AgentPeerRequest,
-    AgentPolicyReply, AgentRef, CallHistoryPage, ResolveAction, ResolveRequest,
-    SetAgentPolicyRequest, WaitingRequest, WaitingRequests, agent_owners_server,
+    AgentPolicyReply, AgentRef, AgentSettingsReply, CallHistoryPage, OutgoingActionReply,
+    OutgoingActions, ResolveAction, ResolveOutgoingRequest, ResolveRequest, SetAgentPolicyRequest,
+    SetInboundRequest, SetOutgoingRequest, WaitingRequest, WaitingRequests, agent_owners_server,
 };
 use push_proto::v1::{self, Contact, ContactList, HistoryPage};
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status};
 
 use crate::calls::history::{cursor, entry};
-use crate::convert::{contact_state, deliver, domain_error, invalid, micros, parse_id};
+use crate::convert::{
+    Viewer, agent_settings, contact_state, deliver, domain_error, inbound_policy_from_wire,
+    invalid, micros, outgoing_action, outgoing_policy_from_wire, parse_id,
+};
 
 /// Serves `AgentOwners` over the messaging service.
 pub struct AgentOwnersApi<S, C, N> {
@@ -208,6 +213,7 @@ where
                     message_count: conversation.message_count,
                     hidden: conversation.hidden,
                     peer_deleted: conversation.peer_deleted,
+                    started_by_agent: conversation.started_by_agent,
                 })
                 .collect(),
         }))
@@ -251,6 +257,104 @@ where
             calls: rows.iter().map(entry).collect(),
         }))
     }
+
+    async fn get_settings(
+        &self,
+        request: Request<AgentRef>,
+    ) -> Result<Response<AgentSettingsReply>, Status> {
+        let (owner, agent) = agent_ref(Some(request.get_ref()))?;
+        let settings = self
+            .messaging
+            .agent_settings(owner, agent)
+            .await
+            .map_err(domain_error)?;
+        Ok(settings_reply(&settings))
+    }
+
+    async fn set_outgoing(
+        &self,
+        request: Request<SetOutgoingRequest>,
+    ) -> Result<Response<AgentSettingsReply>, Status> {
+        let request = request.into_inner();
+        let (owner, agent) = agent_ref(request.agent.as_ref())?;
+        let policy = |code: Option<i32>, field| {
+            code.map(|code| outgoing_policy_from_wire(code, field))
+                .transpose()
+        };
+        let change = OutgoingPolicyChange {
+            requests: policy(request.requests, "requests")?,
+            chats: policy(request.chats, "chats")?,
+            groups: policy(request.groups, "groups")?,
+            calls: policy(request.calls, "calls")?,
+        };
+        let settings = self
+            .messaging
+            .set_outgoing_policy(owner, agent, change)
+            .await
+            .map_err(domain_error)?;
+        Ok(settings_reply(&settings))
+    }
+
+    async fn set_inbound(
+        &self,
+        request: Request<SetInboundRequest>,
+    ) -> Result<Response<AgentSettingsReply>, Status> {
+        let request = request.into_inner();
+        let (owner, agent) = agent_ref(request.agent.as_ref())?;
+        let inbound = inbound_policy_from_wire(request.policy)?;
+        let settings = self
+            .messaging
+            .set_inbound_policy(owner, agent, inbound)
+            .await
+            .map_err(domain_error)?;
+        Ok(settings_reply(&settings))
+    }
+
+    async fn list_outgoing(
+        &self,
+        request: Request<AgentRef>,
+    ) -> Result<Response<OutgoingActions>, Status> {
+        let (owner, agent) = agent_ref(Some(request.get_ref()))?;
+        let actions = self
+            .messaging
+            .waiting_outgoing(owner, agent)
+            .await
+            .map_err(domain_error)?;
+        Ok(Response::new(OutgoingActions {
+            actions: actions
+                .iter()
+                .map(|action| outgoing_action(action, Viewer::Owner))
+                .collect(),
+        }))
+    }
+
+    async fn resolve_outgoing(
+        &self,
+        request: Request<ResolveOutgoingRequest>,
+    ) -> Result<Response<OutgoingActionReply>, Status> {
+        let request = request.into_inner();
+        let (owner, agent) = agent_ref(request.agent.as_ref())?;
+        let action_id = parse_id(&request.action_id, "action_id", std::convert::identity)?;
+        let action = if request.approve {
+            self.messaging
+                .approve_outgoing(owner, agent, action_id)
+                .await
+        } else {
+            self.messaging
+                .decline_outgoing(owner, agent, action_id)
+                .await
+        }
+        .map_err(domain_error)?;
+        Ok(Response::new(OutgoingActionReply {
+            action: Some(outgoing_action(&action, Viewer::Owner)),
+        }))
+    }
+}
+
+fn settings_reply(settings: &AgentSettings) -> Response<AgentSettingsReply> {
+    Response::new(AgentSettingsReply {
+        settings: Some(agent_settings(settings)),
+    })
 }
 
 /// Releases due refused requests every `every` until `shutdown`. Every replica may run

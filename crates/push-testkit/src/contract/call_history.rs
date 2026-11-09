@@ -20,6 +20,7 @@ fn missed(caller: UserId, callee: UserId, minutes: i64) -> Vec<CallHistoryRow> {
         None,
         ended,
         EndReason::Missed,
+        false,
     )
 }
 
@@ -58,6 +59,7 @@ async fn history_is_private_and_hides_per_side<B: Backend>(backend: &B) {
         Some(ended.timestamp_millis() - 61_500),
         ended.timestamp_millis(),
         EndReason::Completed,
+        false,
     );
     insert(&store, &rows).await;
 

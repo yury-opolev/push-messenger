@@ -67,7 +67,7 @@ Notable changes for consumers of push-messenger. Newest first.
     and blocking a requester whose request waits, answer the new error code
     `OWNER_DECIDES` (32); blocking its owner and `CreateInvite` answer `NOT_ALLOWED` (31);
     invites agents created earlier are void (`INVITE_NOT_FOUND`).
-  - **Agents send requests** under limits: 20 an hour, 100 a day, 50 pending, 10
+  - **Agents send requests** under limits: 10 an hour, 20 a day, 50 pending, 10
     waiting at other owners (`RATE_LIMITED` with `retry_after_s`).
   - **Owner routes** on auth-svc, owner only (`404 not_found` for everyone else, the
     same as for an agent that does not exist): `GET|PUT /v1/agents/{agent_id}/policy`,

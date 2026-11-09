@@ -108,11 +108,14 @@ where
 
     /// A deleted agent's relationships end (spec 2026-11-06 agent connections D12): its
     /// waiting requests, its own requests and its contacts, both rows of each pair, except
-    /// a peer's own block of it. Each peer whose row went hears `None`. Its policy and its
-    /// request log are forgotten. One pair per transaction, under the pair lock, so it
-    /// never waits for a user lock while holding one. Idempotent.
+    /// a peer's own block of it. Each peer whose row went hears `None`. Its policy, its
+    /// request log, its settings, its outgoing actions and its action log are forgotten
+    /// (the owner is not told: the agent is gone), under the agent's user lock, so no gate
+    /// or approval of the agent is midway. Then one pair per transaction, under the pair
+    /// lock, so it never waits for a user lock while holding one. Idempotent.
     async fn forget_deleted_agent(&self, agent: UserId) -> DomainResult<()> {
         let mut tx = self.store.begin().await?;
+        tx.lock_users(&[agent]).await?;
         let rows = tx.contacts_of(agent).await?;
         tx.forget_agent(agent).await?;
         tx.commit().await?;

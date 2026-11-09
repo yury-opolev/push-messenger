@@ -14,7 +14,7 @@ use crate::{Backend, Case, case_list};
 async fn owned<B: Backend>(backend: &B) -> (World<B::Store>, Person, Person) {
     let world = World::new(backend).await;
     let owner = world.person().await;
-    let agent = world.agent(&owner).await;
+    let agent = world.free_agent(&owner).await;
     world.notifier.take();
     (world, owner, agent)
 }
@@ -88,7 +88,7 @@ async fn ask_holds_requests_from_people_and_agents_for_the_owner<B: Backend>(bac
     );
 
     let other_owner = world.person().await;
-    let other_agent = world.agent(&other_owner).await;
+    let other_agent = world.free_agent(&other_owner).await;
     world.notifier.take();
     assert_eq!(
         world
@@ -246,7 +246,7 @@ async fn agents_cannot_decide_on_their_requests<B: Backend>(backend: &B) {
 async fn auto_own_accepts_the_owners_agents_only<B: Backend>(backend: &B) {
     let (world, owner, agent) = owned(backend).await;
     set_policy(&world, &owner, &agent, AgentPolicy::AutoOwn).await;
-    let sibling = world.agent(&owner).await;
+    let sibling = world.free_agent(&owner).await;
     assert_eq!(
         world.svc.contact_request(sibling.user, agent.user).await,
         Ok(ContactState::Accepted)
@@ -257,7 +257,7 @@ async fn auto_own_accepts_the_owners_agents_only<B: Backend>(backend: &B) {
     );
     let person = world.person().await;
     let foreign_owner = world.person().await;
-    let foreign = world.agent(&foreign_owner).await;
+    let foreign = world.free_agent(&foreign_owner).await;
     for requester in [&person, &foreign] {
         assert_eq!(
             world.svc.contact_request(requester.user, agent.user).await,
@@ -276,8 +276,8 @@ async fn auto_owner_contacts_accepts_the_owners_circle<B: Backend>(backend: &B) 
     set_policy(&world, &owner, &agent, AgentPolicy::AutoOwnerContacts).await;
     let friend = world.person().await;
     world.befriend(&owner, &friend).await;
-    let friends_agent = world.agent(&friend).await;
-    let sibling = world.agent(&owner).await;
+    let friends_agent = world.free_agent(&friend).await;
+    let sibling = world.free_agent(&owner).await;
     for requester in [&friend, &friends_agent, &sibling] {
         assert_eq!(
             world.svc.contact_request(requester.user, agent.user).await,
@@ -307,7 +307,7 @@ async fn auto_any_accepts_everyone<B: Backend>(backend: &B) {
     set_policy(&world, &owner, &agent, AgentPolicy::AutoAny).await;
     let person = world.person().await;
     let other_owner = world.person().await;
-    let foreign = world.agent(&other_owner).await;
+    let foreign = world.free_agent(&other_owner).await;
     for requester in [&person, &foreign] {
         assert_eq!(
             world.svc.contact_request(requester.user, agent.user).await,
@@ -324,7 +324,7 @@ async fn refuse_all_looks_like_a_decline_to_the_requester<B: Backend>(backend: &
     let (world, owner, agent) = owned(backend).await;
     set_policy(&world, &owner, &agent, AgentPolicy::RefuseAll).await;
     let other_owner = world.person().await;
-    let foreign = world.agent(&other_owner).await;
+    let foreign = world.free_agent(&other_owner).await;
     let person = world.person().await;
     world.notifier.take();
     for requester in [&person, &foreign] {
@@ -463,13 +463,16 @@ async fn agents_cannot_flood_other_owners<B: Backend>(backend: &B) {
     let (world, _owner, agent) = owned(backend).await;
     for _ in 0..AGENT_WAITING_OUT_MAX {
         let other_owner = world.person().await;
-        let target = world.agent(&other_owner).await;
+        let target = world.free_agent(&other_owner).await;
         assert_eq!(
             world.svc.contact_request(agent.user, target.user).await,
             Ok(ContactState::RequestedOut)
         );
     }
     // The cap counts the agent's requests that wait for owners, whatever the next target.
+    world
+        .clock
+        .advance(TimeDelta::hours(1) + TimeDelta::seconds(1));
     let person = world.person().await;
     assert_eq!(
         world.svc.contact_request(agent.user, person.user).await,
@@ -602,7 +605,7 @@ async fn only_the_owner_reaches_the_agent<B: Backend>(backend: &B) {
         .unwrap();
     let stranger = world.person().await;
     let other_owner = world.person().await;
-    let other_agent = world.agent(&other_owner).await;
+    let other_agent = world.free_agent(&other_owner).await;
     for (caller, target) in [
         (&stranger, &agent),
         (&contact, &agent),
@@ -678,7 +681,7 @@ async fn the_owner_view_reads_what_the_agent_sees_and_changes_nothing<B: Backend
     world.send(&person, chat, "are you there?").await;
     // Another owner's agent talks to this one: its owner is named.
     let other_owner = world.person().await;
-    let other = world.agent(&other_owner).await;
+    let other = world.free_agent(&other_owner).await;
     world
         .svc
         .contact_request(other.user, agent.user)

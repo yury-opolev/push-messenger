@@ -18,9 +18,9 @@ use crate::store::{Store, Tx};
 use crate::validation::ValidationError;
 
 /// Contact requests an agent may send per hour.
-pub const AGENT_REQUESTS_PER_HOUR: u32 = 20;
+pub const AGENT_REQUESTS_PER_HOUR: u32 = 10;
 /// Contact requests an agent may send per 24 hours.
-pub const AGENT_REQUESTS_PER_DAY: u32 = 100;
+pub const AGENT_REQUESTS_PER_DAY: u32 = 20;
 /// Pending outgoing requests an agent may have.
 pub const AGENT_PENDING_OUT_MAX: u32 = 50;
 /// Outgoing requests of an agent that may wait for other agents' owners at once.
@@ -95,6 +95,8 @@ pub struct AgentConversation {
     pub message_count: i64,
     pub hidden: bool,
     pub peer_deleted: bool,
+    /// The agent started it on its own (see [`crate::Conversation::started_by_agent`]).
+    pub started_by_agent: bool,
 }
 
 /// The owner's answer to a waiting request.
@@ -163,13 +165,20 @@ pub(crate) async fn check_agent_limits<T: Tx>(
             });
         }
     }
+    check_pending_caps(tx, agent).await?;
+    tx.log_agent_request(agent, peer, now).await
+}
+
+/// The caps on an agent's pending requests and on its requests waiting for other agents'
+/// owners (`RateLimited`). The caller holds the agent's user lock.
+pub(crate) async fn check_pending_caps<T: Tx>(tx: &mut T, agent: UserId) -> DomainResult<()> {
     let (pending, waiting) = tx.outgoing_counts(agent).await?;
     if pending >= AGENT_PENDING_OUT_MAX || waiting >= AGENT_WAITING_OUT_MAX {
         return Err(DomainError::RateLimited {
             retry_after_s: CAP_RETRY_S,
         });
     }
-    tx.log_agent_request(agent, peer, now).await
+    Ok(())
 }
 
 /// Adds an [`Event::AgentContact`] for the owner of every owned agent among the users of
@@ -346,7 +355,8 @@ where
 
     /// Releases the refused requests that are due: each requester's pending request
     /// disappears without an event, as a decline looks to them. Also forgets agents'
-    /// request log entries older than a day. Returns how many requests were released.
+    /// request log entries older than a day, and sweeps outgoing actions (expiry and
+    /// pruning, see `Self::sweep_outgoing`). Returns how many requests were released.
     pub async fn release_refusals(&self) -> DomainResult<u32> {
         let now = self.clock.now();
         let mut tx = self.store.begin().await?;
@@ -366,6 +376,7 @@ where
             }
             tx.commit().await?;
         }
+        self.sweep_outgoing().await?;
         Ok(released)
     }
 
@@ -408,6 +419,7 @@ where
                 message_count: counts.get(&summary.conversation_id).copied().unwrap_or(0),
                 hidden: summary.hidden,
                 peer_deleted: summary.peer_deleted,
+                started_by_agent: summary.started_by_agent,
             });
         }
         tx.rollback().await?;

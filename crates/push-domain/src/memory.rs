@@ -16,8 +16,9 @@ use crate::calls::{CallHistoryRow, HistoryCursor};
 use crate::error::{DomainError, DomainResult};
 use crate::ids::{ClientMsgId, ConversationId, DeviceId, MessageId, UserId};
 use crate::model::{
-    AgentPolicy, ContactState, ContentType, Conversation, ConversationFlags, ConversationKind,
-    ConversationOverview, DeviceState, Entry, EntryKind, GroupPositions, InviteRecord, Member,
+    AgentPolicy, AgentSettings, ContactState, ContentType, Conversation, ConversationFlags,
+    ConversationKind, ConversationOverview, DeviceState, Entry, EntryKind, GroupPositions,
+    InviteRecord, Member, OutgoingAction, OutgoingError, OutgoingKind, OutgoingState,
     PublisherOwner, Role, StoredTemplate, TemplateEvent, TemplateStatus,
 };
 use crate::store::{InsertOutcome, Store, Tx};
@@ -95,6 +96,10 @@ struct State {
     refusals: HashMap<(UserId, UserId), DateTime<Utc>>,
     /// Agents' outgoing requests: `(agent, peer, sent_at)`.
     agent_requests: Vec<(UserId, UserId, DateTime<Utc>)>,
+    agent_settings: HashMap<UserId, (AgentSettings, DateTime<Utc>)>,
+    outgoing: BTreeMap<Uuid, OutgoingAction>,
+    /// Agents' actions: `(agent, kind, count, at)`.
+    agent_actions: Vec<(UserId, OutgoingKind, u32, DateTime<Utc>)>,
 }
 
 impl State {
@@ -286,6 +291,8 @@ impl InMemoryStore {
 pub struct InMemoryTx {
     guard: OwnedMutexGuard<State>,
     work: State,
+    /// The state at [`Tx::savepoint`].
+    saved: Option<State>,
 }
 
 #[async_trait]
@@ -295,7 +302,11 @@ impl Store for InMemoryStore {
     async fn begin(&self) -> DomainResult<InMemoryTx> {
         let guard = Arc::clone(&self.state).lock_owned().await;
         let work = guard.clone();
-        Ok(InMemoryTx { guard, work })
+        Ok(InMemoryTx {
+            guard,
+            work,
+            saved: None,
+        })
     }
 }
 
@@ -318,12 +329,28 @@ impl Tx for InMemoryTx {
         }
     }
     async fn commit(self) -> DomainResult<()> {
-        let InMemoryTx { mut guard, work } = self;
+        let InMemoryTx {
+            mut guard, work, ..
+        } = self;
         *guard = work;
         Ok(())
     }
 
     async fn rollback(self) -> DomainResult<()> {
+        Ok(())
+    }
+
+    async fn savepoint(&mut self) -> DomainResult<()> {
+        self.saved = Some(self.work.clone());
+        Ok(())
+    }
+
+    async fn rollback_to_savepoint(&mut self) -> DomainResult<()> {
+        let saved = self
+            .saved
+            .clone()
+            .ok_or_else(|| DomainError::Store("no savepoint".into()))?;
+        self.work = saved;
         Ok(())
     }
 
@@ -1113,6 +1140,9 @@ impl Tx for InMemoryTx {
     async fn forget_agent(&mut self, agent: UserId) -> DomainResult<()> {
         self.work.agent_policies.remove(&agent);
         self.work.agent_requests.retain(|(row, _, _)| *row != agent);
+        self.work.agent_settings.remove(&agent);
+        self.work.outgoing.retain(|_, action| action.agent != agent);
+        self.work.agent_actions.retain(|(row, ..)| *row != agent);
         Ok(())
     }
 
@@ -1233,6 +1263,219 @@ impl Tx for InMemoryTx {
         let count = self.work.agent_requests.len();
         self.work.agent_requests.retain(|(_, _, at)| *at >= before);
         Ok((count - self.work.agent_requests.len()) as u64)
+    }
+
+    async fn agent_settings(&mut self, agent: UserId) -> DomainResult<AgentSettings> {
+        Ok(self
+            .work
+            .agent_settings
+            .get(&agent)
+            .map(|(settings, _)| *settings)
+            .unwrap_or_default())
+    }
+
+    async fn set_agent_settings(
+        &mut self,
+        agent: UserId,
+        settings: &AgentSettings,
+        at: DateTime<Utc>,
+    ) -> DomainResult<()> {
+        if !self.work.agent_owners.contains_key(&agent) {
+            return Err(missing("agent"));
+        }
+        self.work.agent_settings.insert(agent, (*settings, at));
+        Ok(())
+    }
+
+    async fn insert_outgoing(&mut self, action: &OutgoingAction) -> DomainResult<()> {
+        if !self.work.users.contains(&action.agent) {
+            return Err(missing("user"));
+        }
+        if self.work.outgoing.contains_key(&action.action_id) {
+            return Err(DomainError::Store(
+                "unique violation: outgoing action id".into(),
+            ));
+        }
+        self.work.outgoing.insert(action.action_id, action.clone());
+        Ok(())
+    }
+
+    async fn find_waiting_outgoing(
+        &mut self,
+        action: &OutgoingAction,
+    ) -> DomainResult<Option<OutgoingAction>> {
+        Ok(self
+            .work
+            .outgoing
+            .values()
+            .filter(|stored| stored.state == OutgoingState::Waiting && stored.same_as(action))
+            .min_by_key(|stored| (stored.created_at, stored.action_id))
+            .cloned())
+    }
+
+    async fn outgoing(&mut self, action_id: Uuid) -> DomainResult<Option<OutgoingAction>> {
+        Ok(self.work.outgoing.get(&action_id).cloned())
+    }
+
+    async fn waiting_outgoing_count(&mut self, agent: UserId) -> DomainResult<u32> {
+        Ok(self
+            .work
+            .outgoing
+            .values()
+            .filter(|action| action.agent == agent && action.state == OutgoingState::Waiting)
+            .count() as u32)
+    }
+
+    async fn list_outgoing(
+        &mut self,
+        agent: UserId,
+        resolved_since: Option<DateTime<Utc>>,
+    ) -> DomainResult<Vec<OutgoingAction>> {
+        let mut actions: Vec<OutgoingAction> = self
+            .work
+            .outgoing
+            .values()
+            .filter(|action| action.agent == agent)
+            .filter(|action| {
+                action.state == OutgoingState::Waiting
+                    || resolved_since
+                        .zip(action.resolved_at)
+                        .is_some_and(|(since, resolved)| resolved >= since)
+            })
+            .cloned()
+            .collect();
+        actions.sort_by_key(|action| (action.created_at, action.action_id));
+        Ok(actions)
+    }
+
+    async fn resolve_outgoing(
+        &mut self,
+        action_id: Uuid,
+        from: OutgoingState,
+        to: OutgoingState,
+        error: Option<OutgoingError>,
+        conversation: Option<ConversationId>,
+        at: DateTime<Utc>,
+    ) -> DomainResult<Option<OutgoingAction>> {
+        let Some(action) = self.work.outgoing.get_mut(&action_id) else {
+            return Ok(None);
+        };
+        if action.state != from {
+            return Ok(None);
+        }
+        action.state = to;
+        action.error = error;
+        action.resolved_at = Some(at);
+        if conversation.is_some() {
+            action.conversation = conversation;
+        }
+        Ok(Some(action.clone()))
+    }
+
+    async fn approved_call_grant(
+        &mut self,
+        agent: UserId,
+        callee: UserId,
+        since: DateTime<Utc>,
+    ) -> DomainResult<Option<Uuid>> {
+        Ok(self
+            .work
+            .outgoing
+            .values()
+            .filter(|action| {
+                action.agent == agent
+                    && action.kind == OutgoingKind::Call
+                    && action.target == Some(callee)
+                    && action.state == OutgoingState::Approved
+                    && action.used_at.is_none()
+                    && action.resolved_at.is_some_and(|at| at >= since)
+            })
+            .min_by_key(|action| (action.resolved_at, action.action_id))
+            .map(|action| action.action_id))
+    }
+
+    async fn use_outgoing(&mut self, action_id: Uuid, at: DateTime<Utc>) -> DomainResult<bool> {
+        match self.work.outgoing.get_mut(&action_id) {
+            Some(action) if action.used_at.is_none() => {
+                action.used_at = Some(at);
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    async fn expire_outgoing(
+        &mut self,
+        before: DateTime<Utc>,
+        at: DateTime<Utc>,
+        limit: u32,
+    ) -> DomainResult<Vec<OutgoingAction>> {
+        let mut due: Vec<(DateTime<Utc>, Uuid)> = self
+            .work
+            .outgoing
+            .values()
+            .filter(|action| action.state == OutgoingState::Waiting && action.created_at <= before)
+            .map(|action| (action.created_at, action.action_id))
+            .collect();
+        due.sort();
+        due.truncate(limit as usize);
+        let mut expired = Vec::with_capacity(due.len());
+        for (_, id) in due {
+            if let Some(action) = self.work.outgoing.get_mut(&id) {
+                action.state = OutgoingState::Expired;
+                action.resolved_at = Some(at);
+                expired.push(action.clone());
+            }
+        }
+        Ok(expired)
+    }
+
+    async fn prune_outgoing(&mut self, before: DateTime<Utc>) -> DomainResult<u64> {
+        let count = self.work.outgoing.len();
+        self.work.outgoing.retain(|_, action| {
+            action.state == OutgoingState::Waiting
+                || action.resolved_at.is_none_or(|resolved| resolved >= before)
+        });
+        Ok((count - self.work.outgoing.len()) as u64)
+    }
+
+    async fn log_agent_action(
+        &mut self,
+        agent: UserId,
+        kind: OutgoingKind,
+        count: u32,
+        at: DateTime<Utc>,
+    ) -> DomainResult<()> {
+        if !self.work.users.contains(&agent) {
+            return Err(missing("user"));
+        }
+        self.work.agent_actions.push((agent, kind, count, at));
+        Ok(())
+    }
+
+    async fn agent_actions_since(
+        &mut self,
+        agent: UserId,
+        kind: OutgoingKind,
+        since: DateTime<Utc>,
+    ) -> DomainResult<(u32, Option<DateTime<Utc>>)> {
+        let rows: Vec<(u32, DateTime<Utc>)> = self
+            .work
+            .agent_actions
+            .iter()
+            .filter(|(row, logged, _, at)| *row == agent && *logged == kind && *at >= since)
+            .map(|(_, _, count, at)| (*count, *at))
+            .collect();
+        Ok((
+            rows.iter().map(|(count, _)| *count).sum(),
+            rows.iter().map(|(_, at)| *at).min(),
+        ))
+    }
+
+    async fn prune_agent_actions(&mut self, before: DateTime<Utc>) -> DomainResult<u64> {
+        let count = self.work.agent_actions.len();
+        self.work.agent_actions.retain(|(.., at)| *at >= before);
+        Ok((count - self.work.agent_actions.len()) as u64)
     }
 
     async fn message_counts(&mut self, user: UserId) -> DomainResult<Vec<(ConversationId, i64)>> {

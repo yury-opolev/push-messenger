@@ -406,6 +406,8 @@ fn server_frame(kind: Kind) -> Option<Body> {
         }),
         Kind::ConversationFlags(flags) => Body::ConversationFlags(flags),
         Kind::AgentContactChanged(event) => Body::AgentContactEvent(event),
+        Kind::AgentSettingsChanged(event) => Body::AgentSettingsEvent(event),
+        Kind::OutgoingActionChanged(event) => Body::OutgoingActionEvent(event),
         // Call frames target devices, not every connection of the user: `forward_call`.
         Kind::Call(_) => return None,
     })
@@ -1024,6 +1026,42 @@ mod tests {
         assert_eq!(
             pending(&mut session),
             Some(Signal::Frame(Box::new(Body::AgentContactEvent(event))))
+        );
+        assert_eq!(pending(&mut session), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn agent_settings_and_outgoing_actions_become_their_server_frames() {
+        let (hub, _commands) = hub();
+        let user = Uuid::now_v7();
+        let (mut session, _, _) = connection(&hub, user).await;
+        let settings = v1::AgentSettingsEvent {
+            settings: Some(v1::AgentSettings {
+                calls: v1::OutgoingPolicy::Allowed.into(),
+                ..v1::AgentSettings::default()
+            }),
+        };
+        let action = v1::OutgoingActionEvent {
+            action: Some(v1::OutgoingAction {
+                action_id: id_bytes(Uuid::now_v7()),
+                state: v1::OutgoingState::Waiting.into(),
+                ..v1::OutgoingAction::default()
+            }),
+        };
+        for kind in [
+            Kind::AgentSettingsChanged(settings),
+            Kind::OutgoingActionChanged(action.clone()),
+        ] {
+            let payload = Notification { kind: Some(kind) }.encode_to_vec();
+            hub.dispatch(&notify_channel(user), &payload);
+        }
+        assert_eq!(
+            pending(&mut session),
+            Some(Signal::Frame(Box::new(Body::AgentSettingsEvent(settings))))
+        );
+        assert_eq!(
+            pending(&mut session),
+            Some(Signal::Frame(Box::new(Body::OutgoingActionEvent(action))))
         );
         assert_eq!(pending(&mut session), None);
     }

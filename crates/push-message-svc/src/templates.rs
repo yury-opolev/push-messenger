@@ -214,6 +214,7 @@ fn submit_error(error: DomainError) -> Status {
                 client_msg_id: None,
                 request_id: None,
                 retry_after_s: None,
+                action_id: None,
             },
         ),
         other => domain_error(other),

@@ -1,11 +1,14 @@
-//! Who may call whom (spec D11, D12).
+//! Who may call whom (spec D11, D12; spec 2026-11-09 proactive agents D11).
+
+use chrono::{DateTime, Utc};
 
 use crate::clock::Clock;
 use crate::contacts::are_contacts;
 use crate::error::{DomainError, DomainResult};
 use crate::ids::UserId;
-use crate::model::ContactState;
+use crate::model::{ContactState, OutgoingAction};
 use crate::notify::Notifier;
+use crate::outgoing::{Ask, Gate, acting_agent, gate, use_call_grant};
 use crate::service::Messaging;
 use crate::store::{Store, Tx};
 use crate::validation::ValidationError;
@@ -18,22 +21,57 @@ where
 {
     /// Whether `caller` may call `callee`: accepted contacts both ways with no block
     /// either way, or an owned agent and its owner with no block (even without contact
-    /// rows). An agent calls only its owner, and only its owner calls it. Two agents that
-    /// are accepted contacts get `NotAllowed` (agents talk in messages and cards only);
-    /// every other refusal is `NotContact`, so the answer never reveals which ids exist, a
-    /// block or an agent; `Invalid(SelfTarget)` for oneself. Reads only, publishes nothing.
-    pub async fn call_permission(&self, caller: UserId, callee: UserId) -> DomainResult<()> {
+    /// rows). Only its owner calls an agent. An agent calls its owner, and a person who is
+    /// its accepted contact under its owner's call policy (spec 2026-11-09 proactive
+    /// agents D11): an approved call is used first (once, within [`CALL_GRANT`]), else
+    /// `off` is `NotAllowedByOwner`, `ask` stores a waiting action (`WaitingForOwner`) and
+    /// `allowed` counts the call (`RateLimited`). Two agents that are accepted contacts get
+    /// `NotAllowed` (agents talk in messages and cards only); every other refusal is
+    /// `NotContact`, so the answer never reveals which ids exist, a block or an agent;
+    /// `Invalid(SelfTarget)` for oneself. Returns whether the caller is an agent (the
+    /// call is started by an agent).
+    ///
+    /// [`CALL_GRANT`]: crate::outgoing::CALL_GRANT
+    pub async fn call_permission(&self, caller: UserId, callee: UserId) -> DomainResult<bool> {
         if caller == callee {
             return Err(ValidationError::SelfTarget.into());
         }
         let mut tx = self.store.begin().await?;
-        let result = permission(&mut tx, caller, callee).await;
-        tx.rollback().await?;
-        result
+        match permission(&mut tx, caller, callee, self.clock.now()).await {
+            Ok(Permit::Allowed { by_agent }) => {
+                tx.commit().await?;
+                Ok(by_agent)
+            }
+            Ok(Permit::Waiting { owner, action, new }) => {
+                self.wait_for_owner(tx, owner, action, new).await
+            }
+            Err(error) => {
+                tx.rollback().await?;
+                Err(error)
+            }
+        }
     }
 }
 
-async fn permission<T: Tx>(tx: &mut T, caller: UserId, callee: UserId) -> DomainResult<()> {
+/// What [`permission`] allows.
+enum Permit {
+    Allowed {
+        by_agent: bool,
+    },
+    /// The agent's call waits for its owner (stored on the transaction when `new`).
+    Waiting {
+        owner: UserId,
+        action: OutgoingAction,
+        new: bool,
+    },
+}
+
+async fn permission<T: Tx>(
+    tx: &mut T,
+    caller: UserId,
+    callee: UserId,
+    now: DateTime<Utc>,
+) -> DomainResult<Permit> {
     if !tx.user_exists(caller).await? || !tx.user_exists(callee).await? {
         return Err(DomainError::NotContact);
     }
@@ -55,7 +93,21 @@ async fn permission<T: Tx>(tx: &mut T, caller: UserId, callee: UserId) -> Domain
         };
     }
     if let Some(owner) = caller_owner {
-        return allowed(owner == callee);
+        if owner == callee {
+            return Ok(Permit::Allowed { by_agent: true });
+        }
+        if !are_contacts(tx, caller, callee).await? || acting_agent(tx, caller).await?.is_none() {
+            return Err(DomainError::NotContact);
+        }
+        // Under the agent's lock, so one approved call rings once.
+        tx.lock_users(&[caller]).await?;
+        if use_call_grant(tx, caller, callee, now).await? {
+            return Ok(Permit::Allowed { by_agent: true });
+        }
+        return match gate(tx, caller, Ask::call(callee), now).await? {
+            Gate::Proceed => Ok(Permit::Allowed { by_agent: true }),
+            Gate::Waiting { action, new } => Ok(Permit::Waiting { owner, action, new }),
+        };
     }
     if let Some(owner) = callee_owner {
         return allowed(owner == caller);
@@ -63,9 +115,9 @@ async fn permission<T: Tx>(tx: &mut T, caller: UserId, callee: UserId) -> Domain
     allowed(are_contacts(tx, caller, callee).await?)
 }
 
-fn allowed(yes: bool) -> DomainResult<()> {
+fn allowed(yes: bool) -> DomainResult<Permit> {
     if yes {
-        Ok(())
+        Ok(Permit::Allowed { by_agent: false })
     } else {
         Err(DomainError::NotContact)
     }

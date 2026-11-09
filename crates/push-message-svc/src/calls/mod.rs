@@ -201,7 +201,13 @@ where
         if callee == caller {
             return Err(invalid("callee_user_id: a user cannot call themselves"));
         }
-        self.messaging
+        // Before the permission: an agent's permission is stateful (a call grant or the
+        // outgoing gate), so a resend must not be gated again.
+        if self.repeated_invite(invite.call_id, caller, device).await? {
+            return Ok(CallReply::default());
+        }
+        let by_agent = self
+            .messaging
             .call_permission(caller, callee)
             .await
             .map_err(|error| match error {
@@ -235,9 +241,9 @@ where
             } else {
                 EndReason::Unreachable
             };
-            return Ok(self.not_ringing(invite.call_id, caller, callee, reason, now));
+            return Ok(self.not_ringing(invite.call_id, caller, callee, reason, now, by_agent));
         }
-        let (record, deliveries) = start(
+        let (mut record, deliveries) = start(
             invite.call_id,
             caller,
             device,
@@ -247,6 +253,7 @@ where
             now,
             &self.timing,
         );
+        record.by_agent = by_agent;
         let json = encode(&record)?;
         let write = Write {
             call: record.call_id,
@@ -261,7 +268,14 @@ where
             Applied::Ok => {}
             Applied::InCall => return Err(in_call()),
             Applied::Busy => {
-                return Ok(self.not_ringing(invite.call_id, caller, callee, EndReason::Busy, now));
+                return Ok(self.not_ringing(
+                    invite.call_id,
+                    caller,
+                    callee,
+                    EndReason::Busy,
+                    now,
+                    by_agent,
+                ));
             }
             Applied::Exists => {
                 return if self.repeated_invite(record.call_id, caller, device).await? {
@@ -302,7 +316,8 @@ where
     }
 
     /// An invite that cannot ring: answered `CallEnded` at once, audited as an end and
-    /// written to the call history (the callee's only for `Busy`).
+    /// written to the call history (the callee's only for `Busy`). `by_agent`: the caller
+    /// is an agent.
     fn not_ringing(
         &self,
         call: Uuid,
@@ -310,10 +325,11 @@ where
         callee: UserId,
         reason: EndReason,
         now: i64,
+        by_agent: bool,
     ) -> CallReply {
         audit_end(call, caller, callee, reason, 0, false);
         self.metrics.call_ended(reason);
-        let rows = ended_rows(call, caller, callee, now, None, now, reason);
+        let rows = ended_rows(call, caller, callee, now, None, now, reason, by_agent);
         self.history.record_in_background(call, rows, now);
         CallReply {
             ended: Some(wire::ended(call, reason, None)),
@@ -556,6 +572,7 @@ where
                 before.answered_ms,
                 now,
                 reason,
+                before.by_agent,
             );
             self.history.record_in_background(before.call_id, rows, now);
         }

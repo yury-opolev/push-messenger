@@ -7,7 +7,8 @@ use chrono::{TimeZone, Utc};
 use push_domain::{
     ClientMsgId, Clock, ContentType, Conversation, ConversationId, DeleteMessage, DeviceId,
     DomainResult, EditText, Entry, Event, ManualClock, Member, MessageId, MessageRef, Messaging,
-    Policy, RecordingNotifier, SendMessage, SendReceipt, SendText, Store, SystemEvent, Tx, UserId,
+    OutgoingPolicy, OutgoingPolicyChange, Policy, RecordingNotifier, SendMessage, SendReceipt,
+    SendText, Store, SystemEvent, Tx, UserId,
 };
 
 use crate::Backend;
@@ -119,6 +120,23 @@ impl<S: Store + Clone> World<S> {
     pub async fn agent(&self, owner: &Person) -> Person {
         let agent = self.person().await;
         self.svc.enroll_agent(owner.user, agent.user).await.unwrap();
+        agent
+    }
+
+    /// [`Self::agent`], whose owner allows its contact requests and new chats (spec
+    /// 2026-11-09 proactive agents: by default they wait for the owner), as agents had
+    /// them before outgoing policies.
+    pub async fn free_agent(&self, owner: &Person) -> Person {
+        let agent = self.agent(owner).await;
+        let change = OutgoingPolicyChange {
+            requests: Some(OutgoingPolicy::Allowed),
+            chats: Some(OutgoingPolicy::Allowed),
+            ..OutgoingPolicyChange::default()
+        };
+        self.svc
+            .set_outgoing_policy(owner.user, agent.user, change)
+            .await
+            .unwrap();
         agent
     }
 

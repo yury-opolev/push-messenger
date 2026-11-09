@@ -183,6 +183,18 @@ service AgentOwners {
   rpc History(AgentHistoryRequest) returns (push.v1.HistoryPage);
   // The agent's call history (read only).
   rpc CallHistory(AgentCallHistoryRequest) returns (CallHistoryPage);
+  // The agent's settings (spec 2026-11-09 proactive agents; defaults when never set).
+  rpc GetSettings(AgentRef) returns (AgentSettingsReply);
+  // Changes the given outgoing policies; the agent is told (AgentSettingsEvent). Actions
+  // already waiting keep waiting.
+  rpc SetOutgoing(SetOutgoingRequest) returns (AgentSettingsReply);
+  // Sets who reaches the agent's backend; the agent is told (AgentSettingsEvent).
+  rpc SetInbound(SetInboundRequest) returns (AgentSettingsReply);
+  // The agent's actions waiting for the owner, oldest first.
+  rpc ListOutgoing(AgentRef) returns (OutgoingActions);
+  // Approves (carries out as the agent) or declines a waiting action. One that is not
+  // waiting is NOT_FOUND (push.v1.Error TARGET_NOT_FOUND).
+  rpc ResolveOutgoing(ResolveOutgoingRequest) returns (OutgoingActionReply);
 }
 
 enum AgentPolicy {
@@ -260,10 +272,48 @@ message AgentConversation {
   int64 message_count = 8;
   bool hidden = 9;
   bool peer_deleted = 10;
+  // A direct chat an agent opened with someone other than its owner, or a group an agent
+  // created (spec 2026-11-09 proactive agents D13).
+  bool started_by_agent = 11;
 }
 
 message AgentConversations {
   repeated AgentConversation conversations = 1;
+}
+
+message AgentSettingsReply {
+  push.v1.AgentSettings settings = 1;
+}
+
+// The policies to change; those left out stay as they are.
+message SetOutgoingRequest {
+  AgentRef agent = 1;
+  optional push.v1.OutgoingPolicy requests = 2;
+  optional push.v1.OutgoingPolicy chats = 3;
+  optional push.v1.OutgoingPolicy groups = 4;
+  optional push.v1.OutgoingPolicy calls = 5;
+}
+
+message SetInboundRequest {
+  AgentRef agent = 1;
+  push.v1.InboundPolicy policy = 2;
+}
+
+message OutgoingActions {
+  repeated push.v1.OutgoingAction actions = 1;
+}
+
+message ResolveOutgoingRequest {
+  AgentRef agent = 1;
+  bytes action_id = 2;
+  // True: approve; false: decline.
+  bool approve = 3;
+}
+
+// The action as now stored: APPROVED or FAILED for an approval, OWNER_DECLINED for a
+// decline.
+message OutgoingActionReply {
+  push.v1.OutgoingAction action = 1;
 }
 
 message AgentHistoryRequest {
@@ -444,6 +494,12 @@ message Notification {
     // A relationship of one of the user's agents changed (the user is the owner); sent to
     // every connection of the user as agent_contact_event.
     push.v1.AgentContactEvent agent_contact_changed = 9;
+    // The user is an agent whose owner changed its settings; sent to every connection of
+    // the user as agent_settings_event.
+    push.v1.AgentSettingsEvent agent_settings_changed = 10;
+    // An action of an agent changed (the user is its owner, or the agent itself); sent to
+    // every connection of the user as outgoing_action_event.
+    push.v1.OutgoingActionEvent outgoing_action_changed = 11;
   }
 }
 
@@ -689,6 +745,8 @@ message CallHistoryEntry {
   // Whole seconds from the answer to the end; 0 for calls never answered.
   uint32 duration_s = 7;
   push.v1.CallEndReason outcome = 8;
+  // The caller was an agent (spec 2026-11-09 proactive agents D13).
+  bool started_by_agent = 9;
 }
 
 message CallHistoryPage {

@@ -2,8 +2,9 @@
 
 use chrono::{DateTime, Utc};
 use push_domain::{
-    ActivityState, ContactState, ContentType, DomainError, Entry, EntryKind, PresenceView,
-    SendReceipt, UserId, ValidationError,
+    ActivityState, AgentSettings, ContactState, ContentType, DomainError, Entry, EntryKind,
+    InboundPolicy, OutgoingAction, OutgoingError, OutgoingKind, OutgoingPolicy, OutgoingState,
+    PresenceView, SendReceipt, UserId, ValidationError,
 };
 use push_proto::v1::{self, Deliver, ErrorCode, SendAck};
 use push_proto::{error_status, id, id_bytes};
@@ -39,6 +40,7 @@ pub(crate) fn invalid(message: impl Into<String>) -> Status {
             client_msg_id: None,
             request_id: None,
             retry_after_s: None,
+            action_id: None,
         },
     )
 }
@@ -78,6 +80,11 @@ pub(crate) fn domain_error(error: DomainError) -> Status {
         DomainError::OwnerDecides => (Code::FailedPrecondition, ErrorCode::OwnerDecides),
         DomainError::RateLimited { .. } => (Code::ResourceExhausted, ErrorCode::RateLimited),
         DomainError::AgentNotFound => (Code::NotFound, ErrorCode::UserNotFound),
+        DomainError::WaitingForOwner { .. } => {
+            (Code::FailedPrecondition, ErrorCode::WaitingForOwner)
+        }
+        DomainError::NotAllowedByOwner => (Code::FailedPrecondition, ErrorCode::NotAllowedByOwner),
+        DomainError::OutgoingNotFound => (Code::NotFound, ErrorCode::TargetNotFound),
         DomainError::Conflict => (Code::Aborted, ErrorCode::Unavailable),
         DomainError::KickFailed(_) => (Code::Unavailable, ErrorCode::Unavailable),
         DomainError::Store(_) => (Code::Unavailable, ErrorCode::Unavailable),
@@ -101,6 +108,10 @@ pub(crate) fn domain_error(error: DomainError) -> Status {
             request_id: None,
             retry_after_s: match error {
                 DomainError::RateLimited { retry_after_s } => Some(retry_after_s),
+                _ => None,
+            },
+            action_id: match error {
+                DomainError::WaitingForOwner { action_id } => Some(id_bytes(action_id)),
                 _ => None,
             },
         },
@@ -199,6 +210,129 @@ pub(crate) fn presence(user: UserId, view: PresenceView) -> v1::Presence {
         user_id: id_bytes(user.0),
         state: state.into(),
         last_seen,
+    }
+}
+
+pub(crate) fn outgoing_policy(policy: OutgoingPolicy) -> v1::OutgoingPolicy {
+    match policy {
+        OutgoingPolicy::Allowed => v1::OutgoingPolicy::Allowed,
+        OutgoingPolicy::Ask => v1::OutgoingPolicy::Ask,
+        OutgoingPolicy::Off => v1::OutgoingPolicy::Off,
+    }
+}
+
+/// An outgoing policy as the owner sends it; unspecified or unknown is `INVALID_ARGUMENT`
+/// naming `field`.
+pub(crate) fn outgoing_policy_from_wire(code: i32, field: &str) -> Result<OutgoingPolicy, Status> {
+    match v1::OutgoingPolicy::try_from(code) {
+        Ok(v1::OutgoingPolicy::Allowed) => Ok(OutgoingPolicy::Allowed),
+        Ok(v1::OutgoingPolicy::Ask) => Ok(OutgoingPolicy::Ask),
+        Ok(v1::OutgoingPolicy::Off) => Ok(OutgoingPolicy::Off),
+        Ok(v1::OutgoingPolicy::Unspecified) | Err(_) => {
+            Err(invalid(format!("{field}: must be allowed, ask or off")))
+        }
+    }
+}
+
+pub(crate) fn inbound_policy(policy: InboundPolicy) -> v1::InboundPolicy {
+    match policy {
+        InboundPolicy::OwnerOnly => v1::InboundPolicy::OwnerOnly,
+        InboundPolicy::OwnerAgents => v1::InboundPolicy::OwnerAgents,
+        InboundPolicy::Contacts => v1::InboundPolicy::Contacts,
+    }
+}
+
+/// An inbound policy as the owner sends it; unspecified or unknown is `INVALID_ARGUMENT`.
+pub(crate) fn inbound_policy_from_wire(code: i32) -> Result<InboundPolicy, Status> {
+    match v1::InboundPolicy::try_from(code) {
+        Ok(v1::InboundPolicy::OwnerOnly) => Ok(InboundPolicy::OwnerOnly),
+        Ok(v1::InboundPolicy::OwnerAgents) => Ok(InboundPolicy::OwnerAgents),
+        Ok(v1::InboundPolicy::Contacts) => Ok(InboundPolicy::Contacts),
+        Ok(v1::InboundPolicy::Unspecified) | Err(_) => Err(invalid(
+            "policy: must be owner_only, owner_agents or contacts",
+        )),
+    }
+}
+
+pub(crate) fn agent_settings(settings: &AgentSettings) -> v1::AgentSettings {
+    v1::AgentSettings {
+        inbound: inbound_policy(settings.inbound).into(),
+        requests: outgoing_policy(settings.requests).into(),
+        chats: outgoing_policy(settings.chats).into(),
+        groups: outgoing_policy(settings.groups).into(),
+        calls: outgoing_policy(settings.calls).into(),
+    }
+}
+
+/// Who an [`OutgoingAction`] is shown to: the agent does not tell an expired action from
+/// a declined one (spec 2026-11-09 proactive agents D7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Viewer {
+    Owner,
+    Agent,
+}
+
+/// An agent's action as `viewer` sees it.
+pub(crate) fn outgoing_action(action: &OutgoingAction, viewer: Viewer) -> v1::OutgoingAction {
+    let state = match action.state {
+        OutgoingState::Waiting => v1::OutgoingState::Waiting,
+        OutgoingState::Approved => v1::OutgoingState::Approved,
+        OutgoingState::Declined => v1::OutgoingState::OwnerDeclined,
+        OutgoingState::Expired => match viewer {
+            Viewer::Owner => v1::OutgoingState::Expired,
+            Viewer::Agent => v1::OutgoingState::OwnerDeclined,
+        },
+        OutgoingState::Failed => v1::OutgoingState::Failed,
+    };
+    let kind = match action.kind {
+        OutgoingKind::Request => v1::OutgoingKind::Request,
+        OutgoingKind::Chat => v1::OutgoingKind::Chat,
+        OutgoingKind::Group => v1::OutgoingKind::Group,
+        OutgoingKind::Invite => v1::OutgoingKind::Invite,
+        OutgoingKind::Call => v1::OutgoingKind::Call,
+    };
+    v1::OutgoingAction {
+        action_id: id_bytes(action.action_id),
+        agent_user_id: id_bytes(action.agent.0),
+        kind: kind.into(),
+        target_user_id: action
+            .target
+            .map(|user| id_bytes(user.0))
+            .unwrap_or_default(),
+        conversation_id: action
+            .conversation
+            .map(|conversation| id_bytes(conversation.0))
+            .unwrap_or_default(),
+        title: action.title.clone().unwrap_or_default(),
+        member_ids: action
+            .members
+            .iter()
+            .map(|member| id_bytes(member.0))
+            .collect(),
+        state: state.into(),
+        error: action
+            .error
+            .map_or(ErrorCode::Unspecified, outgoing_error)
+            .into(),
+        created_at: micros(action.created_at),
+        resolved_at: action.resolved_at.map(micros).unwrap_or_default(),
+    }
+}
+
+/// The client code of the error an approved action failed with.
+fn outgoing_error(error: OutgoingError) -> ErrorCode {
+    match error {
+        OutgoingError::NotContact => ErrorCode::NotContact,
+        OutgoingError::Blocked => ErrorCode::Blocked,
+        OutgoingError::NotAdmin => ErrorCode::NotAdmin,
+        OutgoingError::NotMember => ErrorCode::NotMember,
+        OutgoingError::GroupFull => ErrorCode::GroupFull,
+        OutgoingError::NotAGroup => ErrorCode::NotAGroup,
+        OutgoingError::ConversationNotFound => ErrorCode::ConversationNotFound,
+        OutgoingError::NotAllowed => ErrorCode::NotAllowed,
+        OutgoingError::RateLimited => ErrorCode::RateLimited,
+        OutgoingError::Invalid => ErrorCode::Invalid,
+        OutgoingError::Failed => ErrorCode::Rejected,
     }
 }
 
@@ -492,6 +626,23 @@ mod tests {
                 Code::NotFound,
                 ErrorCode::UserNotFound,
             ),
+            (
+                DomainError::WaitingForOwner {
+                    action_id: Uuid::nil(),
+                },
+                Code::FailedPrecondition,
+                ErrorCode::WaitingForOwner,
+            ),
+            (
+                DomainError::NotAllowedByOwner,
+                Code::FailedPrecondition,
+                ErrorCode::NotAllowedByOwner,
+            ),
+            (
+                DomainError::OutgoingNotFound,
+                Code::NotFound,
+                ErrorCode::TargetNotFound,
+            ),
             (DomainError::Conflict, Code::Aborted, ErrorCode::Unavailable),
             (
                 DomainError::KickFailed("redis down".into()),
@@ -522,13 +673,18 @@ mod tests {
             assert_eq!(error.retryable, retryable, "{message}");
             client_codes.insert(error_code);
         }
-        // Only the retryable errors, the template errors and an unknown agent (as an
-        // unknown user) share a client code.
-        assert_eq!(client_codes.len(), 26);
+        // Only the retryable errors, the template errors, an unknown agent (as an unknown
+        // user) and an action that does not wait (as a missing target) share a client code.
+        assert_eq!(client_codes.len(), 28);
         let limited = error_from_status(&domain_error(DomainError::RateLimited {
             retry_after_s: 42,
         }));
         assert_eq!(limited.retry_after_s, Some(42));
+        assert_eq!(limited.action_id, None);
+        let action_id = Uuid::now_v7();
+        let waiting = error_from_status(&domain_error(DomainError::WaitingForOwner { action_id }));
+        assert_eq!(waiting.action_id, Some(id_bytes(action_id)));
+        assert!(!waiting.retryable);
 
         let store = error_from_status(&domain_error(DomainError::Store("relation".into())));
         assert!(!store.message.contains("relation"), "{}", store.message);

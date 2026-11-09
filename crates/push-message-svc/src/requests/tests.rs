@@ -6,7 +6,7 @@ use std::sync::Arc;
 use chrono::{TimeDelta, TimeZone, Utc};
 use push_domain::{
     ClientMsgId, ConversationId, DeviceId, Event, InMemoryStore, ManualClock, Messaging,
-    PresenceView, ReceiptUpdate, RecordingNotifier, UserId,
+    OutgoingPolicy, OutgoingPolicyChange, PresenceView, ReceiptUpdate, RecordingNotifier, UserId,
 };
 use push_proto::internal::v1::messaging_server::Messaging as MessagingRpc;
 use push_proto::internal::v1::{
@@ -15,11 +15,11 @@ use push_proto::internal::v1::{
 use push_proto::v1::{
     self, AddMembers, Contact, ContactAccept, ContactBlock, ContactRequest, ContactState,
     ContactUnblock, ContentType, ConversationKind, CreateGroup, CreateInvite, Delete, Deliver,
-    DirectReceipts, Done, Edit, EntryKind, ErrorCode, FetchHistory, GetPresence, HideConversation,
-    InviteRedeemed, LeaveGroup, ListContacts, ListConversations, OpenDirect, Presence,
-    PresenceSharing, PresenceState, ReadUpTo, RedeemInvite, RemoveMember, RenameGroup,
-    RevokeInvite, Role, SendAck, SetPresenceSharing, SetRole, UnhideConversation,
-    conversation_summary, delete, edit, request, response,
+    DirectReceipts, Done, Edit, EntryKind, ErrorCode, FetchHistory, GetAgentSettings, GetPresence,
+    HideConversation, InviteRedeemed, LeaveGroup, ListContacts, ListConversations,
+    ListOutgoingActions, OpenDirect, Presence, PresenceSharing, PresenceState, ReadUpTo,
+    RedeemInvite, RemoveMember, RenameGroup, RevokeInvite, Role, SendAck, SetPresenceSharing,
+    SetRole, UnhideConversation, conversation_summary, delete, edit, request, response,
 };
 use push_proto::{error_from_status, id_bytes};
 use tonic::{Code, Request, Status};
@@ -1239,4 +1239,284 @@ async fn hiding_a_direct_conversation_filters_the_listing_until_unhidden() {
         .await
         .unwrap_err();
     assert_eq!(status.code(), Code::InvalidArgument);
+}
+
+impl World {
+    /// An owner and its agent (with a device).
+    async fn agent(&self) -> (Person, Person) {
+        let owner = self.person().await;
+        let agent = Person {
+            user: UserId::new(),
+            device: DeviceId::new(),
+        };
+        self.svc.enroll_agent(owner.user, agent.user).await.unwrap();
+        self.svc
+            .device_registered(agent.device, agent.user)
+            .await
+            .unwrap();
+        (owner, agent)
+    }
+
+    async fn policies(&self, owner: &Person, agent: &Person, change: OutgoingPolicyChange) {
+        self.svc
+            .set_outgoing_policy(owner.user, agent.user, change)
+            .await
+            .unwrap();
+    }
+}
+
+/// The client error of a failed call: its code, its action id, and whether it carries
+/// request 42.
+fn refusal(status: &Status) -> (Code, ErrorCode, Option<Vec<u8>>, bool) {
+    let error = error_from_status(status);
+    (
+        status.code(),
+        error.code(),
+        error.action_id,
+        error.request_id == Some(42),
+    )
+}
+
+#[tokio::test]
+async fn an_agent_reads_its_own_settings_and_actions_and_people_may_not() {
+    let world = world();
+    let (owner, agent) = world.agent().await;
+    let peer = world.person().await;
+    let settings = request::Body::GetAgentSettings(GetAgentSettings {});
+    let actions = request::Body::ListOutgoingActions(ListOutgoingActions {});
+    assert_eq!(
+        world.request(&agent, settings.clone()).await.unwrap(),
+        response::Body::AgentSettings(v1::AgentSettings {
+            inbound: v1::InboundPolicy::OwnerOnly.into(),
+            requests: v1::OutgoingPolicy::Ask.into(),
+            chats: v1::OutgoingPolicy::Ask.into(),
+            groups: v1::OutgoingPolicy::Off.into(),
+            calls: v1::OutgoingPolicy::Off.into(),
+        })
+    );
+    for (person, body) in [(&owner, &settings), (&peer, &actions)] {
+        let status = world.request(person, body.clone()).await.unwrap_err();
+        assert_eq!(failure(&status), (ErrorCode::NotAllowed, true));
+    }
+    assert_eq!(
+        world.request(&agent, actions.clone()).await.unwrap(),
+        response::Body::OutgoingActions(v1::OutgoingActionList::default())
+    );
+
+    // A request waits, is declined; a second waits and expires: the agent sees both as
+    // declined by its owner.
+    let ask = |to: &Person| {
+        request::Body::ContactRequest(ContactRequest {
+            user_id: id_bytes(to.user.0),
+        })
+    };
+    let first = world.request(&agent, ask(&peer)).await.unwrap_err();
+    let first = error_from_status(&first).action_id.unwrap();
+    let listed = |body: response::Body| match body {
+        response::Body::OutgoingActions(list) => list
+            .actions
+            .into_iter()
+            .map(|action| (action.action_id.clone(), action.kind(), action.state()))
+            .collect::<Vec<_>>(),
+        other => panic!("not a list of actions: {other:?}"),
+    };
+    assert_eq!(
+        listed(world.request(&agent, actions.clone()).await.unwrap()),
+        [(
+            first.clone(),
+            v1::OutgoingKind::Request,
+            v1::OutgoingState::Waiting
+        )]
+    );
+    let first_id = push_proto::id(&first).unwrap();
+    world
+        .svc
+        .decline_outgoing(owner.user, agent.user, first_id)
+        .await
+        .unwrap();
+    let other = world.person().await;
+    let second = world.request(&agent, ask(&other)).await.unwrap_err();
+    let second = error_from_status(&second).action_id.unwrap();
+    world
+        .clock
+        .advance(TimeDelta::hours(24) + TimeDelta::minutes(1));
+    world.svc.release_refusals().await.unwrap();
+    assert_eq!(
+        listed(world.request(&agent, actions).await.unwrap()),
+        [(
+            second,
+            v1::OutgoingKind::Request,
+            v1::OutgoingState::OwnerDeclined
+        )],
+        "the declined one was resolved more than a day ago"
+    );
+
+    world
+        .policies(
+            &owner,
+            &agent,
+            OutgoingPolicyChange {
+                calls: Some(OutgoingPolicy::Allowed),
+                ..OutgoingPolicyChange::default()
+            },
+        )
+        .await;
+    let response::Body::AgentSettings(now) = world.request(&agent, settings).await.unwrap() else {
+        panic!("not settings");
+    };
+    assert_eq!(now.calls(), v1::OutgoingPolicy::Allowed);
+}
+
+#[tokio::test]
+async fn an_agents_actions_wait_for_its_owner_or_are_refused_with_their_codes() {
+    let world = world();
+    let (owner, agent) = world.agent().await;
+    let (peer, other) = (world.person().await, world.person().await);
+    let waiting = |status: &Status| {
+        let (code, error_code, action_id, carries_request) = refusal(status);
+        assert_eq!(
+            (code, error_code, carries_request),
+            (Code::FailedPrecondition, ErrorCode::WaitingForOwner, true),
+            "{status:?}"
+        );
+        let action_id = action_id.expect("an action id");
+        assert_eq!(action_id.len(), 16);
+        action_id
+    };
+    let off = |status: &Status| {
+        assert_eq!(
+            refusal(status),
+            (
+                Code::FailedPrecondition,
+                ErrorCode::NotAllowedByOwner,
+                None,
+                true
+            )
+        );
+    };
+
+    // ContactRequest under `ask`: the same action while it waits.
+    let ask = request::Body::ContactRequest(ContactRequest {
+        user_id: id_bytes(peer.user.0),
+    });
+    let action = waiting(&world.request(&agent, ask.clone()).await.unwrap_err());
+    assert_eq!(
+        waiting(&world.request(&agent, ask).await.unwrap_err()),
+        action
+    );
+    let queued = world
+        .svc
+        .waiting_outgoing(owner.user, agent.user)
+        .await
+        .unwrap();
+    assert_eq!(id_bytes(queued[0].action_id), action);
+    world
+        .policies(
+            &owner,
+            &agent,
+            OutgoingPolicyChange {
+                requests: Some(OutgoingPolicy::Off),
+                ..OutgoingPolicyChange::default()
+            },
+        )
+        .await;
+    let ask_other = request::Body::ContactRequest(ContactRequest {
+        user_id: id_bytes(other.user.0),
+    });
+    off(&world.request(&agent, ask_other).await.unwrap_err());
+
+    // OpenDirect under `ask` with a contact.
+    world
+        .policies(
+            &owner,
+            &agent,
+            OutgoingPolicyChange {
+                requests: Some(OutgoingPolicy::Allowed),
+                ..OutgoingPolicyChange::default()
+            },
+        )
+        .await;
+    world.befriend(&agent, &peer).await;
+    world.befriend(&agent, &other).await;
+    let open = request::Body::OpenDirect(OpenDirect {
+        peer_user_id: id_bytes(peer.user.0),
+    });
+    waiting(&world.request(&agent, open).await.unwrap_err());
+
+    // CreateGroup: off by default, then `ask`.
+    let create = request::Body::CreateGroup(CreateGroup {
+        title: "Plans".to_owned(),
+        member_ids: vec![id_bytes(peer.user.0)],
+    });
+    off(&world.request(&agent, create.clone()).await.unwrap_err());
+    world
+        .policies(
+            &owner,
+            &agent,
+            OutgoingPolicyChange {
+                groups: Some(OutgoingPolicy::Ask),
+                ..OutgoingPolicyChange::default()
+            },
+        )
+        .await;
+    waiting(&world.request(&agent, create.clone()).await.unwrap_err());
+
+    // AddMembers to the agent's own group: `ask`, then off.
+    world
+        .policies(
+            &owner,
+            &agent,
+            OutgoingPolicyChange {
+                groups: Some(OutgoingPolicy::Allowed),
+                ..OutgoingPolicyChange::default()
+            },
+        )
+        .await;
+    let response::Body::GroupCreated(created) = world.request(&agent, create).await.unwrap() else {
+        panic!("no group");
+    };
+    let add = request::Body::AddMembers(AddMembers {
+        conversation_id: created.conversation_id.clone(),
+        user_ids: vec![id_bytes(other.user.0)],
+    });
+    world
+        .policies(
+            &owner,
+            &agent,
+            OutgoingPolicyChange {
+                groups: Some(OutgoingPolicy::Ask),
+                ..OutgoingPolicyChange::default()
+            },
+        )
+        .await;
+    waiting(&world.request(&agent, add.clone()).await.unwrap_err());
+    world
+        .policies(
+            &owner,
+            &agent,
+            OutgoingPolicyChange {
+                groups: Some(OutgoingPolicy::Off),
+                ..OutgoingPolicyChange::default()
+            },
+        )
+        .await;
+    off(&world.request(&agent, add).await.unwrap_err());
+
+    // The group it created is marked in its listing; the owner's chat is not.
+    world.svc.open_direct(agent.user, owner.user).await.unwrap();
+    let response::Body::Conversations(list) = world
+        .request(&agent, list_conversations(None))
+        .await
+        .unwrap()
+    else {
+        panic!("not a listing");
+    };
+    let marks: Vec<(i32, bool)> = list
+        .conversations
+        .iter()
+        .map(|summary| (summary.kind, summary.started_by_agent))
+        .collect();
+    assert_eq!(marks.len(), 2);
+    assert!(marks.contains(&(ConversationKind::Group.into(), true)));
+    assert!(marks.contains(&(ConversationKind::Direct.into(), false)));
 }

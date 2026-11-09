@@ -69,6 +69,7 @@ async fn a_new_direct_conversation_is_listed_for_both_members<B: Backend>(backen
                 admins: vec![],
                 hidden: false,
                 peer_deleted: false,
+                started_by_agent: false,
             }]
         );
     }
@@ -260,6 +261,7 @@ async fn a_group_is_listed_with_its_admins_and_group_wide_positions<B: Backend>(
             admins: vec![alice.user],
             hidden: false,
             peer_deleted: false,
+            started_by_agent: false,
         }
     );
 

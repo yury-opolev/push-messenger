@@ -32,7 +32,7 @@ use chrono::{DateTime, TimeDelta, Utc};
 
 use crate::activity::ActivityState;
 use crate::ids::{ConversationId, DeviceId, UserId};
-use crate::model::ContactState;
+use crate::model::{AgentSettings, ContactState, OutgoingAction};
 use crate::presence::PresenceView;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,6 +98,15 @@ pub enum Event {
         user: UserId,
         state: Option<ContactState>,
     },
+    /// The owner changed `agent`'s settings (spec 2026-11-09 proactive agents, D8).
+    /// Published to `agent` only.
+    AgentSettings {
+        agent: UserId,
+        settings: AgentSettings,
+    },
+    /// An agent's outgoing action, as now stored: to the owner when it starts waiting and
+    /// when it is resolved, to the agent when it is resolved. Published to `to` only.
+    Outgoing { to: UserId, action: OutgoingAction },
 }
 
 /// Why devices are kicked.

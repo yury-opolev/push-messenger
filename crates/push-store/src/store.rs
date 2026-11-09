@@ -5,10 +5,11 @@ use chrono::{DateTime, Utc};
 use push_domain::calls::{CallDirection, CallHistoryRow, EndReason, HistoryCursor};
 use push_domain::templates::TemplateRef;
 use push_domain::{
-    AgentPolicy, ClientMsgId, ContactState, Conversation, ConversationFlags, ConversationId,
-    ConversationOverview, DeviceId, DeviceState, DomainError, DomainResult, Entry, EntryKind,
-    GroupPositions, InsertOutcome, InviteRecord, Member, MessageId, PublisherOwner, Store,
-    StoredTemplate, TemplateEvent, TemplateStatus, Tx, UserId,
+    AgentPolicy, AgentSettings, ClientMsgId, ContactState, Conversation, ConversationFlags,
+    ConversationId, ConversationOverview, DeviceId, DeviceState, DomainError, DomainResult, Entry,
+    EntryKind, GroupPositions, InboundPolicy, InsertOutcome, InviteRecord, Member, MessageId,
+    OutgoingAction, OutgoingError, OutgoingKind, OutgoingPolicy, OutgoingState, PublisherOwner,
+    Store, StoredTemplate, TemplateEvent, TemplateStatus, Tx, UserId,
 };
 use sqlx::postgres::{PgPool, PgRow};
 use sqlx::{PgConnection, Postgres, Row, Transaction};
@@ -18,7 +19,9 @@ use crate::codes::{Code, decode, encode};
 use crate::error::store_error;
 use crate::locks;
 use crate::options::StoreOptions;
-use crate::rows::{self, conversation_columns, entry_columns, member_columns, template_columns};
+use crate::rows::{
+    self, conversation_columns, entry_columns, member_columns, outgoing_columns, template_columns,
+};
 
 /// The push-domain [`Store`] on PostgreSQL.
 #[derive(Debug, Clone)]
@@ -159,6 +162,24 @@ impl Tx for PgTx {
 
     async fn rollback(self) -> DomainResult<()> {
         self.tx.rollback().await.map_err(store_error)
+    }
+
+    async fn savepoint(&mut self) -> DomainResult<()> {
+        // A savepoint of the same name hides the earlier one; rolling back goes to the
+        // latest.
+        sqlx::query("SAVEPOINT push_domain")
+            .execute(self.conn())
+            .await
+            .map_err(store_error)?;
+        Ok(())
+    }
+
+    async fn rollback_to_savepoint(&mut self) -> DomainResult<()> {
+        sqlx::query("ROLLBACK TO SAVEPOINT push_domain")
+            .execute(self.conn())
+            .await
+            .map_err(store_error)?;
+        Ok(())
     }
 
     async fn insert_user(&mut self, user: UserId) -> DomainResult<()> {
@@ -517,8 +538,8 @@ impl Tx for PgTx {
         let inserted = sqlx::query(
             "INSERT INTO messaging.conversation \
              (conversation_id, kind, direct_key, title, created_by, last_seq, created_at, \
-              updated_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT (direct_key) DO NOTHING",
+              updated_at, started_by_agent) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT (direct_key) DO NOTHING",
         )
         .bind(conversation.id.0)
         .bind(encode(conversation.kind))
@@ -528,6 +549,7 @@ impl Tx for PgTx {
         .bind(conversation.last_seq)
         .bind(conversation.created_at)
         .bind(conversation.updated_at)
+        .bind(conversation.started_by_agent)
         .execute(self.conn())
         .await
         .map_err(store_error)?
@@ -1324,7 +1346,10 @@ impl Tx for PgTx {
 
     async fn forget_agent(&mut self, agent: UserId) -> DomainResult<()> {
         sqlx::query(
-            "WITH policy AS (DELETE FROM messaging.agent_policy WHERE agent_user_id = $1) \
+            "WITH policy AS (DELETE FROM messaging.agent_policy WHERE agent_user_id = $1), \
+             settings AS (DELETE FROM messaging.agent_settings WHERE agent_user_id = $1), \
+             actions AS (DELETE FROM messaging.outgoing_action WHERE agent_user_id = $1), \
+             action_log AS (DELETE FROM messaging.agent_action_log WHERE agent_user_id = $1) \
              DELETE FROM messaging.agent_request_log WHERE agent_user_id = $1",
         )
         .bind(agent.0)
@@ -1475,6 +1500,314 @@ impl Tx for PgTx {
     async fn prune_agent_requests(&mut self, before: DateTime<Utc>) -> DomainResult<u64> {
         Ok(
             sqlx::query("DELETE FROM messaging.agent_request_log WHERE sent_at < $1")
+                .bind(before)
+                .execute(self.conn())
+                .await
+                .map_err(store_error)?
+                .rows_affected(),
+        )
+    }
+
+    async fn agent_settings(&mut self, agent: UserId) -> DomainResult<AgentSettings> {
+        let row: Option<(i16, i16, i16, i16, i16)> = sqlx::query_as(
+            "SELECT inbound, requests, chats, groups, calls FROM messaging.agent_settings \
+             WHERE agent_user_id = $1",
+        )
+        .bind(agent.0)
+        .fetch_optional(self.conn())
+        .await
+        .map_err(store_error)?;
+        let Some((inbound, requests, chats, groups, calls)) = row else {
+            return Ok(AgentSettings::default());
+        };
+        let outgoing = |code: i16| {
+            OutgoingPolicy::from_code(code)
+                .ok_or_else(|| DomainError::Store(format!("unknown outgoing policy {code}")))
+        };
+        Ok(AgentSettings {
+            inbound: InboundPolicy::from_code(inbound)
+                .ok_or_else(|| DomainError::Store(format!("unknown inbound policy {inbound}")))?,
+            requests: outgoing(requests)?,
+            chats: outgoing(chats)?,
+            groups: outgoing(groups)?,
+            calls: outgoing(calls)?,
+        })
+    }
+
+    async fn set_agent_settings(
+        &mut self,
+        agent: UserId,
+        settings: &AgentSettings,
+        at: DateTime<Utc>,
+    ) -> DomainResult<()> {
+        sqlx::query(
+            "INSERT INTO messaging.agent_settings \
+             (agent_user_id, inbound, requests, chats, groups, calls, changed_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (agent_user_id) \
+             DO UPDATE SET inbound = excluded.inbound, requests = excluded.requests, \
+                chats = excluded.chats, groups = excluded.groups, calls = excluded.calls, \
+                changed_at = excluded.changed_at",
+        )
+        .bind(agent.0)
+        .bind(settings.inbound.code())
+        .bind(settings.requests.code())
+        .bind(settings.chats.code())
+        .bind(settings.groups.code())
+        .bind(settings.calls.code())
+        .bind(at)
+        .execute(self.conn())
+        .await
+        .map_err(store_error)?;
+        Ok(())
+    }
+
+    async fn insert_outgoing(&mut self, action: &OutgoingAction) -> DomainResult<()> {
+        let members: Vec<Uuid> = action.members.iter().map(|member| member.0).collect();
+        sqlx::query(
+            "INSERT INTO messaging.outgoing_action \
+             (action_id, agent_user_id, kind, target_user_id, conversation_id, title, \
+              member_ids, state, error_code, created_at, resolved_at, used_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+        )
+        .bind(action.action_id)
+        .bind(action.agent.0)
+        .bind(action.kind.code())
+        .bind(action.target.map(|target| target.0))
+        .bind(action.conversation.map(|conversation| conversation.0))
+        .bind(&action.title)
+        .bind(members)
+        .bind(action.state.code())
+        .bind(action.error.map(OutgoingError::code))
+        .bind(action.created_at)
+        .bind(action.resolved_at)
+        .bind(action.used_at)
+        .execute(self.conn())
+        .await
+        .map_err(store_error)?;
+        Ok(())
+    }
+
+    async fn find_waiting_outgoing(
+        &mut self,
+        action: &OutgoingAction,
+    ) -> DomainResult<Option<OutgoingAction>> {
+        let members: Vec<Uuid> = action.members.iter().map(|member| member.0).collect();
+        let row = sqlx::query(concat!(
+            "SELECT ",
+            outgoing_columns!(),
+            " FROM messaging.outgoing_action \
+             WHERE agent_user_id = $1 AND state = 1 AND kind = $2 \
+               AND target_user_id IS NOT DISTINCT FROM $3 \
+               AND conversation_id IS NOT DISTINCT FROM $4 \
+               AND title IS NOT DISTINCT FROM $5 AND member_ids = $6 \
+             ORDER BY created_at, action_id LIMIT 1"
+        ))
+        .bind(action.agent.0)
+        .bind(action.kind.code())
+        .bind(action.target.map(|target| target.0))
+        .bind(action.conversation.map(|conversation| conversation.0))
+        .bind(&action.title)
+        .bind(members)
+        .fetch_optional(self.conn())
+        .await
+        .map_err(store_error)?;
+        row.map(|row| rows::outgoing(&row).map_err(store_error))
+            .transpose()
+    }
+
+    async fn outgoing(&mut self, action_id: Uuid) -> DomainResult<Option<OutgoingAction>> {
+        let row = sqlx::query(concat!(
+            "SELECT ",
+            outgoing_columns!(),
+            " FROM messaging.outgoing_action WHERE action_id = $1"
+        ))
+        .bind(action_id)
+        .fetch_optional(self.conn())
+        .await
+        .map_err(store_error)?;
+        row.map(|row| rows::outgoing(&row).map_err(store_error))
+            .transpose()
+    }
+
+    async fn waiting_outgoing_count(&mut self, agent: UserId) -> DomainResult<u32> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM messaging.outgoing_action \
+             WHERE agent_user_id = $1 AND state = 1",
+        )
+        .bind(agent.0)
+        .fetch_one(self.conn())
+        .await
+        .map_err(store_error)?;
+        count_u32(count)
+    }
+
+    async fn list_outgoing(
+        &mut self,
+        agent: UserId,
+        resolved_since: Option<DateTime<Utc>>,
+    ) -> DomainResult<Vec<OutgoingAction>> {
+        let rows = sqlx::query(concat!(
+            "SELECT ",
+            outgoing_columns!(),
+            " FROM messaging.outgoing_action \
+             WHERE agent_user_id = $1 AND (state = 1 OR resolved_at >= $2) \
+             ORDER BY created_at, action_id"
+        ))
+        .bind(agent.0)
+        .bind(resolved_since)
+        .fetch_all(self.conn())
+        .await
+        .map_err(store_error)?;
+        read_all(rows, rows::outgoing)
+    }
+
+    async fn resolve_outgoing(
+        &mut self,
+        action_id: Uuid,
+        from: OutgoingState,
+        to: OutgoingState,
+        error: Option<OutgoingError>,
+        conversation: Option<ConversationId>,
+        at: DateTime<Utc>,
+    ) -> DomainResult<Option<OutgoingAction>> {
+        let row = sqlx::query(concat!(
+            "UPDATE messaging.outgoing_action \
+             SET state = $3, error_code = $4, \
+                 conversation_id = coalesce($5, conversation_id), resolved_at = $6 \
+             WHERE action_id = $1 AND state = $2 RETURNING ",
+            outgoing_columns!()
+        ))
+        .bind(action_id)
+        .bind(from.code())
+        .bind(to.code())
+        .bind(error.map(OutgoingError::code))
+        .bind(conversation.map(|conversation| conversation.0))
+        .bind(at)
+        .fetch_optional(self.conn())
+        .await
+        .map_err(store_error)?;
+        row.map(|row| rows::outgoing(&row).map_err(store_error))
+            .transpose()
+    }
+
+    async fn approved_call_grant(
+        &mut self,
+        agent: UserId,
+        callee: UserId,
+        since: DateTime<Utc>,
+    ) -> DomainResult<Option<Uuid>> {
+        sqlx::query_scalar(
+            "SELECT action_id FROM messaging.outgoing_action \
+             WHERE agent_user_id = $1 AND kind = $2 AND target_user_id = $3 AND state = $4 \
+               AND used_at IS NULL AND resolved_at >= $5 \
+             ORDER BY resolved_at, action_id LIMIT 1",
+        )
+        .bind(agent.0)
+        .bind(OutgoingKind::Call.code())
+        .bind(callee.0)
+        .bind(OutgoingState::Approved.code())
+        .bind(since)
+        .fetch_optional(self.conn())
+        .await
+        .map_err(store_error)
+    }
+
+    async fn use_outgoing(&mut self, action_id: Uuid, at: DateTime<Utc>) -> DomainResult<bool> {
+        let used = sqlx::query(
+            "UPDATE messaging.outgoing_action SET used_at = $2 \
+             WHERE action_id = $1 AND used_at IS NULL",
+        )
+        .bind(action_id)
+        .bind(at)
+        .execute(self.conn())
+        .await
+        .map_err(store_error)?
+        .rows_affected();
+        Ok(used == 1)
+    }
+
+    async fn expire_outgoing(
+        &mut self,
+        before: DateTime<Utc>,
+        at: DateTime<Utc>,
+        limit: u32,
+    ) -> DomainResult<Vec<OutgoingAction>> {
+        // A row resolved meanwhile fails `state = 1` when the UPDATE rechecks it.
+        let rows = sqlx::query(concat!(
+            "UPDATE messaging.outgoing_action SET state = $3, resolved_at = $2 \
+             WHERE state = 1 AND action_id IN ( \
+                SELECT action_id FROM messaging.outgoing_action \
+                WHERE state = 1 AND created_at <= $1 \
+                ORDER BY created_at, action_id LIMIT $4) \
+             RETURNING ",
+            outgoing_columns!()
+        ))
+        .bind(before)
+        .bind(at)
+        .bind(OutgoingState::Expired.code())
+        .bind(i64::from(limit))
+        .fetch_all(self.conn())
+        .await
+        .map_err(store_error)?;
+        let mut expired = read_all(rows, rows::outgoing)?;
+        expired.sort_by_key(|action| (action.created_at, action.action_id));
+        Ok(expired)
+    }
+
+    async fn prune_outgoing(&mut self, before: DateTime<Utc>) -> DomainResult<u64> {
+        Ok(sqlx::query(
+            "DELETE FROM messaging.outgoing_action WHERE state <> 1 AND resolved_at < $1",
+        )
+        .bind(before)
+        .execute(self.conn())
+        .await
+        .map_err(store_error)?
+        .rows_affected())
+    }
+
+    async fn log_agent_action(
+        &mut self,
+        agent: UserId,
+        kind: OutgoingKind,
+        count: u32,
+        at: DateTime<Utc>,
+    ) -> DomainResult<()> {
+        sqlx::query(
+            "INSERT INTO messaging.agent_action_log (agent_user_id, kind, count, at) \
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(agent.0)
+        .bind(kind.code())
+        .bind(to_integer(count, "count")?)
+        .bind(at)
+        .execute(self.conn())
+        .await
+        .map_err(store_error)?;
+        Ok(())
+    }
+
+    async fn agent_actions_since(
+        &mut self,
+        agent: UserId,
+        kind: OutgoingKind,
+        since: DateTime<Utc>,
+    ) -> DomainResult<(u32, Option<DateTime<Utc>>)> {
+        let (count, oldest): (i64, Option<DateTime<Utc>>) = sqlx::query_as(
+            "SELECT coalesce(sum(count), 0)::bigint, min(at) FROM messaging.agent_action_log \
+             WHERE agent_user_id = $1 AND kind = $2 AND at >= $3",
+        )
+        .bind(agent.0)
+        .bind(kind.code())
+        .bind(since)
+        .fetch_one(self.conn())
+        .await
+        .map_err(store_error)?;
+        Ok((count_u32(count)?, oldest))
+    }
+
+    async fn prune_agent_actions(&mut self, before: DateTime<Utc>) -> DomainResult<u64> {
+        Ok(
+            sqlx::query("DELETE FROM messaging.agent_action_log WHERE at < $1")
                 .bind(before)
                 .execute(self.conn())
                 .await
@@ -1775,13 +2108,14 @@ impl Tx for PgTx {
             .map(|row| to_integer(row.duration_s, "duration_s"))
             .collect::<DomainResult<Vec<i32>>>()?;
         let outcomes: Vec<&str> = rows.iter().map(|row| row.outcome.as_str()).collect();
+        let by_agent: Vec<bool> = rows.iter().map(|row| row.started_by_agent).collect();
         sqlx::query(
             "INSERT INTO messaging.call_history \
              (user_id, call_id, peer_user_id, direction, started_at, answered_at, ended_at, \
-              duration_s, outcome) \
+              duration_s, outcome, started_by_agent) \
              SELECT * FROM UNNEST($1::uuid[], $2::uuid[], $3::uuid[], $4::text[], \
                 $5::timestamptz[], $6::timestamptz[], $7::timestamptz[], $8::integer[], \
-                $9::text[]) \
+                $9::text[], $10::boolean[]) \
              ON CONFLICT (user_id, call_id) DO NOTHING",
         )
         .bind(users)
@@ -1793,6 +2127,7 @@ impl Tx for PgTx {
         .bind(ended)
         .bind(durations)
         .bind(outcomes)
+        .bind(by_agent)
         .execute(self.conn())
         .await
         .map_err(store_error)?;
@@ -1808,7 +2143,7 @@ impl Tx for PgTx {
     ) -> DomainResult<Vec<CallHistoryRow>> {
         let rows = sqlx::query(
             "SELECT user_id, call_id, peer_user_id, direction, started_at, answered_at, \
-                    ended_at, duration_s, outcome \
+                    ended_at, duration_s, outcome, started_by_agent \
              FROM messaging.call_history \
              WHERE user_id = $1 AND hidden_at IS NULL \
                AND ($2::timestamptz IS NULL OR (ended_at, call_id) < ($2, $3::uuid)) \
@@ -1914,6 +2249,7 @@ fn call_history_row(row: &PgRow) -> Result<CallHistoryRow, sqlx::Error> {
             source: "negative".into(),
         })?,
         outcome,
+        started_by_agent: row.try_get("started_by_agent")?,
     })
 }
 

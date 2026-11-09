@@ -240,5 +240,6 @@ pub(crate) fn entry(row: &CallHistoryRow) -> CallHistoryEntry {
         ended_at: micros(row.ended_at),
         duration_s: row.duration_s,
         outcome: wire::end_reason(row.outcome).into(),
+        started_by_agent: row.started_by_agent,
     }
 }

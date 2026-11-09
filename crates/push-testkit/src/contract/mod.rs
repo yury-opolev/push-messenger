@@ -58,6 +58,7 @@ fn conversation() -> Conversation {
         last_seq: 0,
         created_at: start(),
         updated_at: start(),
+        started_by_agent: false,
     }
 }
 

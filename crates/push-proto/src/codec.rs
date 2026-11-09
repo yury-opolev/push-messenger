@@ -108,6 +108,7 @@ pub fn error_from_status(status: &tonic::Status) -> Error {
             client_msg_id: None,
             request_id: None,
             retry_after_s: None,
+            action_id: None,
         },
     }
 }
@@ -286,6 +287,7 @@ mod tests {
                 message: "too many calls".to_owned(),
                 retryable: true,
                 retry_after_s: Some(120),
+                action_id: None,
             }),
             Body::CallSync(CallSync {
                 calls: vec![CallState {
@@ -398,6 +400,7 @@ mod tests {
             client_msg_id: Some(id_bytes(Uuid::now_v7())),
             request_id: Some(7),
             retry_after_s: None,
+            action_id: None,
         };
         let status = error_status(tonic::Code::FailedPrecondition, error.clone());
         assert_eq!(status.code(), tonic::Code::FailedPrecondition);
@@ -421,6 +424,7 @@ mod tests {
             client_msg_id: None,
             request_id: None,
             retry_after_s: None,
+            action_id: None,
         };
         let status = error_status(tonic::Code::FailedPrecondition, error.clone());
         let rich = RpcStatus::decode(status.details()).unwrap();

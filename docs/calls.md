@@ -489,10 +489,15 @@ sequenceDiagram
 | `CallInvite` per user per hour, refused or not | `calls.attemptsPerHour` (30) | `RATE_LIMITED` with `retry_after_s` |
 | Calls per user | one, ringing or active, across all devices | `IN_CALL` (caller) or `CallEnded BUSY` (callee) |
 
-Who may call whom: accepted contacts, and an owned agent with its owner (an agent calls only
-its owner, and only its owner calls it). Two agents never call each other, even when they
-are contacts (`NOT_ALLOWED`). An agent's owner reads the agent's call history read only
-through `GET /v1/agents/{agent_id}/calls` ([agent connections](superpowers/specs/2026-11-06-agent-connections-and-owner-view.md#53-owner-view)).
+Who may call whom: accepted contacts, and an owned agent with its owner (only its owner calls
+an agent). An agent calls its owner at any time, and a person who is its accepted contact
+under its owner's call policy ([proactive agents](superpowers/specs/2026-11-09-proactive-agents.md)):
+`off` (the default) answers `NOT_ALLOWED_BY_OWNER`; `ask` answers `WAITING_FOR_OWNER` with
+`CallError.action_id`, and once the owner approves, the agent may ring that person once
+within 15 minutes; `allowed` lets it call, ten calls a day. Calls an agent starts are
+marked `started_by_agent` in both participants' history. Two agents never call each other,
+even when they are contacts (`NOT_ALLOWED`). An agent's owner reads the agent's call
+history read only through `GET /v1/agents/{agent_id}/calls` ([agent connections](superpowers/specs/2026-11-06-agent-connections-and-owner-view.md#53-owner-view)).
 
 ## 9. Privacy
 
@@ -1269,6 +1274,7 @@ gathered, the pair selected, and bytes sent and received per direction.
 | Invite answered `UNREACHABLE` at once | the callee has no calls-active device online | the callee's app must advertise the capability and be connected |
 | Invite refused `NOT_CONTACT` | not accepted contacts, a block, or an agent rule | accept the contact request first |
 | Invite refused `NOT_ALLOWED` | caller and callee are both agents | agents never call each other; use messages and cards |
+| An agent's invite refused `NOT_ALLOWED_BY_OWNER` or `WAITING_FOR_OWNER` | the owner's call policy for the agent is `off` or `ask` | the owner changes the policy, or approves the waiting call (`action_id`) and the agent calls again within 15 minutes |
 | Rings, answered, **no audio either way** | ICE never connected | look for `failed` in `iceConnectionState`. With `relay: false` (stun-only), two symmetric NATs or a firewall cannot connect: configure TURN. With TURN: no `relay` candidates means coturn's ports are unreachable or the credentials are refused ([§13.8](#138-troubleshooting-turn)) |
 | **One-way audio** | one direction blocked or not sending | inbound bytes stay at 0 on one side: a firewall drops one direction (UDP to the relay range), a muted or ended local track (`track.enabled`, `track.readyState`), the microphone denied on that side, or `autoplay` blocked playback (bytes arrive but nothing plays: call `audio.play()` from a click) |
 | Works on the same Wi-Fi, fails across networks | no relay | **symmetric NAT** (mobile carriers, many corporate NATs) gives a different public port per destination, so the peer cannot reach the address STUN learned. Only a relay that both sides reach can connect them: TURN is needed, not just STUN |

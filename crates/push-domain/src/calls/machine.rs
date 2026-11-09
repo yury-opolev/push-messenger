@@ -117,6 +117,10 @@ pub struct CallRecord {
     /// Caller candidates buffered before the answer, in arrival order.
     #[serde(default)]
     pub pending_ice: Vec<Candidate>,
+    /// The caller is an agent (spec 2026-11-09 proactive agents D13); the call's history
+    /// rows are marked `started_by_agent`.
+    #[serde(default)]
+    pub by_agent: bool,
     /// The next deadline: when the sweeper ticks the call.
     pub due_ms: i64,
 }
@@ -304,6 +308,7 @@ pub fn start(
         reneg_caller: 0,
         reneg_callee: 0,
         pending_ice: Vec::new(),
+        by_agent: false,
         due_ms: ring_deadline_ms,
     };
     (record, deliveries)
