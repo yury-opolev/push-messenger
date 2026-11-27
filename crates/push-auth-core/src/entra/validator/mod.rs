@@ -7,19 +7,22 @@ mod claims;
 mod config;
 
 use reqwest::Url;
-use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderValue};
+use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderName, HeaderValue};
 use serde_json::{Map, Value};
 
 use super::{EntraError, Reason};
 use crate::identity::{ENTRA_APP_PROVIDER, ENTRA_PROVIDER, RequestMeta};
 
-pub(crate) use claims::recheck;
+pub(crate) use claims::{Presented, recheck};
 use config::is_loopback;
 pub use config::{Protocol, ValidatorSettings};
 
 /// The largest validator answer read, in bytes.
 pub const MAX_VALIDATOR_BODY: usize = 16 * 1024;
 const SECRET_HEADER: &str = "x-push-validator-secret";
+const ORIGINAL_URI_HEADER: &str = "original-uri";
+const ORIGINAL_METHOD_HEADER: &str = "original-method";
+const FORWARDED_FOR_HEADER: &str = "x-forwarded-for";
 
 /// Which Entra provider asks: the validator may apply token-type rules of its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,6 +46,9 @@ pub(crate) struct Validator {
     http: reqwest::Client,
     url: Url,
     secret: Option<HeaderValue>,
+    protocol: Protocol,
+    request_headers: Vec<(HeaderName, HeaderValue)>,
+    correlation_header: Option<HeaderName>,
 }
 
 impl Validator {
@@ -70,7 +76,54 @@ impl Validator {
                 Some(value)
             }
         };
-        Ok(Self { http, url, secret })
+        Ok(Self {
+            http,
+            url,
+            secret,
+            protocol: settings.protocol,
+            request_headers: settings.request_headers.clone(),
+            correlation_header: settings.correlation_header.clone(),
+        })
+    }
+
+    /// Whether the answer must carry `ver`: the JSON schema requires it, while the header
+    /// protocol leaves a missing `ver` to the version rule.
+    pub(crate) fn requires_version(&self) -> bool {
+        self.protocol == Protocol::Json
+    }
+
+    /// A `POST` with the token, the secret, what is known of the sign-in request (when it
+    /// is visible ASCII) and the static headers.
+    fn request(&self, token: &str, meta: &RequestMeta) -> reqwest::RequestBuilder {
+        let mut request = self.http.post(self.url.clone()).bearer_auth(token);
+        if let Some(secret) = &self.secret {
+            request = request.header(SECRET_HEADER, secret.clone());
+        }
+        let client_ip = meta.client_ip.map(|ip| ip.to_string());
+        let known = [
+            (self.correlation_header.as_ref(), meta.request_id.as_deref()),
+            (
+                Some(&HeaderName::from_static(ORIGINAL_URI_HEADER)),
+                meta.original_uri.as_deref(),
+            ),
+            (
+                Some(&HeaderName::from_static(ORIGINAL_METHOD_HEADER)),
+                meta.method.as_deref(),
+            ),
+            (
+                Some(&HeaderName::from_static(FORWARDED_FOR_HEADER)),
+                client_ip.as_deref(),
+            ),
+        ];
+        for (name, value) in known {
+            if let (Some(name), Some(value)) = (name, value.and_then(visible)) {
+                request = request.header(name.clone(), value);
+            }
+        }
+        for (name, value) in &self.request_headers {
+            request = request.header(name.clone(), value.clone());
+        }
+        request
     }
 
     /// The validated claims of `token`, as the validator returns them.
@@ -78,19 +131,14 @@ impl Validator {
         &self,
         token: &str,
         kind: ProviderKind,
-        _meta: &RequestMeta,
+        meta: &RequestMeta,
     ) -> Result<Map<String, Value>, EntraError> {
         let body = serde_json::json!({ "provider": kind.as_str() }).to_string();
-        let mut request = self
-            .http
-            .post(self.url.clone())
-            .bearer_auth(token)
+        let request = self
+            .request(token, meta)
             .header(CONTENT_TYPE, "application/json")
             .header(ACCEPT, "application/json")
             .body(body);
-        if let Some(secret) = &self.secret {
-            request = request.header(SECRET_HEADER, secret.clone());
-        }
         let mut response = request.send().await.map_err(failure)?;
         let status = response.status().as_u16();
         if status != 200 && status != 401 {
@@ -129,6 +177,14 @@ impl Validator {
             _ => Err(EntraError::Rejected(Reason::Malformed)),
         }
     }
+}
+
+/// `value` as a header value if it is 1 or more visible ASCII characters.
+fn visible(value: &str) -> Option<HeaderValue> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_graphic()) {
+        return None;
+    }
+    HeaderValue::from_str(value).ok()
 }
 
 fn unavailable(message: impl Into<String>) -> EntraError {

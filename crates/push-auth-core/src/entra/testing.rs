@@ -19,7 +19,7 @@ use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use super::{CONSUMERS_TENANT, EntraSettings, Tenants, ValidatorSettings};
+use super::{CONSUMERS_TENANT, EntraSettings, Protocol, Tenants, ValidatorSettings};
 
 /// The tenant the stub's tokens come from by default.
 pub const TENANT: &str = "33333333-0000-4000-8000-000000000003";
@@ -335,6 +335,17 @@ pub enum ValidatorAnswer {
     Delay(Duration),
     /// 200 with this raw body, streamed without `Content-Length` (chunked).
     Chunked(String),
+    /// Header protocol: this status with these response headers (repeated names kept)
+    /// and an empty body.
+    Headers {
+        status: u16,
+        headers: Vec<(String, String)>,
+    },
+    /// Header protocol: 200 with a `Subject-Token-Claim-<name>` header for each claim of
+    /// the bearer token's unverified payload (strings as they are, numbers in decimal,
+    /// anything else as JSON), except that `name` and non-ASCII strings come base64-encoded
+    /// in `Subject-Token-Encoded-Claim-<name>`; 400 without a readable bearer token.
+    EchoHeaders,
 }
 
 /// A request the [`StubValidator`] received.
@@ -346,6 +357,21 @@ pub struct SeenRequest {
     pub content_type: Option<String>,
     pub accept: Option<String>,
     pub body: String,
+    /// `Content-Length` as sent.
+    pub content_length: Option<String>,
+    /// Every header in order, names in lower case.
+    pub headers: Vec<(String, String)>,
+}
+
+impl SeenRequest {
+    /// The values of the header `name` (any case), in order.
+    pub fn header(&self, name: &str) -> Vec<&str> {
+        self.headers
+            .iter()
+            .filter(|(known, _)| known.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+            .collect()
+    }
 }
 
 struct ValidatorStub {
@@ -405,6 +431,22 @@ impl StubValidator {
             ..openid.settings()
         }
     }
+
+    /// As [`StubValidator::settings_for`] with the header protocol, asking for every claim
+    /// with the static header `Return-All-Subject-Token-Claims: 1`. Answers
+    /// [`ValidatorAnswer::EchoHeaders`] until told otherwise.
+    pub fn settings_for_headers(&self, openid: &StubOpenId) -> EntraSettings {
+        self.set_answer(ValidatorAnswer::EchoHeaders);
+        let mut settings = self.settings_for(openid);
+        if let Some(validator) = settings.validator.as_mut() {
+            validator.protocol = Protocol::Headers;
+            validator.request_headers = vec![(
+                header::HeaderName::from_static("return-all-subject-token-claims"),
+                header::HeaderValue::from_static("1"),
+            )];
+        }
+        settings
+    }
 }
 
 /// A loopback validator URL nothing listens on: connections are refused.
@@ -437,6 +479,16 @@ async fn validate(
         content_type: text(header::CONTENT_TYPE),
         accept: text(header::ACCEPT),
         body,
+        content_length: text(header::CONTENT_LENGTH),
+        headers: headers
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_owned(),
+                    String::from_utf8_lossy(value.as_bytes()).into_owned(),
+                )
+            })
+            .collect(),
     });
     let answer = stub.answer.lock().unwrap().clone();
     let claims = match answer {
@@ -469,6 +521,34 @@ async fn validate(
             Some(claims) => claims,
             None => return StatusCode::BAD_REQUEST.into_response(),
         },
+        ValidatorAnswer::Headers { status, headers } => {
+            let mut response = Response::builder().status(status);
+            for (name, value) in headers {
+                response = response.header(name, value);
+            }
+            return response.body(Body::empty()).expect("a stub answer");
+        }
+        ValidatorAnswer::EchoHeaders => {
+            let Some(Value::Object(claims)) = echoed(authorization.as_deref()) else {
+                return StatusCode::BAD_REQUEST.into_response();
+            };
+            let mut response = Response::builder();
+            for (name, value) in claims {
+                let text = match value {
+                    Value::String(text) => text,
+                    other => other.to_string(),
+                };
+                response = if name == "name" || !text.is_ascii() {
+                    response.header(
+                        format!("Subject-Token-Encoded-Claim-{name}"),
+                        STANDARD.encode(text),
+                    )
+                } else {
+                    response.header(format!("Subject-Token-Claim-{name}"), text)
+                };
+            }
+            return response.body(Body::empty()).expect("a stub answer");
+        }
     };
     Json(json!({ "claims": claims })).into_response()
 }

@@ -339,12 +339,17 @@ impl EntraSignIn {
                     return Err(EntraError::Rejected(Reason::Malformed));
                 }
                 let payload = validator.check(token, kind, meta).await?;
-                // Any JSON type: only a string can match the validator's `oid`.
+                // Any JSON type: only a string can match the validator's `oid` or `sub`.
                 let unverified_claims: Map<String, Value> = decode_part(parts[1])?;
+                let text = |name: &str| unverified_claims.get(name).and_then(Value::as_str);
                 validator::recheck(
                     &payload,
-                    unverified.tid.as_deref(),
-                    unverified_claims.get("oid").and_then(Value::as_str),
+                    validator::Presented {
+                        tid: unverified.tid.as_deref(),
+                        oid: text("oid"),
+                        sub: text("sub"),
+                    },
+                    validator.requires_version(),
                     tenant,
                     &self.settings,
                     crate::service::unix_now(),
@@ -834,6 +839,7 @@ mod tests {
             ),
             ("ver", json!("1.0"), Reason::Version),
             ("scp", json!("User.Read"), Reason::Scope),
+            ("sub", json!("pairwise-someone-else"), Reason::Malformed),
         ];
         for (name, value, reason) in cases {
             validator.set_answer(ValidatorAnswer::Claims(changed(good.clone(), name, value)));
@@ -849,6 +855,15 @@ mod tests {
             json!(["api://other", API_CLIENT_ID]),
         )));
         assert!(entra.verify(&openid.token(USER)).await.is_ok());
+        // A validator may omit sub, but not name another one than the token's.
+        validator.set_answer(ValidatorAnswer::Claims(without(good.clone(), "sub")));
+        assert!(entra.verify(&openid.token(USER)).await.is_ok());
+        validator.set_answer(ValidatorAnswer::Claims(good.clone()));
+        let no_sub = sign(KEY_A, &without(good.clone(), "sub"));
+        assert_eq!(
+            entra.verify(&no_sub).await,
+            Err(EntraError::Rejected(Reason::Malformed))
+        );
         // A token without oid cannot match the validator's.
         validator.set_answer(ValidatorAnswer::Claims(good.clone()));
         let no_oid = sign(KEY_A, &without(good.clone(), "oid"));
@@ -1049,5 +1064,102 @@ mod tests {
         with_secret.verify(&token).await.unwrap();
         assert_eq!(validator.requests()[2].secret.as_deref(), Some("s3cret"));
         assert!(!format!("{with_secret:?}").contains("s3cret"));
+    }
+
+    const REQUEST_ID: &str = "01937e4c-9c1a-7000-8000-000000000001";
+
+    fn meta() -> RequestMeta {
+        RequestMeta {
+            original_uri: Some("http://push.local/v1/auth/entra".to_owned()),
+            method: Some("POST".to_owned()),
+            client_ip: "198.51.100.7".parse().ok(),
+            request_id: Some(REQUEST_ID.to_owned()),
+        }
+    }
+
+    /// `seen`'s single value of the header `name`, if any.
+    fn single<'a>(seen: &'a super::testing::SeenRequest, name: &str) -> Option<&'a str> {
+        let values = seen.header(name);
+        assert!(values.len() <= 1, "{name}: {values:?}");
+        values.first().copied()
+    }
+
+    /// Checks that `seen` carried `meta()`, the static header `X-Tier: gold` and no secret.
+    fn assert_carries_the_metadata(seen: &super::testing::SeenRequest, token: &str) {
+        let authorization = format!("Bearer {token}");
+        assert_eq!(seen.method, "POST");
+        assert_eq!(single(seen, "authorization"), Some(authorization.as_str()));
+        assert_eq!(
+            single(seen, "original-uri"),
+            Some("http://push.local/v1/auth/entra")
+        );
+        assert_eq!(single(seen, "original-method"), Some("POST"));
+        assert_eq!(single(seen, "x-forwarded-for"), Some("198.51.100.7"));
+        assert_eq!(single(seen, "x-request-id"), Some(REQUEST_ID));
+        assert_eq!(single(seen, "x-tier"), Some("gold"));
+        assert_eq!(single(seen, "x-push-validator-secret"), None);
+        let elsewhere: Vec<_> = seen
+            .headers
+            .iter()
+            .filter(|(name, value)| name != "authorization" && value.contains(token))
+            .collect();
+        assert!(elsewhere.is_empty(), "{elsewhere:?}");
+    }
+
+    fn with_static_header(mut settings: EntraSettings) -> EntraSettings {
+        let validator = settings.validator.as_mut().unwrap();
+        validator.request_headers.push((
+            reqwest::header::HeaderName::from_static("x-tier"),
+            reqwest::header::HeaderValue::from_static("gold"),
+        ));
+        settings
+    }
+
+    #[tokio::test]
+    async fn a_json_validator_request_carries_the_request_metadata() {
+        use crate::identity::Authenticator;
+
+        let openid = StubOpenId::start().await;
+        let validator = StubValidator::start().await;
+        let entra = EntraSignIn::new(with_static_header(validator.settings_for(&openid))).unwrap();
+        let token = openid.token(USER);
+        entra.authenticate_with(&token, &meta()).await.unwrap();
+        let seen = &validator.requests()[0];
+        assert_carries_the_metadata(seen, &token);
+        assert_eq!(seen.content_type.as_deref(), Some("application/json"));
+        assert_eq!(
+            serde_json::from_str::<Value>(&seen.body).unwrap(),
+            json!({"provider": "entra"})
+        );
+
+        // Unknown or unsafe metadata is not sent; neither is a disabled request id.
+        let mut settings = with_static_header(validator.settings_for(&openid));
+        settings.validator.as_mut().unwrap().correlation_header = None;
+        let quiet = EntraSignIn::new(settings).unwrap();
+        quiet.authenticate_with(&token, &meta()).await.unwrap();
+        let unsafe_meta = RequestMeta {
+            original_uri: Some("http://push.local/v1/auth/entra\u{e9}".to_owned()),
+            method: Some("PO ST".to_owned()),
+            client_ip: None,
+            request_id: Some("a\r\nb".to_owned()),
+        };
+        entra.authenticate_with(&token, &unsafe_meta).await.unwrap();
+        entra.verify(&token).await.unwrap();
+        let requests = validator.requests();
+        assert_eq!(single(&requests[1], "x-request-id"), None);
+        assert_eq!(single(&requests[1], "original-method"), Some("POST"));
+        for seen in &requests[2..] {
+            for name in [
+                "original-uri",
+                "original-method",
+                "x-forwarded-for",
+                "x-request-id",
+            ] {
+                assert_eq!(single(seen, name), None, "{name}: {seen:?}");
+            }
+        }
+        for seen in &requests {
+            assert_eq!(single(seen, "x-tier"), Some("gold"));
+        }
     }
 }

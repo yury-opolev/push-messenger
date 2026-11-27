@@ -26,11 +26,11 @@ fn is_audience(value: &Value) -> bool {
 /// A claim's name and its JSON type check.
 type ClaimRule = (&'static str, fn(&Value) -> bool);
 
-/// Whether `claims` follow the response schema: the required claims present, and every
-/// known claim, when present, of its JSON type (`null` is no string).
-fn follows_schema(claims: &Map<String, Value>) -> bool {
-    const REQUIRED: [ClaimRule; 6] = [
-        ("ver", is_string),
+/// Whether `claims` follow the response schema: the required claims present (`ver` only
+/// when `version_required`), and every known claim, when present, of its JSON type (`null`
+/// is no string).
+fn follows_schema(claims: &Map<String, Value>, version_required: bool) -> bool {
+    const REQUIRED: [ClaimRule; 5] = [
         ("iss", is_string),
         ("tid", is_string),
         ("oid", is_string),
@@ -50,9 +50,14 @@ fn follows_schema(claims: &Map<String, Value>) -> bool {
         ("nbf", is_integer),
         ("iat", is_integer),
     ];
-    REQUIRED
-        .iter()
-        .all(|(name, valid)| claims.get(*name).is_some_and(valid))
+    let version_ok = match claims.get("ver") {
+        Some(version) => is_string(version),
+        None => !version_required,
+    };
+    version_ok
+        && REQUIRED
+            .iter()
+            .all(|(name, valid)| claims.get(*name).is_some_and(valid))
         && OPTIONAL
             .iter()
             .all(|(name, valid)| claims.get(*name).is_none_or(valid))
@@ -64,22 +69,36 @@ fn seconds(value: Option<&Value>) -> Option<i64> {
     value.as_i64().or_else(|| value.as_u64().map(|_| i64::MAX))
 }
 
-/// The defensive re-checks of a validator's `claims` for a token whose unverified payload
-/// named `token_tid` and `token_oid`: a validator can only narrow who signs in.
+/// What the presented token's unverified payload names (string claims only).
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct Presented<'a> {
+    pub tid: Option<&'a str>,
+    pub oid: Option<&'a str>,
+    pub sub: Option<&'a str>,
+}
+
+/// The defensive re-checks of a validator's `claims` for the `presented` token: a
+/// validator can only narrow who signs in. `tid` and `oid` must match the token's, and
+/// `sub` too when the validator returns one.
 pub(crate) fn recheck(
     claims: &Map<String, Value>,
-    token_tid: Option<&str>,
-    token_oid: Option<&str>,
+    presented: Presented<'_>,
+    version_required: bool,
     tenant: Uuid,
     settings: &EntraSettings,
     now: i64,
 ) -> Result<(), Reason> {
-    if !follows_schema(claims) {
+    if !follows_schema(claims, version_required) {
         return Err(Reason::Malformed);
     }
     let text = |name: &str| claims.get(name).and_then(Value::as_str);
     let tid = text("tid");
-    if token_tid.is_none() || tid != token_tid || token_oid.is_none() || text("oid") != token_oid {
+    if presented.tid.is_none()
+        || tid != presented.tid
+        || presented.oid.is_none()
+        || text("oid") != presented.oid
+        || (claims.contains_key("sub") && text("sub") != presented.sub)
+    {
         return Err(Reason::Malformed);
     }
     if !tid
