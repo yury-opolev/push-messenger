@@ -559,7 +559,7 @@ rendered verbatim.
 {{- fail "auth.signIn.entra.validator.url must be a string" -}}
 {{- end -}}
 {{- if $validator.url -}}
-{{- $https := regexMatch "(?i)^https://[^/@?#\\s]+([/?][^#\\s]*)?$" $validator.url -}}
+{{- $https := regexMatch "(?i)^https://([^/@?#:\\[\\]\\s]+|\\[[0-9a-f:.]+\\])(:[0-9]+)?([/?][^#\\s]*)?$" $validator.url -}}
 {{- $loopback := regexMatch "(?i)^http://(127\\.0\\.0\\.1|localhost|\\[::1\\])(:[0-9]{1,5})?([/?][^#\\s]*)?$" $validator.url -}}
 {{- $port := regexFind ":[0-9]+$" (regexFind "^[a-zA-Z]+://[^/?#\\s]*" $validator.url) | trimPrefix ":" -}}
 {{- $portOk := or (not $port) (and (le (len $port) 5) (le (atoi $port) 65535)) -}}

@@ -1583,7 +1583,8 @@ Check 'validator: off by default, without a URL, and without Entra sign-in' {
 Check 'validator: https anywhere, http only to a loopback host' {
     $ok = foreach ($url in 'https://validator.example/check', 'http://[::1]:9/x', 'http://localhost:9/',
         'http://127.0.0.1', 'https://validator.example:8443', 'http://127.0.0.1:65535/',
-        'https://validator.example:65535/check?tier=1') {
+        'https://validator.example:65535/check?tier=1', 'https://[2001:db8::1]:8443/x',
+        'https://[2001:db8::1]/x') {
         Render ($signInArgs + @('--set', "auth.signIn.entra.validator.url=$url"))
     }
     @($ok | Where-Object { $_ -ne 0 }).Count -eq 0
@@ -1604,6 +1605,9 @@ Check 'validator: unsafe URLs, timeouts and secret files are refused' {
         'auth.signIn.entra.validator.url=https://v.example:65536/',
         'auth.signIn.entra.validator.url=https://v.example:99999999999999999999/',
         'auth.signIn.entra.validator.url=https://[::1]:70000/',
+        'auth.signIn.entra.validator.url=https://host:abc/',
+        'auth.signIn.entra.validator.url=https://host:8443:1/',
+        'auth.signIn.entra.validator.url=https://2001:db8::1/',
         'auth.signIn.entra.validator.timeoutMs=99',
         'auth.signIn.entra.validator.timeoutMs=10001',
         'auth.signIn.entra.validator.timeoutMs=1.5',
