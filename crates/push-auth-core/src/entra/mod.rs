@@ -323,6 +323,15 @@ impl EntraSignIn {
         }
         let payload = match (&self.validator, &self.keys) {
             (Some(validator), _) => {
+                // Only a base64url signature can travel in the Authorization header.
+                let signature = parts[2];
+                if signature.is_empty()
+                    || !signature
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+                {
+                    return Err(EntraError::Rejected(Reason::Malformed));
+                }
                 let payload = validator.check(token, kind).await?;
                 validator::recheck(
                     &payload,
@@ -840,6 +849,42 @@ mod tests {
             );
         }
         assert_eq!(validator.requests().len(), asked);
+    }
+
+    #[tokio::test]
+    async fn a_signature_that_is_not_base64url_never_reaches_the_validator() {
+        let (openid, validator, entra) = validated().await;
+        let good = openid.user_claims(TENANT, USER);
+        for signature in ["ab\u{1}cd", "", "ab cd", "ab+cd", "ab/cd", "abc="] {
+            let token = with_algorithm("RS256", KEY_A.kid, &good, signature);
+            assert_eq!(
+                entra.verify(&token).await,
+                Err(EntraError::Rejected(Reason::Malformed)),
+                "{signature:?}"
+            );
+        }
+        assert!(validator.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_chunked_validator_answer_over_16_kib_is_unavailable() {
+        let (openid, validator, entra) = validated().await;
+        let mut big = openid.user_claims(TENANT, USER);
+        big["name"] = json!("n".repeat(17 * 1024));
+        validator.set_answer(ValidatorAnswer::Chunked(
+            json!({ "claims": big }).to_string(),
+        ));
+        let verified = entra.verify(&openid.token(USER)).await;
+        assert!(
+            matches!(&verified, Err(EntraError::Unavailable(error)) if error.contains("16 KiB")),
+            "{verified:?}"
+        );
+        // The same answer under the cap is read.
+        validator.set_answer(ValidatorAnswer::Chunked(
+            json!({ "claims": openid.user_claims(TENANT, USER) }).to_string(),
+        ));
+        assert!(entra.verify(&openid.token(USER)).await.is_ok());
+        assert_eq!(validator.requests().len(), 2);
     }
 
     #[tokio::test]

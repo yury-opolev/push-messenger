@@ -555,10 +555,12 @@ timeout; an absolute secret file path. The extras are lists rendered verbatim.
 {{- fail "auth.signIn.entra.validator.url must be a string" -}}
 {{- end -}}
 {{- if $validator.url -}}
-{{- $https := regexMatch "(?i)^https://[^/@?#\\s]+([/?#][^\\s]*)?$" $validator.url -}}
-{{- $loopback := regexMatch "(?i)^http://(127\\.0\\.0\\.1|localhost|\\[::1\\])(:[0-9]{1,5})?([/?#][^\\s]*)?$" $validator.url -}}
-{{- if not (or $https $loopback) -}}
-{{- fail "auth.signIn.entra.validator.url must be https://, or http:// only to a loopback host (127.0.0.1, [::1], localhost), without user info" -}}
+{{- $https := regexMatch "(?i)^https://[^/@?#\\s]+([/?][^#\\s]*)?$" $validator.url -}}
+{{- $loopback := regexMatch "(?i)^http://(127\\.0\\.0\\.1|localhost|\\[::1\\])(:[0-9]{1,5})?([/?][^#\\s]*)?$" $validator.url -}}
+{{- $port := regexFind ":[0-9]+$" (regexFind "^[a-zA-Z]+://[^/?#\\s]*" $validator.url) | trimPrefix ":" -}}
+{{- $portOk := or (not $port) (and (le (len $port) 5) (le (atoi $port) 65535)) -}}
+{{- if not (and (or $https $loopback) $portOk) -}}
+{{- fail "auth.signIn.entra.validator.url must be https://, or http:// only to a loopback host (127.0.0.1, [::1], localhost), without user info, fragment or a port above 65535" -}}
 {{- end -}}
 {{- end -}}
 {{- $ms := int $validator.timeoutMs -}}

@@ -321,6 +321,8 @@ pub enum ValidatorAnswer {
     Status(u16, String),
     /// Waits, then echoes.
     Delay(Duration),
+    /// 200 with this raw body, streamed without `Content-Length` (chunked).
+    Chunked(String),
 }
 
 /// A request the [`StubValidator`] received.
@@ -433,6 +435,16 @@ async fn validate(
                 .status(status)
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(body))
+                .expect("a stub answer");
+        }
+        ValidatorAnswer::Chunked(body) => {
+            let chunks = tokio_util::io::ReaderStream::with_capacity(
+                std::io::Cursor::new(body.into_bytes()),
+                1024,
+            );
+            return Response::builder()
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from_stream(chunks))
                 .expect("a stub answer");
         }
         ValidatorAnswer::Delay(delay) => {

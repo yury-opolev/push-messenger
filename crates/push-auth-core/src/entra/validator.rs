@@ -114,7 +114,7 @@ impl ValidatorSettings {
 fn validator_url(value: &str) -> Result<String, (bool, &'static str)> {
     const REASON: &str = "must be an https:// URL (http:// only for a loopback host: \
                           127.0.0.1, [::1], localhost), without user info or fragment";
-    let url = Url::parse(value).map_err(|_| (true, REASON))?;
+    let url = Url::parse(value).map_err(|_| (!value.contains('@'), REASON))?;
     if !url.username().is_empty() || url.password().is_some() {
         return Err((false, REASON));
     }
@@ -259,8 +259,12 @@ fn unavailable(message: impl Into<String>) -> EntraError {
     EntraError::Unavailable(message.into())
 }
 
-/// The kind of a failed request only: a `reqwest::Error` may show the URL.
+/// The kind of a failed request only: a `reqwest::Error` may show the URL. A request that
+/// cannot be built carries a token no header can hold.
 fn failure(error: reqwest::Error) -> EntraError {
+    if error.is_builder() {
+        return EntraError::Rejected(Reason::Malformed);
+    }
     unavailable(if error.is_timeout() {
         "the token validator timed out"
     } else if error.is_connect() {
@@ -480,6 +484,36 @@ mod tests {
         assert!(!shown.contains("p@") && !shown.contains("u:p"), "{shown}");
         assert!(shown.contains("<redacted>"), "{shown}");
         refused_as(&[(URL, "https://user@h.example/")], URL);
+    }
+
+    #[tokio::test]
+    async fn a_token_that_cannot_be_sent_is_malformed() {
+        let validator = Validator::new(&ValidatorSettings {
+            url: super::super::testing::refused_url().await,
+            timeout: Duration::from_millis(1000),
+            secret: None,
+        })
+        .unwrap();
+        assert_eq!(
+            validator.check("a.b.c\u{1}d", ProviderKind::User).await,
+            Err(EntraError::Rejected(Reason::Malformed))
+        );
+    }
+
+    #[test]
+    fn an_unparsable_url_with_user_info_is_not_shown() {
+        let error = refused_as(&[(URL, "https://user:s3cret@host:99999/")], URL);
+        let shown = format!("{error} {error:?}");
+        assert!(!shown.contains("s3cret"), "{shown}");
+        assert!(
+            shown.contains(URL) && shown.contains("<redacted>"),
+            "{shown}"
+        );
+        let error = refused_as(&[(URL, "https://host:99999/")], URL);
+        assert!(
+            format!("{error}").contains("https://host:99999/"),
+            "{error}"
+        );
     }
 
     #[test]
