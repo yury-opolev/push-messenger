@@ -27,7 +27,7 @@ const MAX_REQUEST_HEADERS: usize = 32;
 /// The longest static request header value, in characters.
 const MAX_HEADER_VALUE_CHARS: usize = 1024;
 /// The headers push-auth sets itself (lower case); the correlation header is one too.
-const RESERVED_HEADERS: [&str; 11] = [
+const RESERVED_HEADERS: [&str; 18] = [
     "authorization",
     "original-uri",
     "original-method",
@@ -39,6 +39,13 @@ const RESERVED_HEADERS: [&str; 11] = [
     "transfer-encoding",
     "connection",
     "x-push-validator-secret",
+    "te",
+    "upgrade",
+    "expect",
+    "keep-alive",
+    "proxy-authorization",
+    "proxy-connection",
+    "trailer",
 ];
 
 /// How push-auth talks to the validator.
@@ -642,6 +649,14 @@ mod tests {
             assert_eq!(pairs(&with_url(&[(HEADERS, value)])), expected, "{value:?}");
         }
         assert!(with_url(&[(HEADERS, " ; \n ")]).request_headers.is_empty());
+        // In the JSON form, `;` is part of a value, as the chart renders it.
+        assert_eq!(
+            pairs(&with_url(&[(
+                HEADERS,
+                r#"{"Prefer":"a=1; X-Injected: 2"}"#
+            )])),
+            vec![("prefer".to_owned(), "a=1; X-Injected: 2".to_owned())]
+        );
         let shown = format!("{:?}", with_url(&[(HEADERS, "X-Key: s3cret-value")]));
         assert!(
             !shown.contains("s3cret-value") && shown.contains("<redacted>"),
@@ -664,6 +679,13 @@ mod tests {
             "Connection",
             "X-Push-Validator-Secret",
             "X-Request-Id",
+            "TE",
+            "Upgrade",
+            "Expect",
+            "Keep-Alive",
+            "Proxy-Authorization",
+            "Proxy-Connection",
+            "Trailer",
         ] {
             let shown = refused_hiding(
                 &[(HEADERS, &format!("{reserved}: s3cret-value"))],
