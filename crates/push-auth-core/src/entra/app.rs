@@ -321,4 +321,45 @@ mod tests {
         ));
         assert_eq!((openid.metadata_fetches(), openid.jwks_fetches()), (0, 0));
     }
+
+    #[tokio::test]
+    async fn a_header_validator_checks_app_tokens_with_the_app_policy() {
+        let openid = StubOpenId::start().await;
+        let validator = StubValidator::start().await;
+        let delegated = EntraSignIn::new(validator.settings_for_headers(&openid)).unwrap();
+        let app = delegated
+            .app(EntraAppSettings {
+                required_role: Some("Agent.Run".to_owned()),
+                ..EntraAppSettings::default()
+            })
+            .unwrap();
+        let mut claims = openid.user_claims(TENANT, OBJECT);
+        claims.as_object_mut().unwrap().remove("scp");
+        claims["idtyp"] = json!("app");
+        claims["roles"] = json!(["Agent.Run", "Other"]);
+        let app_token = sign(KEY_A, &claims);
+
+        let principal = app.authenticate(&app_token).await.unwrap();
+        assert_eq!(principal.provider, "entra-app");
+        assert_eq!(principal.issuer, TENANT);
+        assert_eq!(principal.subject, OBJECT);
+        assert_eq!(principal.claims["roles"], json!(["Agent.Run", "Other"]));
+        assert_eq!(principal.claims["idtyp"], "app");
+        assert_eq!(
+            app.authenticate(&openid.token(OBJECT)).await,
+            Err(AuthenticationError::Rejected("app_only"))
+        );
+        assert_eq!(
+            delegated.authenticate(&app_token).await,
+            Err(AuthenticationError::Rejected("app_only"))
+        );
+        claims["roles"] = json!(["Other"]);
+        assert_eq!(
+            app.authenticate(&sign(KEY_A, &claims)).await,
+            Err(AuthenticationError::Rejected("role"))
+        );
+        assert_eq!(validator.requests().len(), 4);
+        assert!(validator.requests().iter().all(|seen| seen.body.is_empty()));
+        assert_eq!((openid.metadata_fetches(), openid.jwks_fetches()), (0, 0));
+    }
 }

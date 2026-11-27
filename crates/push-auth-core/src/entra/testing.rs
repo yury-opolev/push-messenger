@@ -529,28 +529,42 @@ async fn validate(
             return response.body(Body::empty()).expect("a stub answer");
         }
         ValidatorAnswer::EchoHeaders => {
-            let Some(Value::Object(claims)) = echoed(authorization.as_deref()) else {
+            let Some(claims) = echoed(authorization.as_deref()) else {
                 return StatusCode::BAD_REQUEST.into_response();
             };
             let mut response = Response::builder();
-            for (name, value) in claims {
-                let text = match value {
-                    Value::String(text) => text,
-                    other => other.to_string(),
-                };
-                response = if name == "name" || !text.is_ascii() {
-                    response.header(
-                        format!("Subject-Token-Encoded-Claim-{name}"),
-                        STANDARD.encode(text),
-                    )
-                } else {
-                    response.header(format!("Subject-Token-Claim-{name}"), text)
-                };
+            for (name, value) in claim_headers(&claims) {
+                response = response.header(name, value);
             }
             return response.body(Body::empty()).expect("a stub answer");
         }
     };
     Json(json!({ "claims": claims })).into_response()
+}
+
+/// The header protocol's claim headers of `claims` (an object), as
+/// [`ValidatorAnswer::EchoHeaders`] answers them.
+pub fn claim_headers(claims: &Value) -> Vec<(String, String)> {
+    let Some(claims) = claims.as_object() else {
+        return Vec::new();
+    };
+    claims
+        .iter()
+        .map(|(name, value)| {
+            let text = match value {
+                Value::String(text) => text.clone(),
+                other => other.to_string(),
+            };
+            if name == "name" || !text.is_ascii() {
+                (
+                    format!("Subject-Token-Encoded-Claim-{name}"),
+                    STANDARD.encode(text),
+                )
+            } else {
+                (format!("Subject-Token-Claim-{name}"), text)
+            }
+        })
+        .collect()
 }
 
 /// The unverified payload of the bearer token in `authorization`.

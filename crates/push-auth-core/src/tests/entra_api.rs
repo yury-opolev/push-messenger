@@ -617,9 +617,21 @@ async fn an_entra_user_changes_their_handle_with_an_access_token_alone() {
 /// `app`); the router keeps the client IP in `x-real-ip`.
 async fn validator_mode(world: &mut World, app: bool) -> StubValidator {
     let validator = StubValidator::start().await;
-    let entra =
-        crate::entra::EntraSignIn::with_timing(validator.settings_for(&world.stub), super::quick())
-            .unwrap();
+    let settings = validator.settings_for(&world.stub);
+    use_validator(world, settings, app);
+    validator
+}
+
+/// As [`validator_mode`] for Entra ID alone, with the header protocol.
+async fn header_validator_mode(world: &mut World) -> StubValidator {
+    let validator = StubValidator::start().await;
+    let settings = validator.settings_for_headers(&world.stub);
+    use_validator(world, settings, false);
+    validator
+}
+
+fn use_validator(world: &mut World, settings: crate::entra::EntraSettings, app: bool) {
+    let entra = crate::entra::EntraSignIn::with_timing(settings, super::quick()).unwrap();
     assert!(entra.uses_validator());
     let mut auth = world.auth.clone().with_sign_in(crate::service::SignIn {
         password: false,
@@ -636,7 +648,6 @@ async fn validator_mode(world: &mut World, app: bool) -> StubValidator {
     }
     world.auth = auth;
     rebuild_router(world, Some(HeaderName::from_static("x-real-ip")));
-    validator
 }
 
 #[tokio::test]
@@ -774,4 +785,94 @@ async fn built_in_refusals_carry_no_validator_flag() {
         "{app_only:?}"
     );
     assert!(!captured_logs().contains(&refused));
+}
+
+#[tokio::test]
+async fn a_header_validator_hears_the_sign_in_request_without_its_query() {
+    capture_logs();
+    let mut world = world(Offer::Entra).await;
+    let validator = header_validator_mode(&mut world).await;
+    let token = world.stub.token(USER);
+    let signed_in = call(
+        &world,
+        Method::POST,
+        "/v1/auth/entra?x=1",
+        None,
+        Some(json!({"token": token})),
+    )
+    .await;
+    assert_eq!(signed_in.status, StatusCode::OK, "{}", signed_in.json);
+    assert_eq!(world.accounts().await, 1);
+    assert_eq!(
+        (world.stub.metadata_fetches(), world.stub.jwks_fetches()),
+        (0, 0)
+    );
+    let requests = validator.requests();
+    assert_eq!(requests.len(), 1);
+    let seen = &requests[0];
+    assert_eq!(seen.method, "POST");
+    assert_eq!(seen.body, "");
+    assert_eq!(seen.header("authorization"), [format!("Bearer {token}")]);
+    assert_eq!(
+        seen.header("original-uri"),
+        ["http://push.local/v1/auth/entra"]
+    );
+    assert_eq!(seen.header("original-method"), ["POST"]);
+    assert_eq!(seen.header("x-forwarded-for"), ["198.51.100.7"]);
+    assert_eq!(seen.header("return-all-subject-token-claims"), ["1"]);
+    let request_id = seen.header("x-request-id");
+    assert_eq!(request_id.len(), 1);
+    assert!(Uuid::try_parse(request_id[0]).is_ok(), "{request_id:?}");
+    assert!(!captured_logs().contains(&token), "the log holds the token");
+}
+
+#[tokio::test]
+async fn a_header_validator_refusal_leaks_nothing_and_names_the_request_id() {
+    capture_logs();
+    let mut world = world(Offer::Entra).await;
+    let validator = header_validator_mode(&mut world).await;
+    validator.set_answer(ValidatorAnswer::Headers {
+        status: 401,
+        headers: vec![(
+            "WWW-Authenticate".to_owned(),
+            r#"Bearer error="invalid_token", error_description="secret-desc""#.to_owned(),
+        )],
+    });
+    let token = world.stub.token(USER);
+    let refused = entra(&world, json!({"token": token})).await;
+    assert_eq!(refused.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(refused.json["error"]["code"], "entra_token_invalid");
+    // push-auth's own challenge only, as for any refused token.
+    let challenges: Vec<_> = refused.headers.get_all("www-authenticate").iter().collect();
+    assert_eq!(challenges, ["Bearer"]);
+    assert!(!refused.json.to_string().contains("secret-desc"));
+    assert!(!refused.json.to_string().contains("invalid_token"));
+    assert_eq!(world.accounts().await, 0);
+
+    let requests = validator.requests();
+    assert_eq!(requests.len(), 1);
+    let request_id = requests[0].header("x-request-id")[0].to_owned();
+    let events = security_events();
+    assert!(
+        events
+            .iter()
+            .any(|event| event["event"] == "auth.entra.rejected"
+                && event["reason"] == "validator"
+                && event["validator"] == true
+                && event["request_id"] == request_id.as_str()),
+        "no refusal naming {request_id} in {events:?}"
+    );
+    let text = captured_logs();
+    assert!(
+        text.lines()
+            .any(|line| line.contains("the token validator refused a token")
+                && line.contains("invalid_token")),
+        "the challenge's error is not logged"
+    );
+    assert!(!text.contains(&token), "the log holds the token");
+    assert!(
+        !text.contains("secret-desc"),
+        "the log holds the description"
+    );
+    assert!(!text.contains(USER), "the log holds the object id");
 }

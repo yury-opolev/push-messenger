@@ -447,7 +447,8 @@ mod tests {
 
     use super::testing::{
         API_CLIENT_ID, CLIENT_APP, KEY_A, KEY_B, OTHER_TENANT, StubOpenId, StubValidator, TENANT,
-        ValidatorAnswer, refused_url, sign, sign_as, sign_raw, unix_now, with_algorithm,
+        ValidatorAnswer, claim_headers, refused_url, sign, sign_as, sign_raw, unix_now,
+        with_algorithm,
     };
     use super::*;
 
@@ -1161,5 +1162,412 @@ mod tests {
         for seen in &requests {
             assert_eq!(single(seen, "x-tier"), Some("gold"));
         }
+    }
+
+    async fn headers_mode() -> (StubOpenId, StubValidator, EntraSignIn) {
+        let openid = StubOpenId::start().await;
+        let validator = StubValidator::start().await;
+        let entra = EntraSignIn::new(validator.settings_for_headers(&openid)).unwrap();
+        (openid, validator, entra)
+    }
+
+    /// A header-protocol answer: 200 with the claim headers of `claims`.
+    fn headers_answer(claims: &Value) -> ValidatorAnswer {
+        ValidatorAnswer::Headers {
+            status: 200,
+            headers: claim_headers(claims),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_header_validator_request_is_an_empty_post_with_the_metadata() {
+        use crate::identity::Authenticator;
+
+        let openid = StubOpenId::start().await;
+        let validator = StubValidator::start().await;
+        let mut settings = with_static_header(validator.settings_for_headers(&openid));
+        let entra = EntraSignIn::new(settings.clone()).unwrap();
+        let token = openid.token(USER);
+        entra.authenticate_with(&token, &meta()).await.unwrap();
+        let requests = validator.requests();
+        assert_eq!(requests.len(), 1);
+        let seen = &requests[0];
+        assert_carries_the_metadata(seen, &token);
+        assert_eq!(seen.body, "");
+        assert_eq!(seen.content_length.as_deref(), Some("0"));
+        assert_eq!(seen.content_type, None);
+        assert_eq!(single(seen, "transfer-encoding"), None);
+        assert_eq!(single(seen, "return-all-subject-token-claims"), Some("1"));
+
+        let configured = settings.validator.as_mut().unwrap();
+        configured.secret = Some("s3cret".to_owned());
+        configured.correlation_header =
+            Some(reqwest::header::HeaderName::from_static("x-correlation-id"));
+        let with_secret = EntraSignIn::new(settings).unwrap();
+        with_secret
+            .authenticate_with(&token, &meta())
+            .await
+            .unwrap();
+        let seen = &validator.requests()[1];
+        assert_eq!(seen.secret.as_deref(), Some("s3cret"));
+        assert_eq!(single(seen, "x-correlation-id"), Some(REQUEST_ID));
+        assert_eq!(single(seen, "x-request-id"), None);
+        assert!(!format!("{with_secret:?}").contains("s3cret"));
+    }
+
+    #[tokio::test]
+    async fn a_header_validated_delegated_token_gives_the_built_in_principal() {
+        use crate::identity::Authenticator;
+
+        let (openid, validator, entra) = headers_mode().await;
+        let token = openid.token(USER);
+        let checked = Authenticator::authenticate(&entra, &token).await.unwrap();
+        assert_eq!((openid.metadata_fetches(), openid.jwks_fetches()), (0, 0));
+        assert_eq!(validator.requests().len(), 1);
+        let built_in = EntraSignIn::with_timing(openid.settings(), quick()).unwrap();
+        let expected = Authenticator::authenticate(&built_in, &token)
+            .await
+            .unwrap();
+        assert!(checked == expected, "{checked:?} != {expected:?}");
+        assert_eq!(checked.claims, expected.claims);
+        assert_eq!(checked.claims["exp"], expected.claims["exp"]);
+        assert_eq!(checked.name.as_deref(), Some("Test User"));
+
+        let name = "Zo\u{eb} \u{c5}ngstr\u{f6}m \u{6d4b}\u{8bd5}";
+        let claims = changed(openid.user_claims(TENANT, USER), "name", json!(name));
+        let identity = entra.verify(&sign(KEY_A, &claims)).await.unwrap();
+        assert_eq!(identity.name.as_deref(), Some(name));
+        // A validator may omit nbf and iat.
+        let short = without(without(openid.user_claims(TENANT, USER), "nbf"), "iat");
+        validator.set_answer(headers_answer(&short));
+        assert!(entra.verify(&token).await.is_ok());
+        assert_eq!(validator.requests().len(), 3, "one request per sign-in");
+    }
+
+    #[tokio::test]
+    async fn header_claims_are_checked_again() {
+        let (openid, validator, entra) = headers_mode().await;
+        let good = openid.user_claims(TENANT, USER);
+        let token = openid.token(USER);
+        let now = unix_now();
+        let mut cases: Vec<(Value, Reason)> = ["tid", "oid", "exp", "iss", "aud"]
+            .into_iter()
+            .map(|missing| (without(good.clone(), missing), Reason::Malformed))
+            .collect();
+        cases.extend([
+            (without(good.clone(), "ver"), Reason::Version),
+            (changed(good.clone(), "ver", json!("1.0")), Reason::Version),
+            (
+                changed(good.clone(), "tid", json!(OTHER_TENANT)),
+                Reason::Malformed,
+            ),
+            (
+                changed(
+                    good.clone(),
+                    "oid",
+                    json!("66666666-0000-4000-8000-000000000006"),
+                ),
+                Reason::Malformed,
+            ),
+            (
+                changed(good.clone(), "sub", json!("pairwise-other")),
+                Reason::Malformed,
+            ),
+            (
+                changed(good.clone(), "exp", json!("tomorrow")),
+                Reason::Malformed,
+            ),
+            (changed(good.clone(), "exp", json!(1.5)), Reason::Malformed),
+            (
+                changed(good.clone(), "aud", json!(CLIENT_APP)),
+                Reason::Audience,
+            ),
+            (
+                changed(good.clone(), "aud", json!(["api://other", CLIENT_APP])),
+                Reason::Audience,
+            ),
+            (
+                changed(good.clone(), "iss", json!(openid.issuer(OTHER_TENANT))),
+                Reason::Issuer,
+            ),
+            (
+                changed(good.clone(), "exp", json!(now - 120)),
+                Reason::Expired,
+            ),
+            (
+                changed(good.clone(), "nbf", json!(now + 300)),
+                Reason::NotYetValid,
+            ),
+            (changed(good.clone(), "scp", json!("other")), Reason::Scope),
+        ]);
+        for (claims, reason) in cases {
+            validator.set_answer(headers_answer(&claims));
+            assert_eq!(
+                entra.verify(&token).await,
+                Err(EntraError::Rejected(reason)),
+                "{claims}"
+            );
+        }
+        let mut repeated = claim_headers(&good);
+        repeated.push(("Subject-Token-Claim-oid".to_owned(), USER.to_owned()));
+        let mut bad_base64 = claim_headers(&good);
+        bad_base64.push((
+            "Subject-Token-Encoded-Claim-email".to_owned(),
+            "%%%".to_owned(),
+        ));
+        for headers in [repeated, bad_base64] {
+            validator.set_answer(ValidatorAnswer::Headers {
+                status: 200,
+                headers,
+            });
+            assert_eq!(
+                entra.verify(&token).await,
+                Err(EntraError::Rejected(Reason::Malformed))
+            );
+        }
+        // Several audiences, one of them configured, in any of the list forms.
+        for audiences in [
+            format!("api://other,{API_CLIENT_ID}"),
+            format!("[\"api://other\",\"{API_CLIENT_ID}\"]"),
+        ] {
+            let mut headers = claim_headers(&without(good.clone(), "aud"));
+            headers.push(("Subject-Token-Claim-aud".to_owned(), audiences));
+            validator.set_answer(ValidatorAnswer::Headers {
+                status: 200,
+                headers,
+            });
+            assert!(entra.verify(&token).await.is_ok());
+        }
+
+        // A tenant that is not admitted never reaches the validator.
+        let asked = validator.requests().len();
+        let foreign = "66666666-0000-4000-8000-000000000006";
+        let claims = changed(
+            changed(good.clone(), "tid", json!(foreign)),
+            "iss",
+            json!(openid.issuer(foreign)),
+        );
+        assert_eq!(
+            entra.verify(&sign(KEY_A, &claims)).await,
+            Err(EntraError::Rejected(Reason::Tenant))
+        );
+        assert_eq!(validator.requests().len(), asked);
+    }
+
+    #[tokio::test]
+    async fn header_claims_meet_the_same_policy_as_built_in_ones() {
+        use crate::identity::{AuthenticationError, Authenticator};
+
+        let openid = StubOpenId::start().await;
+        let validator = StubValidator::start().await;
+        let mut settings = validator.settings_for_headers(&openid);
+        settings.required_role = Some("Push.User".to_owned());
+        settings.client_apps = vec![Uuid::parse_str(CLIENT_APP).unwrap()];
+        let entra = EntraSignIn::new(settings.clone()).unwrap();
+        let built_in = EntraSignIn::with_timing(
+            EntraSettings {
+                validator: None,
+                ..settings
+            },
+            quick(),
+        )
+        .unwrap();
+        let good = changed(
+            openid.user_claims(TENANT, USER),
+            "roles",
+            json!(["Push.User"]),
+        );
+        let cases = [
+            (good.clone(), None),
+            (
+                changed(good.clone(), "roles", json!(["Other"])),
+                Some(Reason::Role),
+            ),
+            (without(good.clone(), "roles"), Some(Reason::Role)),
+            (
+                changed(
+                    good.clone(),
+                    "azp",
+                    json!("66666666-0000-4000-8000-000000000006"),
+                ),
+                Some(Reason::ClientApp),
+            ),
+            (
+                changed(good.clone(), "scp", json!("other")),
+                Some(Reason::Scope),
+            ),
+            (
+                changed(without(good.clone(), "scp"), "idtyp", json!("app")),
+                Some(Reason::AppOnly),
+            ),
+        ];
+        // Through the authenticators, which log nothing: an app-only `auth.entra.rejected`
+        // event in validator mode would confuse `built_in_refusals_carry_no_validator_flag`.
+        for (claims, reason) in cases {
+            let token = sign(KEY_A, &claims);
+            let checked = Authenticator::authenticate(&entra, &token)
+                .await
+                .map(|_| ());
+            let expected = Authenticator::authenticate(&built_in, &token)
+                .await
+                .map(|_| ());
+            assert_eq!(checked, expected, "{claims}");
+            let reason = reason.map(|reason| AuthenticationError::Rejected(reason.as_str()));
+            assert_eq!(checked, reason.map_or(Ok(()), Err), "{claims}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_401_or_403_from_a_header_validator_is_a_validator_refusal() {
+        let (openid, validator, entra) = headers_mode().await;
+        let challenge = (
+            "WWW-Authenticate".to_owned(),
+            r#"Bearer error="invalid_token", error_description="secret-desc""#.to_owned(),
+        );
+        for status in [401, 403] {
+            validator.set_answer(ValidatorAnswer::Headers {
+                status,
+                headers: vec![challenge.clone()],
+            });
+            assert_eq!(
+                entra.verify(&openid.token(USER)).await,
+                Err(EntraError::Rejected(Reason::Validator)),
+                "{status}"
+            );
+        }
+        // Its body is drained and ignored, whatever its size; claim headers do not count.
+        validator.set_answer(ValidatorAnswer::Status(401, "x".repeat(100 * 1024)));
+        assert_eq!(
+            entra.verify(&openid.token(USER)).await,
+            Err(EntraError::Rejected(Reason::Validator))
+        );
+        validator.set_answer(ValidatorAnswer::Headers {
+            status: 401,
+            headers: claim_headers(&openid.user_claims(TENANT, USER)),
+        });
+        assert_eq!(
+            entra.verify(&openid.token(USER)).await,
+            Err(EntraError::Rejected(Reason::Validator))
+        );
+    }
+
+    #[test]
+    fn the_error_of_a_challenge_is_read_without_its_description() {
+        for (challenge, error) in [
+            (
+                r#"Bearer error="invalid_token", error_description="d""#,
+                Some("invalid_token"),
+            ),
+            (
+                r#"Bearer realm="x", error=insufficient_scope"#,
+                Some("insufficient_scope"),
+            ),
+            (
+                r#"Bearer error_description="error=fake", error="e""#,
+                Some("e"),
+            ),
+            (r#"Basic realm="a, b", Bearer ERROR="e2""#, Some("e2")),
+            (r#"Bearer realm="error=x""#, None),
+            ("Bearer", None),
+            ("Negotiate abc==", None),
+            (r#"Bearer error="bad value""#, None),
+            (r#"Bearer error="unterminated"#, None),
+        ] {
+            assert_eq!(
+                validator::challenge_error(challenge).as_deref(),
+                error,
+                "{challenge}"
+            );
+        }
+        let long = format!("Bearer error=\"{}\"", "e".repeat(100));
+        assert_eq!(validator::challenge_error(&long), Some("e".repeat(64)));
+    }
+
+    #[tokio::test]
+    async fn an_unusable_header_validator_fails_closed_without_falling_back_to_keys() {
+        use crate::identity::{AuthenticationError, Authenticator};
+
+        let (openid, validator, entra) = headers_mode().await;
+        let token = openid.token(USER);
+        let good = claim_headers(&openid.user_claims(TENANT, USER));
+        let status = |status: u16| ValidatorAnswer::Headers {
+            status,
+            headers: good.clone(),
+        };
+        let mut many = good.clone();
+        many.extend((0..65).map(|index| (format!("Subject-Token-Claim-x{index}"), "v".to_owned())));
+        let mut large = good.clone();
+        large.push(("Subject-Token-Claim-big".to_owned(), "v".repeat(9 * 1024)));
+        let mut total = good.clone();
+        total.extend((0..5).map(|index| {
+            (
+                format!("Subject-Token-Claim-big{index}"),
+                "v".repeat(7 * 1024),
+            )
+        }));
+        let mut redirect = good.clone();
+        redirect.push(("Location".to_owned(), "http://127.0.0.1:1/".to_owned()));
+        let answers = [
+            status(400),
+            status(404),
+            status(429),
+            status(500),
+            status(503),
+            ValidatorAnswer::Headers {
+                status: 302,
+                headers: redirect,
+            },
+            ValidatorAnswer::Headers {
+                status: 200,
+                headers: many,
+            },
+            ValidatorAnswer::Headers {
+                status: 200,
+                headers: large,
+            },
+            ValidatorAnswer::Headers {
+                status: 200,
+                headers: total,
+            },
+            ValidatorAnswer::Delay(Duration::from_millis(1500)),
+        ];
+        for answer in &answers {
+            validator.set_answer(answer.clone());
+            let verified = entra.verify(&token).await;
+            let Err(EntraError::Unavailable(error)) = verified else {
+                panic!("{answer:?}: {verified:?}");
+            };
+            assert!(!error.contains(&token), "{error}");
+        }
+        assert_eq!(validator.requests().len(), answers.len(), "no retries");
+        validator.set_answer(status(500));
+        assert!(matches!(
+            Authenticator::authenticate(&entra, &token).await,
+            Err(AuthenticationError::Unavailable(_))
+        ));
+        let mut settings = validator.settings_for_headers(&openid);
+        settings.validator.as_mut().unwrap().url = refused_url().await;
+        let refused = EntraSignIn::new(settings).unwrap();
+        assert!(matches!(
+            refused.verify(&token).await,
+            Err(EntraError::Unavailable(_))
+        ));
+        entra.warm().await;
+        refused.warm().await;
+        assert_eq!((openid.metadata_fetches(), openid.jwks_fetches()), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn a_header_validator_without_request_headers_is_warned_about() {
+        crate::tests::capture_logs();
+        let openid = StubOpenId::start().await;
+        let validator = StubValidator::start().await;
+        let mut settings = validator.settings_for_headers(&openid);
+        settings.validator.as_mut().unwrap().request_headers.clear();
+        EntraSignIn::new(settings).unwrap();
+        assert!(
+            crate::tests::captured_logs().contains("no PUSH_ENTRA_VALIDATOR_REQUEST_HEADERS"),
+            "no start-up warning"
+        );
     }
 }
