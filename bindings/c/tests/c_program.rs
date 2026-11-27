@@ -9,38 +9,82 @@ use std::process::Command;
 
 use push_sdk::testing::{AutoGateway, FakeAuth};
 
-/// target/<profile>, where cargo puts the shared library.
-fn library_dir() -> PathBuf {
-    let test = std::env::current_exe().unwrap();
-    test.parent().and_then(Path::parent).unwrap().to_path_buf()
+/// The shared library cargo built: the file the C program links (the import library on
+/// MSVC, the shared library elsewhere) and the directory it is found in when it runs.
+struct Library {
+    link: PathBuf,
+    dir: PathBuf,
 }
 
-/// Builds the shared library: cargo builds only the Rust library for integration tests.
-fn build_library() {
-    let library = library_dir();
+/// Builds the shared library (cargo builds only the Rust library for integration tests),
+/// with the profile these tests were built with, and asks cargo where it put it: the test's
+/// own path says nothing reliable about where the artifacts are (build-dir layouts differ).
+fn build_library() -> Library {
     let mut command = Command::new(env!("CARGO"));
-    command
-        .args([
-            "build",
-            "--locked",
-            "--lib",
-            "-p",
-            "push-sdk-c",
-            "--target-dir",
-        ])
-        .arg(library.parent().unwrap());
-    if library.ends_with("release") {
+    command.args([
+        "build",
+        "--locked",
+        "--lib",
+        "-p",
+        "push-sdk-c",
+        "--message-format=json-render-diagnostics",
+    ]);
+    if !cfg!(debug_assertions) {
         command.arg("--release");
     }
-    let built = command.output().expect("cargo runs");
+    let built = command
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("cargo runs");
     assert!(
         built.status.success(),
         "the shared library does not build:\n{}",
         String::from_utf8_lossy(&built.stderr)
     );
+    let filenames: Vec<PathBuf> = String::from_utf8_lossy(&built.stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|message| {
+            message["reason"] == "compiler-artifact"
+                && message["target"]["name"] == "push_sdk_c"
+                && message["target"]["kind"]
+                    .as_array()
+                    .is_some_and(|kinds| kinds.iter().any(|kind| kind == "cdylib"))
+        })
+        .flat_map(|message| {
+            message["filenames"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|name| name.as_str().map(PathBuf::from))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let named = |name: &str| {
+        filenames
+            .iter()
+            .find(|file| file.file_name().is_some_and(|file| file == name))
+            .cloned()
+    };
+    let shared = named(&format!(
+        "{}push_sdk_c{}",
+        std::env::consts::DLL_PREFIX,
+        std::env::consts::DLL_SUFFIX
+    ))
+    .unwrap_or_else(|| panic!("cargo reports no shared library among {filenames:?}"));
+    let link = if cfg!(target_env = "msvc") {
+        named("push_sdk_c.dll.lib")
+            .unwrap_or_else(|| panic!("cargo reports no import library among {filenames:?}"))
+    } else {
+        shared.clone()
+    };
+    Library {
+        link,
+        dir: shared.parent().unwrap().to_path_buf(),
+    }
 }
 
-fn compile(scratch: &Path) -> PathBuf {
+fn compile(scratch: &Path, library: &Library) -> PathBuf {
     let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let target = env!("PUSH_SDK_C_TARGET");
     let compiler = cc::Build::new()
@@ -52,7 +96,6 @@ fn compile(scratch: &Path) -> PathBuf {
         .get_compiler();
     let source = crate_dir.join("tests").join("c").join("flow.c");
     let include = crate_dir.join("include");
-    let library = library_dir();
     let program = scratch.join(if cfg!(windows) { "flow.exe" } else { "flow" });
     let mut command = compiler.to_command();
     if compiler.is_like_msvc() {
@@ -63,7 +106,7 @@ fn compile(scratch: &Path) -> PathBuf {
             .arg(format!("/Fo{}\\", scratch.display()))
             .arg(format!("/Fe{}", program.display()))
             .arg("/link")
-            .arg(library.join("push_sdk_c.dll.lib"));
+            .arg(&library.link);
     } else {
         command
             .arg("-std=c99")
@@ -73,9 +116,9 @@ fn compile(scratch: &Path) -> PathBuf {
             .arg(&source)
             .arg("-o")
             .arg(&program)
-            .arg(format!("-L{}", library.display()))
+            .arg(format!("-L{}", library.dir.display()))
             .arg("-lpush_sdk_c")
-            .arg(format!("-Wl,-rpath,{}", library.display()))
+            .arg(format!("-Wl,-rpath,{}", library.dir.display()))
             .arg("-lpthread");
     }
     let compiled = command.output().expect("the C compiler runs");
@@ -93,8 +136,8 @@ fn a_c_program_signs_in_sends_and_reads_events() {
     let scratch = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("push-sdk-c-flow");
     let _ = std::fs::remove_dir_all(&scratch);
     std::fs::create_dir_all(&scratch).unwrap();
-    build_library();
-    let program = compile(&scratch);
+    let library = build_library();
+    let program = compile(&scratch, &library);
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -107,7 +150,7 @@ fn a_c_program_signs_in_sends_and_reads_events() {
         (auth, gateway)
     });
     // The program finds the shared library next to it (Windows) or by its rpath.
-    let mut path = std::ffi::OsString::from(library_dir());
+    let mut path = std::ffi::OsString::from(&library.dir);
     path.push(if cfg!(windows) { ";" } else { ":" });
     path.push(std::env::var_os("PATH").unwrap_or_default());
     // JSON in the program's config: forward slashes need no escaping.

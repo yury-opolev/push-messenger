@@ -382,14 +382,8 @@ pub fn testkit() -> PathBuf {
     static BINARY: OnceLock<PathBuf> = OnceLock::new();
     BINARY
         .get_or_init(|| {
-            let test = std::env::current_exe().expect("the test's path");
-            // target/<profile>/deps/<test> → target/<profile>
-            let profile_dir = test
-                .parent()
-                .and_then(Path::parent)
-                .expect("the test runs from target/<profile>/deps");
-            let profile = profile_dir.file_name().and_then(|name| name.to_str());
-            let target_dir = profile_dir.parent().expect("target/<profile>");
+            // With the profile these tests were built with; cargo says where the binary is:
+            // the test's own path says nothing reliable about it (build-dir layouts differ).
             let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
             let mut build = std::process::Command::new(cargo);
             build
@@ -398,27 +392,30 @@ pub fn testkit() -> PathBuf {
                     "--locked",
                     "-p",
                     "push-voice-adapter-testkit",
-                    "--target-dir",
+                    "--bin",
+                    "push-voice-adapter-testkit",
+                    "--message-format=json-render-diagnostics",
                 ])
-                .arg(target_dir)
-                .current_dir(env!("CARGO_MANIFEST_DIR"));
-            match profile {
-                Some("debug") => {}
-                Some("release") => {
-                    build.arg("--release");
-                }
-                Some(other) => {
-                    build.args(["--profile", other]);
-                }
-                None => panic!("the profile directory {}", profile_dir.display()),
+                .current_dir(env!("CARGO_MANIFEST_DIR"))
+                .stderr(std::process::Stdio::inherit());
+            if !cfg!(debug_assertions) {
+                build.arg("--release");
             }
             let started = Instant::now();
-            let status = build.status().expect("cargo runs");
-            assert!(status.success(), "building push-voice-adapter-testkit");
-            let binary = profile_dir.join(format!(
-                "push-voice-adapter-testkit{}",
-                std::env::consts::EXE_SUFFIX
-            ));
+            let built = build.output().expect("cargo runs");
+            assert!(
+                built.status.success(),
+                "building push-voice-adapter-testkit"
+            );
+            let binary = String::from_utf8_lossy(&built.stdout)
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .filter(|message| {
+                    message["reason"] == "compiler-artifact"
+                        && message["target"]["name"] == "push-voice-adapter-testkit"
+                })
+                .find_map(|message| message["executable"].as_str().map(PathBuf::from))
+                .expect("cargo reports the testkit's executable");
             assert!(binary.is_file(), "{} exists", binary.display());
             step(&format!(
                 "the testkit adapter is built in {} ms: {}",
