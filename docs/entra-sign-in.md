@@ -528,7 +528,7 @@ PUSH_ENTRA_VALIDATOR_URL"), rather than silently ignored.
 | `PUSH_ENTRA_VALIDATOR_PROTOCOL` | `json` or `headers` (case-insensitive) | `json` |
 | `PUSH_ENTRA_VALIDATOR_TIMEOUT_MS` | Time limit of the whole request, connecting and reading the answer included: a whole number from 100 to 10000 | `2000` |
 | `PUSH_ENTRA_VALIDATOR_SECRET_FILE` | Path of a file whose trimmed content is sent as `X-Push-Validator-Secret`; read once at start-up; must hold 1 to 1024 visible ASCII characters (no spaces). Unset: no secret header | unset |
-| `PUSH_ENTRA_VALIDATOR_REQUEST_HEADERS` | Static headers sent with every validator request, in both protocols: `Name: value` entries separated by newlines or `;`, or a JSON object of strings (`{"Name": "value"}`). At most 32; names are RFC 9110 tokens, unique case-insensitively, and not [reserved](#request-headers-both-protocols); values are trimmed, 1 to 1024 characters of visible ASCII with inner spaces or tabs (in the `Name: value` form a value cannot contain `;`: use the JSON form). Values are never logged | none |
+| `PUSH_ENTRA_VALIDATOR_REQUEST_HEADERS` | Static headers sent with every validator request, in both protocols: `Name: value` entries separated by newlines or `;`, or a JSON object of strings (`{"Name": "value"}`). At most 32; names are RFC 9110 tokens, unique case-insensitively, and not [reserved](#request-headers-both-protocols); values are trimmed, 1 to 1024 characters of visible ASCII with inner spaces or tabs. In the `Name: value` form `;` separates entries, so a value containing `;` needs the JSON form (the chart always renders JSON). Values are never logged | none |
 | `PUSH_ENTRA_VALIDATOR_CORRELATION_HEADER` | The header carrying each sign-in attempt's request id, in both protocols: an RFC 9110 token, not a reserved name. Set but empty: no request id is sent | `X-Request-Id` |
 | `PUSH_ENTRA_VALIDATOR_CLAIM_HEADER_PREFIX` | `headers` protocol: the name prefix (an RFC 9110 token, case-insensitive) of response headers carrying one claim as text | `Subject-Token-Claim-` |
 | `PUSH_ENTRA_VALIDATOR_ENCODED_CLAIM_HEADER_PREFIX` | `headers` protocol: the name prefix of response headers carrying one claim as base64 of UTF-8 text; it must not be the beginning of the plain prefix. Set but empty: no encoded claims are read | `Subject-Token-Encoded-Claim-` |
@@ -559,8 +559,9 @@ metadata, and these four headers are then not sent.
 **Reserved names.** A static header (or the correlation header) may not be one auth-svc
 sets itself, case-insensitively: `Authorization`, `Original-Uri`, `Original-Method`,
 `X-Forwarded-For`, `Host`, `Content-Length`, `Content-Type`, `Accept`,
-`Transfer-Encoding`, `Connection`, `X-Push-Validator-Secret`, nor (for a static header)
-the correlation header.
+`Transfer-Encoding`, `Connection`, `X-Push-Validator-Secret`, `TE`, `Upgrade`, `Expect`,
+`Keep-Alive`, `Proxy-Authorization`, `Proxy-Connection`, `Trailer`, nor (for a static
+header) the correlation header.
 
 A loopback URL bypasses `HTTPS_PROXY` (a pod's proxy must not catch the sidecar); an
 `https://` validator elsewhere is reached like Entra ID, through the proxy variables
@@ -733,9 +734,10 @@ a bare status unless a request header asks for the claims, for example
   misconfigured validator, not a bad token. Other response headers do not count.
 - **Required claims**: `iss`, `aud`, `tid`, `oid`, `exp`, of the types of the
   [JSON schema](#json-protocol) (a missing one is `malformed`), and every claim the policy
-  needs (`scp` for `entra`, `roles` for `entra-app`, and so on). `ver` is not required by
-  the schema here, but the policy accepts only `2.0`: a missing or other `ver` is refused
-  as `version`, so the validator must return it.
+  needs (`scp` for `entra`, `roles` for `entra-app`, and so on). `ver` is optional here:
+  when the answer has none, the presented token's own `ver` (a string) is taken, since the
+  validator has verified the token. The policy accepts only `2.0`: a returned `ver` other
+  than `2.0`, or no `ver` in the answer nor in the token, is refused as `version`.
 
 A 2xx answer for a delegated token, then, looks like:
 
@@ -817,7 +819,7 @@ non-empty `url`: `url`, `protocol` (`json`), `timeoutMs` (2000) and `correlation
 (`X-Request-Id`; empty sends none) always, `secretFile` and `requestHeaders` when set, and
 `claimHeaderPrefix` / `encodedClaimHeaderPrefix` (empty reads no encoded claims) only with
 `protocol: headers`. `requestHeaders` is a map of name to string value (quote numbers:
-`"1"`), rendered sorted as `Name: value` lines; a value must not contain `;`.
+`"1"`), rendered as a JSON object with sorted keys, so a value may contain `;`.
 `auth.extraContainers`, `auth.extraVolumes` and `auth.extraVolumeMounts` are rendered
 verbatim into the auth Deployment (after the auth container, into the pod's volumes and
 into the auth container's mounts).
@@ -828,8 +830,8 @@ host, user info or a fragment; a `timeoutMs` outside 100 to 10000; a relative
 name that is no RFC 9110 token, is reserved or is given twice, a value that is not a
 string or not 1 to 1024 visible ASCII characters (failures name the header, never its
 value); a correlation header that is no token or is reserved; an empty or non-token
-`claimHeaderPrefix`, a non-token `encodedClaimHeaderPrefix` or one equal to
-`claimHeaderPrefix`; and extras that are not lists. It does not harden extra containers: set their `securityContext` and
+`claimHeaderPrefix`, a non-token `encodedClaimHeaderPrefix` or one that begins
+`claimHeaderPrefix` (equal to it or a prefix of it, case-insensitively); and extras that are not lists. It does not harden extra containers: set their `securityContext` and
 `resources` yourself.
 
 **JSON protocol**, with a validator written for auth-svc:
