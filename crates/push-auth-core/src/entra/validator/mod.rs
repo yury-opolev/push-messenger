@@ -105,8 +105,8 @@ impl Validator {
         })
     }
 
-    /// Whether the answer must carry `ver`: the JSON schema requires it, while the header
-    /// protocol leaves a missing `ver` to the version rule.
+    /// Whether the answer must carry `ver`: the JSON schema requires it, while a header
+    /// answer without `ver` takes the presented token's.
     pub(crate) fn requires_version(&self) -> bool {
         self.protocol == Protocol::Json
     }
@@ -173,11 +173,12 @@ impl Validator {
         let status = response.status();
         let answer = std::mem::take(response.headers_mut());
         let mut drained = 0;
+        // No chunk is asked for once 4 KiB have been read.
         while drained < MAX_DRAINED_BODY {
-            match response.chunk().await {
-                Ok(Some(chunk)) => drained += chunk.len(),
-                _ => break,
-            }
+            let Ok(Some(chunk)) = response.chunk().await else {
+                break;
+            };
+            drained += chunk.len();
         }
         drop(response);
         if status.is_success() {

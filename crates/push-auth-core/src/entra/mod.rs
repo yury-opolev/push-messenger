@@ -338,9 +338,15 @@ impl EntraSignIn {
                 {
                     return Err(EntraError::Rejected(Reason::Malformed));
                 }
-                let payload = validator.check(token, kind, meta).await?;
+                let mut payload = validator.check(token, kind, meta).await?;
                 // Any JSON type: only a string can match the validator's `oid` or `sub`.
                 let unverified_claims: Map<String, Value> = decode_part(parts[1])?;
+                if !validator.requires_version() && !payload.contains_key("ver") {
+                    // The validator verified the token, so its own `ver` is authentic.
+                    if let Some(version) = unverified_claims.get("ver").filter(|v| v.is_string()) {
+                        payload.insert("ver".to_owned(), version.clone());
+                    }
+                }
                 let text = |name: &str| unverified_claims.get(name).and_then(Value::as_str);
                 validator::recheck(
                     &payload,
@@ -1255,7 +1261,6 @@ mod tests {
             .map(|missing| (without(good.clone(), missing), Reason::Malformed))
             .collect();
         cases.extend([
-            (without(good.clone(), "ver"), Reason::Version),
             (changed(good.clone(), "ver", json!("1.0")), Reason::Version),
             (
                 changed(good.clone(), "tid", json!(OTHER_TENANT)),
@@ -1308,6 +1313,19 @@ mod tests {
                 "{claims}"
             );
         }
+        // Without `ver` in the answer, the verified token's own `ver` applies.
+        validator.set_answer(headers_answer(&without(good.clone(), "ver")));
+        assert!(entra.verify(&token).await.is_ok());
+        let v1 = sign(KEY_A, &changed(good.clone(), "ver", json!("1.0")));
+        assert_eq!(
+            entra.verify(&v1).await,
+            Err(EntraError::Rejected(Reason::Version))
+        );
+        let unversioned = sign(KEY_A, &without(good.clone(), "ver"));
+        assert_eq!(
+            entra.verify(&unversioned).await,
+            Err(EntraError::Rejected(Reason::Version))
+        );
         let mut repeated = claim_headers(&good);
         repeated.push(("Subject-Token-Claim-oid".to_owned(), USER.to_owned()));
         let mut bad_base64 = claim_headers(&good);
