@@ -121,20 +121,14 @@ impl Validator {
             request = request.header(SECRET_HEADER, secret.clone());
         }
         let client_ip = meta.client_ip.map(|ip| ip.to_string());
+        let original_uri = HeaderName::from_static(ORIGINAL_URI_HEADER);
+        let original_method = HeaderName::from_static(ORIGINAL_METHOD_HEADER);
+        let forwarded_for = HeaderName::from_static(FORWARDED_FOR_HEADER);
         let known = [
             (self.correlation_header.as_ref(), meta.request_id.as_deref()),
-            (
-                Some(&HeaderName::from_static(ORIGINAL_URI_HEADER)),
-                meta.original_uri.as_deref(),
-            ),
-            (
-                Some(&HeaderName::from_static(ORIGINAL_METHOD_HEADER)),
-                meta.method.as_deref(),
-            ),
-            (
-                Some(&HeaderName::from_static(FORWARDED_FOR_HEADER)),
-                client_ip.as_deref(),
-            ),
+            (Some(&original_uri), meta.original_uri.as_deref()),
+            (Some(&original_method), meta.method.as_deref()),
+            (Some(&forwarded_for), client_ip.as_deref()),
         ];
         for (name, value) in known {
             if let (Some(name), Some(value)) = (name, value.and_then(visible)) {
