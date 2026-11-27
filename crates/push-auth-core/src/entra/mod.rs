@@ -195,9 +195,6 @@ struct Unverified {
     tid: Option<String>,
     #[serde(default)]
     iss: Option<String>,
-    /// Any JSON type: only a string can match the validator's `oid`.
-    #[serde(default)]
-    oid: Option<Value>,
 }
 
 impl EntraSignIn {
@@ -333,10 +330,12 @@ impl EntraSignIn {
                     return Err(EntraError::Rejected(Reason::Malformed));
                 }
                 let payload = validator.check(token, kind).await?;
+                // Any JSON type: only a string can match the validator's `oid`.
+                let unverified_claims: Map<String, Value> = decode_part(parts[1])?;
                 validator::recheck(
                     &payload,
                     unverified.tid.as_deref(),
-                    unverified.oid.as_ref().and_then(Value::as_str),
+                    unverified_claims.get("oid").and_then(Value::as_str),
                     tenant,
                     &self.settings,
                     crate::service::unix_now(),
@@ -426,7 +425,7 @@ mod tests {
 
     use super::testing::{
         API_CLIENT_ID, CLIENT_APP, KEY_A, KEY_B, OTHER_TENANT, StubOpenId, StubValidator, TENANT,
-        ValidatorAnswer, refused_url, sign, sign_as, unix_now, with_algorithm,
+        ValidatorAnswer, refused_url, sign, sign_as, sign_raw, unix_now, with_algorithm,
     };
     use super::*;
 
@@ -475,6 +474,20 @@ mod tests {
         let other = stub.user_claims(OTHER_TENANT, USER);
         let identity = entra.verify(&sign(KEY_A, &other)).await.unwrap();
         assert_eq!(identity.tenant_id.to_string(), OTHER_TENANT);
+    }
+
+    #[tokio::test]
+    async fn a_built_in_check_takes_the_last_of_duplicated_oid_claims() {
+        let (stub, entra) = verifier().await;
+        let first = "66666666-0000-4000-8000-000000000006";
+        let claims = without(stub.user_claims(TENANT, USER), "oid");
+        let body = claims.to_string();
+        let payload = format!(
+            "{{\"oid\":\"{first}\",{},\"oid\":\"{USER}\"}}",
+            &body[1..body.len() - 1]
+        );
+        let identity = entra.verify(&sign_raw(KEY_A, &payload)).await.unwrap();
+        assert_eq!(identity.object_id.to_string(), USER);
     }
 
     #[tokio::test]
@@ -954,6 +967,7 @@ mod tests {
             ValidatorAnswer::Status(500, String::new()),
             ValidatorAnswer::Status(302, String::new()),
             ValidatorAnswer::Status(400, String::new()),
+            ValidatorAnswer::Status(401, "x".repeat(17 * 1024)),
             ValidatorAnswer::Status(200, "not json".to_owned()),
             ValidatorAnswer::Claims(big),
             ValidatorAnswer::Delay(Duration::from_millis(1500)),

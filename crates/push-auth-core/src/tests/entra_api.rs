@@ -743,8 +743,11 @@ async fn an_app_route_refusal_in_validator_mode_carries_the_validator_flag() {
 async fn built_in_refusals_carry_no_validator_flag() {
     capture_logs();
     let world = world(Offer::Entra).await;
+    // An app-only token on the delegated route: no validator-mode test logs this
+    // `auth.entra.rejected` reason, so every such event is a built-in refusal.
     let mut claims = world.stub.user_claims(TENANT, USER);
-    claims["aud"] = json!(CLIENT_APP);
+    claims["roles"] = json!(["Messages.Send"]);
+    claims.as_object_mut().unwrap().remove("scp");
     let refused = sign(KEY_A, &claims);
     assert_eq!(
         entra(&world, json!({"token": refused})).await.status,
@@ -755,17 +758,16 @@ async fn built_in_refusals_carry_no_validator_flag() {
         .iter()
         .filter(|event| event["event"] == "auth.entra.rejected")
         .collect();
+    let app_only: Vec<&&Value> = rejected
+        .iter()
+        .filter(|event| event["reason"] == "app_only")
+        .collect();
+    assert!(!app_only.is_empty(), "{rejected:?}");
     assert!(
-        rejected
+        app_only
             .iter()
-            .all(|event| event.get("validator").is_none() || event["validator"] == true),
-        "{rejected:?}"
-    );
-    assert!(
-        rejected
-            .iter()
-            .any(|event| event["reason"] == "audience" && event.get("validator").is_none()),
-        "{rejected:?}"
+            .all(|event| event.get("validator").is_none()),
+        "{app_only:?}"
     );
     assert!(!captured_logs().contains(&refused));
 }

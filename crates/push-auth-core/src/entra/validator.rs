@@ -263,6 +263,7 @@ fn unavailable(message: impl Into<String>) -> EntraError {
 /// cannot be built carries a token no header can hold.
 fn failure(error: reqwest::Error) -> EntraError {
     if error.is_builder() {
+        // Defensive: the signature pre-check already refuses what no header can hold.
         return EntraError::Rejected(Reason::Malformed);
     }
     unavailable(if error.is_timeout() {

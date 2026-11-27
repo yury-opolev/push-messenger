@@ -86,6 +86,18 @@ pub fn sign_as(key: TestKey, kid: &str, claims: &Value) -> String {
     jsonwebtoken::encode(&header, claims, &key.encoding()).expect("signing with a test key")
 }
 
+/// The JSON text `payload_json` signed with `key` (RS256) as it is, naming `key`'s id: for
+/// payloads a JSON value cannot express, such as a duplicated claim.
+pub fn sign_raw(key: TestKey, payload_json: &str) -> String {
+    let header =
+        URL_SAFE_NO_PAD.encode(json!({"alg": "RS256", "kid": key.kid, "typ": "JWT"}).to_string());
+    let message = format!("{header}.{}", URL_SAFE_NO_PAD.encode(payload_json));
+    let signature =
+        jsonwebtoken::crypto::sign(message.as_bytes(), &key.encoding(), Algorithm::RS256)
+            .expect("signing with a test key");
+    format!("{message}.{signature}")
+}
+
 /// A token whose header names `alg` and `kid` and whose last part is `signature`: for
 /// the algorithms the service must refuse (`none`, `HS256`, `RS384`, …).
 pub fn with_algorithm(alg: &str, kid: &str, claims: &Value, signature: &str) -> String {

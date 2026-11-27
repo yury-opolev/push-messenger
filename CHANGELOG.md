@@ -74,7 +74,9 @@ Notable changes for consumers of push-messenger. Newest first.
   `Authorization: Bearer` to the validator instead of fetching Entra ID's keys, re-checks
   the returned claims (schema, `tid`/`oid` match, tenant, issuer, audience, `exp`/`nbf`)
   and applies its unchanged policy, accounts and sessions, so a validator can only narrow
-  who signs in. A 401 maps to the named reason or the new reason `validator`; any other
+  who signs in. In validator mode `nbf` is optional, as in the contract's schema, and is
+  checked within the 60 s leeway when present. A 401 maps to the named reason or the new
+  reason `validator`; any other
   answer, a timeout or a body over 16 KiB fails closed with 503 (no fallback to built-in
   keys, no caching). Refusals log `validator: true` on `auth.entra.rejected` /
   `auth.external.rejected`; the token is never logged. New variables
