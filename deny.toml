@@ -20,6 +20,10 @@ ignore = [
     # (rusqlite 0.41: 1.89), above this workspace's MSRV 1.85; drop this entry when the
     # MSRV moves.
     { id = "RUSTSEC-2026-0459", reason = "push-sdk opens only its own private database; the fix needs Rust 1.89 (MSRV 1.85)" },
+    # chrono is marked unmaintained (informational; no known vulnerability). It is used for
+    # timestamps across the workspace and by sqlx; moving to time or jiff is a change of its
+    # own. Drop this entry once the workspace no longer depends on chrono directly.
+    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained, not vulnerable; replacing it is a separate migration" },
 ]
 
 [licenses]
