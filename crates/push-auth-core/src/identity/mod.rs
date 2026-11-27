@@ -72,8 +72,10 @@ impl fmt::Debug for Principal {
 }
 
 /// What an authenticator may know of the sign-in request besides its token (for an
-/// external token validator, say). Every field is optional.
+/// external token validator, say). Every field is optional. More fields may come: outside
+/// this crate, build it with `RequestMeta::default()` and set the fields.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RequestMeta {
     /// The public URL of the sign-in route as the client called it, without a query.
     pub original_uri: Option<String>,
