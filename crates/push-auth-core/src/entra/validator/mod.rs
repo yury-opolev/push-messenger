@@ -18,8 +18,8 @@ use super::{EntraError, Reason};
 use crate::identity::{ENTRA_APP_PROVIDER, ENTRA_PROVIDER, RequestMeta};
 
 pub(crate) use claims::{Presented, recheck};
-use config::is_loopback;
 pub use config::{Protocol, ValidatorSettings};
+use config::{check_settings, is_loopback};
 
 /// The largest validator answer read, in bytes.
 pub const MAX_VALIDATOR_BODY: usize = 16 * 1024;
@@ -63,6 +63,8 @@ pub(crate) struct Validator {
 
 impl Validator {
     pub(crate) fn new(settings: &ValidatorSettings) -> Result<Self, String> {
+        // Settings built in code are checked as their variables would be.
+        check_settings(settings)?;
         let url = Url::parse(&settings.url)
             .map_err(|_| "the token validator URL is not a URL".to_owned())?;
         let mut builder = reqwest::Client::builder()
@@ -383,5 +385,61 @@ mod tests {
     fn provider_kinds_are_named_as_the_providers() {
         assert_eq!(ProviderKind::User.as_str(), "entra");
         assert_eq!(ProviderKind::App.as_str(), "entra-app");
+    }
+
+    /// The error of `Validator::new` for `settings`, which must not show `hidden`.
+    fn refused_hiding(settings: &ValidatorSettings, hidden: &str) -> String {
+        let Err(error) = Validator::new(settings) else {
+            panic!("{settings:?} is accepted");
+        };
+        assert!(!error.contains(hidden), "{error}");
+        error
+    }
+
+    #[test]
+    fn programmatic_settings_are_checked_as_the_variables_are() {
+        let good = ValidatorSettings::new("https://validator.example/check");
+        assert!(Validator::new(&good).is_ok());
+        for url in [
+            "http://example.com",
+            "ftp://127.0.0.1/",
+            "https://u:s3cret@h.example/",
+            "https://h.example/#s3cret",
+            "not a url",
+        ] {
+            refused_hiding(&ValidatorSettings::new(url), "s3cret");
+        }
+        let header = |name: &str, value: &str| {
+            (
+                HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_str(value).unwrap(),
+            )
+        };
+        for request_headers in [
+            vec![header("authorization", "Bearer s3cret")],
+            vec![header("x-request-id", "s3cret")],
+            vec![header("x-a", "s3cret"), header("x-a", "s3cret")],
+            vec![header("x-a", "s3cret ")],
+            vec![header("x-a", &"s3cret".repeat(200))],
+            vec![header("x-a", "")],
+        ] {
+            let error = refused_hiding(
+                &ValidatorSettings {
+                    request_headers,
+                    ..good.clone()
+                },
+                "s3cret",
+            );
+            assert!(error.contains("request header"), "{error}");
+        }
+        for correlation in ["authorization", "original-uri", "content-length"] {
+            refused_hiding(
+                &ValidatorSettings {
+                    correlation_header: Some(HeaderName::from_static(correlation)),
+                    ..good.clone()
+                },
+                "\u{0}",
+            );
+        }
     }
 }

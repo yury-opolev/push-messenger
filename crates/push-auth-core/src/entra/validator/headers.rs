@@ -108,12 +108,28 @@ fn decoded(value: &HeaderValue) -> Result<String, ClaimError> {
         .map_err(|_| ClaimError::Malformed)
 }
 
+/// The claims that are always one string: a value beginning with `[` is still text, such
+/// as a display name `[EXT] Jane Doe`.
+const STRING_CLAIMS: [&str; 11] = [
+    "iss",
+    "tid",
+    "oid",
+    "sub",
+    "azp",
+    "appid",
+    "idtyp",
+    "name",
+    "preferred_username",
+    "email",
+    "ver",
+];
+
 /// A claim's JSON value from the texts of its headers (design H7).
 fn typed(claim: &str, values: &[String]) -> Result<Value, ClaimError> {
     match (claim, values) {
         ("exp" | "nbf" | "iat", [value]) => integer(value),
         ("exp" | "nbf" | "iat", _) => Err(ClaimError::Malformed),
-        ("scp", _) => Ok(Value::String(items(values)?.join(" "))),
+        ("scp", _) => Ok(Value::String(scopes(values).join(" "))),
         ("roles", _) => Ok(strings(items(values)?)),
         ("aud", _) => {
             let mut audiences = items(values)?;
@@ -122,8 +138,8 @@ fn typed(claim: &str, values: &[String]) -> Result<Value, ClaimError> {
                 _ => strings(audiences),
             })
         }
-        (_, [value]) if value.starts_with('[') => Ok(strings(items(values)?)),
-        (_, [value]) => Ok(Value::String(value.clone())),
+        (_, [value]) if STRING_CLAIMS.contains(&claim) => Ok(Value::String(value.clone())),
+        (_, [value]) => Ok(array(value).map_or_else(|| Value::String(value.clone()), strings)),
         _ => Err(ClaimError::Malformed),
     }
 }
@@ -147,29 +163,51 @@ fn integer(text: &str) -> Result<Value, ClaimError> {
 }
 
 /// The items of a multi-valued claim: each value a JSON array of strings, else a list
-/// split on commas and white space; empty items dropped.
+/// split on commas and white space; empty items dropped. A value beginning with `[` that
+/// is no JSON array of strings is malformed.
 fn items(values: &[String]) -> Result<Vec<String>, ClaimError> {
     let mut items = Vec::new();
     for value in values {
         if value.starts_with('[') {
-            let array: Vec<String> =
-                serde_json::from_str(value).map_err(|_| ClaimError::Malformed)?;
-            items.extend(
-                array
-                    .into_iter()
-                    .map(|item| item.trim().to_owned())
-                    .filter(|item| !item.is_empty()),
-            );
+            items.extend(array(value).ok_or(ClaimError::Malformed)?);
         } else {
-            items.extend(
-                value
-                    .split(|c: char| c == ',' || c.is_whitespace())
-                    .filter(|item| !item.is_empty())
-                    .map(str::to_owned),
-            );
+            items.extend(list(value));
         }
     }
     Ok(items)
+}
+
+/// The scopes of `scp`: as [`items`], but a value beginning with `[` that is no JSON array
+/// of strings is a plain list.
+fn scopes(values: &[String]) -> Vec<String> {
+    values
+        .iter()
+        .flat_map(|value| array(value).unwrap_or_else(|| list(value)))
+        .collect()
+}
+
+/// The trimmed, non-empty items of `value` if it is a JSON array of strings.
+fn array(value: &str) -> Option<Vec<String>> {
+    if !value.starts_with('[') {
+        return None;
+    }
+    let array: Vec<String> = serde_json::from_str(value).ok()?;
+    Some(
+        array
+            .into_iter()
+            .map(|item| item.trim().to_owned())
+            .filter(|item| !item.is_empty())
+            .collect(),
+    )
+}
+
+/// The items of `value` split on commas and white space, empty items dropped.
+fn list(value: &str) -> Vec<String> {
+    value
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|item| !item.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 fn strings(items: Vec<String>) -> Value {
@@ -358,6 +396,38 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn a_bracket_makes_an_array_only_of_claims_that_may_be_one() {
+        let name = "[EXT] Zo\u{eb}";
+        assert_eq!(
+            value(
+                &[("subject-token-encoded-claim-name", &STANDARD.encode(name))],
+                "name"
+            ),
+            name
+        );
+        assert_eq!(
+            value(&[("subject-token-claim-oid", r#"["a","b"]"#)], "oid"),
+            r#"["a","b"]"#
+        );
+        assert_eq!(
+            value(&[("subject-token-claim-custom", "[not json")], "custom"),
+            "[not json"
+        );
+        assert_eq!(
+            value(&[("subject-token-claim-custom", r#"[1, 2]"#)], "custom"),
+            "[1, 2]"
+        );
+        assert_eq!(
+            value(&[("Subject-Token-Claim-custom", r#"["a","b"]"#)], "custom"),
+            json!(["a", "b"])
+        );
+        assert_eq!(
+            value(&[("subject-token-claim-scp", "[not json")], "scp"),
+            "[not json"
+        );
     }
 
     #[test]

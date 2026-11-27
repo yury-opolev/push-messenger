@@ -114,7 +114,11 @@ impl Authenticator for EntraAppSignIn {
             .map_err(|error| match error {
                 EntraError::Rejected(reason) => AuthenticationError::Rejected(reason.as_str()),
                 EntraError::Unavailable(error) => {
-                    self.verifier.log_unavailable(&error, ENTRA_APP_PROVIDER);
+                    self.verifier.log_unavailable(
+                        &error,
+                        ENTRA_APP_PROVIDER,
+                        meta.request_id.as_deref(),
+                    );
                     AuthenticationError::Unavailable(error)
                 }
             })?;

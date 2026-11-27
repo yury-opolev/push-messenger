@@ -705,6 +705,7 @@ async fn a_validator_refusal_is_logged_as_rejected_with_the_validator_flag() {
 
 #[tokio::test]
 async fn an_unavailable_validator_fails_closed() {
+    capture_logs();
     let mut world = world(Offer::Entra).await;
     let validator = validator_mode(&mut world, false).await;
     for answer in [
@@ -720,6 +721,18 @@ async fn an_unavailable_validator_fails_closed() {
         );
     }
     assert_eq!(world.accounts().await, 0);
+    let logs = captured_logs();
+    for seen in validator.requests() {
+        let request_id = seen.header("x-request-id")[0].to_owned();
+        assert!(
+            logs.lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .any(|line| line["fields"]["message"]
+                    == "an Entra ID sign-in failed: the token validator is unavailable"
+                    && line["fields"]["request_id"] == request_id.as_str()),
+            "no unavailable warning naming {request_id}"
+        );
+    }
 }
 
 #[tokio::test]

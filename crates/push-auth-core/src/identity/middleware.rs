@@ -84,10 +84,11 @@ pub(crate) async fn identify(
         original_uri: Some(format!("{}{}", api.auth.public_url(), parts.uri.path())),
         method: Some(parts.method.as_str().to_owned()),
         client_ip: ip,
-        request_id: Some(Uuid::now_v7().to_string()),
+        // Only a validator hears a request id (in the correlation header, when enabled),
+        // so only validator mode makes one; its refusals always log it.
+        request_id: validator.then(|| Uuid::now_v7().to_string()),
     };
-    // Only a validator hears the request id, so only its refusals name it.
-    let request_id = meta.request_id.as_deref().filter(|_| validator);
+    let request_id = meta.request_id.as_deref();
     let principal = match authenticator.authenticate_with(&token, &meta).await {
         Ok(principal) => principal
             .checked(provider)

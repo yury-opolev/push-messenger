@@ -189,15 +189,8 @@ impl ValidatorSettings {
             Some(value) if value.is_empty() => None,
             Some(value) => {
                 let name = header_name(&value)
-                    .filter(|name| !RESERVED_HEADERS.contains(&name.as_str()))
-                    .ok_or_else(|| {
-                        invalid(
-                            CORRELATION_VARIABLE,
-                            &value,
-                            "must be a header name (an RFC 9110 token) that push-auth does \
-                             not set itself, or empty to send no request id",
-                        )
-                    })?;
+                    .filter(|name| !is_reserved(name, None))
+                    .ok_or_else(|| invalid(CORRELATION_VARIABLE, &value, CORRELATION_REASON))?;
                 Some(name)
             }
         };
@@ -216,19 +209,31 @@ impl ValidatorSettings {
         let encoded_claim_prefix = match raw(ENCODED_VARIABLE) {
             None => Some(DEFAULT_ENCODED_CLAIM_PREFIX.to_owned()),
             Some(value) if value.is_empty() => None,
-            Some(value) => {
-                let encoded = prefix(&value)
-                    .ok_or_else(|| invalid(ENCODED_VARIABLE, &value, prefix_reason))?;
-                if claim_prefix.starts_with(&encoded) {
-                    return Err(invalid(
-                        ENCODED_VARIABLE,
-                        &value,
-                        "must not begin every plain claim header's name",
-                    ));
-                }
-                Some(encoded)
-            }
+            Some(value) => Some(
+                prefix(&value).ok_or_else(|| invalid(ENCODED_VARIABLE, &value, prefix_reason))?,
+            ),
         };
+        if encoded_claim_prefix
+            .as_ref()
+            .is_some_and(|encoded| claim_prefix.starts_with(encoded.as_str()))
+        {
+            // The variable that was set is at fault; with both set, the encoded one.
+            return Err(match get(ENCODED_VARIABLE) {
+                Some(value) => invalid(
+                    ENCODED_VARIABLE,
+                    &value,
+                    "must not begin every plain claim header's name",
+                ),
+                None => invalid(
+                    PREFIX_VARIABLE,
+                    &get(PREFIX_VARIABLE).unwrap_or_else(|| claim_prefix.clone()),
+                    "must not begin with the encoded claim header prefix \
+                     (Subject-Token-Encoded-Claim- by default): set \
+                     PUSH_ENTRA_VALIDATOR_ENCODED_CLAIM_HEADER_PREFIX to another prefix, \
+                     or empty to read no encoded claims",
+                ),
+            });
+        }
         Ok(Some(Self {
             url,
             timeout,
@@ -316,19 +321,14 @@ fn request_headers(
         let header =
             header_name(name).ok_or_else(|| "a header name is not an RFC 9110 token".to_owned())?;
         let refused = |reason: &str| format!("header {name}: {reason}");
-        if RESERVED_HEADERS.contains(&header.as_str()) || correlation == Some(&header) {
+        if is_reserved(&header, correlation) {
             return Err(refused("push-auth sets this header itself"));
         }
         if headers.iter().any(|(known, _)| *known == header) {
             return Err(refused("given twice"));
         }
         let value = value.trim();
-        if value.is_empty()
-            || value.chars().count() > MAX_HEADER_VALUE_CHARS
-            || !value
-                .bytes()
-                .all(|byte| byte.is_ascii_graphic() || byte == b' ' || byte == b'\t')
-        {
+        if !is_header_value(value.as_bytes()) {
             return Err(refused(
                 "the value must be 1 to 1024 visible ASCII characters, spaces or tabs",
             ));
@@ -358,23 +358,83 @@ impl<'de> Visitor<'de> for Entries {
     }
 }
 
-/// The validator endpoint, or whether the value may be shown and why it is refused.
+/// The validator endpoint, or whether the value may be shown and why it is refused. A
+/// value with user info or a query (which may hold a key) is never shown.
 fn validator_url(value: &str) -> Result<String, (bool, &'static str)> {
-    const REASON: &str = "must be an https:// URL (http:// only for a loopback host: \
+    let shown = !value.contains(['@', '?']);
+    check_url(value).map_err(|reason| (shown, reason))
+}
+
+const URL_REASON: &str = "must be an https:// URL (http:// only for a loopback host: \
                           127.0.0.1, [::1], localhost), without user info or fragment";
-    let url = Url::parse(value).map_err(|_| (!value.contains('@'), REASON))?;
-    if !url.username().is_empty() || url.password().is_some() {
-        return Err((false, REASON));
-    }
+
+/// `value` as a validator endpoint, or why it is refused (never showing it).
+fn check_url(value: &str) -> Result<String, &'static str> {
+    let url = Url::parse(value).map_err(|_| URL_REASON)?;
     let scheme_ok = match url.scheme() {
         "https" => true,
         "http" => is_loopback(&url),
         _ => false,
     };
-    if !scheme_ok || url.host_str().is_none() || url.fragment().is_some() {
-        return Err((true, REASON));
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || !scheme_ok
+        || url.host_str().is_none()
+        || url.fragment().is_some()
+    {
+        return Err(URL_REASON);
     }
     Ok(url.to_string())
+}
+
+/// Whether push-auth sets the header `name` itself, the correlation header included.
+fn is_reserved(name: &HeaderName, correlation: Option<&HeaderName>) -> bool {
+    RESERVED_HEADERS.contains(&name.as_str()) || correlation == Some(name)
+}
+
+/// Whether `value` is a static request header value: 1 to 1024 characters of visible
+/// ASCII with inner spaces or tabs.
+fn is_header_value(value: &[u8]) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_HEADER_VALUE_CHARS
+        && value.trim_ascii() == value
+        && value
+            .iter()
+            .all(|byte| byte.is_ascii_graphic() || *byte == b' ' || *byte == b'\t')
+}
+
+const CORRELATION_REASON: &str = "must be a header name (an RFC 9110 token) that push-auth \
+                                  does not set itself, or empty to send no request id";
+
+/// Why settings built in code cannot be used, as their variables would be refused; never
+/// showing a value.
+pub(super) fn check_settings(settings: &ValidatorSettings) -> Result<(), String> {
+    check_url(&settings.url).map_err(|reason| format!("the token validator URL {reason}"))?;
+    let correlation = settings.correlation_header.as_ref();
+    if correlation.is_some_and(|name| is_reserved(name, None)) {
+        return Err(format!(
+            "the token validator's correlation header {CORRELATION_REASON}"
+        ));
+    }
+    let headers = &settings.request_headers;
+    let refused =
+        |reason: String| format!("the token validator's static request headers: {reason}");
+    if headers.len() > MAX_REQUEST_HEADERS {
+        return Err(refused(format!("at most {MAX_REQUEST_HEADERS} headers")));
+    }
+    for (index, (name, value)) in headers.iter().enumerate() {
+        let reason = if is_reserved(name, correlation) {
+            "push-auth sets this header itself"
+        } else if headers[..index].iter().any(|(known, _)| known == name) {
+            "given twice"
+        } else if !is_header_value(value.as_bytes()) {
+            "the value must be 1 to 1024 visible ASCII characters, spaces or tabs"
+        } else {
+            continue;
+        };
+        return Err(refused(format!("header {name}: {reason}")));
+    }
+    Ok(())
 }
 
 pub(super) fn is_loopback(url: &Url) -> bool {
@@ -498,6 +558,18 @@ mod tests {
         assert!(!shown.contains("p@") && !shown.contains("u:p"), "{shown}");
         assert!(shown.contains("<redacted>"), "{shown}");
         refused_as(&[(URL, "https://user@h.example/")], URL);
+        for query in [
+            "https://h.example/check?key=s3cret#f",
+            "http://validator.example/?key=s3cret",
+            "not a url?key=s3cret",
+        ] {
+            let error = refused_as(&[(URL, query)], URL);
+            let shown = format!("{error} {error:?}");
+            assert!(
+                !shown.contains("s3cret") && shown.contains("<redacted>"),
+                "{shown}"
+            );
+        }
     }
 
     #[test]
@@ -769,6 +841,14 @@ mod tests {
         refused_hiding(&[(ENCODED, "X:Claim")], ENCODED, "\u{0}");
         // Every plain claim header would be taken for an encoded one.
         refused_hiding(&[(PREFIX, "X-Claim-"), (ENCODED, "x-")], ENCODED, "\u{0}");
+        // The default encoded prefix counts too.
+        refused_hiding(
+            &[(PREFIX, "Subject-Token-Encoded-Claim-X-")],
+            PREFIX,
+            "\u{0}",
+        );
+        let found = with_url(&[(PREFIX, "Subject-Token-Encoded-Claim-X-"), (ENCODED, "")]);
+        assert_eq!(found.claim_prefix, "subject-token-encoded-claim-x-");
     }
 
     #[test]

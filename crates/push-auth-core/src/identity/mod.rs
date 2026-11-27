@@ -83,7 +83,9 @@ pub struct RequestMeta {
     pub method: Option<String>,
     /// The client's address, as the rate limits see it.
     pub client_ip: Option<IpAddr>,
-    /// This sign-in attempt's id, fresh for each attempt.
+    /// This sign-in attempt's id, fresh for each attempt; set only when an external token
+    /// validator checks the route's tokens. It is sent in the correlation header, when
+    /// enabled, and always logged on refusals in validator mode.
     pub request_id: Option<String>,
 }
 

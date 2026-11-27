@@ -421,3 +421,22 @@ async fn external_sign_ins_are_logged_without_tokens_subjects_names_or_addresses
         assert!(!text.contains(secret), "the log holds {secret}");
     }
 }
+
+#[tokio::test]
+async fn an_authenticator_without_a_validator_hears_no_request_id() {
+    let acme = FakeIdentity::new("acme");
+    let world = world_with(Offer::Password, Some(acme.clone()), None).await;
+    let token = fake_token(ISSUER, "s-meta", "", "");
+    let answer = with_body(&world, "/v1/auth/acme", json!({"token": token})).await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.json);
+    let meta = acme.meta.lock().unwrap().clone().unwrap();
+    assert_eq!(meta.request_id, None);
+    assert_eq!(meta.method.as_deref(), Some("POST"));
+    assert_eq!(meta.client_ip, "198.51.100.7".parse().ok());
+    assert!(
+        meta.original_uri
+            .as_deref()
+            .is_some_and(|uri| uri.ends_with("/v1/auth/acme")),
+        "{meta:?}"
+    );
+}

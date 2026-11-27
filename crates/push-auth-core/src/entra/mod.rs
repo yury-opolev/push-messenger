@@ -225,8 +225,9 @@ impl EntraSignIn {
         self.uses_validator().then_some(true)
     }
 
-    /// Logs that no identity could be checked, without the token.
-    fn log_unavailable(&self, error: &str, provider: &str) {
+    /// Logs that no identity could be checked, without the token; in validator mode with
+    /// the attempt's `request_id`, when known.
+    fn log_unavailable(&self, error: &str, provider: &str, request_id: Option<&str>) {
         match (self.uses_validator(), provider) {
             (false, ENTRA_PROVIDER) => {
                 tracing::warn!(%error, "an Entra ID sign-in failed: no usable signing keys");
@@ -236,10 +237,12 @@ impl EntraSignIn {
             }
             (true, ENTRA_PROVIDER) => tracing::warn!(
                 %error,
+                request_id,
                 "an Entra ID sign-in failed: the token validator is unavailable"
             ),
             (true, _) => tracing::warn!(
                 %error,
+                request_id,
                 "an Entra app sign-in failed: the token validator is unavailable"
             ),
         }
@@ -277,7 +280,9 @@ impl EntraSignIn {
                 validator = self.validator_flag(),
                 "an Entra ID access token was refused"
             ),
-            Err(EntraError::Unavailable(error)) => self.log_unavailable(error, ENTRA_PROVIDER),
+            Err(EntraError::Unavailable(error)) => {
+                self.log_unavailable(error, ENTRA_PROVIDER, None);
+            }
             Ok(_) => {}
         }
         checked
@@ -414,7 +419,7 @@ impl Authenticator for EntraSignIn {
                 Err(AuthenticationError::Rejected(reason.as_str()))
             }
             Err(EntraError::Unavailable(error)) => {
-                self.log_unavailable(&error, ENTRA_PROVIDER);
+                self.log_unavailable(&error, ENTRA_PROVIDER, meta.request_id.as_deref());
                 Err(AuthenticationError::Unavailable(error))
             }
         }
@@ -1201,6 +1206,7 @@ mod tests {
         assert_carries_the_metadata(seen, &token);
         assert_eq!(seen.body, "");
         assert_eq!(seen.content_length.as_deref(), Some("0"));
+        assert_eq!(seen.header("content-length"), ["0"]);
         assert_eq!(seen.content_type, None);
         assert_eq!(single(seen, "transfer-encoding"), None);
         assert_eq!(single(seen, "return-all-subject-token-claims"), Some("1"));
@@ -1243,11 +1249,15 @@ mod tests {
         let claims = changed(openid.user_claims(TENANT, USER), "name", json!(name));
         let identity = entra.verify(&sign(KEY_A, &claims)).await.unwrap();
         assert_eq!(identity.name.as_deref(), Some(name));
+        let name = "[EXT] Zo\u{eb}";
+        let claims = changed(openid.user_claims(TENANT, USER), "name", json!(name));
+        let identity = entra.verify(&sign(KEY_A, &claims)).await.unwrap();
+        assert_eq!(identity.name.as_deref(), Some(name));
         // A validator may omit nbf and iat.
         let short = without(without(openid.user_claims(TENANT, USER), "nbf"), "iat");
         validator.set_answer(headers_answer(&short));
         assert!(entra.verify(&token).await.is_ok());
-        assert_eq!(validator.requests().len(), 3, "one request per sign-in");
+        assert_eq!(validator.requests().len(), 4, "one request per sign-in");
     }
 
     #[tokio::test]
