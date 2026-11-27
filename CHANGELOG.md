@@ -65,6 +65,26 @@ Notable changes for consumers of push-messenger. Newest first.
 
 ### Added
 
+- **External token validator for the Entra ID providers** (opt-in;
+  [design](docs/superpowers/specs/2026-11-27-entra-external-validator-design.md),
+  [guide](docs/entra-sign-in.md#external-token-validator)). For organizations that mandate
+  their own token validation library or sidecar: with `PUSH_ENTRA_VALIDATOR_URL` set,
+  auth-svc keeps its local pre-checks (size, segments, `alg` RS256 and `kid`, admitted
+  `tid`, issuer), then POSTs `{"provider": "entra"|"entra-app"}` with the token as
+  `Authorization: Bearer` to the validator instead of fetching Entra ID's keys, re-checks
+  the returned claims (schema, `tid`/`oid` match, tenant, issuer, audience, `exp`/`nbf`)
+  and applies its unchanged policy, accounts and sessions, so a validator can only narrow
+  who signs in. A 401 maps to the named reason or the new reason `validator`; any other
+  answer, a timeout or a body over 16 KiB fails closed with 503 (no fallback to built-in
+  keys, no caching). Refusals log `validator: true` on `auth.entra.rejected` /
+  `auth.external.rejected`; the token is never logged. New variables
+  `PUSH_ENTRA_VALIDATOR_URL` (`https://`, or `http://` to a loopback host),
+  `PUSH_ENTRA_VALIDATOR_TIMEOUT_MS` (100–10000, default 2000) and
+  `PUSH_ENTRA_VALIDATOR_SECRET_FILE` (sent as `X-Push-Validator-Secret`). Chart:
+  `auth.signIn.entra.validator.url|timeoutMs|secretFile` and generic
+  `auth.extraContainers`, `auth.extraVolumes`, `auth.extraVolumeMounts` for a sidecar.
+  Unset, behaviour, logs and chart output are unchanged.
+
 - **Proactive agents**
   ([design](docs/superpowers/specs/2026-11-09-proactive-agents.md)): an owned agent may
   start actions on its own, under its owner's control.

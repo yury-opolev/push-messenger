@@ -221,6 +221,7 @@ as to any other: MFA, compliant devices, named locations.
 | `PUSH_ENTRA_REQUIRED_ROLE` | optional app role value |
 | `PUSH_ENTRA_ALLOWED_CLIENT_APPS` | optional client app ids |
 | `PUSH_ENTRA_MAX_SESSION_HOURS` | `24` (default), 1 to 720 |
+| `PUSH_ENTRA_VALIDATOR_URL` | optional: delegate signature checks to your own validator ([External token validator](#external-token-validator)) |
 
 And for the worker in Entra-only mode: `PUSH_EMAIL_SENDER=none`.
 
@@ -445,6 +446,9 @@ auth-svc logs every refused token as `auth.entra.rejected` with a reason (never 
 | `role` / `client_app` | the user lacks the app role / the client app is not allowed |
 | `expired`, `not_yet_valid` | clock skew over 60 s, or a stale token: get a new one |
 | `signature` | a key auth-svc cannot find, or custom signing keys on the API registration |
+| `validator` | the [external token validator](#external-token-validator) refused the token without naming a known reason |
+
+With an external token validator, refusals also carry `validator: true`.
 
 ## 9. Acceptance on your tenant
 
@@ -461,6 +465,247 @@ auth-svc logs every refused token as `auth.entra.rejected` with a reason (never 
 9. The admin API signs a test user out: their apps report `DeviceRemoved` within seconds.
 10. Switching a test installation from `password,entra` to `entra`: every password device is
     signed out at start-up (`auth.password_sessions.revoked` in the log); Entra users are not.
+
+## External token validator
+
+Some organizations require every service that accepts their Entra ID tokens to validate
+them with an organization-mandated library or sidecar (central key discovery, token
+revocation, protocol hardening, compliance telemetry), usually not available for Rust.
+Instead of writing [your own wrapper](#your-own-wrapper), set `PUSH_ENTRA_VALIDATOR_URL`:
+auth-svc then sends each `entra` and `entra-app` token to that validator over HTTP for the
+signature and protocol checks, and keeps everything else. It is opt-in: with the variable
+unset nothing changes (no request, no log line, no chart output). `password`,
+`agent-key` and `external` are not affected. Design:
+[spec 2026-11-27](superpowers/specs/2026-11-27-entra-external-validator-design.md).
+
+**What moves and what stays.** The validator replaces only the key lookup and the
+signature check: auth-svc fetches no OpenID metadata or keys at all (nothing at start-up,
+no key cache), the validator owns key discovery. auth-svc keeps:
+
+- its local **pre-checks**, before the validator is asked: at most 8 KiB, three segments,
+  a header with `alg` `RS256` and a `kid` (1 to 128 characters), an unverified `tid`
+  admitted by `PUSH_ENTRA_ALLOWED_TENANTS`, an unverified `iss` equal to that tenant's
+  v2.0 issuer, and a non-empty base64url signature segment (only such a token can travel
+  in an `Authorization` header). A token that fails them never reaches the validator;
+- the **defensive re-checks** of the claims the validator returns (below);
+- the whole **policy** (`version`, `app_only`, `scope`, `role`, `client_app`, `subject`),
+  account mapping, admissions, sessions, rate limits and the security log, exactly as with
+  built-in validation.
+
+### Configuration
+
+Read only when `PUSH_AUTH_PROVIDERS` names `entra` or `entra-app`. An invalid value stops
+auth-svc at start-up with a message naming the variable (never the secret, nor a URL with
+user info).
+
+| Variable | Meaning | Default |
+|---|---|---|
+| `PUSH_ENTRA_VALIDATOR_URL` | The validator endpoint: `https://` anywhere, or `http://` only to a loopback host (`127.0.0.1`, `[::1]`, `localhost`), i.e. a sidecar in the same pod. A path and query are allowed; user info and a fragment are refused. Unset or empty: built-in validation | unset |
+| `PUSH_ENTRA_VALIDATOR_TIMEOUT_MS` | Time limit of the whole request, connecting included: a whole number from 100 to 10000 | `2000` |
+| `PUSH_ENTRA_VALIDATOR_SECRET_FILE` | Path of a file whose trimmed content is sent as `X-Push-Validator-Secret`; read once at start-up; must hold 1 to 1024 visible ASCII characters (no spaces). Unset: no secret header | unset |
+
+`PUSH_ENTRA_VALIDATOR_TIMEOUT_MS` or `PUSH_ENTRA_VALIDATOR_SECRET_FILE` without a URL is
+refused too ("set only with PUSH_ENTRA_VALIDATOR_URL"), rather than silently ignored.
+
+### Request
+
+One request per sign-in, no retries, no redirects followed:
+
+```http
+POST <PUSH_ENTRA_VALIDATOR_URL>
+Authorization: Bearer <the presented access token, unchanged>
+Content-Type: application/json
+Accept: application/json
+X-Push-Validator-Secret: <secret>          (only with PUSH_ENTRA_VALIDATOR_SECRET_FILE)
+
+{"provider": "entra"}                       (or "entra-app")
+```
+
+The token is only in the `Authorization` header, never in the body or the URL. `provider`
+lets the validator apply its own token-type rules (delegated or app-only); auth-svc
+enforces its own anyway. No request id header is sent. A loopback URL bypasses
+`HTTPS_PROXY` (a pod's proxy must not catch the sidecar); an `https://` validator elsewhere
+is reached like Entra ID, through the proxy variables (`NO_PROXY` applies) and with
+auth-svc's CA roots.
+
+### Response
+
+**200 OK**: the token is valid. The body (its `Content-Type` is not checked) carries the
+validated token's payload as it is; the validator copies the claims, it does not invent or
+rename them:
+
+```json
+{
+  "claims": {
+    "ver": "2.0",
+    "iss": "https://login.microsoftonline.com/<tid>/v2.0",
+    "aud": "<one of PUSH_ENTRA_CLIENT_ID>",
+    "tid": "<guid>",
+    "oid": "<guid>",
+    "sub": "<string>",
+    "azp": "<guid>",
+    "appid": "<guid>",
+    "scp": "access_as_user",
+    "roles": ["..."],
+    "idtyp": "user | app",
+    "exp": 1767225600,
+    "nbf": 1767222000,
+    "iat": 1767222000,
+    "name": "...",
+    "preferred_username": "...",
+    "email": "..."
+  }
+}
+```
+
+Its JSON schema (draft 2020-12); other claims are allowed and kept:
+
+```json
+{
+  "type": "object",
+  "required": ["claims"],
+  "properties": {
+    "claims": {
+      "type": "object",
+      "required": ["ver", "iss", "aud", "tid", "oid", "exp"],
+      "properties": {
+        "ver": {"type": "string"},
+        "iss": {"type": "string"},
+        "aud": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
+        "tid": {"type": "string"},
+        "oid": {"type": "string"},
+        "sub": {"type": "string"},
+        "azp": {"type": "string"},
+        "appid": {"type": "string"},
+        "scp": {"type": "string"},
+        "roles": {"type": "array", "items": {"type": "string"}},
+        "idtyp": {"type": "string"},
+        "exp": {"type": "integer"},
+        "nbf": {"type": "integer"},
+        "iat": {"type": "integer"},
+        "name": {"type": "string"},
+        "preferred_username": {"type": "string"},
+        "email": {"type": "string"}
+      },
+      "additionalProperties": true
+    }
+  }
+}
+```
+
+**401 Unauthorized**: the token is rejected. An optional body
+`{"error": "invalid_token", "reason": "<reason>"}` names one of auth-svc's reasons:
+`malformed`, `algorithm`, `tenant`, `issuer`, `signature`, `audience`, `expired`,
+`not_yet_valid`, `version`, `app_only`, `scope`, `role`, `client_app`, `subject`. No body,
+another body or an unknown reason gives the reason `validator`. The client hears the usual
+refusal: 401 `entra_token_invalid` for `entra`, 401 `token_invalid` for `entra-app`.
+
+**Anything else** is "unavailable": every other status (3xx, 400, 403 such as a wrong
+shared secret, 404, 5xx), a timeout, a connection error, a body (of a 200 or a 401) over
+16 KiB, or a 200 whose body is not JSON. Sign-in answers 503: `entra_unavailable` for
+`entra`, `identity_unavailable` for `entra-app`, as when Entra ID's keys cannot be fetched
+today.
+
+### Re-checks of the returned claims
+
+A validator can only narrow who signs in. After a 200, auth-svc checks, in this order:
+
+| Check | Reason when it fails |
+|---|---|
+| the body has a `claims` object of the schema above (required claims present, every listed claim of its JSON type; `null` is no string) | `malformed` |
+| `tid` and `oid` equal the presented token's own (unverified) `tid` and `oid`, which must be present | `malformed` |
+| `tid` is the token's tenant and admitted by `PUSH_ENTRA_ALLOWED_TENANTS` | `tenant` |
+| `iss` equals that tenant's v2.0 issuer | `issuer` |
+| `aud` (a string or an array) contains a value of `PUSH_ENTRA_CLIENT_ID` | `audience` |
+| `exp` is not more than 60 s in the past | `expired` |
+| `nbf`, when present (it is optional), is not more than 60 s in the future | `not_yet_valid` |
+
+Then the claims go through exactly the same deserialization (a claim of the wrong type is
+`malformed`) and the same policy as built-in validation, and the returned `claims` object
+becomes the principal's verified claims.
+
+### Failures, caching and logs
+
+- **Fail closed.** With a validator configured, auth-svc never falls back to built-in
+  validation, whatever the validator answers.
+- **No caching.** auth-svc caches neither results nor failures; every sign-in calls the
+  validator exactly once (the validator may cache keys and metadata itself).
+- **Logs.** Refusals keep their events and reasons and add `validator: true`:
+  `auth.entra.rejected` for `entra`, `auth.external.rejected` (provider `entra-app`) for
+  `entra-app`. Without a validator the field is absent, so built-in log lines are
+  unchanged. Unavailability is logged as "the token validator is unavailable" with the
+  HTTP status or the error kind only (timed out, could not be reached, request failed,
+  larger than 16 KiB, not JSON). The token, the secret and the validator's answer are
+  never logged.
+
+### Security considerations
+
+- Plain `http://` only on loopback, i.e. inside the pod; anything off the pod must use
+  `https://`. The shared secret (from a file, such as a mounted Secret) is defense in
+  depth: the validator must compare it in constant time and answer 403 (unavailable to
+  auth-svc) when it is wrong. Every answer is size-limited to 16 KiB before parsing.
+- The validator is trusted for the signature: it is part of auth-svc's trusted computing
+  base. Run it in the same pod, from a pinned image, with as few privileges as auth-svc.
+- Because tenant, issuer, audience, lifetime and the full policy are applied again, a
+  misconfigured validator cannot widen who may sign in beyond what `PUSH_ENTRA_*` allows;
+  it can only narrow it (or make sign-in unavailable).
+
+### With the Helm chart
+
+`auth.signIn.entra.validator.url`, `.timeoutMs` and `.secretFile` set the variables (only
+with an Entra provider and a URL). `auth.extraContainers`, `auth.extraVolumes` and
+`auth.extraVolumeMounts` are rendered verbatim into the auth Deployment (after the auth
+container, into the pod's volumes and into the auth container's mounts). The chart refuses
+an `http://` URL to a non-loopback host, a `timeoutMs` outside 100 to 10000, a relative
+`secretFile` and extras that are not lists. It does not harden extra containers: set
+their `securityContext` and `resources` yourself.
+
+```yaml
+auth:
+  signIn:
+    providers: entra,entra-app
+    entra:
+      clientIds: [11111111-0000-4000-8000-000000000001]
+      tenants: [33333333-0000-4000-8000-000000000003]
+      validator:
+        url: http://127.0.0.1:8099/validate
+        timeoutMs: 2000
+        secretFile: /etc/push/validator/secret
+  extraVolumes:
+    - name: validator-secret
+      secret:
+        secretName: push-token-validator     # yours; key "secret"
+        defaultMode: 0444                    # auth-svc runs as 65532, without fsGroup
+  extraVolumeMounts:                         # into the auth container
+    - name: validator-secret
+      mountPath: /etc/push/validator
+      readOnly: true
+  extraContainers:
+    - name: token-validator
+      image: registry.example.com/org/token-validator:1.2.3@sha256:<digest>  # pinned
+      args: [--listen=127.0.0.1:8099, --secret-file=/etc/validator/secret]
+      volumeMounts:
+        - name: validator-secret
+          mountPath: /etc/validator
+          readOnly: true
+      securityContext:
+        runAsNonRoot: true
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities: {drop: [ALL]}
+        seccompProfile: {type: RuntimeDefault}
+      resources:
+        requests: {cpu: 50m, memory: 64Mi}
+        limits: {cpu: 500m, memory: 256Mi}
+```
+
+The sidecar's flags are your validator's own; it should listen on loopback only, so no
+Service or ingress rule reaches it. Both containers read the same mounted Secret.
+
+**Network policy.** Unchanged: the sidecar shares the pod's network and so its egress
+rules. It needs the same Entra ID egress that built-in validation needs
+([Network](#7-network): `networkPolicy.egress.entraSignInCidrs`, a proxy, or your own
+rules), plus whatever else your validator calls.
 
 ## Your own wrapper
 
