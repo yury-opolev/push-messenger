@@ -9,6 +9,7 @@ mod keys;
 mod settings;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
+mod validator;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,6 +31,8 @@ pub use settings::{
     CONSUMERS_TENANT, DEFAULT_AUTHORITY_HOST, DEFAULT_REQUIRED_SCOPE, EntraSettings, Providers,
     Tenants,
 };
+use validator::ProviderKind;
+pub use validator::{MAX_VALIDATOR_BODY, ValidatorSettings};
 
 /// Why a token was refused. Logged by name; the client only ever hears
 /// `entra_token_invalid`.
@@ -49,9 +52,34 @@ pub enum Reason {
     Role,
     ClientApp,
     Subject,
+    /// The external token validator refused the token without a known reason.
+    Validator,
 }
 
 impl Reason {
+    const ALL: [Reason; 15] = [
+        Self::Malformed,
+        Self::Algorithm,
+        Self::Tenant,
+        Self::Issuer,
+        Self::Signature,
+        Self::Audience,
+        Self::Expired,
+        Self::NotYetValid,
+        Self::Version,
+        Self::AppOnly,
+        Self::Scope,
+        Self::Role,
+        Self::ClientApp,
+        Self::Subject,
+        Self::Validator,
+    ];
+
+    /// The reason named `name` in the security log, if there is one.
+    pub fn from_name(name: &str) -> Option<Reason> {
+        Self::ALL.into_iter().find(|reason| reason.as_str() == name)
+    }
+
     /// The name in the security log.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -69,6 +97,7 @@ impl Reason {
             Self::Role => "role",
             Self::ClientApp => "client_app",
             Self::Subject => "subject",
+            Self::Validator => "validator",
         }
     }
 }
@@ -129,11 +158,15 @@ pub const LEEWAY_SECONDS: u64 = 60;
 
 /// Checks Entra ID access tokens for this API (spec D2): RS256 with a published key of
 /// the key source of an admitted tenant, the v2.0 issuer of the token's own tenant, a configured audience, `exp`/`nbf`
-/// within 60 s, then the claim rules.
+/// within 60 s, then the claim rules. With an external token validator configured, the
+/// validator checks the signature instead and its claims are checked again; no keys are
+/// fetched then.
 #[derive(Clone)]
 pub struct EntraSignIn {
     settings: Arc<EntraSettings>,
-    keys: Arc<keys::KeySets>,
+    /// The published keys: set exactly when there is no validator.
+    keys: Option<Arc<keys::KeySets>>,
+    validator: Option<Arc<validator::Validator>>,
 }
 
 impl std::fmt::Debug for EntraSignIn {
@@ -162,6 +195,9 @@ struct Unverified {
     tid: Option<String>,
     #[serde(default)]
     iss: Option<String>,
+    /// Any JSON type: only a string can match the validator's `oid`.
+    #[serde(default)]
+    oid: Option<Value>,
 }
 
 impl EntraSignIn {
@@ -171,11 +207,45 @@ impl EntraSignIn {
 
     /// As [`EntraSignIn::new`] with other key timings (tests).
     pub fn with_timing(settings: EntraSettings, timing: KeyTiming) -> Result<Self, String> {
-        let keys = keys::KeySets::new(&settings, timing)?;
+        let (keys, validator) = match &settings.validator {
+            Some(validator) => (None, Some(Arc::new(validator::Validator::new(validator)?))),
+            None => (Some(Arc::new(keys::KeySets::new(&settings, timing)?)), None),
+        };
         Ok(Self {
             settings: Arc::new(settings),
-            keys: Arc::new(keys),
+            keys,
+            validator,
         })
+    }
+
+    /// Whether an external token validator checks the tokens.
+    pub fn uses_validator(&self) -> bool {
+        self.validator.is_some()
+    }
+
+    /// The security log's `validator` field: `true` in validator mode, absent otherwise.
+    fn validator_flag(&self) -> Option<bool> {
+        self.uses_validator().then_some(true)
+    }
+
+    /// Logs that no identity could be checked, without the token.
+    fn log_unavailable(&self, error: &str, provider: &str) {
+        match (self.uses_validator(), provider) {
+            (false, ENTRA_PROVIDER) => {
+                tracing::warn!(%error, "an Entra ID sign-in failed: no usable signing keys");
+            }
+            (false, _) => {
+                tracing::warn!(%error, "an Entra app sign-in failed: no usable signing keys");
+            }
+            (true, ENTRA_PROVIDER) => tracing::warn!(
+                %error,
+                "an Entra ID sign-in failed: the token validator is unavailable"
+            ),
+            (true, _) => tracing::warn!(
+                %error,
+                "an Entra app sign-in failed: the token validator is unavailable"
+            ),
+        }
     }
 
     pub fn settings(&self) -> &EntraSettings {
@@ -187,9 +257,12 @@ impl EntraSignIn {
         self.settings.max_session
     }
 
-    /// Fetches every allowed tenant's keys once; failures are logged.
+    /// Fetches every allowed tenant's keys once; failures are logged. Does nothing with a
+    /// token validator: it owns key discovery.
     pub async fn warm(&self) {
-        self.keys.warm().await;
+        if let Some(keys) = &self.keys {
+            keys.warm().await;
+        }
     }
 
     /// The user `token` names, if it is an acceptable access token for this API. A
@@ -201,11 +274,10 @@ impl EntraSignIn {
                 target: "security",
                 event = "auth.entra.rejected",
                 reason = reason.as_str(),
+                validator = self.validator_flag(),
                 "an Entra ID access token was refused"
             ),
-            Err(EntraError::Unavailable(error)) => {
-                tracing::warn!(%error, "an Entra ID sign-in failed: no usable signing keys");
-            }
+            Err(EntraError::Unavailable(error)) => self.log_unavailable(error, ENTRA_PROVIDER),
             Ok(_) => {}
         }
         checked
@@ -213,7 +285,7 @@ impl EntraSignIn {
 
     /// The identity of an acceptable token, and the token's whole verified payload.
     async fn check(&self, token: &str) -> Result<(EntraIdentity, Map<String, Value>), EntraError> {
-        let (claims, tenant, payload) = self.verified(token).await?;
+        let (claims, tenant, payload) = self.verified(token, ProviderKind::User).await?;
         let identity =
             claims::check(&claims, tenant, &self.settings).map_err(EntraError::Rejected)?;
         Ok((identity, payload))
@@ -223,6 +295,7 @@ impl EntraSignIn {
     async fn verified(
         &self,
         token: &str,
+        kind: ProviderKind,
     ) -> Result<(claims::EntraClaims, Uuid, Map<String, Value>), EntraError> {
         let malformed = EntraError::Rejected(Reason::Malformed);
         let parts: Vec<&str> = token.split('.').collect();
@@ -248,20 +321,37 @@ impl EntraSignIn {
         if unverified.iss.as_deref() != Some(issuer.as_str()) {
             return Err(EntraError::Rejected(Reason::Issuer));
         }
-        let key = self
-            .keys
-            .key(tenant, &kid)
-            .await?
-            .ok_or(EntraError::Rejected(Reason::Signature))?;
-        let mut validation = Validation::new(Algorithm::RS256);
-        validation.set_issuer(&[issuer.as_str()]);
-        validation.set_audience(&self.settings.audiences);
-        validation.set_required_spec_claims(&["exp", "nbf", "iss", "aud"]);
-        validation.validate_nbf = true;
-        validation.leeway = LEEWAY_SECONDS;
-        let payload = jsonwebtoken::decode::<Map<String, Value>>(token, &key, &validation)
-            .map_err(|error| EntraError::Rejected(reason_of(&error)))?
-            .claims;
+        let payload = match (&self.validator, &self.keys) {
+            (Some(validator), _) => {
+                let payload = validator.check(token, kind).await?;
+                validator::recheck(
+                    &payload,
+                    unverified.tid.as_deref(),
+                    unverified.oid.as_ref().and_then(Value::as_str),
+                    tenant,
+                    &self.settings,
+                    crate::service::unix_now(),
+                )
+                .map_err(EntraError::Rejected)?;
+                payload
+            }
+            (None, Some(keys)) => {
+                let key = keys
+                    .key(tenant, &kid)
+                    .await?
+                    .ok_or(EntraError::Rejected(Reason::Signature))?;
+                let mut validation = Validation::new(Algorithm::RS256);
+                validation.set_issuer(&[issuer.as_str()]);
+                validation.set_audience(&self.settings.audiences);
+                validation.set_required_spec_claims(&["exp", "nbf", "iss", "aud"]);
+                validation.validate_nbf = true;
+                validation.leeway = LEEWAY_SECONDS;
+                jsonwebtoken::decode::<Map<String, Value>>(token, &key, &validation)
+                    .map_err(|error| EntraError::Rejected(reason_of(&error)))?
+                    .claims
+            }
+            (None, None) => unreachable!("an Entra verifier has keys or a validator"),
+        };
         // A claim of the wrong JSON type makes the whole token malformed, as before.
         let claims: claims::EntraClaims = serde_json::from_value(Value::Object(payload.clone()))
             .map_err(|_| EntraError::Rejected(Reason::Malformed))?;
@@ -288,14 +378,14 @@ impl Authenticator for EntraSignIn {
                 Err(AuthenticationError::Rejected(reason.as_str()))
             }
             Err(EntraError::Unavailable(error)) => {
-                tracing::warn!(%error, "an Entra ID sign-in failed: no usable signing keys");
+                self.log_unavailable(&error, ENTRA_PROVIDER);
                 Err(AuthenticationError::Unavailable(error))
             }
         }
     }
 
     async fn warm(&self) {
-        self.keys.warm().await;
+        EntraSignIn::warm(self).await;
     }
 }
 
@@ -326,8 +416,8 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::testing::{
-        CLIENT_APP, KEY_A, KEY_B, OTHER_TENANT, StubOpenId, TENANT, sign, sign_as, unix_now,
-        with_algorithm,
+        API_CLIENT_ID, CLIENT_APP, KEY_A, KEY_B, OTHER_TENANT, StubOpenId, StubValidator, TENANT,
+        ValidatorAnswer, refused_url, sign, sign_as, unix_now, with_algorithm,
     };
     use super::*;
 
@@ -630,5 +720,259 @@ mod tests {
                 );
             }
         }
+    }
+
+    async fn validated() -> (StubOpenId, StubValidator, EntraSignIn) {
+        let openid = StubOpenId::start().await;
+        let validator = StubValidator::start().await;
+        let entra = EntraSignIn::new(validator.settings_for(&openid)).unwrap();
+        (openid, validator, entra)
+    }
+
+    #[test]
+    fn every_reason_is_found_by_its_name() {
+        for reason in Reason::ALL {
+            assert_eq!(Reason::from_name(reason.as_str()), Some(reason));
+        }
+        assert_eq!(Reason::Validator.as_str(), "validator");
+        assert_eq!(
+            Reason::from_name("not_yet_valid"),
+            Some(Reason::NotYetValid)
+        );
+        assert_eq!(Reason::from_name("bogus"), None);
+        assert_eq!(Reason::from_name("Signature"), None);
+    }
+
+    #[tokio::test]
+    async fn without_a_validator_url_no_validator_is_asked() {
+        let (openid, entra) = verifier().await;
+        let validator = StubValidator::start().await;
+        assert!(!entra.uses_validator());
+        assert!(entra.verify(&openid.token(USER)).await.is_ok());
+        assert!(validator.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_validated_delegated_token_gives_the_built_in_principal() {
+        use crate::identity::Authenticator;
+
+        let (openid, validator, entra) = validated().await;
+        assert!(entra.uses_validator());
+        let token = openid.token(USER);
+        let checked = Authenticator::authenticate(&entra, &token).await.unwrap();
+        assert_eq!((openid.metadata_fetches(), openid.jwks_fetches()), (0, 0));
+        assert_eq!(validator.requests().len(), 1);
+        let built_in = EntraSignIn::with_timing(openid.settings(), quick()).unwrap();
+        let expected = Authenticator::authenticate(&built_in, &token)
+            .await
+            .unwrap();
+        assert!(checked == expected, "{checked:?} != {expected:?}");
+        assert_eq!(checked.subject, USER);
+        // A validator may omit the optional nbf.
+        validator.set_answer(ValidatorAnswer::Claims(without(
+            openid.user_claims(TENANT, USER),
+            "nbf",
+        )));
+        assert!(entra.verify(&token).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn the_validators_claims_are_checked_again() {
+        let (openid, validator, entra) = validated().await;
+        let good = openid.user_claims(TENANT, USER);
+        let now = unix_now();
+        let cases = [
+            ("aud", json!(CLIENT_APP), Reason::Audience),
+            ("aud", json!(["api://other", CLIENT_APP]), Reason::Audience),
+            ("iss", json!(openid.issuer(OTHER_TENANT)), Reason::Issuer),
+            ("exp", json!(now - 120), Reason::Expired),
+            ("nbf", json!(now + 300), Reason::NotYetValid),
+            ("tid", json!(OTHER_TENANT), Reason::Malformed),
+            (
+                "oid",
+                json!("66666666-0000-4000-8000-000000000006"),
+                Reason::Malformed,
+            ),
+            ("ver", json!("1.0"), Reason::Version),
+            ("scp", json!("User.Read"), Reason::Scope),
+        ];
+        for (name, value, reason) in cases {
+            validator.set_answer(ValidatorAnswer::Claims(changed(good.clone(), name, value)));
+            assert_eq!(
+                entra.verify(&openid.token(USER)).await,
+                Err(EntraError::Rejected(reason)),
+                "{name}"
+            );
+        }
+        validator.set_answer(ValidatorAnswer::Claims(changed(
+            good.clone(),
+            "aud",
+            json!(["api://other", API_CLIENT_ID]),
+        )));
+        assert!(entra.verify(&openid.token(USER)).await.is_ok());
+        // A token without oid cannot match the validator's.
+        validator.set_answer(ValidatorAnswer::Claims(good.clone()));
+        let no_oid = sign(KEY_A, &without(good.clone(), "oid"));
+        assert_eq!(
+            entra.verify(&no_oid).await,
+            Err(EntraError::Rejected(Reason::Malformed))
+        );
+
+        // A tenant that is not admitted never reaches the validator.
+        let asked = validator.requests().len();
+        let foreign = "66666666-0000-4000-8000-000000000006";
+        let claims = changed(
+            changed(good.clone(), "tid", json!(foreign)),
+            "iss",
+            json!(openid.issuer(foreign)),
+        );
+        assert_eq!(
+            entra.verify(&sign(KEY_A, &claims)).await,
+            Err(EntraError::Rejected(Reason::Tenant))
+        );
+        for token in [
+            with_algorithm("none", KEY_A.kid, &good, ""),
+            with_algorithm("HS256", KEY_A.kid, &good, "c2lnbmF0dXJl"),
+        ] {
+            assert_eq!(
+                entra.verify(&token).await,
+                Err(EntraError::Rejected(Reason::Algorithm))
+            );
+        }
+        assert_eq!(validator.requests().len(), asked);
+    }
+
+    #[tokio::test]
+    async fn a_validator_answer_off_the_schema_is_malformed() {
+        let (openid, validator, entra) = validated().await;
+        let good = openid.user_claims(TENANT, USER);
+        let answers = [
+            ValidatorAnswer::Status(200, r#"{"other":{}}"#.to_owned()),
+            ValidatorAnswer::Status(200, r#"{"claims":"x"}"#.to_owned()),
+            ValidatorAnswer::Status(200, "[1]".to_owned()),
+            ValidatorAnswer::Claims(without(good.clone(), "exp")),
+            ValidatorAnswer::Claims(without(good.clone(), "ver")),
+            ValidatorAnswer::Claims(changed(good.clone(), "exp", json!("tomorrow"))),
+            ValidatorAnswer::Claims(changed(good.clone(), "exp", json!(1.5))),
+            ValidatorAnswer::Claims(changed(good.clone(), "nbf", json!(1.5))),
+            ValidatorAnswer::Claims(changed(good.clone(), "aud", json!(5))),
+            ValidatorAnswer::Claims(changed(good.clone(), "aud", json!([API_CLIENT_ID, 5]))),
+            ValidatorAnswer::Claims(changed(good.clone(), "roles", json!("a"))),
+            ValidatorAnswer::Claims(changed(good.clone(), "roles", json!([1]))),
+            ValidatorAnswer::Claims(changed(good.clone(), "name", Value::Null)),
+            ValidatorAnswer::Claims(changed(good.clone(), "appid", json!(1))),
+        ];
+        for answer in answers {
+            validator.set_answer(answer.clone());
+            assert_eq!(
+                entra.verify(&openid.token(USER)).await,
+                Err(EntraError::Rejected(Reason::Malformed)),
+                "{answer:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_401_names_the_reason_or_the_validator() {
+        let (openid, validator, entra) = validated().await;
+        for (body, reason) in [
+            (
+                r#"{"error":"invalid_token","reason":"signature"}"#,
+                Reason::Signature,
+            ),
+            (r#"{"reason":"expired"}"#, Reason::Expired),
+            ("", Reason::Validator),
+            (r#"{"reason":"bogus"}"#, Reason::Validator),
+            (r#"{"reason":5}"#, Reason::Validator),
+            (r#"{"error":"invalid_token"}"#, Reason::Validator),
+            ("not json", Reason::Validator),
+        ] {
+            validator.set_answer(ValidatorAnswer::Status(401, body.to_owned()));
+            assert_eq!(
+                entra.verify(&openid.token(USER)).await,
+                Err(EntraError::Rejected(reason)),
+                "{body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unusable_validator_fails_closed_without_falling_back_to_keys() {
+        use crate::identity::{AuthenticationError, Authenticator};
+
+        let (openid, validator, entra) = validated().await;
+        let token = openid.token(USER);
+        let mut big = openid.user_claims(TENANT, USER);
+        big["name"] = json!("n".repeat(17_000));
+        for answer in [
+            ValidatorAnswer::Status(403, r#"{"error":"forbidden"}"#.to_owned()),
+            ValidatorAnswer::Status(500, String::new()),
+            ValidatorAnswer::Status(302, String::new()),
+            ValidatorAnswer::Status(400, String::new()),
+            ValidatorAnswer::Status(200, "not json".to_owned()),
+            ValidatorAnswer::Claims(big),
+            ValidatorAnswer::Delay(Duration::from_millis(1500)),
+        ] {
+            validator.set_answer(answer.clone());
+            let verified = entra.verify(&token).await;
+            let Err(EntraError::Unavailable(error)) = verified else {
+                panic!("{answer:?}: {verified:?}");
+            };
+            assert!(!error.contains(&token), "{error}");
+            assert!(
+                matches!(
+                    Authenticator::authenticate(&entra, &token).await,
+                    Err(AuthenticationError::Unavailable(_))
+                ),
+                "{answer:?}"
+            );
+        }
+        let refused = EntraSignIn::new(EntraSettings {
+            validator: Some(ValidatorSettings {
+                url: refused_url().await,
+                timeout: Duration::from_millis(1000),
+                secret: None,
+            }),
+            ..openid.settings()
+        })
+        .unwrap();
+        let verified = refused.verify(&token).await;
+        // Windows retries a refused connection for longer than the timeout.
+        assert!(
+            matches!(&verified, Err(EntraError::Unavailable(error))
+                if error.contains("could not be reached") || error.contains("timed out")),
+            "{verified:?}"
+        );
+        entra.warm().await;
+        Authenticator::warm(&refused).await;
+        assert_eq!((openid.metadata_fetches(), openid.jwks_fetches()), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn the_validator_request_carries_the_token_in_the_header_only() {
+        let (openid, validator, entra) = validated().await;
+        let token = openid.token(USER);
+        entra.verify(&token).await.unwrap();
+        entra.verify(&token).await.unwrap();
+        let requests = validator.requests();
+        assert_eq!(requests.len(), 2, "no caching");
+        let seen = &requests[0];
+        assert_eq!(seen.method, "POST");
+        assert_eq!(seen.authorization, Some(format!("Bearer {token}")));
+        assert_eq!(
+            serde_json::from_str::<Value>(&seen.body).unwrap(),
+            json!({"provider": "entra"})
+        );
+        assert!(!seen.body.contains(&token));
+        assert_eq!(seen.content_type.as_deref(), Some("application/json"));
+        assert_eq!(seen.accept.as_deref(), Some("application/json"));
+        assert_eq!(seen.secret, None);
+
+        let mut settings = validator.settings_for(&openid);
+        settings.validator.as_mut().unwrap().secret = Some("s3cret".to_owned());
+        let with_secret = EntraSignIn::new(settings).unwrap();
+        with_secret.verify(&token).await.unwrap();
+        assert_eq!(validator.requests()[2].secret.as_deref(), Some("s3cret"));
+        assert!(!format!("{with_secret:?}").contains("s3cret"));
     }
 }

@@ -49,6 +49,9 @@ use crate::turn::TurnSettings;
 /// | `PUSH_ENTRA_REQUIRED_ROLE` | an app role `roles` must contain | none |
 /// | `PUSH_ENTRA_ALLOWED_CLIENT_APPS` | client app ids allowed in `azp` | any |
 /// | `PUSH_ENTRA_MAX_SESSION_HOURS` | maximum session age of an Entra-backed device, 1 to 720 | `24` |
+/// | `PUSH_ENTRA_VALIDATOR_URL` | an external token validator for `entra` and `entra-app`: push-auth POSTs `{"provider": …}` with the token as `Authorization: Bearer` and re-checks the returned claims instead of fetching Entra ID's keys; `https://`, or `http://` to a loopback host | built-in validation |
+/// | `PUSH_ENTRA_VALIDATOR_TIMEOUT_MS` | the validator's time limit, 100 to 10000; only with the URL | `2000` |
+/// | `PUSH_ENTRA_VALIDATOR_SECRET_FILE` | a file whose trimmed content (1 to 1024 visible ASCII characters) is sent as `X-Push-Validator-Secret`, read at start-up; only with the URL | none |
 /// | `PUSH_ENTRA_APP_REQUIRED_ROLE` | app-only role, independent of delegated-user policy | none |
 /// | `PUSH_ENTRA_APP_ALLOWED_CLIENT_APPS` | app-only client ids (`azp`), comma-separated | any valid client id |
 /// | `PUSH_ENTRA_APP_MAX_SESSION_HOURS` | app-only maximum session age, 1 to 720 | `24` |
@@ -903,6 +906,44 @@ mod tests {
             invalid.push((key, bad));
             assert!(config(&invalid).is_err(), "{key}");
         }
+    }
+
+    #[test]
+    fn the_validator_url_is_read_only_with_an_entra_provider() {
+        let mut variables = REQUIRED.to_vec();
+        variables.extend([
+            ("PUSH_AUTH_PROVIDERS", "entra-app"),
+            (
+                "PUSH_ENTRA_CLIENT_ID",
+                "11111111-0000-4000-8000-000000000001",
+            ),
+            (
+                "PUSH_ENTRA_ALLOWED_TENANTS",
+                "33333333-0000-4000-8000-000000000003",
+            ),
+            ("PUSH_ENTRA_VALIDATOR_URL", "http://127.0.0.1:9000/validate"),
+            ("PUSH_ENTRA_VALIDATOR_TIMEOUT_MS", "500"),
+        ]);
+        let validator = config(&variables)
+            .unwrap()
+            .entra
+            .unwrap()
+            .validator
+            .unwrap();
+        assert_eq!(validator.url, "http://127.0.0.1:9000/validate");
+        assert_eq!(validator.timeout, std::time::Duration::from_millis(500));
+        let mut insecure = variables.clone();
+        insecure.push(("PUSH_ENTRA_VALIDATOR_URL", "http://validator.example/"));
+        assert!(matches!(
+            config(&insecure),
+            Err(ConfigError::Invalid {
+                name: "PUSH_ENTRA_VALIDATOR_URL",
+                ..
+            })
+        ));
+        let mut password = with("PUSH_ENTRA_VALIDATOR_URL", "http://validator.example/");
+        password.push(("PUSH_ENTRA_VALIDATOR_TIMEOUT_MS", "1"));
+        assert!(config(&password).unwrap().entra.is_none());
     }
 
     #[test]

@@ -7,10 +7,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use axum::body::Body;
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
@@ -18,7 +19,7 @@ use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use super::{CONSUMERS_TENANT, EntraSettings, Tenants};
+use super::{CONSUMERS_TENANT, EntraSettings, Tenants, ValidatorSettings};
 
 /// The tenant the stub's tokens come from by default.
 pub const TENANT: &str = "33333333-0000-4000-8000-000000000003";
@@ -205,6 +206,7 @@ impl StubOpenId {
             required_role: None,
             client_apps: Vec::new(),
             max_session: Duration::from_secs(24 * 3600),
+            validator: None,
         }
     }
 
@@ -305,6 +307,154 @@ async fn keys(State(stub): State<Arc<Stub>>) -> Response {
         .map(|key| key.jwk())
         .collect();
     Json(json!({ "keys": keys })).into_response()
+}
+
+/// How the [`StubValidator`] answers.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ValidatorAnswer {
+    /// 200 with the bearer token's unverified payload as `claims`, as a validator copies
+    /// them; 400 without a readable bearer token.
+    Echo,
+    /// 200 with these `claims`.
+    Claims(Value),
+    /// This status with this raw body (`Content-Type: application/json`).
+    Status(u16, String),
+    /// Waits, then echoes.
+    Delay(Duration),
+}
+
+/// A request the [`StubValidator`] received.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeenRequest {
+    pub method: String,
+    pub authorization: Option<String>,
+    pub secret: Option<String>,
+    pub content_type: Option<String>,
+    pub accept: Option<String>,
+    pub body: String,
+}
+
+struct ValidatorStub {
+    answer: Mutex<ValidatorAnswer>,
+    requests: Mutex<Vec<SeenRequest>>,
+}
+
+/// A stub external token validator on 127.0.0.1 over plain HTTP, at `POST /validate`.
+/// It checks no signature: it echoes what it is told to.
+pub struct StubValidator {
+    url: String,
+    state: Arc<ValidatorStub>,
+}
+
+impl StubValidator {
+    pub async fn start() -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the stub validator");
+        let url = format!(
+            "http://{}/validate",
+            listener.local_addr().expect("its address")
+        );
+        let state = Arc::new(ValidatorStub {
+            answer: Mutex::new(ValidatorAnswer::Echo),
+            requests: Mutex::new(Vec::new()),
+        });
+        let router = Router::new()
+            .route("/validate", post(validate))
+            .with_state(Arc::clone(&state));
+        tokio::spawn(axum::serve(listener, router).into_future());
+        Self { url, state }
+    }
+
+    /// The value for `PUSH_ENTRA_VALIDATOR_URL`.
+    pub fn url(&self) -> String {
+        self.url.clone()
+    }
+
+    /// Answers every request so from now on.
+    pub fn set_answer(&self, answer: ValidatorAnswer) {
+        *self.state.answer.lock().unwrap() = answer;
+    }
+
+    /// Every request received so far, in order.
+    pub fn requests(&self) -> Vec<SeenRequest> {
+        self.state.requests.lock().unwrap().clone()
+    }
+
+    /// `openid`'s settings with this validator (a one-second timeout, no secret).
+    pub fn settings_for(&self, openid: &StubOpenId) -> EntraSettings {
+        EntraSettings {
+            validator: Some(ValidatorSettings {
+                url: self.url(),
+                timeout: Duration::from_millis(1000),
+                secret: None,
+            }),
+            ..openid.settings()
+        }
+    }
+}
+
+/// A loopback validator URL nothing listens on: connections are refused.
+pub async fn refused_url() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind a port");
+    let address = listener.local_addr().expect("its address");
+    drop(listener);
+    format!("http://{address}/validate")
+}
+
+async fn validate(
+    State(stub): State<Arc<ValidatorStub>>,
+    method: Method,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    let text = |name: header::HeaderName| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+    };
+    let authorization = text(header::AUTHORIZATION);
+    stub.requests.lock().unwrap().push(SeenRequest {
+        method: method.to_string(),
+        authorization: authorization.clone(),
+        secret: text(header::HeaderName::from_static("x-push-validator-secret")),
+        content_type: text(header::CONTENT_TYPE),
+        accept: text(header::ACCEPT),
+        body,
+    });
+    let answer = stub.answer.lock().unwrap().clone();
+    let claims = match answer {
+        ValidatorAnswer::Claims(claims) => claims,
+        ValidatorAnswer::Status(status, body) => {
+            return Response::builder()
+                .status(status)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .expect("a stub answer");
+        }
+        ValidatorAnswer::Delay(delay) => {
+            tokio::time::sleep(delay).await;
+            match echoed(authorization.as_deref()) {
+                Some(claims) => claims,
+                None => return StatusCode::BAD_REQUEST.into_response(),
+            }
+        }
+        ValidatorAnswer::Echo => match echoed(authorization.as_deref()) {
+            Some(claims) => claims,
+            None => return StatusCode::BAD_REQUEST.into_response(),
+        },
+    };
+    Json(json!({ "claims": claims })).into_response()
+}
+
+/// The unverified payload of the bearer token in `authorization`.
+fn echoed(authorization: Option<&str>) -> Option<Value> {
+    let token = authorization?.strip_prefix("Bearer ")?;
+    let payload = token.split('.').nth(1)?;
+    serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).ok()?).ok()
 }
 
 #[cfg(test)]

@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use uuid::Uuid;
 
+use super::validator::ProviderKind;
 use super::{EntraError, EntraSignIn, Reason, Tenants};
 use crate::config::ConfigError;
 use crate::identity::{AuthenticationError, Authenticator, ENTRA_APP_PROVIDER, Principal};
@@ -91,15 +92,17 @@ impl Authenticator for EntraAppSignIn {
     }
 
     async fn authenticate(&self, token: &str) -> Result<Principal, AuthenticationError> {
-        let (claims, tenant, payload) = self.verifier.verified(token).await.map_err(|error| {
-            match error {
+        let (claims, tenant, payload) = self
+            .verifier
+            .verified(token, ProviderKind::App)
+            .await
+            .map_err(|error| match error {
                 EntraError::Rejected(reason) => AuthenticationError::Rejected(reason.as_str()),
                 EntraError::Unavailable(error) => {
-                    tracing::warn!(%error, "an Entra app sign-in failed: no usable signing keys");
+                    self.verifier.log_unavailable(&error, ENTRA_APP_PROVIDER);
                     AuthenticationError::Unavailable(error)
                 }
-            }
-        })?;
+            })?;
         let reject = |reason: Reason| AuthenticationError::Rejected(reason.as_str());
         super::claims::common(&claims, tenant).map_err(reject)?;
         if claims
@@ -149,10 +152,11 @@ mod tests {
 
     use super::*;
     use crate::entra::testing::{
-        CLIENT_APP, KEY_A, KEY_B, StubOpenId, TENANT, sign, sign_as, with_algorithm,
+        CLIENT_APP, KEY_A, KEY_B, StubOpenId, StubValidator, TENANT, ValidatorAnswer, refused_url,
+        sign, sign_as, with_algorithm,
     };
-    use crate::entra::{EntraSignIn, Tenants};
-    use crate::identity::Authenticator;
+    use crate::entra::{EntraSettings, EntraSignIn, Tenants, ValidatorSettings};
+    use crate::identity::{AuthenticationError, Authenticator};
 
     const OBJECT: &str = "55555555-0000-4000-8000-000000000005";
 
@@ -246,5 +250,61 @@ mod tests {
             assert!(app.authenticate(&token).await.is_err());
         }
         assert!(app.authenticate(&stub.token(OBJECT)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_validator_checks_app_tokens_and_hears_which_provider_asks() {
+        let openid = StubOpenId::start().await;
+        let validator = StubValidator::start().await;
+        let delegated = EntraSignIn::new(validator.settings_for(&openid)).unwrap();
+        let app = delegated.app(EntraAppSettings::default()).unwrap();
+        let mut claims = openid.user_claims(TENANT, OBJECT);
+        claims.as_object_mut().unwrap().remove("scp");
+        claims["idtyp"] = json!("app");
+        let app_token = sign(KEY_A, &claims);
+
+        let principal = app.authenticate(&app_token).await.unwrap();
+        assert_eq!(principal.provider, "entra-app");
+        assert_eq!(principal.issuer, TENANT);
+        assert_eq!(principal.subject, OBJECT);
+        assert_eq!(principal.claims["idtyp"], "app");
+        let provider = |index: usize| {
+            serde_json::from_str::<serde_json::Value>(&validator.requests()[index].body).unwrap()
+        };
+        assert_eq!(provider(0), json!({"provider": "entra-app"}));
+
+        assert_eq!(
+            app.authenticate(&openid.token(OBJECT)).await,
+            Err(AuthenticationError::Rejected("app_only"))
+        );
+        assert_eq!(provider(1), json!({"provider": "entra-app"}));
+        assert_eq!(
+            delegated.authenticate(&app_token).await,
+            Err(AuthenticationError::Rejected("app_only"))
+        );
+        assert_eq!(provider(2), json!({"provider": "entra"}));
+
+        validator.set_answer(ValidatorAnswer::Status(503, String::new()));
+        assert!(matches!(
+            app.authenticate(&app_token).await,
+            Err(AuthenticationError::Unavailable(_))
+        ));
+        app.warm().await;
+        let refused = EntraSignIn::new(EntraSettings {
+            validator: Some(ValidatorSettings {
+                url: refused_url().await,
+                timeout: Duration::from_millis(500),
+                secret: None,
+            }),
+            ..openid.settings()
+        })
+        .unwrap()
+        .app(EntraAppSettings::default())
+        .unwrap();
+        assert!(matches!(
+            refused.authenticate(&app_token).await,
+            Err(AuthenticationError::Unavailable(_))
+        ));
+        assert_eq!((openid.metadata_fetches(), openid.jwks_fetches()), (0, 0));
     }
 }
