@@ -18,7 +18,7 @@ use serde_json::{Map, Value};
 
 use super::{
     AdmissionDecision, AuthenticationError, Authenticator, Principal, admission_unavailable,
-    not_permitted, rejected, unavailable,
+    not_permitted, rejected_by, unavailable,
 };
 use crate::api::{Api, MAX_BODY_BYTES, bad_body, client_ip};
 use crate::error::AuthError;
@@ -33,6 +33,9 @@ const MAX_TOKEN_BYTES: usize = 16 * 1024;
 pub(crate) struct IdentityState {
     pub api: Api,
     pub authenticator: Arc<dyn Authenticator>,
+    /// Whether an external token validator checks this route's tokens: refusals then
+    /// carry `validator = true` in the security log.
+    pub validator: bool,
 }
 
 /// Runs steps (1) to (6), then the handler with the principal in the request.
@@ -41,7 +44,11 @@ pub(crate) async fn identify(
     request: Request,
     next: Next,
 ) -> Result<Response, AuthError> {
-    let IdentityState { api, authenticator } = state;
+    let IdentityState {
+        api,
+        authenticator,
+        validator,
+    } = state;
     let provider = authenticator.provider();
     let ip = client_ip(&api, request.headers(), request.extensions());
     api.limits.check(Action::EntraSignIn, ip, None).await?;
@@ -75,8 +82,10 @@ pub(crate) async fn identify(
     let principal = match authenticator.authenticate(&token).await {
         Ok(principal) => principal
             .checked(provider)
-            .ok_or_else(|| rejected(provider, "principal"))?,
-        Err(AuthenticationError::Rejected(reason)) => return Err(rejected(provider, reason)),
+            .ok_or_else(|| rejected_by(provider, "principal", validator))?,
+        Err(AuthenticationError::Rejected(reason)) => {
+            return Err(rejected_by(provider, reason, validator));
+        }
         Err(AuthenticationError::Unavailable(_)) => return Err(unavailable(provider)),
     };
     if let Some(admission) = api.auth.admission() {

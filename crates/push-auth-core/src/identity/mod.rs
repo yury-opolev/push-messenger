@@ -130,11 +130,19 @@ pub fn is_provider_id(id: &str) -> bool {
 /// `entra_token_invalid` for Entra ID, as before; else `auth.external.rejected` with the
 /// provider, and `token_invalid`.
 pub(crate) fn rejected(provider: &str, reason: &'static str) -> AuthError {
+    rejected_by(provider, reason, false)
+}
+
+/// As [`rejected`]; with `validator` (an external token validator checked the token) the
+/// event also carries `validator = true`, else no `validator` field at all.
+pub(crate) fn rejected_by(provider: &str, reason: &'static str, validator: bool) -> AuthError {
+    let validator = validator.then_some(true);
     if provider == ENTRA_PROVIDER {
         tracing::warn!(
             target: "security",
             event = "auth.entra.rejected",
             reason,
+            validator,
             "an Entra ID access token was refused"
         );
         AuthError::EntraTokenInvalid
@@ -144,6 +152,7 @@ pub(crate) fn rejected(provider: &str, reason: &'static str) -> AuthError {
             event = "auth.external.rejected",
             provider,
             reason,
+            validator,
             "an identity token was refused"
         );
         AuthError::TokenInvalid

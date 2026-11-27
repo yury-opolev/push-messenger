@@ -59,6 +59,11 @@ impl EntraAppSignIn {
             _ => unreachable!("app construction requires explicit tenants"),
         }
     }
+
+    /// Whether an external token validator checks the tokens.
+    pub(crate) fn uses_validator(&self) -> bool {
+        self.verifier.uses_validator()
+    }
 }
 
 impl EntraSignIn {
