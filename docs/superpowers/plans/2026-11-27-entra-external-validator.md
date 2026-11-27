@@ -59,3 +59,18 @@ Design: `docs/superpowers/specs/2026-11-27-entra-external-validator-design.md` (
 ## Verification
 
 `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test -p push-auth-core`, `cargo test --workspace --locked`, `pwsh deploy/helm/test-chart.ps1`.
+
+## Addendum: header protocol (design H1–H11)
+
+### Task 6: Validator module split, settings and request metadata
+- [ ] Split `entra/validator.rs` into `entra/validator/{mod,config,claims,headers}.rs` without behaviour change; tests still pass.
+- [ ] Failing tests, then settings H1–H2 (protocol, request headers, correlation header, prefixes; refused without a URL; values never echoed).
+- [ ] `RequestMeta` and `Authenticator::authenticate_with` (H3); middleware builds the meta; Entra authenticators override.
+- [ ] JSON protocol sends the extras (H4); `sub` re-check (H8). Commit.
+
+### Task 7: Header protocol
+- [ ] Failing tests per request §10.2–9, 11, then the client (H4–H5), claim decoding (H6–H7), warning (H9). Commit.
+
+### Task 8: Chart (H10) and Task 9: docs for both protocols
+- [ ] Chart values, env, guards, checks in `test-chart.ps1`; defaults byte-identical. Commit.
+- [ ] `config.rs` table, `docs/entra-sign-in.md`, `values.yaml`, `CHANGELOG.md`. Commit.
