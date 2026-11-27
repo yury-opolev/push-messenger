@@ -70,22 +70,26 @@ Notable changes for consumers of push-messenger. Newest first.
   [guide](docs/entra-sign-in.md#external-token-validator)). For organizations that mandate
   their own token validation library or sidecar: with `PUSH_ENTRA_VALIDATOR_URL` set,
   auth-svc keeps its local pre-checks (size, segments, `alg` RS256 and `kid`, admitted
-  `tid`, issuer), then POSTs `{"provider": "entra"|"entra-app"}` with the token as
-  `Authorization: Bearer` to the validator instead of fetching Entra ID's keys, re-checks
-  the returned claims (schema, `tid`/`oid` match, tenant, issuer, audience, `exp`/`nbf`)
-  and applies its unchanged policy, accounts and sessions, so a validator can only narrow
-  who signs in. In validator mode `nbf` is optional, as in the contract's schema, and is
-  checked within the 60 s leeway when present. A 401 maps to the named reason or the new
-  reason `validator`; any other
-  answer, a timeout or a body over 16 KiB fails closed with 503 (no fallback to built-in
-  keys, no caching). Refusals log `validator: true` on `auth.entra.rejected` /
-  `auth.external.rejected`; the token is never logged. New variables
-  `PUSH_ENTRA_VALIDATOR_URL` (`https://`, or `http://` to a loopback host),
-  `PUSH_ENTRA_VALIDATOR_TIMEOUT_MS` (100–10000, default 2000) and
-  `PUSH_ENTRA_VALIDATOR_SECRET_FILE` (sent as `X-Push-Validator-Secret`). Chart:
-  `auth.signIn.entra.validator.url|timeoutMs|secretFile` and generic
-  `auth.extraContainers`, `auth.extraVolumes`, `auth.extraVolumeMounts` for a sidecar.
-  Unset, behaviour, logs and chart output are unchanged.
+  `tid`, issuer), then sends the token as `Authorization: Bearer` to the validator instead
+  of fetching Entra ID's keys, re-checks the returned claims (schema, `tid`/`oid`/`sub`
+  match, tenant, issuer, audience, `exp`/`nbf`) and applies its unchanged policy, accounts
+  and sessions, so a validator can only narrow who signs in. Two wire protocols
+  (`PUSH_ENTRA_VALIDATOR_PROTOCOL`): `json` (default; POST `{"provider": "entra"|"entra-app"}`,
+  200 `{"claims": {…}}`, 401 with an optional reason) and `headers` (forward-auth as for
+  nginx `auth_request` / Envoy `ext_authz`: an empty POST, 2xx with the claims in
+  `Subject-Token-Claim-*` or base64 `Subject-Token-Encoded-Claim-*` response headers, 401
+  and 403 refuse). Both send `Original-Uri`, `Original-Method`, `X-Forwarded-For`, a
+  per-attempt request id and configured static headers. Any other answer, a timeout or an
+  oversized answer fails closed with 503 (no fallback to built-in keys, no caching).
+  Refusals log `validator: true` and `request_id`; the token is never logged. New
+  variables `PUSH_ENTRA_VALIDATOR_URL` (`https://`, or `http://` to a loopback host),
+  `_PROTOCOL`, `_TIMEOUT_MS` (100–10000, default 2000), `_SECRET_FILE` (sent as
+  `X-Push-Validator-Secret`), `_REQUEST_HEADERS`, `_CORRELATION_HEADER` (default
+  `X-Request-Id`), `_CLAIM_HEADER_PREFIX` and `_ENCODED_CLAIM_HEADER_PREFIX`. Chart:
+  `auth.signIn.entra.validator.url|protocol|timeoutMs|secretFile|correlationHeader|requestHeaders|claimHeaderPrefix|encodedClaimHeaderPrefix`
+  and generic `auth.extraContainers`, `auth.extraVolumes`, `auth.extraVolumeMounts` for a
+  sidecar. The `Authenticator` trait gains a defaulted `authenticate_with(token,
+  &RequestMeta)`. Unset, behaviour, logs and chart output are unchanged.
 
 - **Proactive agents**
   ([design](docs/superpowers/specs/2026-11-09-proactive-agents.md)): an owned agent may
