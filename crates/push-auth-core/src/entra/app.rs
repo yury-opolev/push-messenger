@@ -7,7 +7,9 @@ use uuid::Uuid;
 use super::validator::ProviderKind;
 use super::{EntraError, EntraSignIn, Reason, Tenants};
 use crate::config::ConfigError;
-use crate::identity::{AuthenticationError, Authenticator, ENTRA_APP_PROVIDER, Principal};
+use crate::identity::{
+    AuthenticationError, Authenticator, ENTRA_APP_PROVIDER, Principal, RequestMeta,
+};
 
 /// Policy of the explicitly enabled `entra-app` provider.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,9 +99,17 @@ impl Authenticator for EntraAppSignIn {
     }
 
     async fn authenticate(&self, token: &str) -> Result<Principal, AuthenticationError> {
+        self.authenticate_with(token, &RequestMeta::default()).await
+    }
+
+    async fn authenticate_with(
+        &self,
+        token: &str,
+        meta: &RequestMeta,
+    ) -> Result<Principal, AuthenticationError> {
         let (claims, tenant, payload) = self
             .verifier
-            .verified(token, ProviderKind::App)
+            .verified(token, ProviderKind::App, meta)
             .await
             .map_err(|error| match error {
                 EntraError::Rejected(reason) => AuthenticationError::Rejected(reason.as_str()),

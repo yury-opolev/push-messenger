@@ -679,8 +679,12 @@ async fn a_validator_refusal_is_logged_as_rejected_with_the_validator_flag() {
                 .iter()
                 .any(|event| event["event"] == "auth.entra.rejected"
                     && event["reason"] == reason
-                    && event["validator"] == true),
-            "no validator refusal for {reason} in {events:?}"
+                    && event["validator"] == true
+                    && event["request_id"]
+                        .as_str()
+                        .and_then(|id| Uuid::try_parse(id).ok())
+                        .is_some_and(|id| id.get_version_num() == 7)),
+            "no validator refusal for {reason} with a request id in {events:?}"
         );
     }
     let text = captured_logs();
@@ -766,7 +770,7 @@ async fn built_in_refusals_carry_no_validator_flag() {
     assert!(
         app_only
             .iter()
-            .all(|event| event.get("validator").is_none()),
+            .all(|event| event.get("validator").is_none() && event.get("request_id").is_none()),
         "{app_only:?}"
     );
     assert!(!captured_logs().contains(&refused));

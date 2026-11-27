@@ -5,6 +5,7 @@
 //! addresses are never logged.
 
 use std::fmt;
+use std::net::IpAddr;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -70,6 +71,20 @@ impl fmt::Debug for Principal {
     }
 }
 
+/// What an authenticator may know of the sign-in request besides its token (for an
+/// external token validator, say). Every field is optional.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RequestMeta {
+    /// The public URL of the sign-in route as the client called it, without a query.
+    pub original_uri: Option<String>,
+    /// The request's HTTP method, e.g. `POST`.
+    pub method: Option<String>,
+    /// The client's address, as the rate limits see it.
+    pub client_ip: Option<IpAddr>,
+    /// This sign-in attempt's id, fresh for each attempt.
+    pub request_id: Option<String>,
+}
+
 /// Why an authenticator gave no principal.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AuthenticationError {
@@ -96,6 +111,16 @@ pub trait Authenticator: Send + Sync + fmt::Debug {
     fn max_session(&self) -> Duration;
     /// The user `token` names, if it is acceptable.
     async fn authenticate(&self, token: &str) -> Result<Principal, AuthenticationError>;
+    /// As [`Authenticator::authenticate`], knowing the sign-in request's `meta`; the
+    /// identity middleware calls this one. By default it ignores `meta`.
+    async fn authenticate_with(
+        &self,
+        token: &str,
+        meta: &RequestMeta,
+    ) -> Result<Principal, AuthenticationError> {
+        let _ = meta;
+        self.authenticate(token).await
+    }
     /// Prepares at start-up (fetches keys, …); failures are logged, never fatal.
     async fn warm(&self) {}
 }
@@ -130,19 +155,25 @@ pub fn is_provider_id(id: &str) -> bool {
 /// `entra_token_invalid` for Entra ID, as before; else `auth.external.rejected` with the
 /// provider, and `token_invalid`.
 pub(crate) fn rejected(provider: &str, reason: &'static str) -> AuthError {
-    rejected_by(provider, reason, false)
+    rejected_by(provider, reason, None)
 }
 
-/// As [`rejected`]; with `validator` (an external token validator checked the token) the
-/// event also carries `validator = true`, else no `validator` field at all.
-pub(crate) fn rejected_by(provider: &str, reason: &'static str, validator: bool) -> AuthError {
-    let validator = validator.then_some(true);
+/// As [`rejected`]; with the `request_id` an external token validator was (or would have
+/// been) sent, the event also carries `validator = true` and that `request_id`, else
+/// neither field at all.
+pub(crate) fn rejected_by(
+    provider: &str,
+    reason: &'static str,
+    request_id: Option<&str>,
+) -> AuthError {
+    let validator = request_id.is_some().then_some(true);
     if provider == ENTRA_PROVIDER {
         tracing::warn!(
             target: "security",
             event = "auth.entra.rejected",
             reason,
             validator,
+            request_id,
             "an Entra ID access token was refused"
         );
         AuthError::EntraTokenInvalid
@@ -153,6 +184,7 @@ pub(crate) fn rejected_by(provider: &str, reason: &'static str, validator: bool)
             provider,
             reason,
             validator,
+            request_id,
             "an identity token was refused"
         );
         AuthError::TokenInvalid
@@ -233,5 +265,40 @@ mod tests {
         ] {
             assert!(!is_provider_id(id), "{id}");
         }
+    }
+
+    #[derive(Debug)]
+    struct Refusing;
+
+    #[async_trait]
+    impl Authenticator for Refusing {
+        fn provider(&self) -> &str {
+            "acme"
+        }
+
+        fn max_session(&self) -> Duration {
+            Duration::from_secs(60)
+        }
+
+        async fn authenticate(&self, token: &str) -> Result<Principal, AuthenticationError> {
+            Err(AuthenticationError::Unavailable(format!(
+                "{} bytes",
+                token.len()
+            )))
+        }
+    }
+
+    #[tokio::test]
+    async fn authenticating_with_request_metadata_defaults_to_authenticate() {
+        let meta = RequestMeta {
+            original_uri: Some("https://push.example/v1/auth/acme".to_owned()),
+            method: Some("POST".to_owned()),
+            client_ip: "198.51.100.7".parse().ok(),
+            request_id: Some("r-1".to_owned()),
+        };
+        assert_eq!(
+            Refusing.authenticate_with("abc", &meta).await,
+            Err(AuthenticationError::Unavailable("3 bytes".to_owned()))
+        );
     }
 }

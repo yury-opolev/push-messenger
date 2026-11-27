@@ -11,7 +11,7 @@ use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderValue};
 use serde_json::{Map, Value};
 
 use super::{EntraError, Reason};
-use crate::identity::{ENTRA_APP_PROVIDER, ENTRA_PROVIDER};
+use crate::identity::{ENTRA_APP_PROVIDER, ENTRA_PROVIDER, RequestMeta};
 
 pub(crate) use claims::recheck;
 use config::is_loopback;
@@ -78,6 +78,7 @@ impl Validator {
         &self,
         token: &str,
         kind: ProviderKind,
+        _meta: &RequestMeta,
     ) -> Result<Map<String, Value>, EntraError> {
         let body = serde_json::json!({ "provider": kind.as_str() }).to_string();
         let mut request = self
@@ -164,7 +165,9 @@ mod tests {
         })
         .unwrap();
         assert_eq!(
-            validator.check("a.b.c\u{1}d", ProviderKind::User).await,
+            validator
+                .check("a.b.c\u{1}d", ProviderKind::User, &RequestMeta::default())
+                .await,
             Err(EntraError::Rejected(Reason::Malformed))
         );
     }

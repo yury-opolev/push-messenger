@@ -23,7 +23,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
 use uuid::Uuid;
 
-use crate::identity::{AuthenticationError, Authenticator, ENTRA_PROVIDER, Principal};
+use crate::identity::{AuthenticationError, Authenticator, ENTRA_PROVIDER, Principal, RequestMeta};
 
 pub use app::{EntraAppSettings, EntraAppSignIn};
 pub use keys::KeyTiming;
@@ -265,7 +265,10 @@ impl EntraSignIn {
     /// The user `token` names, if it is an acceptable access token for this API. A
     /// refusal is logged with its reason, never with the token or its claims.
     pub async fn verify(&self, token: &str) -> Result<EntraIdentity, EntraError> {
-        let checked = self.check(token).await.map(|(identity, _)| identity);
+        let checked = self
+            .check(token, &RequestMeta::default())
+            .await
+            .map(|(identity, _)| identity);
         match &checked {
             Err(EntraError::Rejected(reason)) => tracing::warn!(
                 target: "security",
@@ -281,18 +284,24 @@ impl EntraSignIn {
     }
 
     /// The identity of an acceptable token, and the token's whole verified payload.
-    async fn check(&self, token: &str) -> Result<(EntraIdentity, Map<String, Value>), EntraError> {
-        let (claims, tenant, payload) = self.verified(token, ProviderKind::User).await?;
+    async fn check(
+        &self,
+        token: &str,
+        meta: &RequestMeta,
+    ) -> Result<(EntraIdentity, Map<String, Value>), EntraError> {
+        let (claims, tenant, payload) = self.verified(token, ProviderKind::User, meta).await?;
         let identity =
             claims::check(&claims, tenant, &self.settings).map_err(EntraError::Rejected)?;
         Ok((identity, payload))
     }
 
     /// Cryptographic and common claim checks, shared by delegated and app-only policy.
+    /// `meta` describes the sign-in request to a validator.
     async fn verified(
         &self,
         token: &str,
         kind: ProviderKind,
+        meta: &RequestMeta,
     ) -> Result<(claims::EntraClaims, Uuid, Map<String, Value>), EntraError> {
         let malformed = EntraError::Rejected(Reason::Malformed);
         let parts: Vec<&str> = token.split('.').collect();
@@ -329,7 +338,7 @@ impl EntraSignIn {
                 {
                     return Err(EntraError::Rejected(Reason::Malformed));
                 }
-                let payload = validator.check(token, kind).await?;
+                let payload = validator.check(token, kind, meta).await?;
                 // Any JSON type: only a string can match the validator's `oid`.
                 let unverified_claims: Map<String, Value> = decode_part(parts[1])?;
                 validator::recheck(
@@ -380,7 +389,15 @@ impl Authenticator for EntraSignIn {
     }
 
     async fn authenticate(&self, token: &str) -> Result<Principal, AuthenticationError> {
-        match self.check(token).await {
+        self.authenticate_with(token, &RequestMeta::default()).await
+    }
+
+    async fn authenticate_with(
+        &self,
+        token: &str,
+        meta: &RequestMeta,
+    ) -> Result<Principal, AuthenticationError> {
+        match self.check(token, meta).await {
             Ok((identity, claims)) => Ok(identity.principal(claims)),
             Err(EntraError::Rejected(reason)) => {
                 Err(AuthenticationError::Rejected(reason.as_str()))

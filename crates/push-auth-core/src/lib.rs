@@ -48,7 +48,7 @@ pub use error::AuthError;
 pub use external::{EntraRegistration, ExternalRegistration};
 pub use identity::{
     AGENT_KEY_PROVIDER, Admission, AdmissionDecision, AuthenticationError, Authenticator,
-    ENTRA_PROVIDER, Principal,
+    ENTRA_PROVIDER, Principal, RequestMeta,
 };
 pub use owners::{AgentOwnerApi, GrpcAgentOwners, NoAgentOwners};
 pub use profiles::{OwnProfile, PublicProfile};

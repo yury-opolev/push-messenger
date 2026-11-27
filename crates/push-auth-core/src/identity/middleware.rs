@@ -15,10 +15,11 @@ use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
 use axum::middleware::Next;
 use axum::response::Response;
 use serde_json::{Map, Value};
+use uuid::Uuid;
 
 use super::{
-    AdmissionDecision, AuthenticationError, Authenticator, Principal, admission_unavailable,
-    not_permitted, rejected_by, unavailable,
+    AdmissionDecision, AuthenticationError, Authenticator, Principal, RequestMeta,
+    admission_unavailable, not_permitted, rejected_by, unavailable,
 };
 use crate::api::{Api, MAX_BODY_BYTES, bad_body, client_ip};
 use crate::error::AuthError;
@@ -34,7 +35,7 @@ pub(crate) struct IdentityState {
     pub api: Api,
     pub authenticator: Arc<dyn Authenticator>,
     /// Whether an external token validator checks this route's tokens: refusals then
-    /// carry `validator = true` in the security log.
+    /// carry `validator = true` and the attempt's `request_id` in the security log.
     pub validator: bool,
 }
 
@@ -79,12 +80,20 @@ pub(crate) async fn identify(
     if token.len() > MAX_TOKEN_BYTES {
         return Err(invalid("token", "at most 16 KiB"));
     }
-    let principal = match authenticator.authenticate(&token).await {
+    let meta = RequestMeta {
+        original_uri: Some(format!("{}{}", api.auth.public_url(), parts.uri.path())),
+        method: Some(parts.method.as_str().to_owned()),
+        client_ip: ip,
+        request_id: Some(Uuid::now_v7().to_string()),
+    };
+    // Only a validator hears the request id, so only its refusals name it.
+    let request_id = meta.request_id.as_deref().filter(|_| validator);
+    let principal = match authenticator.authenticate_with(&token, &meta).await {
         Ok(principal) => principal
             .checked(provider)
-            .ok_or_else(|| rejected_by(provider, "principal", validator))?,
+            .ok_or_else(|| rejected_by(provider, "principal", request_id))?,
         Err(AuthenticationError::Rejected(reason)) => {
-            return Err(rejected_by(provider, reason, validator));
+            return Err(rejected_by(provider, reason, request_id));
         }
         Err(AuthenticationError::Unavailable(_)) => return Err(unavailable(provider)),
     };

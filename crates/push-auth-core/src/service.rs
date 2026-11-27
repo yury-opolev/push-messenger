@@ -241,6 +241,11 @@ impl Auth {
             })
     }
 
+    /// The public base URL, without a trailing `/`.
+    pub(crate) fn public_url(&self) -> &str {
+        &self.public_url
+    }
+
     /// Whether an external token validator checks the tokens of `provider`: only the
     /// built-in `entra` and `entra-app` can use one, never an external authenticator.
     pub(crate) fn external_validation(&self, provider: &str) -> bool {
