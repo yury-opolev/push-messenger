@@ -13,7 +13,7 @@
 
 # The base images are pinned by digest (their multi-arch index), so a rebuild uses
 # exactly the reviewed bytes; Dependabot proposes new digests.
-FROM rust:1.85-slim-bookworm@sha256:9f841bbe9e7d8e37ceb96ed907265a3a0df7f44e3737d0b100e7907a679acb36 AS builder
+FROM rust:1.99-slim-bookworm@sha256:f2c004e3d2d8b547e8cf7ffbc29205385f4e71d23e53e4e383065db5e9f822cd AS builder
 WORKDIR /src
 COPY . .
 # The registry and target caches survive between builds on the same Docker daemon; the
