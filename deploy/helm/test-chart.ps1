@@ -1546,6 +1546,96 @@ Check 'sign-in egress: without Entra sign-in the list adds nothing' {
     $rendered -notmatch '20\.190\.128\.0/18'
 }
 
+# ---- External Entra token validator ----
+$validatorArgs = @('--set', 'auth.signIn.entra.validator.url=http://127.0.0.1:8099/validate',
+    '--set', 'auth.signIn.entra.validator.timeoutMs=500')
+Check 'validator: its variables reach auth-svc with Entra sign-in; the secret file only when set' {
+    $secretArgs = $validatorArgs + @('--set', 'auth.signIn.entra.validator.secretFile=/etc/push/validator/secret')
+    $rendered = helm template push $chart @signInArgs @secretArgs 2>&1 | Out-String
+    $exit = $LASTEXITCODE
+    $auth = Doc $rendered 'Deployment' 'push-auth'
+    $noSecret = Doc (helm template push $chart @signInArgs @validatorArgs | Out-String) 'Deployment' 'push-auth'
+    $app = Doc (helm template push $chart @appSignInArgs @secretArgs | Out-String) 'Deployment' 'push-auth'
+    $exit -eq 0 -and
+        $auth -match '(?s)name: PUSH_ENTRA_VALIDATOR_URL\s+value: "http://127.0.0.1:8099/validate"' -and
+        $auth -match '(?s)name: PUSH_ENTRA_VALIDATOR_TIMEOUT_MS\s+value: "500"' -and
+        $auth -match '(?s)name: PUSH_ENTRA_VALIDATOR_SECRET_FILE\s+value: "/etc/push/validator/secret"' -and
+        $noSecret -match '(?s)name: PUSH_ENTRA_VALIDATOR_URL\s+value: "http://127.0.0.1:8099/validate"' -and
+        $noSecret -match '(?s)name: PUSH_ENTRA_VALIDATOR_TIMEOUT_MS\s+value: "500"' -and
+        $noSecret -notmatch 'PUSH_ENTRA_VALIDATOR_SECRET_FILE' -and
+        $app -match '(?s)name: PUSH_ENTRA_VALIDATOR_URL\s+value: "http://127.0.0.1:8099/validate"' -and
+        $app -match '(?s)name: PUSH_ENTRA_VALIDATOR_SECRET_FILE\s+value: "/etc/push/validator/secret"' -and
+        @($rendered -split "(?m)^---\s*$" | Where-Object {
+            $_ -match '(?m)^kind: (Deployment|StatefulSet|Job|Pod)\s*$' -and $_ -notmatch '(?m)^  name: push-auth\s*$' -and
+                $_ -match 'PUSH_ENTRA_VALIDATOR' }).Count -eq 0
+}
+Check 'validator: off by default, without a URL, and without Entra sign-in' {
+    $password = helm template push $chart @validatorArgs 2>&1 | Out-String
+    $passwordExit = $LASTEXITCODE
+    (helm template push $chart | Out-String) -notmatch 'PUSH_ENTRA_VALIDATOR' -and
+        (helm template push $chart @signInArgs | Out-String) -notmatch 'PUSH_ENTRA_VALIDATOR' -and
+        $passwordExit -eq 0 -and $password -notmatch 'PUSH_ENTRA_VALIDATOR'
+}
+Check 'validator: https anywhere, http only to a loopback host' {
+    $ok = foreach ($url in 'https://validator.example/check', 'http://[::1]:9/x', 'http://localhost:9/',
+        'http://127.0.0.1', 'https://validator.example:8443') {
+        Render ($signInArgs + @('--set', "auth.signIn.entra.validator.url=$url"))
+    }
+    @($ok | Where-Object { $_ -ne 0 }).Count -eq 0
+}
+Check 'validator: unsafe URLs, timeouts and secret files are refused' {
+    $bad = @(
+        'auth.signIn.entra.validator.url=http://validator.example/',
+        'auth.signIn.entra.validator.url=http://10.0.0.5:8080/',
+        'auth.signIn.entra.validator.url=http://127.0.0.1.example/',
+        'auth.signIn.entra.validator.url=http://localhost@evil.example/',
+        'auth.signIn.entra.validator.url=ftp://127.0.0.1/',
+        'auth.signIn.entra.validator.url=https://u:p@h.example/',
+        'auth.signIn.entra.validator.url=https://',
+        'auth.signIn.entra.validator.url=127.0.0.1:8099',
+        'auth.signIn.entra.validator.timeoutMs=99',
+        'auth.signIn.entra.validator.timeoutMs=10001',
+        'auth.signIn.entra.validator.timeoutMs=1.5',
+        'auth.signIn.entra.validator.secretFile=secret',
+        'auth.signIn.entra.validator.secretFile=/etc/push/a b'
+    )
+    $message = helm template push $chart --set auth.signIn.entra.validator.url=http://validator.example/ 2>&1 | Out-String
+    $messageExit = $LASTEXITCODE
+    @($bad | Where-Object { (Render ($signInArgs + @('--set', $_))) -eq 0 }).Count -eq 0 -and
+        $messageExit -ne 0 -and $message -match 'auth.signIn.entra.validator.url must be https://, or http:// only to a loopback host' -and
+        (Render @('--set', 'auth.signIn.entra.validator.url=http://10.0.0.5:8080/')) -ne 0 -and
+        (Render @('--set-json', 'auth.signIn.entra.validator.url=8099')) -ne 0 -and
+        (Render ($signInArgs + @('--set', 'auth.signIn.entra.validator.url=https://v.example/', '--set', 'auth.signIn.entra.validator.timeoutMs=100'))) -eq 0 -and
+        (Render ($signInArgs + @('--set', 'auth.signIn.entra.validator.url=https://v.example/', '--set', 'auth.signIn.entra.validator.timeoutMs=10000'))) -eq 0
+}
+Check 'auth extras: sidecars, volumes and mounts render verbatim in the auth Deployment; lists only' {
+    $rendered = helm template push $chart @signInArgs @validatorArgs `
+        --set auth.signIn.entra.validator.secretFile=/etc/push/validator/secret `
+        --set-json 'auth.extraContainers=[{"name":"validator","image":"example/validator:1","ports":[{"containerPort":8099}]}]' `
+        --set-json 'auth.extraVolumes=[{"name":"validator-secret","secret":{"secretName":"validator-secret"}}]' `
+        --set-json 'auth.extraVolumeMounts=[{"name":"validator-secret","mountPath":"/etc/push/validator","readOnly":true}]' 2>$null | Out-String
+    $exit = $LASTEXITCODE
+    $extras = @'
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(sys.stdin.read()) if d]
+deployments = {d["metadata"]["name"]: d["spec"]["template"]["spec"] for d in docs if d["kind"] == "Deployment"}
+auth = deployments["push-auth"]
+assert [c["name"] for c in auth["containers"]] == ["auth", "validator"], auth["containers"]
+assert auth["containers"][1] == {"name": "validator", "image": "example/validator:1", "ports": [{"containerPort": 8099}]}
+assert {"name": "validator-secret", "secret": {"secretName": "validator-secret"}} in auth["volumes"], auth["volumes"]
+assert {"name": "validator-secret", "mountPath": "/etc/push/validator", "readOnly": True} in auth["containers"][0]["volumeMounts"]
+for name, spec in deployments.items():
+    if name != "push-auth":
+        assert "validator" not in yaml.safe_dump(spec), name
+'@
+    $parsed = $false
+    if ($exit -eq 0) { $rendered | & $python.Source -c $extras; $parsed = $LASTEXITCODE -eq 0 }
+    $parsed -and
+        (Render @('--set', 'auth.extraContainers=sidecar')) -ne 0 -and
+        (Render @('--set-json', 'auth.extraVolumes={"name":"v"}')) -ne 0 -and
+        (Render @('--set', 'auth.extraVolumeMounts=mount')) -ne 0
+}
+
 Check 'admin: off by default' {
     (helm template push $chart | Out-String) -notmatch 'PUSH_AUTH_ADMIN|auth-admin-token|name: admin|8082'
 }

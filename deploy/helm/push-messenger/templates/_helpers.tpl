@@ -544,6 +544,41 @@ The admin listener is a boolean; its peers carry both label maps.
 {{- end -}}
 
 {{/*
+Checks the external token validator and the auth Deployment's extras whether or not Entra
+sign-in is on, as auth-svc would its PUSH_ENTRA_VALIDATOR_* variables: an https:// URL, or
+http:// only to a loopback host (a sidecar), never with user info; a 100 to 10000 ms
+timeout; an absolute secret file path. The extras are lists rendered verbatim.
+*/}}
+{{- define "push.checkValidator" -}}
+{{- $validator := .Values.auth.signIn.entra.validator -}}
+{{- if not (kindIs "string" $validator.url) -}}
+{{- fail "auth.signIn.entra.validator.url must be a string" -}}
+{{- end -}}
+{{- if $validator.url -}}
+{{- $https := regexMatch "(?i)^https://[^/@?#\\s]+([/?#][^\\s]*)?$" $validator.url -}}
+{{- $loopback := regexMatch "(?i)^http://(127\\.0\\.0\\.1|localhost|\\[::1\\])(:[0-9]{1,5})?([/?#][^\\s]*)?$" $validator.url -}}
+{{- if not (or $https $loopback) -}}
+{{- fail "auth.signIn.entra.validator.url must be https://, or http:// only to a loopback host (127.0.0.1, [::1], localhost), without user info" -}}
+{{- end -}}
+{{- end -}}
+{{- $ms := int $validator.timeoutMs -}}
+{{- if or (lt $ms 100) (gt $ms 10000) (ne (toString $ms) (toString $validator.timeoutMs)) -}}
+{{- fail "auth.signIn.entra.validator.timeoutMs must be a whole number of milliseconds from 100 to 10000" -}}
+{{- end -}}
+{{- if not (kindIs "string" $validator.secretFile) -}}
+{{- fail "auth.signIn.entra.validator.secretFile must be a string" -}}
+{{- end -}}
+{{- if and $validator.secretFile (not (regexMatch "^/[^\\s]+$" $validator.secretFile)) -}}
+{{- fail "auth.signIn.entra.validator.secretFile must be an absolute path without whitespace" -}}
+{{- end -}}
+{{- range $name := list "extraContainers" "extraVolumes" "extraVolumeMounts" -}}
+{{- if not (kindIs "slice" (index $.Values.auth $name)) -}}
+{{- fail (printf "auth.%s must be a list" $name) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
 "true" when the chart itself points a workload's SSL_CERT_FILE at Plan 12B's authority CA
 bundle (injection chart). Arguments: root, key.
 */}}
@@ -564,7 +599,8 @@ sets its SSL_CERT_FILE, push.checkSignIn insists on the same ConfigMap and that 
 auth-svc's sign-in variables (spec 2026-10-19 §3), as env list entries; nothing for the
 default (password only). The proxy serves only auth-svc's requests to Entra ID (reqwest):
 gRPC and the datastores never read it. A CA bundle replaces the system roots for every TLS
-connection auth-svc makes (rustls-native-certs reads SSL_CERT_FILE alone).
+connection auth-svc makes (rustls-native-certs reads SSL_CERT_FILE alone). The external
+token validator's variables come only with Entra sign-in and a validator URL.
 */}}
 {{- define "push.signInEnv" -}}
 {{- $signIn := .Values.auth.signIn -}}
@@ -626,6 +662,18 @@ connection auth-svc makes (rustls-native-certs reads SSL_CERT_FILE alone).
 {{- if include "push.signInCa" . }}
 - name: SSL_CERT_FILE
   value: "/etc/push/entra-ca/ca.crt"
+{{- end }}
+{{- with $entra.validator }}
+{{- if .url }}
+- name: PUSH_ENTRA_VALIDATOR_URL
+  value: {{ .url | quote }}
+- name: PUSH_ENTRA_VALIDATOR_TIMEOUT_MS
+  value: {{ int .timeoutMs | quote }}
+{{- with .secretFile }}
+- name: PUSH_ENTRA_VALIDATOR_SECRET_FILE
+  value: {{ . | quote }}
+{{- end }}
+{{- end }}
 {{- end }}
 {{- end }}
 {{- end -}}

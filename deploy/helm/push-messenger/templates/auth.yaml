@@ -1,4 +1,9 @@
 {{- $name := include "push.name" (dict "root" . "component" "auth") -}}
+{{- /* auth.extraVolumeMounts and auth.extraVolumes, appended verbatim; empty adds nothing. */ -}}
+{{- $extraMounts := "" -}}
+{{- with .Values.auth.extraVolumeMounts -}}{{- $extraMounts = printf "\n%s" (toYaml .) -}}{{- end -}}
+{{- $extraVolumes := "" -}}
+{{- with .Values.auth.extraVolumes -}}{{- $extraVolumes = printf "\n%s" (toYaml .) -}}{{- end -}}
 apiVersion: v1
 kind: Service
 metadata:
@@ -128,11 +133,15 @@ spec:
             periodSeconds: 10
           resources:
             {{- toYaml .Values.auth.resources | nindent 12 }}
-          {{- with (printf "%s%s%s" (include "push.identityMounts" (dict "root" . "key" "auth" "postgres" true "redis" true)) (include "push.signInMounts" .) (include "push.applicationMounts" (dict "root" . "component" "auth"))) | trim }}
+          {{- with (printf "%s%s%s%s" (include "push.identityMounts" (dict "root" . "key" "auth" "postgres" true "redis" true)) (include "push.signInMounts" .) (include "push.applicationMounts" (dict "root" . "component" "auth")) $extraMounts) | trim }}
           volumeMounts:
             {{- . | nindent 12 }}
           {{- end }}
-      {{- with (printf "%s%s%s" (include "push.identityVolumes" (dict "root" . "key" "auth" "postgres" true "redis" true)) (include "push.signInVolumes" .) (include "push.applicationVolumes" .)) | trim }}
+        {{- with .Values.auth.extraContainers }}
+        # auth.extraContainers, verbatim (e.g. an external token validator sidecar).
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with (printf "%s%s%s%s" (include "push.identityVolumes" (dict "root" . "key" "auth" "postgres" true "redis" true)) (include "push.signInVolumes" .) (include "push.applicationVolumes" .) $extraVolumes) | trim }}
       volumes:
         {{- . | nindent 8 }}
       {{- end }}
