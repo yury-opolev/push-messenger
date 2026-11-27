@@ -450,7 +450,8 @@ auth-svc logs every refused token as `auth.entra.rejected` with a reason (never 
 | `malformed` (validator) | the validator's claims break the schema or differ from the token's `tid`/`oid`/`sub`; with `headers`, often a validator that returns no claim headers (see [Header protocol](#header-protocol)) |
 
 With an external token validator, refusals also carry `validator: true` and the attempt's
-`request_id`, the value sent to the validator in its correlation header.
+`request_id`, the value sent to the validator in its correlation header; so do the
+warnings "the token validator is unavailable". Without a validator no request id is made.
 
 ## 9. Acceptance on your tenant
 
@@ -524,14 +525,14 @@ PUSH_ENTRA_VALIDATOR_URL"), rather than silently ignored.
 
 | Variable | Meaning | Default |
 |---|---|---|
-| `PUSH_ENTRA_VALIDATOR_URL` | The validator endpoint: `https://` anywhere, or `http://` only to a loopback host (`127.0.0.1`, `[::1]`, `localhost`), i.e. a sidecar in the same pod. A path and query are allowed; user info and a fragment are refused. Unset or empty: built-in validation | unset |
+| `PUSH_ENTRA_VALIDATOR_URL` | The validator endpoint: `https://` anywhere, or `http://` only to a loopback host (`127.0.0.1`, `[::1]`, `localhost`), i.e. a sidecar in the same pod. A path and query are allowed; user info and a fragment are refused. A refused URL with user info or a query is not shown in the error. Unset or empty: built-in validation | unset |
 | `PUSH_ENTRA_VALIDATOR_PROTOCOL` | `json` or `headers` (case-insensitive) | `json` |
 | `PUSH_ENTRA_VALIDATOR_TIMEOUT_MS` | Time limit of the whole request, connecting and reading the answer included: a whole number from 100 to 10000 | `2000` |
 | `PUSH_ENTRA_VALIDATOR_SECRET_FILE` | Path of a file whose trimmed content is sent as `X-Push-Validator-Secret`; read once at start-up; must hold 1 to 1024 visible ASCII characters (no spaces). Unset: no secret header | unset |
 | `PUSH_ENTRA_VALIDATOR_REQUEST_HEADERS` | Static headers sent with every validator request, in both protocols: `Name: value` entries separated by newlines or `;`, or a JSON object of strings (`{"Name": "value"}`). At most 32; names are RFC 9110 tokens, unique case-insensitively, and not [reserved](#request-headers-both-protocols); values are trimmed, 1 to 1024 characters of visible ASCII with inner spaces or tabs. In the `Name: value` form `;` separates entries, so a value containing `;` needs the JSON form (the chart always renders JSON). Values are never logged | none |
 | `PUSH_ENTRA_VALIDATOR_CORRELATION_HEADER` | The header carrying each sign-in attempt's request id, in both protocols: an RFC 9110 token, not a reserved name. Set but empty: no request id is sent | `X-Request-Id` |
 | `PUSH_ENTRA_VALIDATOR_CLAIM_HEADER_PREFIX` | `headers` protocol: the name prefix (an RFC 9110 token, case-insensitive) of response headers carrying one claim as text | `Subject-Token-Claim-` |
-| `PUSH_ENTRA_VALIDATOR_ENCODED_CLAIM_HEADER_PREFIX` | `headers` protocol: the name prefix of response headers carrying one claim as base64 of UTF-8 text; it must not be the beginning of the plain prefix. Set but empty: no encoded claims are read | `Subject-Token-Encoded-Claim-` |
+| `PUSH_ENTRA_VALIDATOR_ENCODED_CLAIM_HEADER_PREFIX` | `headers` protocol: the name prefix of response headers carrying one claim as base64 of UTF-8 text; it must not be the beginning of the plain prefix, defaults included (a plain prefix such as `Subject-Token-Encoded-Claim-X-` with this variable unset is refused, naming `PUSH_ENTRA_VALIDATOR_CLAIM_HEADER_PREFIX`; with both set, this variable is named). Set but empty: no encoded claims are read | `Subject-Token-Encoded-Claim-` |
 
 The two prefixes are read and checked with either protocol but used only by `headers`.
 
@@ -723,9 +724,10 @@ a bare status unless a request header asks for the claims, for example
   | Claim | Becomes |
   |---|---|
   | `exp`, `nbf`, `iat` | exactly one header with an (optionally signed) decimal integer, a JSON number; anything else, or a repeated header, is `malformed` |
-  | `roles`, `aud`, and any other claim whose single value begins with `[` | multi-valued: each header value is a JSON array of strings (when it begins with `[`) or a list split on commas and white space; repeated headers add up; empty items are dropped. `roles` (and a `[` claim) is always an array of strings; `aud` is a string when it has exactly one item, else an array |
-  | `scp` | the same items joined by single spaces, as in the token (`access_as_user Other.Read`), whether returned as one header, a JSON array, a comma list or repeated headers |
-  | any other claim | the trimmed text of exactly one header, a string; a repeated header is `malformed` |
+  | `roles`, `aud` | multi-valued: each header value is a JSON array of strings (when it begins with `[`; one that is not is `malformed`) or a list split on commas and white space; repeated headers add up; empty items are dropped. `roles` is always an array of strings; `aud` is a string when it has exactly one item, else an array |
+  | `scp` | the same items joined by single spaces, as in the token (`access_as_user Other.Read`), whether returned as one header, a JSON array, a comma list or repeated headers; a value beginning with `[` that is not a JSON array of strings is read as a list |
+  | `iss`, `tid`, `oid`, `sub`, `azp`, `appid`, `idtyp`, `name`, `preferred_username`, `email`, `ver` | the trimmed text of exactly one header, a string, even when it begins with `[` (a display name such as `[EXT] Jane Doe`); a repeated header is `malformed` |
+  | any other claim | exactly one header (a repeated header is `malformed`): an array of strings when its value is a JSON array of strings, else its trimmed text, a string (`[not json` stays text) |
 
   Unknown claims are kept, under their lower-case name, in the principal's claims.
 - **Limits**, checked before anything is decoded: at most 64 claim headers (plain and
@@ -940,7 +942,8 @@ contract keeps working; it now also receives `Original-Uri`, `Original-Method`,
 `X-Forwarded-For` and `X-Request-Id`, which it may ignore (an empty
 `PUSH_ENTRA_VALIDATOR_CORRELATION_HEADER` drops the request id). The `Authenticator` trait
 gains `authenticate_with(token, &RequestMeta)`, which defaults to `authenticate`: external
-authenticators need no change.
+authenticators need no change. A wrapper that builds these types in code may need a
+one-line change, see [Your own wrapper](#your-own-wrapper).
 
 ## Your own wrapper
 
@@ -965,6 +968,19 @@ built-in Entra ID check (keeping the provider id `entra`, so `/v1/auth/entra` an
 the group `EXAMPLE_REQUIRED_GROUP` (the API registration must emit the `groups` claim). It
 runs with `PUSH_AUTH_PROVIDERS=external` (plus `password` if wanted) and the usual
 `PUSH_ENTRA_*` variables, which the wrapper reads itself (`EntraSettings::from_env`).
+
+**Public API additions of the external token validator** (`push-auth-core`, additive):
+
+- `EntraSettings` gains `pub validator: Option<ValidatorSettings>`: a wrapper that builds
+  `EntraSettings` with a struct literal adds `validator: None` (or uses
+  `EntraSettings::from_env`, which reads `PUSH_ENTRA_VALIDATOR_*`). `EntraSignIn::new`
+  refuses `ValidatorSettings` built in code that the variables would refuse.
+- `entra::Reason` gains `Reason::Validator`: an exhaustive `match` on it needs an arm.
+- `identity::RequestMeta` (`original_uri`, `method`, `client_ip`, `request_id`; build it
+  with `RequestMeta::default()`, it is `#[non_exhaustive]`) and the `Authenticator` method
+  `authenticate_with(token, &RequestMeta)`, which defaults to `authenticate`: an
+  authenticator may override it to see the sign-in request; `request_id` is set only for a
+  route checked by an external token validator.
 
 Rules the service enforces at start-up: `external` needs an authenticator and an
 authenticator needs `external`; its id is 1 to 32 lower-case letters, digits or `-`, not a

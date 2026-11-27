@@ -88,8 +88,11 @@ Notable changes for consumers of push-messenger. Newest first.
   `X-Request-Id`), `_CLAIM_HEADER_PREFIX` and `_ENCODED_CLAIM_HEADER_PREFIX`. Chart:
   `auth.signIn.entra.validator.url|protocol|timeoutMs|secretFile|correlationHeader|requestHeaders|claimHeaderPrefix|encodedClaimHeaderPrefix`
   and generic `auth.extraContainers`, `auth.extraVolumes`, `auth.extraVolumeMounts` for a
-  sidecar. The `Authenticator` trait gains a defaulted `authenticate_with(token,
-  &RequestMeta)`. Unset, behaviour, logs and chart output are unchanged.
+  sidecar. Public API additions in `push-auth-core`: `EntraSettings.validator` (struct
+  literals need `validator: None`), `Reason::Validator` (exhaustive matches need an arm),
+  `RequestMeta` and the defaulted `Authenticator::authenticate_with(token, &RequestMeta)`
+  (its `request_id` is set only in validator mode). Unset, behaviour, logs and chart
+  output are unchanged.
 
 - **Proactive agents**
   ([design](docs/superpowers/specs/2026-11-09-proactive-agents.md)): an owned agent may
