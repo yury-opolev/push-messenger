@@ -2,6 +2,7 @@
 {{- include "push.checkSecretSelection" . -}}
 {{- include "push.checkEmail" . -}}
 {{- include "push.checkSignIn" . -}}
+{{- include "push.checkValidator" . -}}
 {{- include "push.checkIngress" . -}}
 {{- include "push.checkDatastores" . -}}
 {{- include "push.checkCalls" . -}}

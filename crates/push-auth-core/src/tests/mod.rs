@@ -40,7 +40,7 @@ use crate::directory::NoDirectory;
 use crate::entra::testing::{StubOpenId, TENANT};
 use crate::entra::{EntraIdentity, EntraSignIn, KeyTiming};
 use crate::identity::{
-    Admission, AdmissionDecision, AuthenticationError, Authenticator, Principal,
+    Admission, AdmissionDecision, AuthenticationError, Authenticator, Principal, RequestMeta,
 };
 use crate::limits::{Limits, MemoryCounter};
 use crate::links::LinkSigner;
@@ -241,6 +241,8 @@ impl World {
 pub(crate) struct FakeIdentity {
     pub provider: String,
     pub calls: AtomicUsize,
+    /// The request metadata of the last sign-in.
+    pub meta: Mutex<Option<RequestMeta>>,
 }
 
 impl FakeIdentity {
@@ -248,6 +250,7 @@ impl FakeIdentity {
         Arc::new(Self {
             provider: provider.to_owned(),
             calls: AtomicUsize::new(0),
+            meta: Mutex::new(None),
         })
     }
 
@@ -269,6 +272,15 @@ impl Authenticator for FakeIdentity {
 
     fn max_session(&self) -> Duration {
         Duration::from_secs(2 * 3600)
+    }
+
+    async fn authenticate_with(
+        &self,
+        token: &str,
+        meta: &RequestMeta,
+    ) -> Result<Principal, AuthenticationError> {
+        *self.meta.lock().unwrap() = Some(meta.clone());
+        self.authenticate(token).await
     }
 
     async fn authenticate(&self, token: &str) -> Result<Principal, AuthenticationError> {

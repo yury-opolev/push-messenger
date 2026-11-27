@@ -11,7 +11,7 @@ repository.workspace = true
 [features]
 # The stub OpenID issuer and RSA test keys of Microsoft Entra ID sign-in, for tests in
 # other crates (push-smoke, push-auth's example). Never enabled by a service binary.
-testing = []
+testing = ["tokio-util/io"]
 
 [dependencies]
 anyhow.workspace = true
@@ -48,6 +48,7 @@ md-5 = "0.10"
 testcontainers-modules.workspace = true
 tokio = { workspace = true, features = ["io-util"] }
 tokio-stream.workspace = true
+tokio-util = { workspace = true, features = ["io"] }
 tower.workspace = true
 
 [lints]

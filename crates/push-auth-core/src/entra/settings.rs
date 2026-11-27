@@ -6,6 +6,7 @@ use std::time::Duration;
 use reqwest::Url;
 use uuid::Uuid;
 
+use super::ValidatorSettings;
 use crate::config::ConfigError;
 
 /// Microsoft Entra ID in the global Azure cloud.
@@ -99,6 +100,9 @@ pub struct EntraSettings {
     pub client_apps: Vec<Uuid>,
     /// How long an Entra-backed device stays signed in without a new Entra sign-in.
     pub max_session: Duration,
+    /// An external token validator replacing the built-in signature check
+    /// (`PUSH_ENTRA_VALIDATOR_*`); `None` checks tokens against Entra ID's published keys.
+    pub validator: Option<ValidatorSettings>,
 }
 
 impl EntraSettings {
@@ -158,6 +162,7 @@ impl EntraSettings {
                 "PUSH_ENTRA_MAX_SESSION_HOURS",
             ],
         )?;
+        let validator = ValidatorSettings::from_lookup(lookup)?;
         Ok(Self {
             authority_host,
             tenants,
@@ -166,6 +171,7 @@ impl EntraSettings {
             required_role,
             client_apps,
             max_session,
+            validator,
         })
     }
 

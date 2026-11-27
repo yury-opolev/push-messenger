@@ -241,6 +241,29 @@ impl Auth {
             })
     }
 
+    /// The public base URL, without a trailing `/`.
+    pub(crate) fn public_url(&self) -> &str {
+        &self.public_url
+    }
+
+    /// Whether an external token validator checks the tokens of `provider`: only the
+    /// built-in `entra` and `entra-app` can use one, never an external authenticator.
+    pub(crate) fn external_validation(&self, provider: &str) -> bool {
+        match provider {
+            crate::identity::ENTRA_PROVIDER => self
+                .sign_in
+                .entra
+                .as_ref()
+                .is_some_and(EntraSignIn::uses_validator),
+            crate::identity::ENTRA_APP_PROVIDER => self
+                .identity
+                .entra_app
+                .as_ref()
+                .is_some_and(crate::entra::EntraAppSignIn::uses_validator),
+            _ => false,
+        }
+    }
+
     /// The admission every sign-in by token passes, if any.
     pub fn admission(&self) -> Option<&Arc<dyn Admission>> {
         self.identity.admission.as_ref()

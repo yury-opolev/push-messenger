@@ -292,14 +292,16 @@ jobs:
           registry: true
       - name: Build coturn and push it to the kind registry
         id: coturn
+        # The runner's Docker pushes through localhost:5000 (it trusts only loopback
+        # registries over plain HTTP); the nodes pull the same image as kind-registry:5000.
         run: |
-          image=kind-registry:5000/push-coturn:ci
+          image=localhost:5000/push-coturn:ci
           docker build -f deploy/docker/coturn.Dockerfile -t "$image" deploy/docker
           docker push "$image"
-          repo_digest=$(docker image inspect "$image" --format '{{range .RepoDigests}}{{println .}}{{end}}' | grep -m1 '^kind-registry:5000/push-coturn@')
+          repo_digest=$(docker image inspect "$image" --format '{{range .RepoDigests}}{{println .}}{{end}}' | grep -m1 '^localhost:5000/push-coturn@')
           digest="${repo_digest#*@}"
           test -n "$digest"
-          echo "ref=$image@$digest" >> "$GITHUB_OUTPUT"
+          echo "ref=kind-registry:5000/push-coturn:ci@$digest" >> "$GITHUB_OUTPUT"
       - shell: pwsh
         run: ./deploy/helm/test-chart-cluster.ps1 -Context kind-push-chart -CoturnImage '${{ steps.coturn.outputs.ref }}' -CopyBinary $false
 

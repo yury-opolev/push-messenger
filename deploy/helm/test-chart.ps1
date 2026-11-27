@@ -1546,6 +1546,240 @@ Check 'sign-in egress: without Entra sign-in the list adds nothing' {
     $rendered -notmatch '20\.190\.128\.0/18'
 }
 
+# ---- External Entra token validator ----
+$validatorArgs = @('--set', 'auth.signIn.entra.validator.url=http://127.0.0.1:8099/validate',
+    '--set', 'auth.signIn.entra.validator.timeoutMs=500')
+Check 'validator: its variables reach auth-svc with Entra sign-in; the secret file only when set' {
+    $secretArgs = $validatorArgs + @('--set', 'auth.signIn.entra.validator.secretFile=/etc/push/validator/secret')
+    $rendered = helm template push $chart @signInArgs @secretArgs 2>&1 | Out-String
+    $exit = $LASTEXITCODE
+    $auth = Doc $rendered 'Deployment' 'push-auth'
+    $noSecret = Doc (helm template push $chart @signInArgs @validatorArgs | Out-String) 'Deployment' 'push-auth'
+    $app = Doc (helm template push $chart @appSignInArgs @secretArgs | Out-String) 'Deployment' 'push-auth'
+    $exit -eq 0 -and
+        $auth -match '(?s)name: PUSH_ENTRA_VALIDATOR_URL\s+value: "http://127.0.0.1:8099/validate"' -and
+        $auth -match '(?s)name: PUSH_ENTRA_VALIDATOR_PROTOCOL\s+value: "json"' -and
+        $auth -match '(?s)name: PUSH_ENTRA_VALIDATOR_TIMEOUT_MS\s+value: "500"' -and
+        $auth -match '(?s)name: PUSH_ENTRA_VALIDATOR_CORRELATION_HEADER\s+value: "X-Request-Id"' -and
+        $auth -match '(?s)name: PUSH_ENTRA_VALIDATOR_SECRET_FILE\s+value: "/etc/push/validator/secret"' -and
+        $auth -notmatch 'PUSH_ENTRA_VALIDATOR_(REQUEST_HEADERS|CLAIM_HEADER_PREFIX|ENCODED_CLAIM_HEADER_PREFIX)' -and
+        $noSecret -match '(?s)name: PUSH_ENTRA_VALIDATOR_URL\s+value: "http://127.0.0.1:8099/validate"' -and
+        $noSecret -match '(?s)name: PUSH_ENTRA_VALIDATOR_TIMEOUT_MS\s+value: "500"' -and
+        $noSecret -notmatch 'PUSH_ENTRA_VALIDATOR_SECRET_FILE' -and
+        $app -match '(?s)name: PUSH_ENTRA_VALIDATOR_URL\s+value: "http://127.0.0.1:8099/validate"' -and
+        $app -match '(?s)name: PUSH_ENTRA_VALIDATOR_SECRET_FILE\s+value: "/etc/push/validator/secret"' -and
+        $app -match '(?s)name: PUSH_ENTRA_VALIDATOR_PROTOCOL\s+value: "json"' -and
+        @($rendered -split "(?m)^---\s*$" | Where-Object {
+            $_ -match '(?m)^kind: (Deployment|StatefulSet|Job|Pod)\s*$' -and $_ -notmatch '(?m)^  name: push-auth\s*$' -and
+                $_ -match 'PUSH_ENTRA_VALIDATOR' }).Count -eq 0
+}
+Check 'validator: off by default, without a URL, and without Entra sign-in' {
+    $password = helm template push $chart @validatorArgs 2>&1 | Out-String
+    $passwordExit = $LASTEXITCODE
+    (helm template push $chart | Out-String) -notmatch 'PUSH_ENTRA_VALIDATOR' -and
+        (helm template push $chart @signInArgs | Out-String) -notmatch 'PUSH_ENTRA_VALIDATOR' -and
+        $passwordExit -eq 0 -and $password -notmatch 'PUSH_ENTRA_VALIDATOR'
+}
+Check 'validator: https anywhere, http only to a loopback host' {
+    $ok = foreach ($url in 'https://validator.example/check', 'http://[::1]:9/x', 'http://localhost:9/',
+        'http://127.0.0.1', 'https://validator.example:8443', 'http://127.0.0.1:65535/',
+        'https://validator.example:65535/check?tier=1', 'https://[2001:db8::1]:8443/x',
+        'https://[2001:db8::1]/x') {
+        Render ($signInArgs + @('--set', "auth.signIn.entra.validator.url=$url"))
+    }
+    @($ok | Where-Object { $_ -ne 0 }).Count -eq 0
+}
+Check 'validator: unsafe URLs, timeouts and secret files are refused' {
+    $bad = @(
+        'auth.signIn.entra.validator.url=http://validator.example/',
+        'auth.signIn.entra.validator.url=http://10.0.0.5:8080/',
+        'auth.signIn.entra.validator.url=http://127.0.0.1.example/',
+        'auth.signIn.entra.validator.url=http://localhost@evil.example/',
+        'auth.signIn.entra.validator.url=ftp://127.0.0.1/',
+        'auth.signIn.entra.validator.url=https://u:p@h.example/',
+        'auth.signIn.entra.validator.url=https://',
+        'auth.signIn.entra.validator.url=127.0.0.1:8099',
+        'auth.signIn.entra.validator.url=https://v.example/#f',
+        'auth.signIn.entra.validator.url=http://127.0.0.1/#x',
+        'auth.signIn.entra.validator.url=http://127.0.0.1:99999/',
+        'auth.signIn.entra.validator.url=https://v.example:65536/',
+        'auth.signIn.entra.validator.url=https://v.example:99999999999999999999/',
+        'auth.signIn.entra.validator.url=https://[::1]:70000/',
+        'auth.signIn.entra.validator.url=https://host:abc/',
+        'auth.signIn.entra.validator.url=https://host:8443:1/',
+        'auth.signIn.entra.validator.url=https://2001:db8::1/',
+        'auth.signIn.entra.validator.timeoutMs=99',
+        'auth.signIn.entra.validator.timeoutMs=10001',
+        'auth.signIn.entra.validator.timeoutMs=1.5',
+        'auth.signIn.entra.validator.secretFile=secret',
+        'auth.signIn.entra.validator.secretFile=/etc/push/a b'
+    )
+    $message = helm template push $chart --set auth.signIn.entra.validator.url=http://validator.example/ 2>&1 | Out-String
+    $messageExit = $LASTEXITCODE
+    @($bad | Where-Object { (Render ($signInArgs + @('--set', $_))) -eq 0 }).Count -eq 0 -and
+        $messageExit -ne 0 -and $message -match 'auth.signIn.entra.validator.url must be https://, or http:// only to a loopback host' -and
+        (Render @('--set', 'auth.signIn.entra.validator.url=http://10.0.0.5:8080/')) -ne 0 -and
+        (Render @('--set-json', 'auth.signIn.entra.validator.url=8099')) -ne 0 -and
+        (Render ($signInArgs + @('--set', 'auth.signIn.entra.validator.url=https://v.example/', '--set', 'auth.signIn.entra.validator.timeoutMs=100'))) -eq 0 -and
+        (Render ($signInArgs + @('--set', 'auth.signIn.entra.validator.url=https://v.example/', '--set', 'auth.signIn.entra.validator.timeoutMs=10000'))) -eq 0
+}
+# push-auth's container env as a hashtable (name -> value), or $null when the render fails.
+function AuthEnv([string[]] $arguments) {
+    $rendered = helm template push $chart @arguments 2>$null | Out-String
+    if ($LASTEXITCODE -ne 0) { return $null }
+    $script = @'
+import sys, json, yaml
+docs = [d for d in yaml.safe_load_all(sys.stdin.read()) if d]
+auth = next(d for d in docs if d["kind"] == "Deployment" and d["metadata"]["name"] == "push-auth")
+container = next(c for c in auth["spec"]["template"]["spec"]["containers"] if c["name"] == "auth")
+print(json.dumps({e["name"]: e.get("value") for e in container.get("env", [])}))
+'@
+    $json = $rendered | & $python.Source -c $script
+    if ($LASTEXITCODE -ne 0) { return $null }
+    $json | ConvertFrom-Json -AsHashtable
+}
+$headerArgs = $signInArgs + $validatorArgs + @('--set', 'auth.signIn.entra.validator.protocol=headers',
+    '--set-json', 'auth.signIn.entra.validator.requestHeaders={"X-Tier":"gold","Return-All-Subject-Token-Claims":"1"}')
+Check 'validator headers: the protocol, sorted request headers, correlation header and both prefixes reach auth-svc' {
+    $vars = AuthEnv $headerArgs
+    $app = AuthEnv ($headerArgs + @('--set', 'auth.signIn.providers=entra-app'))
+    $upper = AuthEnv ($signInArgs + $validatorArgs + @('--set', 'auth.signIn.entra.validator.protocol=HEADERS',
+        '--set', 'auth.signIn.entra.validator.correlationHeader=X-Correlation-Id',
+        '--set', 'auth.signIn.entra.validator.claimHeaderPrefix=X-Claim-',
+        '--set', 'auth.signIn.entra.validator.encodedClaimHeaderPrefix='))
+    $null -ne $vars -and $null -ne $app -and $null -ne $upper -and
+        $vars['PUSH_ENTRA_VALIDATOR_URL'] -ceq 'http://127.0.0.1:8099/validate' -and
+        $vars['PUSH_ENTRA_VALIDATOR_PROTOCOL'] -ceq 'headers' -and
+        $vars['PUSH_ENTRA_VALIDATOR_TIMEOUT_MS'] -ceq '500' -and
+        $vars['PUSH_ENTRA_VALIDATOR_CORRELATION_HEADER'] -ceq 'X-Request-Id' -and
+        $vars['PUSH_ENTRA_VALIDATOR_REQUEST_HEADERS'] -ceq '{"Return-All-Subject-Token-Claims":"1","X-Tier":"gold"}' -and
+        $vars['PUSH_ENTRA_VALIDATOR_CLAIM_HEADER_PREFIX'] -ceq 'Subject-Token-Claim-' -and
+        $vars['PUSH_ENTRA_VALIDATOR_ENCODED_CLAIM_HEADER_PREFIX'] -ceq 'Subject-Token-Encoded-Claim-' -and
+        -not $vars.ContainsKey('PUSH_ENTRA_VALIDATOR_SECRET_FILE') -and
+        $app['PUSH_ENTRA_VALIDATOR_PROTOCOL'] -ceq 'headers' -and
+        $app['PUSH_ENTRA_VALIDATOR_REQUEST_HEADERS'] -ceq '{"Return-All-Subject-Token-Claims":"1","X-Tier":"gold"}' -and
+        $upper['PUSH_ENTRA_VALIDATOR_PROTOCOL'] -ceq 'headers' -and
+        $upper['PUSH_ENTRA_VALIDATOR_CORRELATION_HEADER'] -ceq 'X-Correlation-Id' -and
+        $upper['PUSH_ENTRA_VALIDATOR_CLAIM_HEADER_PREFIX'] -ceq 'X-Claim-' -and
+        $upper.ContainsKey('PUSH_ENTRA_VALIDATOR_ENCODED_CLAIM_HEADER_PREFIX') -and
+        $upper['PUSH_ENTRA_VALIDATOR_ENCODED_CLAIM_HEADER_PREFIX'] -ceq '' -and
+        -not $upper.ContainsKey('PUSH_ENTRA_VALIDATOR_REQUEST_HEADERS')
+}
+Check 'validator json: the protocol and correlation header render without prefixes; an empty correlation header renders empty' {
+    $json = AuthEnv ($signInArgs + $validatorArgs + @('--set-json',
+        'auth.signIn.entra.validator.requestHeaders={"X-Tier":"gold"}'))
+    $empty = AuthEnv ($signInArgs + $validatorArgs + @('--set', 'auth.signIn.entra.validator.correlationHeader='))
+    $null -ne $json -and $null -ne $empty -and
+        $json['PUSH_ENTRA_VALIDATOR_PROTOCOL'] -ceq 'json' -and
+        $json['PUSH_ENTRA_VALIDATOR_CORRELATION_HEADER'] -ceq 'X-Request-Id' -and
+        $json['PUSH_ENTRA_VALIDATOR_REQUEST_HEADERS'] -ceq '{"X-Tier":"gold"}' -and
+        -not $json.ContainsKey('PUSH_ENTRA_VALIDATOR_CLAIM_HEADER_PREFIX') -and
+        -not $json.ContainsKey('PUSH_ENTRA_VALIDATOR_ENCODED_CLAIM_HEADER_PREFIX') -and
+        $empty.ContainsKey('PUSH_ENTRA_VALIDATOR_CORRELATION_HEADER') -and
+        $empty['PUSH_ENTRA_VALIDATOR_CORRELATION_HEADER'] -ceq '' -and
+        (Render ($signInArgs + $validatorArgs + @('--set', 'auth.signIn.entra.validator.correlationHeader=X-Correlation-Id',
+            '--set-json', 'auth.signIn.entra.validator.requestHeaders={"X-Request-Id":"1"}'))) -eq 0
+}
+Check 'validator request headers render as JSON: a value with ; stays one header' {
+    $semi = AuthEnv ($signInArgs + $validatorArgs + @('--set-json',
+        'auth.signIn.entra.validator.requestHeaders={"Prefer":"a=1; X-Injected: 2"}'))
+    $null -ne $semi -and
+        $semi['PUSH_ENTRA_VALIDATOR_REQUEST_HEADERS'] -ceq '{"Prefer":"a=1; X-Injected: 2"}'
+}
+Check 'validator headers: lint passes with the header protocol' {
+    helm lint $chart --strict @headerArgs 2>&1 | Out-Null
+    $LASTEXITCODE -eq 0
+}
+Check 'validator headers: nothing renders by default, without a URL, or without Entra sign-in' {
+    $protocolArgs = @('--set', 'auth.signIn.entra.validator.protocol=headers',
+        '--set-json', 'auth.signIn.entra.validator.requestHeaders={"X-Tier":"gold"}')
+    (helm template push $chart @signInArgs @protocolArgs | Out-String) -notmatch 'PUSH_ENTRA_VALIDATOR' -and
+        (helm template push $chart @validatorArgs @protocolArgs | Out-String) -notmatch 'PUSH_ENTRA_VALIDATOR'
+}
+Check 'validator headers: unknown protocols, bad or reserved request headers and bad prefixes are refused' {
+    $v = 'auth.signIn.entra.validator'
+    $many = '{' + ((1..33 | ForEach-Object { "`"X-H$_`":`"v`"" }) -join ',') + '}'
+    $max = '{' + ((1..32 | ForEach-Object { "`"X-H$_`":`"v`"" }) -join ',') + '}'
+    $bad = @(
+        @('--set', "$v.protocol=grpc"),
+        @('--set-json', "$v.protocol=1"),
+        @('--set-json', "$v.requestHeaders={`"authorization`":`"x`"}"),
+        @('--set-json', "$v.requestHeaders={`"HOST`":`"x`"}"),
+        @('--set-json', "$v.requestHeaders={`"x-forwarded-for`":`"x`"}"),
+        @('--set-json', "$v.requestHeaders={`"Original-Uri`":`"x`"}"),
+        @('--set-json', "$v.requestHeaders={`"content-type`":`"x`"}"),
+        @('--set-json', "$v.requestHeaders={`"X-Request-Id`":`"x`"}"),
+        @('--set-json', "$v.requestHeaders={`"x-push-validator-secret`":`"x`"}"),
+        @('--set-json', "$v.requestHeaders={`"TE`":`"x`"}"),
+        @('--set-json', "$v.requestHeaders={`"upgrade`":`"x`"}"),
+        @('--set-json', "$v.requestHeaders={`"Expect`":`"x`"}"),
+        @('--set-json', "$v.requestHeaders={`"Keep-Alive`":`"x`"}"),
+        @('--set-json', "$v.requestHeaders={`"Proxy-Authorization`":`"x`"}"),
+        @('--set-json', "$v.requestHeaders={`"proxy-connection`":`"x`"}"),
+        @('--set-json', "$v.requestHeaders={`"Trailer`":`"x`"}"),
+        @('--set', "$v.correlationHeader=X-Corr", '--set-json', "$v.requestHeaders={`"x-corr`":`"x`"}"),
+        @('--set-json', "$v.requestHeaders={`"bad name`":`"x`"}"),
+        @('--set-json', "$v.requestHeaders={`"X-A`":`"a\nb`"}"),
+        @('--set-json', "$v.requestHeaders={`"X-A`":`"a\rb`"}"),
+        @('--set-json', "$v.requestHeaders={`"X-A`":`"`"}"),
+        @('--set-json', "$v.requestHeaders={`"X-A`":`" a`"}"),
+        @('--set-json', "$v.requestHeaders={`"X-A`":`"$('a' * 1025)`"}"),
+        @('--set-json', "$v.requestHeaders={`"X-A`":1}"),
+        @('--set-json', "$v.requestHeaders={`"X-A`":true}"),
+        @('--set-json', "$v.requestHeaders={`"X-Tier`":`"a`",`"x-tier`":`"b`"}"),
+        @('--set-json', "$v.requestHeaders=$many"),
+        @('--set-json', "$v.requestHeaders=[`"X-A: 1`"]"),
+        @('--set', "$v.correlationHeader=bad header"),
+        @('--set', "$v.correlationHeader=Authorization"),
+        @('--set', "$v.correlationHeader=x-push-validator-secret"),
+        @('--set-json', "$v.correlationHeader=1"),
+        @('--set', "$v.claimHeaderPrefix="),
+        @('--set', "$v.claimHeaderPrefix=bad prefix"),
+        @('--set', "$v.encodedClaimHeaderPrefix=bad prefix"),
+        @('--set', "$v.encodedClaimHeaderPrefix=subject-token-claim-"),
+        @('--set', "$v.claimHeaderPrefix=X-Claim-Plain-", '--set', "$v.encodedClaimHeaderPrefix=X-Claim-")
+    )
+    $refused = @($bad | Where-Object { (Render ($signInArgs + $validatorArgs + @('--set-json', "$v.protocol=`"headers`"") + $_)) -ne 0 })
+    $message = helm template push $chart @signInArgs @validatorArgs --set-json "$v.requestHeaders={`"X-Leak`":`"hush-hush\nvalue`"}" 2>&1 | Out-String
+    $messageExit = $LASTEXITCODE
+    $number = helm template push $chart @signInArgs @validatorArgs --set-json "$v.requestHeaders={`"X-Num`":1}" 2>&1 | Out-String
+    $refused.Count -eq $bad.Count -and
+        $messageExit -ne 0 -and $message -match 'X-Leak' -and $message -notmatch 'hush-hush' -and
+        $number -match 'X-Num' -and $number -match 'quote' -and
+        (Render @('--set', "$v.protocol=grpc")) -ne 0 -and
+        (Render @('--set-json', "$v.requestHeaders={`"Host`":`"x`"}")) -ne 0 -and
+        (Render ($signInArgs + $validatorArgs + @('--set-json', "$v.requestHeaders=$max"))) -eq 0 -and
+        (Render ($signInArgs + $validatorArgs + @('--set-json', "$v.requestHeaders={`"X-Long`":`"$('a' * 1024)`"}"))) -eq 0 -and
+        (Render ($signInArgs + $validatorArgs + @('--set-json', "$v.requestHeaders={`"X-A`":`"a b\tc`"}"))) -eq 0
+}
+Check 'auth extras: sidecars, volumes and mounts render verbatim in the auth Deployment; lists only' {
+    $rendered = helm template push $chart @signInArgs @validatorArgs `
+        --set auth.signIn.entra.validator.secretFile=/etc/push/validator/secret `
+        --set-json 'auth.extraContainers=[{"name":"validator","image":"example/validator:1","ports":[{"containerPort":8099}]}]' `
+        --set-json 'auth.extraVolumes=[{"name":"validator-secret","secret":{"secretName":"validator-secret"}}]' `
+        --set-json 'auth.extraVolumeMounts=[{"name":"validator-secret","mountPath":"/etc/push/validator","readOnly":true}]' 2>$null | Out-String
+    $exit = $LASTEXITCODE
+    $extras = @'
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(sys.stdin.read()) if d]
+deployments = {d["metadata"]["name"]: d["spec"]["template"]["spec"] for d in docs if d["kind"] == "Deployment"}
+auth = deployments["push-auth"]
+assert [c["name"] for c in auth["containers"]] == ["auth", "validator"], auth["containers"]
+assert auth["containers"][1] == {"name": "validator", "image": "example/validator:1", "ports": [{"containerPort": 8099}]}
+assert {"name": "validator-secret", "secret": {"secretName": "validator-secret"}} in auth["volumes"], auth["volumes"]
+assert {"name": "validator-secret", "mountPath": "/etc/push/validator", "readOnly": True} in auth["containers"][0]["volumeMounts"]
+for name, spec in deployments.items():
+    if name != "push-auth":
+        assert "validator" not in yaml.safe_dump(spec), name
+'@
+    $parsed = $false
+    if ($exit -eq 0) { $rendered | & $python.Source -c $extras; $parsed = $LASTEXITCODE -eq 0 }
+    $parsed -and
+        (Render @('--set', 'auth.extraContainers=sidecar')) -ne 0 -and
+        (Render @('--set-json', 'auth.extraVolumes={"name":"v"}')) -ne 0 -and
+        (Render @('--set', 'auth.extraVolumeMounts=mount')) -ne 0
+}
+
 Check 'admin: off by default' {
     (helm template push $chart | Out-String) -notmatch 'PUSH_AUTH_ADMIN|auth-admin-token|name: admin|8082'
 }

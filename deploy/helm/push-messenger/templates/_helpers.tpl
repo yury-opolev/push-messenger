@@ -544,6 +544,100 @@ The admin listener is a boolean; its peers carry both label maps.
 {{- end -}}
 
 {{/*
+Checks the external token validator and the auth Deployment's extras whether or not Entra
+sign-in is on, as auth-svc would its PUSH_ENTRA_VALIDATOR_* variables: an https:// URL, or
+http:// only to a loopback host (a sidecar), never with user info; a 100 to 10000 ms
+timeout; an absolute secret file path; a json or headers protocol; request headers as a map
+of at most 32 RFC 9110 token names (none that auth-svc sets itself, nor the correlation
+header) to visible ASCII string values; token correlation header and claim header prefixes.
+Failure messages name a request header but never show its value. The extras are lists
+rendered verbatim.
+*/}}
+{{- define "push.checkValidator" -}}
+{{- $validator := .Values.auth.signIn.entra.validator -}}
+{{- if not (kindIs "string" $validator.url) -}}
+{{- fail "auth.signIn.entra.validator.url must be a string" -}}
+{{- end -}}
+{{- if $validator.url -}}
+{{- $https := regexMatch "(?i)^https://([^/@?#:\\[\\]\\s]+|\\[[0-9a-f:.]+\\])(:[0-9]+)?([/?][^#\\s]*)?$" $validator.url -}}
+{{- $loopback := regexMatch "(?i)^http://(127\\.0\\.0\\.1|localhost|\\[::1\\])(:[0-9]{1,5})?([/?][^#\\s]*)?$" $validator.url -}}
+{{- $port := regexFind ":[0-9]+$" (regexFind "^[a-zA-Z]+://[^/?#\\s]*" $validator.url) | trimPrefix ":" -}}
+{{- $portOk := or (not $port) (and (le (len $port) 5) (le (atoi $port) 65535)) -}}
+{{- if not (and (or $https $loopback) $portOk) -}}
+{{- fail "auth.signIn.entra.validator.url must be https://, or http:// only to a loopback host (127.0.0.1, [::1], localhost), without user info, fragment or a port above 65535" -}}
+{{- end -}}
+{{- end -}}
+{{- $ms := int $validator.timeoutMs -}}
+{{- if or (lt $ms 100) (gt $ms 10000) (ne (toString $ms) (toString $validator.timeoutMs)) -}}
+{{- fail "auth.signIn.entra.validator.timeoutMs must be a whole number of milliseconds from 100 to 10000" -}}
+{{- end -}}
+{{- if not (kindIs "string" $validator.secretFile) -}}
+{{- fail "auth.signIn.entra.validator.secretFile must be a string" -}}
+{{- end -}}
+{{- if and $validator.secretFile (not (regexMatch "^/[^\\s]+$" $validator.secretFile)) -}}
+{{- fail "auth.signIn.entra.validator.secretFile must be an absolute path without whitespace" -}}
+{{- end -}}
+{{- if not (and (kindIs "string" $validator.protocol) (has (lower (toString $validator.protocol)) (list "json" "headers"))) -}}
+{{- fail "auth.signIn.entra.validator.protocol must be json or headers" -}}
+{{- end -}}
+{{- $token := "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$" -}}
+{{- $reserved := list "authorization" "original-uri" "original-method" "x-forwarded-for" "host" "content-length" "content-type" "accept" "transfer-encoding" "connection" "x-push-validator-secret" "te" "upgrade" "expect" "keep-alive" "proxy-authorization" "proxy-connection" "trailer" -}}
+{{- $correlation := $validator.correlationHeader -}}
+{{- if not (kindIs "string" $correlation) -}}
+{{- fail "auth.signIn.entra.validator.correlationHeader must be a string" -}}
+{{- end -}}
+{{- if and $correlation (or (not (regexMatch $token $correlation)) (has (lower $correlation) $reserved)) -}}
+{{- fail (printf "auth.signIn.entra.validator.correlationHeader must be empty or a header name (RFC 9110 token) other than %s" (join ", " $reserved)) -}}
+{{- end -}}
+{{- if $correlation -}}
+{{- $reserved = append $reserved (lower $correlation) -}}
+{{- end -}}
+{{- $headers := $validator.requestHeaders -}}
+{{- if not (kindIs "map" $headers) -}}
+{{- fail "auth.signIn.entra.validator.requestHeaders must be a map of header name to value" -}}
+{{- end -}}
+{{- if gt (len $headers) 32 -}}
+{{- fail "auth.signIn.entra.validator.requestHeaders must have at most 32 headers" -}}
+{{- end -}}
+{{- $seen := dict -}}
+{{- range $name := keys $headers | sortAlpha -}}
+{{- $value := index $headers $name -}}
+{{- if not (regexMatch $token $name) -}}
+{{- fail (printf "auth.signIn.entra.validator.requestHeaders: %q is not a header name (RFC 9110 token)" $name) -}}
+{{- end -}}
+{{- if has (lower $name) $reserved -}}
+{{- fail (printf "auth.signIn.entra.validator.requestHeaders.%s is reserved: auth-svc sets it itself (reserved, case-insensitively: %s)" $name (join ", " $reserved)) -}}
+{{- end -}}
+{{- if hasKey $seen (lower $name) -}}
+{{- fail (printf "auth.signIn.entra.validator.requestHeaders.%s is set twice (header names are case-insensitive)" $name) -}}
+{{- end -}}
+{{- $_ := set $seen (lower $name) true -}}
+{{- if not (kindIs "string" $value) -}}
+{{- fail (printf "auth.signIn.entra.validator.requestHeaders.%s must be a string: quote values such as \"1\"" $name) -}}
+{{- end -}}
+{{- if or (gt (len $value) 1024) (not (regexMatch "^[!-~]([ \\t!-~]*[!-~])?$" $value)) -}}
+{{- fail (printf "auth.signIn.entra.validator.requestHeaders.%s must be 1-1024 characters of visible ASCII with inner spaces or tabs, without line breaks (value not shown)" $name) -}}
+{{- end -}}
+{{- end -}}
+{{- $prefix := $validator.claimHeaderPrefix -}}
+{{- if not (and (kindIs "string" $prefix) (regexMatch $token (toString $prefix))) -}}
+{{- fail "auth.signIn.entra.validator.claimHeaderPrefix must be a non-empty header name prefix (RFC 9110 token)" -}}
+{{- end -}}
+{{- $encoded := $validator.encodedClaimHeaderPrefix -}}
+{{- if not (kindIs "string" $encoded) -}}
+{{- fail "auth.signIn.entra.validator.encodedClaimHeaderPrefix must be a string" -}}
+{{- end -}}
+{{- if and $encoded (or (not (regexMatch $token $encoded)) (hasPrefix (lower $encoded) (lower $prefix))) -}}
+{{- fail "auth.signIn.entra.validator.encodedClaimHeaderPrefix must be empty or a header name prefix (RFC 9110 token) that does not begin claimHeaderPrefix (equal to or a prefix of it)" -}}
+{{- end -}}
+{{- range $name := list "extraContainers" "extraVolumes" "extraVolumeMounts" -}}
+{{- if not (kindIs "slice" (index $.Values.auth $name)) -}}
+{{- fail (printf "auth.%s must be a list" $name) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
 "true" when the chart itself points a workload's SSL_CERT_FILE at Plan 12B's authority CA
 bundle (injection chart). Arguments: root, key.
 */}}
@@ -564,7 +658,8 @@ sets its SSL_CERT_FILE, push.checkSignIn insists on the same ConfigMap and that 
 auth-svc's sign-in variables (spec 2026-10-19 §3), as env list entries; nothing for the
 default (password only). The proxy serves only auth-svc's requests to Entra ID (reqwest):
 gRPC and the datastores never read it. A CA bundle replaces the system roots for every TLS
-connection auth-svc makes (rustls-native-certs reads SSL_CERT_FILE alone).
+connection auth-svc makes (rustls-native-certs reads SSL_CERT_FILE alone). The external
+token validator's variables come only with Entra sign-in and a validator URL.
 */}}
 {{- define "push.signInEnv" -}}
 {{- $signIn := .Values.auth.signIn -}}
@@ -626,6 +721,33 @@ connection auth-svc makes (rustls-native-certs reads SSL_CERT_FILE alone).
 {{- if include "push.signInCa" . }}
 - name: SSL_CERT_FILE
   value: "/etc/push/entra-ca/ca.crt"
+{{- end }}
+{{- with $entra.validator }}
+{{- if .url }}
+- name: PUSH_ENTRA_VALIDATOR_URL
+  value: {{ .url | quote }}
+- name: PUSH_ENTRA_VALIDATOR_PROTOCOL
+  value: {{ lower .protocol | quote }}
+- name: PUSH_ENTRA_VALIDATOR_TIMEOUT_MS
+  value: {{ int .timeoutMs | quote }}
+- name: PUSH_ENTRA_VALIDATOR_CORRELATION_HEADER
+  value: {{ .correlationHeader | quote }}
+{{- with .secretFile }}
+- name: PUSH_ENTRA_VALIDATOR_SECRET_FILE
+  value: {{ . | quote }}
+{{- end }}
+{{- with .requestHeaders }}
+{{- /* JSON (keys sorted): a value may hold `;`, which separates entries in the text form. */}}
+- name: PUSH_ENTRA_VALIDATOR_REQUEST_HEADERS
+  value: {{ toJson . | quote }}
+{{- end }}
+{{- if eq (lower .protocol) "headers" }}
+- name: PUSH_ENTRA_VALIDATOR_CLAIM_HEADER_PREFIX
+  value: {{ .claimHeaderPrefix | quote }}
+- name: PUSH_ENTRA_VALIDATOR_ENCODED_CLAIM_HEADER_PREFIX
+  value: {{ .encodedClaimHeaderPrefix | quote }}
+{{- end }}
+{{- end }}
 {{- end }}
 {{- end }}
 {{- end -}}

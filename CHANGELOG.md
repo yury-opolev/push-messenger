@@ -65,6 +65,35 @@ Notable changes for consumers of push-messenger. Newest first.
 
 ### Added
 
+- **External token validator for the Entra ID providers** (opt-in;
+  [design](docs/superpowers/specs/2026-11-27-entra-external-validator-design.md),
+  [guide](docs/entra-sign-in.md#external-token-validator)). For organizations that mandate
+  their own token validation library or sidecar: with `PUSH_ENTRA_VALIDATOR_URL` set,
+  auth-svc keeps its local pre-checks (size, segments, `alg` RS256 and `kid`, admitted
+  `tid`, issuer), then sends the token as `Authorization: Bearer` to the validator instead
+  of fetching Entra ID's keys, re-checks the returned claims (schema, `tid`/`oid`/`sub`
+  match, tenant, issuer, audience, `exp`/`nbf`) and applies its unchanged policy, accounts
+  and sessions, so a validator can only narrow who signs in. Two wire protocols
+  (`PUSH_ENTRA_VALIDATOR_PROTOCOL`): `json` (default; POST `{"provider": "entra"|"entra-app"}`,
+  200 `{"claims": {…}}`, 401 with an optional reason) and `headers` (forward-auth as for
+  nginx `auth_request` / Envoy `ext_authz`: an empty POST, 2xx with the claims in
+  `Subject-Token-Claim-*` or base64 `Subject-Token-Encoded-Claim-*` response headers, 401
+  and 403 refuse). Both send `Original-Uri`, `Original-Method`, `X-Forwarded-For`, a
+  per-attempt request id and configured static headers. Any other answer, a timeout or an
+  oversized answer fails closed with 503 (no fallback to built-in keys, no caching).
+  Refusals log `validator: true` and `request_id`; the token is never logged. New
+  variables `PUSH_ENTRA_VALIDATOR_URL` (`https://`, or `http://` to a loopback host),
+  `_PROTOCOL`, `_TIMEOUT_MS` (100–10000, default 2000), `_SECRET_FILE` (sent as
+  `X-Push-Validator-Secret`), `_REQUEST_HEADERS`, `_CORRELATION_HEADER` (default
+  `X-Request-Id`), `_CLAIM_HEADER_PREFIX` and `_ENCODED_CLAIM_HEADER_PREFIX`. Chart:
+  `auth.signIn.entra.validator.url|protocol|timeoutMs|secretFile|correlationHeader|requestHeaders|claimHeaderPrefix|encodedClaimHeaderPrefix`
+  and generic `auth.extraContainers`, `auth.extraVolumes`, `auth.extraVolumeMounts` for a
+  sidecar. Public API additions in `push-auth-core`: `EntraSettings.validator` (struct
+  literals need `validator: None`), `Reason::Validator` (exhaustive matches need an arm),
+  `RequestMeta` and the defaulted `Authenticator::authenticate_with(token, &RequestMeta)`
+  (its `request_id` is set only in validator mode). Unset, behaviour, logs and chart
+  output are unchanged.
+
 - **Proactive agents**
   ([design](docs/superpowers/specs/2026-11-09-proactive-agents.md)): an owned agent may
   start actions on its own, under its owner's control.

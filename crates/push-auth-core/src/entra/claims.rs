@@ -128,6 +128,7 @@ mod tests {
             required_role: None,
             client_apps: Vec::new(),
             max_session: Duration::from_secs(3600),
+            validator: None,
         }
     }
 

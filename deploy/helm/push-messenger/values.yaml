@@ -118,6 +118,57 @@ auth:
       # system roots (SSL_CERT_FILE) for every TLS connection it makes, e.g. a
       # TLS-inspecting proxy's root plus the public roots it needs. Empty: system roots.
       caConfigMap: ""
+      # Opt-in external token validator (docs/entra-sign-in.md, "External token
+      # validator"), for organizations that mandate their own validator, typically a
+      # sidecar in auth.extraContainers. With a url, auth-svc sends each presented Entra
+      # access token to it and lets it check the signature and protocol; auth-svc still
+      # re-checks tenant, issuer, audience and lifetime on the returned claims and applies
+      # its full policy, so the validator can only narrow who signs in. When the
+      # validator is unavailable, sign-in fails closed (503): auth-svc never falls back
+      # to its built-in keys. Read only with entra or entra-app in providers. The network
+      # policy is unchanged: a sidecar shares the pod's egress rules, so it needs the same
+      # Entra ID egress (networkPolicy.egress.entraSignInCidrs, a proxy, or extra rules)
+      # as built-in validation.
+      validator:
+        # https:// anywhere; http:// only to a loopback host (127.0.0.1, [::1],
+        # localhost), i.e. a sidecar in the same pod. Empty: built-in validation.
+        url: ""
+        # How auth-svc talks to the validator (case-insensitive):
+        # - json: POST with the token in Authorization and the body {"provider": "entra"
+        #   | "entra-app"}; 200 with {"claims": {...}} accepts, 401 rejects, anything
+        #   else is unavailable (503).
+        # - headers: forward-auth style, as for nginx auth_request or Envoy ext_authz:
+        #   POST without a body, the token in Authorization plus the request metadata
+        #   headers Original-Uri, Original-Method, X-Forwarded-For and the correlation
+        #   header. A 2xx accepts, with the claims in response headers named
+        #   <claimHeaderPrefix><claim>, or base64 in <encodedClaimHeaderPrefix><claim>;
+        #   401 or 403 rejects; anything else is unavailable (503). Most forward-auth
+        #   validators return claims only when asked by a request header, e.g.
+        #   requestHeaders: {Return-All-Subject-Token-Claims: "1"}.
+        protocol: json
+        # Per-request timeout in milliseconds, 100-10000.
+        timeoutMs: 2000
+        # Request header carrying auth-svc's request id (both protocols). Empty: not sent.
+        correlationHeader: X-Request-Id
+        # Static request headers sent to the validator with both protocols, as a map of
+        # header name to string value (quote numbers: "1"); at most 32. Names are RFC 9110
+        # tokens and may not be Authorization, Original-Uri, Original-Method,
+        # X-Forwarded-For, Host, Content-Length, Content-Type, Accept, Transfer-Encoding,
+        # Connection, X-Push-Validator-Secret, TE, Upgrade, Expect, Keep-Alive,
+        # Proxy-Authorization, Proxy-Connection, Trailer or the correlation header; values
+        # are 1-1024 characters of visible ASCII with inner spaces or tabs (";" included:
+        # the map is rendered as JSON).
+        requestHeaders: {}
+        # headers protocol only: the prefix of response headers carrying one plain claim
+        # each, and of those carrying one base64-encoded claim (for non-ASCII values;
+        # empty: not read). Matched case-insensitively; the encoded prefix must not begin
+        # the plain one (be equal to it or a prefix of it).
+        claimHeaderPrefix: Subject-Token-Claim-
+        encodedClaimHeaderPrefix: Subject-Token-Encoded-Claim-
+        # Absolute path of a file whose trimmed content auth-svc sends as the shared
+        # secret header X-Push-Validator-Secret, e.g. a Secret mounted with
+        # auth.extraVolumes and auth.extraVolumeMounts. Empty: no secret header.
+        secretFile: ""
     # Independent app-only policy. Requires explicit tenant GUIDs above (no keywords).
     entraApp:
       requiredRole: ""
@@ -138,6 +189,15 @@ auth:
     # kubectl port-forward). Its bearer token is the Secret's auth-admin-token: generated
     # for a chart-managed Secret, required in a consumer-managed one.
     enabled: false
+  # Rendered verbatim (toYaml) into the auth Deployment, e.g. for an external token
+  # validator sidecar (auth.signIn.entra.validator): extraContainers after the auth
+  # container, extraVolumes in the pod's volumes, extraVolumeMounts in the auth
+  # container's volumeMounts. Lists of Kubernetes Container, Volume and VolumeMount
+  # objects; the chart does not harden extra containers, so set their securityContext
+  # and resources yourself.
+  extraContainers: []
+  extraVolumes: []
+  extraVolumeMounts: []
   resources:
     requests:
       cpu: 100m

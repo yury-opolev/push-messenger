@@ -87,6 +87,7 @@ pub fn router(api: Api) -> Router {
     for authenticator in api.auth.authenticators() {
         let path = format!("/v1/auth/{}", authenticator.provider());
         let state = IdentityState {
+            validator: api.auth.external_validation(authenticator.provider()),
             api: api.clone(),
             authenticator,
         };

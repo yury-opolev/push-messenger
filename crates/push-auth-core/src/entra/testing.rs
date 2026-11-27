@@ -7,10 +7,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use axum::body::Body;
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
@@ -18,7 +19,7 @@ use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use super::{CONSUMERS_TENANT, EntraSettings, Tenants};
+use super::{CONSUMERS_TENANT, EntraSettings, Protocol, Tenants, ValidatorSettings};
 
 /// The tenant the stub's tokens come from by default.
 pub const TENANT: &str = "33333333-0000-4000-8000-000000000003";
@@ -83,6 +84,18 @@ pub fn sign_as(key: TestKey, kid: &str, claims: &Value) -> String {
     let mut header = Header::new(Algorithm::RS256);
     header.kid = Some(kid.to_owned());
     jsonwebtoken::encode(&header, claims, &key.encoding()).expect("signing with a test key")
+}
+
+/// The JSON text `payload_json` signed with `key` (RS256) as it is, naming `key`'s id: for
+/// payloads a JSON value cannot express, such as a duplicated claim.
+pub fn sign_raw(key: TestKey, payload_json: &str) -> String {
+    let header =
+        URL_SAFE_NO_PAD.encode(json!({"alg": "RS256", "kid": key.kid, "typ": "JWT"}).to_string());
+    let message = format!("{header}.{}", URL_SAFE_NO_PAD.encode(payload_json));
+    let signature =
+        jsonwebtoken::crypto::sign(message.as_bytes(), &key.encoding(), Algorithm::RS256)
+            .expect("signing with a test key");
+    format!("{message}.{signature}")
 }
 
 /// A token whose header names `alg` and `kid` and whose last part is `signature`: for
@@ -205,6 +218,7 @@ impl StubOpenId {
             required_role: None,
             client_apps: Vec::new(),
             max_session: Duration::from_secs(24 * 3600),
+            validator: None,
         }
     }
 
@@ -305,6 +319,259 @@ async fn keys(State(stub): State<Arc<Stub>>) -> Response {
         .map(|key| key.jwk())
         .collect();
     Json(json!({ "keys": keys })).into_response()
+}
+
+/// How the [`StubValidator`] answers.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ValidatorAnswer {
+    /// 200 with the bearer token's unverified payload as `claims`, as a validator copies
+    /// them; 400 without a readable bearer token.
+    Echo,
+    /// 200 with these `claims`.
+    Claims(Value),
+    /// This status with this raw body (`Content-Type: application/json`).
+    Status(u16, String),
+    /// Waits, then echoes.
+    Delay(Duration),
+    /// 200 with this raw body, streamed without `Content-Length` (chunked).
+    Chunked(String),
+    /// Header protocol: this status with these response headers (repeated names kept)
+    /// and an empty body.
+    Headers {
+        status: u16,
+        headers: Vec<(String, String)>,
+    },
+    /// Header protocol: 200 with a `Subject-Token-Claim-<name>` header for each claim of
+    /// the bearer token's unverified payload (strings as they are, numbers in decimal,
+    /// anything else as JSON), except that `name` and non-ASCII strings come base64-encoded
+    /// in `Subject-Token-Encoded-Claim-<name>`; 400 without a readable bearer token.
+    EchoHeaders,
+}
+
+/// A request the [`StubValidator`] received.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeenRequest {
+    pub method: String,
+    pub authorization: Option<String>,
+    pub secret: Option<String>,
+    pub content_type: Option<String>,
+    pub accept: Option<String>,
+    pub body: String,
+    /// `Content-Length` as sent.
+    pub content_length: Option<String>,
+    /// Every header in order, names in lower case.
+    pub headers: Vec<(String, String)>,
+}
+
+impl SeenRequest {
+    /// The values of the header `name` (any case), in order.
+    pub fn header(&self, name: &str) -> Vec<&str> {
+        self.headers
+            .iter()
+            .filter(|(known, _)| known.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+            .collect()
+    }
+}
+
+struct ValidatorStub {
+    answer: Mutex<ValidatorAnswer>,
+    requests: Mutex<Vec<SeenRequest>>,
+}
+
+/// A stub external token validator on 127.0.0.1 over plain HTTP, at `POST /validate`.
+/// It checks no signature: it echoes what it is told to.
+pub struct StubValidator {
+    url: String,
+    state: Arc<ValidatorStub>,
+}
+
+impl StubValidator {
+    pub async fn start() -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the stub validator");
+        let url = format!(
+            "http://{}/validate",
+            listener.local_addr().expect("its address")
+        );
+        let state = Arc::new(ValidatorStub {
+            answer: Mutex::new(ValidatorAnswer::Echo),
+            requests: Mutex::new(Vec::new()),
+        });
+        let router = Router::new()
+            .route("/validate", post(validate))
+            .with_state(Arc::clone(&state));
+        tokio::spawn(axum::serve(listener, router).into_future());
+        Self { url, state }
+    }
+
+    /// The value for `PUSH_ENTRA_VALIDATOR_URL`.
+    pub fn url(&self) -> String {
+        self.url.clone()
+    }
+
+    /// Answers every request so from now on.
+    pub fn set_answer(&self, answer: ValidatorAnswer) {
+        *self.state.answer.lock().unwrap() = answer;
+    }
+
+    /// Every request received so far, in order.
+    pub fn requests(&self) -> Vec<SeenRequest> {
+        self.state.requests.lock().unwrap().clone()
+    }
+
+    /// `openid`'s settings with this validator (a one-second timeout, no secret).
+    pub fn settings_for(&self, openid: &StubOpenId) -> EntraSettings {
+        EntraSettings {
+            validator: Some(ValidatorSettings {
+                timeout: Duration::from_millis(1000),
+                ..ValidatorSettings::new(self.url())
+            }),
+            ..openid.settings()
+        }
+    }
+
+    /// As [`StubValidator::settings_for`] with the header protocol, asking for every claim
+    /// with the static header `Return-All-Subject-Token-Claims: 1`. Answers
+    /// [`ValidatorAnswer::EchoHeaders`] until told otherwise.
+    pub fn settings_for_headers(&self, openid: &StubOpenId) -> EntraSettings {
+        self.set_answer(ValidatorAnswer::EchoHeaders);
+        let mut settings = self.settings_for(openid);
+        if let Some(validator) = settings.validator.as_mut() {
+            validator.protocol = Protocol::Headers;
+            validator.request_headers = vec![(
+                header::HeaderName::from_static("return-all-subject-token-claims"),
+                header::HeaderValue::from_static("1"),
+            )];
+        }
+        settings
+    }
+}
+
+/// A loopback validator URL nothing listens on: connections are refused.
+pub async fn refused_url() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind a port");
+    let address = listener.local_addr().expect("its address");
+    drop(listener);
+    format!("http://{address}/validate")
+}
+
+async fn validate(
+    State(stub): State<Arc<ValidatorStub>>,
+    method: Method,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    let text = |name: header::HeaderName| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+    };
+    let authorization = text(header::AUTHORIZATION);
+    stub.requests.lock().unwrap().push(SeenRequest {
+        method: method.to_string(),
+        authorization: authorization.clone(),
+        secret: text(header::HeaderName::from_static("x-push-validator-secret")),
+        content_type: text(header::CONTENT_TYPE),
+        accept: text(header::ACCEPT),
+        body,
+        content_length: text(header::CONTENT_LENGTH),
+        headers: headers
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_owned(),
+                    String::from_utf8_lossy(value.as_bytes()).into_owned(),
+                )
+            })
+            .collect(),
+    });
+    let answer = stub.answer.lock().unwrap().clone();
+    let claims = match answer {
+        ValidatorAnswer::Claims(claims) => claims,
+        ValidatorAnswer::Status(status, body) => {
+            return Response::builder()
+                .status(status)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .expect("a stub answer");
+        }
+        ValidatorAnswer::Chunked(body) => {
+            let chunks = tokio_util::io::ReaderStream::with_capacity(
+                std::io::Cursor::new(body.into_bytes()),
+                1024,
+            );
+            return Response::builder()
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from_stream(chunks))
+                .expect("a stub answer");
+        }
+        ValidatorAnswer::Delay(delay) => {
+            tokio::time::sleep(delay).await;
+            match echoed(authorization.as_deref()) {
+                Some(claims) => claims,
+                None => return StatusCode::BAD_REQUEST.into_response(),
+            }
+        }
+        ValidatorAnswer::Echo => match echoed(authorization.as_deref()) {
+            Some(claims) => claims,
+            None => return StatusCode::BAD_REQUEST.into_response(),
+        },
+        ValidatorAnswer::Headers { status, headers } => {
+            let mut response = Response::builder().status(status);
+            for (name, value) in headers {
+                response = response.header(name, value);
+            }
+            return response.body(Body::empty()).expect("a stub answer");
+        }
+        ValidatorAnswer::EchoHeaders => {
+            let Some(claims) = echoed(authorization.as_deref()) else {
+                return StatusCode::BAD_REQUEST.into_response();
+            };
+            let mut response = Response::builder();
+            for (name, value) in claim_headers(&claims) {
+                response = response.header(name, value);
+            }
+            return response.body(Body::empty()).expect("a stub answer");
+        }
+    };
+    Json(json!({ "claims": claims })).into_response()
+}
+
+/// The header protocol's claim headers of `claims` (an object), as
+/// [`ValidatorAnswer::EchoHeaders`] answers them.
+pub fn claim_headers(claims: &Value) -> Vec<(String, String)> {
+    let Some(claims) = claims.as_object() else {
+        return Vec::new();
+    };
+    claims
+        .iter()
+        .map(|(name, value)| {
+            let text = match value {
+                Value::String(text) => text.clone(),
+                other => other.to_string(),
+            };
+            if name == "name" || !text.is_ascii() {
+                (
+                    format!("Subject-Token-Encoded-Claim-{name}"),
+                    STANDARD.encode(text),
+                )
+            } else {
+                (format!("Subject-Token-Claim-{name}"), text)
+            }
+        })
+        .collect()
+}
+
+/// The unverified payload of the bearer token in `authorization`.
+fn echoed(authorization: Option<&str>) -> Option<Value> {
+    let token = authorization?.strip_prefix("Bearer ")?;
+    let payload = token.split('.').nth(1)?;
+    serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).ok()?).ok()
 }
 
 #[cfg(test)]
