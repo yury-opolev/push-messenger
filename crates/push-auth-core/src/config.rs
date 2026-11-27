@@ -49,9 +49,14 @@ use crate::turn::TurnSettings;
 /// | `PUSH_ENTRA_REQUIRED_ROLE` | an app role `roles` must contain | none |
 /// | `PUSH_ENTRA_ALLOWED_CLIENT_APPS` | client app ids allowed in `azp` | any |
 /// | `PUSH_ENTRA_MAX_SESSION_HOURS` | maximum session age of an Entra-backed device, 1 to 720 | `24` |
-/// | `PUSH_ENTRA_VALIDATOR_URL` | an external token validator for `entra` and `entra-app`: push-auth POSTs `{"provider": …}` with the token as `Authorization: Bearer` and re-checks the returned claims instead of fetching Entra ID's keys; `https://`, or `http://` to a loopback host | built-in validation |
+/// | `PUSH_ENTRA_VALIDATOR_URL` | an external token validator for `entra` and `entra-app`: push-auth POSTs the token as `Authorization: Bearer` (with `Original-Uri`, `Original-Method`, `X-Forwarded-For` and the request id) and re-checks the returned claims instead of fetching Entra ID's keys; `https://`, or `http://` to a loopback host | built-in validation |
 /// | `PUSH_ENTRA_VALIDATOR_TIMEOUT_MS` | the validator's time limit, 100 to 10000; only with the URL | `2000` |
 /// | `PUSH_ENTRA_VALIDATOR_SECRET_FILE` | a file whose trimmed content (1 to 1024 visible ASCII characters) is sent as `X-Push-Validator-Secret`, read at start-up; only with the URL | none |
+/// | `PUSH_ENTRA_VALIDATOR_PROTOCOL` | `json` (POST `{"provider": …}`, answer `{"claims": {…}}`) or `headers` (forward-auth: an empty POST, the claims in response headers; 401 and 403 refuse); only with the URL | `json` |
+/// | `PUSH_ENTRA_VALIDATOR_REQUEST_HEADERS` | static headers sent to the validator, such as `Return-All-Subject-Token-Claims: 1`: `Name: value` pairs separated by newlines or `;`, or a JSON object of strings; at most 32, values 1 to 1024 visible ASCII characters, never logged; push-auth's own headers are refused; only with the URL | none |
+/// | `PUSH_ENTRA_VALIDATOR_CORRELATION_HEADER` | the header carrying each sign-in attempt's request id (also logged with a refusal); set but empty sends none; only with the URL | `X-Request-Id` |
+/// | `PUSH_ENTRA_VALIDATOR_CLAIM_HEADER_PREFIX` | `headers` protocol: the name prefix of response headers carrying a claim as text; only with the URL | `Subject-Token-Claim-` |
+/// | `PUSH_ENTRA_VALIDATOR_ENCODED_CLAIM_HEADER_PREFIX` | `headers` protocol: the name prefix of response headers carrying a claim as base64 of UTF-8 text (it wins over a plain header of the same claim); set but empty reads none; only with the URL | `Subject-Token-Encoded-Claim-` |
 /// | `PUSH_ENTRA_APP_REQUIRED_ROLE` | app-only role, independent of delegated-user policy | none |
 /// | `PUSH_ENTRA_APP_ALLOWED_CLIENT_APPS` | app-only client ids (`azp`), comma-separated | any valid client id |
 /// | `PUSH_ENTRA_APP_MAX_SESSION_HOURS` | app-only maximum session age, 1 to 720 | `24` |
