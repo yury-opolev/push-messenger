@@ -581,7 +581,7 @@ rendered verbatim.
 {{- fail "auth.signIn.entra.validator.protocol must be json or headers" -}}
 {{- end -}}
 {{- $token := "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$" -}}
-{{- $reserved := list "authorization" "original-uri" "original-method" "x-forwarded-for" "host" "content-length" "content-type" "accept" "transfer-encoding" "connection" "x-push-validator-secret" -}}
+{{- $reserved := list "authorization" "original-uri" "original-method" "x-forwarded-for" "host" "content-length" "content-type" "accept" "transfer-encoding" "connection" "x-push-validator-secret" "te" "upgrade" "expect" "keep-alive" "proxy-authorization" "proxy-connection" "trailer" -}}
 {{- $correlation := $validator.correlationHeader -}}
 {{- if not (kindIs "string" $correlation) -}}
 {{- fail "auth.signIn.entra.validator.correlationHeader must be a string" -}}
@@ -627,8 +627,8 @@ rendered verbatim.
 {{- if not (kindIs "string" $encoded) -}}
 {{- fail "auth.signIn.entra.validator.encodedClaimHeaderPrefix must be a string" -}}
 {{- end -}}
-{{- if and $encoded (or (not (regexMatch $token $encoded)) (eq (lower $encoded) (lower $prefix))) -}}
-{{- fail "auth.signIn.entra.validator.encodedClaimHeaderPrefix must be empty or a header name prefix (RFC 9110 token) other than claimHeaderPrefix" -}}
+{{- if and $encoded (or (not (regexMatch $token $encoded)) (hasPrefix (lower $encoded) (lower $prefix))) -}}
+{{- fail "auth.signIn.entra.validator.encodedClaimHeaderPrefix must be empty or a header name prefix (RFC 9110 token) that does not begin claimHeaderPrefix (equal to or a prefix of it)" -}}
 {{- end -}}
 {{- range $name := list "extraContainers" "extraVolumes" "extraVolumeMounts" -}}
 {{- if not (kindIs "slice" (index $.Values.auth $name)) -}}
@@ -737,13 +737,9 @@ token validator's variables come only with Entra sign-in and a validator URL.
   value: {{ . | quote }}
 {{- end }}
 {{- with .requestHeaders }}
-{{- $headers := . }}
-{{- $lines := list }}
-{{- range $name := keys $headers | sortAlpha }}
-{{- $lines = append $lines (printf "%s: %s" $name (index $headers $name)) }}
-{{- end }}
+{{- /* JSON (keys sorted): a value may hold `;`, which separates entries in the text form. */}}
 - name: PUSH_ENTRA_VALIDATOR_REQUEST_HEADERS
-  value: {{ join "\n" $lines | quote }}
+  value: {{ toJson . | quote }}
 {{- end }}
 {{- if eq (lower .protocol) "headers" }}
 - name: PUSH_ENTRA_VALIDATOR_CLAIM_HEADER_PREFIX

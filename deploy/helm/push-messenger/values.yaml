@@ -154,12 +154,15 @@ auth:
         # header name to string value (quote numbers: "1"); at most 32. Names are RFC 9110
         # tokens and may not be Authorization, Original-Uri, Original-Method,
         # X-Forwarded-For, Host, Content-Length, Content-Type, Accept, Transfer-Encoding,
-        # Connection, X-Push-Validator-Secret or the correlation header; values are 1-1024
-        # characters of visible ASCII with inner spaces or tabs.
+        # Connection, X-Push-Validator-Secret, TE, Upgrade, Expect, Keep-Alive,
+        # Proxy-Authorization, Proxy-Connection, Trailer or the correlation header; values
+        # are 1-1024 characters of visible ASCII with inner spaces or tabs (";" included:
+        # the map is rendered as JSON).
         requestHeaders: {}
         # headers protocol only: the prefix of response headers carrying one plain claim
         # each, and of those carrying one base64-encoded claim (for non-ASCII values;
-        # empty: not read). Matched case-insensitively; the two must differ.
+        # empty: not read). Matched case-insensitively; the encoded prefix must not begin
+        # the plain one (be equal to it or a prefix of it).
         claimHeaderPrefix: Subject-Token-Claim-
         encodedClaimHeaderPrefix: Subject-Token-Encoded-Claim-
         # Absolute path of a file whose trimmed content auth-svc sends as the shared

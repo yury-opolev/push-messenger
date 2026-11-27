@@ -1648,12 +1648,12 @@ Check 'validator headers: the protocol, sorted request headers, correlation head
         $vars['PUSH_ENTRA_VALIDATOR_PROTOCOL'] -ceq 'headers' -and
         $vars['PUSH_ENTRA_VALIDATOR_TIMEOUT_MS'] -ceq '500' -and
         $vars['PUSH_ENTRA_VALIDATOR_CORRELATION_HEADER'] -ceq 'X-Request-Id' -and
-        $vars['PUSH_ENTRA_VALIDATOR_REQUEST_HEADERS'] -ceq "Return-All-Subject-Token-Claims: 1`nX-Tier: gold" -and
+        $vars['PUSH_ENTRA_VALIDATOR_REQUEST_HEADERS'] -ceq '{"Return-All-Subject-Token-Claims":"1","X-Tier":"gold"}' -and
         $vars['PUSH_ENTRA_VALIDATOR_CLAIM_HEADER_PREFIX'] -ceq 'Subject-Token-Claim-' -and
         $vars['PUSH_ENTRA_VALIDATOR_ENCODED_CLAIM_HEADER_PREFIX'] -ceq 'Subject-Token-Encoded-Claim-' -and
         -not $vars.ContainsKey('PUSH_ENTRA_VALIDATOR_SECRET_FILE') -and
         $app['PUSH_ENTRA_VALIDATOR_PROTOCOL'] -ceq 'headers' -and
-        $app['PUSH_ENTRA_VALIDATOR_REQUEST_HEADERS'] -ceq "Return-All-Subject-Token-Claims: 1`nX-Tier: gold" -and
+        $app['PUSH_ENTRA_VALIDATOR_REQUEST_HEADERS'] -ceq '{"Return-All-Subject-Token-Claims":"1","X-Tier":"gold"}' -and
         $upper['PUSH_ENTRA_VALIDATOR_PROTOCOL'] -ceq 'headers' -and
         $upper['PUSH_ENTRA_VALIDATOR_CORRELATION_HEADER'] -ceq 'X-Correlation-Id' -and
         $upper['PUSH_ENTRA_VALIDATOR_CLAIM_HEADER_PREFIX'] -ceq 'X-Claim-' -and
@@ -1668,13 +1668,19 @@ Check 'validator json: the protocol and correlation header render without prefix
     $null -ne $json -and $null -ne $empty -and
         $json['PUSH_ENTRA_VALIDATOR_PROTOCOL'] -ceq 'json' -and
         $json['PUSH_ENTRA_VALIDATOR_CORRELATION_HEADER'] -ceq 'X-Request-Id' -and
-        $json['PUSH_ENTRA_VALIDATOR_REQUEST_HEADERS'] -ceq 'X-Tier: gold' -and
+        $json['PUSH_ENTRA_VALIDATOR_REQUEST_HEADERS'] -ceq '{"X-Tier":"gold"}' -and
         -not $json.ContainsKey('PUSH_ENTRA_VALIDATOR_CLAIM_HEADER_PREFIX') -and
         -not $json.ContainsKey('PUSH_ENTRA_VALIDATOR_ENCODED_CLAIM_HEADER_PREFIX') -and
         $empty.ContainsKey('PUSH_ENTRA_VALIDATOR_CORRELATION_HEADER') -and
         $empty['PUSH_ENTRA_VALIDATOR_CORRELATION_HEADER'] -ceq '' -and
         (Render ($signInArgs + $validatorArgs + @('--set', 'auth.signIn.entra.validator.correlationHeader=X-Correlation-Id',
             '--set-json', 'auth.signIn.entra.validator.requestHeaders={"X-Request-Id":"1"}'))) -eq 0
+}
+Check 'validator request headers render as JSON: a value with ; stays one header' {
+    $semi = AuthEnv ($signInArgs + $validatorArgs + @('--set-json',
+        'auth.signIn.entra.validator.requestHeaders={"Prefer":"a=1; X-Injected: 2"}'))
+    $null -ne $semi -and
+        $semi['PUSH_ENTRA_VALIDATOR_REQUEST_HEADERS'] -ceq '{"Prefer":"a=1; X-Injected: 2"}'
 }
 Check 'validator headers: lint passes with the header protocol' {
     helm lint $chart --strict @headerArgs 2>&1 | Out-Null
@@ -1700,6 +1706,13 @@ Check 'validator headers: unknown protocols, bad or reserved request headers and
         @('--set-json', "$v.requestHeaders={`"content-type`":`"x`"}"),
         @('--set-json', "$v.requestHeaders={`"X-Request-Id`":`"x`"}"),
         @('--set-json', "$v.requestHeaders={`"x-push-validator-secret`":`"x`"}"),
+        @('--set-json', "$v.requestHeaders={`"TE`":`"x`"}"),
+        @('--set-json', "$v.requestHeaders={`"upgrade`":`"x`"}"),
+        @('--set-json', "$v.requestHeaders={`"Expect`":`"x`"}"),
+        @('--set-json', "$v.requestHeaders={`"Keep-Alive`":`"x`"}"),
+        @('--set-json', "$v.requestHeaders={`"Proxy-Authorization`":`"x`"}"),
+        @('--set-json', "$v.requestHeaders={`"proxy-connection`":`"x`"}"),
+        @('--set-json', "$v.requestHeaders={`"Trailer`":`"x`"}"),
         @('--set', "$v.correlationHeader=X-Corr", '--set-json', "$v.requestHeaders={`"x-corr`":`"x`"}"),
         @('--set-json', "$v.requestHeaders={`"bad name`":`"x`"}"),
         @('--set-json', "$v.requestHeaders={`"X-A`":`"a\nb`"}"),
@@ -1719,7 +1732,8 @@ Check 'validator headers: unknown protocols, bad or reserved request headers and
         @('--set', "$v.claimHeaderPrefix="),
         @('--set', "$v.claimHeaderPrefix=bad prefix"),
         @('--set', "$v.encodedClaimHeaderPrefix=bad prefix"),
-        @('--set', "$v.encodedClaimHeaderPrefix=subject-token-claim-")
+        @('--set', "$v.encodedClaimHeaderPrefix=subject-token-claim-"),
+        @('--set', "$v.claimHeaderPrefix=X-Claim-Plain-", '--set', "$v.encodedClaimHeaderPrefix=X-Claim-")
     )
     $refused = @($bad | Where-Object { (Render ($signInArgs + $validatorArgs + @('--set-json', "$v.protocol=`"headers`"") + $_)) -ne 0 })
     $message = helm template push $chart @signInArgs @validatorArgs --set-json "$v.requestHeaders={`"X-Leak`":`"hush-hush\nvalue`"}" 2>&1 | Out-String
