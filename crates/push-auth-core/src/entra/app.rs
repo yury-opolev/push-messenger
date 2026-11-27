@@ -297,9 +297,8 @@ mod tests {
         app.warm().await;
         let refused = EntraSignIn::new(EntraSettings {
             validator: Some(ValidatorSettings {
-                url: refused_url().await,
                 timeout: Duration::from_millis(500),
-                secret: None,
+                ..ValidatorSettings::new(refused_url().await)
             }),
             ..openid.settings()
         })

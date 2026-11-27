@@ -14,8 +14,8 @@ use super::{EntraError, Reason};
 use crate::identity::{ENTRA_APP_PROVIDER, ENTRA_PROVIDER};
 
 pub(crate) use claims::recheck;
-pub use config::ValidatorSettings;
 use config::is_loopback;
+pub use config::{Protocol, ValidatorSettings};
 
 /// The largest validator answer read, in bytes.
 pub const MAX_VALIDATOR_BODY: usize = 16 * 1024;
@@ -159,9 +159,8 @@ mod tests {
     #[tokio::test]
     async fn a_token_that_cannot_be_sent_is_malformed() {
         let validator = Validator::new(&ValidatorSettings {
-            url: crate::entra::testing::refused_url().await,
             timeout: Duration::from_millis(1000),
-            secret: None,
+            ..ValidatorSettings::new(crate::entra::testing::refused_url().await)
         })
         .unwrap();
         assert_eq!(

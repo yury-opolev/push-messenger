@@ -32,7 +32,7 @@ pub use settings::{
     Tenants,
 };
 use validator::ProviderKind;
-pub use validator::{MAX_VALIDATOR_BODY, ValidatorSettings};
+pub use validator::{MAX_VALIDATOR_BODY, Protocol, ValidatorSettings};
 
 /// Why a token was refused. Logged by name; the client only ever hears
 /// `entra_token_invalid`.
@@ -988,9 +988,8 @@ mod tests {
         }
         let refused = EntraSignIn::new(EntraSettings {
             validator: Some(ValidatorSettings {
-                url: refused_url().await,
                 timeout: Duration::from_millis(1000),
-                secret: None,
+                ..ValidatorSettings::new(refused_url().await)
             }),
             ..openid.settings()
         })

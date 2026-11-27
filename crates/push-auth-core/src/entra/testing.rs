@@ -399,9 +399,8 @@ impl StubValidator {
     pub fn settings_for(&self, openid: &StubOpenId) -> EntraSettings {
         EntraSettings {
             validator: Some(ValidatorSettings {
-                url: self.url(),
                 timeout: Duration::from_millis(1000),
-                secret: None,
+                ..ValidatorSettings::new(self.url())
             }),
             ..openid.settings()
         }
