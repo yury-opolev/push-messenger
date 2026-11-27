@@ -547,7 +547,11 @@ The admin listener is a boolean; its peers carry both label maps.
 Checks the external token validator and the auth Deployment's extras whether or not Entra
 sign-in is on, as auth-svc would its PUSH_ENTRA_VALIDATOR_* variables: an https:// URL, or
 http:// only to a loopback host (a sidecar), never with user info; a 100 to 10000 ms
-timeout; an absolute secret file path. The extras are lists rendered verbatim.
+timeout; an absolute secret file path; a json or headers protocol; request headers as a map
+of at most 32 RFC 9110 token names (none that auth-svc sets itself, nor the correlation
+header) to visible ASCII string values; token correlation header and claim header prefixes.
+Failure messages name a request header but never show its value. The extras are lists
+rendered verbatim.
 */}}
 {{- define "push.checkValidator" -}}
 {{- $validator := .Values.auth.signIn.entra.validator -}}
@@ -572,6 +576,59 @@ timeout; an absolute secret file path. The extras are lists rendered verbatim.
 {{- end -}}
 {{- if and $validator.secretFile (not (regexMatch "^/[^\\s]+$" $validator.secretFile)) -}}
 {{- fail "auth.signIn.entra.validator.secretFile must be an absolute path without whitespace" -}}
+{{- end -}}
+{{- if not (and (kindIs "string" $validator.protocol) (has (lower (toString $validator.protocol)) (list "json" "headers"))) -}}
+{{- fail "auth.signIn.entra.validator.protocol must be json or headers" -}}
+{{- end -}}
+{{- $token := "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$" -}}
+{{- $reserved := list "authorization" "original-uri" "original-method" "x-forwarded-for" "host" "content-length" "content-type" "accept" "transfer-encoding" "connection" "x-push-validator-secret" -}}
+{{- $correlation := $validator.correlationHeader -}}
+{{- if not (kindIs "string" $correlation) -}}
+{{- fail "auth.signIn.entra.validator.correlationHeader must be a string" -}}
+{{- end -}}
+{{- if and $correlation (or (not (regexMatch $token $correlation)) (has (lower $correlation) $reserved)) -}}
+{{- fail (printf "auth.signIn.entra.validator.correlationHeader must be empty or a header name (RFC 9110 token) other than %s" (join ", " $reserved)) -}}
+{{- end -}}
+{{- if $correlation -}}
+{{- $reserved = append $reserved (lower $correlation) -}}
+{{- end -}}
+{{- $headers := $validator.requestHeaders -}}
+{{- if not (kindIs "map" $headers) -}}
+{{- fail "auth.signIn.entra.validator.requestHeaders must be a map of header name to value" -}}
+{{- end -}}
+{{- if gt (len $headers) 32 -}}
+{{- fail "auth.signIn.entra.validator.requestHeaders must have at most 32 headers" -}}
+{{- end -}}
+{{- $seen := dict -}}
+{{- range $name := keys $headers | sortAlpha -}}
+{{- $value := index $headers $name -}}
+{{- if not (regexMatch $token $name) -}}
+{{- fail (printf "auth.signIn.entra.validator.requestHeaders: %q is not a header name (RFC 9110 token)" $name) -}}
+{{- end -}}
+{{- if has (lower $name) $reserved -}}
+{{- fail (printf "auth.signIn.entra.validator.requestHeaders.%s is reserved: auth-svc sets it itself (reserved, case-insensitively: %s)" $name (join ", " $reserved)) -}}
+{{- end -}}
+{{- if hasKey $seen (lower $name) -}}
+{{- fail (printf "auth.signIn.entra.validator.requestHeaders.%s is set twice (header names are case-insensitive)" $name) -}}
+{{- end -}}
+{{- $_ := set $seen (lower $name) true -}}
+{{- if not (kindIs "string" $value) -}}
+{{- fail (printf "auth.signIn.entra.validator.requestHeaders.%s must be a string: quote values such as \"1\"" $name) -}}
+{{- end -}}
+{{- if or (gt (len $value) 1024) (not (regexMatch "^[!-~]([ \\t!-~]*[!-~])?$" $value)) -}}
+{{- fail (printf "auth.signIn.entra.validator.requestHeaders.%s must be 1-1024 characters of visible ASCII with inner spaces or tabs, without line breaks (value not shown)" $name) -}}
+{{- end -}}
+{{- end -}}
+{{- $prefix := $validator.claimHeaderPrefix -}}
+{{- if not (and (kindIs "string" $prefix) (regexMatch $token (toString $prefix))) -}}
+{{- fail "auth.signIn.entra.validator.claimHeaderPrefix must be a non-empty header name prefix (RFC 9110 token)" -}}
+{{- end -}}
+{{- $encoded := $validator.encodedClaimHeaderPrefix -}}
+{{- if not (kindIs "string" $encoded) -}}
+{{- fail "auth.signIn.entra.validator.encodedClaimHeaderPrefix must be a string" -}}
+{{- end -}}
+{{- if and $encoded (or (not (regexMatch $token $encoded)) (eq (lower $encoded) (lower $prefix))) -}}
+{{- fail "auth.signIn.entra.validator.encodedClaimHeaderPrefix must be empty or a header name prefix (RFC 9110 token) other than claimHeaderPrefix" -}}
 {{- end -}}
 {{- range $name := list "extraContainers" "extraVolumes" "extraVolumeMounts" -}}
 {{- if not (kindIs "slice" (index $.Values.auth $name)) -}}
@@ -669,11 +726,30 @@ token validator's variables come only with Entra sign-in and a validator URL.
 {{- if .url }}
 - name: PUSH_ENTRA_VALIDATOR_URL
   value: {{ .url | quote }}
+- name: PUSH_ENTRA_VALIDATOR_PROTOCOL
+  value: {{ lower .protocol | quote }}
 - name: PUSH_ENTRA_VALIDATOR_TIMEOUT_MS
   value: {{ int .timeoutMs | quote }}
+- name: PUSH_ENTRA_VALIDATOR_CORRELATION_HEADER
+  value: {{ .correlationHeader | quote }}
 {{- with .secretFile }}
 - name: PUSH_ENTRA_VALIDATOR_SECRET_FILE
   value: {{ . | quote }}
+{{- end }}
+{{- with .requestHeaders }}
+{{- $headers := . }}
+{{- $lines := list }}
+{{- range $name := keys $headers | sortAlpha }}
+{{- $lines = append $lines (printf "%s: %s" $name (index $headers $name)) }}
+{{- end }}
+- name: PUSH_ENTRA_VALIDATOR_REQUEST_HEADERS
+  value: {{ join "\n" $lines | quote }}
+{{- end }}
+{{- if eq (lower .protocol) "headers" }}
+- name: PUSH_ENTRA_VALIDATOR_CLAIM_HEADER_PREFIX
+  value: {{ .claimHeaderPrefix | quote }}
+- name: PUSH_ENTRA_VALIDATOR_ENCODED_CLAIM_HEADER_PREFIX
+  value: {{ .encodedClaimHeaderPrefix | quote }}
 {{- end }}
 {{- end }}
 {{- end }}
